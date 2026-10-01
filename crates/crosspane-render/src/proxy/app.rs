@@ -145,7 +145,13 @@ impl App {
             return Err("surface does not support FIFO presentation".into());
         }
         config.format = format;
-        config.present_mode = wgpu::PresentMode::Fifo;
+        config.present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        config.desired_maximum_frame_latency = 1;
+        tracing::debug!(id, mode = ?config.present_mode, "proxy present mode");
         // Opaque avoids compositor alpha blending of a source window's canvas where supported.
         if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
@@ -250,6 +256,17 @@ impl App {
                         .presenter
                         .upload(&gpu.device, &gpu.queue, size, &pixels, &dirty)
                     {
+                        Ok(()) => window.window.request_redraw(),
+                        Err(error) => {
+                            tracing::warn!(id, %error, "proxy frame rejected");
+                            self.remove(id, true);
+                        }
+                    }
+                }
+            }
+            HostCommand::Video { id, size, picture } => {
+                if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
+                    match window.presenter.set_video(&gpu.device, size, picture) {
                         Ok(()) => window.window.request_redraw(),
                         Err(error) => {
                             tracing::warn!(id, %error, "proxy frame rejected");
@@ -561,6 +578,7 @@ impl ProxyWindow {
                 return Err("surface validation failed".into());
             }
         };
+        self.presenter.prepare_video(&gpu.device, &gpu.queue);
         self.consecutive_surface_losses = 0;
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = gpu

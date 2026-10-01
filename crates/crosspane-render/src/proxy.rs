@@ -44,6 +44,14 @@ pub enum HostCommand {
         pixels: Arc<[u8]>,
         dirty: Vec<PixelRect>,
     },
+    /// A decoded video picture (03 §6 video layer). Shown, cropped to its top-left `size` (the
+    /// coded padding is never shown), until the next `Frame` or `Video` for this proxy. Only the
+    /// newest picture not yet drawn is uploaded; superseded ones are dropped.
+    Video {
+        id: u64,
+        size: PixelSize,
+        picture: Arc<crosspane_media::picture::Nv12>,
+    },
     /// The source's cursor over this proxy (03 §4.6, WP-2.16): BGRA with straight alpha, `size`
     /// pixels at the content's density, click point `hotspot`. All-transparent hides the cursor.
     SetCursor {
@@ -101,6 +109,11 @@ impl fmt::Debug for HostCommand {
                 .field("bytes", &pixels.len())
                 .field("dirty", dirty)
                 .finish(),
+            Self::Video { id, size, .. } => f
+                .debug_struct("Video")
+                .field("id", id)
+                .field("size", size)
+                .finish_non_exhaustive(),
             Self::SetCursor {
                 id, size, hotspot, ..
             } => f
