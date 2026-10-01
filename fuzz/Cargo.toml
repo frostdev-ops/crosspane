@@ -1,0 +1,36 @@
+[package]
+name = "crosspane-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+crosspane-protocol = { path = "../crates/crosspane-protocol" }
+libfuzzer-sys = "0.4.13"
+
+[[bin]]
+name = "input_stream"
+path = "fuzz_targets/input_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pointer_datagram"
+path = "fuzz_targets/pointer_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_stream"
+path = "fuzz_targets/control_stream.rs"
+test = false
+doc = false
+bench = false

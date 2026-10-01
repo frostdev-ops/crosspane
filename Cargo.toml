@@ -31,11 +31,13 @@ clap = { version = "4.6.7", features = ["derive"] }
 euclid = { version = "0.22.14", features = ["serde"] }
 pollster = "1.0.1"
 proptest = "1.11.0"
+prost = "0.14.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
 wgpu = "30.0.1"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
+zerocopy = { version = "0.8.59", features = ["derive"] }
 zeroize = "1.9.0"
 
 [workspace.lints.rust]
