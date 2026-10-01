@@ -15,7 +15,7 @@ perf.data*
 /fuzz/coverage/
 
 # Spikes: build output and raw measurement data. Raw captures (e.g. the P3 frame corpus) live
-# outside the repo in ~/span-data/; spike reports commit only summaries and CSVs.
+# outside the repo in ~/crosspane-data/; spike reports commit only summaries and CSVs.
 /spikes/**/target/
 /spikes/**/out/
 

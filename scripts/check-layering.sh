@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Changing either policy variable requires a lead decision.
-OS_FREE=(span-types span-protocol span-security span-input span-media span-platform span-engine)
+OS_FREE=(crosspane-types crosspane-protocol crosspane-security crosspane-input crosspane-media crosspane-platform crosspane-engine)
 PLATFORM_BINDINGS='^(windows|windows-sys|windows-core|objc2.*|block2|dispatch2?|core-foundation(-sys)?|core-graphics.*|cocoa.*|wayland-.*|smithay-client-toolkit|ashpd|pipewire(-sys)?|reis|x11rb.*|x11-dl|xkbcommon.*|libudev.*|evdev.*)$'
 
 set -euo pipefail
@@ -36,11 +36,11 @@ violations=$(jq -r --argjson os_free "$os_free_json" '
         | "\($package.name): rule a: \($dependency.kind // "normal") dependency on non-OS-free workspace member \(.name)"
       ), (
         $members[]
-        | select(.name == "span-testkit")
+        | select(.name == "crosspane-testkit")
         | .dependencies[]
         | select(.kind == null or .kind == "build")
-        | select(.name | startswith("span-platform-"))
-        | "span-testkit: rule d: \(.kind // "normal") dependency on platform adapter \(.name)"
+        | select(.name | startswith("crosspane-platform-"))
+        | "crosspane-testkit: rule d: \(.kind // "normal") dependency on platform adapter \(.name)"
       )
 ' <<< "$metadata")
 if [[ -n "$violations" ]]; then

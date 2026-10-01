@@ -1,0 +1,22 @@
+[package]
+name = "crosspane-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crosspane-types.workspace = true
+crosspane-protocol.workspace = true
+crosspane-security.workspace = true
+crosspane-input.workspace = true
+crosspane-media.workspace = true
+crosspane-platform.workspace = true
+
+[dev-dependencies]
+crosspane-testkit.workspace = true

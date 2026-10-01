@@ -1,4 +1,4 @@
 # Custom labels of the self-hosted runners (docs/plan/11-work-packages.md §Delegation mechanics).
 self-hosted-runner:
   labels:
-    - span-mac
+    - crosspane-mac

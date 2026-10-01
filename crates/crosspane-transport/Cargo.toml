@@ -1,0 +1,16 @@
+[package]
+name = "crosspane-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crosspane-types.workspace = true
+crosspane-protocol.workspace = true
+crosspane-security.workspace = true

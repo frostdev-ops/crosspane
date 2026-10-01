@@ -12,18 +12,18 @@ repository = "https://github.com/frostdev-ops/crosspane"
 publish = false
 
 [workspace.dependencies]
-span-types = { path = "crates/span-types" }
-span-protocol = { path = "crates/span-protocol" }
-span-security = { path = "crates/span-security" }
-span-input = { path = "crates/span-input" }
-span-media = { path = "crates/span-media" }
-span-platform = { path = "crates/span-platform" }
-span-engine = { path = "crates/span-engine" }
-span-transport = { path = "crates/span-transport" }
-span-render = { path = "crates/span-render" }
-span-testkit = { path = "crates/span-testkit" }
-span-platform-linux = { path = "crates/span-platform-linux" }
-span-platform-macos = { path = "crates/span-platform-macos" }
+crosspane-types = { path = "crates/crosspane-types" }
+crosspane-protocol = { path = "crates/crosspane-protocol" }
+crosspane-security = { path = "crates/crosspane-security" }
+crosspane-input = { path = "crates/crosspane-input" }
+crosspane-media = { path = "crates/crosspane-media" }
+crosspane-platform = { path = "crates/crosspane-platform" }
+crosspane-engine = { path = "crates/crosspane-engine" }
+crosspane-transport = { path = "crates/crosspane-transport" }
+crosspane-render = { path = "crates/crosspane-render" }
+crosspane-testkit = { path = "crates/crosspane-testkit" }
+crosspane-platform-linux = { path = "crates/crosspane-platform-linux" }
+crosspane-platform-macos = { path = "crates/crosspane-platform-macos" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -60,8 +60,8 @@ jobs:
         run: scripts/check-layering.sh
 
   macos:
-    if: vars.SPAN_MAC_RUNNER == 'true'
-    runs-on: [self-hosted, macOS, ARM64, span-mac]
+    if: vars.CROSSPANE_MAC_RUNNER == 'true'
+    runs-on: [self-hosted, macOS, ARM64, crosspane-mac]
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

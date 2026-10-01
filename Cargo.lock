@@ -3,131 +3,131 @@
 version = 4
 
 [[package]]
-name = "span-agent"
+name = "crosspane-agent"
 version = "0.0.0"
 dependencies = [
- "span-engine",
- "span-platform",
- "span-platform-linux",
- "span-platform-macos",
- "span-render",
- "span-transport",
- "span-types",
+ "crosspane-engine",
+ "crosspane-platform",
+ "crosspane-platform-linux",
+ "crosspane-platform-macos",
+ "crosspane-render",
+ "crosspane-transport",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-bench"
+name = "crosspane-bench"
 version = "0.0.0"
 dependencies = [
- "span-types",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-engine"
+name = "crosspane-engine"
 version = "0.0.0"
 dependencies = [
- "span-input",
- "span-media",
- "span-platform",
- "span-protocol",
- "span-security",
- "span-testkit",
- "span-types",
+ "crosspane-input",
+ "crosspane-media",
+ "crosspane-platform",
+ "crosspane-protocol",
+ "crosspane-security",
+ "crosspane-testkit",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-input"
+name = "crosspane-input"
 version = "0.0.0"
 dependencies = [
- "span-types",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-media"
+name = "crosspane-media"
 version = "0.0.0"
 dependencies = [
- "span-types",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-platform"
+name = "crosspane-platform"
 version = "0.0.0"
 dependencies = [
- "span-types",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-platform-linux"
+name = "crosspane-platform-linux"
 version = "0.0.0"
 dependencies = [
- "span-platform",
- "span-types",
+ "crosspane-platform",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-platform-macos"
+name = "crosspane-platform-macos"
 version = "0.0.0"
 dependencies = [
- "span-platform",
- "span-types",
+ "crosspane-platform",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-protocol"
+name = "crosspane-protocol"
 version = "0.0.0"
 dependencies = [
- "span-types",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-render"
+name = "crosspane-render"
 version = "0.0.0"
 dependencies = [
- "span-media",
- "span-types",
+ "crosspane-media",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-security"
+name = "crosspane-security"
 version = "0.0.0"
 dependencies = [
- "span-protocol",
- "span-types",
+ "crosspane-protocol",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-testkit"
+name = "crosspane-testkit"
 version = "0.0.0"
 dependencies = [
- "span-platform",
- "span-types",
+ "crosspane-platform",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-transport"
+name = "crosspane-transport"
 version = "0.0.0"
 dependencies = [
- "span-protocol",
- "span-security",
- "span-types",
+ "crosspane-protocol",
+ "crosspane-security",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "span-types"
+name = "crosspane-types"
 version = "0.0.0"
 
 [[package]]
-name = "span-ui"
+name = "crosspane-ui"
 version = "0.0.0"
 dependencies = [
- "span-protocol",
- "span-types",
+ "crosspane-protocol",
+ "crosspane-types",
 ]
 
 [[package]]
-name = "spanctl"
+name = "crosspanectl"
 version = "0.0.0"
 dependencies = [
- "span-protocol",
- "span-types",
+ "crosspane-protocol",
+ "crosspane-types",
 ]
