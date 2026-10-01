@@ -1,6 +1,8 @@
 //! The per-session daemon wiring engine, platform, and transport (WP-1.37).
 
 mod agent;
+#[allow(dead_code)] // wired in by WP-3.6d
+mod audio;
 mod config;
 mod ctl;
 mod keys;
