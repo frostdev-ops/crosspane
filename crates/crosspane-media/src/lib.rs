@@ -3,5 +3,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod codec;
+pub mod hybrid;
 pub mod tiles;
 pub mod wire;

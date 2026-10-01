@@ -53,6 +53,8 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
 xkbcommon = "0.9.0"
 zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
+# H.264 on Linux through FFmpeg (WP-2.14b; 09 §2 allows FFmpeg as a thin wrapper).
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"] }
 # mDNS discovery (WP-1.6, 09 §2).
 mdns-sd = { version = "0.21.4", default-features = false }
 # StatusNotifierItem tray (WP-1.34, Linux), on the same zbus/async-io stack.
@@ -73,6 +75,7 @@ objc2-core-graphics = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-foundation = "0.3.2"
+objc2-video-toolbox = "0.3.2"
 objc2-screen-capture-kit = "0.3.2"
 security-framework = "3.7.0"
 

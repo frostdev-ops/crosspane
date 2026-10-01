@@ -50,6 +50,44 @@ pub enum MediaError {
     Trailing,
 }
 
+/// What a media frame carries (header byte 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codec {
+    /// 0: lossless tile records (`tiles`).
+    Tiles,
+    /// 1: one H.264 Annex B access unit (WP-2.14). The header's tile-size field is 0 and its
+    /// count field is the access unit's length in bytes; `key` marks an IDR.
+    H264,
+}
+
+/// The codec of a media frame, from its header alone.
+pub fn read_codec(data: &[u8]) -> Result<Codec, MediaError> {
+    // WP-2.14a implements this (and makes `read_header` accept codec 1).
+    let _ = data;
+    Ok(Codec::Tiles)
+}
+
+/// Append a codec-1 frame: the CPF1 header for `header` followed by `access_unit`. `out` is
+/// cleared first. Fails with `TooLarge` past `MAX_FRAME_BYTES` and `BadSize` for dimensions the
+/// tile format would also refuse.
+pub fn write_video(
+    header: FrameHeader,
+    access_unit: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), MediaError> {
+    // WP-2.14a implements this.
+    let _ = (header, access_unit, out);
+    Err(MediaError::BadCodec)
+}
+
+/// Parse a codec-1 frame: its header and access unit (borrowed from `data`). Every check the
+/// tile format applies to the header applies here too; the payload must be exactly `count` bytes.
+pub fn read_video(data: &[u8]) -> Result<(FrameHeader, &[u8]), MediaError> {
+    // WP-2.14a implements this.
+    let _ = data;
+    Err(MediaError::BadCodec)
+}
+
 /// Parse just the header (the receiver uses it to drop stale frames before decoding).
 /// Tile records are deliberately not inspected here.
 pub fn read_header(data: &[u8]) -> Result<FrameHeader, MediaError> {
