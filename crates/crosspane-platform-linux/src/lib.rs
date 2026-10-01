@@ -7,3 +7,4 @@ pub mod hyprland;
 pub mod logind;
 pub mod permissions;
 pub mod secret_service;
+pub mod tray;
