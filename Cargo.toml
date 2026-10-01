@@ -53,6 +53,19 @@ xkbcommon = "0.9.0"
 zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
 zerocopy = { version = "0.8.59", features = ["derive"] }
 zeroize = "1.9.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+toml = "1.1.6"
+
+# macOS bindings (09 §2: objc2 0.6 family 0.3). Versions checked 2026-10-01.
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-application-services = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-foundation = "0.3.2"
+security-framework = "3.7.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

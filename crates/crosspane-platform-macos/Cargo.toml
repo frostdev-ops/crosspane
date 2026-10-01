@@ -13,3 +13,17 @@ workspace = true
 [dependencies]
 crosspane-types.workspace = true
 crosspane-platform.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+dispatch2.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-application-services.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-foundation.workspace = true
+security-framework.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true

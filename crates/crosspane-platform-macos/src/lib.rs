@@ -3,3 +3,5 @@
 //! CGVirtualDisplay (D7).
 
 #![cfg(target_os = "macos")]
+
+pub mod permissions;
