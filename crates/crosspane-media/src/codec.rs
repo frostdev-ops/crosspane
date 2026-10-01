@@ -7,6 +7,8 @@
 
 use crosspane_types::geom::PixelSize;
 
+use crate::picture::Nv12;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CodecError {
     /// No working encoder or decoder on this machine (the caller stays on lossless tiles).
@@ -54,6 +56,10 @@ pub trait VideoDecoder: Send {
     /// [`VideoEncoder::encode`]). A frame that depends on one the decoder hasn't seen is an error
     /// (the caller requests a key frame); an IDR always decodes on its own.
     fn decode(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<PixelSize, CodecError>;
+    /// Decode one access unit like [`VideoDecoder::decode`], but into NV12 planes for the
+    /// renderer's shader to convert (03 §6 video layer). `out`'s allocations are reused; on success
+    /// it holds the coded size and the picture's colour description.
+    fn decode_nv12(&mut self, data: &[u8], out: &mut Nv12) -> Result<(), CodecError>;
     /// The backend, for logs.
     fn name(&self) -> &str;
 }

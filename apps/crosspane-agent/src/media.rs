@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use crosspane_engine::{Input, ProjectionKey};
 use crosspane_media::codec::{VideoCodecs, VideoDecoder, VideoEncoder};
 use crosspane_media::hybrid::{FramePlan, HybridConfig, HybridScheduler};
+use crosspane_media::picture::{Nv12, nv12_to_bgra};
 use crosspane_media::tiles::{TileDecoder, TileEncoder};
 use crosspane_media::wire::{
     Codec, FrameHeader, MediaError, TILE, read_codec, read_cursor, read_header, read_video,
@@ -31,6 +32,7 @@ use crosspane_platform::{CursorImage, Frame, StreamId};
 use crosspane_protocol::link::LinkError;
 use crosspane_render::proxy::{HostCommand, HostHandle};
 use crosspane_transport::Transport;
+use crosspane_types::geom::PixelSize;
 use crosspane_types::id::{NodeId, ProjectionId};
 
 use crate::agent::Event;
@@ -396,7 +398,8 @@ fn header(enc: &Encoding, frame: &Frame) -> FrameHeader {
 }
 
 /// One captured frame: tile change detection always runs (it counts the changed tiles and keeps
-/// the tile hashes current), then the scheduler decides what goes out.
+/// the tile hashes current), then the scheduler decides what goes out, and only tiles that go out
+/// are compressed.
 fn encode_frame(
     enc: &mut Encoding,
     frame: &Frame,
@@ -406,33 +409,39 @@ fn encode_frame(
     out: &mut Vec<u8>,
 ) {
     out.clear();
-    let tiles = enc
-        .encoder
-        .encode(header(enc, frame), &frame.pixels, frame.stride, false, out);
-    let changed = match &tiles {
-        Ok(Some(stats)) => stats.tiles,
-        Ok(None) => 0,
+    // Change detection only: LZ4 runs just for frames that go out as tiles.
+    let scan = match enc.encoder.scan(frame.size, &frame.pixels, frame.stride) {
+        Ok(scan) => scan,
         Err(e) => {
             tracing::warn!(error = %e, "encode failed");
             return;
         }
     };
+    let (changed, total) = (scan.changed(), scan.total());
     let available = enc.peer_video && video.codecs.is_some();
-    let plan = enc
-        .scheduler
-        .plan(changed, tile_count(frame), now, available);
-    tracing::trace!(changed, total = tile_count(frame), ?plan, "frame plan");
+    let plan = enc.scheduler.plan(changed, total, now, available);
+    tracing::trace!(changed, total, ?plan, "frame plan");
     match plan {
-        FramePlan::Tiles => {
-            if matches!(tiles, Ok(Some(_))) {
-                send(enc, out, transport);
+        FramePlan::Tiles | FramePlan::TilesKey => {
+            let key = plan == FramePlan::TilesKey;
+            match enc.encoder.emit(
+                scan,
+                header(enc, frame),
+                &frame.pixels,
+                frame.stride,
+                key,
+                out,
+            ) {
+                Ok(Some(_)) => send(enc, out, transport),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "encode failed"),
             }
         }
-        FramePlan::TilesKey => {
-            enc.encoder.request_key();
-            send_tiles(enc, frame, true, transport, out);
-        }
         FramePlan::Video { key } => {
+            // The tile hashes follow the picture; the next tile frame is a key frame.
+            if let Err(e) = enc.encoder.commit(scan) {
+                tracing::warn!(error = %e, "tile commit failed");
+            }
             if let Err(e) = send_video(enc, frame, key, video, transport, out) {
                 tracing::info!(error = %e, "video failed: lossless tiles for a while");
                 enc.video = None;
@@ -509,11 +518,7 @@ fn send_cursor(enc: &mut Encoding, transport: &Transport, out: &mut Vec<u8>) {
     const HIDDEN: [u8; 4] = [0; 4];
     let (size, hotspot, pixels) = match cursor {
         Shape::Image(c) => (c.size, c.hotspot, &c.pixels[..]),
-        Shape::Hidden | Shape::Default => (
-            crosspane_types::geom::PixelSize::new(1, 1),
-            (0, 0),
-            &HIDDEN[..],
-        ),
+        Shape::Hidden | Shape::Default => (PixelSize::new(1, 1), (0, 0), &HIDDEN[..]),
     };
     let header = FrameHeader {
         projection: enc.projection.0,
@@ -573,7 +578,7 @@ pub enum DestCmd {
 }
 
 /// A decoded picture: its size and BGRA rows of `width * 4` bytes.
-pub type Shown = (crosspane_types::geom::PixelSize, Arc<[u8]>);
+pub type Shown = (PixelSize, Arc<[u8]>);
 
 struct Decoding {
     decoder: TileDecoder,
@@ -585,8 +590,37 @@ struct Decoding {
     pending: BTreeMap<u64, Arc<[u8]>>,
     gap_since: Option<Instant>,
     last_error: Option<Instant>,
-    /// The picture last handed to the proxy.
-    shown: Option<Shown>,
+    /// Which picture the proxy shows, for snapshots (made only when asked).
+    showing: Showing,
+    /// The newest decoded video picture. Its buffers are reused once the proxy has let go of it.
+    picture: Arc<Nv12>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Showing {
+    Nothing,
+    /// The tile decoder's canvas.
+    Canvas,
+    /// `picture`, cropped to this size.
+    Video(PixelSize),
+}
+
+impl Decoding {
+    /// The picture last handed to the proxy, as BGRA rows.
+    fn snapshot(&self) -> Option<Shown> {
+        match self.showing {
+            Showing::Nothing => None,
+            Showing::Canvas => {
+                let (pixels, size) = self.decoder.canvas();
+                Some((size, Arc::from(pixels)))
+            }
+            Showing::Video(size) => {
+                let mut pixels = Vec::new();
+                nv12_to_bgra(&self.picture, size, &mut pixels).ok()?;
+                Some((size, Arc::from(pixels)))
+            }
+        }
+    }
 }
 
 const GAP_TIMEOUT: Duration = Duration::from_millis(300);
@@ -631,7 +665,7 @@ fn decode_loop(
                 decoders.remove(&key);
             }
             Some(DestCmd::Snapshot { key, reply }) => {
-                let _ = reply.send(decoders.get(&key).and_then(|d| d.shown.clone()));
+                let _ = reply.send(decoders.get(&key).and_then(Decoding::snapshot));
             }
             Some(DestCmd::Media { peer, data }) => {
                 let Ok(header) = read_header(&data) else {
@@ -648,7 +682,8 @@ fn decode_loop(
                     video: None,
                     last: 0,
                     cursor_seq: 0,
-                    shown: None,
+                    showing: Showing::Nothing,
+                    picture: Arc::default(),
                     pending: BTreeMap::new(),
                     gap_since: None,
                     last_error: None,
@@ -705,31 +740,42 @@ fn apply(
     video: &VideoSetup,
 ) {
     let result = match read_codec(data) {
-        Ok(Codec::H264) => apply_video(d, data, video),
-        Ok(Codec::Tiles) => {
-            d.decoder
-                .apply(data)
-                .map_err(|e| e.to_string())
-                .map(|(header, dirty)| {
-                    let (pixels, size) = d.decoder.canvas();
-                    (header, Arc::from(pixels), size, dirty)
-                })
+        Ok(Codec::H264) => {
+            apply_video(d, data, video).map(|(header, size)| (header, Some(size), None))
         }
+        Ok(Codec::Tiles) => d
+            .decoder
+            .apply(data)
+            .map_err(|e| e.to_string())
+            .map(|(header, dirty)| (header, None, Some(dirty))),
         Ok(Codec::Cursor) => Err("a cursor frame in the picture sequence".to_owned()),
         Err(e) => Err(e.to_string()),
     };
     match result {
-        Ok((header, pixels, size, dirty)) => {
+        Ok((header, video_size, dirty)) => {
             d.last = seq.max(header.seq);
             ids.shown(key, data.len(), header.captured_ns);
-            d.shown = Some((size, pixels.clone()));
-            if let Some(host) = host {
-                let _ = host.send(HostCommand::Frame {
+            let command = if let Some(size) = video_size {
+                d.showing = Showing::Video(size);
+                HostCommand::Video {
+                    id,
+                    size,
+                    picture: Arc::clone(&d.picture),
+                }
+            } else {
+                d.showing = Showing::Canvas;
+                // Shared, not copied: the decoder copies the canvas only if the proxy still holds
+                // it when the next tile frame arrives.
+                let (pixels, size) = d.decoder.shared_canvas();
+                HostCommand::Frame {
                     id,
                     size,
                     pixels,
-                    dirty,
-                });
+                    dirty: dirty.unwrap_or_default(),
+                }
+            };
+            if let Some(host) = host {
+                let _ = host.send(command);
             }
         }
         Err(e) => {
@@ -765,23 +811,19 @@ fn apply_cursor(d: &mut Decoding, id: u64, data: &[u8], host: Option<&HostHandle
         }
         let _ = host.send(HostCommand::SetCursor {
             id,
-            size: crosspane_types::geom::PixelSize::new(frame.header.width, frame.header.height),
+            size: PixelSize::new(frame.header.width, frame.header.height),
             hotspot: frame.hotspot,
             pixels: Arc::from(frame.pixels),
         });
     }
 }
 
-type Applied = (
-    FrameHeader,
-    Arc<[u8]>,
-    crosspane_types::geom::PixelSize,
-    Vec<crosspane_types::geom::PixelRect>,
-);
-
-/// Decode an H.264 frame and crop the coded image to the frame's real size.
-fn apply_video(d: &mut Decoding, data: &[u8], video: &VideoSetup) -> Result<Applied, String> {
-    use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
+/// Decode an H.264 frame into `d.picture`; returns its header and visible size.
+fn apply_video(
+    d: &mut Decoding,
+    data: &[u8],
+    video: &VideoSetup,
+) -> Result<(FrameHeader, PixelSize), String> {
     let (header, access_unit) = read_video(data).map_err(|e: MediaError| e.to_string())?;
     if d.video.is_none() {
         let codecs = video
@@ -793,35 +835,17 @@ fn apply_video(d: &mut Decoding, data: &[u8], video: &VideoSetup) -> Result<Appl
         d.video = Some(decoder);
     }
     let decoder = d.video.as_mut().ok_or("no decoder")?;
-    let mut coded = Vec::new();
-    let coded_size = decoder
-        .decode(access_unit, &mut coded)
+    // Reuse the last picture's buffers unless the proxy hasn't uploaded it yet.
+    if Arc::get_mut(&mut d.picture).is_none() {
+        d.picture = Arc::default();
+    }
+    let picture = Arc::get_mut(&mut d.picture).ok_or("picture buffer in use")?;
+    decoder
+        .decode_nv12(access_unit, picture)
         .map_err(|e| e.to_string())?;
     let (w, h) = (header.width, header.height);
-    if coded_size.width < w || coded_size.height < h {
+    if w == 0 || h == 0 || picture.size.width < w || picture.size.height < h {
         return Err("decoded frame smaller than its header".into());
     }
-    let pixels: Arc<[u8]> = if coded_size.width == w && coded_size.height == h {
-        Arc::from(coded)
-    } else {
-        let src_row = coded_size.width as usize * 4;
-        let row = w as usize * 4;
-        if coded.len() < src_row * h as usize {
-            return Err("decoded frame shorter than its size".into());
-        }
-        let mut cropped = Vec::with_capacity(row * h as usize);
-        for y in 0..h as usize {
-            cropped.extend_from_slice(&coded[y * src_row..y * src_row + row]);
-        }
-        Arc::from(cropped)
-    };
-    let size = PixelSize::new(w, h);
-    let dirty = vec![PixelRect::new(
-        point2(0, 0),
-        point2(
-            i32::try_from(w).unwrap_or(i32::MAX),
-            i32::try_from(h).unwrap_or(i32::MAX),
-        ),
-    )];
-    Ok((header, pixels, size, dirty))
+    Ok((header, PixelSize::new(w, h)))
 }
