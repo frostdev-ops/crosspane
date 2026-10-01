@@ -33,7 +33,7 @@ build() {
   cd crosspane
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release -p crosspane-agent -p crosspanectl
+  cargo build --frozen --release -p crosspane-agent -p crosspanectl -p crosspane-ui
 }
 
 check() {
@@ -46,6 +46,9 @@ package() {
   cd crosspane
   install -Dm755 target/release/crosspane-agent "$pkgdir/usr/bin/crosspane-agent"
   install -Dm755 target/release/crosspanectl "$pkgdir/usr/bin/crosspanectl"
+  install -Dm755 target/release/crosspane-ui "$pkgdir/usr/bin/crosspane-ui"
+  install -Dm644 packaging/linux/crosspane-settings.desktop \
+    "$pkgdir/usr/share/applications/crosspane-settings.desktop"
   sed 's|%h/.local/bin/crosspane-agent|/usr/bin/crosspane-agent|' \
     packaging/linux/crosspane-agent.service \
     | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/crosspane-agent.service"

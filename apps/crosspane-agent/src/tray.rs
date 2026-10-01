@@ -100,6 +100,8 @@ pub enum TrayAction {
     PairConfirm(bool),
     PairPick(usize),
     OpenSettings(Permission),
+    /// Open the settings app (`crosspane-ui`).
+    OpenApp,
 }
 
 /// Builds items and remembers which id does what.
@@ -314,6 +316,7 @@ pub fn build(view: &TrayView) -> (TrayMenu, BTreeMap<TrayItemId, TrayAction>) {
 
     // Safety and lifecycle.
     items.push(TrayItem::Separator);
+    items.push(b.action("Settings…", TrayAction::OpenApp));
     if view.disarmed {
         items.push(b.action("Re-arm edge crossing", TrayAction::Rearm));
     }

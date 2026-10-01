@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo 'Usage: bundle.sh --bin PATH --id BUNDLE_ID --name NAME --out DIR [--ui-element] [--entitlements PLIST] [--identity SHA1]' >&2
+    echo 'Usage: bundle.sh --bin PATH --id BUNDLE_ID --name NAME --out DIR [--ui-element] [--entitlements PLIST] [--identity SHA1] [--extra PATH]...' >&2
     exit 2
 }
 fail() {
@@ -11,6 +11,7 @@ fail() {
 }
 
 bin= id= name= out= entitlements= identity=
+extras=()
 ui_element=false
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -23,6 +24,7 @@ while [[ $# -gt 0 ]]; do
                 --out) out=$2 ;;
                 --entitlements) entitlements=$2 ;;
                 --identity) identity=$2 ;;
+                --extra) extras+=("$2") ;;
             esac
             shift 2
             ;;
@@ -57,6 +59,12 @@ app=$stage/$name.app
 /bin/mkdir -p "$app/Contents/MacOS"
 /bin/cp -- "$bin" "$app/Contents/MacOS/$name"
 /bin/chmod 755 "$app/Contents/MacOS/$name"
+# Helper executables (e.g. crosspane-ui) live beside the main one and are signed on their own,
+# without the main executable's entitlements, before the bundle is.
+for extra in "${extras[@]+"${extras[@]}"}"; do
+    /bin/cp -- "$extra" "$app/Contents/MacOS/${extra##*/}"
+    /bin/chmod 755 "$app/Contents/MacOS/${extra##*/}"
+done
 plist=$app/Contents/Info.plist
 /usr/bin/plutil -create xml1 "$plist"
 for key in CFBundleIdentifier CFBundleName CFBundleExecutable CFBundlePackageType \
@@ -81,6 +89,9 @@ if [[ $ui_element == true ]]; then
     /usr/bin/plutil -insert LSUIElement -bool true "$plist"
 fi
 sign=(/usr/bin/codesign --force --timestamp=none --options runtime -s "$identity")
+for extra in "${extras[@]+"${extras[@]}"}"; do
+    "$script_dir/run-in-gui.sh" -- "${sign[@]}" "$app/Contents/MacOS/${extra##*/}"
+done
 if [[ -n $entitlements ]]; then
     sign+=(--entitlements "$entitlements")
 fi

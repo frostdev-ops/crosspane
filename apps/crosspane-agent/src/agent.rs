@@ -1118,6 +1118,14 @@ impl Agent {
                 crate::open_settings_pane(permission);
                 return;
             }
+            TrayAction::OpenApp => {
+                if let Err(e) = open_settings_app() {
+                    tracing::warn!(error = %e, "could not open the settings app");
+                    self.notices
+                        .push_back(format!("could not open the settings app: {e}"));
+                }
+                return;
+            }
         };
         if let Some(error) = response.error {
             self.notices.push_back(error);
@@ -2001,6 +2009,25 @@ fn resolve<'a>(
         (Some((node, _)), None) => Some(node),
         _ => None,
     }
+}
+
+/// Start the settings app: `crosspane-ui` next to this executable (the same bin directory, or
+/// Contents/MacOS in the app bundle), else from PATH. Its exit is reaped on a thread.
+fn open_settings_app() -> std::io::Result<()> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("crosspane-ui")))
+        .filter(|path| path.exists());
+    let program = beside.unwrap_or_else(|| std::path::PathBuf::from("crosspane-ui"));
+    let mut child = std::process::Command::new(program)
+        .stdin(std::process::Stdio::null())
+        .spawn()?;
+    std::thread::Builder::new()
+        .name("settings-app".into())
+        .spawn(move || {
+            let _ = child.wait();
+        })?;
+    Ok(())
 }
 
 fn display_json(d: &DisplayInfo) -> Value {
