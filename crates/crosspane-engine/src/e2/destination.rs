@@ -15,7 +15,7 @@ use crosspane_types::time::MonoTime;
 
 use super::ledger::split;
 use super::{E2, send};
-use crate::io::{Failure, Notice, Output, ProjectionKey, ProxyEvent};
+use crate::io::{Command, Failure, Notice, Output, ProjectionKey, ProxyEvent};
 
 // Ceiling of 1 second / 120: rounding downward would exceed 120 Hz.
 const MOTION_SLOT: Duration = Duration::from_nanos(8_333_334);
@@ -114,6 +114,27 @@ impl Destination {
 }
 
 impl E2 {
+    pub(super) fn browse_command(&self, command: Command, out: &mut Vec<Output>) {
+        let (peer, request, msg) = match command {
+            Command::Browse { peer, request } => (peer, request, Message::ListWindows { request }),
+            Command::Pull {
+                peer,
+                window,
+                request,
+            } => (peer, request, Message::Pull { request, window }),
+            _ => return,
+        };
+        if self.peers.contains(&peer) {
+            send(peer, msg, out);
+        } else {
+            out.push(Output::BrowseResult {
+                peer,
+                request,
+                result: Err(Refusal::Busy),
+            });
+        }
+    }
+
     pub(super) fn destination_control(
         &mut self,
         peer: NodeId,
@@ -121,6 +142,25 @@ impl E2 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        match msg {
+            Message::WindowList { request, windows } => {
+                out.push(Output::BrowseResult {
+                    peer,
+                    request: *request,
+                    result: Ok(windows.clone()),
+                });
+                return;
+            }
+            Message::BrowseRefused { request, reason } => {
+                out.push(Output::BrowseResult {
+                    peer,
+                    request: *request,
+                    result: Err(*reason),
+                });
+                return;
+            }
+            _ => {}
+        }
         let projection = match msg {
             Message::Start { projection, .. }
             | Message::Geometry { projection, .. }

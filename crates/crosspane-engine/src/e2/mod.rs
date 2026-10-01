@@ -157,7 +157,12 @@ impl E2 {
                 WindowEvent::Focused(window) => self.focused = *window,
                 _ => {}
             },
-            Input::Command(Command::Project { window, to }) => self.project(*window, *to, now, out),
+            Input::Command(Command::Project { window, to }) => {
+                let _ = self.project(*window, *to, now, out);
+            }
+            Input::Command(command @ (Command::Browse { .. } | Command::Pull { .. })) => {
+                self.browse_command(*command, out);
+            }
             Input::Command(Command::Return(key)) => {
                 if key.source == self.node {
                     self.end_source(key.projection, Reason::Returned, false, now, out);
@@ -200,13 +205,19 @@ impl E2 {
                     Message::Start { .. }
                     | Message::Geometry { .. }
                     | Message::Title { .. }
-                    | Message::End { .. } => self.destination_control(*peer, msg, now, out),
+                    | Message::End { .. }
+                    | Message::WindowList { .. }
+                    | Message::BrowseRefused { .. } => {
+                        self.destination_control(*peer, msg, now, out)
+                    }
                     Message::Accepted { .. }
                     | Message::Refused { .. }
                     | Message::Resize { .. }
                     | Message::Focus { .. }
                     | Message::KeyFrameRequest { .. }
-                    | Message::Close { .. } => self.source_control(*peer, msg, now, out),
+                    | Message::Close { .. }
+                    | Message::ListWindows { .. }
+                    | Message::Pull { .. } => self.source_control(*peer, msg, now, out),
                     _ => {}
                 }
             }

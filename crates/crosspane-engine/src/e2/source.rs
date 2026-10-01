@@ -5,11 +5,12 @@ use std::time::Duration;
 use crosspane_input::Held;
 use crosspane_platform::{
     CaptureTarget, Parked, ParkingKind as PlatformParking, StreamEndReason, StreamId, WindowInfo,
+    WindowRole,
 };
 use crosspane_protocol::msg::{Capability, Refusal};
 use crosspane_protocol::projection::{
-    ParkingKind, ProjInput, ProjectionEndReason as Reason, ProjectionMessage as Message,
-    WindowSummary,
+    BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjInput, ProjectionEndReason as Reason,
+    ProjectionMessage as Message, WindowSummary,
 };
 use crosspane_types::geom::{PixelSize, PointDevice};
 use crosspane_types::id::{NodeId, ProjectionId, WindowId};
@@ -50,7 +51,7 @@ impl E2 {
         peer: NodeId,
         now: MonoTime,
         out: &mut Vec<Output>,
-    ) {
+    ) -> Result<(), Refusal> {
         let refusal = if !self.granted(peer, Capability::WindowShare) {
             Some(Refusal::Permission)
         } else if !self.permits_io() {
@@ -68,10 +69,14 @@ impl E2 {
         };
         if let Some(reason) = refusal {
             out.push(Output::Notice(Notice::ProjectionRefused { peer, reason }));
-            return;
+            return Err(reason);
         }
         let (Some(info), Some(id)) = (self.windows.get(&window), self.next_projection) else {
-            return;
+            out.push(Output::Notice(Notice::ProjectionRefused {
+                peer,
+                reason: Refusal::Busy,
+            }));
+            return Err(Refusal::Busy);
         };
         self.next_projection = id.checked_add(1);
         let projection = ProjectionId(id);
@@ -80,26 +85,14 @@ impl E2 {
                 peer,
                 reason: Refusal::InjectorFailed,
             }));
-            return;
+            return Err(Refusal::InjectorFailed);
         }
-        let scale = info
-            .display
-            .and_then(|d| self.scales.get(&d))
-            .copied()
-            .filter(|s| s.is_finite() && *s > 0.0)
-            .unwrap_or(1.0);
-        let size = PixelSize::new(
-            dimension(info.frame.size.width * scale),
-            dimension(info.frame.size.height * scale),
-        );
+        let (window_summary, size, scale) = self.window_details(info);
         send(
             peer,
             Message::Start {
                 projection,
-                window: WindowSummary {
-                    title: wire_text(&info.title),
-                    app_id: wire_text(&info.app_id),
-                },
+                window: window_summary,
                 size,
             },
             out,
@@ -119,6 +112,28 @@ impl E2 {
                 last_activation: None,
             },
         );
+        Ok(())
+    }
+
+    fn window_details(&self, info: &WindowInfo) -> (WindowSummary, PixelSize, f64) {
+        let scale = info
+            .display
+            .and_then(|d| self.scales.get(&d))
+            .copied()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0);
+        let size = PixelSize::new(
+            dimension(info.frame.size.width * scale),
+            dimension(info.frame.size.height * scale),
+        );
+        (
+            WindowSummary {
+                title: wire_text(&info.title),
+                app_id: wire_text(&info.app_id),
+            },
+            size,
+            scale,
+        )
     }
 
     pub(super) fn source_control(
@@ -128,6 +143,69 @@ impl E2 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        if let Message::ListWindows { request } | Message::Pull { request, .. } = msg {
+            let refusal = if !self.granted(peer, Capability::WindowBrowse)
+                || !self.granted(peer, Capability::WindowShare)
+            {
+                Some(Refusal::Permission)
+            } else if !self.permits_io() {
+                Some(Refusal::Locked)
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
+                send(
+                    peer,
+                    Message::BrowseRefused {
+                        request: *request,
+                        reason,
+                    },
+                    out,
+                );
+                return;
+            }
+            if let Message::Pull { window, .. } = msg {
+                if let Err(reason) = self.project(*window, peer, now, out) {
+                    send(
+                        peer,
+                        Message::BrowseRefused {
+                            request: *request,
+                            reason,
+                        },
+                        out,
+                    );
+                }
+            } else {
+                // BTreeMap iteration supplies ascending WindowId order before the cap.
+                let windows = self
+                    .windows
+                    .values()
+                    .filter(|info| {
+                        matches!(info.role, WindowRole::Toplevel | WindowRole::Dialog)
+                            && !self.sources.values().any(|s| s.window == info.id)
+                            && !self.pending_parks.contains_key(&info.id)
+                    })
+                    .take(MAX_BROWSE_WINDOWS)
+                    .map(|info| {
+                        let (summary, size, _) = self.window_details(info);
+                        BrowsableWindow {
+                            window: info.id,
+                            summary,
+                            size,
+                        }
+                    })
+                    .collect();
+                send(
+                    peer,
+                    Message::WindowList {
+                        request: *request,
+                        windows,
+                    },
+                    out,
+                );
+            }
+            return;
+        }
         let projection = match msg {
             Message::Accepted { projection, .. }
             | Message::Refused { projection, .. }
