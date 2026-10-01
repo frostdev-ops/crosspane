@@ -11,6 +11,8 @@ const MAX_DIMENSION: u32 = 16384;
 /// The largest cursor image a codec-2 frame carries, in pixels per side.
 pub const MAX_CURSOR: u32 = 256;
 const HOTSPOT_BYTES: usize = 8;
+/// Codec-2 flag: show the receiver's default cursor.
+const DEFAULT_CURSOR: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -67,6 +69,8 @@ pub enum Codec {
     /// height * 4`: the hotspot x and y (u32 each, inside the image), then BGRA rows of `width * 4`
     /// bytes with straight alpha. `seq` numbers the stream's cursor frames on their own (not with
     /// its pictures). An image whose pixels are all transparent means the app hid the cursor.
+    /// Flag bit 1 instead means "show your default cursor" (the source can't see the shape): the
+    /// image is then 1×1, transparent, hotspot (0, 0).
     Cursor,
 }
 
@@ -143,16 +147,41 @@ pub fn write_cursor(
     out.try_reserve_exact(HEADER_BYTES + count as usize)
         .map_err(|_| MediaError::TooLarge)?;
     write_codec_header(header, count, Codec::Cursor, out);
+    write_hotspot_and_pixels(hotspot, bgra, out);
+    Ok(())
+}
+
+/// Append a codec-2 "default cursor" frame (flag bit 1) for `header`'s projection and seq; its
+/// size and key fields are ignored. `out` is cleared first.
+pub fn write_default_cursor(header: FrameHeader, out: &mut Vec<u8>) -> Result<(), MediaError> {
+    out.clear();
+    let header = FrameHeader {
+        key: false,
+        width: 1,
+        height: 1,
+        ..header
+    };
+    let count = (HOTSPOT_BYTES + 4) as u32;
+    out.try_reserve_exact(HEADER_BYTES + count as usize)
+        .map_err(|_| MediaError::TooLarge)?;
+    write_codec_header(header, count, Codec::Cursor, out);
+    out[5] = DEFAULT_CURSOR;
+    write_hotspot_and_pixels((0, 0), &[0; 4], out);
+    Ok(())
+}
+
+fn write_hotspot_and_pixels(hotspot: (u32, u32), bgra: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&hotspot.0.to_le_bytes());
     out.extend_from_slice(&hotspot.1.to_le_bytes());
     out.extend_from_slice(bgra);
-    Ok(())
 }
 
 /// A parsed codec-2 frame; `pixels` borrows from the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorFrame<'a> {
     pub header: FrameHeader,
+    /// Show the receiver's default cursor (flag bit 1); the image is a 1×1 placeholder.
+    pub default: bool,
     pub hotspot: (u32, u32),
     /// BGRA rows of `header.width * 4` bytes, straight alpha.
     pub pixels: &'a [u8],
@@ -173,8 +202,13 @@ pub fn read_cursor(data: &[u8]) -> Result<CursorFrame<'_>, MediaError> {
     if hotspot.0 >= header.width || hotspot.1 >= header.height {
         return Err(MediaError::BadPayload);
     }
+    let default = data.get(5).is_some_and(|flags| flags & DEFAULT_CURSOR != 0);
+    if default && (header.width, header.height, hotspot) != (1, 1, (0, 0)) {
+        return Err(MediaError::BadPayload);
+    }
     Ok(CursorFrame {
         header,
+        default,
         hotspot,
         pixels,
     })
@@ -212,10 +246,16 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<(FrameHeader, u32), MediaError
         return Err(MediaError::BadVersion);
     }
     let flags = input.u8()?;
-    if flags & !1 != 0 {
+    let codec = parse_codec(input.u8()?)?;
+    // Bit 0 is the key flag (tiles, video); codec 2 uses bit 1 alone (default cursor).
+    let allowed = if codec == Codec::Cursor {
+        DEFAULT_CURSOR
+    } else {
+        1
+    };
+    if flags & !allowed != 0 {
         return Err(MediaError::BadReserved);
     }
-    let codec = parse_codec(input.u8()?)?;
     if input.u8()? != 0 {
         return Err(MediaError::BadReserved);
     }
@@ -231,9 +271,6 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<(FrameHeader, u32), MediaError
         // A tile header relabelled as video is still an unsupported codec/format pairing.
         Codec::H264 | Codec::Cursor if tile_size != 0 => return Err(MediaError::BadCodec),
         _ => {}
-    }
-    if codec == Codec::Cursor && flags != 0 {
-        return Err(MediaError::BadReserved);
     }
     if input.u16()? != 0 {
         return Err(MediaError::BadReserved);

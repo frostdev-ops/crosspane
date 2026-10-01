@@ -13,7 +13,7 @@ use winit::{
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::PhysicalKey,
-    window::{CustomCursor, Window, WindowId},
+    window::{CursorIcon, CustomCursor, Window, WindowId},
 };
 
 use super::{
@@ -242,6 +242,12 @@ impl App {
             } => {
                 if let Some(window) = self.windows.get(&id) {
                     set_cursor(event_loop, &window.window, size, hotspot, &pixels);
+                }
+            }
+            HostCommand::DefaultCursor { id } => {
+                if let Some(window) = self.windows.get(&id) {
+                    window.window.set_cursor(CursorIcon::Default);
+                    window.window.set_cursor_visible(true);
                 }
             }
             HostCommand::Shutdown => {

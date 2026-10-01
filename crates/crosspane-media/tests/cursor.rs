@@ -4,7 +4,7 @@
 use crosspane_media::tiles::TileDecoder;
 use crosspane_media::wire::{
     Codec, FrameHeader, MAX_CURSOR, MediaError, read_codec, read_cursor, read_header, read_video,
-    write_cursor,
+    write_cursor, write_default_cursor,
 };
 use proptest::prelude::*;
 
@@ -31,6 +31,7 @@ fn a_cursor_round_trips() {
     assert_eq!(read_codec(&out), Ok(Codec::Cursor));
     assert_eq!(read_header(&out), Ok(header(32, 24)));
     let frame = read_cursor(&out).unwrap();
+    assert!(!frame.default);
     assert_eq!(frame.header, header(32, 24));
     assert_eq!(frame.hotspot, (5, 7));
     assert_eq!(frame.pixels, pixels.as_slice());
@@ -89,7 +90,7 @@ fn read_refuses_malformed_cursors() {
     assert_eq!(read_cursor(&frame), Err(MediaError::BadReserved));
     // Unknown flag bit.
     let mut frame = valid();
-    frame[5] = 2;
+    frame[5] = 4;
     assert_eq!(read_cursor(&frame), Err(MediaError::BadReserved));
     // Tile-size field set (bytes 40..42).
     let mut frame = valid();
@@ -119,6 +120,25 @@ fn read_refuses_malformed_cursors() {
     let mut frame = valid();
     frame[52..56].copy_from_slice(&4_u32.to_le_bytes());
     assert_eq!(read_cursor(&frame), Err(MediaError::BadPayload));
+}
+
+#[test]
+fn default_cursor_frames_round_trip_and_are_strict() {
+    let mut out = Vec::new();
+    write_default_cursor(header(40, 40), &mut out).unwrap();
+    let frame = read_cursor(&out).unwrap();
+    assert!(frame.default);
+    assert_eq!((frame.header.width, frame.header.height), (1, 1));
+    assert_eq!((frame.header.projection, frame.header.seq), (7, 3));
+    assert_eq!(frame.hotspot, (0, 0));
+    // The default flag with a real image is malformed.
+    let mut image = Vec::new();
+    write_cursor(header(4, 4), (1, 1), &[255; 64], &mut image).unwrap();
+    image[5] = 2;
+    assert_eq!(read_cursor(&image), Err(MediaError::BadPayload));
+    // The default and key flags together are reserved.
+    out[5] = 3;
+    assert_eq!(read_cursor(&out), Err(MediaError::BadReserved));
 }
 
 #[test]

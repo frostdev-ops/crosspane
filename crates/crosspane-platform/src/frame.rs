@@ -80,6 +80,12 @@ pub enum FrameEvent {
         stream: StreamId,
         cursor: Option<CursorImage>,
     },
+    /// The pointer is over the captured content but the backend can't see its shape right now
+    /// (e.g. a compositor-drawn themed cursor that its cursor capture doesn't render): the
+    /// destination shows its own default cursor. Sent on the same change rules as `Cursor`.
+    CursorDefault {
+        stream: StreamId,
+    },
 }
 
 /// Captures pixels for projection.
