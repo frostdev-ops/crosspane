@@ -891,7 +891,9 @@ fn crossing_home_warps_to_layout_entry_and_keeps_hud_until_ended() {
     let mut f = Fixture::new(config(), 2);
     let (session, capture) = f.controlling(vec![]);
     f.send(key(KEY, true, f.now));
-    let out = f.raw(1, -10.0);
+    // Right after entering, the edge back home is disarmed (WP-1.39): move in first.
+    f.raw(1, 50.0);
+    let out = f.raw(2, -2000.0);
     assert_eq!(
         out[0],
         Output::EndCapture {
@@ -904,15 +906,15 @@ fn crossing_home_warps_to_layout_entry_and_keeps_hud_until_ended() {
     );
     assert_end(&out, B, session, EndReason::Released);
     assert!(!out.contains(&Output::HideOverlay(HUD)));
-    assert_eq!(f.engine.next_deadline(), Some(time(301)));
-    assert!(f.raw(2, 10.0).is_empty());
+    assert_eq!(f.engine.next_deadline(), Some(time(302)));
+    assert!(f.raw(3, 10.0).is_empty());
     assert!(
         f.send(Input::Command(Command::ReleaseControl))
             .iter()
             .all(|o| !matches!(o, Output::EndCapture { .. }))
     );
-    assert_eq!(f.ended(3, capture), vec![Output::HideOverlay(HUD)]);
-    assert!(f.ended(4, capture).is_empty());
+    assert_eq!(f.ended(4, capture), vec![Output::HideOverlay(HUD)]);
+    assert!(f.ended(5, capture).is_empty());
 }
 
 #[test]
@@ -920,13 +922,15 @@ fn button_held_blocks_crossing_and_restores_previous_pointer_position() {
     let mut f = Fixture::new(config(), 3);
     f.up(C);
     f.controlling(vec![]);
+    // Right after entering, the edge back home is disarmed (WP-1.39): move in first.
+    let inside = motions(&f.raw(1, 50.0))[0].1.position.x;
     f.send(button(true, f.now));
-    assert!(f.raw(1, -10.0).is_empty());
-    assert!(f.raw(2, 2000.0).is_empty());
-    assert!((motions(&f.raw(3, 1.0))[0].1.position.x - 1.0).abs() < 1e-8);
+    assert!(f.raw(2, -2000.0).is_empty());
+    assert!(f.raw(3, 2000.0).is_empty());
+    assert!((motions(&f.raw(4, 1.0))[0].1.position.x - (inside + 1.0)).abs() < 1e-8);
     f.send(button(false, f.now));
     assert!(
-        f.raw(4, -10.0)
+        f.raw(5, -2000.0)
             .iter()
             .any(|o| matches!(o, Output::EndCapture { .. }))
     );
@@ -1930,10 +1934,12 @@ fn buttons_after_started_block_crossings_until_their_physical_ups() {
         });
         if !released_before_activation {
             assert!(f.raw(1, 2000.0).is_empty());
-            assert!(f.raw(2, -2000.0).is_empty());
+            // The edge back home is disarmed right after entering (WP-1.39): move in first.
+            f.raw(2, 50.0);
+            assert!(f.raw(3, -2000.0).is_empty());
             assert!(f.send(button(false, f.now)).is_empty()); // Its down was never forwarded.
         }
-        assert_eq!(start(&f.raw(3, 2000.0)).0, C);
+        assert_eq!(start(&f.raw(4, 2000.0)).0, C);
     }
 }
 
