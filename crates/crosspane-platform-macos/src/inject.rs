@@ -1,7 +1,9 @@
 //! Physical input through one private CGEventSource. CGEventPost submits events; it cannot tell
 //! whether an application received them. The target's NSEvent settings drive synthesized repeat.
-//! Scroll signs follow WP-1.17: forward the OS's natural-scroll-adjusted x/y without another
-//! inversion (positive y is scroll up). Pixels are target logical points, not device pixels.
+//! Scroll signs follow WP-1.17: positive x is scroll right and positive y is scroll up.
+//! Quartz axis 2 has the opposite sign, so negate x only at output, after carrying remainders
+//! in Crosspane's domain. Natural scrolling is already applied by capture. Pixels are target
+//! logical points, not device pixels.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -15,7 +17,7 @@ use crosspane_types::id::DisplayId;
 use crosspane_types::input::{LockKeys, ScrollDelta, ScrollPhase};
 use crosspane_types::time::MonoTime;
 use objc2_app_kit::NSEvent;
-use objc2_core_foundation::{CFRetained, CGPoint};
+use objc2_core_foundation::{CFRetained, CGPoint, CGRect};
 use objc2_core_graphics::{
     CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsActive, CGDisplayMode, CGEvent,
     CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
@@ -27,6 +29,8 @@ use crate::{clock, main_thread::on_main};
 const TAG: i64 = 0x0043_5049_4E4A;
 const BUDGET: Duration = Duration::from_millis(50);
 const WATCHDOG: Duration = Duration::from_millis(5);
+const DROP_BUDGET: Duration = Duration::from_millis(500);
+const PERMISSION_CACHE: Duration = Duration::from_secs(1);
 const CAPS_LOCK: HidUsage = HidUsage::keyboard(0x39);
 
 // Apple's public HIToolbox/CarbonEventsCore.h declares this Boolean-returning function.
@@ -78,9 +82,22 @@ struct Shared {
 
 impl Shared {
     fn lock(&self, deadline: Instant) -> Result<MutexGuard<'_, State>, PlatformError> {
+        self.lock_inner(deadline, false)
+    }
+
+    fn release_lock(&self, deadline: Instant) -> Result<MutexGuard<'_, State>, PlatformError> {
+        self.lock_inner(deadline, true)
+    }
+
+    fn lock_inner(
+        &self,
+        deadline: Instant,
+        releasing: bool,
+    ) -> Result<MutexGuard<'_, State>, PlatformError> {
         loop {
             match self.state.try_lock() {
                 Ok(state) => return Ok(state),
+                Err(TryLockError::Poisoned(error)) if releasing => return Ok(error.into_inner()),
                 Err(TryLockError::Poisoned(_)) => return Err(backend("injection state poisoned")),
                 Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
                     return Err(PlatformError::Timeout);
@@ -88,6 +105,38 @@ impl Shared {
                 Err(TryLockError::WouldBlock) => std::thread::yield_now(),
             }
         }
+    }
+
+    fn release_on_drop(&self, key_handle: bool) {
+        let deadline = Instant::now() + DROP_BUDGET;
+        while Instant::now() < deadline {
+            {
+                let Ok(mut state) = self.release_lock(deadline) else {
+                    break;
+                };
+                // Notify under the mutex as well, so an idle worker cannot miss the wake-up.
+                self.changed.notify_one();
+                let done = if key_handle {
+                    state.stop_repeat(self);
+                    let keys: Vec<_> = state.keys.iter().copied().collect();
+                    let _ = release_keys(&mut state, &keys, self, deadline);
+                    state.keys.is_empty() && state.caps_up_owed.is_none()
+                } else {
+                    let buttons: Vec<_> = state.buttons.iter().copied().collect();
+                    let _ = release_buttons(&mut state, &buttons, self, deadline);
+                    state.buttons.is_empty() && state.gesture.is_none()
+                };
+                if done {
+                    break;
+                }
+            }
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(WATCHDOG),
+            );
+        }
+        self.changed.notify_one();
     }
 }
 
@@ -98,6 +147,9 @@ struct State {
     buttons: BTreeSet<MouseButton>,
     clicks: [Click; 32],
     click_interval: Duration,
+    last_point: Option<(CGPoint, MonoTime)>,
+    permission_checked: Instant,
+    post_access: bool,
     line_remainder: [i64; 2],
     pixel_remainder: [f64; 2],
     gesture: Option<Gesture>,
@@ -108,8 +160,19 @@ struct State {
 
 #[derive(Clone, Copy, Debug)]
 enum Gesture {
+    MayBegin,
     Touch,
     Momentum,
+}
+
+impl Gesture {
+    fn end_phase(self) -> ScrollPhase {
+        match self {
+            Self::MayBegin => ScrollPhase::Cancelled,
+            Self::Touch => ScrollPhase::Ended,
+            Self::Momentum => ScrollPhase::MomentumEnded,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -150,9 +213,23 @@ impl State {
     ) -> Result<(), PlatformError> {
         CGEvent::set_flags(Some(event), flags);
         CGEvent::set_integer_value_field(Some(event), CGEventField::EventSourceUserData, TAG);
-        if let Err(error) = permission() {
+        self.check_submission(submission, shared)?;
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
+        Ok(())
+    }
+
+    fn check_submission(
+        &mut self,
+        submission: Submission,
+        shared: &Shared,
+    ) -> Result<(), PlatformError> {
+        if self.permission_checked.elapsed() >= PERMISSION_CACHE {
+            self.post_access = CGPreflightPostEventAccess();
+            self.permission_checked = Instant::now();
+        }
+        if !self.post_access {
             self.stop_repeat(shared);
-            return Err(error);
+            return Err(PlatformError::PermissionDenied(Permission::Accessibility));
         }
         if !matches!(submission, Submission::Release) {
             if !shared.gate.is_open() {
@@ -180,7 +257,6 @@ impl State {
                 return Err(PlatformError::Locked);
             }
         }
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
         Ok(())
     }
 
@@ -251,7 +327,7 @@ impl State {
         shared: &Shared,
     ) -> Result<(), PlatformError> {
         let number = button_number(button)?;
-        let position = cursor()?;
+        let position = self.cursor_position()?;
         let mut click = self.clicks[usize::from(number)];
         if down {
             click.down(clock::now(), position, self.click_interval);
@@ -268,6 +344,7 @@ impl State {
             CGEventField::MouseEventClickState,
             click.count,
         );
+        let at = clock::now();
         self.post(
             &event,
             self.flags(),
@@ -278,6 +355,7 @@ impl State {
             },
             shared,
         )?;
+        self.last_point = Some((position, at));
         self.clicks[usize::from(number)] = click;
         if down {
             self.buttons.insert(button);
@@ -285,6 +363,27 @@ impl State {
             self.buttons.remove(&button);
         }
         Ok(())
+    }
+
+    fn cursor_position(&self) -> Result<CGPoint, PlatformError> {
+        let now = clock::now();
+        // CGEventCreate(NULL) has a zero timestamp on this Mac. Use the public elapsed-time
+        // query for the most recent OS motion instead of guessing ticks versus nanoseconds.
+        let age = [
+            CGEventType::MouseMoved,
+            CGEventType::LeftMouseDragged,
+            CGEventType::RightMouseDragged,
+            CGEventType::OtherMouseDragged,
+        ]
+        .into_iter()
+        .map(|kind| {
+            CGEventSource::seconds_since_last_event_type(
+                CGEventSourceStateID::CombinedSessionState,
+                kind,
+            )
+        })
+        .fold(f64::INFINITY, f64::min);
+        Ok(latest_point(self.last_point, cursor()?, now, age))
     }
 
     fn end_gesture(&mut self, shared: &Shared) -> Result<(), PlatformError> {
@@ -300,13 +399,7 @@ impl State {
             0,
         )
         .ok_or_else(|| backend("create scroll end"))?;
-        scroll_fields(
-            &event,
-            match gesture {
-                Gesture::Touch => ScrollPhase::Ended,
-                Gesture::Momentum => ScrollPhase::MomentumEnded,
-            },
-        );
+        scroll_fields(&event, gesture.end_phase());
         self.post(&event, self.flags(), Submission::Release, shared)?;
         self.gesture = None;
         self.pixel_remainder = [0.0; 2];
@@ -367,15 +460,18 @@ pub fn injectors(gate: Arc<IoGate>) -> Result<(MacKeyInjector, MacPointerInjecto
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
             clicks: [Click::default(); 32],
-            click_interval: duration(click_interval)?,
+            click_interval: duration(click_interval, Duration::from_millis(500)),
+            last_point: None,
+            permission_checked: Instant::now(),
+            post_access: true,
             line_remainder: [0; 2],
             pixel_remainder: [0.0; 2],
             gesture: None,
             caps_up_owed: None,
             caps_key_flags: None,
             repeat: RepeatSchedule {
-                delay: duration(delay)?,
-                interval: duration(interval)?,
+                delay: duration(delay, Duration::from_millis(500)),
+                interval: duration(interval, Duration::from_millis(83)),
                 pending: None,
             },
         }),
@@ -396,13 +492,11 @@ pub fn injectors(gate: Arc<IoGate>) -> Result<(MacKeyInjector, MacPointerInjecto
     ))
 }
 
-fn duration(seconds: f64) -> Result<Duration, PlatformError> {
-    let value = Duration::try_from_secs_f64(seconds)
-        .map_err(|_| backend("invalid NSEvent timing setting"))?;
-    if value.is_zero() {
-        return Err(backend("zero NSEvent timing setting"));
-    }
-    Ok(value)
+fn duration(seconds: f64, default: Duration) -> Duration {
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|value| !value.is_zero())
+        .unwrap_or(default)
 }
 
 fn repeat_worker(shared: &Shared) {
@@ -415,7 +509,8 @@ fn repeat_worker(shared: &Shared) {
             state.stop_repeat(shared);
         }
         if state.repeat.pending.is_none() && state.gesture.is_none() {
-            let Ok(next) = shared.changed.wait(state) else {
+            // The timeout also guarantees exit if a drop times out acquiring the mutex.
+            let Ok((next, _)) = shared.changed.wait_timeout(state, DROP_BUDGET) else {
                 return;
             };
             state = next;
@@ -472,9 +567,13 @@ impl KeyInjector for MacKeyInjector {
             );
         }
         self.shared.changed.notify_one();
-        self.shared
-            .lock(Instant::now() + BUDGET)?
-            .key(usage, down, &self.shared)
+        let deadline = Instant::now() + BUDGET;
+        let mut state = if down {
+            self.shared.lock(deadline)?
+        } else {
+            self.shared.release_lock(deadline)?
+        };
+        state.key(usage, down, &self.shared)
     }
 
     fn lock_keys(&self) -> Result<LockKeys, PlatformError> {
@@ -511,6 +610,8 @@ impl KeyInjector for MacKeyInjector {
         state.caps_up_owed = Some(wanted);
         state.post(&up, flags, Submission::Release, &self.shared)?;
         state.caps_up_owed = None;
+        // Give WindowServer a full verification window after the completed tap.
+        let deadline = Instant::now() + BUDGET;
         drop(state);
         loop {
             if caps_lock() == wanted {
@@ -528,7 +629,7 @@ impl KeyInjector for MacKeyInjector {
         self.shared.repeat_key.store(0, Ordering::Release);
         self.shared.changed.notify_one();
         let deadline = Instant::now() + BUDGET;
-        let mut state = self.shared.lock(deadline)?;
+        let mut state = self.shared.release_lock(deadline)?;
         state.repeat.stop();
         self.shared.changed.notify_one();
         let keys: Vec<_> = state.keys.iter().copied().collect();
@@ -539,7 +640,7 @@ impl KeyInjector for MacKeyInjector {
         self.shared.repeat_key.store(0, Ordering::Release);
         self.shared.changed.notify_one();
         let deadline = Instant::now() + BUDGET;
-        let mut state = self.shared.lock(deadline)?;
+        let mut state = self.shared.release_lock(deadline)?;
         state.repeat.stop();
         self.shared.changed.notify_one();
         release_keys(&mut state, keys, &self.shared, deadline)
@@ -580,7 +681,14 @@ impl PointerInjector for MacPointerInjector {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(PlatformError::Unsupported("display scale"));
         }
-        let point = display_point(bounds.origin, position, scale);
+        if !bounds.size.width.is_finite()
+            || !bounds.size.height.is_finite()
+            || bounds.size.width <= 0.0
+            || bounds.size.height <= 0.0
+        {
+            return Err(PlatformError::Unsupported("display bounds"));
+        }
+        let point = display_point(bounds, position, scale);
         if !point.x.is_finite() || !point.y.is_finite() {
             return Err(PlatformError::Unsupported("non-finite display point"));
         }
@@ -599,14 +707,39 @@ impl PointerInjector for MacPointerInjector {
             CGMouseButton(u32::from(number)),
         )
         .ok_or_else(|| backend("create pointer motion"))?;
+        let previous = match state.last_point {
+            Some((point, _)) => point,
+            None => cursor()?,
+        };
+        let [dx, dy] = mouse_delta(point, previous);
+        for (field, value) in [
+            (CGEventField::MouseEventDeltaX, dx),
+            (CGEventField::MouseEventDeltaY, dy),
+        ] {
+            CGEvent::set_integer_value_field(Some(&event), field, value);
+        }
+        if button.is_some() {
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::MouseEventClickState,
+                state.clicks[usize::from(number)].count,
+            );
+        }
         let flags = state.flags();
-        state.post(&event, flags, Submission::Press, &self.shared)
+        let at = clock::now();
+        state.post(&event, flags, Submission::Press, &self.shared)?;
+        state.last_point = Some((point, at));
+        Ok(())
     }
 
     fn button(&mut self, button: MouseButton, down: bool) -> Result<(), PlatformError> {
-        self.shared
-            .lock(Instant::now() + BUDGET)?
-            .button(button, down, &self.shared)
+        let deadline = Instant::now() + BUDGET;
+        let mut state = if down {
+            self.shared.lock(deadline)?
+        } else {
+            self.shared.release_lock(deadline)?
+        };
+        state.button(button, down, &self.shared)
     }
 
     fn scroll(&mut self, delta: ScrollDelta) -> Result<(), PlatformError> {
@@ -626,8 +759,17 @@ impl PointerInjector for MacPointerInjector {
             remainder = [rest_x, rest_y];
             (CGScrollEventUnit::Line, x, y)
         };
-        let event = CGEvent::new_scroll_wheel_event2(Some(&state.source.0), units, 2, y, x, 0)
-            .ok_or_else(|| backend("create scroll event"))?;
+        if delta.pixels.is_none() && x == 0 && y == 0 {
+            // Keep the residual in Crosspane units, without submitting a zero line event.
+            state.check_submission(Submission::Press, &self.shared)?;
+            state.line_remainder = remainder;
+            state.pixel_remainder = pixel_remainder;
+            return Ok(());
+        }
+        let [axis1, axis2] = quartz_scroll(x, y);
+        let event =
+            CGEvent::new_scroll_wheel_event2(Some(&state.source.0), units, 2, axis1, axis2, 0)
+                .ok_or_else(|| backend("create scroll event"))?;
         if delta.pixels.is_some() {
             scroll_fields(&event, delta.phase);
         }
@@ -637,9 +779,8 @@ impl PointerInjector for MacPointerInjector {
         state.pixel_remainder = pixel_remainder;
         state.gesture = if delta.pixels.is_some() {
             match delta.phase {
-                ScrollPhase::MayBegin | ScrollPhase::Began | ScrollPhase::Changed => {
-                    Some(Gesture::Touch)
-                }
+                ScrollPhase::MayBegin => Some(Gesture::MayBegin),
+                ScrollPhase::Began | ScrollPhase::Changed => Some(Gesture::Touch),
                 ScrollPhase::MomentumBegan | ScrollPhase::MomentumChanged => {
                     Some(Gesture::Momentum)
                 }
@@ -657,7 +798,7 @@ impl PointerInjector for MacPointerInjector {
 
     fn release_all(&mut self) -> Result<(), PlatformError> {
         let deadline = Instant::now() + BUDGET;
-        let mut state = self.shared.lock(deadline)?;
+        let mut state = self.shared.release_lock(deadline)?;
         self.shared.changed.notify_one();
         let buttons: Vec<_> = state.buttons.iter().copied().collect();
         release_buttons(&mut state, &buttons, &self.shared, deadline)
@@ -665,7 +806,7 @@ impl PointerInjector for MacPointerInjector {
 
     fn recover_buttons(&mut self, buttons: &[MouseButton]) -> Result<(), PlatformError> {
         let deadline = Instant::now() + BUDGET;
-        let mut state = self.shared.lock(deadline)?;
+        let mut state = self.shared.release_lock(deadline)?;
         release_buttons(&mut state, buttons, &self.shared, deadline)
     }
 }
@@ -695,7 +836,7 @@ impl Drop for MacKeyInjector {
         self.shared.repeat_key.store(0, Ordering::Release);
         self.shared.handles.fetch_and(!1, Ordering::AcqRel);
         self.shared.changed.notify_one();
-        let _ = self.release_all();
+        self.shared.release_on_drop(true);
     }
 }
 
@@ -703,7 +844,7 @@ impl Drop for MacPointerInjector {
     fn drop(&mut self) {
         self.shared.handles.fetch_and(!2, Ordering::AcqRel);
         self.shared.changed.notify_one();
-        let _ = self.release_all();
+        self.shared.release_on_drop(false);
     }
 }
 
@@ -725,10 +866,15 @@ fn modifier_flags(keys: &BTreeSet<HidUsage>) -> CGEventFlags {
         flags
             | if usage.page == HidUsage::PAGE_KEYBOARD {
                 match usage.id {
-                    0xE0 | 0xE4 => CGEventFlags::MaskControl,
-                    0xE1 | 0xE5 => CGEventFlags::MaskShift,
-                    0xE2 | 0xE6 => CGEventFlags::MaskAlternate,
-                    0xE3 | 0xE7 => CGEventFlags::MaskCommand,
+                    // Public device-dependent masks from IOKit/hidsystem/IOLLEvent.h.
+                    0xE0 => CGEventFlags::MaskControl | CGEventFlags(0x1),
+                    0xE1 => CGEventFlags::MaskShift | CGEventFlags(0x2),
+                    0xE2 => CGEventFlags::MaskAlternate | CGEventFlags(0x20),
+                    0xE3 => CGEventFlags::MaskCommand | CGEventFlags(0x8),
+                    0xE4 => CGEventFlags::MaskControl | CGEventFlags(0x2000),
+                    0xE5 => CGEventFlags::MaskShift | CGEventFlags(0x4),
+                    0xE6 => CGEventFlags::MaskAlternate | CGEventFlags(0x40),
+                    0xE7 => CGEventFlags::MaskCommand | CGEventFlags(0x10),
                     _ => CGEventFlags::empty(),
                 }
             } else {
@@ -742,8 +888,39 @@ fn cursor() -> Result<CGPoint, PlatformError> {
     Ok(CGEvent::location(Some(&event)))
 }
 
-fn display_point(origin: CGPoint, position: PointDevice, scale: f64) -> CGPoint {
-    CGPoint::new(origin.x + position.x / scale, origin.y + position.y / scale)
+fn latest_point(
+    posted: Option<(CGPoint, MonoTime)>,
+    observed: CGPoint,
+    now: MonoTime,
+    observed_age: f64,
+) -> CGPoint {
+    if let Some((point, at)) = posted
+        && observed_age >= 0.0
+        && observed_age > now.saturating_duration_since(at).as_secs_f64()
+    {
+        point
+    } else {
+        observed
+    }
+}
+
+fn mouse_delta(point: CGPoint, previous: CGPoint) -> [i64; 2] {
+    // Quartz's delta fields are integer logical points, so round fractional positions.
+    [
+        (point.x - previous.x).round() as i64,
+        (point.y - previous.y).round() as i64,
+    ]
+}
+
+fn display_point(bounds: CGRect, position: PointDevice, scale: f64) -> CGPoint {
+    // Clamp to the last device pixel; the display's right/bottom edges are exclusive.
+    let x = position
+        .x
+        .clamp(0.0, (bounds.size.width * scale - 1.0).max(0.0));
+    let y = position
+        .y
+        .clamp(0.0, (bounds.size.height * scale - 1.0).max(0.0));
+    CGPoint::new(bounds.origin.x + x / scale, bounds.origin.y + y / scale)
 }
 
 fn button_number(button: MouseButton) -> Result<u8, PlatformError> {
@@ -802,6 +979,10 @@ fn lines(v120: i32, remainder: i64) -> (i32, i64) {
     let total = i64::from(v120) + remainder;
     // The previous remainder is in -119..=119, so dividing an i32 input is always in range.
     ((total / 120) as i32, total % 120)
+}
+
+fn quartz_scroll(x: i32, y: i32) -> [i32; 2] {
+    [y, x.saturating_neg()]
 }
 
 fn pixel_delta(value: f64, remainder: f64) -> Result<(i32, f64), PlatformError> {
@@ -877,6 +1058,7 @@ impl RepeatSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_core_foundation::CGSize;
 
     #[test]
     fn held_modifiers_derive_flags() {
@@ -886,13 +1068,36 @@ mod tests {
         let all = CGEventFlags::MaskControl
             | CGEventFlags::MaskShift
             | CGEventFlags::MaskAlternate
-            | CGEventFlags::MaskCommand;
+            | CGEventFlags::MaskCommand
+            | CGEventFlags(0x207F);
         assert_eq!(modifier_flags(&keys), all);
         keys.remove(&HidUsage::keyboard(0xE1));
-        assert_eq!(modifier_flags(&keys), all);
+        assert_eq!(modifier_flags(&keys), CGEventFlags(all.0 & !0x2));
         keys.remove(&HidUsage::keyboard(0xE5));
-        assert_eq!(modifier_flags(&keys), all & !CGEventFlags::MaskShift);
+        assert_eq!(
+            modifier_flags(&keys),
+            CGEventFlags(all.0 & !(CGEventFlags::MaskShift.0 | 0x6))
+        );
         assert_eq!(modifier_flags(&BTreeSet::new()), CGEventFlags::empty());
+    }
+
+    #[test]
+    fn releasing_left_shift_preserves_right_shift() {
+        let left = HidUsage::keyboard(0xE1);
+        let right = HidUsage::keyboard(0xE5);
+        let mut keys = BTreeSet::from([left, right]);
+        assert_eq!(
+            modifier_flags(&keys),
+            CGEventFlags::MaskShift | CGEventFlags(0x6)
+        );
+        keys.remove(&left); // The release event uses the prospective held-key ledger.
+        assert!(left.is_modifier()); // Modifier transitions are FlagsChanged, not KeyUp.
+        assert_eq!(hid_to_macos(left), Some(0x38));
+        assert_eq!(
+            modifier_flags(&keys),
+            CGEventFlags::MaskShift | CGEventFlags(0x4)
+        );
+        assert!(!modifier_flags(&keys).contains(CGEventFlags(0x2)));
     }
 
     #[test]
@@ -928,25 +1133,74 @@ mod tests {
         assert_eq!(pixel_delta(0.75, 0.75).ok(), Some((1, 0.5)));
         assert_eq!(pixel_delta(-0.75, -0.75).ok(), Some((-1, -0.5)));
         assert!(pixel_delta(f64::NAN, 0.0).is_err());
+        assert_eq!(Gesture::MayBegin.end_phase(), ScrollPhase::Cancelled);
+        assert_eq!(Gesture::Touch.end_phase(), ScrollPhase::Ended);
+        assert_eq!(Gesture::Momentum.end_phase(), ScrollPhase::MomentumEnded);
+    }
+
+    #[test]
+    fn horizontal_scroll_sign_at_quartz_output() {
+        assert_eq!(quartz_scroll(1, 2), [2, -1]);
+        assert_eq!(quartz_scroll(-1, -2), [-2, 1]);
+        assert_eq!(quartz_scroll(i32::MIN, 0), [0, i32::MAX]);
+        let (x, remainder) = lines(90, 0);
+        assert_eq!((quartz_scroll(x, 0), remainder), ([0, 0], 90));
+        let (x, remainder) = lines(90, remainder);
+        assert_eq!((quartz_scroll(x, 0), remainder), ([0, -1], 60));
+        let (x, remainder) = lines(-180, remainder);
+        assert_eq!((quartz_scroll(x, 0), remainder), ([0, 1], 0));
+        let (x, remainder) = pixel_delta(0.75, 0.0).expect("pixel delta");
+        assert_eq!((quartz_scroll(x, 0), remainder), ([0, 0], 0.75));
+        let (x, remainder) = pixel_delta(0.75, remainder).expect("pixel delta");
+        assert_eq!((quartz_scroll(x, 0), remainder), ([0, -1], 0.5));
+        let (x, remainder) = pixel_delta(-1.5, remainder).expect("pixel delta");
+        assert_eq!((quartz_scroll(x, 0), remainder), ([0, 1], 0.0));
+        let (x, _) = pixel_delta(f64::from(i32::MIN), 0.0).expect("minimum pixel delta");
+        assert_eq!(quartz_scroll(x, 0), [0, i32::MAX]);
     }
 
     #[test]
     fn display_point_at_scale_two() {
+        let bounds = CGRect::new(CGPoint::new(-100.0, 50.0), CGSize::new(400.0, 300.0));
         assert_eq!(
-            display_point(
-                CGPoint::new(-100.0, 50.0),
-                PointDevice::new(200.0, 300.0),
-                2.0
-            ),
+            display_point(bounds, PointDevice::new(200.0, 300.0), 2.0),
             CGPoint::new(0.0, 200.0)
         );
+        assert_eq!(
+            display_point(bounds, PointDevice::new(-50.0, -1.0), 2.0),
+            bounds.origin
+        );
+        assert_eq!(
+            display_point(bounds, PointDevice::new(800.0, 600.0), 2.0),
+            CGPoint::new(299.5, 349.5)
+        );
+        assert_eq!(
+            mouse_delta(CGPoint::new(100.5, 8.0), CGPoint::new(98.0, 10.0)),
+            [3, -2]
+        );
+        let posted_point = CGPoint::new(100.0, 200.0);
+        let observed = CGPoint::new(0.0, 0.0);
+        let at = MonoTime::from_nanos(1_000_000_000);
+        let now = at.saturating_add(Duration::from_millis(1));
+        let posted = Some((posted_point, at));
+        assert_eq!(latest_point(posted, observed, now, 0.002), posted_point);
+        assert_eq!(latest_point(posted, observed, now, 0.0005), observed);
+        assert_eq!(latest_point(posted, observed, now, f64::NAN), observed);
+        assert_eq!(latest_point(None, observed, now, 0.002), observed);
     }
 
     #[test]
     fn repeat_schedule_with_injected_clock() {
+        let delay = Duration::from_millis(500);
+        let interval = Duration::from_millis(83);
+        for seconds in [0.0, f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(duration(seconds, delay), delay);
+            assert_eq!(duration(seconds, interval), interval);
+        }
+        assert_eq!(duration(0.25, delay), Duration::from_millis(250));
         let mut schedule = RepeatSchedule {
-            delay: Duration::from_millis(500),
-            interval: Duration::from_millis(83),
+            delay,
+            interval,
             pending: None,
         };
         let at = |ms: u64| MonoTime::from_nanos(ms * 1_000_000);

@@ -292,7 +292,7 @@ fn live_release_all_leaves_no_keys_held() {
 }
 
 #[test]
-fn live_repeats_a_for_one_second() {
+fn live_repeats_a_for_three_seconds() {
     let Some(_live) = live("autorepeat") else {
         return;
     };
@@ -307,7 +307,8 @@ fn live_repeats_a_for_one_second() {
         fixture.press(&mut keys, HidUsage::keyboard(0xE1));
     }
     fixture.press(&mut keys, HidUsage::keyboard(0x04));
-    let until = Instant::now() + Duration::from_secs(1);
+    // Use the review's fixed three-second alternative to accommodate the user's settings.
+    let until = Instant::now() + Duration::from_secs(3);
     while Instant::now() < until {
         assert!(fixture.focused(), "fixture lost focus during repeat");
         sleep(Duration::from_millis(10));
