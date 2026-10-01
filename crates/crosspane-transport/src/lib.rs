@@ -135,6 +135,11 @@ impl Transport {
         config: TransportConfig,
         events: LinkEventSink,
     ) -> Result<Transport, TransportError> {
+        let local_audio = config
+            .hello
+            .features
+            .iter()
+            .any(|feature| feature == "audio");
         let mut hello_frame = Vec::new();
         encode_control(&ControlMessage::Hello(config.hello), &mut hello_frame).map_err(
             |error| {
@@ -176,6 +181,7 @@ impl Transport {
             events,
             hello_frame,
             client_config,
+            local_audio,
         ));
         tokio::spawn(inner.clone().accept_loop());
         Ok(Transport { inner, local_addr })

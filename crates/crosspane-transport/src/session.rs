@@ -11,14 +11,17 @@ use std::future::pending;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use std::time::{Duration, Instant};
+
+use crosspane_protocol::audio::decode_audio;
 
 use crosspane_protocol::link::{LinkError, LinkEvent};
 use crosspane_protocol::msg::{ControlMessage, InputMessage};
 use crosspane_protocol::wire::{
-    FrameDecoder, MAX_CONTROL_PAYLOAD, MAX_INPUT_PAYLOAD, WireError, decode_control, decode_input,
-    decode_pointer,
+    FrameDecoder, HEADER_LEN, KIND_AUDIO, KIND_POINTER, MAX_CONTROL_PAYLOAD, MAX_INPUT_PAYLOAD,
+    WireError, decode_control, decode_input, decode_pointer,
 };
 use crosspane_types::id::NodeId;
 use quinn::{Chunk, Connection, ConnectionError, ReadError, ReadExactError, RecvStream, VarInt};
@@ -103,6 +106,7 @@ pub(crate) struct Start {
     pub(crate) hold: bool,
     pub(crate) role: Role,
     pub(crate) activity: Arc<Activity>,
+    pub(crate) audio_enabled: Arc<AtomicBool>,
 }
 
 /// Start the tasks of a registered connection.
@@ -118,6 +122,7 @@ pub(crate) fn spawn(start: Start) {
         hold,
         role,
         activity,
+        audio_enabled,
     } = start;
     tokio::spawn(write_stream(
         conn.clone(),
@@ -145,6 +150,7 @@ pub(crate) fn spawn(start: Start) {
         peer,
         streams: Streams::default(),
         hello_seen: false,
+        audio_enabled,
         settled: !hold,
         role,
         held_since: Instant::now(),
@@ -308,6 +314,7 @@ struct Session {
     /// This connection's `Hello` has arrived. Input and motion wait for it so the engine always
     /// sees the `Hello` first.
     hello_seen: bool,
+    audio_enabled: Arc<AtomicBool>,
     /// Whether we dialed this connection or the peer did.
     role: Role,
     /// When the hold began.
@@ -390,14 +397,11 @@ impl Session {
                 }
                 datagram = self.conn.read_datagram(), if self.settled && self.hello_seen => {
                     match datagram {
-                        Ok(datagram) => match decode_pointer(&datagram) {
-                            Ok(msg) => self.inner.deliver(
-                                self.peer,
-                                self.conn_id,
-                                LinkEvent::Motion { peer: self.peer, msg },
-                            ),
-                            Err(_) => return Outcome::Fault("malformed pointer datagram"),
-                        },
+                        Ok(datagram) => {
+                            if let Some(outcome) = self.on_datagram(&datagram) {
+                                return outcome;
+                            }
+                        }
                         Err(error) => return Outcome::Closed(error),
                     }
                 }
@@ -438,6 +442,38 @@ impl Session {
                 }
             }
         }
+    }
+
+    fn on_datagram(&self, datagram: &[u8]) -> Option<Outcome> {
+        // Only inspect the kind once the bounded header is present. The frozen codecs
+        // validate version, reserved bytes and exact lengths before any payload allocation.
+        let event = match datagram.get(..HEADER_LEN).map(|header| header[1]) {
+            Some(KIND_AUDIO) => {
+                if !self.audio_enabled.load(Ordering::Acquire) {
+                    return Some(Outcome::Fault("audio is unavailable"));
+                }
+                let Ok(packet) = decode_audio(datagram) else {
+                    return Some(Outcome::Fault("malformed audio datagram"));
+                };
+                LinkEvent::Audio {
+                    peer: self.peer,
+                    packet,
+                }
+            }
+            Some(KIND_POINTER) => {
+                let Ok(msg) = decode_pointer(datagram) else {
+                    return Some(Outcome::Fault("malformed pointer datagram"));
+                };
+                LinkEvent::Motion {
+                    peer: self.peer,
+                    msg,
+                }
+            }
+            // Keep the existing pointer protocol-error category for unknown/truncated data.
+            _ => return Some(Outcome::Fault("malformed pointer datagram")),
+        };
+        self.inner.deliver(self.peer, self.conn_id, event);
+        None
     }
 
     /// Note whether the connection received anything since the last sample, so a replacement
@@ -520,6 +556,11 @@ impl Session {
             };
             match decode_control(&frame) {
                 Ok(ControlMessage::Hello(hello)) if !self.hello_seen => {
+                    self.audio_enabled.store(
+                        self.inner.local_audio
+                            && hello.features.iter().any(|feature| feature == "audio"),
+                        Ordering::Release,
+                    );
                     self.hello_seen = true;
                     self.inner.deliver_hello(self.peer, self.conn_id, hello);
                 }

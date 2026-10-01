@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use crosspane_protocol::audio::{AudioPacket, encode_audio};
 use crosspane_protocol::link::{LinkError, PeerLink};
 use crosspane_protocol::msg::{ControlMessage, InputMessage, PointerMessage};
 use crosspane_protocol::wire::{WireError, encode_control, encode_input, encode_pointer};
@@ -108,6 +109,10 @@ pub(crate) struct ConnTx {
     pub(crate) input: Queue,
     /// What the peer has not yet acknowledged of the media frames sent on this connection.
     media: Arc<SendBudget>,
+    /// Admission belongs to this connection and starts disabled until its first Hello.
+    pub(crate) audio_enabled: Arc<AtomicBool>,
+    /// Serializes the datagram space check and enqueue across all handles of this connection.
+    datagram_send: Arc<Mutex<()>>,
     /// The runtime the connection's tasks run on, for the graceful close.
     rt: Handle,
 }
@@ -130,9 +135,38 @@ impl ConnTx {
             control,
             input,
             media: Arc::new(SendBudget::default()),
+            audio_enabled: Arc::new(AtomicBool::new(false)),
+            datagram_send: Arc::new(Mutex::new(())),
             rt: Handle::current(),
         };
         (tx, control_rx, input_rx)
+    }
+
+    /// Best effort, without evicting previously queued motion or audio.
+    fn send_datagram(&self, datagram: Vec<u8>) -> Result<(), LinkError> {
+        // Never wait on another sender. All ConnTx clones share this connection's guard so
+        // motion and audio cannot both reserve the same free space and evict queued datagrams.
+        let _guard = self
+            .datagram_send
+            .try_lock()
+            .map_err(|_| LinkError::Congested)?;
+        match self.conn.max_datagram_size() {
+            None => return Err(LinkError::Invalid("the peer does not accept datagrams")),
+            Some(max) if datagram.len() > max => return Err(LinkError::Congested),
+            Some(_) => {}
+        }
+        // quinn would silently drop older queued datagrams to make room. Report a full buffer
+        // instead so the caller sees the congestion.
+        if self.conn.datagram_send_buffer_space() < datagram.len() {
+            return Err(LinkError::Congested);
+        }
+        self.conn
+            .send_datagram(datagram.into())
+            .map_err(|error| match error {
+                SendDatagramError::TooLarge => LinkError::Congested,
+                SendDatagramError::ConnectionLost(_) => LinkError::Closed,
+                _ => LinkError::Invalid("datagrams are unavailable"),
+            })
     }
 
     fn queue(&self, queue: &Queue, frame: Vec<u8>) -> Result<(), LinkError> {
@@ -299,23 +333,16 @@ impl PeerLink for QuicLink {
     fn send_motion(&mut self, msg: &PointerMessage) -> Result<(), LinkError> {
         let datagram = encode_pointer(msg).map_err(invalid)?;
         let tx = self.cell.live()?;
-        match tx.conn.max_datagram_size() {
-            None => return Err(LinkError::Invalid("the peer does not accept datagrams")),
-            Some(max) if datagram.len() > max => return Err(LinkError::Congested),
-            Some(_) => {}
+        tx.send_datagram(datagram)
+    }
+
+    fn send_audio(&mut self, packet: &AudioPacket) -> Result<(), LinkError> {
+        let tx = self.cell.live()?;
+        if !tx.audio_enabled.load(Ordering::Acquire) {
+            return Err(LinkError::Invalid("audio is unavailable"));
         }
-        // quinn would silently drop older queued datagrams to make room. Report a full buffer
-        // instead so the caller sees the congestion.
-        if tx.conn.datagram_send_buffer_space() < datagram.len() {
-            return Err(LinkError::Congested);
-        }
-        tx.conn
-            .send_datagram(datagram.into())
-            .map_err(|error| match error {
-                SendDatagramError::TooLarge => LinkError::Congested,
-                SendDatagramError::ConnectionLost(_) => LinkError::Closed,
-                _ => LinkError::Invalid("datagrams are unavailable"),
-            })
+        let datagram = encode_audio(packet).map_err(invalid)?;
+        tx.send_datagram(datagram)
     }
 
     fn send_control(&mut self, msg: &ControlMessage) -> Result<(), LinkError> {
@@ -341,6 +368,66 @@ impl PeerLink for QuicLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn contended_connection_guard_refuses_motion_and_audio_from_other_handles() {
+        use crate::common::{Node, Raw, identity};
+        use crosspane_protocol::audio::AudioStreamId;
+        use crosspane_types::geom::PointDevice;
+        use crosspane_types::id::{DisplayId, SessionId};
+
+        let local = identity();
+        let remote = identity();
+        let node = Node::start("remote", remote.clone(), &[&local]);
+        let raw = Raw::new();
+        let conn = raw.connect(&local, &remote, node.addr()).await;
+        let (tx, _control_rx, _input_rx) = ConnTx::new(conn);
+        tx.audio_enabled.store(true, Ordering::Release);
+        let cell = LinkCell::new(tx.clone());
+        let mut motion_handle = QuicLink::new(node.id, cell.clone());
+        let mut audio_handle = QuicLink::new(node.id, cell);
+        let motion = PointerMessage {
+            session: SessionId(1),
+            seq: 3,
+            display: DisplayId(1),
+            position: PointDevice::new(2.0, 4.0),
+        };
+        let audio = AudioPacket {
+            stream: AudioStreamId(7),
+            seq: 19,
+            sample_time: 48_000,
+            opus: vec![0x5a; 400],
+        };
+        motion_handle.send_motion(&motion).unwrap();
+        let space = tx.conn.datagram_send_buffer_space();
+        let guard = tx.datagram_send.lock().unwrap();
+        let (mut motion_handle, mut audio_handle) = std::thread::spawn({
+            let audio = audio.clone();
+            move || {
+                assert_eq!(
+                    motion_handle.send_motion(&motion),
+                    Err(LinkError::Congested)
+                );
+                assert_eq!(audio_handle.send_audio(&audio), Err(LinkError::Congested));
+                (motion_handle, audio_handle)
+            }
+        })
+        .join()
+        .unwrap();
+        // The current-thread runtime has not drained the previously queued motion. Neither
+        // contended send enqueued anything or evicted it, despite ample remaining space.
+        assert_eq!(tx.conn.datagram_send_buffer_space(), space);
+        drop(guard);
+        motion_handle.send_motion(&motion).unwrap();
+        audio_handle.send_audio(&audio).unwrap();
+        // Quinn also budgets per-datagram bookkeeping, so assert the payload lower bound.
+        assert!(
+            tx.conn.datagram_send_buffer_space()
+                <= space
+                    - encode_pointer(&motion).unwrap().len()
+                    - encode_audio(&audio).unwrap().len()
+        );
+    }
 
     #[test]
     fn a_queue_refuses_frames_past_its_cap_and_frees_room_as_they_are_written() {
