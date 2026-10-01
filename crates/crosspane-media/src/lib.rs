@@ -3,6 +3,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod audio;
 pub mod codec;
 pub mod hybrid;
 pub mod picture;
