@@ -50,14 +50,20 @@ impl<J: Journal> TargetLedger<J> {
     /// - A down is journaled *before* `Press` is returned.
     /// - A duplicate down, or an up for something not held, returns `None`.
     /// - An up returns `Release`; its journal record is written by `confirm_released`.
-    /// - The first message received starts the lease clock.
+    /// - The first message received starts the lease clock, and so does a down while nothing is held
+    ///   (a lease left over from an idle period or an earlier session must not cut a new press
+    ///   short).
     pub fn on_input(
         &mut self,
         item: Held,
         down: bool,
         now: MonoTime,
     ) -> Result<Option<Action>, JournalError> {
-        self.lease_start.get_or_insert(now);
+        if down && self.held.is_empty() {
+            self.lease_start = Some(now);
+        } else {
+            self.lease_start.get_or_insert(now);
+        }
         if down {
             if self.held.contains(&item) {
                 return Ok(None);
@@ -125,13 +131,18 @@ impl<J: Journal> TargetLedger<J> {
         self.held.iter().copied().collect()
     }
 
-    /// When `on_tick` must next run: lease start + `LEASE_TIMEOUT` while anything is held.
+    /// When `on_tick` must next run: the first instant the lease is *older* than `LEASE_TIMEOUT`
+    /// (lease start + `LEASE_TIMEOUT` + 1 ns) while anything is held, so a tick delivered exactly at
+    /// the deadline makes progress.
     pub fn next_deadline(&self) -> Option<MonoTime> {
         if self.held.is_empty() {
             None
         } else {
-            self.lease_start
-                .map(|start| start.saturating_add(LEASE_TIMEOUT))
+            self.lease_start.map(|start| {
+                start
+                    .saturating_add(LEASE_TIMEOUT)
+                    .saturating_add(Duration::from_nanos(1))
+            })
         }
     }
 }
@@ -189,8 +200,8 @@ impl ControllerLease {
     }
 
     /// When `lost` will next become true if no acknowledgement arrives: the oldest unacknowledged
-    /// message's send time plus `max(ACK_TIMEOUT_MIN, ACK_TIMEOUT_RTT_FACTOR × rtt)`. `None` when
-    /// nothing is unacknowledged. (Added by the lead for WP-1.22a's `next_deadline`.)
+    /// message's send time plus `max(ACK_TIMEOUT_MIN, ACK_TIMEOUT_RTT_FACTOR × rtt)` plus 1 ns
+    /// (`lost` needs *more* than the timeout). `None` when nothing is unacknowledged. (Added by the lead for WP-1.22a's `next_deadline`.)
     pub fn ack_deadline(&self, rtt: Option<Duration>) -> Option<MonoTime> {
         let timeout = rtt.map_or(ACK_TIMEOUT_MIN, |rtt| {
             ACK_TIMEOUT_MIN.max(
@@ -198,9 +209,10 @@ impl ControllerLease {
                     .unwrap_or(Duration::MAX),
             )
         });
-        self.unacked
-            .front()
-            .map(|&(_, sent)| sent.saturating_add(timeout))
+        self.unacked.front().map(|&(_, sent)| {
+            sent.saturating_add(timeout)
+                .saturating_add(Duration::from_nanos(1))
+        })
     }
 
     /// True when the oldest unacknowledged message was sent more than

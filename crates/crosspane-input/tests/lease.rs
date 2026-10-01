@@ -128,7 +128,11 @@ proptest! {
             let mut heartbeat = None;
             let actions = match operation {
                 Operation::Input(index, down) => {
-                    lease_start.get_or_insert(now);
+                    if down && pressed.is_empty() {
+                        lease_start = Some(now);
+                    } else {
+                        lease_start.get_or_insert(now);
+                    }
                     let item = ITEMS[usize::from(index)];
                     if down && !pressed.contains(&item) {
                         expected.push(Action::Press(item));
@@ -235,7 +239,9 @@ proptest! {
             let deadline = if pressed.is_empty() {
                 None
             } else {
-                lease_start.map(|start| start.saturating_add(LEASE_TIMEOUT))
+                lease_start.map(|start| {
+                    start.saturating_add(LEASE_TIMEOUT).saturating_add(Duration::from_nanos(1))
+                })
             };
             prop_assert_eq!(ledger.next_deadline(), deadline);
         }
@@ -341,13 +347,36 @@ fn controller_ack_deadline_matches_lost() {
     let mut lease = ControllerLease::new(time(0));
     assert_eq!(lease.ack_deadline(None), None);
     lease.sent(1, time(10));
-    assert_eq!(lease.ack_deadline(None), Some(time(160)));
+    let ns = Duration::from_nanos(1);
+    assert_eq!(lease.ack_deadline(None), Some(time(160).saturating_add(ns)));
     assert_eq!(
         lease.ack_deadline(Some(Duration::from_millis(100))),
-        Some(time(410))
+        Some(time(410).saturating_add(ns))
     );
     assert!(!lease.lost(time(160), None));
     assert!(lease.lost(time(161), None));
     lease.acked(1, time(20));
     assert_eq!(lease.ack_deadline(None), None);
+}
+
+#[test]
+fn tick_at_next_deadline_makes_progress() {
+    let (mut ledger, _) = TargetLedger::open(MemoryJournal::default()).unwrap();
+    let key = Held::Key(HidUsage::keyboard(4));
+    ledger.on_heartbeat(&[], time(0));
+    // A down after an idle gap restarts the lease instead of inheriting the old one.
+    ledger.on_input(key, true, time(10_000)).unwrap();
+    let deadline = ledger.next_deadline().unwrap();
+    assert!(deadline > time(10_300));
+    assert!(ledger.on_tick(time(10_299)).is_empty());
+    assert_eq!(ledger.on_tick(deadline), vec![Action::Release(key)]);
+}
+
+#[test]
+fn lost_at_ack_deadline() {
+    let mut lease = ControllerLease::new(time(0));
+    lease.sent(1, time(1_000));
+    let deadline = lease.ack_deadline(None).unwrap();
+    assert!(!lease.lost(MonoTime::from_nanos(deadline.as_nanos() - 1), None));
+    assert!(lease.lost(deadline, None));
 }
