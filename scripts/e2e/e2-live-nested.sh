@@ -21,8 +21,12 @@ bin=$repo/target/debug
 app=crosspane-e2-test
 cargo build -q -p crosspane-agent -p crosspanectl
 rm -rf "$work"; mkdir -p "$work"
-pkill -f -- "--app-id $app" 2>/dev/null || true # a test window left by an earlier KEEP=1 run
 
+close_test_window() { # by exact name and argv (pkill -f would also match a shell quoting it)
+  for p in $(pgrep -x foot || true); do
+    tr '\0' ' ' < "/proc/$p/cmdline" | grep -q -- "--app-id $app" && kill "$p" 2>/dev/null || true
+  done
+}
 agent_pid() { # the agent whose CROSSPANE_RUNTIME_DIR is $1 (the setsid wrapper's PID isn't it)
   for p in $(pgrep -f "crosspane-agent run" || true); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "CROSSPANE_RUNTIME_DIR=$1" && echo "$p"
@@ -32,10 +36,18 @@ cleanup() {
   [ "${KEEP:-0}" = 1 ] && return
   for n in l b; do kill $(agent_pid "$work/$n/run") 2>/dev/null || true; done
   sleep 1
-  pkill -f -- "--app-id $app" 2>/dev/null || true
+  close_test_window
   scripts/hypr-nested.sh stop --name e2e-b >/dev/null 2>&1 || true
 }
+# Parking recovery removes every CROSSPANE-* output at startup, so two agents in one session would
+# tear down each other's twins.
+for p in $(pgrep -f "crosspane-agent run" || true); do
+  if tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "HYPRLAND_INSTANCE_SIGNATURE=$HYPRLAND_INSTANCE_SIGNATURE"; then
+    echo "another agent (pid $p) runs in this session: stop it first" >&2; exit 2
+  fi
+done
 trap cleanup EXIT
+close_test_window # a test window left by an earlier KEEP=1 run
 fail() { echo "FAIL: $*"; exit 1; }
 
 envof() { XDG_CONFIG_HOME=$work/$1/config XDG_STATE_HOME=$work/$1/state CROSSPANE_RUNTIME_DIR=$work/$1/run "${@:2}"; }

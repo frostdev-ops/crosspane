@@ -299,6 +299,15 @@ fn print_status(s: &Value) {
             p["projection"],
             p["text"].as_str().unwrap_or("")
         );
+        let r = &p["received"];
+        if r.is_object() {
+            println!(
+                "    received {} frames, {:.1} MB, last {} ms ago",
+                r["frames"],
+                r["bytes"].as_f64().unwrap_or(0.0) / 1e6,
+                r["last_ms_ago"]
+            );
+        }
     }
     for n in s["notices"].as_array().into_iter().flatten() {
         println!("  notice: {}", n.as_str().unwrap_or(""));

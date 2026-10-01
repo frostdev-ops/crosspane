@@ -35,6 +35,15 @@ struct ProxyMap {
     next: u64,
     by_key: HashMap<ProjectionKey, u64>,
     by_id: HashMap<u64, ProjectionKey>,
+    stats: HashMap<ProjectionKey, FrameStats>,
+}
+
+/// What the decoder has shown for one projection (for `crosspanectl status`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    pub frames: u64,
+    pub bytes: u64,
+    pub last: Option<Instant>,
 }
 
 impl ProxyIds {
@@ -56,7 +65,21 @@ impl ProxyIds {
         let mut map = self.inner.lock().ok()?;
         let id = map.by_key.remove(&key)?;
         map.by_id.remove(&id);
+        map.stats.remove(&key);
         Some(id)
+    }
+
+    fn shown(&self, key: ProjectionKey, bytes: usize) {
+        if let Ok(mut map) = self.inner.lock() {
+            let stats = map.stats.entry(key).or_default();
+            stats.frames += 1;
+            stats.bytes += bytes as u64;
+            stats.last = Some(Instant::now());
+        }
+    }
+
+    pub fn stats(&self, key: ProjectionKey) -> Option<FrameStats> {
+        self.inner.lock().ok()?.stats.get(&key).copied()
     }
 
     pub fn id(&self, key: ProjectionKey) -> Option<u64> {
@@ -260,14 +283,14 @@ fn decode_loop(
                 if header.key && header.seq > d.last {
                     // A key frame supersedes everything older.
                     d.pending.retain(|seq, _| *seq > header.seq);
-                    apply(d, key, id, &data, header.seq, host, engine);
+                    apply(d, key, id, &data, header.seq, host, engine, ids);
                 } else if header.seq > d.last && d.pending.len() < MAX_PENDING {
                     d.pending.insert(header.seq, data);
                 }
                 // Apply whatever is now consecutive.
                 while let Some(data) = d.pending.remove(&(d.last + 1)) {
                     let seq = d.last + 1;
-                    apply(d, key, id, &data, seq, host, engine);
+                    apply(d, key, id, &data, seq, host, engine, ids);
                 }
                 d.gap_since = if d.pending.is_empty() {
                     None
@@ -292,6 +315,7 @@ fn decode_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply(
     d: &mut Decoding,
     key: ProjectionKey,
@@ -300,10 +324,12 @@ fn apply(
     seq: u64,
     host: Option<&HostHandle>,
     engine: &Sender<Event>,
+    ids: &ProxyIds,
 ) {
     match d.decoder.apply(data) {
         Ok((header, dirty)) => {
             d.last = seq.max(header.seq);
+            ids.shown(key, data.len());
             if let Some(host) = host {
                 let (pixels, size) = d.decoder.canvas();
                 let _ = host.send(HostCommand::Frame {

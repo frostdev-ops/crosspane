@@ -154,7 +154,15 @@ fn parse_monitors(json: &serde_json::Value) -> Result<Vec<DisplayInfo>, Platform
     let list = json
         .as_array()
         .ok_or_else(|| PlatformError::Backend("hyprland monitors: not a list".into()))?;
-    list.iter().map(parse_monitor).collect()
+    // Crosspane's own twin outputs (parking) are not displays anyone may point at.
+    list.iter()
+        .filter(|m| {
+            !m.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|n| n.starts_with(super::parking::OUTPUT_PREFIX))
+        })
+        .map(parse_monitor)
+        .collect()
 }
 
 fn parse_monitor(m: &serde_json::Value) -> Result<DisplayInfo, PlatformError> {
@@ -228,11 +236,14 @@ mod tests {
         {"id":2,"name":"DP-3","width":3440,"height":1440,"x":1080,"y":1080,"scale":1.25,
          "transform":0,"physicalWidth":800,"physicalHeight":340,"refreshRate":164.99899},
         {"id":5,"name":"WAYLAND-1","width":950,"height":1046,"x":-950,"y":0,"scale":1,
-         "transform":0,"physicalWidth":0,"physicalHeight":0,"refreshRate":60.0}
+         "transform":0,"physicalWidth":0,"physicalHeight":0,"refreshRate":60.0},
+        {"id":7,"name":"CROSSPANE-180027f1","width":1072,"height":938,"x":1048576,"y":0,
+         "scale":2,"transform":0,"physicalWidth":0,"physicalHeight":0,"refreshRate":60.0}
     ]"#;
 
     #[test]
     fn maps_monitors() {
+        // The twin output (parking) is left out.
         let d = parse_monitors(&serde_json::from_str(LIVE_LIKE).unwrap()).unwrap();
         assert_eq!(d.len(), 3);
 

@@ -473,7 +473,14 @@ impl Agent {
                     .host
                     .as_ref()
                     .is_some_and(|h| h.send(HostCommand::Open { id, title, size }).is_ok());
-                if !sent {
+                if sent {
+                    let from = self
+                        .peers
+                        .get(&key.source)
+                        .map_or_else(|| key.source.short(), |info| info.name.clone());
+                    let text = format!("showing window {} of {from}", key.projection.0);
+                    self.projections.insert(key, text);
+                } else {
                     self.proxy_ids.close(key);
                     self.pending.push_back(Input::ProxyOpened {
                         key,
@@ -496,6 +503,7 @@ impl Agent {
                 }
             }
             Output::CloseProxy { key } => {
+                self.projections.remove(&key);
                 if let Some(id) = self.proxy_ids.close(key)
                     && let Some(h) = &self.host
                 {
@@ -614,10 +622,19 @@ impl Agent {
     }
 
     fn send_grants(&mut self) {
+        // A node that can't inject (e.g. macOS without the Accessibility grant) refuses control
+        // rather than accept a session whose input would go nowhere.
+        let can_inject = self.platform.keys.is_some() && self.platform.pointer.is_some();
         let grants: BTreeMap<NodeId, BTreeSet<Capability>> = self.trust.with(|t| {
             t.peers()
                 .into_iter()
-                .map(|e| (e.node, e.granted.clone()))
+                .map(|e| {
+                    let mut granted = e.granted.clone();
+                    if !can_inject {
+                        granted.remove(&Capability::InputAccept);
+                    }
+                    (e.node, granted)
+                })
                 .collect()
         });
         self.feed(Input::Grants(grants));
@@ -1027,11 +1044,19 @@ impl Agent {
                 "version": p.version,
             })).collect::<Vec<_>>(),
             "notices": self.notices.iter().collect::<Vec<_>>(),
-            "projections": self.projections.iter().map(|(k, text)| json!({
-                "source": k.source.short(),
-                "projection": k.projection.0,
-                "text": text,
-            })).collect::<Vec<_>>(),
+            "projections": self.projections.iter().map(|(k, text)| {
+                let frames = self.proxy_ids.stats(*k).map(|s| json!({
+                    "frames": s.frames,
+                    "bytes": s.bytes,
+                    "last_ms_ago": s.last.map(|t| t.elapsed().as_millis() as u64),
+                }));
+                json!({
+                    "source": k.source.short(),
+                    "projection": k.projection.0,
+                    "text": text,
+                    "received": frames,
+                })
+            }).collect::<Vec<_>>(),
             "uptime_s": now.as_nanos() / 1_000_000_000,
         })
     }
