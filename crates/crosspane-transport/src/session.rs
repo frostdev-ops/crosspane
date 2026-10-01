@@ -1,12 +1,17 @@
 //! One connection's tasks: a writer per outgoing stream and one reader that owns everything
 //! arriving (both streams, datagrams, closure). A single reader keeps a connection's events
 //! ordered and makes every protocol-error decision in one place.
+//!
+//! Media frames are the exception to "the reader reads": each media stream is read by a task of its
+//! own, so a large frame never delays control or input. The reader only collects the finished
+//! frames (a `JoinSet` that dies with the session) and delivers them.
 
 use std::collections::VecDeque;
 use std::future::pending;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use crosspane_protocol::link::{LinkError, LinkEvent};
@@ -17,6 +22,7 @@ use crosspane_protocol::wire::{
 };
 use crosspane_types::id::NodeId;
 use quinn::{Chunk, Connection, ConnectionError, ReadError, ReadExactError, RecvStream, VarInt};
+use tokio::task::{JoinError, JoinSet};
 use tokio::time::{MissedTickBehavior, Sleep, interval, sleep};
 
 use crate::hub::{
@@ -24,6 +30,7 @@ use crate::hub::{
     is_duplicate_close,
 };
 use crate::link::{Out, QueueRx};
+use crate::media::{self, Received, STREAM_MEDIA};
 
 /// First byte of a unidirectional stream: the control channel.
 const STREAM_CONTROL: u8 = 0x01;
@@ -147,6 +154,8 @@ pub(crate) fn spawn(start: Start) {
         activity,
         rx_datagrams: 0,
         finish_timer: None,
+        media: JoinSet::new(),
+        media_buffered: Arc::new(AtomicUsize::new(0)),
     };
     tokio::spawn(session.run(first));
 }
@@ -315,6 +324,11 @@ struct Session {
     rx_datagrams: u64,
     /// Set once the peer finishes a stream: the connection must close soon after.
     finish_timer: Option<Pin<Box<Sleep>>>,
+    /// The tasks reading the peer's media streams. Dropping them (when the session ends) aborts
+    /// whatever is still unfinished.
+    media: JoinSet<Received>,
+    /// Bytes of partly received media across `media`.
+    media_buffered: Arc<AtomicUsize>,
     guard: Guard,
 }
 
@@ -347,9 +361,9 @@ impl Session {
 
     async fn drive(&mut self, first: Option<FirstStream>) -> Outcome {
         if let Some((kind, recv)) = first
-            && let Err(reason) = self.streams.install(kind, recv)
+            && let Some(outcome) = self.on_stream(kind, recv)
         {
-            return Outcome::Fault(reason);
+            return outcome;
         }
         // Futures that must survive across loop iterations (they hold a half-accepted stream or a
         // registration) are pinned outside the select; the reads inside it are cancel-safe.
@@ -387,11 +401,17 @@ impl Session {
                         Err(error) => return Outcome::Closed(error),
                     }
                 }
+                // Before `closed`, so a frame that finished before the connection closed is delivered.
+                Some(done) = self.media.join_next(), if !self.media.is_empty() => {
+                    if let Some(outcome) = self.on_media(done) {
+                        return outcome;
+                    }
+                }
                 error = &mut closed => return Outcome::Closed(error),
                 accepted = &mut accepting, if self.settled => match accepted {
                     Ok((kind, recv)) => {
-                        if let Err(reason) = self.streams.install(kind, recv) {
-                            return Outcome::Fault(reason);
+                        if let Some(outcome) = self.on_stream(kind, recv) {
+                            return outcome;
                         }
                         accepting = Box::pin(accept_stream(self.conn.clone()));
                     }
@@ -427,6 +447,46 @@ impl Session {
         if received != self.rx_datagrams {
             self.rx_datagrams = received;
             self.activity.touch();
+        }
+    }
+
+    /// The peer opened a stream. Control and input attach to their slot (anything else of those
+    /// kinds is a protocol error); each media frame gets a reading task of its own.
+    fn on_stream(&mut self, kind: u8, recv: RecvStream) -> Option<Outcome> {
+        if kind != STREAM_MEDIA {
+            return self.streams.install(kind, recv).err().map(Outcome::Fault);
+        }
+        // The engine hears of a peer's `Hello` before anything else it sends. A peer only has media
+        // to send once the other side has accepted a projection, which takes control messages that
+        // follow the `Hello`: media before it is not a peer we can serve.
+        if !self.hello_seen {
+            return Some(Outcome::Fault("media before hello"));
+        }
+        self.media
+            .spawn(media::read_frame(recv, self.media_buffered.clone()));
+        None
+    }
+
+    /// A media task ended: deliver its frame.
+    fn on_media(&mut self, done: Result<Received, JoinError>) -> Option<Outcome> {
+        match done {
+            Ok(Received::Frame(data)) => {
+                self.inner.deliver(
+                    self.peer,
+                    self.conn_id,
+                    LinkEvent::Media {
+                        peer: self.peer,
+                        data,
+                    },
+                );
+                None
+            }
+            Ok(Received::Dropped) => None,
+            Ok(Received::Fault(reason)) => Some(Outcome::Fault(reason)),
+            Err(error) => {
+                tracing::debug!(peer = %self.peer.short(), %error, "a media task failed");
+                None
+            }
         }
     }
 

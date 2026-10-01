@@ -6,7 +6,8 @@
 //! handles stay closed for good, even if the peer reconnects: the engine must fetch a new handle.
 //!
 //! Sends never block. Frames are queued per stream with a byte cap; a peer that stops reading
-//! until the cap is hit loses its connection instead of growing memory without bound.
+//! until the cap is hit loses its connection instead of growing memory without bound. Media frames
+//! have a budget of their own and are refused as congested instead (see [`crate::media`]).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -24,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::hub::{CODE_NORMAL, CODE_OVERFLOW};
+use crate::media::{self, SendBudget};
 
 /// Queued input-stream bytes at which the connection is closed.
 const INPUT_QUEUE_CAP: usize = 1024 * 1024;
@@ -104,6 +106,8 @@ pub(crate) struct ConnTx {
     pub(crate) control: Queue,
     /// Frames for the input stream's writer task.
     pub(crate) input: Queue,
+    /// What the peer has not yet acknowledged of the media frames sent on this connection.
+    media: Arc<SendBudget>,
     /// The runtime the connection's tasks run on, for the graceful close.
     rt: Handle,
 }
@@ -125,6 +129,7 @@ impl ConnTx {
             conn,
             control,
             input,
+            media: Arc::new(SendBudget::default()),
             rt: Handle::current(),
         };
         (tx, control_rx, input_rx)
@@ -150,6 +155,20 @@ impl ConnTx {
 
     pub(crate) fn queue_input(&self, frame: Vec<u8>) -> Result<(), LinkError> {
         self.queue(&self.input, frame)
+    }
+
+    /// Send `frame` on a stream of its own. `Congested` if the peer has too much unfinished media
+    /// (the frame is not sent); `Invalid` if the peer would refuse a frame this large.
+    pub(crate) fn send_media(&self, frame: Arc<[u8]>) -> Result<(), LinkError> {
+        if frame.len() > media::MAX_FRAME {
+            return Err(LinkError::Invalid("media frame too large"));
+        }
+        let (projection, key) = media::frame_info(&frame);
+        let reservation = self.media.reserve(projection, key, frame.len())?;
+        // The runtime handle, not `tokio::spawn`, so the engine may call from any thread.
+        self.rt
+            .spawn(media::write_frame(self.conn.clone(), frame, reservation));
+        Ok(())
     }
 
     /// Finish both streams once their queued data is out, give the peer a moment to acknowledge it,
@@ -221,6 +240,11 @@ impl LinkCell {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()?;
         Some(tx.flush_and_close(message.to_owned()))
+    }
+
+    /// Send a media frame over the live connection.
+    pub(crate) fn send_media(&self, frame: Arc<[u8]>) -> Result<(), LinkError> {
+        self.live()?.send_media(frame)
     }
 
     /// The live connection, if the link is open and the connection hasn't closed.

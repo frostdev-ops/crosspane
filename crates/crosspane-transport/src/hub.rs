@@ -389,6 +389,19 @@ impl Inner {
         Some(Box::new(QuicLink::new(peer, entry.cell.clone())))
     }
 
+    /// Queue a media frame to `peer`: `Closed` unless its link is visible and open.
+    pub(crate) fn send_media(&self, peer: NodeId, frame: Arc<[u8]>) -> Result<(), LinkError> {
+        let cell = {
+            let peers = lock(&self.peers);
+            let entry = peers.get(&peer).ok_or(LinkError::Closed)?;
+            if !entry.settled || !entry.live() {
+                return Err(LinkError::Closed);
+            }
+            entry.cell.clone()
+        };
+        cell.send_media(frame)
+    }
+
     /// The peer behind an open connection (settled or not) whose remote address is `addr`.
     fn live_peer_at(&self, addr: SocketAddr) -> Option<NodeId> {
         let canonical = |addr: SocketAddr| (addr.ip().to_canonical(), addr.port());

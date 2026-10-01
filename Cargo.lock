@@ -817,6 +817,7 @@ dependencies = [
 name = "crosspane-transport"
 version = "0.0.0"
 dependencies = [
+ "crosspane-media",
  "crosspane-protocol",
  "crosspane-security",
  "crosspane-types",
