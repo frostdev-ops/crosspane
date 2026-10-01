@@ -4,11 +4,17 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::*;
+use crosspane_protocol::audio::{AudioPacket, AudioStreamId};
 use crosspane_protocol::link::{LinkError, LinkEvent};
-use crosspane_protocol::msg::{ControlMessage, InputMessage};
+use crosspane_protocol::msg::{Capability, ControlMessage, InputMessage, PointerMessage, Refusal};
+use crosspane_security::identity::DeviceIdentity;
+use crosspane_types::audio::AudioKind;
+use crosspane_types::geom::PointDevice;
+use crosspane_types::id::{DisplayId, SessionId};
 use tokio::time::sleep;
 
 const QUIET: Duration = Duration::from_millis(400);
@@ -242,4 +248,379 @@ async fn a_duplicate_close_with_no_replacement_ends_the_link_after_the_grace_per
         closed_at.elapsed()
     );
     a.expect_quiet(QUIET).await;
+}
+
+// ---- silent supersession: HelloRefresh (WP-3.0b) -------------------------------------------------
+
+/// Everything the local node under test advertises.
+const FULL: [&str; 5] = ["e1", "audio", "h264", "h264roi", "cursor"];
+
+fn pointer() -> PointerMessage {
+    PointerMessage {
+        session: SessionId(1),
+        seq: 3,
+        display: DisplayId(1),
+        position: PointDevice::new(2.0, 4.0),
+    }
+}
+
+fn packet() -> AudioPacket {
+    AudioPacket {
+        stream: AudioStreamId(7),
+        seq: 19,
+        sample_time: 48_000,
+        opus: vec![0x5a; 40],
+    }
+}
+
+fn all_grants() -> Vec<Capability> {
+    vec![
+        Capability::WindowShare,
+        Capability::AudioSpeaker,
+        Capability::InputAccept,
+        Capability::AudioMic,
+    ]
+}
+
+fn grants_without_audio() -> Vec<Capability> {
+    vec![Capability::WindowShare, Capability::InputAccept]
+}
+
+/// `(larger, smaller)`: the node under test is the larger, so a connection it dialed loses rule 7
+/// to one the smaller node dials.
+fn ordered() -> (Arc<DeviceIdentity>, Arc<DeviceIdentity>) {
+    let one = identity();
+    let two = identity();
+    if one.node() > two.node() {
+        (one, two)
+    } else {
+        (two, one)
+    }
+}
+
+/// `a` (the larger node) is connected to `b1`; `b2` is the same identity dialing from another
+/// endpoint, so its connection has the smaller client id and silently supersedes the first. The
+/// engine of `a` must see one ordinary `Hello` (from `b1`), then `HelloRefresh` with `b2`'s own
+/// features before anything else `b2` sends, and no `Closed` at all.
+async fn refresh_case(first: &[&str], second: &[&str]) {
+    let (ia, ib) = ordered();
+    let mut a = node_with_hello(ia.clone(), &[&ib], hello_with("a", &FULL));
+    let mut b1 = node_with_hello(ib.clone(), &[&ia], hello_with("b1", first));
+    let mut b2 = node_with_hello(ib.clone(), &[&ia], hello_with("b2", second));
+    let b = ib.node();
+    let negotiated = second.contains(&"audio");
+    let what = format!("{first:?} -> {second:?}");
+
+    assert_eq!(a.transport.connect(b1.addr()).await.unwrap(), b);
+    a.expect_hello(b, "b1").await;
+    b1.expect_hello(a.id, "a").await;
+    let mut old = a.transport.link(b).unwrap();
+    // Nothing but the one ordinary Hello so far.
+    a.expect_quiet(Duration::from_millis(100)).await;
+
+    assert_eq!(b2.transport.connect(a.addr()).await.unwrap(), a.id);
+    b2.expect_hello(a.id, "a").await;
+    let mut from_b2 = b2.transport.link(a.id).unwrap();
+    // Sent at once, right behind b2's Hello, on all three channels.
+    from_b2
+        .send_control(&ControlMessage::Ping { t0: 7 })
+        .unwrap();
+    from_b2.send_input(&key(1)).unwrap();
+    from_b2.send_motion(&pointer()).unwrap();
+    if negotiated {
+        from_b2.send_audio(&packet()).unwrap();
+    }
+
+    // The refresh is the survivor's own Hello, before anything else it sent.
+    match a.next().await {
+        LinkEvent::HelloRefresh { peer, hello } => {
+            assert_eq!(peer, b, "{what}");
+            assert_eq!(hello, hello_with("b2", second), "{what}");
+        }
+        other => panic!("{what}: expected a HelloRefresh first, got {other:?}"),
+    }
+    // (That a replaced connection can deliver nothing is checked directly, with traffic from an
+    // obsolete connection id, by `hub::tests::an_obsolete_connection_delivers_nothing_and_changes_nothing`.)
+    let mut seen = [false; 4];
+    seen[3] = !negotiated;
+    while !seen.iter().all(|v| *v) {
+        match a.next().await {
+            LinkEvent::Control {
+                msg: ControlMessage::Ping { t0: 7 },
+                ..
+            } => seen[0] = true,
+            LinkEvent::Input { msg, .. } => {
+                assert_eq!(msg, key(1), "{what}");
+                seen[1] = true;
+            }
+            LinkEvent::Motion { msg, .. } => {
+                assert_eq!(msg, pointer(), "{what}");
+                seen[2] = true;
+            }
+            LinkEvent::Audio { packet: got, .. } => {
+                assert_eq!(got, packet(), "{what}");
+                seen[3] = true;
+            }
+            other => panic!("{what}: unexpected event {other:?}"),
+        }
+    }
+    a.expect_quiet(QUIET).await;
+
+    // The handle the engine already holds follows the link onto the survivor, and is gated by the
+    // survivor's Hello, not by the connection it replaced.
+    old.send_control(&ControlMessage::Ping { t0: 5 }).unwrap();
+    let audio_controls = [
+        ControlMessage::AudioOpen {
+            stream: AudioStreamId(2),
+            kind: AudioKind::Speaker,
+            channels: 2,
+        },
+        ControlMessage::AudioOpened {
+            stream: AudioStreamId(2),
+        },
+        ControlMessage::AudioRefused {
+            stream: AudioStreamId(2),
+            reason: Refusal::InjectorFailed,
+        },
+        ControlMessage::AudioClose {
+            stream: AudioStreamId(2),
+        },
+    ];
+    for msg in &audio_controls {
+        let sent = old.send_control(msg);
+        if negotiated {
+            sent.unwrap();
+        } else {
+            assert_eq!(
+                sent,
+                Err(LinkError::Invalid("audio is unavailable")),
+                "{what}"
+            );
+        }
+    }
+    let sent = old.send_audio(&packet());
+    if negotiated {
+        sent.unwrap();
+    } else {
+        assert_eq!(
+            sent,
+            Err(LinkError::Invalid("audio is unavailable")),
+            "{what}"
+        );
+    }
+    old.send_control(&ControlMessage::Grants(all_grants()))
+        .unwrap();
+    let (mut ping, mut grants, mut audio) = (false, false, !negotiated);
+    let mut controls = Vec::new();
+    while !(ping && grants && audio) {
+        match b2.next().await {
+            LinkEvent::Control {
+                msg: ControlMessage::Ping { t0: 5 },
+                ..
+            } => ping = true,
+            LinkEvent::Control {
+                msg: ControlMessage::Grants(got),
+                ..
+            } => {
+                // Audio capabilities reach only a peer that negotiated audio.
+                assert_eq!(
+                    got,
+                    if negotiated {
+                        all_grants()
+                    } else {
+                        grants_without_audio()
+                    },
+                    "{what}"
+                );
+                grants = true;
+            }
+            LinkEvent::Control { msg, .. } => controls.push(msg),
+            LinkEvent::Audio { packet: got, .. } => {
+                assert_eq!(got, packet(), "{what}");
+                audio = true;
+            }
+            other => panic!("{what}: b2 got {other:?}"),
+        }
+    }
+    // The audio control messages arrived, in order, exactly when audio was negotiated.
+    assert_eq!(
+        controls,
+        if negotiated {
+            audio_controls.to_vec()
+        } else {
+            Vec::new()
+        },
+        "{what}"
+    );
+    b2.expect_quiet(Duration::from_millis(150)).await;
+    a.expect_quiet(Duration::from_millis(150)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseding_connection_with_the_same_features_still_refreshes() {
+    refresh_case(&["e1", "audio", "h264"], &["e1", "audio", "h264"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_that_drops_audio_gates_the_existing_handle_and_filters_grants() {
+    refresh_case(&["e1", "audio", "h264"], &["e1", "h264"]).await;
+    refresh_case(&["e1", "audio", "h264roi", "cursor"], &["e1"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_that_gains_audio_enables_it_on_the_existing_handle() {
+    refresh_case(&["e1"], &["e1", "audio", "h264", "h264roi", "cursor"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_that_changes_codec_and_cursor_features_reports_them() {
+    refresh_case(
+        &["e1", "audio", "h264"],
+        &["e1", "audio", "h264roi", "cursor"],
+    )
+    .await;
+}
+
+/// A connection that is registered but whose Hello has not arrived is replaced by a connection the
+/// node dialed itself: the engine never heard of the link, so it gets one ordinary `Hello` (the
+/// survivor's), never a refresh, never a `Closed`.
+///
+/// Nothing here depends on timing. A controlled raw peer is the original: it connects, opens its
+/// control stream and deliberately sends no Hello, and the node's own streams reaching it prove the
+/// node registered the connection. The node then dials a real peer with the smaller client id, and
+/// the original being closed as a duplicate proves the supersession happened before anything else
+/// is checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_replaced_before_its_hello_yields_one_ordinary_hello_and_no_refresh() {
+    for round in 0..3 {
+        // `ia` is the smaller node: the node under test dials with the smaller client id, so its
+        // connection beats the raw peer's (the larger client).
+        let (ib, ia) = ordered();
+        let mut a = node_with_hello(ia.clone(), &[&ib], hello_with("a", &FULL));
+        let mut b = node_with_hello(
+            ib.clone(),
+            &[&ia],
+            hello_with("survivor", &["e1", "audio", "h264"]),
+        );
+        let peer = ib.node();
+
+        // The original: registered at the node, Hello withheld.
+        let raw = Raw::new();
+        let original = raw.connect(&ib, &ia, a.addr()).await;
+        let _control = open_stream(&original, 0x01, &[]).await;
+        let (_from_node, node_hello) = RawReceiver::accept(&original).await;
+        assert_eq!(node_hello, hello_with("a", &FULL), "round {round}");
+        a.expect_quiet(Duration::from_millis(150)).await;
+
+        // The survivor: the node's own dial.
+        assert_eq!(a.transport.connect(b.addr()).await.unwrap(), peer);
+        // The supersession happened: the original, still without a Hello, was closed as a
+        // duplicate (a refused survivor would have left it open).
+        let (code, reason) = closed_by_peer(&original).await;
+        assert_eq!((code, reason.as_str()), (2, "duplicate"), "round {round}");
+
+        // The engine's whole history: the survivor's one ordinary Hello, then nothing.
+        match a.next().await {
+            LinkEvent::Control {
+                peer: from,
+                msg: ControlMessage::Hello(hello),
+            } => {
+                assert_eq!(from, peer, "round {round}");
+                assert_eq!(
+                    hello,
+                    hello_with("survivor", &["e1", "audio", "h264"]),
+                    "round {round}"
+                );
+            }
+            other => panic!("round {round}: expected the survivor's Hello, got {other:?}"),
+        }
+        b.expect_hello(a.id, "a").await;
+        a.expect_quiet(QUIET).await;
+        assert_eq!(a.transport.peers(), vec![peer], "round {round}");
+        // The link works over the survivor, whose features were negotiated on its own Hello.
+        let mut link = a.transport.link(peer).unwrap();
+        link.send_audio(&packet()).unwrap();
+        link.send_control(&ControlMessage::Ping { t0: 3 }).unwrap();
+        // A datagram and a stream message arrive in either order.
+        let (mut audio, mut ping) = (false, false);
+        while !(audio && ping) {
+            match b.next().await {
+                LinkEvent::Audio { packet: got, .. } => {
+                    assert_eq!(got, packet(), "round {round}");
+                    audio = true;
+                }
+                LinkEvent::Control {
+                    msg: ControlMessage::Ping { t0: 3 },
+                    ..
+                } => ping = true,
+                other => panic!("round {round}: unexpected event {other:?}"),
+            }
+        }
+    }
+}
+
+/// A connection that loses rule 7 is refused: its Hello and everything after it never reach the
+/// engine, and the established link is undisturbed (no refresh, no Closed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_connection_delivers_no_refresh_and_no_events() {
+    let (ib, ia) = ordered();
+    // `ia` is the smaller node here: the node under test dialed first, and its client id wins.
+    let mut a = node_with_hello(ia.clone(), &[&ib], hello_with("a", &FULL));
+    let mut b = node_with_hello(ib.clone(), &[&ia], hello_with("b", &FULL));
+    assert_eq!(a.transport.connect(b.addr()).await.unwrap(), b.id);
+    a.expect_hello(b.id, "b").await;
+    b.expect_hello(a.id, "a").await;
+    let mut link = a.transport.link(b.id).unwrap();
+
+    // The larger node dials again from another endpoint (a different features list, too).
+    let raw = Raw::new();
+    let loser = raw.connect(&ib, &ia, a.addr()).await;
+    let _control = try_open_stream(&loser, 0x01, &hello_frame_with("loser", &["e1"])).await;
+    let (code, reason) = closed_by_peer(&loser).await;
+    assert_eq!((code, reason.as_str()), (2, "duplicate"));
+    a.expect_quiet(QUIET).await;
+    b.expect_quiet(Duration::from_millis(100)).await;
+    // The first connection carries on, in both directions.
+    link.send_control(&ControlMessage::Ping { t0: 1 }).unwrap();
+    assert!(matches!(
+        b.next().await,
+        LinkEvent::Control {
+            msg: ControlMessage::Ping { t0: 1 },
+            ..
+        }
+    ));
+    b.transport
+        .link(a.id)
+        .unwrap()
+        .send_control(&ControlMessage::Ping { t0: 2 })
+        .unwrap();
+    assert!(matches!(
+        a.next().await,
+        LinkEvent::Control {
+            msg: ControlMessage::Ping { t0: 2 },
+            ..
+        }
+    ));
+    a.expect_quiet(QUIET).await;
+}
+
+/// Only authenticated peers can supersede: a connection with an unpinned key never gets as far as a
+/// Hello, so the engine is not refreshed and the link is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unauthenticated_connection_cannot_refresh_an_established_link() {
+    let (ia, ib) = ordered();
+    let stranger = identity();
+    let mut a = node_with_hello(ia.clone(), &[&ib], hello_with("a", &FULL));
+    let b = node_with_hello(ib.clone(), &[&ia], hello_with("b", &FULL));
+    a.transport.connect(b.addr()).await.unwrap();
+    a.expect_hello(b.id, "b").await;
+    let raw = Raw::new();
+    if let Ok(conn) = raw
+        .connect_with_alpn(&stranger, &ia, a.addr(), crosspane_protocol::ALPN)
+        .await
+    {
+        let _ = try_open_stream(&conn, 0x01, &hello_frame_with("stranger", &FULL)).await;
+    }
+    a.expect_quiet(QUIET).await;
+    assert_eq!(a.transport.peers(), vec![b.id]);
 }

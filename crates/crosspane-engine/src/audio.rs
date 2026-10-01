@@ -12,10 +12,17 @@ use crosspane_types::time::MonoTime;
 use crate::io::{AudioEndpoint, AudioKey};
 use crate::{Command, Failure, Input, Notice, Output};
 
+/// Per-peer admission state. It outlives links: `next` and `remote_high` are the identity
+/// counters that keep a stream ID from being reused for the lifetime of this engine (WP-3.0b),
+/// so a closed link only clears `up` and `negotiated`.
 #[derive(Debug, Default)]
 struct Peer {
+    /// `PeerUp` arrived and no `Closed` followed. Only an up peer can negotiate audio.
+    up: bool,
     negotiated: bool,
+    /// The next stream ID this node allocates (odd for the smaller NodeId, even for the larger).
     next: u32,
+    /// The highest valid ID the peer has used to open a stream to us.
     remote_high: u16,
 }
 
@@ -47,6 +54,8 @@ pub(crate) struct Audio {
     session_permits: bool,
     asleep: bool,
     engine_permits: bool,
+    /// Whether this node can host microphones at all. False in production speaker-v0.
+    mic_support: bool,
 }
 
 impl Audio {
@@ -61,6 +70,7 @@ impl Audio {
             session_permits: false,
             asleep: false,
             engine_permits: true,
+            mic_support: false,
         }
     }
 
@@ -90,10 +100,14 @@ impl Audio {
         match input {
             Input::PeerUp { peer } => {
                 if *peer != self.node {
-                    self.peers.entry(*peer).or_insert_with(|| Peer {
-                        next: if self.node < *peer { 1 } else { 2 },
-                        ..Peer::default()
-                    });
+                    // An existing entry keeps its identity counters: a new link never resets them.
+                    self.peers
+                        .entry(*peer)
+                        .or_insert_with(|| Peer {
+                            next: if self.node < *peer { 1 } else { 2 },
+                            ..Peer::default()
+                        })
+                        .up = true;
                 }
             }
             Input::AudioPeer {
@@ -101,7 +115,7 @@ impl Audio {
                 name,
                 available,
             } => {
-                if let Some(p) = self.peers.get_mut(peer) {
+                if let Some(p) = self.peers.get_mut(peer).filter(|p| p.up) {
                     let changed = p.negotiated != *available;
                     p.negotiated = *available;
                     if changed {
@@ -121,8 +135,39 @@ impl Audio {
             Input::Link(LinkEvent::Closed { peer, .. }) => {
                 self.end_where(|s| s.key.peer == *peer, None, out);
                 self.activity.retain(|(p, _)| p != peer);
-                if self.peers.remove(peer).is_some_and(|p| p.negotiated) {
-                    out.push(Output::RemoveAudioPeer { peer: *peer });
+                // A true disconnect removes availability and devices but keeps the peer's
+                // identity counters, so a reconnect cannot reuse a stream ID.
+                if let Some(p) = self.peers.get_mut(peer) {
+                    p.up = false;
+                    if std::mem::take(&mut p.negotiated) {
+                        out.push(Output::RemoveAudioPeer { peer: *peer });
+                    }
+                }
+            }
+            Input::AudioConnectionReplaced { peer } => {
+                // A silent supersession keeps the logical link, so availability, the identity
+                // counters, admission generations and the retained device demand all stay. Only
+                // the sessions bound to the old connection end; demand restarts only after the
+                // app goes inactive and active again.
+                self.end_where(|s| s.key.peer == *peer, None, out);
+            }
+            Input::AudioStreamFailed { key } => {
+                // Only the complete currently admitted key: a stale failure of an older
+                // generation (or of an already ended session) cannot touch a newer admission.
+                let id = (key.peer, key.stream);
+                if self.sessions.get(&id).is_some_and(|s| s.key == *key) {
+                    self.end(id, Some(Refusal::InjectorFailed), out);
+                }
+            }
+            Input::AudioMicrophoneSupport { available } => {
+                self.mic_support = *available;
+                if !*available {
+                    // Demand latches stay: nothing restarts until the app goes inactive, active.
+                    self.end_where(
+                        |s| s.kind == AudioKind::Microphone,
+                        Some(Refusal::InjectorFailed),
+                        out,
+                    );
                 }
             }
             Input::Session(event) => {
@@ -233,7 +278,7 @@ impl Audio {
         self.session_permits && !self.asleep && self.engine_permits
     }
     fn connected(&self, peer: NodeId) -> bool {
-        self.peers.get(&peer).is_some_and(|p| p.negotiated)
+        self.peers.get(&peer).is_some_and(|p| p.up && p.negotiated)
     }
     fn has_grant(&self, peer: NodeId, kind: AudioKind) -> bool {
         self.grants
@@ -243,6 +288,7 @@ impl Audio {
     fn admitted(&self, s: Session) -> bool {
         self.gate()
             && self.connected(s.key.peer)
+            && (s.kind != AudioKind::Microphone || self.mic_support)
             && (!s.incoming || self.has_grant(s.key.peer, s.kind))
     }
     fn key(&mut self, peer: NodeId, stream: AudioStreamId) -> Option<AudioKey> {
@@ -272,6 +318,11 @@ impl Audio {
     fn outgoing(&mut self, peer: NodeId, kind: AudioKind, now: MonoTime, out: &mut Vec<Output>) {
         if !self.connected(peer) {
             Self::notice(peer, kind, Refusal::Permission, out);
+            return;
+        }
+        if kind == AudioKind::Microphone && !self.mic_support {
+            // Unsupported: no AudioOpen, no stream ID consumed, only the refusal notice.
+            Self::notice(peer, kind, Refusal::InjectorFailed, out);
             return;
         }
         if !self.gate() {
@@ -323,7 +374,7 @@ impl Audio {
         let fresh = self
             .peers
             .get(&peer)
-            .is_some_and(|p| stream.0 > p.remote_high);
+            .is_some_and(|p| p.up && stream.0 > p.remote_high);
         // Consume fresh remote IDs even when admission fails. Ordered control stream bounds replay state.
         if valid_id
             && fresh
@@ -338,6 +389,9 @@ impl Audio {
             || !self.has_grant(peer, kind)
         {
             Some(Refusal::Permission)
+        } else if kind == AudioKind::Microphone && !self.mic_support {
+            // A valid ID was consumed above; no indicator, notice of use or capture follows.
+            Some(Refusal::InjectorFailed)
         } else if !self.gate() {
             Some(Refusal::Locked)
         } else if self
@@ -584,9 +638,12 @@ mod tests {
     fn ready() -> Audio {
         let mut audio = Audio::new(NODE);
         audio.session_permits = true;
+        // These synthetic tests exercise the future microphone paths explicitly.
+        audio.mic_support = true;
         audio.peers.insert(
             PEER,
             Peer {
+                up: true,
                 negotiated: true,
                 next: 1,
                 remote_high: 0,
@@ -669,9 +726,10 @@ mod tests {
             &mut out,
         );
         out.clear();
+        // The reconnect cannot reuse ID 2 (WP-3.0b); a higher ID reaches generation exhaustion.
         audio.incoming(
             PEER,
-            AudioStreamId(2),
+            AudioStreamId(4),
             AudioKind::Microphone,
             1,
             MonoTime::ZERO,
@@ -681,7 +739,7 @@ mod tests {
         assert!(out.contains(&Output::SendControl {
             peer: PEER,
             msg: ControlMessage::AudioRefused {
-                stream: AudioStreamId(2),
+                stream: AudioStreamId(4),
                 reason: Refusal::Busy
             }
         }));

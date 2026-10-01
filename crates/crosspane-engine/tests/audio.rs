@@ -23,6 +23,7 @@ fn ms(n: u64) -> MonoTime {
 fn run(e: &mut Engine, i: Input) -> Vec<Output> {
     e.handle(i, ms(0))
 }
+/// The production configuration: speakers only, microphones unsupported (WP-3.0b).
 fn engine(node: NodeId) -> Engine {
     let (mut e, _) = Engine::new(
         EngineConfig::new(node),
@@ -33,6 +34,15 @@ fn engine(node: NodeId) -> Engine {
     .unwrap();
     run(&mut e, unlocked());
     e
+}
+/// Synthetic positive microphone tests enable support explicitly; production never does.
+fn mic_engine(node: NodeId) -> Engine {
+    let mut e = engine(node);
+    assert!(only(run(&mut e, microphones(true))).is_empty());
+    e
+}
+fn microphones(available: bool) -> Input {
+    Input::AudioMicrophoneSupport { available }
 }
 fn unlocked() -> Input {
     Input::Session(SessionEvent::State(SessionState {
@@ -64,7 +74,15 @@ fn grants(peers: &[NodeId]) -> Input {
             .collect(),
     )
 }
+/// A connected, fully granted engine with the synthetic microphone support enabled.
 fn prepared() -> Engine {
+    let mut e = mic_engine(LOCAL);
+    connect(&mut e, PEER);
+    run(&mut e, grants(&[PEER]));
+    e
+}
+/// The same, in the production configuration: microphones unsupported.
+fn speaker_only() -> Engine {
     let mut e = engine(LOCAL);
     connect(&mut e, PEER);
     run(&mut e, grants(&[PEER]));
@@ -230,7 +248,7 @@ fn devices_only_after_authenticated_feature_negotiation() {
 fn both_kinds_both_directions_and_both_id_parities() {
     for local in [LOCAL, OTHER] {
         for kind in KINDS {
-            let mut e = engine(local);
+            let mut e = mic_engine(local);
             connect(&mut e, PEER);
             run(&mut e, grants(&[PEER]));
             let out = run(&mut e, activity(PEER, kind, true));
@@ -266,7 +284,7 @@ fn both_kinds_both_directions_and_both_id_parities() {
 #[test]
 fn default_off_unnegotiated_invalid_and_replayed_requests_cannot_capture() {
     for kind in KINDS {
-        let mut e = engine(LOCAL);
+        let mut e = mic_engine(LOCAL);
         refused(&run(&mut e, open(PEER, 2, kind)), Refusal::Permission);
         run(&mut e, Input::PeerUp { peer: PEER });
         run(&mut e, grants(&[PEER]));
@@ -588,7 +606,7 @@ fn timed_hotkey_engine_gate_stops_audio() {
 #[test]
 fn reciprocal_and_peer_scoped_streams_cannot_cross_close() {
     let mut a = prepared();
-    let mut b = engine(PEER);
+    let mut b = mic_engine(PEER);
     connect(&mut b, LOCAL);
     run(&mut b, grants(&[LOCAL]));
     let sa = outgoing(&run(&mut a, activity(PEER, AudioKind::Microphone, true)));
@@ -644,8 +662,12 @@ fn reconnect_generations_isolate_old_indicator_and_device_callbacks() {
             }),
         );
         connect(&mut e, PEER);
-        let new = key(&run(&mut e, open(PEER, 2, kind)));
+        // The old wire ID is rejected for the rest of the process (WP-3.0b); a higher one is
+        // admitted with a fresh generation.
+        refused(&run(&mut e, open(PEER, 2, kind)), Refusal::Permission);
+        let new = key(&run(&mut e, open(PEER, 4, kind)));
         assert_ne!(old, new);
+        assert_ne!(old.stream, new.stream);
         assert!(new.generation > old.generation);
         assert!(only(run(&mut e, shown(old, true))).is_empty());
         assert!(only(run(&mut e, shown(old, false))).is_empty());
@@ -903,7 +925,7 @@ fn distinct_oversubscribed_and_wrong_parity_opens_preserve_valid_sessions() {
 fn unknown_and_unnegotiated_virtual_activity_cannot_poison_first_device_demand() {
     for kind in KINDS {
         for peer_up in [false, true] {
-            let mut e = engine(LOCAL);
+            let mut e = mic_engine(LOCAL);
             if peer_up {
                 run(&mut e, Input::PeerUp { peer: PEER });
             }
@@ -965,9 +987,8 @@ fn removed_devices_allow_fresh_demand_without_an_old_inactive_event() {
                     })
                 );
                 let new = outgoing(&run(&mut e, activity(PEER, kind, true)));
-                if !link_down {
-                    assert!(new.0 > old.0);
-                }
+                // Neither a device removal nor a real disconnect reuses an ID (WP-3.0b).
+                assert!(new.0 > old.0);
                 assert!(only(run(&mut e, activity(PEER, kind, true))).is_empty());
                 let out = run(
                     &mut e,
@@ -1161,7 +1182,7 @@ fn remote_grant_revocation_stops_outgoing_pending_and_active_without_restart() {
 fn local_grants_remove_only_applicable_kinds() {
     // Outgoing use is authorized by the remote engine; unrelated local grant snapshots
     // do not require granting the remote peer our own physical devices.
-    let mut ungranted = engine(LOCAL);
+    let mut ungranted = mic_engine(LOCAL);
     connect(&mut ungranted, PEER);
     let stream = outgoing(&run(
         &mut ungranted,
@@ -1192,4 +1213,674 @@ fn local_grants_remove_only_applicable_kinds() {
         microphones: vec![],
         speakers: vec![speaker]
     }));
+}
+
+// ---- WP-3.6b: identity counters, connection replacement, stream failure, microphones ----------
+
+fn phases(kind: AudioKind) -> &'static [u8] {
+    // 0: pending indicator (microphone only), 1: opening the device, 2: active.
+    if kind == AudioKind::Microphone {
+        &[0, 1, 2]
+    } else {
+        &[1, 2]
+    }
+}
+fn incoming_at(e: &mut Engine, id: u16, kind: AudioKind, phase: u8) -> AudioKey {
+    let k = key(&run(e, open(PEER, id, kind)));
+    if kind == AudioKind::Microphone && phase > 0 {
+        run(e, shown(k, true));
+    }
+    if phase == 2 {
+        run(e, done(k, kind, Ok(())));
+    }
+    k
+}
+fn stops(out: &[Output]) -> Vec<AudioKey> {
+    out.iter()
+        .filter_map(|o| match o {
+            Output::StopAudioStream { key } => Some(*key),
+            _ => None,
+        })
+        .collect()
+}
+fn sent_close(out: &[Output], stream: AudioStreamId) -> bool {
+    out.contains(&Output::SendControl {
+        peer: PEER,
+        msg: ControlMessage::AudioClose { stream },
+    })
+}
+fn device_close(key: AudioKey, kind: AudioKind) -> Output {
+    if kind == AudioKind::Microphone {
+        Output::CloseAudioCapture { key }
+    } else {
+        Output::CloseAudioPlayback { key }
+    }
+}
+fn started_key(out: &[Output]) -> AudioKey {
+    out.iter()
+        .find_map(|o| match o {
+            Output::StartAudioStream { key, .. } => Some(*key),
+            _ => None,
+        })
+        .unwrap()
+}
+fn no_indicator_or_capture(out: &[Output]) {
+    assert!(!out.iter().any(|o| matches!(
+        o,
+        Output::AudioIndicators { .. }
+            | Output::OpenAudioCapture { .. }
+            | Output::CloseAudioCapture { .. }
+            | Output::StartAudioStream { .. }
+            | Output::Notice(Notice::MicInUseBy(_))
+    )));
+}
+fn no_audio_output(out: &[Output]) {
+    assert!(
+        !out.iter().any(audio_output),
+        "unexpected audio output: {out:?}"
+    );
+}
+fn disconnect(e: &mut Engine, peer: NodeId) -> Vec<Output> {
+    run(
+        e,
+        Input::Link(LinkEvent::Closed {
+            peer,
+            error: LinkError::Closed,
+        }),
+    )
+}
+
+#[test]
+fn production_refuses_microphones_in_both_directions_without_any_device_or_indicator() {
+    let mut e = speaker_only();
+    // A valid incoming microphone ID is consumed and refused as unsupported (InjectorFailed on
+    // the wire), with no indicator, no "in use" notice, no capture open and no stream.
+    let out = run(&mut e, open(PEER, 2, AudioKind::Microphone));
+    refused(&out, Refusal::InjectorFailed);
+    no_indicator_or_capture(&out);
+    assert!(out.contains(&Output::SendControl {
+        peer: PEER,
+        msg: ControlMessage::AudioRefused {
+            stream: AudioStreamId(2),
+            reason: Refusal::InjectorFailed,
+        },
+    }));
+    assert!(stops(&out).is_empty());
+    // The ID was consumed: a replay is a replay, the next valid one is refused as unsupported.
+    refused(
+        &run(&mut e, open(PEER, 2, AudioKind::Microphone)),
+        Refusal::Permission,
+    );
+    let out = run(&mut e, open(PEER, 4, AudioKind::Microphone));
+    refused(&out, Refusal::InjectorFailed);
+    no_indicator_or_capture(&out);
+    // Invalid requests keep their own refusal and consume nothing they should not.
+    refused(
+        &run(&mut e, open(PEER, 5, AudioKind::Microphone)),
+        Refusal::Permission,
+    );
+    refused(
+        &run(
+            &mut e,
+            control(
+                PEER,
+                ControlMessage::AudioOpen {
+                    stream: AudioStreamId(6),
+                    kind: AudioKind::Microphone,
+                    channels: 2,
+                },
+            ),
+        ),
+        Refusal::Permission,
+    );
+    // Without a grant the peer learns nothing about support.
+    run(&mut e, grants(&[]));
+    refused(
+        &run(&mut e, open(PEER, 8, AudioKind::Microphone)),
+        Refusal::Permission,
+    );
+    run(&mut e, grants(&[PEER]));
+    // Speakers are unaffected and still show their usage indicator.
+    let speaker = key(&run(&mut e, open(PEER, 10, AudioKind::Speaker)));
+    assert!(
+        run(&mut e, done(speaker, AudioKind::Speaker, Ok(())))
+            .iter()
+            .any(|o| matches!(o, Output::StartAudioStream { key, .. } if *key == speaker))
+    );
+
+    // Outgoing demand sends no open, consumes no ID and reports the refusal once per edge.
+    let mut e = speaker_only();
+    let out = run(&mut e, activity(PEER, AudioKind::Microphone, true));
+    assert!(!out.iter().any(|o| matches!(
+        o,
+        Output::SendControl {
+            msg: ControlMessage::AudioOpen { .. },
+            ..
+        }
+    )));
+    refused(&out, Refusal::InjectorFailed);
+    // Not a single indicator, in-use notice, capture or stream output on the first edge...
+    no_indicator_or_capture(&out);
+    assert!(only(run(&mut e, activity(PEER, AudioKind::Microphone, true))).is_empty());
+    assert!(only(run(&mut e, activity(PEER, AudioKind::Microphone, false))).is_empty());
+    let out = run(&mut e, activity(PEER, AudioKind::Microphone, true));
+    refused(&out, Refusal::InjectorFailed);
+    // ...nor on the next one.
+    no_indicator_or_capture(&out);
+    assert!(!out.iter().any(|o| matches!(
+        o,
+        Output::SendControl { .. } | Output::StartAudioStream { .. }
+    )));
+    assert_eq!(
+        outgoing(&run(&mut e, activity(PEER, AudioKind::Speaker, true))),
+        AudioStreamId(1)
+    );
+}
+
+#[test]
+fn microphone_support_off_ends_microphone_sessions_keeps_latches_and_speakers() {
+    for phase in phases(AudioKind::Microphone) {
+        for outgoing_active in [false, true] {
+            let mut e = prepared();
+            let mic = incoming_at(&mut e, 2, AudioKind::Microphone, *phase);
+            let speaker = incoming_at(&mut e, 4, AudioKind::Speaker, 2);
+            let mic_out = outgoing(&run(&mut e, activity(PEER, AudioKind::Microphone, true)));
+            if outgoing_active {
+                run(
+                    &mut e,
+                    control(PEER, ControlMessage::AudioOpened { stream: mic_out }),
+                );
+            }
+            let out = run(&mut e, microphones(false));
+            no_start_or_capture(&out);
+            assert!(stops(&out).contains(&mic));
+            assert!(
+                stops(&out)
+                    .iter()
+                    .any(|k| k.stream == mic_out && k.peer == PEER)
+            );
+            assert!(!stops(&out).contains(&speaker));
+            if *phase == 0 {
+                assert!(!out.contains(&Output::CloseAudioCapture { key: mic }));
+            } else {
+                closed(&out, mic, AudioKind::Microphone);
+            }
+            assert!(out.iter().any(|o| matches!(
+                o,
+                Output::Notice(Notice::AudioRefused {
+                    kind: AudioKind::Microphone,
+                    reason: Refusal::InjectorFailed,
+                    ..
+                })
+            )));
+            assert!(sent_close(&out, mic_out));
+            assert!(out.contains(&Output::AudioIndicators {
+                microphones: vec![],
+                speakers: vec![speaker],
+            }));
+            // The demand latch survives: no restart until the app goes inactive, then active.
+            assert!(only(run(&mut e, activity(PEER, AudioKind::Microphone, true))).is_empty());
+            // Stale callbacks for the ended key close its handle and nothing else.
+            assert!(only(run(&mut e, shown(mic, true))).is_empty());
+            assert_eq!(
+                only(run(&mut e, done(mic, AudioKind::Microphone, Ok(())))),
+                vec![Output::CloseAudioCapture { key: mic }]
+            );
+            // Further microphone requests are unsupported; speakers still admit.
+            refused(
+                &run(&mut e, open(PEER, 6, AudioKind::Microphone)),
+                Refusal::InjectorFailed,
+            );
+            // The speaker session survived the whole time and ends only on its own close.
+            let out = run(
+                &mut e,
+                control(
+                    PEER,
+                    ControlMessage::AudioClose {
+                        stream: speaker.stream,
+                    },
+                ),
+            );
+            assert_eq!(stops(&out), vec![speaker]);
+            incoming(&mut e, 8, AudioKind::Speaker, true);
+            run(&mut e, activity(PEER, AudioKind::Microphone, false));
+            let out = run(&mut e, activity(PEER, AudioKind::Microphone, true));
+            refused(&out, Refusal::InjectorFailed);
+            no_indicator_or_capture(&out);
+            assert!(!out.iter().any(|o| matches!(o, Output::SendControl { .. })));
+            // Enabling support again restarts nothing by itself, but allows deliberate new use.
+            assert!(only(run(&mut e, microphones(true))).is_empty());
+            assert!(only(run(&mut e, activity(PEER, AudioKind::Microphone, true))).is_empty());
+            run(&mut e, activity(PEER, AudioKind::Microphone, false));
+            assert!(
+                outgoing(&run(&mut e, activity(PEER, AudioKind::Microphone, true))).0 > mic_out.0
+            );
+            incoming(&mut e, 10, AudioKind::Microphone, true);
+        }
+    }
+}
+
+#[test]
+fn replacement_ends_every_session_but_keeps_availability_counters_and_demand() {
+    for kind in KINDS {
+        for phase in phases(kind) {
+            for outgoing_active in [false, true] {
+                let mut e = prepared();
+                connect(&mut e, OTHER);
+                run(&mut e, grants(&[PEER, OTHER]));
+                let bystander = key(&run(&mut e, open(OTHER, 2, AudioKind::Speaker)));
+                let old = incoming_at(&mut e, 2, kind, *phase);
+                let stream = outgoing(&run(&mut e, activity(PEER, kind, true)));
+                if outgoing_active {
+                    run(
+                        &mut e,
+                        control(PEER, ControlMessage::AudioOpened { stream }),
+                    );
+                }
+                let out = run(&mut e, Input::AudioConnectionReplaced { peer: PEER });
+                let stopped = stops(&out);
+                assert_eq!(stopped.len(), 2, "{out:?}");
+                assert!(stopped.contains(&old));
+                let outgoing_key = *stopped.iter().find(|k| k.stream == stream).unwrap();
+                assert!(!stopped.contains(&bystander));
+                if *phase == 0 {
+                    // No physical capture was ever opened for a pending indicator.
+                    assert!(
+                        !out.iter()
+                            .any(|o| matches!(o, Output::CloseAudioCapture { .. }))
+                    );
+                } else {
+                    closed(&out, old, kind);
+                }
+                // The final indicator state lists only the bystander peer's usage.
+                let last = out.iter().rev().find_map(|o| match o {
+                    Output::AudioIndicators {
+                        microphones,
+                        speakers,
+                    } => Some((microphones.clone(), speakers.clone())),
+                    _ => None,
+                });
+                assert_eq!(last, Some((vec![], vec![bystander])));
+                assert!(sent_close(&out, old.stream));
+                assert!(sent_close(&out, stream));
+                // Silent: no refusal notice, no availability change, nothing starts.
+                assert!(!out.iter().any(|o| matches!(
+                    o,
+                    Output::Notice(Notice::AudioRefused { .. })
+                        | Output::AddAudioPeer { .. }
+                        | Output::RemoveAudioPeer { .. }
+                )));
+                no_start_or_capture(&out);
+                // Callbacks and responses of the replaced connection cannot restart anything.
+                assert!(only(run(&mut e, shown(old, true))).is_empty());
+                assert_eq!(
+                    only(run(&mut e, done(old, kind, Ok(())))),
+                    vec![device_close(old, kind)]
+                );
+                no_start_or_capture(&run(
+                    &mut e,
+                    control(PEER, ControlMessage::AudioOpened { stream }),
+                ));
+                // Availability is untouched; demand and identity counters are retained.
+                assert!(only(run(&mut e, feature(PEER, true))).is_empty());
+                assert!(only(run(&mut e, activity(PEER, kind, true))).is_empty());
+                refused(&run(&mut e, open(PEER, 2, kind)), Refusal::Permission);
+                let fresh = key(&run(&mut e, open(PEER, 4, kind)));
+                assert!(fresh.generation > old.generation);
+                assert!(fresh.generation > outgoing_key.generation);
+                assert!(fresh.generation > bystander.generation);
+                // The bystander peer's session is still live and ends only on its own events.
+                let out = run(
+                    &mut e,
+                    control(
+                        OTHER,
+                        ControlMessage::AudioClose {
+                            stream: bystander.stream,
+                        },
+                    ),
+                );
+                assert_eq!(stops(&out), vec![bystander]);
+                // After an inactive/active edge, the next ID continues past the replaced one.
+                run(&mut e, activity(PEER, kind, false));
+                assert_eq!(
+                    outgoing(&run(&mut e, activity(PEER, kind, true))),
+                    AudioStreamId(stream.0 + 2)
+                );
+            }
+        }
+    }
+    // Nothing to end: silent, including for unknown peers.
+    let mut e = prepared();
+    for peer in [PEER, OTHER] {
+        assert!(run(&mut e, Input::AudioConnectionReplaced { peer }).is_empty());
+    }
+}
+
+#[test]
+fn replacement_during_handshake_opening_and_active_never_restarts_without_a_new_edge() {
+    for kind in KINDS {
+        let mut e = prepared();
+        let stream = outgoing(&run(&mut e, activity(PEER, kind, true)));
+        // Handshake: replaced before the peer answered; the late answer is refused.
+        let out = run(&mut e, Input::AudioConnectionReplaced { peer: PEER });
+        assert_eq!(stops(&out).len(), 1);
+        assert!(sent_close(&out, stream));
+        no_start_or_capture(&run(
+            &mut e,
+            control(PEER, ControlMessage::AudioOpened { stream }),
+        ));
+        // Repeated active after replacement does not restart; inactive then active does.
+        assert!(only(run(&mut e, activity(PEER, kind, true))).is_empty());
+        run(&mut e, activity(PEER, kind, false));
+        let next = outgoing(&run(&mut e, activity(PEER, kind, true)));
+        assert_eq!(next.0, stream.0 + 2);
+        let out = run(
+            &mut e,
+            control(PEER, ControlMessage::AudioOpened { stream: next }),
+        );
+        let active = started_key(&out);
+        // Active: replaced again; the second replacement is idempotent.
+        let out = run(&mut e, Input::AudioConnectionReplaced { peer: PEER });
+        assert_eq!(stops(&out), vec![active]);
+        assert!(only(run(&mut e, Input::AudioConnectionReplaced { peer: PEER })).is_empty());
+        assert!(only(run(&mut e, activity(PEER, kind, true))).is_empty());
+    }
+}
+
+#[test]
+fn real_disconnect_reconnect_uses_larger_ids_and_stale_messages_cannot_touch_new_keys() {
+    for kind in KINDS {
+        let mut e = prepared();
+        let old_in = incoming(&mut e, 2, kind, true);
+        let old_out = outgoing(&run(&mut e, activity(PEER, kind, true)));
+        let out = disconnect(&mut e, PEER);
+        assert!(out.contains(&Output::RemoveAudioPeer { peer: PEER }));
+        closed(&out, old_in, kind);
+        assert!(stops(&out).iter().any(|k| k.stream == old_out));
+        // Availability needs a new link: an AudioPeer with no PeerUp is not trusted, and demand
+        // from a removed device cannot latch.
+        assert!(only(run(&mut e, feature(PEER, true))).is_empty());
+        assert!(only(run(&mut e, activity(PEER, kind, true))).is_empty());
+        refused(&run(&mut e, open(PEER, 4, kind)), Refusal::Permission);
+        run(&mut e, Input::PeerUp { peer: PEER });
+        assert!(
+            run(&mut e, feature(PEER, true)).contains(&Output::AddAudioPeer {
+                peer: PEER,
+                name: "display text".into(),
+            })
+        );
+        // Outgoing IDs continue upward; the old ID is never allocated again.
+        let new_out = outgoing(&run(&mut e, activity(PEER, kind, true)));
+        assert!(new_out.0 > old_out.0);
+        // Incoming: the old ID and every lower one are replays; a higher one is admitted.
+        refused(&run(&mut e, open(PEER, 2, kind)), Refusal::Permission);
+        // (ID 4 above arrived while disconnected, so it was neither consumed nor admitted.)
+        let new_in = key(&run(&mut e, open(PEER, 4, kind)));
+        assert!(new_in.generation > old_in.generation);
+        assert_ne!(new_in.stream, old_in.stream);
+        // Stale controls and completions of the old streams cannot affect the new keys.
+        let out = run(
+            &mut e,
+            control(PEER, ControlMessage::AudioOpened { stream: old_out }),
+        );
+        no_start_or_capture(&out);
+        assert!(stops(&out).is_empty());
+        for msg in [
+            ControlMessage::AudioClose { stream: old_out },
+            ControlMessage::AudioClose {
+                stream: old_in.stream,
+            },
+            ControlMessage::AudioRefused {
+                stream: old_out,
+                reason: Refusal::Permission,
+            },
+        ] {
+            assert!(stops(&run(&mut e, control(PEER, msg))).is_empty());
+        }
+        assert!(only(run(&mut e, shown(old_in, true))).is_empty());
+        assert!(only(run(&mut e, shown(old_in, false))).is_empty());
+        assert_eq!(
+            only(run(&mut e, done(old_in, kind, Ok(())))),
+            vec![device_close(old_in, kind)]
+        );
+        assert!(only(run(&mut e, done(old_in, kind, Err(Failure::Other)))).is_empty());
+        assert!(only(run(&mut e, Input::AudioStreamFailed { key: old_in })).is_empty());
+        // The new sessions complete normally.
+        if kind == AudioKind::Microphone {
+            assert_eq!(
+                only(run(&mut e, shown(new_in, true))),
+                vec![Output::OpenAudioCapture { key: new_in }]
+            );
+        }
+        assert!(
+            run(&mut e, done(new_in, kind, Ok(())))
+                .iter()
+                .any(|o| matches!(o, Output::StartAudioStream { key, .. } if *key == new_in))
+        );
+        assert!(
+            run(
+                &mut e,
+                control(PEER, ControlMessage::AudioOpened { stream: new_out })
+            )
+            .iter()
+            .any(|o| matches!(o, Output::StartAudioStream { key, .. } if key.stream == new_out))
+        );
+    }
+}
+
+#[test]
+fn stream_ids_never_wrap_across_reconnects_and_replacements() {
+    for local in [LOCAL, OTHER] {
+        let first = if local < PEER { 1 } else { 2 };
+        let last = if local < PEER { 65_535 } else { 65_534 };
+        let mut e = engine(local);
+        connect(&mut e, PEER);
+        run(&mut e, grants(&[PEER]));
+        let mut previous = 0u16;
+        let mut rounds = 0u32;
+        loop {
+            let out = run(&mut e, activity(PEER, AudioKind::Speaker, true));
+            let Some(stream) = out.iter().find_map(|o| match o {
+                Output::SendControl {
+                    msg: ControlMessage::AudioOpen { stream, .. },
+                    ..
+                } => Some(*stream),
+                _ => None,
+            }) else {
+                // Exhausted: refused as Busy, nothing sent.
+                assert!(out.iter().any(|o| matches!(
+                    o,
+                    Output::Notice(Notice::AudioRefused {
+                        reason: Refusal::Busy,
+                        ..
+                    })
+                )));
+                assert!(!out.iter().any(|o| matches!(o, Output::SendControl { .. })));
+                break;
+            };
+            // Strictly ascending in this node's parity namespace, with no ID skipped or reused.
+            assert_eq!(stream.0, if previous == 0 { first } else { previous + 2 });
+            previous = stream.0;
+            rounds += 1;
+            if rounds.is_multiple_of(1_000) {
+                // A real disconnect and reconnect keep the counters.
+                disconnect(&mut e, PEER);
+                run(&mut e, Input::PeerUp { peer: PEER });
+                run(&mut e, feature(PEER, true));
+            } else if rounds.is_multiple_of(7) {
+                // A silent replacement while the open is pending keeps them too.
+                run(&mut e, Input::AudioConnectionReplaced { peer: PEER });
+                run(&mut e, activity(PEER, AudioKind::Speaker, false));
+            } else {
+                run(&mut e, activity(PEER, AudioKind::Speaker, false));
+            }
+        }
+        assert_eq!(previous, last);
+        // Exhaustion is permanent: further demand, after a reconnect or replacement, is
+        // still refused and never wraps back to a used ID.
+        for reconnect in [false, true] {
+            if reconnect {
+                disconnect(&mut e, PEER);
+                run(&mut e, Input::PeerUp { peer: PEER });
+                run(&mut e, feature(PEER, true));
+            } else {
+                run(&mut e, Input::AudioConnectionReplaced { peer: PEER });
+            }
+            run(&mut e, activity(PEER, AudioKind::Speaker, false));
+            let out = run(&mut e, activity(PEER, AudioKind::Speaker, true));
+            assert!(!out.iter().any(|o| matches!(o, Output::SendControl { .. })));
+            refused(&out, Refusal::Busy);
+        }
+    }
+    // The remote namespace: the highest ID is admitted once; no ID, however low, is ever
+    // admitted again after reconnecting.
+    let mut e = prepared();
+    let highest = incoming(&mut e, 65_534, AudioKind::Speaker, true);
+    disconnect(&mut e, PEER);
+    connect(&mut e, PEER);
+    for id in [2, 4, 65_532, 65_534] {
+        refused(
+            &run(&mut e, open(PEER, id, AudioKind::Speaker)),
+            Refusal::Permission,
+        );
+    }
+    assert_eq!(
+        only(run(&mut e, done(highest, AudioKind::Speaker, Ok(())))),
+        vec![Output::CloseAudioPlayback { key: highest }]
+    );
+}
+
+#[test]
+fn stream_failure_ends_only_the_matching_admission_with_injector_failed() {
+    for kind in KINDS {
+        for phase in phases(kind) {
+            let mut e = prepared();
+            let k = incoming_at(&mut e, 2, kind, *phase);
+            let pending = outgoing(&run(&mut e, activity(PEER, kind, true)));
+            // Wrong generation, peer or stream: no effect at all.
+            for stale in [
+                AudioKey {
+                    generation: k.generation + 1,
+                    ..k
+                },
+                AudioKey {
+                    generation: k.generation - 1,
+                    ..k
+                },
+                AudioKey { peer: OTHER, ..k },
+                AudioKey {
+                    stream: AudioStreamId(8),
+                    ..k
+                },
+            ] {
+                no_audio_output(&run(&mut e, Input::AudioStreamFailed { key: stale }));
+            }
+            let out = run(&mut e, Input::AudioStreamFailed { key: k });
+            assert_eq!(stops(&out), vec![k], "{out:?}");
+            assert!(out.iter().any(|o| matches!(o,
+                Output::Notice(Notice::AudioRefused { peer: PEER, kind: nk, reason: Refusal::InjectorFailed })
+                    if *nk == kind)));
+            if *phase == 0 {
+                assert!(
+                    !out.iter()
+                        .any(|o| matches!(o, Output::CloseAudioCapture { .. }))
+                );
+            } else {
+                closed(&out, k, kind);
+            }
+            // Admission that never became active is refused on the wire; an active one is closed.
+            if *phase == 2 {
+                assert!(sent_close(&out, k.stream));
+            } else {
+                assert!(out.contains(&Output::SendControl {
+                    peer: PEER,
+                    msg: ControlMessage::AudioRefused {
+                        stream: k.stream,
+                        reason: Refusal::InjectorFailed,
+                    },
+                }));
+            }
+            no_start_or_capture(&out);
+            // Stale failures are idempotent, and late callbacks of the ended key stay safe.
+            no_audio_output(&run(&mut e, Input::AudioStreamFailed { key: k }));
+            assert!(only(run(&mut e, shown(k, true))).is_empty());
+            assert_eq!(
+                only(run(&mut e, done(k, kind, Ok(())))),
+                vec![device_close(k, kind)]
+            );
+            // The unrelated outgoing request is untouched and still completes.
+            assert!(
+                run(
+                    &mut e,
+                    control(PEER, ControlMessage::AudioOpened { stream: pending })
+                )
+                .iter()
+                .any(
+                    |o| matches!(o, Output::StartAudioStream { key, .. } if key.stream == pending)
+                )
+            );
+            // The slot is free again for a deliberate new request with a larger ID.
+            incoming(&mut e, 4, kind, true);
+        }
+        // An active outgoing session fails the same way and keeps its demand latch.
+        let mut e = prepared();
+        let stream = outgoing(&run(&mut e, activity(PEER, kind, true)));
+        let active = started_key(&run(
+            &mut e,
+            control(PEER, ControlMessage::AudioOpened { stream }),
+        ));
+        let out = run(&mut e, Input::AudioStreamFailed { key: active });
+        assert_eq!(stops(&out), vec![active]);
+        assert!(sent_close(&out, stream));
+        assert!(out.iter().any(|o| matches!(
+            o,
+            Output::Notice(Notice::AudioRefused {
+                reason: Refusal::InjectorFailed,
+                ..
+            })
+        )));
+        assert!(!out.iter().any(|o| matches!(
+            o,
+            Output::CloseAudioCapture { .. }
+                | Output::CloseAudioPlayback { .. }
+                | Output::AudioIndicators { .. }
+        )));
+        no_audio_output(&run(&mut e, Input::AudioStreamFailed { key: active }));
+        assert!(only(run(&mut e, activity(PEER, kind, true))).is_empty());
+        // A failure of the old key cannot end the next session of the same peer and kind.
+        run(&mut e, activity(PEER, kind, false));
+        let next = outgoing(&run(&mut e, activity(PEER, kind, true)));
+        let next_key = started_key(&run(
+            &mut e,
+            control(PEER, ControlMessage::AudioOpened { stream: next }),
+        ));
+        assert!(next_key.generation > active.generation);
+        no_audio_output(&run(&mut e, Input::AudioStreamFailed { key: active }));
+        assert_eq!(
+            stops(&run(&mut e, Input::AudioStreamFailed { key: next_key })),
+            vec![next_key]
+        );
+    }
+}
+
+#[test]
+fn replay_and_hello_refresh_events_do_not_disturb_the_engine() {
+    // The engine consumes only the agent's translation of a refresh (AudioConnectionReplaced);
+    // the raw transport event is ignored here (WP-3.6 handles it).
+    let mut e = prepared();
+    let k = incoming(&mut e, 2, AudioKind::Speaker, true);
+    let out = run(
+        &mut e,
+        Input::Link(LinkEvent::HelloRefresh {
+            peer: PEER,
+            hello: crosspane_protocol::msg::Hello {
+                minor: 0,
+                name: "peer".into(),
+                features: vec!["audio".into()],
+                displays: Vec::new(),
+            },
+        }),
+    );
+    no_audio_output(&out);
+    assert!(!stops(&out).contains(&k));
 }

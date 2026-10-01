@@ -11,7 +11,9 @@ use std::time::Duration;
 use crosspane_protocol::ALPN;
 use crosspane_protocol::link::{LinkEvent, LinkEventSink};
 use crosspane_protocol::msg::{ControlMessage, Hello, InputMessage};
-use crosspane_protocol::wire::{encode_control, encode_input};
+use crosspane_protocol::wire::{
+    FrameDecoder, MAX_CONTROL_PAYLOAD, decode_control, encode_control, encode_input,
+};
 use crosspane_security::identity::DeviceIdentity;
 use crosspane_transport::{PinStore, Transport, TransportConfig};
 use crosspane_types::hid::HidUsage;
@@ -586,5 +588,102 @@ pub fn node_with_hello(
         id: identity.node(),
         identity,
         events,
+    }
+}
+
+/// A `Hello` advertising exactly `features`.
+pub fn hello_with(name: &str, features: &[&str]) -> Hello {
+    Hello {
+        features: features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect(),
+        ..hello(name)
+    }
+}
+
+/// An encoded `Hello` control frame advertising exactly `features`.
+pub fn hello_frame_with(name: &str, features: &[&str]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    encode_control(
+        &ControlMessage::Hello(hello_with(name, features)),
+        &mut frame,
+    )
+    .unwrap();
+    frame
+}
+
+/// An encoded control frame.
+pub fn control_frame(msg: &ControlMessage) -> Vec<u8> {
+    let mut frame = Vec::new();
+    encode_control(msg, &mut frame).unwrap();
+    frame
+}
+
+/// What a raw peer receives from the node it connected to: the node's control stream decoded
+/// message by message. Both of the node's streams are kept open (dropping one would make the node
+/// close the connection), and the `Hello` the node starts with is read by [`RawReceiver::accept`].
+pub struct RawReceiver {
+    control: quinn::RecvStream,
+    _input: quinn::RecvStream,
+    decoder: FrameDecoder,
+}
+
+impl RawReceiver {
+    /// Accept the node's two streams and return the receiver together with the node's `Hello`.
+    pub async fn accept(conn: &quinn::Connection) -> (RawReceiver, Hello) {
+        let mut control = None;
+        let mut input = None;
+        for _ in 0..2 {
+            let mut recv = timeout(WAIT, conn.accept_uni())
+                .await
+                .expect("the node never opened its streams")
+                .unwrap();
+            let mut kind = [0u8; 1];
+            recv.read_exact(&mut kind).await.unwrap();
+            match kind[0] {
+                0x01 => control = Some(recv),
+                0x02 => input = Some(recv),
+                other => panic!("unexpected stream type {other:#x}"),
+            }
+        }
+        let mut receiver = RawReceiver {
+            control: control.expect("no control stream"),
+            _input: input.expect("no input stream"),
+            decoder: FrameDecoder::new(MAX_CONTROL_PAYLOAD),
+        };
+        match receiver.next().await {
+            ControlMessage::Hello(hello) => (receiver, hello),
+            other => panic!("expected the node's hello first, got {other:?}"),
+        }
+    }
+
+    async fn read_message(&mut self) -> ControlMessage {
+        loop {
+            if let Some(frame) = self.decoder.next_frame().unwrap() {
+                return decode_control(&frame).unwrap();
+            }
+            let chunk = self
+                .control
+                .read_chunk(4096, true)
+                .await
+                .unwrap()
+                .expect("the control stream ended");
+            self.decoder.push(&chunk.bytes);
+        }
+    }
+
+    /// The next control message the node sent.
+    pub async fn next(&mut self) -> ControlMessage {
+        timeout(WAIT, self.read_message())
+            .await
+            .expect("timed out waiting for a control message")
+    }
+
+    /// Assert the node sends no control message for `duration`.
+    pub async fn expect_quiet(&mut self, duration: Duration) {
+        if let Ok(msg) = timeout(duration, self.read_message()).await {
+            panic!("unexpected control message: {msg:?}");
+        }
     }
 }

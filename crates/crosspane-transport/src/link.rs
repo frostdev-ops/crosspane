@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use crosspane_protocol::audio::{AudioPacket, encode_audio};
+use crosspane_protocol::audio::{AudioPacket, encode_audio, grants_for_features};
 use crosspane_protocol::link::{LinkError, PeerLink};
 use crosspane_protocol::msg::{ControlMessage, InputMessage, PointerMessage};
 use crosspane_protocol::wire::{WireError, encode_control, encode_input, encode_pointer};
@@ -34,6 +34,23 @@ const INPUT_QUEUE_CAP: usize = 1024 * 1024;
 const CONTROL_QUEUE_CAP: usize = 8 * 1024 * 1024;
 /// How long a graceful close waits for queued data to be acknowledged.
 pub(crate) const FLUSH_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The `Hello.features` entry that negotiates audio (D8), and the static reason audio is refused
+/// on a connection that did not negotiate it.
+const AUDIO_FEATURE: &str = "audio";
+pub(crate) const AUDIO_UNAVAILABLE: &str = "audio is unavailable";
+
+/// The control messages that belong to the audio feature: only a connection whose Hello exchange
+/// negotiated audio (both sides advertised it) may carry them, in either direction.
+pub(crate) fn is_audio_control(msg: &ControlMessage) -> bool {
+    matches!(
+        msg,
+        ControlMessage::AudioOpen { .. }
+            | ControlMessage::AudioOpened { .. }
+            | ControlMessage::AudioRefused { .. }
+            | ControlMessage::AudioClose { .. }
+    )
+}
 
 /// What a stream's writer task receives.
 pub(crate) enum Out {
@@ -185,6 +202,34 @@ impl ConnTx {
 
     pub(crate) fn queue_control(&self, frame: Vec<u8>) -> Result<(), LinkError> {
         self.queue(&self.control, frame)
+    }
+
+    /// Queue a control message the engine sent, applying what this connection negotiated. Audio
+    /// control messages are refused unless audio is negotiated, and a `Grants` message loses its
+    /// audio capabilities then: a peer without the feature may not know them, and its decoder
+    /// rejects unknown capabilities. Decided here, at the actual enqueue on this connection, so
+    /// a link handle that moved to a surviving connection (a silent supersession) is filtered by
+    /// the survivor's own Hello and never by the connection it replaced.
+    pub(crate) fn send_control(&self, msg: &ControlMessage) -> Result<(), LinkError> {
+        let audio = self.audio_enabled.load(Ordering::Acquire);
+        if is_audio_control(msg) && !audio {
+            return Err(LinkError::Invalid(AUDIO_UNAVAILABLE));
+        }
+        let filtered;
+        let msg = match msg {
+            ControlMessage::Grants(grants) => {
+                let negotiated: Vec<String> = audio
+                    .then(|| AUDIO_FEATURE.to_owned())
+                    .into_iter()
+                    .collect();
+                filtered = ControlMessage::Grants(grants_for_features(grants, &negotiated));
+                &filtered
+            }
+            _ => msg,
+        };
+        let mut frame = Vec::new();
+        encode_control(msg, &mut frame).map_err(invalid)?;
+        self.queue_control(frame)
     }
 
     pub(crate) fn queue_input(&self, frame: Vec<u8>) -> Result<(), LinkError> {
@@ -339,16 +384,14 @@ impl PeerLink for QuicLink {
     fn send_audio(&mut self, packet: &AudioPacket) -> Result<(), LinkError> {
         let tx = self.cell.live()?;
         if !tx.audio_enabled.load(Ordering::Acquire) {
-            return Err(LinkError::Invalid("audio is unavailable"));
+            return Err(LinkError::Invalid(AUDIO_UNAVAILABLE));
         }
         let datagram = encode_audio(packet).map_err(invalid)?;
         tx.send_datagram(datagram)
     }
 
     fn send_control(&mut self, msg: &ControlMessage) -> Result<(), LinkError> {
-        let mut frame = Vec::new();
-        encode_control(msg, &mut frame).map_err(invalid)?;
-        self.cell.live()?.queue_control(frame)
+        self.cell.live()?.send_control(msg)
     }
 
     fn rtt(&self) -> Option<Duration> {

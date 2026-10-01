@@ -23,6 +23,14 @@
 //! So the engine never sees a `Hello` from a connection that is about to be closed as a duplicate,
 //! and never replies on one.
 //!
+//! # Silent supersession
+//!
+//! When a connection takes over a logical link the engine already knows (rule 7, or a peer that
+//! declared the old connection a duplicate), the engine is told neither `Closed` nor a new
+//! `Hello`. The survivor's own first Hello, which may advertise different features, is delivered as
+//! [`LinkEvent::HelloRefresh`] before any later event of that connection. Each logical link has
+//! exactly one ordinary `Hello`, and refused or replaced connections deliver nothing at all.
+//!
 //! # Locking
 //!
 //! Two mutexes, always taken in this order, never held across an `.await`:
@@ -834,21 +842,30 @@ impl Inner {
         }
     }
 
-    /// Deliver a connection's `Hello`, unless the engine already has one for this logical link
-    /// (a duplicate connection resolved in favour of this one).
+    /// Deliver a connection's first `Hello`, as the ordinary `Hello` if the engine has none for this
+    /// logical link yet. If it already has one, `conn_id` is a connection that silently took the
+    /// link over (a duplicate resolved in its favour): its Hello goes out as
+    /// [`LinkEvent::HelloRefresh`], so the engine learns the survivor's features, and always before
+    /// any later event of that connection (the session reads nothing else before its Hello). A
+    /// connection that is no longer the link's current one (refused, replaced, or closed) delivers
+    /// nothing, so a stale connection never produces a refresh.
     pub(crate) fn deliver_hello(&self, peer: NodeId, conn_id: u64, hello: Hello) {
         let _order = lock(&self.emit);
-        let first = match lock(&self.peers).get_mut(&peer) {
+        let event = match lock(&self.peers).get_mut(&peer) {
             Some(entry) if entry.conn_id == conn_id => {
-                !std::mem::replace(&mut entry.announced, true)
+                Some(if std::mem::replace(&mut entry.announced, true) {
+                    LinkEvent::HelloRefresh { peer, hello }
+                } else {
+                    LinkEvent::Control {
+                        peer,
+                        msg: ControlMessage::Hello(hello),
+                    }
+                })
             }
-            _ => false,
+            _ => None,
         };
-        if first {
-            (self.events)(LinkEvent::Control {
-                peer,
-                msg: ControlMessage::Hello(hello),
-            });
+        if let Some(event) = event {
+            (self.events)(event);
         }
     }
 
@@ -913,6 +930,7 @@ pub(crate) fn map_connection_error(error: ConnectionError) -> ConnectFail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::{Node, Raw, hello, identity, wait_until};
 
     const LOW: NodeId = NodeId([1; 32]);
     const HIGH: NodeId = NodeId([9; 32]);
@@ -1017,5 +1035,94 @@ mod tests {
         assert!(activity.silent_for() >= Duration::from_millis(50));
         activity.touch();
         assert!(activity.silent_for() < Duration::from_millis(50));
+    }
+
+    /// A node with one real, registered connection from a raw peer, and that connection's id.
+    async fn registered() -> (Node, Raw, quinn::Connection, NodeId, u64) {
+        // The raw peer has the smaller NodeId, so its connection cannot lose rule 7 and is
+        // visible to the engine at once (a larger client's would be held for a while first).
+        let (one, two) = (identity(), identity());
+        let (local, remote) = if one.node() > two.node() {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        let node = Node::start("node", local.clone(), &[&remote]);
+        let peer = remote.node();
+        let raw = Raw::new();
+        let conn = raw.connect(&remote, &local, node.addr()).await;
+        let inner = node.transport.inner.clone();
+        wait_until("the connection is registered and visible", || {
+            lock(&inner.peers)
+                .get(&peer)
+                .is_some_and(|entry| entry.settled)
+        })
+        .await;
+        let current = lock(&inner.peers).get(&peer).map(|entry| entry.conn_id);
+        (node, raw, conn, peer, current.unwrap())
+    }
+
+    /// Delivery re-checks, under the emit lock, that the connection is still the one carrying the
+    /// peer's link. A connection the registry no longer holds (replaced, refused or closed, with
+    /// traffic still buffered in its reader) must produce no event, no refresh, and no `Closed`,
+    /// and must not use up the link's one ordinary `Hello`.
+    #[tokio::test]
+    async fn an_obsolete_connection_delivers_nothing_and_changes_nothing() {
+        let (mut node, _raw, _conn, peer, current) = registered().await;
+        let inner = node.transport.inner.clone();
+        let ping = LinkEvent::Control {
+            peer,
+            msg: ControlMessage::Ping { t0: 1 },
+        };
+        // Ids the registry does not hold: never issued, and one issued after the current one.
+        for obsolete in [0, current + 1, current + 1_000] {
+            inner.deliver(peer, obsolete, ping.clone());
+            inner.deliver(
+                peer,
+                obsolete,
+                LinkEvent::HelloRefresh {
+                    peer,
+                    hello: hello("obsolete"),
+                },
+            );
+            inner.deliver_hello(peer, obsolete, hello("obsolete"));
+            inner.finish(peer, obsolete, LinkError::Closed);
+        }
+        // Every attempt returned, and not one of them reached the engine or touched the registry.
+        node.expect_quiet(Duration::from_millis(100)).await;
+        assert_eq!(
+            lock(&inner.peers).get(&peer).map(|entry| entry.conn_id),
+            Some(current)
+        );
+
+        // The obsolete attempts left the first-Hello state alone: the current connection's Hello
+        // is still the ordinary one, then a refresh, and its other events pass.
+        inner.deliver_hello(peer, current, hello("first"));
+        node.expect_hello(peer, "first").await;
+        inner.deliver_hello(peer, current + 1, hello("obsolete"));
+        inner.deliver(peer, current + 1, ping.clone());
+        node.expect_quiet(Duration::from_millis(100)).await;
+        inner.deliver_hello(peer, current, hello("second"));
+        match node.next().await {
+            LinkEvent::HelloRefresh { peer: from, hello } => {
+                assert_eq!(from, peer);
+                assert_eq!(hello.name, "second");
+            }
+            other => panic!("expected a HelloRefresh, got {other:?}"),
+        }
+        inner.deliver(peer, current, ping.clone());
+        assert_eq!(node.next().await, ping);
+        node.expect_quiet(Duration::from_millis(100)).await;
+
+        // Only the connection that is current can end the link.
+        inner.finish(peer, current, LinkError::Closed);
+        match node.next().await {
+            LinkEvent::Closed { peer: from, .. } => assert_eq!(from, peer),
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        // A refresh or event from the now-gone connection is dropped as well.
+        inner.deliver_hello(peer, current, hello("late"));
+        inner.deliver(peer, current, ping);
+        node.expect_quiet(Duration::from_millis(100)).await;
     }
 }

@@ -95,9 +95,35 @@ async fn zero_rtt_is_never_available() {
     }
 }
 
+/// Drain `node`'s events for `quiet` after the last one: at most one `HelloRefresh` from `peer` (a
+/// connection that silently took the link over, WP-3.0b) may appear; a `Closed` or a second
+/// ordinary `Hello` fails the test.
+async fn expect_at_most_one_refresh(
+    node: &mut Node,
+    peer: crosspane_types::id::NodeId,
+    quiet: Duration,
+    round: u32,
+) {
+    use crosspane_protocol::link::LinkEvent;
+
+    let mut refreshes = 0;
+    while let Ok(event) = tokio::time::timeout(quiet, node.events.recv()).await {
+        match event {
+            Some(LinkEvent::HelloRefresh { peer: from, .. }) => {
+                assert_eq!(from, peer, "round {round}");
+                refreshes += 1;
+                assert!(refreshes <= 1, "round {round}: more than one refresh");
+            }
+            other => panic!("round {round}: unexpected event {other:?}"),
+        }
+    }
+}
+
 /// A competing connection that shows up well after the first one settled (so the engines have
-/// already been told about the link) is resolved by rule 7 without the engines noticing: no
-/// `Closed`, no second `Hello`, existing handles keep working, and exactly one connection is left.
+/// already been told about the link) is resolved by rule 7 without the engines noticing a close:
+/// no `Closed`, no second ordinary `Hello` (a connection that takes the link over refreshes the
+/// engine once with `HelloRefresh`), existing handles keep working, and exactly one connection is
+/// left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_competing_connection_takes_over_or_gives_way_silently() {
     use crosspane_protocol::link::LinkEvent;
@@ -139,8 +165,9 @@ async fn a_late_competing_connection_takes_over_or_gives_way_silently() {
                 "round {round}"
             );
 
-            a.expect_quiet(Duration::from_millis(500)).await;
-            b.expect_quiet(Duration::from_millis(500)).await;
+            let quiet = Duration::from_millis(500);
+            expect_at_most_one_refresh(&mut a, b.id, quiet, round).await;
+            expect_at_most_one_refresh(&mut b, a.id, quiet, round).await;
             assert_eq!(a.transport.peers(), vec![b.id], "round {round}");
             assert_eq!(b.transport.peers(), vec![a.id], "round {round}");
             a_link

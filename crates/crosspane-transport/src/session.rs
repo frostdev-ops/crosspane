@@ -32,7 +32,7 @@ use crate::hub::{
     Activity, CODE_NORMAL, CODE_PROTOCOL_ERROR, DUPLICATE_GRACE, Inner, MAX_HOLD, Role, SETTLE,
     is_duplicate_close,
 };
-use crate::link::{Out, QueueRx};
+use crate::link::{AUDIO_UNAVAILABLE, Out, QueueRx, is_audio_control};
 use crate::media::{self, Received, STREAM_MEDIA};
 
 /// First byte of a unidirectional stream: the control channel.
@@ -450,7 +450,7 @@ impl Session {
         let event = match datagram.get(..HEADER_LEN).map(|header| header[1]) {
             Some(KIND_AUDIO) => {
                 if !self.audio_enabled.load(Ordering::Acquire) {
-                    return Some(Outcome::Fault("audio is unavailable"));
+                    return Some(Outcome::Fault(AUDIO_UNAVAILABLE));
                 }
                 let Ok(packet) = decode_audio(datagram) else {
                     return Some(Outcome::Fault("malformed audio datagram"));
@@ -568,6 +568,13 @@ impl Session {
                 Ok(ControlMessage::Hello(_)) => return Some(Outcome::Fault("second hello")),
                 Ok(_) if !self.hello_seen => {
                     return Some(Outcome::Fault("first control message was not a hello"));
+                }
+                // Audio control messages need audio negotiated on this very connection (both
+                // Hellos advertised it). Anything else is a protocol error, and is not delivered.
+                Ok(msg)
+                    if is_audio_control(&msg) && !self.audio_enabled.load(Ordering::Acquire) =>
+                {
+                    return Some(Outcome::Fault(AUDIO_UNAVAILABLE));
                 }
                 Ok(msg) => self.inner.deliver(
                     self.peer,
