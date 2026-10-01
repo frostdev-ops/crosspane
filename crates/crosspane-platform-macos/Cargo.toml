@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The owner-approved private-API module (D7): CGVirtualDisplay twin-display parking. Off by default.
+private-vdisplay = []
+
 [lints]
 workspace = true
 

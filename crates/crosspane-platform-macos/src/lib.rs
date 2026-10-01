@@ -14,5 +14,7 @@ pub mod main_thread;
 pub mod overlay;
 pub mod parking;
 pub mod permissions;
+#[cfg(feature = "private-vdisplay")]
+pub mod private_vdisplay;
 pub mod session;
 pub mod windows;
