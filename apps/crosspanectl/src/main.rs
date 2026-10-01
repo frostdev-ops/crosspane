@@ -47,6 +47,16 @@ enum Command {
     Forget { peer: String },
     /// Put a peer (name or node-id prefix) on a side of this machine.
     Layout { peer: String, side: Side },
+    /// Place one display on the shared canvas: NODE (this machine's or a peer's name, or a
+    /// node-id prefix), its display id (from `status`), and its top-left corner in millimetres.
+    Place {
+        node: String,
+        display: u32,
+        #[arg(allow_hyphen_values = true)]
+        x_mm: f64,
+        #[arg(allow_hyphen_values = true)]
+        y_mm: f64,
+    },
     /// Connect to a peer at ADDR (host:port) now.
     Dial { addr: String },
     /// List this machine's windows (ids for `project`).
@@ -153,6 +163,15 @@ fn main() -> Result<()> {
             let side = format!("{side:?}").to_lowercase();
             json!({"cmd": "layout", "peer": peer, "side": side})
         }
+        Command::Place {
+            node,
+            display,
+            x_mm,
+            y_mm,
+        } => json!({
+            "cmd": "place",
+            "placements": [{"node": node, "display": display, "origin_mm": [x_mm, y_mm]}],
+        }),
         Command::Dial { addr } => {
             use std::net::ToSocketAddrs;
             let resolved = addr

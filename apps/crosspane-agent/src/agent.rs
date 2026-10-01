@@ -1377,6 +1377,88 @@ impl Agent {
         Ok(())
     }
 
+    /// Place displays at explicit positions (the settings app's layout editor).
+    fn place(&mut self, entries: &[crate::ctl::PlaceEntry]) -> Result<(), String> {
+        if entries.is_empty() {
+            return Err("no placements".into());
+        }
+        let version = self.placements.iter().map(|p| p.version).max().unwrap_or(0) + 1;
+        let mut fresh = Vec::new();
+        for entry in entries {
+            let [x, y] = entry.origin_mm;
+            if !(x.is_finite() && y.is_finite() && x.abs() < 1e6 && y.abs() < 1e6) {
+                return Err(format!("bad position for display {}", entry.display));
+            }
+            let is_self = entry.node == self.name
+                || (!entry.node.is_empty()
+                    && self
+                        .node
+                        .to_string()
+                        .starts_with(&entry.node.to_lowercase()));
+            let node = if is_self {
+                self.node
+            } else {
+                self.find_peer(&entry.node)
+                    .ok_or_else(|| format!("no peer matches {:?}", entry.node))?
+            };
+            let displays = if node == self.node {
+                &self.local_displays
+            } else {
+                &self.peers.get(&node).ok_or("unknown peer")?.displays
+            };
+            if !displays.iter().any(|d| d.id.0 == entry.display) {
+                return Err(format!("{} has no display {}", entry.node, entry.display));
+            }
+            fresh.push(Placement {
+                node,
+                display: crosspane_types::id::DisplayId(entry.display),
+                origin: crosspane_types::geom::PointMm::new(x, y),
+                version,
+            });
+        }
+        // The layout as it would be, checked for overlaps before anything changes.
+        let mut next = self.placements.clone();
+        arrange::merge(&mut next, &fresh);
+        let size = |p: &Placement| {
+            let displays = if p.node == self.node {
+                Some(&self.local_displays)
+            } else {
+                self.peers.get(&p.node).map(|i| &i.displays)
+            };
+            displays
+                .and_then(|ds| ds.iter().find(|d| d.id == p.display))
+                .map(|d| d.geometry.physical_size)
+        };
+        let rects: Vec<_> = next
+            .iter()
+            .filter_map(|p| size(p).map(|s| (p, s)))
+            .collect();
+        for (i, (a, sa)) in rects.iter().enumerate() {
+            for (b, sb) in &rects[i + 1..] {
+                let dx =
+                    (a.origin.x + sa.width).min(b.origin.x + sb.width) - a.origin.x.max(b.origin.x);
+                let dy = (a.origin.y + sa.height).min(b.origin.y + sb.height)
+                    - a.origin.y.max(b.origin.y);
+                // A millimetre of slack: edges that touch are adjacent, not overlapping.
+                if dx > 1.0 && dy > 1.0 {
+                    return Err(format!(
+                        "display {} of {} would overlap display {} of {}",
+                        a.display.0,
+                        self.peer_label(a.node),
+                        b.display.0,
+                        self.peer_label(b.node)
+                    ));
+                }
+            }
+        }
+        self.placements = next;
+        // Explicit side choices from the tray no longer describe the layout.
+        self.tray.sides.clear();
+        self.feed(Input::Layout(self.placements.clone()));
+        self.broadcast(&ControlMessage::Layout(self.explicit()));
+        Ok(())
+    }
+
     fn explicit(&self) -> Vec<Placement> {
         self.placements
             .iter()
@@ -1571,6 +1653,10 @@ impl Agent {
                     Err(e) => Response::err(e),
                 },
             },
+            Request::Place { placements } => match self.place(&placements) {
+                Ok(()) => Response::ok(json!("layout updated")),
+                Err(e) => Response::err(e),
+            },
             Request::Dial { addr } => {
                 self.net.dial(addr);
                 Response::ok(json!(format!("dialing {addr}")))
@@ -1708,6 +1794,16 @@ impl Agent {
                 "connected": info.connected,
                 "rtt_ms": info.rtt.map(|r| r.as_secs_f64() * 1000.0),
                 "displays": info.displays.iter().map(display_json).collect::<Vec<_>>(),
+                "features": info.features,
+                "grants": self.trust.with(|t| t.peers().iter().find(|e| e.node == *node).map(|e| {
+                    e.granted.iter().filter_map(|c| match c {
+                        Capability::InputAccept => Some("input"),
+                        Capability::WindowShare => Some("share"),
+                        Capability::WindowBrowse => Some("browse"),
+                        Capability::WindowPresent => Some("present"),
+                        _ => None,
+                    }).collect::<Vec<_>>()
+                }).unwrap_or_default()),
             })).collect::<Vec<_>>(),
             "layout": self.placements.iter().map(|p| json!({
                 "node": p.node.short(),

@@ -51,6 +51,9 @@ wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wgpu = "30.0.1"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
+# The settings app (crosspane-ui). Same wgpu and winit as crosspane-render. No default_fonts: those
+# are OFL/Ubuntu-font licensed (not in the D5 policy), so the app loads a system font at runtime.
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "wayland"] }
 xkbcommon = "0.9.0"
 zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
 # H.264 on Linux through FFmpeg (WP-2.14b; 09 §2 allows FFmpeg as a thin wrapper).

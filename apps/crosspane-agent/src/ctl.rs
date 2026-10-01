@@ -52,6 +52,13 @@ pub enum Request {
         peer: String,
         side: Side,
     },
+    /// Place displays on the shared canvas (the settings app's layout editor). Each entry names a
+    /// node (this one, or a peer by name or node-id prefix), one of its display ids, and the
+    /// display's top-left corner in millimetres. Displays left out keep their place. Refused if
+    /// any two displays of the resulting layout overlap.
+    Place {
+        placements: Vec<PlaceEntry>,
+    },
     /// Dial a peer address now.
     Dial {
         addr: SocketAddr,
@@ -88,6 +95,13 @@ pub enum Request {
     PairPick {
         index: usize,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlaceEntry {
+    pub node: String,
+    pub display: u32,
+    pub origin_mm: [f64; 2],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
