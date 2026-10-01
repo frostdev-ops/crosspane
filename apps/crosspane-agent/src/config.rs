@@ -22,6 +22,9 @@ pub struct Config {
     pub allow_file_keystore: bool,
     /// Always use the 0600 key file, never the OS key store (several agents on one machine).
     pub force_file_keystore: bool,
+    /// E1 edge crossing from this node. `false` keeps this node's screen edges inert (it can
+    /// still be controlled and project windows).
+    pub crossing: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +42,7 @@ impl Default for Config {
             push_to_cross_ms: 0,
             allow_file_keystore: cfg!(target_os = "macos"),
             force_file_keystore: false,
+            crossing: true,
         }
     }
 }

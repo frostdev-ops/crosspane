@@ -166,6 +166,7 @@ fn run() -> Result<()> {
         host: host.as_ref().map(|(_, handle)| handle.clone()),
         proxy_ids,
         events: tx.clone(),
+        crossing: config.crossing,
     };
     let agent =
         agent::Agent::new(node, config.name, engine, platform, net, trust, local_displays, e2);

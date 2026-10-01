@@ -73,6 +73,7 @@ pub struct Agent {
     streams: HashMap<StreamId, ProjectionId>,
     projections: BTreeMap<ProjectionKey, String>,
     events: Sender<Event>,
+    crossing: bool,
 }
 
 /// The E2 pieces the agent wires in (`media.rs`, the proxy host).
@@ -82,6 +83,8 @@ pub struct E2Wiring {
     pub host: Option<HostHandle>,
     pub proxy_ids: ProxyIds,
     pub events: Sender<Event>,
+    /// `config.crossing`.
+    pub crossing: bool,
 }
 
 const NOTICE_HISTORY: usize = 20;
@@ -120,6 +123,7 @@ impl Agent {
             streams: HashMap::new(),
             projections: BTreeMap::new(),
             events: e2.events,
+            crossing: e2.crossing,
         }
     }
 
@@ -265,6 +269,7 @@ impl Agent {
         }
         match output {
             Output::SetPortals(portals) => {
+                let portals = if self.crossing { portals } else { Vec::new() };
                 if let Some(capture) = &mut self.platform.capture
                     && let Err(e) = capture.set_portals(&portals)
                 {
