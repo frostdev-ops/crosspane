@@ -1223,6 +1223,44 @@ fn destination_grants_open_accept_refusal_and_geometry() {
             parking: ParkingKind::Twin
         }]
     );
+    // The source's content differs from the proxy (an app minimum, say). The proxy follows it,
+    // and reporting that size back is not a new request; a size of the user's own still is.
+    let content = PixelSize::new(size().width + 52, size().height);
+    f.handle(
+        control(
+            A,
+            Message::Geometry {
+                projection: ID,
+                size: content,
+                parking: ParkingKind::Twin,
+            },
+        ),
+        0,
+    );
+    assert!(
+        messages(&f.proxy(
+            ProxyEvent::Resized {
+                size: content,
+                scale: 2.0
+            },
+            100
+        ))
+        .is_empty()
+    );
+    assert_eq!(
+        messages(&f.proxy(
+            ProxyEvent::Resized {
+                size: size(),
+                scale: 2.0
+            },
+            200
+        )),
+        vec![Message::Resize {
+            projection: ID,
+            size: size(),
+            scale: 2.0
+        }]
+    );
     assert_eq!(
         f.handle(
             control(
