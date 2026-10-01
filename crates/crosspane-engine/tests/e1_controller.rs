@@ -2419,3 +2419,370 @@ proptest! {
         }
     }
 }
+
+fn exclusive_engine_with(config: EngineConfig) -> (crosspane_engine::Engine, PortalId) {
+    use crosspane_input::journal::MemoryJournal;
+    let f = Fixture::new(config.clone(), 2);
+    let (mut engine, _) = crosspane_engine::Engine::new(
+        config,
+        Box::new(MemoryJournal::default()),
+        Box::new(MemoryJournal::default()),
+        time(0),
+    )
+    .unwrap();
+    for input in [
+        Input::LocalDisplays(vec![display(1)]),
+        Input::PeerDisplays {
+            peer: B,
+            displays: vec![display(1)],
+        },
+        Input::Layout(vec![
+            Placement {
+                node: A,
+                display: DisplayId(1),
+                origin: PointMm::zero(),
+                version: 1,
+            },
+            Placement {
+                node: B,
+                display: DisplayId(1),
+                origin: PointMm::new(100.0, 0.0),
+                version: 1,
+            },
+        ]),
+        Input::PeerUp { peer: B },
+        Input::Session(SessionEvent::State(PERMITTED)),
+        Input::Grants(BTreeMap::from([(
+            B,
+            BTreeSet::from([crosspane_protocol::msg::Capability::InputAccept]),
+        )])),
+    ] {
+        engine.handle(input, time(0));
+    }
+    (engine, f.portal)
+}
+
+fn incoming_start() -> Input {
+    control(
+        B,
+        ControlMessage::StartControl {
+            session: SessionId(90),
+            entry_display: DisplayId(1),
+            entry: PointDevice::new(500.0, 500.0),
+            lock_keys: LockKeys::default(),
+        },
+    )
+}
+
+fn exclusive_step(engine: &mut crosspane_engine::Engine, input: Input, ms: u64) -> Vec<Output> {
+    let out = engine.handle(input, time(ms));
+    assert!(engine.controlling().is_none() || engine.controlled_by().is_none());
+    if engine.controlled_by().is_some() {
+        assert!(!out.iter().any(|o| matches!(
+            o,
+            Output::BeginCapture { .. }
+                | Output::SendControl {
+                    msg: ControlMessage::StartControl { .. },
+                    ..
+                }
+        )));
+    }
+    out
+}
+
+#[test]
+fn incoming_control_cancels_pending_hud_and_push_without_outgoing_capture() {
+    for push_delay in [0, 100] {
+        let mut cfg = config();
+        cfg.push_to_cross = Duration::from_millis(push_delay);
+        let (mut engine, portal) = exclusive_engine_with(cfg);
+        exclusive_step(
+            &mut engine,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal,
+                position: 0.5,
+                at: time(0),
+            }),
+            0,
+        );
+        let out = exclusive_step(&mut engine, incoming_start(), 1);
+        assert_eq!(engine.controlled_by(), Some(B));
+        if push_delay == 0 {
+            assert!(out.contains(&Output::HideOverlay(HUD)));
+        }
+        exclusive_step(&mut engine, Input::Overlay(OverlayEvent::Visible(HUD)), 2);
+        exclusive_step(&mut engine, Input::Tick, 200);
+        exclusive_step(
+            &mut engine,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal,
+                position: 0.5,
+                at: time(201),
+            }),
+            201,
+        );
+    }
+}
+
+#[test]
+fn incoming_control_cancels_sent_handshake_and_ends_late_acknowledgement() {
+    let (mut engine, portal) = exclusive_engine_with(config());
+    exclusive_step(
+        &mut engine,
+        Input::Capture(CaptureEvent::EdgePressed {
+            portal,
+            position: 0.5,
+            at: time(0),
+        }),
+        0,
+    );
+    let session = start(&exclusive_step(
+        &mut engine,
+        Input::Overlay(OverlayEvent::Visible(HUD)),
+        0,
+    ))
+    .1;
+    let out = exclusive_step(&mut engine, incoming_start(), 1);
+    assert_end(&out, B, session, EndReason::Released);
+    let out = exclusive_step(
+        &mut engine,
+        control(B, ControlMessage::ControlStarted { session }),
+        2,
+    );
+    assert_end(&out, B, session, EndReason::Released);
+    exclusive_step(&mut engine, Input::Overlay(OverlayEvent::Visible(HUD)), 3);
+    exclusive_step(&mut engine, Input::Tick, 200);
+    assert_eq!(engine.controlling(), None);
+    assert_eq!(engine.controlled_by(), Some(B));
+}
+
+#[test]
+fn incoming_control_is_busy_after_outgoing_acknowledgement_and_activation() {
+    let (mut engine, portal) = exclusive_engine_with(config());
+    exclusive_step(
+        &mut engine,
+        Input::Capture(CaptureEvent::EdgePressed {
+            portal,
+            position: 0.5,
+            at: time(0),
+        }),
+        0,
+    );
+    let session = start(&exclusive_step(
+        &mut engine,
+        Input::Overlay(OverlayEvent::Visible(HUD)),
+        0,
+    ))
+    .1;
+    let out = exclusive_step(
+        &mut engine,
+        control(B, ControlMessage::ControlStarted { session }),
+        1,
+    );
+    let capture = out
+        .iter()
+        .find_map(|o| {
+            if let Output::BeginCapture { id, .. } = o {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    for input in [
+        None,
+        Some(Input::CaptureBegun {
+            id: capture,
+            result: Ok(CaptureStart {
+                held_keys: vec![],
+                lock_keys: LockKeys::default(),
+            }),
+        }),
+    ] {
+        if let Some(input) = input {
+            exclusive_step(&mut engine, input, 2);
+        }
+        let out = exclusive_step(&mut engine, incoming_start(), 3);
+        assert!(out.contains(&Output::SendControl {
+            peer: B,
+            msg: ControlMessage::ControlRefused {
+                session: SessionId(90),
+                reason: Refusal::Busy
+            }
+        }));
+        assert_eq!(engine.controlled_by(), None);
+        assert_eq!(engine.controlling(), Some(B));
+    }
+}
+
+#[test]
+fn pointer_return_guards_only_the_return_portal_for_150_ms() {
+    for (delay, crosses) in [(100, false), (200, true)] {
+        let mut f = Fixture::new(config(), 2);
+        let (_, capture) = f.controlling(vec![]);
+        // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+        f.raw(1, 50.0);
+        f.raw(2, -60.0);
+        f.ended(3, capture);
+        let edge = f.edge(0.5);
+        let out = f.feed(2 + delay, edge);
+        assert_eq!(
+            out.iter()
+                .any(|o| matches!(o, Output::ShowOverlay { id, .. } if *id == HUD)),
+            crosses
+        );
+        let out = f.send(Input::Overlay(OverlayEvent::Visible(HUD)));
+        assert_eq!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::SendControl {
+                    msg: ControlMessage::StartControl { .. },
+                    ..
+                }
+            )),
+            crosses
+        );
+    }
+    let mut f = Fixture::new(config(), 3);
+    f.up(C);
+    let placements = vec![
+        Placement {
+            node: A,
+            display: DisplayId(1),
+            origin: PointMm::zero(),
+            version: 1,
+        },
+        Placement {
+            node: B,
+            display: DisplayId(1),
+            origin: PointMm::new(100.0, 0.0),
+            version: 1,
+        },
+        Placement {
+            node: C,
+            display: DisplayId(1),
+            origin: PointMm::new(-100.0, 0.0),
+            version: 1,
+        },
+    ];
+    f.send(Input::Layout(placements.clone()));
+    let layout = Layout::new(
+        placements
+            .iter()
+            .map(|p| Placed {
+                id: GlobalDisplayId {
+                    node: p.node,
+                    display: p.display,
+                },
+                geometry: display(1).geometry,
+                origin: p.origin,
+            })
+            .collect(),
+        config().layout,
+    )
+    .unwrap();
+    f.portal = layout
+        .portals()
+        .iter()
+        .find(|p| p.from.node == A && p.to.node == B)
+        .unwrap()
+        .id;
+    let other = layout
+        .portals()
+        .iter()
+        .find(|p| p.from.node == A && p.to.node == C)
+        .unwrap()
+        .id;
+    let (_, capture) = f.controlling(vec![]);
+    // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+    f.raw(1, 50.0);
+    f.raw(2, -60.0);
+    f.ended(3, capture);
+    f.feed(
+        52,
+        Input::Capture(CaptureEvent::EdgePressed {
+            portal: other,
+            position: 0.5,
+            at: time(52),
+        }),
+    );
+    assert_eq!(
+        start(&f.send(Input::Overlay(OverlayEvent::Visible(HUD)))).0,
+        C
+    );
+}
+
+#[test]
+fn pointer_return_guard_survives_layout_portal_id_reassignment() {
+    let mut f = Fixture::new(config(), 3);
+    f.up(C);
+    let original_id = f.portal;
+    let (_, capture) = f.controlling(vec![]);
+    // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+    f.raw(1, 50.0);
+    f.raw(2, -60.0);
+    f.ended(3, capture);
+
+    // Adding a portal on A's left sorts it before the existing A -> B portal,
+    // reassigning the original ID to A -> C while A -> B remains in place.
+    let placements: Vec<_> = [(A, 0.0), (B, 100.0), (C, -100.0)]
+        .into_iter()
+        .map(|(node, x)| Placement {
+            node,
+            display: DisplayId(1),
+            origin: PointMm::new(x, 0.0),
+            version: 2,
+        })
+        .collect();
+    let layout = Layout::new(
+        placements
+            .iter()
+            .map(|p| Placed {
+                id: GlobalDisplayId {
+                    node: p.node,
+                    display: p.display,
+                },
+                geometry: display(1).geometry,
+                origin: p.origin,
+            })
+            .collect(),
+        config().layout,
+    )
+    .unwrap();
+    f.feed(26, Input::Layout(placements));
+    let guarded = layout
+        .portals()
+        .iter()
+        .find(|p| p.from.node == A && p.to.node == B)
+        .unwrap()
+        .id;
+    let other = layout
+        .portals()
+        .iter()
+        .find(|p| p.from.node == A && p.to.node == C)
+        .unwrap()
+        .id;
+    assert_ne!(guarded, original_id);
+    assert_eq!(other, original_id);
+    let edge = |portal| {
+        Input::Capture(CaptureEvent::EdgePressed {
+            portal,
+            position: 0.5,
+            at: time(52),
+        })
+    };
+    assert!(f.feed(52, edge(guarded)).is_empty());
+    assert!(
+        f.send(Input::Overlay(OverlayEvent::Visible(HUD)))
+            .is_empty()
+    );
+    let out = f.send(edge(other));
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, Output::ShowOverlay { id, .. } if *id == HUD))
+    );
+    assert_eq!(
+        start(&f.send(Input::Overlay(OverlayEvent::Visible(HUD)))).0,
+        C
+    );
+}
