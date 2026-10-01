@@ -5,6 +5,17 @@ root) and is driven with `crosspanectl`. There is no settings UI yet; everything
 
 ## Build
 
+On macOS, install system Opus and select it before a direct Cargo build:
+
+```sh
+brew install opus
+export OPUS_LIB_DIR=${OPUS_LIB_DIR:-$(brew --prefix opus)}
+```
+
+The Mac build and install helpers set this variable automatically. Crosspane.app
+links Homebrew's `/opt/homebrew/opt/opus/lib/libopus.0.dylib` dynamically; the bundle
+does not embed it. Keep Homebrew Opus installed while using the agent.
+
 ```sh
 cargo build --release -p crosspane-agent -p crosspanectl
 ```
@@ -184,4 +195,3 @@ permissions and recent notices.
 - **Video:** H.264 needs a build with `--features video` (FFmpeg 9 on Linux; built in on the Mac);
   without it everything is lossless tiles, which is fine on a wired LAN but heavy for full-screen
   video over Wi-Fi.
-
