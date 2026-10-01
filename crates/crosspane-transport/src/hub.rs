@@ -330,6 +330,7 @@ pub(crate) struct Inner {
     pins: Arc<dyn PinStore>,
     events: LinkEventSink,
     hello_frame: Vec<u8>,
+    pub(crate) local_audio: bool,
     pub(crate) client_config: quinn::ClientConfig,
     next_conn_id: AtomicU64,
     emit: Mutex<()>,
@@ -363,6 +364,7 @@ impl Inner {
         events: LinkEventSink,
         hello_frame: Vec<u8>,
         client_config: quinn::ClientConfig,
+        local_audio: bool,
     ) -> Self {
         Self {
             endpoint,
@@ -370,6 +372,7 @@ impl Inner {
             pins,
             events,
             hello_frame,
+            local_audio,
             client_config,
             next_conn_id: AtomicU64::new(1),
             emit: Mutex::new(()),
@@ -644,6 +647,7 @@ impl Inner {
         let activity = Activity::new();
         activity.touch();
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let audio_enabled = tx.audio_enabled.clone();
         let Some(hold) = self.place(peer, conn_id, client, tx, activity.clone()) else {
             conn.close(VarInt::from_u32(CODE_DUPLICATE), b"duplicate");
             tracing::debug!(peer = %peer.short(), ?role, "duplicate connection refused");
@@ -663,6 +667,7 @@ impl Inner {
             hold,
             role,
             activity,
+            audio_enabled,
         });
         if role == Role::Client {
             self.wait_settled(peer, CONNECT_TIMEOUT).await?;

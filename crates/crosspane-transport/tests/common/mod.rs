@@ -559,3 +559,32 @@ impl CrashablePeer {
             .unwrap();
     }
 }
+
+/// A loopback node with an explicitly configured feature advertisement.
+pub fn node_with_hello(
+    identity: Arc<DeviceIdentity>,
+    pinned: &[&DeviceIdentity],
+    hello: Hello,
+) -> Node {
+    let (tx, events) = unbounded_channel();
+    let transport = Arc::new(
+        Transport::bind(
+            TransportConfig {
+                bind: loopback(),
+                identity: identity.clone(),
+                pins: Pins::of(pinned),
+                hello,
+            },
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        )
+        .unwrap(),
+    );
+    Node {
+        transport,
+        id: identity.node(),
+        identity,
+        events,
+    }
+}
