@@ -49,6 +49,10 @@ pub enum HostCommand {
         hotspot: (u32, u32),
         pixels: Arc<[u8]>,
     },
+    /// Show the platform's default cursor over this proxy (the source can't see its shape).
+    DefaultCursor {
+        id: u64,
+    },
     /// Close every proxy and leave the event loop.
     Shutdown,
     /// Run a closure on the main thread.
@@ -96,6 +100,7 @@ impl fmt::Debug for HostCommand {
                 .field("size", size)
                 .field("hotspot", hotspot)
                 .finish_non_exhaustive(),
+            Self::DefaultCursor { id } => f.debug_struct("DefaultCursor").field("id", id).finish(),
             Self::Shutdown => f.write_str("Shutdown"),
             Self::Run(_) => f.write_str("Run(..)"),
         }
