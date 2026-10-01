@@ -8,6 +8,8 @@ pub mod capture;
 pub mod clock;
 pub mod displays;
 pub mod frame_capture;
+#[cfg(feature = "gpu")]
+pub mod gpu_import;
 pub mod inject;
 pub mod keychain;
 pub mod link;
