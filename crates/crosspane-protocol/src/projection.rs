@@ -99,8 +99,17 @@ pub enum ProjectionMessage {
     },
     /// Destination → source: send a key frame (full frame) next.
     KeyFrameRequest { projection: ProjectionId },
-    /// Either side: the projection is over. The source restores the window (04 §8 invariant 4).
+    /// Source → destination: the projection is over (window closed, returned locally, lock, …).
+    /// The destination closes the proxy.
     End {
+        projection: ProjectionId,
+        reason: ProjectionEndReason,
+    },
+    /// Destination → source: the destination ended the projection (proxy closed by the user, lock,
+    /// …). The source restores the window (04 §8 invariant 4). A separate variant from `End` because
+    /// two nodes can project to each other with equal `ProjectionId`s: `End` always names a
+    /// projection the *sender* is the source of, `Close` one the *receiver* is the source of.
+    Close {
         projection: ProjectionId,
         reason: ProjectionEndReason,
     },
