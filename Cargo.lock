@@ -459,6 +459,7 @@ dependencies = [
  "crosspane-security",
  "crosspane-testkit",
  "crosspane-types",
+ "proptest",
 ]
 
 [[package]]

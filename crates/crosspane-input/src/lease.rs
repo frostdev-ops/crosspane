@@ -188,6 +188,21 @@ impl ControllerLease {
         })
     }
 
+    /// When `lost` will next become true if no acknowledgement arrives: the oldest unacknowledged
+    /// message's send time plus `max(ACK_TIMEOUT_MIN, ACK_TIMEOUT_RTT_FACTOR × rtt)`. `None` when
+    /// nothing is unacknowledged. (Added by the lead for WP-1.22a's `next_deadline`.)
+    pub fn ack_deadline(&self, rtt: Option<Duration>) -> Option<MonoTime> {
+        let timeout = rtt.map_or(ACK_TIMEOUT_MIN, |rtt| {
+            ACK_TIMEOUT_MIN.max(
+                rtt.checked_mul(ACK_TIMEOUT_RTT_FACTOR)
+                    .unwrap_or(Duration::MAX),
+            )
+        });
+        self.unacked
+            .front()
+            .map(|&(_, sent)| sent.saturating_add(timeout))
+    }
+
     /// True when the oldest unacknowledged message was sent more than
     /// `max(ACK_TIMEOUT_MIN, ACK_TIMEOUT_RTT_FACTOR × rtt)` before `now` (`rtt` `None` → the minimum).
     pub fn lost(&self, now: MonoTime, rtt: Option<Duration>) -> bool {

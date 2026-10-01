@@ -20,3 +20,4 @@ crosspane-platform.workspace = true
 
 [dev-dependencies]
 crosspane-testkit.workspace = true
+proptest.workspace = true

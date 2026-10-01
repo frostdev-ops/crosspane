@@ -334,3 +334,20 @@ fn controller_stale_and_unknown_acks_are_ignored() {
     lease.acked(3, time(201));
     assert!(!lease.lost(time(9_000), None));
 }
+
+#[test]
+fn controller_ack_deadline_matches_lost() {
+    use core::time::Duration;
+    let mut lease = ControllerLease::new(time(0));
+    assert_eq!(lease.ack_deadline(None), None);
+    lease.sent(1, time(10));
+    assert_eq!(lease.ack_deadline(None), Some(time(160)));
+    assert_eq!(
+        lease.ack_deadline(Some(Duration::from_millis(100))),
+        Some(time(410))
+    );
+    assert!(!lease.lost(time(160), None));
+    assert!(lease.lost(time(161), None));
+    lease.acked(1, time(20));
+    assert_eq!(lease.ack_deadline(None), None);
+}
