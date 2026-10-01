@@ -1,11 +1,16 @@
 //! CPU reference codec for tightly packed BGRA8 tiles.
 //!
-//! Changes are detected with xxh3-64 over concatenated pixel rows, excluding stride padding.
+//! Changes are detected with xxh3-64 over each tile's concatenated pixel rows, excluding stride
+//! padding. [`TileEncoder::scan`] only hashes; LZ4 runs in [`TileEncoder::emit`] for the tiles it
+//! sends, so a capture that goes out as video costs a scan and a [`TileEncoder::commit`].
 //! A 64-bit hash collision can suppress a change; this is accepted for E2 v0. Periodic key
 //! frames repair it. Encoders belong to one projection; sequence/stale-frame policy is the
 //! caller's responsibility.
 
+use std::sync::Arc;
+
 use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
+
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::wire::{
@@ -22,6 +27,31 @@ pub struct TileEncoder {
     hashes: Vec<u64>,
     frames_since_key: u32,
     key_requested: bool,
+    // Replaced on every successful emit/commit; outstanding scans keep their token alive.
+    generation: Arc<()>,
+}
+
+/// The tile changes of one capture, from [`TileEncoder::scan`]. Hand it to [`TileEncoder::emit`]
+/// or [`TileEncoder::commit`] before the next scan.
+#[derive(Debug)]
+pub struct TileScan {
+    size: PixelSize,
+    hashes: Vec<u64>,
+    changed: u32,
+    generation: Arc<()>,
+}
+
+impl TileScan {
+    /// Tiles that differ from the last committed capture: all of them after a size change or
+    /// before the first commit.
+    pub fn changed(&self) -> u32 {
+        self.changed
+    }
+
+    /// Tiles in the capture.
+    pub fn total(&self) -> u32 {
+        self.hashes.len() as u32
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,27 +70,77 @@ impl TileEncoder {
     /// Only successful calls advance the hashes and periodic-key counter.
     pub fn encode(
         &mut self,
+        header: FrameHeader,
+        pixels: &[u8],
+        stride: u32,
+        force_key: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<EncodeStats>, MediaError> {
+        let scan = self.scan(PixelSize::new(header.width, header.height), pixels, stride)?;
+        self.emit(scan, header, pixels, stride, force_key, out)
+    }
+
+    /// Hash the tiles of a capture (`size` pixels, BGRA8 rows of `stride` bytes; padding after the
+    /// last row need not be supplied) and compare them with the last committed capture. Doesn't
+    /// change the encoder.
+    pub fn scan(
+        &self,
+        size: PixelSize,
+        pixels: &[u8],
+        stride: u32,
+    ) -> Result<TileScan, MediaError> {
+        let (tiles_x, tiles_y) = tile_grid(size.width, size.height)?;
+        validate_pixels(size, pixels, stride)?;
+        let mut hashes = Vec::with_capacity((tiles_x * tiles_y) as usize);
+        let mut changed = 0;
+        // Gathering a tile into this cache-resident buffer and hashing it in one shot measured
+        // faster than streaming the rows through `Xxh3` (0.87 vs 1.13 ms at 3440×1440).
+        let mut tile = Vec::with_capacity((TILE * TILE * 4) as usize);
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let geometry = TileGeometry::for_size(size, tx, ty);
+                tile.clear();
+                for y in geometry.y..geometry.y + geometry.height {
+                    let start = y as usize * stride as usize + geometry.x as usize * 4;
+                    tile.extend_from_slice(&pixels[start..start + geometry.row_bytes()]);
+                }
+                let hash = xxh3_64(&tile);
+                if self.size != Some(size) || self.hashes.get(hashes.len()) != Some(&hash) {
+                    changed += 1;
+                }
+                hashes.push(hash);
+            }
+        }
+        Ok(TileScan {
+            size,
+            hashes,
+            changed,
+            generation: Arc::clone(&self.generation),
+        })
+    }
+
+    /// Encode a scanned capture into `out` (replaced) and commit its hashes. `pixels` and `stride`
+    /// must be the scanned image, and `header.width`/`height` its size. It's a key frame (all
+    /// tiles) when `force_key`, a requested key, a size change or the periodic interval calls for
+    /// one. Otherwise it holds only the changed tiles, and is `Ok(None)` with `out` empty when none
+    /// changed. A scan taken before the last `emit`/`commit`, or of another size than `header`, is
+    /// `Err(MediaError::BadPayload)` and changes nothing.
+    pub fn emit(
+        &mut self,
+        scan: TileScan,
         mut header: FrameHeader,
         pixels: &[u8],
         stride: u32,
         force_key: bool,
         out: &mut Vec<u8>,
     ) -> Result<Option<EncodeStats>, MediaError> {
-        let (tiles_x, tiles_y) = tile_grid(header.width, header.height)?;
-        let row_bytes = header.width as usize * 4;
-        let stride = stride as usize;
-        if stride < row_bytes {
-            return Err(MediaError::BadPayload);
-        }
-        // Padding after the last row is not read and need not be supplied.
-        let required = (header.height as usize - 1)
-            .checked_mul(stride)
-            .and_then(|offset| offset.checked_add(row_bytes))
-            .ok_or(MediaError::BadPayload)?;
-        if pixels.len() < required {
-            return Err(MediaError::BadPayload);
-        }
         let size = PixelSize::new(header.width, header.height);
+        if !Arc::ptr_eq(&scan.generation, &self.generation) || scan.size != size {
+            return Err(MediaError::BadPayload);
+        }
+        let (tiles_x, tiles_y) = tile_grid(header.width, header.height)?;
+        validate_pixels(size, pixels, stride)?;
+        let stride = stride as usize;
         let key = force_key
             || self.key_requested
             || self.size != Some(size)
@@ -69,12 +149,16 @@ impl TileEncoder {
 
         out.clear();
         write_header(header, 0, out);
-        let mut hashes = Vec::with_capacity((tiles_x * tiles_y) as usize);
         let mut tile = Vec::with_capacity((TILE * TILE * 4) as usize);
         let mut count = 0_u32;
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let geometry = TileGeometry::new(header, tx, ty);
+                let index = (ty * tiles_x + tx) as usize;
+                let hash = scan.hashes[index];
+                if !key && self.hashes.get(index) == Some(&hash) {
+                    continue;
+                }
                 tile.clear();
                 for y in geometry.y..geometry.y + geometry.height {
                     // The checked required length above bounds all row offsets, even on 32-bit.
@@ -84,13 +168,6 @@ impl TileEncoder {
                         .ok_or(MediaError::BadPayload)?;
                     tile.extend_from_slice(row);
                 }
-                let hash = xxh3_64(&tile);
-                let changed = key || self.hashes.get(hashes.len()) != Some(&hash);
-                hashes.push(hash);
-                if !changed {
-                    continue;
-                }
-
                 let first_pixel = tile.get(..4).ok_or(MediaError::BadPayload)?;
                 let solid = tile
                     .as_chunks::<4>()
@@ -124,7 +201,8 @@ impl TileEncoder {
             .ok_or(MediaError::Truncated)?
             .copy_from_slice(&count.to_le_bytes());
         self.size = Some(size);
-        self.hashes = hashes;
+        self.hashes = scan.hashes;
+        self.generation = Arc::new(());
         self.key_requested = false;
         self.frames_since_key = if key { 0 } else { self.frames_since_key + 1 };
         if !key && count == 0 {
@@ -138,6 +216,22 @@ impl TileEncoder {
         }))
     }
 
+    /// Commit a scanned capture's hashes without encoding it (it went out as video). It counts
+    /// toward the periodic key frame, and requests a key frame for the next `emit`, because the
+    /// destination's canvas no longer matches. A stale scan (as for `emit`) is
+    /// `Err(MediaError::BadPayload)` and changes nothing.
+    pub fn commit(&mut self, scan: TileScan) -> Result<(), MediaError> {
+        if !Arc::ptr_eq(&scan.generation, &self.generation) {
+            return Err(MediaError::BadPayload);
+        }
+        self.size = Some(scan.size);
+        self.hashes = scan.hashes;
+        self.frames_since_key = self.frames_since_key.saturating_add(1);
+        self.key_requested = true;
+        self.generation = Arc::new(());
+        Ok(())
+    }
+
     /// Force the next successfully encoded frame to contain every tile.
     pub fn request_key(&mut self) {
         self.key_requested = true;
@@ -146,7 +240,7 @@ impl TileEncoder {
 
 #[derive(Debug, Default)]
 pub struct TileDecoder {
-    pixels: Vec<u8>,
+    pixels: Arc<[u8]>,
     size: PixelSize,
 }
 
@@ -230,29 +324,34 @@ impl TileDecoder {
         }
         // Unique in-range indices plus an exact key count prove that every tile is present.
         // All potentially failing operations finish before touching the existing canvas.
-        if header.key {
+        if self.size != size {
             let len = header.width as usize * header.height as usize * 4;
             let mut canvas = Vec::new();
             canvas
                 .try_reserve_exact(len)
                 .map_err(|_| MediaError::TooLarge)?;
             canvas.resize(len, 0);
-            for tile in tiles {
-                tile.apply(&mut canvas, header.width);
-            }
-            self.pixels = canvas;
-            self.size = size;
-        } else {
-            for tile in tiles {
-                tile.apply(&mut self.pixels, header.width);
-            }
+            self.pixels = Arc::from(canvas);
+        } else if Arc::get_mut(&mut self.pixels).is_none() {
+            self.pixels = Arc::from(self.pixels.as_ref());
         }
+        let canvas = Arc::get_mut(&mut self.pixels).ok_or(MediaError::BadPayload)?;
+        for tile in tiles {
+            tile.apply(canvas, header.width);
+        }
+        self.size = size;
         Ok((header, rects))
     }
 
     /// BGRA8 canvas, tightly packed; empty (with size 0×0) before the first key frame.
     pub fn canvas(&self) -> (&[u8], PixelSize) {
         (&self.pixels, self.size)
+    }
+
+    /// The canvas without copying: the same bytes and size as [`TileDecoder::canvas`].
+    /// Copy-on-write: the next `apply` copies the canvas only if a returned `Arc` is still alive.
+    pub fn shared_canvas(&self) -> (Arc<[u8]>, PixelSize) {
+        (Arc::clone(&self.pixels), self.size)
     }
 }
 
@@ -266,13 +365,17 @@ struct TileGeometry {
 impl TileGeometry {
     // Callers have validated dimensions and indices before constructing geometry.
     fn new(header: FrameHeader, tx: u32, ty: u32) -> Self {
+        Self::for_size(PixelSize::new(header.width, header.height), tx, ty)
+    }
+
+    fn for_size(size: PixelSize, tx: u32, ty: u32) -> Self {
         let x = tx * TILE;
         let y = ty * TILE;
         Self {
             x,
             y,
-            width: TILE.min(header.width - x),
-            height: TILE.min(header.height - y),
+            width: TILE.min(size.width - x),
+            height: TILE.min(size.height - y),
         }
     }
 
@@ -336,4 +439,20 @@ impl ValidatedTile<'_> {
             }
         }
     }
+}
+
+fn validate_pixels(size: PixelSize, pixels: &[u8], stride: u32) -> Result<(), MediaError> {
+    let row_bytes = size.width as usize * 4;
+    let stride = stride as usize;
+    if stride < row_bytes {
+        return Err(MediaError::BadPayload);
+    }
+    let required = (size.height as usize - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(row_bytes))
+        .ok_or(MediaError::BadPayload)?;
+    if pixels.len() < required {
+        return Err(MediaError::BadPayload);
+    }
+    Ok(())
 }
