@@ -19,8 +19,8 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CFDictionary, CFNumber, CFString, CFType, CGPoint, CGRect, CGSize};
 #[allow(deprecated)] // Public, still exported by CoreGraphics; no CGS/SLS cursor APIs.
 use objc2_core_graphics::{
-    CGCursorIsVisible, CGDisplayBounds, CGEvent, CGRectMakeWithDictionaryRepresentation,
-    CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds, kCGWindowNumber,
+    CGDisplayBounds, CGEvent, CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo,
+    CGWindowListOption, kCGWindowBounds, kCGWindowNumber,
 };
 
 use super::Shared;
@@ -267,9 +267,9 @@ fn read(
     scales: &[u64],
     cache: &mut Cache,
 ) -> Result<BTreeMap<u64, Option<CursorImage>>, &'static str> {
-    if !CGCursorIsVisible() {
-        return Ok(scales.iter().map(|&scale| (scale, None)).collect());
-    }
+    // Not CGCursorIsVisible: apps hide the cursor while the user types until the mouse moves, and
+    // motion injected into a projected window doesn't end that, so shapes would stop updating.
+    // A cursor counts as hidden only when its image has no opaque pixel.
     let cursor = NSCursor::currentSystemCursor().ok_or("nil system cursor")?;
     // SAFETY: NSCursor's public image getter returns an NSImage. Use a nullable retained return
     // to handle an unexpected nil without a panic; all AppKit access stays on the main thread.

@@ -324,7 +324,13 @@ fn set_cursor(
         pixels,
         window.scale_factor(),
     ) {
-        Some(cursor::Shape::Hidden) => window.set_cursor_visible(false),
+        // The pointer over a proxy is this machine's own: it never disappears. A hidden remote
+        // cursor (an app hides it while typing until the mouse moves, which injected motion may
+        // not count as) shows the default arrow instead.
+        Some(cursor::Shape::Hidden) => {
+            window.set_cursor(CursorIcon::Default);
+            window.set_cursor_visible(true);
+        }
         Some(cursor::Shape::Image(image)) => {
             let source = CustomCursor::from_rgba(
                 image.rgba,
