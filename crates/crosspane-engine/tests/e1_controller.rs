@@ -2620,10 +2620,12 @@ fn pointer_return_guards_only_the_return_portal_for_150_ms() {
     for (delay, crosses) in [(100, false), (200, true)] {
         let mut f = Fixture::new(config(), 2);
         let (_, capture) = f.controlling(vec![]);
-        f.raw(1, -10.0);
-        f.ended(2, capture);
+        // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+        f.raw(1, 50.0);
+        f.raw(2, -60.0);
+        f.ended(3, capture);
         let edge = f.edge(0.5);
-        let out = f.feed(1 + delay, edge);
+        let out = f.feed(2 + delay, edge);
         assert_eq!(
             out.iter()
                 .any(|o| matches!(o, Output::ShowOverlay { id, .. } if *id == HUD)),
@@ -2692,14 +2694,16 @@ fn pointer_return_guards_only_the_return_portal_for_150_ms() {
         .unwrap()
         .id;
     let (_, capture) = f.controlling(vec![]);
-    f.raw(1, -10.0);
-    f.ended(2, capture);
+    // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+    f.raw(1, 50.0);
+    f.raw(2, -60.0);
+    f.ended(3, capture);
     f.feed(
-        51,
+        52,
         Input::Capture(CaptureEvent::EdgePressed {
             portal: other,
             position: 0.5,
-            at: time(51),
+            at: time(52),
         }),
     );
     assert_eq!(
@@ -2714,8 +2718,10 @@ fn pointer_return_guard_survives_layout_portal_id_reassignment() {
     f.up(C);
     let original_id = f.portal;
     let (_, capture) = f.controlling(vec![]);
-    f.raw(1, -10.0);
-    f.ended(2, capture);
+    // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+    f.raw(1, 50.0);
+    f.raw(2, -60.0);
+    f.ended(3, capture);
 
     // Adding a portal on A's left sorts it before the existing A -> B portal,
     // reassigning the original ID to A -> C while A -> B remains in place.
@@ -2743,7 +2749,7 @@ fn pointer_return_guard_survives_layout_portal_id_reassignment() {
         config().layout,
     )
     .unwrap();
-    f.feed(25, Input::Layout(placements));
+    f.feed(26, Input::Layout(placements));
     let guarded = layout
         .portals()
         .iter()
@@ -2762,10 +2768,10 @@ fn pointer_return_guard_survives_layout_portal_id_reassignment() {
         Input::Capture(CaptureEvent::EdgePressed {
             portal,
             position: 0.5,
-            at: time(51),
+            at: time(52),
         })
     };
-    assert!(f.feed(51, edge(guarded)).is_empty());
+    assert!(f.feed(52, edge(guarded)).is_empty());
     assert!(
         f.send(Input::Overlay(OverlayEvent::Visible(HUD)))
             .is_empty()
