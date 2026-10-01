@@ -98,7 +98,9 @@ impl Engine {
                     peer,
                     reason: Refusal::Busy,
                 }));
-            } else {
+            } else if self.target.would_admit(peer) {
+                // Only a request the target will admit may pre-empt this node's own pending
+                // crossing: a peer without the input grant (or a locked node) can't cancel it.
                 self.controller.cancel_pending(now, &mut out);
             }
         }

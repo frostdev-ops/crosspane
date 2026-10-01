@@ -222,6 +222,14 @@ impl TargetE1 {
     }
 
     /// True while another node controls this one (an E1 session is active here).
+    /// Whether a `StartControl` from `peer` would be admitted now (the same checks as the
+    /// admission itself): only then may it pre-empt this node's own pending crossing.
+    pub(crate) fn would_admit(&self, peer: NodeId) -> bool {
+        self.has_grant(peer)
+            && self.permits_io()
+            && self.active.is_none_or(|s| s.controller == peer)
+    }
+
     pub fn is_controlled(&self) -> bool {
         self.active.is_some()
     }
