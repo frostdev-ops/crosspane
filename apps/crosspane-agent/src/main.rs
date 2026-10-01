@@ -136,6 +136,43 @@ pub fn exit_on_panic<R>(thread: &str, f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Ask the OS for every missing permission (04 §2 onboarding). The requests come from the agent's
+/// own process, so the system dialogs name Crosspane. Returns what was asked for.
+pub fn request_missing_permissions(platform: &mut platform::Platform) -> Vec<&'static str> {
+    let perms = platform.permissions.as_mut();
+    let mut requested = Vec::new();
+    for permission in perms.required() {
+        if perms.state(permission) != PermissionState::Granted {
+            match perms.request(permission) {
+                Ok(()) => requested.push(permission_name(permission)),
+                Err(e) => tracing::warn!(error = %e, ?permission, "permission request failed"),
+            }
+        }
+    }
+    requested
+}
+
+/// At most once a day, show the OS permission dialogs for anything missing, so a fresh install
+/// asks on its own rather than waiting for the user to find the menu.
+fn request_permissions_daily(state_dir: &std::path::Path, platform: &mut platform::Platform) {
+    let marker = state_dir.join("permissions-requested");
+    let recent = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age < std::time::Duration::from_secs(24 * 3600));
+    if recent {
+        return;
+    }
+    let requested = request_missing_permissions(platform);
+    if !requested.is_empty() {
+        tracing::info!(?requested, "asked the OS for missing permissions");
+        if let Err(e) = std::fs::write(&marker, b"") {
+            tracing::debug!(error = %e, "could not record the permission request");
+        }
+    }
+}
+
 fn run() -> Result<()> {
     let paths = Paths::new()?;
     let config = Config::load(&paths)?;
@@ -157,6 +194,7 @@ fn run() -> Result<()> {
     })?;
     let mut platform = platform::create(&paths.state_dir, &config)?;
     tracing::info!(backends = ?platform, "platform ready");
+    request_permissions_daily(&paths.state_dir, &mut platform);
     let identity = Arc::new(load_identity(
         &paths,
         &config,

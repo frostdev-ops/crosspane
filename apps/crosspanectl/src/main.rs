@@ -45,6 +45,9 @@ enum Command {
     },
     /// Unpair a peer (name or node-id prefix): its key is forgotten and the connection ends now.
     Forget { peer: String },
+    /// Show the OS permission dialogs for whatever this machine still lacks (macOS: Screen
+    /// Recording, Accessibility, Input Monitoring).
+    RequestPermissions,
     /// A lost or stolen device: forget it here and tell every other paired machine to forget it
     /// too (a signed revocation notice). It can only come back through a fresh pairing.
     Revoke { peer: String },
@@ -162,6 +165,7 @@ fn main() -> Result<()> {
         Command::Restart => json!({"cmd": "restart"}),
         Command::Diag { out } => return diag(out.clone()),
         Command::Forget { peer } => json!({"cmd": "forget", "peer": peer}),
+        Command::RequestPermissions => json!({"cmd": "ask_permissions"}),
         Command::Revoke { peer } => json!({"cmd": "revoke", "peer": peer}),
         Command::Layout { peer, side } => {
             let side = format!("{side:?}").to_lowercase();

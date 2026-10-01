@@ -2079,6 +2079,17 @@ impl Agent {
                 },
                 Err(e) => Response::err(e),
             },
+            Request::AskPermissions => {
+                let requested = crate::request_missing_permissions(&mut self.platform);
+                Response::ok(json!(if requested.is_empty() {
+                    "every permission is granted".to_owned()
+                } else {
+                    format!(
+                        "asked for {}; answer the dialogs on this machine",
+                        requested.join(", ")
+                    )
+                }))
+            }
             Request::Restart => {
                 self.restart_requested = true;
                 Response::ok(json!("restarting"))
