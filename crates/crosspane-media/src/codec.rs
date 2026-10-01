@@ -28,10 +28,11 @@ pub struct EncodedVideo {
 
 /// A real-time H.264 encoder for one projection.
 pub trait VideoEncoder: Send {
-    /// Encode one frame. `pixels` is BGRA8 with `stride` bytes per row and `size` pixels; odd sizes
-    /// are allowed (the encoder pads internally and the decoder returns `size` exactly). `out` is
-    /// cleared and gets exactly one Annex B access unit. `force_key` makes it an IDR; the first
-    /// frame and the first after a size change are always IDRs.
+    /// Encode one frame. `pixels` is BGRA8 with `stride` bytes per row and `size` pixels. Odd sizes
+    /// are allowed: the encoder pads to even dimensions by repeating the last column and row, the
+    /// decoder returns that padded (coded) size, and the receiver crops to the size in the media
+    /// frame header. `out` is cleared and gets exactly one Annex B access unit. `force_key` makes
+    /// it an IDR; the first frame and the first after a size change are always IDRs.
     fn encode(
         &mut self,
         pixels: &[u8],
@@ -49,8 +50,9 @@ pub trait VideoEncoder: Send {
 /// A low-latency H.264 decoder for one projection.
 pub trait VideoDecoder: Send {
     /// Decode one Annex B access unit. On success `out` is replaced by the frame as BGRA8 rows of
-    /// `width * 4` bytes and its size is returned. A frame that depends on one the decoder hasn't
-    /// seen is an error (the caller requests a key frame); an IDR always decodes on its own.
+    /// `width * 4` bytes and its coded size is returned (even dimensions; see
+    /// [`VideoEncoder::encode`]). A frame that depends on one the decoder hasn't seen is an error
+    /// (the caller requests a key frame); an IDR always decodes on its own.
     fn decode(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<PixelSize, CodecError>;
     /// The backend, for logs.
     fn name(&self) -> &str;

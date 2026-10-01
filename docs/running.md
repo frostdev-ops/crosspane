@@ -52,7 +52,13 @@ mac_virtual_display = false   # Mac + private-vdisplay build only: hide projecte
 
 [[peers]]                 # machines to connect to (both directions work; one side is enough)
 addr = "192.168.4.244:47811"
+
+[remap]                   # optional: modifier swaps while this machine drives a peer
+macbook = "swap-ctrl-gui" # none | swap-ctrl-gui (Ctrl ↔ ⌘/Super) | swap-alt-gui (Alt ↔ ⌘/Super)
 ```
+
+A remap profile applies while *this* machine's keyboard drives that peer, so set it on the
+machine whose keyboard you use. Changes to `config.toml` apply after `crosspanectl restart`.
 
 ## Install, start and stop
 
@@ -92,6 +98,17 @@ window projection only. Both machines then show the peer in `crosspanectl status
 
 ## Use
 
+**The tray / menu-bar icon** (Waybar on Linux, the menu bar on the Mac) is the main control:
+- the status, and **Take input back** while this machine drives another;
+- **Show a window of ⟨peer⟩ here** and **Send a window to ⟨peer⟩**;
+- **Projected windows**, to give any of them back;
+- **Machines**: per machine, its side and what it may do here (control, browse), plus
+  **Pair a new machine…** and the pairing steps;
+- on the Mac, the missing permissions, each explained; clicking one opens its Settings pane;
+- **Stop everything (panic)**, **Restart** and **Quit**.
+
+Everything is also available from the command line:
+
 **One keyboard and mouse (E1).**
 - Set where the other machine is: `crosspanectl layout <peer> left|right|above|below`.
 - Push the pointer past that edge. A banner shows while input is routed to the other machine.
@@ -99,10 +116,22 @@ window projection only. Both machines then show the peer in `crosspanectl status
   disarms crossing until `crosspanectl rearm`.
 
 **Project a window (E2).**
-- `crosspanectl windows` lists this machine's windows.
-- `crosspanectl project <id> <peer>` moves the window into a window on the peer, where it is used
-  normally. The app keeps running here, and its window is hidden here while projected.
-- `crosspanectl return <projection>` (or closing the projected window on the peer) gives the window
-  back.
+- From the machine that has it: `crosspanectl windows` lists this machine's windows, and
+  `crosspanectl project <id> <peer>` moves one to the peer.
+- From the machine where you want it: `crosspanectl pick --from <peer>` shows the peer's windows
+  in a menu (walker, fuzzel, wofi or rofi on Linux; a list on the Mac) and pulls the chosen one.
+  Bind it to a key, e.g. in Hyprland `crosspanectl pick --from macbook`. The scriptable form is
+  `crosspanectl windows --from <peer>` and `crosspanectl pull <peer> <id>`.
+  - The peer must allow it once: on the peer, `crosspanectl allow <this machine> browse` (or the
+    tray's **May browse and pull my windows**).
+- The window is used normally where it's shown; the app keeps running at home, hidden there.
+- `crosspanectl return <projection>` (or closing the projected window) gives the window back.
 
-`crosspanectl status` shows peers, layout, projections, missing permissions and recent notices.
+**Machines and permissions.**
+- `crosspanectl allow <peer> input|share|browse|present [--off]` grants or withdraws one thing.
+- `crosspanectl forget <peer>` unpairs a machine and ends its connection at once.
+- `crosspanectl restart` restarts the agent (the agent also restarts itself when macOS
+  permissions change).
+
+`crosspanectl status` shows peers, layout, projections (with received frames), missing
+permissions and recent notices.
