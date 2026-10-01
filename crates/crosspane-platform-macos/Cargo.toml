@@ -40,3 +40,7 @@ zeroize.workspace = true
 name = "overlay_gui"
 path = "tests/overlay_gui.rs"
 harness = false
+
+[[test]]
+name = "tray_gui"
+harness = false
