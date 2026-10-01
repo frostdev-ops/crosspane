@@ -35,6 +35,15 @@ pub enum Request {
     Project { window: u64, peer: String },
     /// End projection `projection` of `source` (default: this node) and return the window.
     Return { projection: u64, source: Option<String> },
+    /// Open a 120 s pairing window (this node shows the code and confirms).
+    PairListen { allow_input: bool },
+    /// Join another node's pairing window at `addr` (its normal address).
+    PairJoin { addr: SocketAddr, allow_input: bool },
+    PairStatus,
+    /// Initiator: the codes match (or not).
+    PairConfirm { accept: bool },
+    /// Joiner: the code the other screen shows is candidate `index` (0-based).
+    PairPick { index: usize },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

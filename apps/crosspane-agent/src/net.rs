@@ -67,6 +67,10 @@ impl Net {
         self.transport.clone()
     }
 
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.runtime.handle().clone()
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.transport.local_addr()
     }

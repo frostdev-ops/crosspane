@@ -43,6 +43,11 @@ enum Command {
         /// Peer name or node-id prefix.
         peer: String,
     },
+    /// Pair with another machine (SAS number matching).
+    Pair {
+        #[command(subcommand)]
+        action: PairAction,
+    },
     /// End a projection and give the window back to its source.
     Return {
         projection: u64,
@@ -50,6 +55,28 @@ enum Command {
         #[arg(long)]
         source: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PairAction {
+    /// Open a pairing window here (shows a code to compare).
+    Listen {
+        /// Let the new peer control this machine's keyboard and mouse.
+        #[arg(long)]
+        allow_input: bool,
+    },
+    /// Join the pairing window of the machine at ADDR (host:port, its normal port).
+    Join {
+        addr: String,
+        #[arg(long)]
+        allow_input: bool,
+    },
+    /// Show the pairing state (the code, or the candidates to pick from).
+    Status,
+    /// Confirm (yes) or reject (no) the code on the listening machine.
+    Confirm { answer: String },
+    /// Pick candidate N (1–3) on the joining machine.
+    Pick { n: usize },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -94,6 +121,23 @@ fn main() -> Result<()> {
             json!({"cmd": "dial", "addr": resolved.to_string()})
         }
         Command::Windows => json!({"cmd": "windows"}),
+        Command::Pair { action } => match action {
+            PairAction::Listen { allow_input } => json!({"cmd": "pair_listen", "allow_input": allow_input}),
+            PairAction::Join { addr, allow_input } => {
+                use std::net::ToSocketAddrs;
+                let resolved = addr
+                    .to_socket_addrs()
+                    .with_context(|| format!("resolve {addr}"))?
+                    .next()
+                    .context("no address")?;
+                json!({"cmd": "pair_join", "addr": resolved.to_string(), "allow_input": allow_input})
+            }
+            PairAction::Status => json!({"cmd": "pair_status"}),
+            PairAction::Confirm { answer } => {
+                json!({"cmd": "pair_confirm", "accept": matches!(answer.as_str(), "yes" | "y")})
+            }
+            PairAction::Pick { n } => json!({"cmd": "pair_pick", "index": n.saturating_sub(1)}),
+        },
         Command::Project { window, peer } => json!({"cmd": "project", "window": window, "peer": peer}),
         Command::Return { projection, source } => {
             json!({"cmd": "return", "projection": projection, "source": source})
@@ -123,6 +167,21 @@ fn main() -> Result<()> {
 fn print_result(command: &Command, result: &Value) {
     match command {
         Command::Status => print_status(result),
+        Command::Pair { action: PairAction::Status } => {
+            println!("phase: {}", result["phase"].as_str().unwrap_or("idle"));
+            if let Some(sas) = result["sas"].as_str() {
+                println!("code:  {} {}", &sas[..3.min(sas.len())], &sas[3.min(sas.len())..]);
+            }
+            for (i, c) in result["candidates"].as_array().into_iter().flatten().enumerate() {
+                println!("  {}) {}", i + 1, c.as_str().unwrap_or(""));
+            }
+            if let Some(peer) = result["peer"].as_str() {
+                println!("peer:  {peer}");
+            }
+            if let Some(e) = result["error"].as_str() {
+                println!("error: {e}");
+            }
+        }
         Command::Windows => {
             for w in result.as_array().into_iter().flatten() {
                 println!(

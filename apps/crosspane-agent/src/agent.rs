@@ -37,6 +37,8 @@ pub enum Event {
     Ctl(Request, Sender<Response>),
     /// From the proxy window host (E2 destination).
     Host(HostEvent),
+    /// A pairing exchange succeeded: pin the peer.
+    Paired(crate::pairing::Paired),
 }
 
 /// What the loop knows about a peer.
@@ -74,6 +76,9 @@ pub struct Agent {
     projections: BTreeMap<ProjectionKey, String>,
     events: Sender<Event>,
     crossing: bool,
+    pairing: crate::pairing::Pairing,
+    identity: Arc<crosspane_security::identity::DeviceIdentity>,
+    port: u16,
 }
 
 /// The E2 pieces the agent wires in (`media.rs`, the proxy host).
@@ -85,6 +90,8 @@ pub struct E2Wiring {
     pub events: Sender<Event>,
     /// `config.crossing`.
     pub crossing: bool,
+    pub identity: Arc<crosspane_security::identity::DeviceIdentity>,
+    pub port: u16,
 }
 
 const NOTICE_HISTORY: usize = 20;
@@ -124,6 +131,9 @@ impl Agent {
             projections: BTreeMap::new(),
             events: e2.events,
             crossing: e2.crossing,
+            pairing: crate::pairing::Pairing::default(),
+            identity: e2.identity,
+            port: e2.port,
         }
     }
 
@@ -188,6 +198,7 @@ impl Agent {
                 let _ = reply.send(response);
             }
             Event::Host(event) => self.on_host(event),
+            Event::Paired(paired) => self.on_paired(paired),
         }
     }
 
@@ -667,6 +678,31 @@ impl Agent {
             .map(|(node, _)| *node)
     }
 
+    fn on_paired(&mut self, paired: crate::pairing::Paired) {
+        let peer = paired.peer;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let entry = crosspane_security::trust::PeerEntry {
+            node: peer.node,
+            spki: peer.spki.clone(),
+            name: peer.name.clone(),
+            granted: paired.granted,
+            paired_at_ms: now_ms,
+        };
+        match self.trust.update(|t| t.pin(entry).map_err(|e| anyhow::anyhow!("{e}"))) {
+            Ok(()) => {
+                tracing::info!(peer = %peer.node.short(), name = %peer.name, "paired");
+                self.notices.push_back(format!("paired with {}", peer.name));
+                self.send_grants();
+                if let Some(addr) = paired.dial {
+                    self.net.dial(addr);
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "could not pin the paired peer"),
+        }
+    }
+
     fn on_host(&mut self, event: HostEvent) {
         let (id, input_of): (u64, Box<dyn FnOnce(ProjectionKey) -> Input>) = match event {
             HostEvent::Opened { id, size, scale } => (
@@ -732,6 +768,45 @@ impl Agent {
             Request::Dial { addr } => {
                 self.net.dial(addr);
                 Response::ok(json!(format!("dialing {addr}")))
+            }
+            Request::PairListen { allow_input } => {
+                match self.pairing.listen(
+                    &self.net.runtime(),
+                    self.port,
+                    self.identity.clone(),
+                    self.name.clone(),
+                    allow_input,
+                    self.events.clone(),
+                ) {
+                    Ok(()) => Response::ok(json!("pairing window open for 120 s")),
+                    Err(e) => Response::err(e),
+                }
+            }
+            Request::PairJoin { addr, allow_input } => {
+                match self.pairing.join(
+                    &self.net.runtime(),
+                    addr,
+                    self.identity.clone(),
+                    self.name.clone(),
+                    allow_input,
+                    self.events.clone(),
+                ) {
+                    Ok(()) => Response::ok(json!(format!("joining {addr}"))),
+                    Err(e) => Response::err(e),
+                }
+            }
+            Request::PairStatus => Response::ok(json!(self.pairing.status())),
+            Request::PairConfirm { accept } => {
+                match self.pairing.decide(crate::pairing::Decision::Confirm(accept)) {
+                    Ok(()) => Response::ok(json!(if accept { "confirmed" } else { "rejected" })),
+                    Err(e) => Response::err(e),
+                }
+            }
+            Request::PairPick { index } => {
+                match self.pairing.decide(crate::pairing::Decision::Pick(index)) {
+                    Ok(()) => Response::ok(json!("picked")),
+                    Err(e) => Response::err(e),
+                }
             }
             Request::Windows => match &self.platform.windows {
                 None => Response::err("no window source on this node"),

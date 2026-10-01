@@ -6,6 +6,7 @@ mod ctl;
 mod keys;
 mod media;
 mod net;
+mod pairing;
 mod paths;
 mod platform;
 mod trust;
@@ -141,7 +142,7 @@ fn run() -> Result<()> {
         displays: local_displays.clone(),
     };
     let pins: Arc<dyn crosspane_transport::PinStore> = Arc::new(trust.clone());
-    let net = net::Net::start(config.port, identity, pins, hello, tx.clone())?;
+    let net = net::Net::start(config.port, identity.clone(), pins, hello, tx.clone())?;
     for peer in &config.peers {
         net.dial(peer.addr);
     }
@@ -167,6 +168,8 @@ fn run() -> Result<()> {
         proxy_ids,
         events: tx.clone(),
         crossing: config.crossing,
+        identity,
+        port: config.port,
     };
     let agent =
         agent::Agent::new(node, config.name, engine, platform, net, trust, local_displays, e2);
