@@ -36,6 +36,13 @@ enum Command {
     Rearm,
     /// Restart the agent in place (e.g. after granting macOS permissions).
     Restart,
+    /// Collect a diagnostics bundle (status, config, paired machines, recent logs, versions) into
+    /// a .tar.gz for a bug report. It never contains private keys or typed text.
+    Diag {
+        /// Where to write the bundle (default: a timestamped file in the current directory).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Unpair a peer (name or node-id prefix): its key is forgotten and the connection ends now.
     Forget { peer: String },
     /// Put a peer (name or node-id prefix) on a side of this machine.
@@ -138,6 +145,7 @@ fn main() -> Result<()> {
         Command::Panic => json!({"cmd": "panic"}),
         Command::Rearm => json!({"cmd": "rearm"}),
         Command::Restart => json!({"cmd": "restart"}),
+        Command::Diag { out } => return diag(out.clone()),
         Command::Forget { peer } => json!({"cmd": "forget", "peer": peer}),
         Command::Layout { peer, side } => {
             let side = format!("{side:?}").to_lowercase();
@@ -220,6 +228,113 @@ fn call(request: &Value) -> Result<Value> {
         bail!("{}", response["error"].as_str().unwrap_or("request failed"));
     }
     Ok(response["result"].clone())
+}
+
+/// `crosspanectl diag`: gather what a bug report needs into one archive.
+fn diag(out: Option<PathBuf>) -> Result<()> {
+    use std::process::Command as Process;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = format!("crosspane-diag-{stamp}");
+    let dir = std::env::temp_dir().join(&name);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let write = |file: &str, text: &str| {
+        let _ = std::fs::write(dir.join(file), text);
+    };
+    let run = |program: &str, args: &[&str]| -> String {
+        match Process::new(program).args(args).output() {
+            Ok(o) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => format!("({program} failed: {e})\n"),
+        }
+    };
+    // The agent's view.
+    for (file, cmd) in [
+        ("status.json", "status"),
+        ("windows.json", "windows"),
+        ("pairing.json", "pair_status"),
+    ] {
+        let text = exchange(&json!({ "cmd": cmd }))
+            .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+            .unwrap_or_else(|e| format!("(agent not reachable: {e})"));
+        write(file, &text);
+    }
+    // Configuration and paired machines: public keys and grants only (no private keys exist in
+    // these files; the device key lives in the OS key store or its own 0600 file, not copied).
+    let config_dir = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Application Support/Crosspane"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|c| c.join("crosspane"))
+    };
+    if let Some(config_dir) = config_dir {
+        for file in ["config.toml", "trust.json"] {
+            if let Ok(text) = std::fs::read_to_string(config_dir.join(file)) {
+                write(file, &text);
+            }
+        }
+    }
+    // Recent logs (they never record key contents, 04 §8) and versions.
+    if cfg!(target_os = "macos") {
+        let log = std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Logs/Crosspane/agent.log"));
+        if let Some(text) = log.and_then(|p| std::fs::read_to_string(p).ok()) {
+            let tail: Vec<&str> = text.lines().rev().take(5000).collect();
+            write(
+                "agent.log",
+                &tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
+            );
+        }
+        write("system.txt", &run("/usr/bin/sw_vers", &[]));
+    } else {
+        write(
+            "agent.log",
+            &run(
+                "journalctl",
+                &[
+                    "--user",
+                    "-u",
+                    "crosspane-agent",
+                    "-n",
+                    "5000",
+                    "--no-pager",
+                    "-o",
+                    "short-iso",
+                ],
+            ),
+        );
+        write(
+            "system.txt",
+            &format!("{}{}", run("uname", &["-a"]), run("hyprctl", &["version"])),
+        );
+    }
+    write(
+        "crosspanectl.txt",
+        &format!("crosspanectl {}\n", env!("CARGO_PKG_VERSION")),
+    );
+
+    let out = out.unwrap_or_else(|| PathBuf::from(format!("{name}.tar.gz")));
+    let status = Process::new("tar")
+        .arg("czf")
+        .arg(&out)
+        .arg("-C")
+        .arg(std::env::temp_dir())
+        .arg(&name)
+        .status()
+        .context("run tar")?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if !status.success() {
+        bail!("tar failed");
+    }
+    println!("{}", out.display());
+    Ok(())
 }
 
 /// `crosspanectl pick`: list `peer`'s windows, let the user choose one, pull it.
