@@ -31,7 +31,11 @@ impl Issued {
     pub fn load(path: PathBuf) -> Issued {
         let notices = match std::fs::read_to_string(&path) {
             Ok(text) => parse(&text).unwrap_or_else(|e| {
-                tracing::warn!(path = %path.display(), error = %e, "ignoring unreadable revocations file");
+                // Keep the unreadable file for inspection rather than overwrite it later.
+                let aside = path.with_extension("json.corrupt");
+                tracing::warn!(path = %path.display(), error = %e, aside = %aside.display(),
+                    "unreadable revocations file moved aside");
+                let _ = std::fs::rename(&path, &aside);
                 Vec::new()
             }),
             Err(_) => Vec::new(),
@@ -86,18 +90,19 @@ impl Issued {
 
 fn parse(text: &str) -> Result<Vec<RevocationNotice>> {
     let stored: Vec<Stored> = serde_json::from_str(text)?;
-    stored
+    // A malformed entry is skipped, not fatal: the others stay deliverable.
+    Ok(stored
         .into_iter()
         .take(MAX)
-        .map(|s| {
-            Ok(RevocationNotice {
-                revoked: s.revoked.parse().context("revoked node id")?,
-                issuer: s.issuer.parse().context("issuer node id")?,
+        .filter_map(|s| {
+            Some(RevocationNotice {
+                revoked: s.revoked.parse().ok()?,
+                issuer: s.issuer.parse().ok()?,
                 issued_at_ms: s.issued_at_ms,
-                signature: unhex(&s.signature).context("signature")?,
+                signature: unhex(&s.signature)?,
             })
         })
-        .collect()
+        .collect())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -105,7 +110,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) || text.len() > 512 {
+    if !text.len().is_multiple_of(2)
+        || text.len() > 512
+        || !text.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return None;
     }
     (0..text.len())
@@ -169,7 +177,8 @@ mod tests {
         assert_eq!(issued.notices().len(), MAX);
         assert_eq!(issued.notices()[0], notice(6, 6));
         std::fs::write(&path, "not json").unwrap();
-        assert!(Issued::load(path).notices().is_empty());
+        assert!(Issued::load(path.clone()).notices().is_empty());
+        assert!(path.with_extension("json.corrupt").exists());
     }
 
     #[test]
@@ -180,5 +189,6 @@ mod tests {
         );
         assert_eq!(unhex("abc"), None);
         assert_eq!(unhex("zz"), None);
+        assert_eq!(unhex("+f"), None);
     }
 }

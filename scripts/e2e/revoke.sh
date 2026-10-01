@@ -55,14 +55,15 @@ wait_for '[ "$(connected d)" = "" ]'
 grep -q "revocation applied" "$work/b/agent.log" || { echo "FAIL: B never applied the notice"; exit 1; }
 echo "online: B forgot D"
 
-# Offline: B is down while A revokes C; B learns it when it reconnects to A.
-kill "$(cat "$work/b/pid")"; sleep 1
+# Offline: the lost device C and peer B are both down while A revokes C (A resolves C from its
+# trust store); B learns it when it reconnects to A.
+kill "$(cat "$work/b/pid")" "$(cat "$work/c/pid")"; sleep 1
 ctl a revoke rv-c
-wait_for '[[ "$(connected a)" != *rv-c* ]]'
+start c
 start b
 wait_for '[ "$(connected a)" = "rv-b " ]'
 wait_for '! knows b c'
-echo "offline: B forgot C after reconnecting"
+echo "offline: A revoked C while C was down; B forgot C after reconnecting"
 
 # Revoked nodes stay out: D and C are refused by A and B even when they dial.
 ctl d dial "127.0.0.1:${port[a]}" >/dev/null; ctl c dial "127.0.0.1:${port[b]}" >/dev/null; sleep 2

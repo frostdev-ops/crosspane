@@ -361,6 +361,10 @@ impl Agent {
             LinkEvent::Control { peer, msg } => match msg {
                 ControlMessage::Hello(hello) => {
                     let peer = *peer;
+                    // A Hello queued before a forget or revoke: the link is closing.
+                    if !self.trust.with(|t| t.get(peer).is_some()) {
+                        return;
+                    }
                     let name = self
                         .trust
                         .with(|t| t.get(peer).map(|e| e.name.clone()))
@@ -380,12 +384,19 @@ impl Agent {
                         displays: hello.displays.clone(),
                     });
                     // Revocations this node issued: the peer may have been offline then.
+                    // Skip devices paired here again since (e.g. with `trust add`).
+                    let due: Vec<RevocationNotice> = self
+                        .revocations
+                        .notices()
+                        .iter()
+                        .filter(|n| {
+                            n.revoked != peer && !self.trust.with(|t| t.get(n.revoked).is_some())
+                        })
+                        .cloned()
+                        .collect();
                     if let Some(link) = self.links.get_mut(&peer) {
-                        for notice in self.revocations.notices() {
-                            if notice.revoked != peer {
-                                let _ =
-                                    link.send_control(&ControlMessage::Revocation(notice.clone()));
-                            }
+                        for notice in due {
+                            let _ = link.send_control(&ControlMessage::Revocation(notice));
                         }
                     }
                     // Tell the peer our view of the layout; it merges by version.
@@ -1490,14 +1501,28 @@ impl Agent {
             .collect()
     }
 
+    /// A connected-or-known peer by exact name (case-insensitive), else by a unique node-id
+    /// prefix of at least 4 hex digits. Empty and ambiguous queries match nothing.
     fn find_peer(&self, query: &str) -> Option<NodeId> {
-        let query = query.to_lowercase();
-        self.peers
-            .iter()
-            .find(|(node, info)| {
-                info.name.to_lowercase() == query || node.to_string().starts_with(&query)
-            })
-            .map(|(node, _)| *node)
+        resolve(
+            query,
+            self.peers
+                .iter()
+                .map(|(node, info)| (*node, info.name.as_str())),
+        )
+    }
+
+    /// A paired peer from the trust store (it may be offline, e.g. a lost device), matched like
+    /// [`Agent::find_peer`].
+    fn find_trusted(&self, query: &str) -> Result<NodeId, String> {
+        let pinned: Vec<(NodeId, String)> = self
+            .trust
+            .with(|t| t.peers().iter().map(|e| (e.node, e.name.clone())).collect());
+        resolve(
+            query,
+            pinned.iter().map(|(node, name)| (*node, name.as_str())),
+        )
+        .ok_or_else(|| format!("no single paired machine matches {query:?}"))
     }
 
     /// Revoke a lost or stolen device (04 §4): forget it here, refuse it until it pairs again,
@@ -1507,17 +1532,23 @@ impl Agent {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        // Receivers drop notices older than their pairing with the device: an unset clock would
+        // make this one useless everywhere while looking successful here.
+        if now_ms < 1_700_000_000_000 {
+            return Err("this machine's clock isn't set; fix it before revoking".into());
+        }
         let notice =
             crosspane_security::trust::TrustStore::issue_revocation(&self.identity, node, now_ms)
                 .map_err(|e| format!("could not sign the revocation: {e}"))?;
+        // Keep the notice first, so peers that are offline now still get it later.
+        self.revocations
+            .add(notice.clone())
+            .map_err(|e| format!("could not save the revocation notice: {e}"))?;
         self.trust
             .update(|t| Ok(t.revoke(node)))
             .map_err(|e| format!("could not update the trust store: {e}"))?;
         self.close_untrusted();
         self.send_grants();
-        if let Err(e) = self.revocations.add(notice.clone()) {
-            tracing::warn!(error = %e, "could not save the revocation notice");
-        }
         // The revoked node's link is closing; it isn't told.
         let mut told = 0;
         for (peer, link) in &mut self.links {
@@ -1539,6 +1570,17 @@ impl Agent {
     /// A peer passed on a revocation notice: apply it if its issuer is trusted and it verifies.
     fn on_revocation(&mut self, from: NodeId, notice: &RevocationNotice) {
         use crosspane_security::trust::Revoked;
+        // Notices travel only from their issuer (it resends them on every connection); a relayed
+        // copy could replay a revocation the issuer has withdrawn by pairing again.
+        if from != notice.issuer {
+            tracing::warn!(peer = %from.short(), "revocation notice relayed by a non-issuer: ignored");
+            return;
+        }
+        // Nothing to do for a node this machine never paired (and no disk write per notice).
+        if !self.trust.with(|t| t.get(notice.revoked).is_some()) {
+            tracing::debug!(revoked = %notice.revoked.short(), "revocation of an unknown node");
+            return;
+        }
         let own = self.node;
         let result = self.trust.update(|t| {
             t.apply_revocation(notice, own)
@@ -1554,7 +1596,11 @@ impl Agent {
                 self.notices
                     .push_back(format!("{revoked} was revoked by {issuer}"));
             }
-            Ok(Revoked::Duplicate | Revoked::IgnoredSelf | Revoked::Stale) => {
+            Ok(Revoked::Stale) => {
+                tracing::info!(revoked = %notice.revoked.short(), issuer = %notice.issuer.short(),
+                    "revocation notice predates the current pairing: ignored");
+            }
+            Ok(Revoked::Duplicate | Revoked::IgnoredSelf) => {
                 tracing::debug!(revoked = %notice.revoked.short(), "revocation notice already handled");
             }
             Err(e) => {
@@ -1713,7 +1759,7 @@ impl Agent {
             Request::WindowsFrom { .. } | Request::Pull { .. } => {
                 Response::err("internal: answered asynchronously")
             }
-            Request::Forget { peer } => match self.find_peer(&peer) {
+            Request::Forget { peer } => match self.find_trusted(&peer).ok() {
                 Some(node) => match self.trust.update(|t| Ok(t.forget(node))) {
                     Ok(Some(entry)) => {
                         self.close_untrusted();
@@ -1725,12 +1771,12 @@ impl Agent {
                 },
                 None => Response::err(format!("no peer called {peer}")),
             },
-            Request::Revoke { peer } => match self.find_peer(&peer) {
-                Some(node) => match self.revoke(node) {
+            Request::Revoke { peer } => match self.find_trusted(&peer) {
+                Ok(node) => match self.revoke(node) {
                     Ok(text) => Response::ok(json!(text)),
                     Err(e) => Response::err(e),
                 },
-                None => Response::err(format!("no peer called {peer}")),
+                Err(e) => Response::err(e),
             },
             Request::Restart => {
                 self.restart_requested = true;
@@ -1927,6 +1973,36 @@ impl Agent {
     }
 }
 
+/// Match a peer by exact name (case-insensitive), else by a unique node-id prefix of at least 4
+/// hex digits; empty and ambiguous queries match nothing.
+fn resolve<'a>(
+    query: &str,
+    peers: impl Iterator<Item = (NodeId, &'a str)> + Clone,
+) -> Option<NodeId> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    let mut named = peers
+        .clone()
+        .filter(|(_, name)| name.to_lowercase() == query);
+    if let Some((node, _)) = named.next() {
+        return if named.next().is_none() {
+            Some(node)
+        } else {
+            None
+        };
+    }
+    if query.len() < 4 || !query.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut prefixed = peers.filter(|(node, _)| node.to_string().starts_with(&query));
+    match (prefixed.next(), prefixed.next()) {
+        (Some((node, _)), None) => Some(node),
+        _ => None,
+    }
+}
+
 fn display_json(d: &DisplayInfo) -> Value {
     json!({
         "id": d.id.0,
@@ -2075,4 +2151,36 @@ fn restart() -> ! {
     };
     tracing::error!(%error, "could not restart; exiting");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peers() -> Vec<(NodeId, &'static str)> {
+        vec![
+            (NodeId([0xab; 32]), "Desk"),
+            (NodeId([0xac; 32]), "laptop"),
+            (NodeId([0x11; 32]), "twin"),
+            (NodeId([0x12; 32]), "twin"),
+        ]
+    }
+
+    #[test]
+    fn peers_resolve_by_exact_name_or_unique_long_prefix() {
+        let peers = peers();
+        let find = |q: &str| resolve(q, peers.iter().copied());
+        assert_eq!(find("desk"), Some(NodeId([0xab; 32])));
+        assert_eq!(find(" Laptop "), Some(NodeId([0xac; 32])));
+        assert_eq!(find("abab"), Some(NodeId([0xab; 32])));
+        // Empty, too short, non-hex, ambiguous names and ambiguous prefixes match nothing.
+        assert_eq!(find(""), None);
+        assert_eq!(find("  "), None);
+        assert_eq!(find("aba"), None);
+        assert_eq!(find("lapt"), None);
+        assert_eq!(find("twin"), None);
+        assert_eq!(find("1111"), Some(NodeId([0x11; 32])));
+        let shared = [(NodeId([0x11; 32]), "a"), (NodeId([0x11; 32]), "b")];
+        assert_eq!(resolve("1111", shared.iter().copied()), None);
+    }
 }
