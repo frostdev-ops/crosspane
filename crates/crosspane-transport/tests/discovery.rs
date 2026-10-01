@@ -140,6 +140,35 @@ fn is_hex_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Everything reported about the test's own nodes (`ports`) names the stable random id, never a
+/// renamed `<id> (N)` form, and each of them is listed exactly once.
+fn assert_stable_ids(events: &Events, discovery: &Discovery, ports: &[u16]) {
+    for event in &events.seen {
+        if let DiscoveryEvent::Found(candidate) = event
+            && ports.iter().any(|port| on_port(candidate, *port))
+        {
+            assert!(
+                is_hex_id(&candidate.instance),
+                "not the stable id: {candidate:?}"
+            );
+        }
+    }
+    let listed = discovery.candidates();
+    for port in ports {
+        let nodes: Vec<&Candidate> = listed.iter().filter(|c| on_port(c, *port)).collect();
+        assert_eq!(
+            nodes.len(),
+            1,
+            "port {port} should be listed once: {listed:?}"
+        );
+        assert!(
+            is_hex_id(&nodes[0].instance),
+            "not the stable id: {:?}",
+            nodes[0]
+        );
+    }
+}
+
 fn is_link_local_v6(addr: &SocketAddr) -> bool {
     matches!(addr.ip(), IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80)
 }
@@ -264,6 +293,8 @@ fn two_nodes_see_each_other_and_not_themselves() {
             discovery.candidates()
         );
     }
+    assert_stable_ids(&a_events, &a, &[pb]);
+    assert_stable_ids(&b_events, &b, &[pa]);
 }
 
 #[test]
@@ -286,6 +317,7 @@ fn pairing_name_is_advertised_only_while_set() {
         unreachable!()
     };
     assert_eq!(named.pairing_name.as_deref(), Some("Desk"));
+    assert!(is_hex_id(&named.instance), "{named:?}");
     assert_eq!(named.instance, first.instance, "same node, same instance");
     assert_eq!(named.version, 1);
 
@@ -298,7 +330,10 @@ fn pairing_name_is_advertised_only_while_set() {
     let DiscoveryEvent::Found(unnamed) = unnamed else {
         unreachable!()
     };
+    assert!(is_hex_id(&unnamed.instance), "{unnamed:?}");
     assert_eq!(unnamed.instance, first.instance);
+    b_events.drain();
+    assert_stable_ids(&b_events, &b, &[pa]);
     assert!(
         b_events
             .seen
@@ -338,8 +373,10 @@ fn rapid_pairing_name_changes_end_in_the_last_one() {
     let DiscoveryEvent::Found(last) = last else {
         unreachable!()
     };
+    assert!(is_hex_id(&last.instance), "{last:?}");
     assert_eq!(last.instance, first.instance);
     b_events.drain();
+    assert_stable_ids(&b_events, &b, &[pa]);
     assert!(
         b_events
             .seen
@@ -377,7 +414,7 @@ fn long_pairing_names_are_cut_on_a_character_boundary() {
     require_multicast!();
     let (pa, pb) = (port(4), port(5));
     let (a, _a_events) = node(pa);
-    let (_b, mut b_events) = node(pb);
+    let (b, mut b_events) = node(pb);
     b_events.found("B to see A", pa);
 
     // 200 bytes of two-byte characters: 31 of them fit in 63 bytes.
@@ -389,6 +426,9 @@ fn long_pairing_names_are_cut_on_a_character_boundary() {
         unreachable!()
     };
     assert_eq!(named.pairing_name, Some("é".repeat(31)));
+    assert!(is_hex_id(&named.instance), "{named:?}");
+    b_events.drain();
+    assert_stable_ids(&b_events, &b, &[pa]);
 }
 
 #[test]
@@ -461,7 +501,7 @@ fn instance_ids_are_random_hex_and_change_on_restart() {
     require_multicast!();
     let (pw, pa, pb) = (port(8), port(9), port(10));
     // One watcher sees two nodes, then a restart of the first.
-    let (_watcher, mut events) = node(pw);
+    let (watcher, mut events) = node(pw);
     let (a, _a_events) = node(pa);
     let first = events.found("the watcher to see A", pa);
     assert!(is_hex_id(&first.instance), "{first:?}");
@@ -482,6 +522,8 @@ fn instance_ids_are_random_hex_and_change_on_restart() {
     assert!(is_hex_id(&restarted.instance), "{restarted:?}");
     assert_ne!(restarted.instance, first.instance);
     assert_ne!(restarted.instance, second.instance);
+    events.drain();
+    assert_stable_ids(&events, &watcher, &[pa, pb]);
     drop(b);
 }
 
