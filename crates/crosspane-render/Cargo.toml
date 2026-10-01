@@ -13,3 +13,11 @@ workspace = true
 [dependencies]
 crosspane-types.workspace = true
 crosspane-media.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
