@@ -120,9 +120,41 @@ fn load_identity(
     )
 }
 
+/// Run `f` (a thread's whole body); if it panics, exit the process. A dead engine or media thread
+/// in a live process would leave input or windows stranded; exiting lets the service manager
+/// restart the agent, whose startup recovery releases input and restores parked windows (04 §8).
+pub fn exit_on_panic<R>(thread: &str, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::error!(
+                thread,
+                "thread panicked; exiting so the agent restarts and recovers"
+            );
+            std::process::exit(101);
+        }
+    }
+}
+
 fn run() -> Result<()> {
     let paths = Paths::new()?;
     let config = Config::load(&paths)?;
+    // One agent per user, settled before anything touches the session: creating the platform
+    // recovers parked windows, which would un-hide a running agent's projections. The lock is
+    // held for the life of the process (close-on-exec, so a restart in place takes it again).
+    let lock_path = paths.state_dir.join("agent.lock");
+    let _lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    _lock.try_lock().map_err(|_| {
+        anyhow::anyhow!(
+            "another crosspane-agent is already running for this user ({} is locked)",
+            lock_path.display()
+        )
+    })?;
     let mut platform = platform::create(&paths.state_dir, &config)?;
     tracing::info!(backends = ?platform, "platform ready");
     let identity = Arc::new(load_identity(
@@ -275,7 +307,7 @@ fn run_loop(
             std::thread::Builder::new()
                 .name("engine".into())
                 .spawn(move || {
-                    agent.run(startup, &rx);
+                    exit_on_panic("engine", || agent.run(startup, &rx));
                     drop(tx);
                     std::process::exit(0);
                 })
@@ -292,7 +324,7 @@ fn run_loop(
                 std::thread::Builder::new()
                     .name("engine".into())
                     .spawn(move || {
-                        agent.run(startup, &rx);
+                        exit_on_panic("engine", || agent.run(startup, &rx));
                         drop(tx);
                         std::process::exit(0);
                     })
