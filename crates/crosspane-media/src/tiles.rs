@@ -9,8 +9,8 @@ use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::wire::{
-    FrameHeader, HEADER_BYTES, MAX_FRAME_BYTES, MediaError, RECORD_BYTES, Reader, TILE,
-    parse_header, tile_grid, write_header,
+    Codec, FrameHeader, HEADER_BYTES, MAX_FRAME_BYTES, MediaError, RECORD_BYTES, Reader, TILE,
+    parse_header, read_codec, tile_grid, write_header,
 };
 
 /// Maximum number of successful capture calls between key frames. Unchanged captures count.
@@ -157,6 +157,9 @@ impl TileDecoder {
 
     /// Validate the whole payload, then apply it. An error leaves the canvas unchanged.
     pub fn apply(&mut self, data: &[u8]) -> Result<(FrameHeader, Vec<PixelRect>), MediaError> {
+        if read_codec(data)? != Codec::Tiles {
+            return Err(MediaError::BadCodec);
+        }
         let (header, count) = parse_header(data)?;
         let size = PixelSize::new(header.width, header.height);
         if !header.key {

@@ -49,11 +49,25 @@ pub enum FramePlan {
 #[derive(Debug)]
 pub struct HybridScheduler {
     config: HybridConfig,
+    video: bool,
+    enter_count: u32,
+    still_since: Option<Duration>,
+    retry_since: Option<Duration>,
+    tiles_key_pending: bool,
+    last_now: Duration,
 }
 
 impl HybridScheduler {
     pub fn new(config: HybridConfig) -> HybridScheduler {
-        HybridScheduler { config }
+        HybridScheduler {
+            config,
+            video: false,
+            enter_count: 0,
+            still_since: None,
+            retry_since: None,
+            tiles_key_pending: false,
+            last_now: Duration::ZERO,
+        }
     }
 
     /// Plan the frame captured at `now` (any monotonic clock) in which `changed` of `total` tiles
@@ -66,19 +80,81 @@ impl HybridScheduler {
         now: Duration,
         video_available: bool,
     ) -> FramePlan {
-        // WP-2.14a implements this.
-        let _ = (changed, total, now, video_available, &self.config);
-        FramePlan::Tiles
+        let now = self.monotonic_now(now);
+        if total == 0 {
+            // No image to encode. Preserve the mode (and any pending key) until there is one.
+            self.enter_count = 0;
+            self.still_since = None;
+            return FramePlan::Tiles;
+        }
+        if self.tiles_key_pending {
+            self.tiles_key_pending = false;
+            return FramePlan::TilesKey;
+        }
+        if !video_available {
+            return self.leave_video();
+        }
+        if let Some(failed_at) = self.retry_since {
+            if now.saturating_sub(failed_at) < self.config.retry_after {
+                return FramePlan::Tiles;
+            }
+            self.retry_since = None;
+        }
+
+        let fraction = changed as f32 / total as f32;
+        if self.video {
+            if fraction <= self.config.exit_fraction {
+                let still_since = self.still_since.get_or_insert(now);
+                if now.saturating_sub(*still_since) >= self.config.exit_after {
+                    return self.leave_video();
+                }
+            } else {
+                self.still_since = None;
+            }
+            FramePlan::Video { key: false }
+        } else {
+            if fraction >= self.config.enter_fraction {
+                self.enter_count = self.enter_count.saturating_add(1);
+                if self.enter_count >= self.config.enter_frames {
+                    self.video = true;
+                    self.enter_count = 0;
+                    return FramePlan::Video { key: true };
+                }
+            } else {
+                self.enter_count = 0;
+            }
+            FramePlan::Tiles
+        }
     }
 
     /// The video encoder failed at `now`: back to tiles (the next plan is `TilesKey` if video was
     /// on), and no video until `retry_after` has passed.
     pub fn video_failed(&mut self, now: Duration) {
-        let _ = now;
+        self.retry_since = Some(self.monotonic_now(now));
+        self.tiles_key_pending |= self.video;
+        self.video = false;
+        self.enter_count = 0;
+        self.still_since = None;
     }
 
     /// True while the projection is in video mode.
     pub fn in_video(&self) -> bool {
-        false
+        self.video
+    }
+
+    fn monotonic_now(&mut self, now: Duration) -> Duration {
+        self.last_now = self.last_now.max(now);
+        self.last_now
+    }
+
+    fn leave_video(&mut self) -> FramePlan {
+        self.enter_count = 0;
+        self.still_since = None;
+        if self.video {
+            self.video = false;
+            FramePlan::TilesKey
+        } else {
+            FramePlan::Tiles
+        }
     }
 }

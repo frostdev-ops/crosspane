@@ -758,6 +758,7 @@ dependencies = [
 name = "crosspane-platform-linux"
 version = "0.0.0"
 dependencies = [
+ "crosspane-media",
  "crosspane-platform",
  "crosspane-types",
  "ffmpeg-next",
@@ -783,6 +784,7 @@ name = "crosspane-platform-macos"
 version = "0.0.0"
 dependencies = [
  "block2 0.6.2",
+ "crosspane-media",
  "crosspane-platform",
  "crosspane-types",
  "dispatch2",
