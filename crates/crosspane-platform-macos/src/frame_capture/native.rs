@@ -7,6 +7,7 @@ use crosspane_platform::{
     CaptureTarget, Frame, Permission, PlatformError, StreamEndReason, StreamId,
 };
 use crosspane_types::geom::{PixelRect, PixelSize};
+use crosspane_types::id::DisplayId;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -14,7 +15,10 @@ use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::{
     CFArray, CFDictionary, CFNumber, CFString, CFType, CGPoint, CGRect, CGSize,
 };
-use objc2_core_graphics::CGRectMakeWithDictionaryRepresentation;
+use objc2_core_graphics::{
+    CGDisplayCopyDisplayMode, CGDisplayMode, CGRectMakeWithDictionaryRepresentation,
+    kCGColorSpaceSRGB,
+};
 use objc2_core_media::{CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
     CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetDataSize,
@@ -290,6 +294,10 @@ fn filter(
             _ => return Err(PlatformError::Unsupported("unknown capture target")),
         }
     };
+    if let CaptureTarget::Display(id) = target {
+        let (size, scale) = display_geometry(id)?;
+        return Ok((filter, size, scale));
+    }
     // SAFETY: Read-only property of the live, initialized filter; gives the target's backing scale.
     let scale = f64::from(unsafe { filter.pointPixelScale() });
     let width = (rect.size.width * scale).round();
@@ -306,6 +314,23 @@ fn filter(
         return Err(PlatformError::Backend("invalid capture geometry".into()));
     }
     Ok((filter, PixelSize::new(width as u32, height as u32), scale))
+}
+
+fn display_geometry(id: DisplayId) -> Result<(PixelSize, f64), PlatformError> {
+    let mode = CGDisplayCopyDisplayMode(id.0).ok_or(PlatformError::NotFound)?;
+    let width = CGDisplayMode::pixel_width(Some(&mode));
+    let height = CGDisplayMode::pixel_height(Some(&mode));
+    let scale = width as f64 / CGDisplayMode::width(Some(&mode)) as f64;
+    if width == 0
+        || height == 0
+        || width > i32::MAX as usize
+        || height > i32::MAX as usize
+        || !scale.is_finite()
+        || scale <= 0.0
+    {
+        return Err(PlatformError::Backend("invalid capture geometry".into()));
+    }
+    Ok((PixelSize::new(width as u32, height as u32), scale))
 }
 
 pub(super) fn target_exists(content: &SCShareableContent, target: CaptureTarget) -> bool {
@@ -337,6 +362,10 @@ fn checked_crop(crop: Option<PixelRect>, size: PixelSize) -> Result<PixelRect, P
     }
 }
 
+fn crop_needs_refresh(target: CaptureTarget, crop: Option<PixelRect>, size: PixelSize) -> bool {
+    matches!(target, CaptureTarget::Display(_)) && checked_crop(crop, size).is_err()
+}
+
 fn configuration(
     target: CaptureTarget,
     size: PixelSize,
@@ -347,6 +376,7 @@ fn configuration(
     let rect = checked_crop(crop, size)?;
     // SAFETY: All setters are documented SCK APIs on a new, worker-owned configuration. FPS was
     // validated before construction; dimensions and sourceRect have been checked against bounds.
+    // The public sRGB name is an immutable framework constant, alive for the stream's lifetime.
     let config = unsafe {
         let config = SCStreamConfiguration::new();
         let output_size = if matches!(target, CaptureTarget::Display(_)) {
@@ -360,6 +390,7 @@ fn configuration(
         config.setWidth(output_size.width as usize);
         config.setHeight(output_size.height as usize);
         config.setPixelFormat(kCVPixelFormatType_32BGRA);
+        config.setColorSpaceName(kCGColorSpaceSRGB);
         config.setMinimumFrameInterval(CMTime::new(1, fps as i32));
         config.setShowsCursor(false);
         config.setCapturesAudio(false);
@@ -471,7 +502,14 @@ impl Stream {
         deadline: Instant,
         wait: &Wait<'_>,
     ) -> Result<(), PlatformError> {
-        self.update(self.size, self.scale, crop, deadline, wait)
+        // Validate against fresh geometry and submit only the requested crop's configuration.
+        let (size, scale) = match self.target {
+            CaptureTarget::Display(id) if crop_needs_refresh(self.target, crop, self.size) => {
+                display_geometry(id)?
+            }
+            _ => (self.size, self.scale),
+        };
+        self.update(size, scale, crop, deadline, wait)
     }
 
     pub fn resize(
@@ -480,24 +518,22 @@ impl Stream {
         deadline: Instant,
         wait: &Wait<'_>,
     ) -> Result<(), PlatformError> {
-        if matches!(self.target, CaptureTarget::Window(_)) {
-            let (_, size, scale) = filter(content, self.target)?;
-            if size != self.size || scale != self.scale {
-                // Preserve only the old crop's intersection when a window shrinks. The engine can
-                // supply its new crop next; never read outside the resized IOSurface.
-                let crop = self.crop.and_then(|crop| {
-                    crop.intersection(&PixelRect::new(
-                        [0, 0].into(),
-                        [size.width as i32, size.height as i32].into(),
-                    ))
-                });
-                if self.crop.is_some() && crop.is_none() {
-                    return Err(PlatformError::Backend(
-                        "crop no longer intersects window".into(),
-                    ));
-                }
-                self.update(size, scale, crop, deadline, wait)?;
+        let (_, size, scale) = filter(content, self.target)?;
+        if size != self.size || scale != self.scale {
+            // Preserve only the old crop's intersection when the target shrinks. The engine can
+            // supply its new crop next; never read outside the resized IOSurface.
+            let crop = self.crop.and_then(|crop| {
+                crop.intersection(&PixelRect::new(
+                    [0, 0].into(),
+                    [size.width as i32, size.height as i32].into(),
+                ))
+            });
+            if self.crop.is_some() && crop.is_none() {
+                return Err(PlatformError::Backend(
+                    "crop no longer intersects target".into(),
+                ));
             }
+            self.update(size, scale, crop, deadline, wait)?;
         }
         Ok(())
     }
@@ -739,6 +775,166 @@ fn key(string: &NSString) -> &objc2_core_foundation::CFType {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_refresh_only_for_displays_outside_cached_size() {
+        let display = CaptureTarget::Display(DisplayId(1));
+        let window = CaptureTarget::Window(crosspane_types::id::WindowId(1));
+        let size = PixelSize::new(100, 80);
+        let fits = PixelRect::new([10, 10].into(), [100, 80].into());
+        let wider = PixelRect::new([10, 10].into(), [101, 80].into());
+        let taller = PixelRect::new([10, 10].into(), [100, 81].into());
+        assert!(!crop_needs_refresh(display, None, size));
+        assert!(!crop_needs_refresh(display, Some(fits), size));
+        assert!(crop_needs_refresh(display, Some(wider), size));
+        assert!(crop_needs_refresh(display, Some(taller), size));
+        assert!(!crop_needs_refresh(window, Some(wider), size));
+        assert!(!crop_needs_refresh(window, Some(taller), size));
+    }
+
+    #[test]
+    fn refreshed_size_accepts_only_nonempty_in_bounds_crops() {
+        let cached = PixelSize::new(100, 80);
+        let current = PixelSize::new(200, 160);
+        let crop = PixelRect::new([10, 20].into(), [200, 160].into());
+        assert!(checked_crop(Some(crop), cached).is_err());
+        assert_eq!(checked_crop(Some(crop), current).unwrap(), crop);
+        for invalid in [
+            PixelRect::new([10, 20].into(), [201, 160].into()),
+            PixelRect::new([10, 20].into(), [200, 161].into()),
+            PixelRect::new([-1, 0].into(), [100, 80].into()),
+            PixelRect::new([10, 20].into(), [10, 20].into()),
+            PixelRect::new([20, 20].into(), [10, 10].into()),
+        ] {
+            assert!(checked_crop(Some(invalid), current).is_err());
+        }
+    }
+
+    #[test]
+    fn live_main_display_crop_refresh_continues_frames() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+
+        use crosspane_platform::{FrameEvent, IoGate};
+        use objc2_core_graphics::{
+            CGColorSpace, CGDisplayCopyColorSpace, CGDisplayModelNumber, CGDisplayVendorNumber,
+            CGMainDisplayID,
+        };
+
+        if std::env::var("CROSSPANE_MAC_LIVE").as_deref() != Ok("1") {
+            eprintln!(
+                "skipped: display crop refresh requires CROSSPANE_MAC_LIVE=1 in the GUI session"
+            );
+            return;
+        }
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let (commands, _receiver) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            gate,
+            deliveries: Mutex::new(Default::default()),
+            commands,
+            cursor_wake: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+        let wait = Wait::new(&shared, std::iter::empty());
+        let content = content(Instant::now() + super::super::TIMEOUT, &wait).unwrap();
+        // SAFETY: Read-only display IDs from the retained, immutable SCK snapshot.
+        for display in unsafe { content.0.displays() } {
+            // SAFETY: Read-only ID of a retained display from the snapshot.
+            let id = unsafe { display.displayID() };
+            if CGDisplayVendorNumber(id) == crate::displays::TWIN_VENDOR
+                && CGDisplayModelNumber(id) == crate::displays::TWIN_PRODUCT
+            {
+                let space = CGDisplayCopyColorSpace(id);
+                eprintln!(
+                    "twin display {id} colour-space name: {:?}",
+                    CGColorSpace::name(Some(&space)).map(|name| name.to_string())
+                );
+            }
+        }
+        let target = CaptureTarget::Display(DisplayId(CGMainDisplayID()));
+        let (size, scale) = display_geometry(DisplayId(CGMainDisplayID())).unwrap();
+        assert!(size.width >= 4 && size.height >= 4);
+        let cached = PixelSize::new(size.width / 4, size.height / 4);
+        let initial = checked_crop(None, cached).unwrap();
+        let config = configuration(target, size, scale, Some(initial), 30).unwrap();
+        // SAFETY: Read-only property of the live configuration; the sRGB constant is immutable.
+        unsafe { assert_eq!(&*config.colorSpaceName(), kCGColorSpaceSRGB) };
+        let enlarged = PixelRect::new(
+            [0, 0].into(),
+            [size.width as i32 / 2, size.height as i32 / 2].into(),
+        );
+        let (tx, rx) = mpsc::channel();
+        let id = StreamId(1);
+        let mut stream = Stream::new(&content.0, target, Some(initial), 30, id, &shared).unwrap();
+        shared.deliveries.lock().unwrap().insert(
+            id,
+            super::super::Delivery {
+                sink: Arc::new(move |event| {
+                    let _ = tx.send(event);
+                }),
+                active: true,
+                scale,
+                crop: None,
+                interval: Duration::from_nanos(1_000_000_000_u64.div_ceil(30)),
+                last: None,
+                size: None,
+                full_damage: true,
+                cursor: super::super::cursor::StreamCursor::new(target, Some(initial)),
+            },
+        );
+        let await_frame = |expected| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                {
+                    FrameEvent::Frame { stream, frame } => {
+                        assert_eq!(stream, id);
+                        if frame.size == expected {
+                            assert_eq!(frame.stride, expected.width * 4);
+                            assert_eq!(
+                                frame.pixels.len(),
+                                frame.stride as usize * expected.height as usize
+                            );
+                            break;
+                        }
+                    }
+                    FrameEvent::Ended { reason, .. } => panic!("capture ended: {reason:?}"),
+                    _ => {}
+                }
+            }
+        };
+        stream
+            .start(Instant::now() + super::super::TIMEOUT, &wait)
+            .unwrap();
+        await_frame(cached);
+        // Only the cache changes; the real display mode and owner's windows stay untouched.
+        stream.size = cached;
+        stream.scale = scale / 2.0;
+        assert!(crop_needs_refresh(target, Some(enlarged), stream.size));
+        stream
+            .set_crop(
+                Some(enlarged),
+                Instant::now() + super::super::TIMEOUT,
+                &wait,
+            )
+            .unwrap();
+        assert_eq!(stream.size, size);
+        assert_eq!(stream.scale, scale);
+        await_frame(PixelSize::new(size.width / 2, size.height / 2));
+        wait.receive(
+            &stream.stop_async(),
+            Instant::now() + super::super::TIMEOUT,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    }
 
     #[test]
     fn dirty_rect_points_to_pixels_at_scale_two() {
