@@ -45,6 +45,19 @@ for n in a b; do
   mkdir -p "$work/$n/config/crosspane" "$work/$n/state" "$work/$n/run"
   scripts/hypr-nested.sh start --name "e2e-m$n" --width 1600 --height 900 >/dev/null
 done
+# Pin both nests as floating 1600x900 windows in the outer session (as e1-nested.sh does): if the
+# outer layout re-tiles them, their outputs resize and every window inside re-tiles.
+nest_addr() {
+  local pid; pid=$(cat "$XDG_RUNTIME_DIR/crosspane-hypr-e2e-m$1/pid" 2>/dev/null || true)
+  [ -n "$pid" ] && hyprctl -j clients | jq -r --argjson pid "$pid" '.[] | select(.pid == $pid) | .address' | head -n1
+}
+for n in a b; do
+  addr=$(nest_addr "$n")
+  [ -n "$addr" ] || continue
+  hyprctl dispatch "hl.dsp.window.float({ window = \"address:$addr\", action = \"set\" })" >/dev/null
+  hyprctl dispatch "hl.dsp.window.resize({ window = \"address:$addr\", x = 1600, y = 900, relative = false })" >/dev/null
+done
+sleep 1
 port_a=48001 port_b=48011
 cat > "$work/a/config/crosspane/config.toml" <<CFG
 name = "e2e-ma"
@@ -96,7 +109,11 @@ for i in 1 2 3 4; do
   ids+=("$id")
 done
 spot() { nest a hyprctl -j clients | jq -r --arg t "$1" '.[] | select(.title == $t) | "\(.workspace.name) \(.at | join(",")) \(.size | join("x"))"'; }
-before=$(for i in 1 2 3 4; do spot "e2e-multi-$i"; done)
+layout() { for i in 1 2 3 4; do spot "e2e-multi-$i"; done; }
+# New windows are still being tiled: wait until the layout holds still for a second.
+settled() { local a; a=$(layout); sleep 1; [ "$a" = "$(layout)" ]; }
+wait_for 15 settled || fail "the test windows never settled"
+before=$(layout)
 proxies() { nest b timeout 3 hyprctl -j clients | jq '[.[] | select(.class == "crosspane-proxy")] | length'; }
 projections() { envof "$1" "$bin/crosspanectl" status 2>/dev/null | grep -cE "^  projection " || true; }
 journal_empty() { for f in "$work"/a/state/crosspane/*.json; do [ -f "$f" ] || continue; case $f in *parking*|*mirror*) [ "$(jq length "$f")" -eq 0 ] || return 1;; esac; done; }
@@ -120,7 +137,7 @@ for p in $(envof a "$bin/crosspanectl" status | awk '/^  projection / {split($2,
 done
 none() { [ "$(proxies)" -eq 0 ] && [ "$(projections a)" -eq 0 ]; }
 wait_for 15 none || fail "after return: $(proxies) proxies, $(projections a) projections on A"
-after=$(for i in 1 2 3 4; do spot "e2e-multi-$i"; done)
+after=$(layout)
 [ "$before" = "$after" ] || fail "windows moved: before [$before] after [$after]"
 journal_empty || fail "the parking journal is not empty"
 echo "ok: all returned, windows unchanged"

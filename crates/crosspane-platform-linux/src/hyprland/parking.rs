@@ -34,6 +34,10 @@ const PARK_STRIDE: i64 = 1 << 14;
 const SETTLE: Duration = Duration::from_millis(1500);
 /// Mode changes one settle may make for a bar that arrived late on the twin output.
 const MAX_REPADS: u32 = 2;
+/// After a twin output failed to come up, how long parks fail fast (`Unsupported`, so the window
+/// is mirrored) instead of trying again: each try adds and removes an output, which re-tiles the
+/// session.
+const TWIN_RETRY: Duration = Duration::from_secs(600);
 
 /// Where a window was before it was parked.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,6 +70,8 @@ pub struct HyprlandParking {
     /// again. On 2026-10-01 that loop changed one twin's mode hundreds of times and Hyprland
     /// 0.56.2 crashed.
     padding: BTreeMap<u64, [u32; 4]>,
+    /// When a twin output last failed to come up (see [`TWIN_RETRY`]).
+    twin_failed: Option<Instant>,
 }
 
 impl HyprlandParking {
@@ -86,6 +92,7 @@ impl HyprlandParking {
             journal,
             entries,
             padding: BTreeMap::new(),
+            twin_failed: None,
         })
     }
 
@@ -222,18 +229,35 @@ impl HyprlandParking {
                 .and_then(Value::as_str)
                 .unwrap_or(&entry.address)
                 .to_owned();
-            self.ipc.dispatch(&format!(
-                "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = 0, client = 0 }})"
-            ))?;
-            self.move_window(&address, &workspace_selector(&entry.original.workspace))?;
+            // A park that failed before the window moved left it where it was: moving it "back"
+            // would re-tile it.
+            let on_twin = client.pointer("/workspace/name").and_then(Value::as_str)
+                == Some(entry.workspace.as_str());
+            let fullscreen = client
+                .get("fullscreen")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let floating = client
+                .get("floating")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let o = &entry.original;
-            if o.fullscreen != 0 {
+            let changed = on_twin || fullscreen != o.fullscreen || floating != o.floating;
+            if changed {
+                self.ipc.dispatch(&format!(
+                    "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = 0, client = 0 }})"
+                ))?;
+            }
+            if on_twin {
+                self.move_window(&address, &workspace_selector(&o.workspace))?;
+            }
+            if changed && o.fullscreen != 0 {
                 self.ipc.dispatch(&format!(
                     "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = {0}, client = {0} }})",
                     o.fullscreen
                 ))?;
             }
-            if o.floating {
+            if changed && o.floating {
                 self.ipc.dispatch(&format!(
                     "hl.dsp.window.float({{ window = \"address:{address}\", action = \"set\" }})"
                 ))?;
@@ -269,6 +293,12 @@ impl WindowParking for HyprlandParking {
     ) -> Result<Parked, PlatformError> {
         if self.entries.contains_key(&window.0) {
             return self.resize(window, size, scale);
+        }
+        if self
+            .twin_failed
+            .is_some_and(|failed| failed.elapsed() < TWIN_RETRY)
+        {
+            return Err(PlatformError::Unsupported("twin output unavailable"));
         }
         let client = self.client(window)?.ok_or(PlatformError::NotFound)?;
         let address = client
@@ -332,7 +362,8 @@ impl WindowParking for HyprlandParking {
                 self.set_mode(&entry, size, scale)
             })();
             if let Err(error) = twin {
-                tracing::warn!(%error, output = entry.output, "no twin output");
+                tracing::warn!(%error, output = entry.output, "no twin output; mirroring for a while");
+                self.twin_failed = Some(Instant::now());
                 return Err(PlatformError::Unsupported("twin output unavailable"));
             }
             if entry.original.fullscreen != 0 {
