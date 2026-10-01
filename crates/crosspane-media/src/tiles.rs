@@ -54,6 +54,14 @@ impl TileScan {
     }
 }
 
+/// Packed tiles of one capture, for encoding from a GPU readback that holds only some tiles
+/// (WP-2.24). Tile `(tx, ty)` is its pixels as BGRA8 rows of `w * 4` bytes, `h` rows, no padding,
+/// where `w` × `h` is the tile's size inside the image (edge tiles are smaller). `None` when the
+/// source doesn't hold that tile.
+pub trait TileSource {
+    fn tile(&self, tx: u32, ty: u32) -> Option<&[u8]>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncodeStats {
     pub key: bool,

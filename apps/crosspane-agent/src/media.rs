@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use crosspane_engine::{Input, ProjectionKey};
 use crosspane_media::codec::{VideoCodecs, VideoDecoder, VideoEncoder};
 use crosspane_media::hybrid::{FramePlan, HybridConfig, HybridScheduler};
-use crosspane_media::picture::{Nv12, nv12_to_bgra};
+use crosspane_media::picture::{Decoded, NativePicture, Nv12, nv12_to_bgra};
 use crosspane_media::tiles::{TileDecoder, TileEncoder};
 use crosspane_media::wire::{
     Codec, FrameHeader, MediaError, TILE, read_codec, read_cursor, read_header, read_video,
@@ -382,6 +382,17 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
     }
 }
 
+/// Run a codec step over a frame's pixels wherever they are (a native image is mapped meanwhile).
+fn with_pixels<T, E: std::fmt::Display>(
+    frame: &Frame,
+    f: impl FnOnce(&[u8], u32) -> Result<T, E>,
+) -> Result<T, String> {
+    frame
+        .with_pixels(f)
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 fn tile_count(frame: &Frame) -> u32 {
     frame.size.width.div_ceil(TILE) * frame.size.height.div_ceil(TILE)
 }
@@ -410,7 +421,9 @@ fn encode_frame(
 ) {
     out.clear();
     // Change detection only: LZ4 runs just for frames that go out as tiles.
-    let scan = match enc.encoder.scan(frame.size, &frame.pixels, frame.stride) {
+    let scan = match with_pixels(frame, |pixels, stride| {
+        enc.encoder.scan(frame.size, pixels, stride)
+    }) {
         Ok(scan) => scan,
         Err(e) => {
             tracing::warn!(error = %e, "encode failed");
@@ -424,14 +437,10 @@ fn encode_frame(
     match plan {
         FramePlan::Tiles | FramePlan::TilesKey => {
             let key = plan == FramePlan::TilesKey;
-            match enc.encoder.emit(
-                scan,
-                header(enc, frame),
-                &frame.pixels,
-                frame.stride,
-                key,
-                out,
-            ) {
+            let header = header(enc, frame);
+            match with_pixels(frame, |pixels, stride| {
+                enc.encoder.emit(scan, header, pixels, stride, key, out)
+            }) {
                 Ok(Some(_)) => send(enc, out, transport),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "encode failed"),
@@ -462,10 +471,10 @@ fn send_tiles(
     out: &mut Vec<u8>,
 ) {
     out.clear();
-    match enc
-        .encoder
-        .encode(header(enc, frame), &frame.pixels, frame.stride, key, out)
-    {
+    let header = header(enc, frame);
+    match with_pixels(frame, |pixels, stride| {
+        enc.encoder.encode(header, pixels, stride, key, out)
+    }) {
         Ok(Some(_)) => send(enc, out, transport),
         Ok(None) => {}
         Err(e) => tracing::warn!(error = %e, "encode failed"),
@@ -491,15 +500,10 @@ fn send_video(
     }
     let encoder = enc.video.as_mut().ok_or("no encoder")?;
     let mut access_unit = Vec::new();
-    let encoded = encoder
-        .encode(
-            &frame.pixels,
-            frame.stride,
-            frame.size,
-            key || enc.video_key,
-            &mut access_unit,
-        )
-        .map_err(|e| e.to_string())?;
+    let force_key = key || enc.video_key;
+    let encoded = with_pixels(frame, |pixels, stride| {
+        encoder.encode(pixels, stride, frame.size, force_key, &mut access_unit)
+    })?;
     enc.video_key = false;
     let mut header = header(enc, frame);
     header.key = encoded.key;
@@ -592,8 +596,11 @@ struct Decoding {
     last_error: Option<Instant>,
     /// Which picture the proxy shows, for snapshots (made only when asked).
     showing: Showing,
-    /// The newest decoded video picture. Its buffers are reused once the proxy has let go of it.
+    /// The newest decoded video picture when the decoder works in CPU memory. Its buffers are
+    /// reused once the proxy has let go of it.
     picture: Arc<Nv12>,
+    /// The newest decoded picture when it stayed in native memory (zero-copy).
+    native: Option<Arc<dyn NativePicture>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -615,8 +622,18 @@ impl Decoding {
                 Some((size, Arc::from(pixels)))
             }
             Showing::Video(size) => {
+                let copy;
+                let picture = match &self.native {
+                    Some(native) => {
+                        let mut nv12 = Nv12::default();
+                        native.to_nv12(&mut nv12).ok()?;
+                        copy = nv12;
+                        &copy
+                    }
+                    None => &*self.picture,
+                };
                 let mut pixels = Vec::new();
-                nv12_to_bgra(&self.picture, size, &mut pixels).ok()?;
+                nv12_to_bgra(picture, size, &mut pixels).ok()?;
                 Some((size, Arc::from(pixels)))
             }
         }
@@ -684,6 +701,7 @@ fn decode_loop(
                     cursor_seq: 0,
                     showing: Showing::Nothing,
                     picture: Arc::default(),
+                    native: None,
                     pending: BTreeMap::new(),
                     gap_since: None,
                     last_error: None,
@@ -757,10 +775,17 @@ fn apply(
             ids.shown(key, data.len(), header.captured_ns);
             let command = if let Some(size) = video_size {
                 d.showing = Showing::Video(size);
-                HostCommand::Video {
-                    id,
-                    size,
-                    picture: Arc::clone(&d.picture),
+                match &d.native {
+                    Some(picture) => HostCommand::VideoNative {
+                        id,
+                        size,
+                        picture: Arc::clone(picture),
+                    },
+                    None => HostCommand::Video {
+                        id,
+                        size,
+                        picture: Arc::clone(&d.picture),
+                    },
                 }
             } else {
                 d.showing = Showing::Canvas;
@@ -835,16 +860,24 @@ fn apply_video(
         d.video = Some(decoder);
     }
     let decoder = d.video.as_mut().ok_or("no decoder")?;
-    // Reuse the last picture's buffers unless the proxy hasn't uploaded it yet.
-    if Arc::get_mut(&mut d.picture).is_none() {
-        d.picture = Arc::default();
-    }
-    let picture = Arc::get_mut(&mut d.picture).ok_or("picture buffer in use")?;
-    decoder
-        .decode_nv12(access_unit, picture)
-        .map_err(|e| e.to_string())?;
+    // A CPU picture reuses the last one's buffers unless the proxy hasn't uploaded it yet; a
+    // native one stays where the decoder put it.
+    let coded = match decoder
+        .decode_native(access_unit, &mut d.picture)
+        .map_err(|e| e.to_string())?
+    {
+        Decoded::Nv12(picture) => {
+            d.native = None;
+            picture.size
+        }
+        Decoded::Native(picture) => {
+            let size = picture.size();
+            d.native = Some(picture);
+            size
+        }
+    };
     let (w, h) = (header.width, header.height);
-    if w == 0 || h == 0 || picture.size.width < w || picture.size.height < h {
+    if w == 0 || h == 0 || coded.width < w || coded.height < h {
         return Err("decoded frame smaller than its header".into());
     }
     Ok((header, PixelSize::new(w, h)))

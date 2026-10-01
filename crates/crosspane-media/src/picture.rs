@@ -5,6 +5,10 @@
 //! definition of that conversion: the shader gets its numbers as a uniform, and
 //! [`nv12_to_bgra`] is the CPU reference the shader is tested against (and what snapshots use).
 
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+
 use crosspane_types::geom::PixelSize;
 
 use crate::codec::CodecError;
@@ -108,6 +112,38 @@ impl Nv12 {
             return Err(CodecError::BadInput("NV12 plane shorter than its size"));
         }
         Ok(())
+    }
+}
+
+/// A decoded picture that stays in native memory (an IOSurface on macOS), for the renderer to
+/// import into the GPU without a copy (WP-2.24). Holding it keeps the decoder's buffer from being
+/// reused; drop it once it's shown or superseded.
+pub trait NativePicture: Send + Sync + fmt::Debug {
+    /// The coded size (even dimensions, as for [`Nv12::size`]).
+    fn size(&self) -> PixelSize;
+    fn colour(&self) -> YuvColour;
+    /// CPU fallback: copy the picture into `out` as NV12, reusing its allocations.
+    fn to_nv12(&self, out: &mut Nv12) -> Result<(), CodecError>;
+    /// The platform crate's concrete type, for its GPU importer.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// What [`crate::codec::VideoDecoder::decode_native`] produced.
+#[derive(Clone, Debug)]
+pub enum Decoded {
+    /// NV12 planes in CPU memory.
+    Nv12(Arc<Nv12>),
+    /// A picture in native memory.
+    Native(Arc<dyn NativePicture>),
+}
+
+impl Decoded {
+    /// The coded size.
+    pub fn size(&self) -> PixelSize {
+        match self {
+            Decoded::Nv12(picture) => picture.size,
+            Decoded::Native(picture) => picture.size(),
+        }
     }
 }
 

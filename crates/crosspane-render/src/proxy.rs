@@ -52,6 +52,15 @@ pub enum HostCommand {
         size: PixelSize,
         picture: Arc<crosspane_media::picture::Nv12>,
     },
+    /// A decoded picture in native memory (WP-2.24): like `Video`, but the host imports its
+    /// planes into the GPU with the [`PictureImporter`] given to [`ProxyHost::set_importer`] (no
+    /// copy), or copies it when there's none or the import fails. Dropping the picture releases
+    /// the decoder's buffer, so the host holds only the newest one plus the one on screen.
+    VideoNative {
+        id: u64,
+        size: PixelSize,
+        picture: Arc<dyn crosspane_media::picture::NativePicture>,
+    },
     /// The source's cursor over this proxy (03 §4.6, WP-2.16): BGRA with straight alpha, `size`
     /// pixels at the content's density, click point `hotspot`. All-transparent hides the cursor.
     SetCursor {
@@ -111,6 +120,11 @@ impl fmt::Debug for HostCommand {
                 .finish(),
             Self::Video { id, size, .. } => f
                 .debug_struct("Video")
+                .field("id", id)
+                .field("size", size)
+                .finish_non_exhaustive(),
+            Self::VideoNative { id, size, .. } => f
+                .debug_struct("VideoNative")
                 .field("id", id)
                 .field("size", size)
                 .finish_non_exhaustive(),
@@ -179,6 +193,20 @@ pub enum HostEvent {
     },
 }
 
+/// Imports a native picture's planes into the host's GPU `device` without copying them (WP-2.24):
+/// `[luma, chroma]` as an `R8Unorm` texture of the picture's coded size and an `Rg8Unorm` texture
+/// of half that, both with `TEXTURE_BINDING`. The textures must keep the picture's memory alive
+/// until wgpu destroys them (wgpu does that only after the GPU has finished with them). Platform
+/// crates provide one for their decoders' pictures; it runs on the host's thread.
+pub type PictureImporter = Arc<
+    dyn Fn(
+            &wgpu::Device,
+            &dyn crosspane_media::picture::NativePicture,
+        ) -> Result<[wgpu::Texture; 2], String>
+        + Send
+        + Sync,
+>;
+
 /// Cloneable, Send handle for commanding the host from other threads.
 #[derive(Clone, Debug)]
 pub struct HostHandle {
@@ -195,9 +223,9 @@ impl HostHandle {
 }
 
 /// The host. `new` must run on the main thread (winit's rule on macOS).
-#[derive(Debug)]
 pub struct ProxyHost {
     event_loop: EventLoop<HostCommand>,
+    importer: Option<PictureImporter>,
 }
 
 impl ProxyHost {
@@ -227,14 +255,34 @@ impl ProxyHost {
         let handle = HostHandle {
             proxy: event_loop.create_proxy(),
         };
-        Ok((Self { event_loop }, handle))
+        Ok((
+            Self {
+                event_loop,
+                importer: None,
+            },
+            handle,
+        ))
+    }
+
+    /// Import `VideoNative` pictures with `importer` instead of copying them.
+    pub fn set_importer(&mut self, importer: PictureImporter) {
+        self.importer = Some(importer);
     }
 
     /// Run until `Shutdown`. The event callback runs on the main thread and must not block.
     pub fn run(self, events: Box<dyn FnMut(HostEvent)>) -> Result<(), HostError> {
-        let mut app = app::App::new(self.event_loop.create_proxy(), events);
+        let mut app = app::App::new(self.event_loop.create_proxy(), events, self.importer);
         self.event_loop.run_app(&mut app)?;
         Ok(())
+    }
+}
+
+impl fmt::Debug for ProxyHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyHost")
+            .field("event_loop", &self.event_loop)
+            .field("importer", &self.importer.is_some())
+            .finish()
     }
 }
 
