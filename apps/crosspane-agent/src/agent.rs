@@ -105,6 +105,13 @@ pub struct Agent {
     projections: BTreeMap<ProjectionKey, String>,
     events: Sender<Event>,
     crossing: bool,
+    /// `config.latency_overlay`, and per destination projection its title and the frame count
+    /// at the last readout.
+    latency_overlay: bool,
+    titles: HashMap<ProjectionKey, (String, u64)>,
+    /// Clock samples per peer, (round trip, offset) in ns, from the ping exchange.
+    clocks: HashMap<NodeId, VecDeque<(u64, i64)>>,
+    last_ping: Instant,
     pairing: crate::pairing::Pairing,
     identity: Arc<crosspane_security::identity::DeviceIdentity>,
     port: u16,
@@ -121,6 +128,7 @@ pub struct E2Wiring {
     pub events: Sender<Event>,
     /// `config.crossing`.
     pub crossing: bool,
+    pub latency_overlay: bool,
     pub identity: Arc<crosspane_security::identity::DeviceIdentity>,
     pub port: u16,
     pub revocations: crate::revocations::Issued,
@@ -128,6 +136,9 @@ pub struct E2Wiring {
 
 const NOTICE_HISTORY: usize = 20;
 const HOUSEKEEPING: Duration = Duration::from_secs(1);
+/// Clock-offset pings to every peer (for frame latency).
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+const CLOCK_SAMPLES: usize = 8;
 const PERMISSION_CHECK: Duration = Duration::from_secs(2);
 /// How long a browse or pull waits for the peer's answer.
 const BROWSE_WAIT: Duration = Duration::from_secs(5);
@@ -255,6 +266,10 @@ impl Agent {
             projections: BTreeMap::new(),
             events: e2.events,
             crossing: e2.crossing,
+            latency_overlay: e2.latency_overlay,
+            titles: HashMap::new(),
+            clocks: HashMap::new(),
+            last_ping: Instant::now(),
             pairing: crate::pairing::Pairing::default(),
             identity: e2.identity,
             port: e2.port,
@@ -437,7 +452,21 @@ impl Agent {
                     self.on_revocation(peer, &notice);
                     return;
                 }
-                ControlMessage::Ping { .. } | ControlMessage::Pong { .. } => return,
+                ControlMessage::Ping { t0 } => {
+                    let now = platform::now().as_nanos();
+                    if let Some(link) = self.links.get_mut(peer) {
+                        let _ = link.send_control(&ControlMessage::Pong {
+                            t0: *t0,
+                            t1: now,
+                            t2: now,
+                        });
+                    }
+                    return;
+                }
+                ControlMessage::Pong { t0, t1, t2 } => {
+                    self.on_pong(*peer, *t0, *t1, *t2);
+                    return;
+                }
                 _ => {}
             },
             LinkEvent::Closed { peer, error } => {
@@ -657,6 +686,7 @@ impl Agent {
                 size,
             } => {
                 let id = self.proxy_ids.open(key);
+                self.titles.insert(key, (title.clone(), 0));
                 let sent = self
                     .host
                     .as_ref()
@@ -698,6 +728,9 @@ impl Agent {
                 }
             }
             Output::ProxyTitle { key, title } => {
+                if let Some(entry) = self.titles.get_mut(&key) {
+                    entry.0.clone_from(&title);
+                }
                 if let (Some(h), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
                     let _ = h.send(HostCommand::SetTitle { id, title });
                 }
@@ -748,6 +781,7 @@ impl Agent {
             }
             Output::CloseProxy { key } => {
                 self.projections.remove(&key);
+                self.titles.remove(&key);
                 if let Some(id) = self.proxy_ids.close(key)
                     && let Some(h) = &self.host
                 {
@@ -1228,8 +1262,67 @@ impl Agent {
             .map_or_else(|| node.short(), |info| info.name.clone())
     }
 
+    /// An NTP-style sample: the peer's clock minus ours is ((t1 - t0) + (t2 - t3)) / 2. The
+    /// sample with the shortest round trip of the last few is the most trustworthy.
+    fn on_pong(&mut self, peer: NodeId, t0: u64, t1: u64, t2: u64) {
+        let t3 = platform::now().as_nanos();
+        let (t0, t1, t2, t3) = (
+            i128::from(t0),
+            i128::from(t1),
+            i128::from(t2),
+            i128::from(t3),
+        );
+        let rtt = (t3 - t0) - (t2 - t1);
+        if !(0..5_000_000_000).contains(&rtt) {
+            return;
+        }
+        let offset = ((t1 - t0) + (t2 - t3)) / 2;
+        let Ok(offset) = i64::try_from(offset) else {
+            return;
+        };
+        let samples = self.clocks.entry(peer).or_default();
+        samples.push_back((rtt as u64, offset));
+        while samples.len() > CLOCK_SAMPLES {
+            samples.pop_front();
+        }
+        if let Some(&(_, best)) = samples.iter().min_by_key(|(rtt, _)| *rtt) {
+            self.proxy_ids.set_offset(peer, best);
+        }
+    }
+
+    /// The opt-in latency overlay: frame rate and latency in each projected window's title.
+    fn latency_titles(&mut self) {
+        let keys: Vec<ProjectionKey> = self.titles.keys().copied().collect();
+        for key in keys {
+            let (Some(stats), Some(id)) = (self.proxy_ids.stats(key), self.proxy_ids.id(key))
+            else {
+                continue;
+            };
+            let Some((title, frames)) = self.titles.get_mut(&key) else {
+                continue;
+            };
+            let fps = stats.frames.saturating_sub(*frames) as f64 / HOUSEKEEPING.as_secs_f64();
+            *frames = stats.frames;
+            let latency = stats
+                .latency_ms
+                .map_or_else(|| "—".to_owned(), |ms| format!("{ms:.0} ms"));
+            let text = format!("{title} — {fps:.0} fps, {latency}");
+            if let Some(h) = &self.host {
+                let _ = h.send(HostCommand::SetTitle { id, title: text });
+            }
+        }
+    }
+
     fn housekeeping(&mut self) {
         self.discovery_housekeeping();
+        if self.last_ping.elapsed() >= PING_INTERVAL {
+            self.last_ping = Instant::now();
+            let t0 = platform::now().as_nanos();
+            self.broadcast(&ControlMessage::Ping { t0 });
+        }
+        if self.latency_overlay {
+            self.latency_titles();
+        }
         let expired: Vec<u32> = self
             .waiters
             .iter()
@@ -1968,6 +2061,7 @@ impl Agent {
                     "frames": s.frames,
                     "bytes": s.bytes,
                     "last_ms_ago": s.last.map(|t| t.elapsed().as_millis() as u64),
+                    "latency_ms": s.latency_ms.map(|ms| (ms * 10.0).round() / 10.0),
                 }));
                 json!({
                     "source": k.source.short(),

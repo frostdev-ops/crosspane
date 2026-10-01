@@ -48,6 +48,8 @@ struct ProxyMap {
     by_key: HashMap<ProjectionKey, u64>,
     by_id: HashMap<u64, ProjectionKey>,
     stats: HashMap<ProjectionKey, FrameStats>,
+    /// Each peer's clock minus this node's (ns), from the agent's ping exchange.
+    offsets: HashMap<NodeId, i64>,
 }
 
 /// What the decoder has shown for one projection (for `crosspanectl status`).
@@ -56,6 +58,8 @@ pub struct FrameStats {
     pub frames: u64,
     pub bytes: u64,
     pub last: Option<Instant>,
+    /// Capture-to-decoded time, smoothed, once the peer's clock offset is known.
+    pub latency_ms: Option<f64>,
 }
 
 impl ProxyIds {
@@ -81,12 +85,29 @@ impl ProxyIds {
         Some(id)
     }
 
-    fn shown(&self, key: ProjectionKey, bytes: usize) {
+    fn shown(&self, key: ProjectionKey, bytes: usize, captured_ns: u64) {
+        let now = crate::platform::now().as_nanos();
         if let Ok(mut map) = self.inner.lock() {
+            let age_ms = map.offsets.get(&key.source).and_then(|&offset| {
+                // The capture time on this node's clock.
+                let local = i128::from(captured_ns) - i128::from(offset);
+                let age = i128::from(now) - local;
+                (0..10_000_000_000).contains(&age).then(|| age as f64 / 1e6)
+            });
             let stats = map.stats.entry(key).or_default();
             stats.frames += 1;
             stats.bytes += bytes as u64;
             stats.last = Some(Instant::now());
+            if let Some(age) = age_ms {
+                stats.latency_ms = Some(stats.latency_ms.map_or(age, |l| l * 0.9 + age * 0.1));
+            }
+        }
+    }
+
+    /// `peer`'s clock minus this node's, in nanoseconds (for frame ages).
+    pub fn set_offset(&self, peer: NodeId, offset_ns: i64) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.offsets.insert(peer, offset_ns);
         }
     }
 
@@ -620,7 +641,7 @@ fn apply(
     match result {
         Ok((header, pixels, size, dirty)) => {
             d.last = seq.max(header.seq);
-            ids.shown(key, data.len());
+            ids.shown(key, data.len(), header.captured_ns);
             if let Some(host) = host {
                 let _ = host.send(HostCommand::Frame {
                     id,
