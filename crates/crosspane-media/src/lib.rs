@@ -2,3 +2,6 @@
 //! detection, hybrid scheduler, rate controller, and codec traits.
 
 #![deny(unsafe_code)]
+
+pub mod tiles;
+pub mod wire;

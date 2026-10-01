@@ -2,19 +2,22 @@
 
 use crosspane_types::geom::{PointDevice, VectorLogical};
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::{DisplayId, SessionId};
+use crosspane_types::id::{DisplayId, ProjectionId, SessionId};
 use crosspane_types::input::{LockKeys, ScrollDelta, ScrollPhase};
 
 use super::frame::decode_header;
 use super::{
-    Frame, HEADER_LEN, KIND_ACK, KIND_BUTTON, KIND_KEY, KIND_LOCK_KEYS, KIND_POINTER, KIND_SCROLL,
-    KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION, WireError,
+    Frame, HEADER_LEN, KIND_ACK, KIND_BUTTON, KIND_KEY, KIND_LOCK_KEYS, KIND_POINTER,
+    KIND_PROJ_BUTTON, KIND_PROJ_HELD, KIND_PROJ_KEY, KIND_PROJ_MOTION, KIND_PROJ_SCROLL,
+    KIND_SCROLL, KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION, WireError,
 };
 use crate::msg::{InputMessage, MAX_HELD_KEYS, PointerMessage, Refusal, TargetStatus};
+use crate::projection::ProjInput;
 
 /// Append one framed input message to `out`.
 pub fn encode_input(msg: &InputMessage, out: &mut Vec<u8>) -> Result<(), WireError> {
     match msg {
+        InputMessage::Proj(input) => encode_projection_input(input, out)?,
         InputMessage::Key {
             session,
             seq,
@@ -121,6 +124,9 @@ pub fn encode_input(msg: &InputMessage, out: &mut Vec<u8>) -> Result<(), WireErr
 
 /// Decode an input-stream frame.
 pub fn decode_input(frame: &Frame) -> Result<InputMessage, WireError> {
+    if (KIND_PROJ_KEY..=KIND_PROJ_HELD).contains(&frame.kind) {
+        return decode_projection_input(frame).map(InputMessage::Proj);
+    }
     let len = frame.payload.len();
     let expected = match frame.kind {
         KIND_KEY => 17,
@@ -235,6 +241,230 @@ pub fn decode_input(frame: &Frame) -> Result<InputMessage, WireError> {
     }
 }
 
+// E2 payloads are packed, little-endian, with no padding. Offsets exclude the frame header.
+// All start with projection u64 at 0 and seq u32 at 8.
+// Key (17): page u16 at 12, id u16 at 14, down u8 at 16.
+// Button (30): button/down u8 at 12/13, position x/y f64 at 14/22.
+// Scroll (46): E1 delta at 12..30, position x/y f64 at 30/38.
+// Motion (28): position x/y f64 at 12/20.
+// Held (14 + 4*K + B): key/button counts u8 at 12/13, K usages at 14, then B buttons.
+const MAX_PROJ_HELD_BUTTONS: usize = 16;
+
+fn encode_projection_input(input: &ProjInput, out: &mut Vec<u8>) -> Result<(), WireError> {
+    match input {
+        ProjInput::Key {
+            projection,
+            seq,
+            usage,
+            down,
+        } => {
+            projection_prefix(out, KIND_PROJ_KEY, 17, *projection, *seq);
+            out.extend_from_slice(&usage.page.to_le_bytes());
+            out.extend_from_slice(&usage.id.to_le_bytes());
+            out.push(u8::from(*down));
+        }
+        ProjInput::Button {
+            projection,
+            seq,
+            button,
+            down,
+            position,
+        } => {
+            check_button(*button)?;
+            check_position(*position)?;
+            projection_prefix(out, KIND_PROJ_BUTTON, 30, *projection, *seq);
+            out.extend_from_slice(&[button.0, u8::from(*down)]);
+            append_position(out, *position);
+        }
+        ProjInput::Scroll {
+            projection,
+            seq,
+            delta,
+            position,
+        } => {
+            check_position(*position)?;
+            let (x, y) = match delta.pixels {
+                Some(pixels) => (finite_f32(pixels.x)?, finite_f32(pixels.y)?),
+                None => (0.0, 0.0),
+            };
+            let flags = u8::from(delta.pixels.is_some())
+                | (u8::from(delta.stop_x) << 1)
+                | (u8::from(delta.stop_y) << 2);
+            projection_prefix(out, KIND_PROJ_SCROLL, 46, *projection, *seq);
+            out.extend_from_slice(&delta.v120_x.to_le_bytes());
+            out.extend_from_slice(&delta.v120_y.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&[flags, encode_phase(delta.phase)]);
+            append_position(out, *position);
+        }
+        ProjInput::Motion {
+            projection,
+            seq,
+            position,
+        } => {
+            check_position(*position)?;
+            projection_prefix(out, KIND_PROJ_MOTION, 28, *projection, *seq);
+            append_position(out, *position);
+        }
+        ProjInput::Held {
+            projection,
+            seq,
+            keys,
+            buttons,
+        } => {
+            check_held_counts(keys.len(), buttons.len())?;
+            for button in buttons {
+                check_held_button(*button)?;
+            }
+            let len = 14 + 4 * keys.len() + buttons.len();
+            projection_prefix(out, KIND_PROJ_HELD, len as u32, *projection, *seq);
+            out.extend_from_slice(&[keys.len() as u8, buttons.len() as u8]);
+            for usage in keys {
+                out.extend_from_slice(&usage.page.to_le_bytes());
+                out.extend_from_slice(&usage.id.to_le_bytes());
+            }
+            out.extend(buttons.iter().map(|button| button.0));
+        }
+    }
+    Ok(())
+}
+
+fn decode_projection_input(frame: &Frame) -> Result<ProjInput, WireError> {
+    let kind = frame.kind;
+    let len = frame.payload.len();
+    let expected = match kind {
+        KIND_PROJ_KEY => 17,
+        KIND_PROJ_BUTTON => 30,
+        KIND_PROJ_SCROLL => 46,
+        KIND_PROJ_MOTION => 28,
+        KIND_PROJ_HELD if len >= 14 => len,
+        KIND_PROJ_HELD => 14,
+        _ => return Err(WireError::BadKind(kind)),
+    };
+    if len != expected {
+        return Err(WireError::BadLength { kind, len });
+    }
+    let mut reader = Reader(&frame.payload);
+    let projection = ProjectionId(u64::from_le_bytes(reader.take()?));
+    let seq = u32::from_le_bytes(reader.take()?);
+    match kind {
+        KIND_PROJ_KEY => Ok(ProjInput::Key {
+            projection,
+            seq,
+            usage: reader.usage()?,
+            down: decode_down(reader.byte()?)?,
+        }),
+        KIND_PROJ_BUTTON => {
+            let button = MouseButton(reader.byte()?);
+            check_button(button)?;
+            Ok(ProjInput::Button {
+                projection,
+                seq,
+                button,
+                down: decode_down(reader.byte()?)?,
+                position: reader.position()?,
+            })
+        }
+        KIND_PROJ_SCROLL => {
+            let v120_x = i32::from_le_bytes(reader.take()?);
+            let v120_y = i32::from_le_bytes(reader.take()?);
+            let x = f32::from_le_bytes(reader.take()?);
+            let y = f32::from_le_bytes(reader.take()?);
+            let flags = reader.byte()?;
+            if flags & !7 != 0 {
+                return Err(WireError::BadValue("unknown scroll flags"));
+            }
+            let phase = decode_phase(reader.byte()?)?;
+            // As in E1, absent pixel fields have no meaning regardless of their bit patterns.
+            let pixels = if flags & 1 != 0 {
+                Some(VectorLogical::new(finite_f64(x)?, finite_f64(y)?))
+            } else {
+                None
+            };
+            Ok(ProjInput::Scroll {
+                projection,
+                seq,
+                delta: ScrollDelta {
+                    v120_x,
+                    v120_y,
+                    pixels,
+                    phase,
+                    stop_x: flags & 2 != 0,
+                    stop_y: flags & 4 != 0,
+                },
+                position: reader.position()?,
+            })
+        }
+        KIND_PROJ_MOTION => Ok(ProjInput::Motion {
+            projection,
+            seq,
+            position: reader.position()?,
+        }),
+        KIND_PROJ_HELD => {
+            let key_count = usize::from(reader.byte()?);
+            let button_count = usize::from(reader.byte()?);
+            check_held_counts(key_count, button_count)?;
+            if len != 14 + 4 * key_count + button_count {
+                return Err(WireError::BadLength { kind, len });
+            }
+            let mut keys = Vec::with_capacity(key_count);
+            for _ in 0..key_count {
+                keys.push(reader.usage()?);
+            }
+            let mut buttons = Vec::with_capacity(button_count);
+            for _ in 0..button_count {
+                let button = MouseButton(reader.byte()?);
+                check_held_button(button)?;
+                buttons.push(button);
+            }
+            Ok(ProjInput::Held {
+                projection,
+                seq,
+                keys,
+                buttons,
+            })
+        }
+        _ => Err(WireError::BadKind(kind)),
+    }
+}
+
+fn projection_prefix(out: &mut Vec<u8>, kind: u8, len: u32, projection: ProjectionId, seq: u32) {
+    append_header(out, kind, len);
+    out.extend_from_slice(&projection.0.to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+}
+
+fn check_position(position: PointDevice) -> Result<(), WireError> {
+    if position.x.is_finite() && position.y.is_finite() {
+        Ok(())
+    } else {
+        Err(WireError::BadValue("non-finite coordinate"))
+    }
+}
+
+fn append_position(out: &mut Vec<u8>, position: PointDevice) {
+    out.extend_from_slice(&position.x.to_le_bytes());
+    out.extend_from_slice(&position.y.to_le_bytes());
+}
+
+fn check_held_counts(keys: usize, buttons: usize) -> Result<(), WireError> {
+    if keys > MAX_HELD_KEYS {
+        return Err(WireError::BadValue("too many held keys"));
+    }
+    if buttons > MAX_PROJ_HELD_BUTTONS {
+        return Err(WireError::BadValue("too many held buttons"));
+    }
+    Ok(())
+}
+
+fn check_held_button(button: MouseButton) -> Result<(), WireError> {
+    if !(1..=16).contains(&button.0) {
+        return Err(WireError::BadValue("held button outside 1..=16"));
+    }
+    Ok(())
+}
+
 /// Encode a pointer message as one complete datagram (header plus payload).
 pub fn encode_pointer(msg: &PointerMessage) -> Result<Vec<u8>, WireError> {
     let x = finite_f32(msg.position.x)?;
@@ -309,6 +539,15 @@ impl Reader<'_> {
             page: u16::from_le_bytes(self.take()?),
             id: u16::from_le_bytes(self.take()?),
         })
+    }
+
+    fn position(&mut self) -> Result<PointDevice, WireError> {
+        let position = PointDevice::new(
+            f64::from_le_bytes(self.take()?),
+            f64::from_le_bytes(self.take()?),
+        );
+        check_position(position)?;
+        Ok(position)
     }
 }
 

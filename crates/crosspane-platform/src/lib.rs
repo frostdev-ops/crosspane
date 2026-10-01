@@ -30,6 +30,7 @@
 pub mod capture;
 pub mod display;
 pub mod error;
+pub mod frame;
 pub mod hotkey;
 pub mod inject;
 pub mod keystore;
@@ -38,6 +39,7 @@ pub mod overlay;
 pub mod permission;
 pub mod session;
 pub mod sink;
+pub mod window;
 
 pub use capture::{
     CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, Edge, EndReason,
@@ -45,6 +47,7 @@ pub use capture::{
 };
 pub use display::Displays;
 pub use error::{Permission, PlatformError};
+pub use frame::{CaptureTarget, Frame, FrameCapture, FrameEvent, StreamEndReason, StreamId};
 pub use hotkey::{Chord, GlobalHotkeys, HotkeyEvent};
 pub use inject::{KeyInjector, PointerInjector};
 pub use keystore::KeyStore;
@@ -53,3 +56,7 @@ pub use overlay::{Overlay, OverlayAnchor, OverlayEvent, OverlayHost, OverlayId, 
 pub use permission::{PermissionState, Permissions};
 pub use session::{IoGate, LockState, SessionEvent, SessionEvents, SessionState};
 pub use sink::EventSink;
+pub use window::{
+    Parked, ParkingKind, WindowEvent, WindowInfo, WindowParking, WindowRole, WindowSource,
+    WindowState,
+};

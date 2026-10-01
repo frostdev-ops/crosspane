@@ -15,6 +15,7 @@ message ControlMessage {
     Ping ping = 10;
     Pong pong = 11;
     Goodbye goodbye = 12;
+    Projection projection = 13;
   }
 }
 
@@ -53,3 +54,82 @@ message Revocation { bytes revoked = 1; bytes issuer = 2; uint64 issued_at_ms = 
 message Ping { uint64 t0 = 1; }
 message Pong { uint64 t0 = 1; uint64 t1 = 2; uint64 t2 = 3; }
 message Goodbye { string message = 1; }
+
+// E2 projection; unknown nested variants are ignored as UnknownControl.
+message Projection {
+  oneof body {
+    ProjectionStart start = 1;
+    ProjectionAccepted accepted = 2;
+    ProjectionRefused refused = 3;
+    ProjectionResize resize = 4;
+    ProjectionGeometry geometry = 5;
+    ProjectionTitle title = 6;
+    ProjectionFocus focus = 7;
+    ProjectionKeyFrameRequest key_frame_request = 8;
+    ProjectionEnd end = 9; // Source -> destination: close the proxy.
+    ProjectionClose close = 10; // Destination -> source: restore the source window.
+  }
+}
+
+// uint32 enum codes (0 and unknown codes are invalid):
+// parking: 1 Twin, 2 Mirror.
+// end reason: 1 Returned, 2 WindowClosed, 3 Revoked, 4 Locked, 5 LinkLost, 6 Failed.
+// refusal: same 1..5 codes as Refusal above.
+// title/app_id are capped at 1024 UTF-8 bytes; scale must be finite and positive.
+message ProjectionStart {
+  uint64 projection = 1;
+  string title = 2;
+  string app_id = 3;
+  uint32 pixel_w = 4;
+  uint32 pixel_h = 5;
+}
+
+message ProjectionAccepted {
+  uint64 projection = 1;
+  uint32 pixel_w = 2;
+  uint32 pixel_h = 3;
+  double scale = 4;
+}
+
+message ProjectionRefused {
+  uint64 projection = 1;
+  uint32 reason = 2;
+}
+
+message ProjectionResize {
+  uint64 projection = 1;
+  uint32 pixel_w = 2;
+  uint32 pixel_h = 3;
+  double scale = 4;
+}
+
+message ProjectionGeometry {
+  uint64 projection = 1;
+  uint32 pixel_w = 2;
+  uint32 pixel_h = 3;
+  uint32 parking = 4;
+}
+
+message ProjectionTitle {
+  uint64 projection = 1;
+  string title = 2;
+}
+
+message ProjectionFocus {
+  uint64 projection = 1;
+  bool focused = 2;
+}
+
+message ProjectionKeyFrameRequest {
+  uint64 projection = 1;
+}
+
+message ProjectionEnd {
+  uint64 projection = 1;
+  uint32 reason = 2;
+}
+
+message ProjectionClose {
+  uint64 projection = 1;
+  uint32 reason = 2;
+}
