@@ -9,9 +9,9 @@ repo=$(cd -- "${BASH_SOURCE[0]%/*}/../.." && pwd -P)
 cd "$repo"
 label=io.frostdev.crosspane.agent
 cargo build --release --locked -p crosspane-agent "$@"
-cargo build --release --locked -p crosspanectl
+cargo build --release --locked -p crosspanectl -p crosspane-ui
 scripts/macos/bundle.sh --bin target/release/crosspane-agent --id "$label" --name Crosspane \
-    --out target/macos-bundles --ui-element >/dev/null
+    --out target/macos-bundles --ui-element --extra target/release/crosspane-ui >/dev/null
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/Crosspane" "$HOME/.cargo/bin"
 plist=$HOME/Library/LaunchAgents/$label.plist
 domain=gui/$(id -u)
