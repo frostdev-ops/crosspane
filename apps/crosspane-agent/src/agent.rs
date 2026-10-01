@@ -578,8 +578,9 @@ impl Agent {
         let text = match notice {
             Notice::LostConnection(p) => format!("lost connection to {}", peer_name(self, p)),
             Notice::TargetLocked(p) => format!("{} is locked", peer_name(self, p)),
+            // Both roles report a refusal with the other node as `peer`.
             Notice::Refused { peer, reason } => {
-                format!("{} refused control: {reason:?}", peer_name(self, peer))
+                format!("control with {} refused: {reason:?}", peer_name(self, peer))
             }
             Notice::ControlledBy(p) => format!("controlled by {}", peer_name(self, p)),
             Notice::ControlEnded(p) => format!("control by {} ended", peer_name(self, p)),
