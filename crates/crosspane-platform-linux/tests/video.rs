@@ -581,3 +581,103 @@ fn hardware_and_software_quality_agree() {
         );
     }
 }
+
+/// A single-slice stream exercises one decode thread even when slice threading is available.
+#[test]
+#[ignore = "120-frame 1440p CPU timing"]
+fn nv12_decode_cpu_timing() {
+    use crosspane_media::picture::Nv12;
+    use ffmpeg_next::{self as ffmpeg, codec, format::Pixel, frame};
+    use rustix::time::{ClockId, clock_gettime};
+
+    fn cpu_seconds() -> f64 {
+        let time = clock_gettime(ClockId::ThreadCPUTime);
+        time.tv_sec as f64 + time.tv_nsec as f64 / 1_000_000_000.0
+    }
+
+    let name = "nv12_decode_cpu_timing";
+    if !is_child(name) {
+        let output = child_test(name, "software")
+            .arg("--ignored")
+            .output()
+            .unwrap();
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(output.status.success());
+        return;
+    }
+    ffmpeg::init().unwrap();
+    let size = PixelSize::new(2560, 1440);
+    let codec = ffmpeg::encoder::find_by_name("libx264").unwrap();
+    let mut context = codec::Context::new_with_codec(codec)
+        .encoder()
+        .video()
+        .unwrap();
+    context.set_width(size.width);
+    context.set_height(size.height);
+    context.set_format(Pixel::YUV420P);
+    context.set_time_base((1, 30));
+    context.set_bit_rate(20_000_000);
+    context.set_gop(100_000);
+    context.set_max_b_frames(0);
+    context.set_threading(codec::threading::Config::count(1));
+    context.set_colorspace(ffmpeg::color::Space::BT709);
+    context.set_color_range(ffmpeg::color::Range::MPEG);
+    let mut options = ffmpeg::Dictionary::new();
+    options.set("preset", "ultrafast");
+    options.set("tune", "zerolatency");
+    options.set(
+        "x264-params",
+        "slices=1:annexb=1:repeat-headers=1:scenecut=0",
+    );
+    let mut encoder = context.open_as_with(codec, options).unwrap();
+    let mut input = frame::Video::new(Pixel::YUV420P, size.width, size.height);
+    input.data_mut(1).fill(96);
+    input.data_mut(2).fill(160);
+    let mut packets = Vec::new();
+    for index in 0..120 {
+        let stride = input.stride(0);
+        for y in 0..size.height as usize {
+            for x in 0..size.width as usize {
+                input.data_mut(0)[y * stride + x] = (16 + (x / 16 + y / 16 + index) % 220) as u8;
+            }
+        }
+        input.set_pts(Some(index as i64));
+        encoder.send_frame(&input).unwrap();
+        let mut packet = ffmpeg::Packet::empty();
+        encoder.receive_packet(&mut packet).unwrap();
+        let bytes = packet.data().unwrap();
+        assert_eq!(
+            nal_types(bytes)
+                .iter()
+                .filter(|kind| matches!(kind, 1 | 5))
+                .count(),
+            1
+        );
+        packets.push(bytes.to_vec());
+    }
+    let codecs = FfmpegCodecs::new().unwrap();
+    let mut bgra_decoder = codecs.decoder_nv12().unwrap();
+    let mut nv12_decoder = codecs.decoder_nv12().unwrap();
+    let mut bgra = Vec::new();
+    let mut nv12 = Nv12::default();
+    // Warm both allocations and decoder contexts before measuring the same 120 access units.
+    bgra_decoder.decode(&packets[0], &mut bgra).unwrap();
+    nv12_decoder.decode_nv12(&packets[0], &mut nv12).unwrap();
+    let start = cpu_seconds();
+    for packet in &packets {
+        assert_eq!(bgra_decoder.decode(packet, &mut bgra).unwrap(), size);
+        std::hint::black_box(&bgra);
+    }
+    let old = (cpu_seconds() - start) * 1000.0 / 120.0;
+    let start = cpu_seconds();
+    for packet in &packets {
+        nv12_decoder.decode_nv12(packet, &mut nv12).unwrap();
+        assert_eq!(nv12.size, size);
+        std::hint::black_box(&nv12);
+    }
+    let new = (cpu_seconds() - start) * 1000.0 / 120.0;
+    eprintln!(
+        "WP-2.23 single-thread CPU, 120 frames 2560x1440: BGRA {old:.3} ms/frame, NV12 {new:.3} ms/frame"
+    );
+}
