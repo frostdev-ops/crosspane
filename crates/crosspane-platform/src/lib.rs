@@ -39,6 +39,7 @@ pub mod overlay;
 pub mod permission;
 pub mod session;
 pub mod sink;
+pub mod tray;
 pub mod window;
 
 pub use capture::{
@@ -56,6 +57,7 @@ pub use overlay::{Overlay, OverlayAnchor, OverlayEvent, OverlayHost, OverlayId, 
 pub use permission::{PermissionState, Permissions};
 pub use session::{IoGate, LockState, SessionEvent, SessionEvents, SessionState};
 pub use sink::EventSink;
+pub use tray::{TrayEvent, TrayHost, TrayItem, TrayItemId, TrayMenu, TrayState};
 pub use window::{
     Parked, ParkingKind, WindowEvent, WindowInfo, WindowParking, WindowRole, WindowSource,
     WindowState,

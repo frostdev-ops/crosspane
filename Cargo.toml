@@ -53,6 +53,8 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
 xkbcommon = "0.9.0"
 zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
+# StatusNotifierItem tray (WP-1.34, Linux), on the same zbus/async-io stack.
+ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
 zerocopy = { version = "0.8.59", features = ["derive"] }
 zeroize = "1.9.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

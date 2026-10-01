@@ -16,6 +16,7 @@ crosspane-platform.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 font8x8.workspace = true
+ksni.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
