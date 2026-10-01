@@ -687,7 +687,7 @@ impl Agent {
                 if let Some(w) = &mut self.platform.windows
                     && let Err(e) = w.activate(window)
                 {
-                    tracing::debug!(error = %e, "activate failed");
+                    tracing::warn!(error = %e, "could not focus a projected window: its keys are held back");
                 }
             }
             Output::StartCapture {

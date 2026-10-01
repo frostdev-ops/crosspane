@@ -59,7 +59,10 @@ e2() {
   [ -n "$wid" ] || fail "the Mac test window never appeared"
   mac crosspanectl project "$wid" desktop >/dev/null
   proxy() { hyprctl -j clients | jq -r '.[] | select(.class == "crosspane-proxy") | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1]) \(.address)"' | head -1; }
-  wait_for 15 test -n "$(proxy)" || fail "no proxy window on the desktop"
+  # wait_for runs its command each time, so the check must be a function (not "$(proxy)").
+  has_proxy() { [ -n "$(proxy)" ]; }
+  no_proxy() { [ -z "$(proxy)" ]; }
+  wait_for 15 has_proxy || fail "no proxy window on the desktop"
   sleep 3
   read -r at size address <<< "$(proxy)"
   echo "ok: proxy $size at $at"
@@ -97,7 +100,7 @@ PY
   local proj
   proj=$(mac crosspanectl status | awk '/projecting window/ {split($2, k, ":"); print k[2]; exit}')
   mac crosspanectl return "${proj:-1}" >/dev/null
-  wait_for 10 test -z "$(proxy)" || fail "the proxy stayed open after return"
+  wait_for 10 no_proxy || fail "the proxy stayed open after return"
   echo "ok: returned"
 }
 

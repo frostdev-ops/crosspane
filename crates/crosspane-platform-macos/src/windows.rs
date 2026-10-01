@@ -69,15 +69,16 @@ impl WindowSource for MacWindows {
 
     fn activate(&mut self, window: WindowId) -> Result<(), PlatformError> {
         require_accessibility()?;
+        // Off-screen too: a parked window sits on a twin display.
         let raw = self
             .query
-            .list(false)?
+            .list(true)?
             .into_iter()
             .find(|w| w.id == window)
             .ok_or(PlatformError::NotFound)?;
         let deadline = Instant::now() + MAIN_WAIT;
         let pid = raw.pid;
-        on_main(MAIN_WAIT, move |_| {
+        let requested = on_main(MAIN_WAIT, move |_| {
             // on_main may execute a timed-out closure later. Never activate in that case.
             if Instant::now() >= deadline {
                 return Err(PlatformError::Timeout);
@@ -86,16 +87,21 @@ impl WindowSource for MacWindows {
             autoreleasepool(|_| {
                 let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
                     .ok_or(PlatformError::NotFound)?;
-                if app.activateWithOptions(NSApplicationActivationOptions::empty()) {
-                    Ok(())
-                } else {
-                    Err(PlatformError::Backend(
-                        "application rejected activation".into(),
-                    ))
-                }
+                Ok(app.activateWithOptions(NSApplicationActivationOptions::empty()))
             })
-        })??;
-        AxWindow::find(&raw, Instant::now() + Duration::from_secs(1))?.raise()
+        })
+        .and_then(|result| result);
+        // Since macOS 14, activation is cooperative: a background agent's request can be ignored
+        // (or refused). Accessibility's AXFrontmost, the route window managers use, isn't.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let frontmost =
+            AxWindow::application(pid, deadline).set("AXFrontmost", CFBoolean::new(true));
+        if let (Ok(false) | Err(_), Err(error)) = (&requested, &frontmost) {
+            return Err(PlatformError::Backend(format!(
+                "activation refused ({requested:?}); AXFrontmost: {error}"
+            )));
+        }
+        AxWindow::find(&raw, deadline)?.raise()
     }
 
     fn subscribe(&mut self, sink: Arc<dyn EventSink<WindowEvent>>) -> Result<(), PlatformError> {
@@ -458,13 +464,18 @@ impl AxWindow {
         })
     }
 
+    /// The application element of process `pid` (for app-level attributes like AXFrontmost).
+    fn application(pid: i32, deadline: Instant) -> Self {
+        Self {
+            // SAFETY: positive pid obtained from Quartz; creates a retained public AX application object.
+            element: unsafe { AXUIElement::new_application(pid) },
+            deadline,
+        }
+    }
+
     pub(crate) fn find(raw: &RawWindow, deadline: Instant) -> Result<Self, PlatformError> {
         require_accessibility()?;
-        let app = Self {
-            // SAFETY: positive pid obtained from Quartz; creates a retained public AX application object.
-            element: unsafe { AXUIElement::new_application(raw.pid) },
-            deadline,
-        };
+        let app = Self::application(raw.pid, deadline);
         let values = app
             .attribute("AXWindows")?
             .downcast::<CFArray>()
