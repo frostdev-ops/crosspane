@@ -37,6 +37,18 @@ pub struct Frame {
     pub at: MonoTime,
 }
 
+/// The cursor the pointer shows over captured content (03 §4.6, WP-2.16): 8-bit **BGRA** with
+/// straight (not premultiplied) alpha, rows of `size.width * 4` bytes, top row first, at the
+/// captured content's pixel density. `hotspot` is the click point in pixels from the top-left
+/// corner, inside the image. Each side is at most 256 pixels (backends scale a larger cursor
+/// down).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorImage {
+    pub size: PixelSize,
+    pub hotspot: (u32, u32),
+    pub pixels: Arc<[u8]>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum StreamEndReason {
@@ -58,6 +70,15 @@ pub enum FrameEvent {
     Ended {
         stream: StreamId,
         reason: StreamEndReason,
+    },
+    /// The cursor shape over the captured content changed (WP-2.16). Sent when the pointer is over
+    /// the content and its shape differs from the last one this stream reported (so at least
+    /// once, the first time the pointer is over it); `None` when the app hid the cursor. Never
+    /// sent while the pointer is elsewhere. A backend that can't observe the cursor never sends
+    /// it, and the destination keeps its default cursor.
+    Cursor {
+        stream: StreamId,
+        cursor: Option<CursorImage>,
     },
 }
 

@@ -48,7 +48,9 @@ pub use capture::{
 };
 pub use display::Displays;
 pub use error::{Permission, PlatformError};
-pub use frame::{CaptureTarget, Frame, FrameCapture, FrameEvent, StreamEndReason, StreamId};
+pub use frame::{
+    CaptureTarget, CursorImage, Frame, FrameCapture, FrameEvent, StreamEndReason, StreamId,
+};
 pub use hotkey::{Chord, GlobalHotkeys, HotkeyEvent};
 pub use inject::{KeyInjector, PointerInjector};
 pub use keystore::KeyStore;

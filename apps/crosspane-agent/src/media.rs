@@ -8,6 +8,8 @@
 //!     encoder and the peer advertised `h264`), and one lossless key frame follows when the motion
 //!     stops, so the destination is bit-exact again. Captures arrive only on damage, so the thread
 //!     also wakes on a timer to send that last key frame when frames simply stop.
+//!   - Cursor shapes (03 §4.6, WP-2.16) go as codec-2 frames numbered on their own, when the peer
+//!     advertised `cursor`; the last one is sent again with every key frame request.
 //! - **Destination:** media frames → a decoder thread → the proxy host. Frames are applied in
 //!   `seq` order (streams can complete out of order); a gap that doesn't fill within 300 ms, or a
 //!   frame that fails to apply, asks the source for a key frame through the engine.
@@ -22,9 +24,10 @@ use crosspane_media::codec::{VideoCodecs, VideoDecoder, VideoEncoder};
 use crosspane_media::hybrid::{FramePlan, HybridConfig, HybridScheduler};
 use crosspane_media::tiles::{TileDecoder, TileEncoder};
 use crosspane_media::wire::{
-    Codec, FrameHeader, MediaError, TILE, read_codec, read_header, read_video, write_video,
+    Codec, FrameHeader, MediaError, TILE, read_codec, read_cursor, read_header, read_video,
+    write_cursor, write_video,
 };
-use crosspane_platform::{Frame, StreamId};
+use crosspane_platform::{CursorImage, Frame, StreamId};
 use crosspane_protocol::link::LinkError;
 use crosspane_render::proxy::{HostCommand, HostHandle};
 use crosspane_transport::Transport;
@@ -112,10 +115,16 @@ pub enum SourceCmd {
         peer: NodeId,
         /// The peer can decode H.264 (it advertised `h264`).
         video: bool,
+        /// The peer shows cursor shapes (it advertised `cursor`).
+        cursor: bool,
     },
     Frame {
         stream: StreamId,
         frame: Frame,
+    },
+    Cursor {
+        stream: StreamId,
+        cursor: Option<CursorImage>,
     },
     Stop {
         stream: StreamId,
@@ -139,6 +148,13 @@ struct Encoding {
     /// The last captured frame, for the lossless refresh when frames stop during video.
     last: Option<Frame>,
     last_at: Instant,
+    /// The peer shows cursor shapes.
+    peer_cursor: bool,
+    /// The newest cursor the capture reported (`Some(None)`: hidden), and whether the peer still
+    /// needs it.
+    cursor: Option<Option<CursorImage>>,
+    cursor_dirty: bool,
+    cursor_seq: u64,
 }
 
 /// What the encoder thread needs for video.
@@ -162,6 +178,8 @@ pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> Sender<Sour
 
 fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSetup) {
     let mut streams: HashMap<StreamId, Encoding> = HashMap::new();
+    // Cursors reported before the stream's Start arrived (the capture thread may be first).
+    let mut early_cursors: HashMap<StreamId, Option<CursorImage>> = HashMap::new();
     let mut out = Vec::new();
     let epoch = Instant::now();
     loop {
@@ -178,7 +196,9 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                 projection,
                 peer,
                 video: peer_video,
+                cursor: peer_cursor,
             } => {
+                let cursor = early_cursors.remove(&stream);
                 streams.insert(
                     stream,
                     Encoding {
@@ -192,20 +212,37 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                         video_key: true,
                         last: None,
                         last_at: Instant::now(),
+                        peer_cursor,
+                        cursor_dirty: cursor.is_some(),
+                        cursor,
+                        cursor_seq: 0,
                     },
                 );
             }
             SourceCmd::Frame { stream, frame } => {
                 latest.insert(stream, frame);
             }
+            SourceCmd::Cursor { stream, cursor } => match streams.get_mut(&stream) {
+                Some(e) => {
+                    e.cursor = Some(cursor);
+                    e.cursor_dirty = true;
+                }
+                None => {
+                    if early_cursors.len() < 64 {
+                        early_cursors.insert(stream, cursor);
+                    }
+                }
+            },
             SourceCmd::Stop { stream } => {
                 streams.remove(&stream);
                 latest.remove(&stream);
+                early_cursors.remove(&stream);
             }
             SourceCmd::RequestKey { projection } => {
                 for e in streams.values_mut().filter(|e| e.projection == projection) {
                     e.encoder.request_key();
                     e.video_key = true;
+                    e.cursor_dirty = e.cursor.is_some();
                 }
             }
         };
@@ -214,6 +251,9 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
         }
         while let Ok(cmd) = rx.try_recv() {
             handle(cmd, &mut streams);
+        }
+        for enc in streams.values_mut().filter(|e| e.cursor_dirty) {
+            send_cursor(enc, transport, &mut out);
         }
         let now = epoch.elapsed();
         for (stream, frame) in latest {
@@ -370,6 +410,42 @@ fn send_video(
     Ok(())
 }
 
+/// Send the newest cursor shape; a refused one stays due and goes again on the next pass.
+fn send_cursor(enc: &mut Encoding, transport: &Transport, out: &mut Vec<u8>) {
+    enc.cursor_dirty = false;
+    let Some(cursor) = &enc.cursor else { return };
+    if !enc.peer_cursor {
+        return;
+    }
+    const HIDDEN: [u8; 4] = [0; 4];
+    let (size, hotspot, pixels) = match cursor {
+        Some(c) => (c.size, c.hotspot, &c.pixels[..]),
+        None => (
+            crosspane_types::geom::PixelSize::new(1, 1),
+            (0, 0),
+            &HIDDEN[..],
+        ),
+    };
+    let header = FrameHeader {
+        projection: enc.projection.0,
+        seq: enc.cursor_seq + 1,
+        key: false,
+        captured_ns: 0,
+        width: size.width,
+        height: size.height,
+    };
+    if let Err(e) = write_cursor(header, hotspot, pixels, out) {
+        tracing::debug!(error = %e, "cursor image not sendable");
+        return;
+    }
+    enc.cursor_seq += 1;
+    match transport.send_media(enc.peer, Arc::from(&out[..])) {
+        Ok(()) => {}
+        Err(LinkError::Congested) => enc.cursor_dirty = true,
+        Err(e) => tracing::debug!(error = ?e, "cursor send failed"),
+    }
+}
+
 /// Send one encoded frame; a refused one is dropped and the next of either kind becomes a key.
 fn send(enc: &mut Encoding, frame: &[u8], transport: &Transport) {
     enc.seq += 1;
@@ -401,6 +477,8 @@ struct Decoding {
     /// Created at the first H.264 frame.
     video: Option<Box<dyn VideoDecoder>>,
     last: u64,
+    /// The newest cursor frame applied (cursor frames are numbered on their own).
+    cursor_seq: u64,
     pending: BTreeMap<u64, Arc<[u8]>>,
     gap_since: Option<Instant>,
     last_error: Option<Instant>,
@@ -457,10 +535,15 @@ fn decode_loop(
                     decoder: TileDecoder::new(),
                     video: None,
                     last: 0,
+                    cursor_seq: 0,
                     pending: BTreeMap::new(),
                     gap_since: None,
                     last_error: None,
                 });
+                if read_codec(&data) == Ok(Codec::Cursor) {
+                    apply_cursor(d, id, &data, host);
+                    continue;
+                }
                 if header.key && header.seq > d.last {
                     // A key frame supersedes everything older.
                     d.pending.retain(|seq, _| *seq > header.seq);
@@ -519,6 +602,7 @@ fn apply(
                     (header, Arc::from(pixels), size, dirty)
                 })
         }
+        Ok(Codec::Cursor) => Err("a cursor frame in the picture sequence".to_owned()),
         Err(e) => Err(e.to_string()),
     };
     match result {
@@ -544,6 +628,29 @@ fn apply(
                 let _ = engine.send(Event::Input(Input::MediaError { key }));
             }
         }
+    }
+}
+
+/// Show a cursor frame on the proxy unless a newer one was already shown.
+fn apply_cursor(d: &mut Decoding, id: u64, data: &[u8], host: Option<&HostHandle>) {
+    let frame = match read_cursor(data) {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::debug!(error = %e, "dropping a malformed cursor frame");
+            return;
+        }
+    };
+    if frame.header.seq <= d.cursor_seq {
+        return;
+    }
+    d.cursor_seq = frame.header.seq;
+    if let Some(host) = host {
+        let _ = host.send(HostCommand::SetCursor {
+            id,
+            size: crosspane_types::geom::PixelSize::new(frame.header.width, frame.header.height),
+            hotspot: frame.hotspot,
+            pixels: Arc::from(frame.pixels),
+        });
     }
 }
 

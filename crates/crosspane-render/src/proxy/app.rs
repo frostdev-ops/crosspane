@@ -13,11 +13,11 @@ use winit::{
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::PhysicalKey,
-    window::{Window, WindowId},
+    window::{CustomCursor, Window, WindowId},
 };
 
 use super::{
-    HostCommand, HostEvent,
+    HostCommand, HostEvent, cursor,
     gpu::{Presenter, surface_format},
     input::{InputState, mouse_button, scroll},
 };
@@ -234,6 +234,16 @@ impl App {
                     }
                 }
             }
+            HostCommand::SetCursor {
+                id,
+                size,
+                hotspot,
+                pixels,
+            } => {
+                if let Some(window) = self.windows.get(&id) {
+                    set_cursor(event_loop, &window.window, size, hotspot, &pixels);
+                }
+            }
             HostCommand::Shutdown => {
                 let ids: Vec<_> = self.windows.keys().copied().collect();
                 for id in ids {
@@ -262,6 +272,41 @@ impl App {
             size: pixel_size(size),
             scale,
         });
+    }
+}
+
+fn set_cursor(
+    event_loop: &ActiveEventLoop,
+    window: &Window,
+    size: PixelSize,
+    hotspot: (u32, u32),
+    pixels: &[u8],
+) {
+    match cursor::shape(
+        size.width,
+        size.height,
+        hotspot,
+        pixels,
+        window.scale_factor(),
+    ) {
+        Some(cursor::Shape::Hidden) => window.set_cursor_visible(false),
+        Some(cursor::Shape::Image(image)) => {
+            let source = CustomCursor::from_rgba(
+                image.rgba,
+                image.width,
+                image.height,
+                image.hotspot.0,
+                image.hotspot.1,
+            );
+            match source {
+                Ok(source) => {
+                    window.set_cursor(event_loop.create_custom_cursor(source));
+                    window.set_cursor_visible(true);
+                }
+                Err(error) => tracing::debug!(%error, "cursor image refused"),
+            }
+        }
+        None => tracing::debug!("malformed cursor image"),
     }
 }
 

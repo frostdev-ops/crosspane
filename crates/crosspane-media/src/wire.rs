@@ -1,4 +1,5 @@
-//! E2 v0 media payloads: a little-endian CPF1 header followed by lossless tile records.
+//! E2 media payloads: a little-endian CPF1 header followed by lossless tile records (codec 0),
+//! an H.264 access unit (codec 1) or a cursor image (codec 2).
 
 pub const MAGIC: u32 = 0x3146_5043;
 pub const TILE: u32 = 64;
@@ -7,6 +8,9 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const HEADER_BYTES: usize = 48;
 pub(crate) const RECORD_BYTES: usize = 12;
 const MAX_DIMENSION: u32 = 16384;
+/// The largest cursor image a codec-2 frame carries, in pixels per side.
+pub const MAX_CURSOR: u32 = 256;
+const HOTSPOT_BYTES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -58,6 +62,12 @@ pub enum Codec {
     /// 1: one H.264 Annex B access unit (WP-2.14). The header's tile-size field is 0 and its
     /// count field is the access unit's length in bytes; `key` marks an IDR.
     H264,
+    /// 2: a cursor image (WP-2.16, 03 §4.6). Width and height are the image size (each
+    /// 1..=`MAX_CURSOR`), the tile-size field is 0, `key` is false, and count is `8 + width *
+    /// height * 4`: the hotspot x and y (u32 each, inside the image), then BGRA rows of `width * 4`
+    /// bytes with straight alpha. `seq` numbers the stream's cursor frames on their own (not with
+    /// its pictures). An image whose pixels are all transparent means the app hid the cursor.
+    Cursor,
 }
 
 /// The codec of a media frame, from its header alone.
@@ -110,6 +120,73 @@ pub fn read_video(data: &[u8]) -> Result<(FrameHeader, &[u8]), MediaError> {
     Ok((header, access_unit))
 }
 
+/// Append a codec-2 frame: the CPF1 header for `header` (its `key` must be false) with a cursor
+/// image of `header.width` × `header.height` BGRA pixels and its `hotspot`. `out` is cleared
+/// first. Fails with `BadSize` for an image outside 1..=`MAX_CURSOR` per side, `BadPayload` when
+/// `bgra` isn't exactly `width * height * 4` bytes or the hotspot is outside the image, and
+/// `BadReserved` for a key flag.
+pub fn write_cursor(
+    header: FrameHeader,
+    hotspot: (u32, u32),
+    bgra: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), MediaError> {
+    out.clear();
+    if header.key {
+        return Err(MediaError::BadReserved);
+    }
+    let pixels = cursor_bytes(header.width, header.height)?;
+    if bgra.len() != pixels || hotspot.0 >= header.width || hotspot.1 >= header.height {
+        return Err(MediaError::BadPayload);
+    }
+    let count = u32::try_from(HOTSPOT_BYTES + pixels).map_err(|_| MediaError::TooLarge)?;
+    out.try_reserve_exact(HEADER_BYTES + count as usize)
+        .map_err(|_| MediaError::TooLarge)?;
+    write_codec_header(header, count, Codec::Cursor, out);
+    out.extend_from_slice(&hotspot.0.to_le_bytes());
+    out.extend_from_slice(&hotspot.1.to_le_bytes());
+    out.extend_from_slice(bgra);
+    Ok(())
+}
+
+/// A parsed codec-2 frame; `pixels` borrows from the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorFrame<'a> {
+    pub header: FrameHeader,
+    pub hotspot: (u32, u32),
+    /// BGRA rows of `header.width * 4` bytes, straight alpha.
+    pub pixels: &'a [u8],
+}
+
+/// Parse a codec-2 frame.
+pub fn read_cursor(data: &[u8]) -> Result<CursorFrame<'_>, MediaError> {
+    if read_codec(data)? != Codec::Cursor {
+        return Err(MediaError::BadCodec);
+    }
+    let (header, count) = parse_header(data)?;
+    let mut input = Reader::new(data.get(HEADER_BYTES..).ok_or(MediaError::Truncated)?);
+    let hotspot = (input.u32()?, input.u32()?);
+    let pixels = input.take(count as usize - HOTSPOT_BYTES)?;
+    if !input.remaining().is_empty() {
+        return Err(MediaError::Trailing);
+    }
+    if hotspot.0 >= header.width || hotspot.1 >= header.height {
+        return Err(MediaError::BadPayload);
+    }
+    Ok(CursorFrame {
+        header,
+        hotspot,
+        pixels,
+    })
+}
+
+fn cursor_bytes(width: u32, height: u32) -> Result<usize, MediaError> {
+    if !(1..=MAX_CURSOR).contains(&width) || !(1..=MAX_CURSOR).contains(&height) {
+        return Err(MediaError::BadSize);
+    }
+    Ok(width as usize * height as usize * 4)
+}
+
 /// Parse just the header (the receiver uses it to drop stale frames before decoding).
 /// Tile records are deliberately not inspected here.
 pub fn read_header(data: &[u8]) -> Result<FrameHeader, MediaError> {
@@ -152,8 +229,11 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<(FrameHeader, u32), MediaError
     match codec {
         Codec::Tiles if tile_size != TILE => return Err(MediaError::BadTile),
         // A tile header relabelled as video is still an unsupported codec/format pairing.
-        Codec::H264 if tile_size != 0 => return Err(MediaError::BadCodec),
+        Codec::H264 | Codec::Cursor if tile_size != 0 => return Err(MediaError::BadCodec),
         _ => {}
+    }
+    if codec == Codec::Cursor && flags != 0 {
+        return Err(MediaError::BadReserved);
     }
     if input.u16()? != 0 {
         return Err(MediaError::BadReserved);
@@ -161,6 +241,11 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<(FrameHeader, u32), MediaError
     let count = input.u32()?;
     if codec == Codec::Tiles && count > tiles_x * tiles_y {
         return Err(MediaError::BadTile);
+    }
+    if codec == Codec::Cursor
+        && usize::try_from(count).ok() != cursor_bytes(width, height)?.checked_add(HOTSPOT_BYTES)
+    {
+        return Err(MediaError::BadPayload);
     }
     let key = flags & 1 != 0;
     if codec == Codec::Tiles && key && count != tiles_x * tiles_y {
@@ -187,6 +272,7 @@ fn parse_codec(byte: u8) -> Result<Codec, MediaError> {
     match byte {
         0 => Ok(Codec::Tiles),
         1 => Ok(Codec::H264),
+        2 => Ok(Codec::Cursor),
         _ => Err(MediaError::BadCodec),
     }
 }
@@ -195,6 +281,7 @@ fn write_codec_header(header: FrameHeader, count: u32, codec: Codec, out: &mut V
     let (codec_byte, tile_size) = match codec {
         Codec::Tiles => (0, TILE as u16),
         Codec::H264 => (1, 0),
+        Codec::Cursor => (2, 0),
     };
     out.extend_from_slice(&MAGIC.to_le_bytes());
     out.extend_from_slice(&[1, u8::from(header.key), codec_byte, 0]);
