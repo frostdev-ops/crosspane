@@ -34,6 +34,8 @@ enum Command {
     Panic,
     /// Re-arm edge crossing after a release or panic.
     Rearm,
+    /// Restart the agent in place (e.g. after granting macOS permissions).
+    Restart,
     /// Put a peer (name or node-id prefix) on a side of this machine.
     Layout { peer: String, side: Side },
     /// Connect to a peer at ADDR (host:port) now.
@@ -111,6 +113,7 @@ fn main() -> Result<()> {
         Command::Release => json!({"cmd": "release"}),
         Command::Panic => json!({"cmd": "panic"}),
         Command::Rearm => json!({"cmd": "rearm"}),
+        Command::Restart => json!({"cmd": "restart"}),
         Command::Layout { peer, side } => {
             let side = format!("{side:?}").to_lowercase();
             json!({"cmd": "layout", "peer": peer, "side": side})

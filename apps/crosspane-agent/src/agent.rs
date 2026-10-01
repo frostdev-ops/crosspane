@@ -12,7 +12,8 @@ use crosspane_engine::{
 };
 use crosspane_input::arrange::{self, Side};
 use crosspane_platform::{
-    CaptureEvent, EventSink, FrameEvent, OverlayEvent, PlatformError, StreamId, WindowEvent,
+    CaptureEvent, EventSink, FrameEvent, OverlayEvent, Permission, PermissionState, PlatformError,
+    StreamId, WindowEvent,
 };
 use crosspane_protocol::link::{LinkEvent, PeerLink};
 use crosspane_protocol::msg::{Capability, ControlMessage, Placement};
@@ -69,6 +70,13 @@ pub struct Agent {
     notices: VecDeque<String>,
     last_trust_check: Instant,
     last_rtt_poll: Instant,
+    /// OS permissions granted when the backends were created (they are created once, at start).
+    granted: Vec<Permission>,
+    /// A different set seen once; it must be seen again before the agent restarts.
+    granted_changing: Option<Vec<Permission>>,
+    last_permission_check: Instant,
+    started: Instant,
+    restart_requested: bool,
     // E2 data plane and window host.
     source_media: Sender<SourceCmd>,
     dest_media: Sender<DestCmd>,
@@ -98,6 +106,8 @@ pub struct E2Wiring {
 
 const NOTICE_HISTORY: usize = 20;
 const HOUSEKEEPING: Duration = Duration::from_secs(1);
+const PERMISSION_CHECK: Duration = Duration::from_secs(2);
+const MIN_RUN_BEFORE_RESTART: Duration = Duration::from_secs(30);
 
 impl Agent {
     #[allow(clippy::too_many_arguments)]
@@ -126,6 +136,11 @@ impl Agent {
             notices: VecDeque::new(),
             last_trust_check: Instant::now(),
             last_rtt_poll: Instant::now(),
+            granted: Vec::new(),
+            granted_changing: None,
+            last_permission_check: Instant::now(),
+            started: Instant::now(),
+            restart_requested: false,
             source_media: e2.source_media,
             dest_media: e2.dest_media,
             host: e2.host,
@@ -143,6 +158,7 @@ impl Agent {
     /// Carry out `outputs` (crash recovery from `Engine::new` first), then run until the channel
     /// closes.
     pub fn run(mut self, startup: Vec<Output>, events: &Receiver<Event>) {
+        self.granted = self.granted_permissions();
         self.execute(startup);
         self.feed(Input::LocalDisplays(self.local_displays.clone()));
         self.send_grants();
@@ -176,6 +192,10 @@ impl Agent {
                 self.feed(Input::Tick);
             }
             self.housekeeping();
+            if self.restart_requested || self.permissions_changed() {
+                self.shutdown();
+                restart();
+            }
         }
     }
 
@@ -593,6 +613,38 @@ impl Agent {
         self.notices.push_back(text);
     }
 
+    fn granted_permissions(&self) -> Vec<Permission> {
+        let p = &self.platform.permissions;
+        p.required()
+            .into_iter()
+            .filter(|&perm| p.state(perm) == PermissionState::Granted)
+            .collect()
+    }
+
+    /// True when an OS permission was granted or revoked since start: the backends that depend on
+    /// it only change when the agent starts again (macOS often needs that for the grant to apply).
+    /// The change must be seen on two checks in a row and the agent must have run for a while, so
+    /// a flapping permission state can't make it restart in a loop.
+    fn permissions_changed(&mut self) -> bool {
+        if self.last_permission_check.elapsed() < PERMISSION_CHECK
+            || self.started.elapsed() < MIN_RUN_BEFORE_RESTART
+        {
+            return false;
+        }
+        self.last_permission_check = Instant::now();
+        let now = self.granted_permissions();
+        if now == self.granted {
+            self.granted_changing = None;
+            return false;
+        }
+        if self.granted_changing.as_ref() != Some(&now) {
+            self.granted_changing = Some(now);
+            return false;
+        }
+        tracing::info!(before = ?self.granted, now = ?now, "OS permissions changed");
+        true
+    }
+
     fn housekeeping(&mut self) {
         if self.last_trust_check.elapsed() >= HOUSEKEEPING {
             self.last_trust_check = Instant::now();
@@ -894,6 +946,10 @@ impl Agent {
                 self.feed(Input::Command(Command::Panic));
                 Response::ok(json!("panic"))
             }
+            Request::Restart => {
+                self.restart_requested = true;
+                Response::ok(json!("restarting"))
+            }
             Request::Rearm => {
                 self.feed(Input::Command(Command::Rearm));
                 Response::ok(json!("re-armed"))
@@ -1186,4 +1242,19 @@ fn log_output(output: &Output) {
 
 fn proxy(key: ProjectionKey, event: ProxyEvent) -> Input {
     Input::Proxy { key, event }
+}
+
+/// Start this agent again in place (same binary, same arguments, same PID), after a clean
+/// shutdown. Exits if that fails, rather than run on with closed links.
+fn restart() -> ! {
+    use std::os::unix::process::CommandExt;
+    tracing::info!("restarting");
+    let error = match std::env::current_exe() {
+        Ok(exe) => std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec(),
+        Err(error) => error,
+    };
+    tracing::error!(%error, "could not restart; exiting");
+    std::process::exit(1);
 }

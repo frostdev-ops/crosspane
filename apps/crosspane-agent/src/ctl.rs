@@ -25,6 +25,8 @@ pub enum Request {
     /// End everything and disarm (04 §6).
     Panic,
     Rearm,
+    /// Stop cleanly and start again in place (e.g. after granting OS permissions).
+    Restart,
     /// Put a peer (by name or node-id prefix) on a side of this node.
     Layout {
         peer: String,
