@@ -1,8 +1,9 @@
 //! E2 window projection messages (docs/wp/E2-v0.md). Frozen by WP-2.1; encoded by WP-2.3.
 //!
 //! - Control: [`ProjectionMessage`], carried in [`crate::msg::ControlMessage::Projection`].
-//! - Input to a projected window: [`ProjInput`] on the input stream (reliable, ordered), and
-//!   [`ProjPointer`] as datagrams (latest wins).
+//! - Input to a projected window: [`ProjInput`], carried as [`crate::msg::InputMessage::Proj`] on
+//!   the input stream (reliable, ordered). Pointer motion is coalesced by the destination to at most
+//!   120 Hz (v0: no datagram path for E2).
 //! - Pixels: media streams (stream type 0x03), format owned by `crosspane-media`.
 //!
 //! Roles: the **source** owns the real window. The **destination** shows the proxy and owns its
@@ -131,6 +132,13 @@ pub enum ProjInput {
         delta: ScrollDelta,
         position: PointDevice,
     },
+    /// The pointer moved over the proxy (coalesced to ≤ 120 Hz by the destination).
+    Motion {
+        projection: ProjectionId,
+        seq: u32,
+        /// Device pixels of the window's content, origin top-left.
+        position: PointDevice,
+    },
     /// Heartbeat: everything the destination holds down in this projection. Every 50 ms while
     /// anything is held, every 250 ms otherwise (crosspane-input timing).
     Held {
@@ -139,14 +147,4 @@ pub enum ProjInput {
         keys: Vec<HidUsage>,
         buttons: Vec<MouseButton>,
     },
-}
-
-/// Destination → source pointer position over a projected window, as a datagram. Stale datagrams
-/// (lower `seq`) are dropped.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ProjPointer {
-    pub projection: ProjectionId,
-    pub seq: u32,
-    /// Device pixels of the window's content, origin top-left.
-    pub position: PointDevice,
 }

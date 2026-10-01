@@ -56,6 +56,8 @@ pub enum InputMessage {
         session: SessionId,
         status: TargetStatus,
     },
+    /// E2: destination → source input for a projected window (docs/wp/E2-v0.md).
+    Proj(crate::projection::ProjInput),
 }
 
 /// The most keys a [`InputMessage::State`] heartbeat may list. A controller holding more releases

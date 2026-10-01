@@ -15,6 +15,10 @@ use crate::msg::{InputMessage, MAX_HELD_KEYS, PointerMessage, Refusal, TargetSta
 /// Append one framed input message to `out`.
 pub fn encode_input(msg: &InputMessage, out: &mut Vec<u8>) -> Result<(), WireError> {
     match msg {
+        // Encoded by WP-2.3.
+        InputMessage::Proj(_) => {
+            return Err(WireError::BadValue("projection input not encodable yet"));
+        }
         InputMessage::Key {
             session,
             seq,
