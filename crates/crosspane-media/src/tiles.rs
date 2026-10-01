@@ -13,6 +13,8 @@ use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
 
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::hybrid::TileRect;
+
 use crate::wire::{
     Codec, FrameHeader, HEADER_BYTES, MAX_FRAME_BYTES, MediaError, RECORD_BYTES, Reader, TILE,
     parse_header, read_codec, tile_grid, write_header,
@@ -25,6 +27,7 @@ const KEY_FRAME_INTERVAL: u32 = 300;
 pub struct TileEncoder {
     size: Option<PixelSize>,
     hashes: Vec<u64>,
+    stale: Vec<bool>,
     frames_since_key: u32,
     key_requested: bool,
     // Replaced on every successful emit/commit; outstanding scans keep their token alive.
@@ -40,6 +43,7 @@ pub struct TileScan {
     kind: ScanKind,
     total: u32,
     changed: u32,
+    bits: Vec<u32>,
     generation: Arc<()>,
 }
 
@@ -59,6 +63,11 @@ impl ScanKind {
 }
 
 impl TileScan {
+    /// This scan's changed tiles as a row-major bitmap (the layout `scan_external` takes).
+    pub fn changed_bits(&self) -> Vec<u32> {
+        self.bits.clone()
+    }
+
     /// Tiles that differ from the last committed capture: all of them after a size change or
     /// before the first commit.
     pub fn changed(&self) -> u32 {
@@ -118,6 +127,7 @@ impl TileEncoder {
         validate_pixels(size, pixels, stride)?;
         let mut hashes = Vec::with_capacity((tiles_x * tiles_y) as usize);
         let mut changed = 0;
+        let mut bits = vec![0; (tiles_x * tiles_y).div_ceil(32) as usize];
         // Gathering a tile into this cache-resident buffer and hashing it in one shot measured
         // faster than streaming the rows through `Xxh3` (0.87 vs 1.13 ms at 3440×1440).
         let mut tile = Vec::with_capacity((TILE * TILE * 4) as usize);
@@ -132,6 +142,7 @@ impl TileEncoder {
                 let hash = xxh3_64(&tile);
                 if self.size != Some(size) || self.hashes.get(hashes.len()) != Some(&hash) {
                     changed += 1;
+                    bits[hashes.len() / 32] |= 1 << (hashes.len() % 32);
                 }
                 hashes.push(hash);
             }
@@ -141,6 +152,7 @@ impl TileEncoder {
             kind: ScanKind::Cpu(hashes),
             total: tiles_x * tiles_y,
             changed,
+            bits,
             generation: Arc::clone(&self.generation),
         })
     }
@@ -179,7 +191,8 @@ impl TileEncoder {
         let changed = bits.iter().map(|word| word.count_ones()).sum();
         Ok(TileScan {
             size,
-            kind: ScanKind::External(bits),
+            kind: ScanKind::External(bits.clone()),
+            bits,
             total,
             changed,
             generation: Arc::clone(&self.generation),
@@ -208,6 +221,7 @@ impl TileEncoder {
             header,
             TileInput::Strided { pixels, stride },
             force_key,
+            None,
             out,
         )
     }
@@ -226,7 +240,34 @@ impl TileEncoder {
         out: &mut Vec<u8>,
     ) -> Result<Option<EncodeStats>, MediaError> {
         self.validate_scan(&scan, header)?;
-        self.emit_tiles(scan, header, TileInput::Packed(tiles), force_key, out)
+        self.emit_tiles(scan, header, TileInput::Packed(tiles), force_key, None, out)
+    }
+
+    /// `emit`/`emit_from` for a capture whose `video` tiles went out as region video. Tiles inside
+    /// `video` aren't encoded; their hashes are committed and they become **stale**. Every emit
+    /// encodes the stale tiles it doesn't exclude (whether or not they changed), which clears
+    /// them. A key frame (forced or pending) ignores `video`, sends every tile and clears all
+    /// stale marks. `video: None` is exactly `emit`/`emit_from` (which also send stale tiles).
+    /// Errors as for `emit`/`emit_from`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_region(
+        &mut self,
+        scan: TileScan,
+        header: FrameHeader,
+        pixels: TilePixels<'_>,
+        video: Option<TileRect>,
+        force_key: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<EncodeStats>, MediaError> {
+        self.validate_scan(&scan, header)?;
+        let input = match pixels {
+            TilePixels::Strided { pixels, stride } => {
+                validate_pixels(scan.size, pixels, stride)?;
+                TileInput::Strided { pixels, stride }
+            }
+            TilePixels::Packed(source) => TileInput::Packed(source),
+        };
+        self.emit_tiles(scan, header, input, force_key, video, out)
     }
 
     /// Whether the next `emit`/`emit_from` of a capture of `size` will be a key frame even
@@ -247,18 +288,26 @@ impl TileEncoder {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_tiles(
         &mut self,
         scan: TileScan,
         mut header: FrameHeader,
         input: TileInput<'_>,
         force_key: bool,
+        video: Option<TileRect>,
         out: &mut Vec<u8>,
     ) -> Result<Option<EncodeStats>, MediaError> {
         let size = scan.size;
         let (tiles_x, tiles_y) = tile_grid(size.width, size.height)?;
         let key = force_key || self.key_pending(size);
         header.key = key;
+        let mut stale = if self.size == Some(size) {
+            self.stale.clone()
+        } else {
+            Vec::new()
+        };
+        stale.resize(scan.total as usize, false);
         out.clear();
         write_header(header, 0, out);
         let result = (|| {
@@ -271,13 +320,18 @@ impl TileEncoder {
                         ScanKind::Cpu(hashes) => self.hashes.get(index) != hashes.get(index),
                         ScanKind::External(bits) => bits[index / 32] & (1 << (index % 32)) != 0,
                     };
-                    if !key && !changed {
+                    if !key && video.is_some_and(|rect| rect.contains(tx, ty)) {
+                        stale[index] = true;
+                        continue;
+                    }
+                    if !key && !changed && !stale[index] {
                         continue;
                     }
                     let geometry = TileGeometry::for_size(size, tx, ty);
                     let tile = input.tile(tx, ty, &geometry, &mut scratch)?;
                     write_tile_record(tx, ty, tile, out)?;
                     count += 1;
+                    stale[index] = false;
                 }
             }
             out.get_mut(44..HEADER_BYTES)
@@ -292,6 +346,7 @@ impl TileEncoder {
                 return Err(error);
             }
         };
+        self.stale = stale;
         self.size = Some(size);
         self.hashes = scan.kind.into_hashes();
         self.generation = Arc::new(());
@@ -316,6 +371,9 @@ impl TileEncoder {
         if !Arc::ptr_eq(&scan.generation, &self.generation) {
             return Err(MediaError::BadPayload);
         }
+        if self.size != Some(scan.size) {
+            self.stale.clear();
+        }
         self.size = Some(scan.size);
         self.hashes = scan.kind.into_hashes();
         self.frames_since_key = self.frames_since_key.saturating_add(1);
@@ -328,6 +386,14 @@ impl TileEncoder {
     pub fn request_key(&mut self) {
         self.key_requested = true;
     }
+}
+
+/// A capture's pixels for `TileEncoder::emit_region`.
+// TileSource is frozen and need not implement Debug.
+#[allow(missing_debug_implementations)]
+pub enum TilePixels<'a> {
+    Strided { pixels: &'a [u8], stride: u32 },
+    Packed(&'a dyn TileSource),
 }
 
 enum TileInput<'a> {
@@ -456,7 +522,7 @@ impl TileDecoder {
             }
             let payload = input.take(len)?;
             let pixels = match encoding {
-                0 => TilePixels::Packed(payload),
+                0 => DecodedTilePixels::Packed(payload),
                 1 => {
                     let mut block = Reader::new(payload);
                     // Never let an attacker-controlled LZ4 size determine the allocation.
@@ -469,9 +535,11 @@ impl TileDecoder {
                     if written != expected {
                         return Err(MediaError::BadPayload);
                     }
-                    TilePixels::Decoded(decoded)
+                    DecodedTilePixels::Decoded(decoded)
                 }
-                2 => TilePixels::Solid(payload.try_into().map_err(|_| MediaError::BadPayload)?),
+                2 => DecodedTilePixels::Solid(
+                    payload.try_into().map_err(|_| MediaError::BadPayload)?,
+                ),
                 _ => return Err(MediaError::BadPayload),
             };
             rects.push(geometry.rect());
@@ -553,7 +621,7 @@ impl TileGeometry {
     }
 }
 
-enum TilePixels<'a> {
+enum DecodedTilePixels<'a> {
     Packed(&'a [u8]),
     Decoded(Vec<u8>),
     Solid([u8; 4]),
@@ -561,7 +629,7 @@ enum TilePixels<'a> {
 
 struct ValidatedTile<'a> {
     geometry: TileGeometry,
-    pixels: TilePixels<'a>,
+    pixels: DecodedTilePixels<'a>,
 }
 
 impl ValidatedTile<'_> {
@@ -573,7 +641,7 @@ impl ValidatedTile<'_> {
             .skip(geometry.y as usize)
             .take(geometry.height as usize);
         match self.pixels {
-            TilePixels::Solid(pixel) => {
+            DecodedTilePixels::Solid(pixel) => {
                 for row in rows {
                     // Validated geometry and canvas dimensions guarantee this range exists.
                     if let Some(destination) = row.get_mut(x..x + geometry.row_bytes()) {
@@ -585,9 +653,9 @@ impl ValidatedTile<'_> {
             }
             packed => {
                 let bytes = match &packed {
-                    TilePixels::Packed(bytes) => *bytes,
-                    TilePixels::Decoded(bytes) => bytes.as_slice(),
-                    TilePixels::Solid(_) => return,
+                    DecodedTilePixels::Packed(bytes) => *bytes,
+                    DecodedTilePixels::Decoded(bytes) => bytes.as_slice(),
+                    DecodedTilePixels::Solid(_) => return,
                 };
                 for (row, source) in rows.zip(bytes.chunks_exact(geometry.row_bytes())) {
                     if let Some(destination) = row.get_mut(x..x + geometry.row_bytes()) {
