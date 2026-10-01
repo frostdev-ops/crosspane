@@ -16,11 +16,14 @@ mod input;
 
 /// Commands to the host, sent from any thread through `HostHandle`.
 pub enum HostCommand {
-    /// Open a proxy with roughly `size` device pixels of content.
+    /// Open a proxy with roughly `size` device pixels of content. `accent` is the source node's
+    /// colour (sRGB bytes): the proxy always shows it as a band around its content (04 §5), so a
+    /// remote window can't pass as a local one.
     Open {
         id: u64,
         title: String,
         size: PixelSize,
+        accent: [u8; 3],
     },
     Close {
         id: u64,
@@ -63,11 +66,17 @@ pub enum HostCommand {
 impl fmt::Debug for HostCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Open { id, title, size } => f
+            Self::Open {
+                id,
+                title,
+                size,
+                accent,
+            } => f
                 .debug_struct("Open")
                 .field("id", id)
                 .field("title", title)
                 .field("size", size)
+                .field("accent", accent)
                 .finish(),
             Self::Close { id } => f.debug_struct("Close").field("id", id).finish(),
             Self::SetTitle { id, title } => f

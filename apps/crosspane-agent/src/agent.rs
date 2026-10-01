@@ -766,10 +766,15 @@ impl Agent {
                 let id = self.proxy_ids.open(key);
                 let title = self.badged(key.source, &title);
                 self.titles.insert(key, (title.clone(), 0));
-                let sent = self
-                    .host
-                    .as_ref()
-                    .is_some_and(|h| h.send(HostCommand::Open { id, title, size }).is_ok());
+                let sent = self.host.as_ref().is_some_and(|h| {
+                    h.send(HostCommand::Open {
+                        id,
+                        title,
+                        size,
+                        accent: node_accent(key.source),
+                    })
+                    .is_ok()
+                });
                 if sent {
                     let from = self
                         .peers
@@ -2572,9 +2577,33 @@ fn restart() -> ! {
     std::process::exit(1);
 }
 
+/// A node's colour on proxy edges: a hue from its id, at fixed saturation and lightness.
+fn node_accent(node: NodeId) -> [u8; 3] {
+    let hue = f64::from(u16::from_be_bytes([node.0[0], node.0[1]])) * 6.0 / 65536.0;
+    let chroma = 0.65;
+    let secondary = chroma * (1.0 - (hue % 2.0 - 1.0).abs());
+    let rgb = match hue as u8 {
+        0 => [chroma, secondary, 0.0],
+        1 => [secondary, chroma, 0.0],
+        2 => [0.0, chroma, secondary],
+        3 => [0.0, secondary, chroma],
+        4 => [secondary, 0.0, chroma],
+        _ => [chroma, 0.0, secondary],
+    };
+    rgb.map(|value| ((value + 0.175) * 255.0).round() as u8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_node_colours() {
+        assert_eq!(node_accent(NodeId([0; 32])), [210, 45, 45]);
+        let mut node = [0; 32];
+        node[0] = 128;
+        assert_eq!(node_accent(NodeId(node)), [45, 210, 210]);
+    }
 
     fn peers() -> Vec<(NodeId, &'static str)> {
         vec![

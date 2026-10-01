@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crosspane_types::geom::{PixelSize, PointDevice};
@@ -11,7 +12,7 @@ use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoopProxy},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     keyboard::PhysicalKey,
     monitor::MonitorHandle,
     window::{CursorIcon, CustomCursor, Window, WindowId},
@@ -48,6 +49,9 @@ struct ProxyWindow {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     scale: f64,
+    accent: [u8; 3],
+    fullscreen: bool,
+    flash_until: Option<Instant>,
     input: InputState,
     consecutive_surface_losses: u8,
 }
@@ -74,6 +78,7 @@ impl App {
         id: u64,
         title: String,
         size: PixelSize,
+        accent: [u8; 3],
     ) -> Result<(), String> {
         if self.windows.contains_key(&id) {
             return Err("proxy ID is already open".into());
@@ -153,6 +158,9 @@ impl App {
             config,
             size: actual_size,
             scale,
+            accent,
+            fullscreen: false,
+            flash_until: None,
             input: InputState::default(),
             consecutive_surface_losses: 0,
         };
@@ -201,8 +209,13 @@ impl App {
     fn command(&mut self, event_loop: &ActiveEventLoop, command: HostCommand) {
         self.check_gpu();
         match command {
-            HostCommand::Open { id, title, size } => {
-                if let Err(error) = self.open(event_loop, id, title, size) {
+            HostCommand::Open {
+                id,
+                title,
+                size,
+                accent,
+            } => {
+                if let Err(error) = self.open(event_loop, id, title, size, accent) {
                     (self.events)(HostEvent::OpenFailed { id, error });
                 }
             }
@@ -278,6 +291,11 @@ impl App {
         let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) else {
             return;
         };
+        let fullscreen = window.window.fullscreen().is_some();
+        if fullscreen && !window.fullscreen {
+            window.flash_until = Some(Instant::now() + Duration::from_secs(2));
+        }
+        window.fullscreen = fullscreen;
         window.scale = scale;
         if let Err(error) = window.resize(gpu, size) {
             tracing::warn!(id, %error, "proxy resize failed");
@@ -432,8 +450,21 @@ impl ApplicationHandler<HostCommand> for App {
         self.check_gpu();
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.check_gpu();
+        let now = Instant::now();
+        let mut next = None;
+        for window in self.windows.values_mut() {
+            if let Some(deadline) = window.flash_until {
+                if deadline <= now {
+                    window.flash_until = None;
+                    window.window.request_redraw();
+                } else {
+                    next = Some(next.map_or(deadline, |previous: Instant| previous.min(deadline)));
+                }
+            }
+        }
+        event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 }
 
@@ -531,7 +562,20 @@ impl ProxyWindow {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("proxy draw"),
             });
-        self.presenter.encode(&mut encoder, &view);
+        let normal = (2.0 * self.scale).round().max(1.0) as u32;
+        let flashing = self
+            .flash_until
+            .is_some_and(|deadline| deadline > Instant::now());
+        self.presenter.set_edge(
+            self.accent,
+            if flashing {
+                normal.saturating_mul(4)
+            } else {
+                normal
+            },
+        );
+        self.presenter
+            .encode(&gpu.queue, pixel_size(self.size), &mut encoder, &view);
         gpu.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
         gpu.queue.present(frame);
