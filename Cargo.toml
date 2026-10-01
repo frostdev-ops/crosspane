@@ -30,18 +30,27 @@ anyhow = "1.0.104"
 aws-lc-rs = "1.18.1"
 clap = { version = "4.6.7", features = ["derive"] }
 euclid = { version = "0.22.14", features = ["serde"] }
+font8x8 = "0.3.1"
 pollster = "1.0.1"
 proptest = "1.11.0"
 prost = "0.14.4"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+rustix = { version = "1.1.5", features = ["fs", "shm", "mm", "event", "time"] }
 rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+smithay-client-toolkit = "0.21.1"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tracing = "0.1.44"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "unstable", "staging"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wgpu = "30.0.1"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
+xkbcommon = "0.9.0"
+zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
 zerocopy = { version = "0.8.59", features = ["derive"] }
 zeroize = "1.9.0"
 

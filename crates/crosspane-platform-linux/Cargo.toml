@@ -13,3 +13,19 @@ workspace = true
 [dependencies]
 crosspane-types.workspace = true
 crosspane-platform.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+font8x8.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smithay-client-toolkit.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+wayland-protocols-misc.workspace = true
+wayland-protocols-wlr.workspace = true
+xkbcommon.workspace = true
+zbus.workspace = true
+zeroize.workspace = true
