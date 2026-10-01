@@ -1273,6 +1273,12 @@ impl TapState {
             self.last_activity = Some(at);
             self.shared.event(0, CaptureEvent::LocalActivity { at });
         }
+        // Crosspane's own injected input (as an E1 target, or into a projected window) belongs to
+        // the OS: never local motion, an edge press or a captured key. Otherwise injected motion
+        // reaching an edge could cross back to the controller.
+        if integer(CGEventField::EventSourceUserData) == INJECTED {
+            return true;
+        }
         let motion = matches!(
             kind,
             CGEventType::MouseMoved
