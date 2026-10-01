@@ -1,0 +1,343 @@
+//! The [`PeerLink`] the engine sends through.
+//!
+//! A handle is bound to a *logical link*: the sequence of events the engine saw for one peer from
+//! its `Hello` to its `Closed`. When a duplicate connection resolves (rule 7), the logical link
+//! moves to the surviving connection and existing handles keep working. After the link closes, its
+//! handles stay closed for good, even if the peer reconnects: the engine must fetch a new handle.
+//!
+//! Sends never block. Frames are queued per stream with a byte cap; a peer that stops reading
+//! until the cap is hit loses its connection instead of growing memory without bound.
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use crosspane_protocol::link::{LinkError, PeerLink};
+use crosspane_protocol::msg::{ControlMessage, InputMessage, PointerMessage};
+use crosspane_protocol::wire::{WireError, encode_control, encode_input, encode_pointer};
+use crosspane_types::id::NodeId;
+use quinn::{Connection, SendDatagramError, VarInt};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+use crate::hub::{CODE_NORMAL, CODE_OVERFLOW};
+
+/// Queued input-stream bytes at which the connection is closed.
+const INPUT_QUEUE_CAP: usize = 1024 * 1024;
+/// Queued control-stream bytes at which the connection is closed.
+const CONTROL_QUEUE_CAP: usize = 8 * 1024 * 1024;
+/// How long a graceful close waits for queued data to be acknowledged.
+pub(crate) const FLUSH_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// What a stream's writer task receives.
+pub(crate) enum Out {
+    /// Bytes to write: one or more complete frames.
+    Data(Vec<u8>),
+    /// Everything queued so far is written: finish the stream, wait for the peer to acknowledge
+    /// it, then report back.
+    Finish(oneshot::Sender<()>),
+}
+
+/// The sending side of one stream's queue.
+#[derive(Clone)]
+pub(crate) struct Queue {
+    tx: UnboundedSender<Out>,
+    queued: Arc<AtomicUsize>,
+    cap: usize,
+}
+
+/// The writer task's side of a queue.
+pub(crate) struct QueueRx {
+    pub(crate) rx: UnboundedReceiver<Out>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl QueueRx {
+    /// A frame of `len` bytes has been written out.
+    pub(crate) fn written(&self, len: usize) {
+        self.queued.fetch_sub(len, Ordering::Relaxed);
+    }
+}
+
+pub(crate) enum PushError {
+    /// The writer is gone.
+    Closed,
+    /// The queue would exceed its cap.
+    Overflow,
+}
+
+impl Queue {
+    pub(crate) fn new(cap: usize) -> (Queue, QueueRx) {
+        let (tx, rx) = unbounded_channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        (
+            Queue {
+                tx,
+                queued: queued.clone(),
+                cap,
+            },
+            QueueRx { rx, queued },
+        )
+    }
+
+    pub(crate) fn push(&self, frame: Vec<u8>) -> Result<(), PushError> {
+        let len = frame.len();
+        if self.queued.fetch_add(len, Ordering::Relaxed) + len > self.cap {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return Err(PushError::Overflow);
+        }
+        self.tx.send(Out::Data(frame)).map_err(|_| {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            PushError::Closed
+        })
+    }
+}
+
+/// What the senders need from the connection currently carrying a logical link.
+#[derive(Clone)]
+pub(crate) struct ConnTx {
+    pub(crate) conn: Connection,
+    /// Frames for the control stream's writer task.
+    pub(crate) control: Queue,
+    /// Frames for the input stream's writer task.
+    pub(crate) input: Queue,
+    /// The runtime the connection's tasks run on, for the graceful close.
+    rt: Handle,
+}
+
+// `Connection` and the queues have no useful Debug output; keep it short.
+impl std::fmt::Debug for ConnTx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnTx { .. }")
+    }
+}
+
+impl ConnTx {
+    /// Queues for a new connection, and the receiving ends for its writer tasks. Must be called
+    /// inside the tokio runtime.
+    pub(crate) fn new(conn: Connection) -> (ConnTx, QueueRx, QueueRx) {
+        let (control, control_rx) = Queue::new(CONTROL_QUEUE_CAP);
+        let (input, input_rx) = Queue::new(INPUT_QUEUE_CAP);
+        let tx = ConnTx {
+            conn,
+            control,
+            input,
+            rt: Handle::current(),
+        };
+        (tx, control_rx, input_rx)
+    }
+
+    fn queue(&self, queue: &Queue, frame: Vec<u8>) -> Result<(), LinkError> {
+        match queue.push(frame) {
+            Ok(()) => Ok(()),
+            Err(PushError::Closed) => Err(LinkError::Closed),
+            Err(PushError::Overflow) => {
+                // The peer isn't reading. Don't let the queue grow without bound.
+                tracing::warn!("send queue overflow; closing the connection");
+                self.conn
+                    .close(VarInt::from_u32(CODE_OVERFLOW), b"send queue overflow");
+                Err(LinkError::Closed)
+            }
+        }
+    }
+
+    pub(crate) fn queue_control(&self, frame: Vec<u8>) -> Result<(), LinkError> {
+        self.queue(&self.control, frame)
+    }
+
+    pub(crate) fn queue_input(&self, frame: Vec<u8>) -> Result<(), LinkError> {
+        self.queue(&self.input, frame)
+    }
+
+    /// Finish both streams once their queued data is out, give the peer a moment to acknowledge it,
+    /// then close the connection with `message` (application code 0). Everything queued before this
+    /// call is delivered unless the peer is unresponsive.
+    pub(crate) fn flush_and_close(self, message: String) -> JoinHandle<()> {
+        let rt = self.rt.clone();
+        rt.spawn(async move {
+            let mut waits = Vec::new();
+            for queue in [&self.control, &self.input] {
+                let (done, wait) = oneshot::channel();
+                if queue.tx.send(Out::Finish(done)).is_ok() {
+                    waits.push(wait);
+                }
+            }
+            let _ = timeout(FLUSH_TIMEOUT, async {
+                for wait in waits {
+                    let _ = wait.await;
+                }
+            })
+            .await;
+            self.conn
+                .close(VarInt::from_u32(CODE_NORMAL), message.as_bytes());
+        })
+    }
+}
+
+/// Shared by the registry and every [`QuicLink`] of one logical link.
+#[derive(Debug)]
+pub(crate) struct LinkCell {
+    /// `None` once the logical link has closed.
+    current: Mutex<Option<ConnTx>>,
+    /// The engine asked to close: further sends fail even while the flush is still in flight.
+    closing: AtomicBool,
+}
+
+impl LinkCell {
+    pub(crate) fn new(tx: ConnTx) -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new(Some(tx)),
+            closing: AtomicBool::new(false),
+        })
+    }
+
+    /// Route the link over another connection (duplicate resolution).
+    pub(crate) fn set(&self, tx: ConnTx) {
+        if self.closing.load(Ordering::Relaxed) {
+            // The engine already closed this link; the survivor goes too.
+            tx.conn
+                .close(VarInt::from_u32(CODE_NORMAL), b"closed by the local engine");
+        }
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+    }
+
+    /// Close the logical link for good.
+    pub(crate) fn clear(&self) {
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Start a graceful close: nothing more can be sent, queued data is flushed, then the
+    /// connection closes. `None` if the link was already closing or closed.
+    pub(crate) fn begin_close(&self, message: &str) -> Option<JoinHandle<()>> {
+        if self.closing.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        let tx = self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        Some(tx.flush_and_close(message.to_owned()))
+    }
+
+    /// The live connection, if the link is open and the connection hasn't closed.
+    fn live(&self) -> Result<ConnTx, LinkError> {
+        if self.closing.load(Ordering::Relaxed) {
+            return Err(LinkError::Closed);
+        }
+        let tx = self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or(LinkError::Closed)?;
+        if tx.conn.close_reason().is_some() {
+            return Err(LinkError::Closed);
+        }
+        Ok(tx)
+    }
+}
+
+/// The engine's send handle for one peer.
+#[derive(Debug)]
+pub(crate) struct QuicLink {
+    peer: NodeId,
+    cell: Arc<LinkCell>,
+}
+
+impl QuicLink {
+    pub(crate) fn new(peer: NodeId, cell: Arc<LinkCell>) -> Self {
+        Self { peer, cell }
+    }
+}
+
+fn invalid(error: WireError) -> LinkError {
+    match error {
+        WireError::TooLarge { .. } => LinkError::Invalid("message too large"),
+        _ => LinkError::Invalid("message cannot be encoded"),
+    }
+}
+
+impl PeerLink for QuicLink {
+    fn peer(&self) -> NodeId {
+        self.peer
+    }
+
+    fn send_input(&mut self, msg: &InputMessage) -> Result<(), LinkError> {
+        let mut frame = Vec::new();
+        encode_input(msg, &mut frame).map_err(invalid)?;
+        self.cell.live()?.queue_input(frame)
+    }
+
+    fn send_motion(&mut self, msg: &PointerMessage) -> Result<(), LinkError> {
+        let datagram = encode_pointer(msg).map_err(invalid)?;
+        let tx = self.cell.live()?;
+        match tx.conn.max_datagram_size() {
+            None => return Err(LinkError::Invalid("the peer does not accept datagrams")),
+            Some(max) if datagram.len() > max => return Err(LinkError::Congested),
+            Some(_) => {}
+        }
+        // quinn would silently drop older queued datagrams to make room. Report a full buffer
+        // instead so the caller sees the congestion.
+        if tx.conn.datagram_send_buffer_space() < datagram.len() {
+            return Err(LinkError::Congested);
+        }
+        tx.conn
+            .send_datagram(datagram.into())
+            .map_err(|error| match error {
+                SendDatagramError::TooLarge => LinkError::Congested,
+                SendDatagramError::ConnectionLost(_) => LinkError::Closed,
+                _ => LinkError::Invalid("datagrams are unavailable"),
+            })
+    }
+
+    fn send_control(&mut self, msg: &ControlMessage) -> Result<(), LinkError> {
+        let mut frame = Vec::new();
+        encode_control(msg, &mut frame).map_err(invalid)?;
+        self.cell.live()?.queue_control(frame)
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        // The handshake itself yields an RTT sample, so an established connection always has one.
+        self.cell.live().ok().map(|tx| tx.conn.rtt())
+    }
+
+    fn close(&mut self, message: &str) {
+        let _ = self.cell.begin_close(message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_queue_refuses_frames_past_its_cap_and_frees_room_as_they_are_written() {
+        let (queue, mut rx) = Queue::new(100);
+        assert!(queue.push(vec![0; 60]).is_ok());
+        assert!(matches!(queue.push(vec![0; 60]), Err(PushError::Overflow)));
+        assert!(queue.push(vec![0; 40]).is_ok());
+        assert!(matches!(queue.push(vec![0; 1]), Err(PushError::Overflow)));
+
+        let Some(Out::Data(first)) = rx.rx.try_recv().ok() else {
+            panic!("expected data");
+        };
+        rx.written(first.len());
+        assert!(queue.push(vec![0; 60]).is_ok());
+    }
+
+    #[test]
+    fn a_queue_with_no_writer_reports_closed() {
+        let (queue, rx) = Queue::new(100);
+        drop(rx);
+        assert!(matches!(queue.push(vec![0; 10]), Err(PushError::Closed)));
+        // The failed push did not leak budget.
+        let (queue, rx) = Queue::new(10);
+        drop(rx);
+        assert!(matches!(queue.push(vec![0; 10]), Err(PushError::Closed)));
+        assert!(matches!(queue.push(vec![0; 10]), Err(PushError::Closed)));
+    }
+}
