@@ -15,7 +15,7 @@ extras=()
 ui_element=false
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --bin|--id|--name|--out|--entitlements|--identity)
+        --bin|--id|--name|--out|--entitlements|--identity|--extra)
             [[ $# -ge 2 && -n $2 ]] || usage
             case $1 in
                 --bin) bin=$2 ;;
