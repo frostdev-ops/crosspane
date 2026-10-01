@@ -75,6 +75,12 @@ pub enum Request {
         window: u64,
         peer: String,
     },
+    /// Save the picture last shown for projection `projection` of `source` (a diagnostic: the
+    /// decoded frame, before presentation) as a PPM file; answers its path.
+    Snapshot {
+        projection: u64,
+        source: String,
+    },
     /// End projection `projection` of `source` (default: this node) and return the window.
     Return {
         projection: u64,

@@ -2191,6 +2191,24 @@ impl Agent {
                     Response::ok(json!("projection offered"))
                 }
             },
+            Request::Snapshot { projection, source } => match self.find_peer(&source) {
+                None => Response::err(format!("no peer matches {source:?}")),
+                Some(source) => {
+                    let key = ProjectionKey {
+                        source,
+                        projection: ProjectionId(projection),
+                    };
+                    let (reply, answer) = std::sync::mpsc::channel::<Option<crate::media::Shown>>();
+                    let _ = self.dest_media.send(DestCmd::Snapshot { key, reply });
+                    match answer.recv_timeout(Duration::from_secs(2)) {
+                        Ok(Some((size, pixels))) => match write_snapshot(key, size, &pixels) {
+                            Ok(path) => Response::ok(json!(path)),
+                            Err(e) => Response::err(format!("could not save the snapshot: {e}")),
+                        },
+                        _ => Response::err("no picture shown for that projection"),
+                    }
+                }
+            },
             Request::Return { projection, source } => {
                 let source = match source {
                     None => Some(self.node),
@@ -2335,6 +2353,28 @@ fn open_settings_app() -> std::io::Result<()> {
             let _ = child.wait();
         })?;
     Ok(())
+}
+
+/// Write a decoded picture as a binary PPM (RGB) in the temp directory, readable only by this user.
+fn write_snapshot(
+    key: ProjectionKey,
+    size: crosspane_types::geom::PixelSize,
+    bgra: &[u8],
+) -> anyhow::Result<String> {
+    let (w, h) = (size.width as usize, size.height as usize);
+    anyhow::ensure!(bgra.len() >= w * h * 4, "picture shorter than its size");
+    let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+    ppm.reserve(w * h * 3);
+    for pixel in bgra[..w * h * 4].as_chunks::<4>().0 {
+        ppm.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+    }
+    let path = std::env::temp_dir().join(format!(
+        "crosspane-snapshot-{}-{}.ppm",
+        key.source.short(),
+        key.projection.0
+    ));
+    crate::paths::write_private(&path, &ppm)?;
+    Ok(path.display().to_string())
 }
 
 fn display_json(d: &DisplayInfo) -> Value {

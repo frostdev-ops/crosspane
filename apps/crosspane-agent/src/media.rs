@@ -565,7 +565,15 @@ pub enum DestCmd {
     },
     /// The proxy for `key` closed: forget its decoder.
     Forget(ProjectionKey),
+    /// The picture last shown for `key` (BGRA rows), for `crosspanectl snapshot`.
+    Snapshot {
+        key: ProjectionKey,
+        reply: Sender<Option<Shown>>,
+    },
 }
+
+/// A decoded picture: its size and BGRA rows of `width * 4` bytes.
+pub type Shown = (crosspane_types::geom::PixelSize, Arc<[u8]>);
 
 struct Decoding {
     decoder: TileDecoder,
@@ -577,6 +585,8 @@ struct Decoding {
     pending: BTreeMap<u64, Arc<[u8]>>,
     gap_since: Option<Instant>,
     last_error: Option<Instant>,
+    /// The picture last handed to the proxy.
+    shown: Option<Shown>,
 }
 
 const GAP_TIMEOUT: Duration = Duration::from_millis(300);
@@ -620,6 +630,9 @@ fn decode_loop(
             Some(DestCmd::Forget(key)) => {
                 decoders.remove(&key);
             }
+            Some(DestCmd::Snapshot { key, reply }) => {
+                let _ = reply.send(decoders.get(&key).and_then(|d| d.shown.clone()));
+            }
             Some(DestCmd::Media { peer, data }) => {
                 let Ok(header) = read_header(&data) else {
                     tracing::debug!("dropping a malformed media frame");
@@ -635,6 +648,7 @@ fn decode_loop(
                     video: None,
                     last: 0,
                     cursor_seq: 0,
+                    shown: None,
                     pending: BTreeMap::new(),
                     gap_since: None,
                     last_error: None,
@@ -708,6 +722,7 @@ fn apply(
         Ok((header, pixels, size, dirty)) => {
             d.last = seq.max(header.seq);
             ids.shown(key, data.len(), header.captured_ns);
+            d.shown = Some((size, pixels.clone()));
             if let Some(host) = host {
                 let _ = host.send(HostCommand::Frame {
                     id,
