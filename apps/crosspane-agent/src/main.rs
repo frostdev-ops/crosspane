@@ -165,10 +165,23 @@ fn run() -> Result<()> {
     agent::subscribe_platform(&mut platform, &tx);
     ctl::serve(&paths.control_socket(), tx.clone())?;
 
+    // E2 video (WP-2.14): this node's encoder/decoder, if it has one and video isn't turned off.
+    let video = media::VideoSetup {
+        codecs: if config.video_mbps > 0 {
+            platform::video_codecs()
+        } else {
+            None
+        },
+        bits_per_second: config.video_mbps.saturating_mul(1_000_000),
+    };
+    let mut features = vec!["e1".to_owned()];
+    if video.codecs.is_some() {
+        features.push("h264".to_owned());
+    }
     let hello = Hello {
         minor: crosspane_protocol::PROTOCOL_MINOR,
         name: config.name.clone(),
-        features: vec!["e1".to_owned()],
+        features,
         displays: local_displays.clone(),
     };
     let pins: Arc<dyn crosspane_transport::PinStore> = Arc::new(trust.clone());
@@ -189,11 +202,12 @@ fn run() -> Result<()> {
     };
     let proxy_ids = media::ProxyIds::default();
     let e2 = agent::E2Wiring {
-        source_media: media::start_source(net.transport()),
+        source_media: media::start_source(net.transport(), video.clone()),
         dest_media: media::start_destination(
             host.as_ref().map(|(_, handle)| handle.clone()),
             proxy_ids.clone(),
             tx.clone(),
+            video,
         ),
         host: host.as_ref().map(|(_, handle)| handle.clone()),
         proxy_ids,
@@ -202,7 +216,7 @@ fn run() -> Result<()> {
         identity,
         port: config.port,
     };
-    let agent = agent::Agent::new(
+    let mut agent = agent::Agent::new(
         node,
         config.name,
         engine,
@@ -212,6 +226,7 @@ fn run() -> Result<()> {
         local_displays,
         e2,
     );
+    agent.start_discovery();
     run_loop(agent, startup, rx, tx, host.map(|(host, _)| host))
 }
 

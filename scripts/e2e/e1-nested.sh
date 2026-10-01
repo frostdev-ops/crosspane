@@ -16,6 +16,9 @@ cargo build -q -p crosspane-agent -p crosspanectl
 cargo build -q -p crosspane-platform-linux --example vinput
 rm -rf "$work"; mkdir -p "$work"
 cleanup() {
+  if [ -n "${outer_cursor:-}" ]; then
+    hyprctl dispatch "hl.dsp.cursor.move({ x = ${outer_cursor%%,*}, y = ${outer_cursor##*, } })" >/dev/null 2>&1 || true
+  fi
   [ "${KEEP:-0}" = 1 ] && return
   for n in a b; do [ -f "$work/$n/pid" ] && kill "$(cat "$work/$n/pid")" 2>/dev/null || true; done
   for n in a b; do scripts/hypr-nested.sh stop --name e2e-$n >/dev/null 2>&1 || true; done
@@ -27,6 +30,19 @@ for n in a b; do
   mkdir -p "$work/$n/config/crosspane" "$work/$n/state" "$work/$n/run"
   scripts/hypr-nested.sh start --name e2e-$n --width 1280 --height 720 >/dev/null
 done
+# Pin both nests as floating 1280x720 windows in the outer session: if the outer layout re-tiles
+# them, their outputs resize mid-test and the capture ends (as it should, but not what we test).
+nest_addr() {
+  local pid; pid=$(cat "$XDG_RUNTIME_DIR/crosspane-hypr-e2e-$1/pid" 2>/dev/null || true)
+  [ -n "$pid" ] && hyprctl -j clients | jq -r --argjson pid "$pid" '.[] | select(.pid == $pid) | .address' | head -n1
+}
+for n in a b; do
+  addr=$(nest_addr "$n")
+  [ -n "$addr" ] || continue
+  hyprctl dispatch "hl.dsp.window.float({ window = \"address:$addr\", action = \"set\" })" >/dev/null
+  hyprctl dispatch "hl.dsp.window.resize({ window = \"address:$addr\", x = 1280, y = 720, relative = false })" >/dev/null
+done
+sleep 1
 port_a=47961 port_b=47971
 cat > "$work/a/config/crosspane/config.toml" <<CFG
 name = "e2e-a"
@@ -58,6 +74,19 @@ for _ in $(seq 1 50); do
 done
 envof a "$bin/crosspanectl" status | grep -q "connected" || { echo "FAIL: peers did not connect"; exit 1; }
 
+# Nest A must have keyboard and pointer focus in the outer session: its pointer lock (the capture)
+# only holds while it does, and the outer focus follows wherever the real mouse happens to be.
+# The nest maps its pointer lock (the capture) onto the outer pointer, which only works while the
+# real cursor is over the nest's window: focus nest A and put the cursor in its middle (restored
+# at exit).
+outer_cursor=$(hyprctl cursorpos)
+addr=$(nest_addr a)
+if [ -n "$addr" ]; then
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$addr\" })" >/dev/null
+  read -r cx cy < <(hyprctl -j clients | jq -r --arg a "$addr" '.[] | select(.address == $a) | "\(.at[0] + .size[0] / 2 | floor) \(.at[1] + .size[1] / 2 | floor)"')
+  hyprctl dispatch "hl.dsp.cursor.move({ x = $cx, y = $cy })" >/dev/null
+fi
+sleep 0.3
 (eval "$(scripts/hypr-nested.sh env --name e2e-a)"
  { echo "abs 400 200"; for _ in $(seq 1 60); do echo "rel 20 0"; echo "sleep 10"; done
    echo "sleep 300"; for _ in $(seq 1 20); do echo "rel 15 5"; echo "sleep 10"; done; echo "sleep 300"

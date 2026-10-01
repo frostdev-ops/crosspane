@@ -16,6 +16,8 @@ use serde_json::Value;
 use super::ipc::{EventStream, HyprIpc, IpcEvent};
 
 const DEBOUNCE: Duration = Duration::from_millis(50);
+/// How often the window list is diffed when no event arrives.
+const POLL: Duration = Duration::from_secs(1);
 const PARKING_PREFIX: &str = "special:crosspane-";
 
 type Clients = BTreeMap<WindowId, Client>;
@@ -157,7 +159,17 @@ fn worker_loop(
     for client in clients.values() {
         sink.send(WindowEvent::Added(client.info.clone()));
     }
-    while let Ok(change) = rx.recv() {
+    loop {
+        // Hyprland announces no event when a window's size or position changes by itself (for
+        // example when a bar reserves space on its output), so a periodic diff catches those.
+        let change = match rx.recv_timeout(POLL) {
+            Ok(change) => change,
+            Err(RecvTimeoutError::Timeout) => {
+                refresh(ipc, addresses, &mut clients, sink);
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
         match change {
             Change::Connected => refresh(ipc, addresses, &mut clients, sink),
             Change::Refresh => {

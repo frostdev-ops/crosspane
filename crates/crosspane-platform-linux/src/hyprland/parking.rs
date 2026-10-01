@@ -125,8 +125,36 @@ impl HyprlandParking {
 
     /// Set the twin output's mode and wait until Hyprland reports it.
     fn set_mode(&self, entry: &Entry, size: PixelSize, scale: f64) -> Result<(), PlatformError> {
+        let reserved = self.reserved(&entry.output)?;
+        self.set_mode_padded(entry, size, scale, reserved)
+    }
+
+    /// The area other clients reserve on `output` (bars' exclusive zones), in logical pixels:
+    /// left, top, right, bottom.
+    fn reserved(&self, output: &str) -> Result<[u32; 4], PlatformError> {
+        let mut r = [0; 4];
+        if let Some(m) = self.monitor(output)?
+            && let Some(a) = m.get("reserved").and_then(Value::as_array)
+        {
+            for (i, v) in a.iter().take(4).enumerate() {
+                r[i] = v.as_u64().and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+            }
+        }
+        Ok(r)
+    }
+
+    /// Set the twin's mode so that, after the area bars reserve on it (Waybar puts one on every
+    /// output), the work area is exactly `size`: the window tiles into that work area and the
+    /// capture crops to the window, so the bar never shows in the projection.
+    fn set_mode_padded(
+        &self,
+        entry: &Entry,
+        size: PixelSize,
+        scale: f64,
+        reserved: [u32; 4],
+    ) -> Result<(), PlatformError> {
         let scale = sane_scale(scale);
-        let (w, h) = mode_size(size, scale);
+        let (w, h) = padded_mode(size, scale, reserved);
         let x = PARK_ORIGIN_X + entry.slot * PARK_STRIDE;
         self.ipc.eval(&format!(
             "hl.monitor({{ output = \"{}\", mode = \"{w}x{h}@60\", position = \"{x}x0\", scale = {scale} }})",
@@ -165,8 +193,17 @@ impl HyprlandParking {
                 .and_then(Value::as_str)
                 .unwrap_or(&entry.address)
                 .to_owned();
+            self.ipc.dispatch(&format!(
+                "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = 0, client = 0 }})"
+            ))?;
             self.move_window(&address, &workspace_selector(&entry.original.workspace))?;
             let o = &entry.original;
+            if o.fullscreen != 0 {
+                self.ipc.dispatch(&format!(
+                    "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = {0}, client = {0} }})",
+                    o.fullscreen
+                ))?;
+            }
             if o.floating {
                 self.ipc.dispatch(&format!(
                     "hl.dsp.window.float({{ window = \"address:{address}\", action = \"set\" }})"
@@ -350,7 +387,14 @@ impl HyprlandParking {
         let entry = self.entries.get(&window.0).ok_or(PlatformError::NotFound)?;
         let (w, h) = mode_size(size, sane_scale(scale));
         let deadline = Instant::now() + SETTLE;
+        let mut padded_for = self.reserved(&entry.output)?;
         loop {
+            // A bar can arrive on the new output after its mode was set: pad again.
+            let reserved = self.reserved(&entry.output)?;
+            if reserved != padded_for {
+                self.set_mode_padded(entry, size, scale, reserved)?;
+                padded_for = reserved;
+            }
             let client = self.client(window)?.ok_or(PlatformError::NotFound)?;
             let monitor = self
                 .monitor(&entry.output)?
@@ -415,6 +459,18 @@ fn stable_id(client: &Value) -> Option<u64> {
 }
 
 /// A mode whose size is a whole number of logical pixels at `scale` (Hyprland rejects others).
+/// `mode_size` plus the reserved area (logical pixels, converted to device pixels).
+fn padded_mode(size: PixelSize, scale: f64, reserved: [u32; 4]) -> (u32, u32) {
+    let (w, h) = mode_size(size, scale);
+    let px = |v: u32| (f64::from(v) * scale).round() as u32;
+    (
+        w.saturating_add(px(reserved[0]))
+            .saturating_add(px(reserved[2])),
+        h.saturating_add(px(reserved[1]))
+            .saturating_add(px(reserved[3])),
+    )
+}
+
 fn mode_size(size: PixelSize, scale: f64) -> (u32, u32) {
     let fit = |v: u32| {
         let logical = (f64::from(v.max(64)) / scale).floor().max(32.0);
@@ -466,6 +522,14 @@ mod tests {
         assert_eq!(mode_size(PixelSize::new(1600, 1201), 2.0), (1600, 1200));
         assert_eq!(mode_size(PixelSize::new(800, 600), 1.0), (800, 600));
         assert_eq!(mode_size(PixelSize::new(1, 1), 2.0), (64, 64));
+        assert_eq!(
+            padded_mode(PixelSize::new(800, 600), 1.0, [0, 26, 0, 0]),
+            (800, 626)
+        );
+        assert_eq!(
+            padded_mode(PixelSize::new(1600, 1200), 2.0, [0, 26, 0, 10]),
+            (1600, 1272)
+        );
         assert_eq!(sane_scale(1.25), 1.0);
         assert_eq!(sane_scale(2.0), 2.0);
         assert_eq!(sane_scale(f64::NAN), 1.0);

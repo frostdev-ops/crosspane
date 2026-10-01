@@ -3,6 +3,7 @@
 //! backend threads) talks to it through one channel.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -45,12 +46,16 @@ pub enum Event {
     Shutdown,
     /// The user chose a tray / menu-bar item.
     Tray(crosspane_platform::TrayEvent),
+    /// mDNS discovery saw a change (WP-1.6).
+    Discovery(crosspane_transport::discovery::DiscoveryEvent),
 }
 
 /// What the loop knows about a peer.
 #[derive(Debug, Default)]
 struct PeerInfo {
     name: String,
+    /// What its `Hello` advertised (e.g. `h264`).
+    features: Vec<String>,
     displays: Vec<DisplayInfo>,
     connected: bool,
     rtt: Option<Duration>,
@@ -85,6 +90,12 @@ pub struct Agent {
     next_request: u32,
     tray: TrayState,
     quit_requested: bool,
+    discovery: Option<crosspane_transport::discovery::Discovery>,
+    /// Other Crosspane nodes on the network, by instance id.
+    candidates: BTreeMap<String, crosspane_transport::discovery::Candidate>,
+    last_candidate_dial: Option<Instant>,
+    /// The device name is in the advertisement (a pairing window is open).
+    advertising_name: bool,
     // E2 data plane and window host.
     source_media: Sender<SourceCmd>,
     dest_media: Sender<DestCmd>,
@@ -154,6 +165,19 @@ impl TrayState {
     }
 }
 
+/// A candidate's addresses, best first: IPv4, then global IPv6, then link-local IPv6 (at most 3).
+fn dial_order(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let rank = |a: &SocketAddr| match a {
+        SocketAddr::V4(_) => 0,
+        SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() => 2,
+        SocketAddr::V6(_) => 1,
+    };
+    let mut sorted = addrs.to_vec();
+    sorted.sort_by_key(rank);
+    sorted.truncate(3);
+    sorted
+}
+
 /// A window as one menu line: "title — app", shortened.
 fn window_label(title: &str, app: &str) -> String {
     let text = if title.is_empty() {
@@ -216,6 +240,10 @@ impl Agent {
             next_request: 1,
             tray: TrayState::new(),
             quit_requested: false,
+            discovery: None,
+            candidates: BTreeMap::new(),
+            last_candidate_dial: None,
+            advertising_name: false,
             source_media: e2.source_media,
             dest_media: e2.dest_media,
             host: e2.host,
@@ -291,6 +319,7 @@ impl Agent {
         match event {
             // `run` stops the loop for this one.
             Event::Shutdown => {}
+            Event::Discovery(event) => self.on_discovery(event),
             Event::Tray(crosspane_platform::TrayEvent::Chosen(id)) => {
                 if let Some(action) = self.tray.actions.get(&id).cloned() {
                     self.tray_action(action);
@@ -335,6 +364,7 @@ impl Agent {
                     tracing::info!(peer = %peer.short(), %name, "peer connected");
                     let info = self.peers.entry(peer).or_default();
                     info.name = name;
+                    info.features = hello.features.clone();
                     info.displays = hello.displays.clone();
                     info.connected = true;
                     if let Some(link) = self.net.link(peer) {
@@ -544,10 +574,15 @@ impl Agent {
                 };
                 if let Ok(stream) = result {
                     self.streams.insert(stream, projection);
+                    let video = self
+                        .peers
+                        .get(&peer)
+                        .is_some_and(|p| p.features.iter().any(|f| f == "h264"));
                     let _ = self.source_media.send(SourceCmd::Start {
                         stream,
                         projection,
                         peer,
+                        video,
                     });
                 }
                 self.pending
@@ -971,7 +1006,7 @@ impl Agent {
                 candidates: status.candidates,
                 peer: status.peer,
                 error: status.error,
-                offers: Vec::new(),
+                offers: self.pairing_offers(),
             },
         }
     }
@@ -1046,6 +1081,94 @@ impl Agent {
         self.tray.last_update = Instant::now() - TRAY_UPDATE;
     }
 
+    /// Start mDNS discovery (03 §2): advertise this node and dial candidates when a paired peer
+    /// is offline. Without it the agent runs on configured addresses.
+    pub fn start_discovery(&mut self) {
+        use crosspane_transport::discovery::Discovery;
+        let events = self.events.clone();
+        match Discovery::start(
+            self.port,
+            Box::new(move |ev| {
+                let _ = events.send(Event::Discovery(ev));
+            }),
+        ) {
+            Ok(d) => self.discovery = Some(d),
+            Err(e) => tracing::warn!(error = %e, "no discovery: using configured addresses only"),
+        }
+    }
+
+    fn on_discovery(&mut self, event: crosspane_transport::discovery::DiscoveryEvent) {
+        use crosspane_transport::discovery::DiscoveryEvent;
+        match event {
+            DiscoveryEvent::Found(candidate) => {
+                let fresh = !self.candidates.contains_key(&candidate.instance);
+                if self.paired_peer_offline() && fresh {
+                    for addr in dial_order(&candidate.addrs) {
+                        self.net.dial_once(addr);
+                    }
+                }
+                self.candidates
+                    .insert(candidate.instance.clone(), candidate);
+            }
+            DiscoveryEvent::Lost { instance } => {
+                self.candidates.remove(&instance);
+            }
+        }
+    }
+
+    fn paired_peer_offline(&self) -> bool {
+        self.trust.with(|t| {
+            t.peers()
+                .iter()
+                .any(|e| !self.peers.get(&e.node).is_some_and(|p| p.connected))
+        })
+    }
+
+    /// Housekeeping for discovery: re-try candidates while a paired peer is offline, and put the
+    /// device name in the advertisement only while a pairing window is open (04 §3).
+    fn discovery_housekeeping(&mut self) {
+        let Some(discovery) = &self.discovery else {
+            return;
+        };
+        let listening = self.pairing.status().phase == "listening";
+        if listening != self.advertising_name {
+            let name = listening.then_some(self.name.as_str());
+            match discovery.set_pairing_name(name) {
+                Ok(()) => self.advertising_name = listening,
+                Err(e) => tracing::debug!(error = %e, "could not update the advertisement"),
+            }
+        }
+        if self
+            .last_candidate_dial
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(15))
+        {
+            self.last_candidate_dial = Some(Instant::now());
+            if self.paired_peer_offline() {
+                let addrs: Vec<SocketAddr> = self
+                    .candidates
+                    .values()
+                    .take(16)
+                    .flat_map(|c| dial_order(&c.addrs))
+                    .collect();
+                for addr in addrs {
+                    self.net.dial_once(addr);
+                }
+            }
+        }
+    }
+
+    /// Machines with a pairing window open: name and the address to join.
+    fn pairing_offers(&self) -> Vec<(String, SocketAddr)> {
+        self.candidates
+            .values()
+            .filter_map(|c| {
+                let name = c.pairing_name.clone()?;
+                let addr = dial_order(&c.addrs).into_iter().next()?;
+                Some((name, addr))
+            })
+            .collect()
+    }
+
     fn peer_label(&self, node: NodeId) -> String {
         self.peers
             .get(&node)
@@ -1053,6 +1176,7 @@ impl Agent {
     }
 
     fn housekeeping(&mut self) {
+        self.discovery_housekeeping();
         let expired: Vec<u32> = self
             .waiters
             .iter()
@@ -1467,6 +1591,12 @@ impl Agent {
                 }
             }
             Request::PairStatus => Response::ok(json!(self.pairing.status())),
+            Request::PairScan => Response::ok(json!(
+                self.pairing_offers()
+                    .into_iter()
+                    .map(|(name, addr)| json!({ "name": name, "addr": addr.to_string() }))
+                    .collect::<Vec<_>>()
+            )),
             Request::PairConfirm { accept } => {
                 match self
                     .pairing

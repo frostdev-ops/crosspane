@@ -3,6 +3,11 @@
 //! - **Source:** capture frames → one encoder thread per node → `Transport::send_media`. A frame
 //!   the transport refuses (`Congested`) is dropped and the next one becomes a key frame, because a
 //!   lost delta would corrupt the receiver's canvas.
+//!   - Hybrid encoding (03 §7.1, WP-2.14): still content goes as lossless tiles; while a large
+//!     part of the window keeps changing the projection switches to H.264 (when this node has an
+//!     encoder and the peer advertised `h264`), and one lossless key frame follows when the motion
+//!     stops, so the destination is bit-exact again. Captures arrive only on damage, so the thread
+//!     also wakes on a timer to send that last key frame when frames simply stop.
 //! - **Destination:** media frames → a decoder thread → the proxy host. Frames are applied in
 //!   `seq` order (streams can complete out of order); a gap that doesn't fill within 300 ms, or a
 //!   frame that fails to apply, asks the source for a key frame through the engine.
@@ -13,8 +18,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crosspane_engine::{Input, ProjectionKey};
+use crosspane_media::codec::{VideoCodecs, VideoDecoder, VideoEncoder};
+use crosspane_media::hybrid::{FramePlan, HybridConfig, HybridScheduler};
 use crosspane_media::tiles::{TileDecoder, TileEncoder};
-use crosspane_media::wire::{FrameHeader, read_header};
+use crosspane_media::wire::{
+    Codec, FrameHeader, MediaError, TILE, read_codec, read_header, read_video, write_video,
+};
 use crosspane_platform::{Frame, StreamId};
 use crosspane_protocol::link::LinkError;
 use crosspane_render::proxy::{HostCommand, HostHandle};
@@ -101,6 +110,8 @@ pub enum SourceCmd {
         stream: StreamId,
         projection: ProjectionId,
         peer: NodeId,
+        /// The peer can decode H.264 (it advertised `h264`).
+        video: bool,
     },
     Frame {
         stream: StreamId,
@@ -119,24 +130,46 @@ struct Encoding {
     peer: NodeId,
     encoder: TileEncoder,
     seq: u64,
+    scheduler: HybridScheduler,
+    /// The peer can decode H.264.
+    peer_video: bool,
+    video: Option<Box<dyn VideoEncoder>>,
+    /// The next video frame must be an IDR (a frame was dropped, or the receiver asked).
+    video_key: bool,
+    /// The last captured frame, for the lossless refresh when frames stop during video.
+    last: Option<Frame>,
+    last_at: Instant,
+}
+
+/// What the encoder thread needs for video.
+#[derive(Clone)]
+pub struct VideoSetup {
+    pub codecs: Option<Arc<dyn VideoCodecs>>,
+    pub bits_per_second: u32,
 }
 
 /// Start the encoder thread; capture sinks and the engine loop send it `SourceCmd`s.
-pub fn start_source(transport: Arc<Transport>) -> Sender<SourceCmd> {
+pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> Sender<SourceCmd> {
     let (tx, rx) = mpsc::channel::<SourceCmd>();
     let spawned = std::thread::Builder::new()
         .name("media-encode".into())
-        .spawn(move || encode_loop(&rx, &transport));
+        .spawn(move || encode_loop(&rx, &transport, &video));
     if let Err(e) = spawned {
         tracing::error!(error = %e, "could not start the media encoder");
     }
     tx
 }
 
-fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport) {
+fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSetup) {
     let mut streams: HashMap<StreamId, Encoding> = HashMap::new();
     let mut out = Vec::new();
-    while let Ok(first) = rx.recv() {
+    let epoch = Instant::now();
+    loop {
+        let first = match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(cmd) => Some(cmd),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
         // Only the newest frame of each stream matters: drain what queued up meanwhile.
         let mut latest: BTreeMap<StreamId, Frame> = BTreeMap::new();
         let mut handle = |cmd: SourceCmd, streams: &mut HashMap<StreamId, Encoding>| match cmd {
@@ -144,6 +177,7 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport) {
                 stream,
                 projection,
                 peer,
+                video: peer_video,
             } => {
                 streams.insert(
                     stream,
@@ -152,6 +186,12 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport) {
                         peer,
                         encoder: TileEncoder::new(),
                         seq: 0,
+                        scheduler: HybridScheduler::new(HybridConfig::default()),
+                        peer_video,
+                        video: None,
+                        video_key: true,
+                        last: None,
+                        last_at: Instant::now(),
                     },
                 );
             }
@@ -165,45 +205,181 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport) {
             SourceCmd::RequestKey { projection } => {
                 for e in streams.values_mut().filter(|e| e.projection == projection) {
                     e.encoder.request_key();
+                    e.video_key = true;
                 }
             }
         };
-        handle(first, &mut streams);
+        if let Some(first) = first {
+            handle(first, &mut streams);
+        }
         while let Ok(cmd) = rx.try_recv() {
             handle(cmd, &mut streams);
         }
+        let now = epoch.elapsed();
         for (stream, frame) in latest {
             let Some(enc) = streams.get_mut(&stream) else {
                 continue;
             };
-            let header = FrameHeader {
-                projection: enc.projection.0,
-                seq: enc.seq + 1,
-                key: false,
-                captured_ns: frame.at.as_nanos(),
-                width: frame.size.width,
-                height: frame.size.height,
-            };
-            out.clear();
-            match enc
-                .encoder
-                .encode(header, &frame.pixels, frame.stride, false, &mut out)
+            encode_frame(enc, &frame, now, video, transport, &mut out);
+            enc.last_at = Instant::now();
+            enc.last = Some(frame);
+        }
+        // Motion stopped during video and no new frame came: plan on the last frame so the
+        // scheduler can leave video with its lossless key frame.
+        for enc in streams.values_mut() {
+            tracing::trace!(
+                in_video = enc.scheduler.in_video(),
+                idle_ms = enc.last_at.elapsed().as_millis() as u64,
+                has_last = enc.last.is_some(),
+                "idle check"
+            );
+            if enc.scheduler.in_video()
+                && enc.last_at.elapsed() >= Duration::from_millis(200)
+                && let Some(frame) = enc.last.clone()
             {
-                Ok(Some(_stats)) => {
-                    enc.seq += 1;
-                    match transport.send_media(enc.peer, Arc::from(out.as_slice())) {
-                        Ok(()) => {}
-                        Err(LinkError::Congested) => {
-                            // Dropped: the receiver will see a gap, and the next frame is a key frame.
-                            enc.encoder.request_key();
-                        }
-                        Err(e) => tracing::debug!(error = ?e, "media send failed"),
-                    }
+                let total = tile_count(&frame);
+                let available = enc.peer_video && video.codecs.is_some();
+                let plan = enc.scheduler.plan(0, total, now, available);
+                tracing::debug!(?plan, "idle plan during video");
+                if plan == FramePlan::TilesKey {
+                    enc.encoder.request_key();
+                    send_tiles(enc, &frame, true, transport, &mut out);
+                    tracing::debug!(seq = enc.seq, "lossless refresh after motion");
                 }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(error = %e, "encode failed"),
             }
         }
+    }
+}
+
+fn tile_count(frame: &Frame) -> u32 {
+    frame.size.width.div_ceil(TILE) * frame.size.height.div_ceil(TILE)
+}
+
+fn header(enc: &Encoding, frame: &Frame) -> FrameHeader {
+    FrameHeader {
+        projection: enc.projection.0,
+        seq: enc.seq + 1,
+        key: false,
+        captured_ns: frame.at.as_nanos(),
+        width: frame.size.width,
+        height: frame.size.height,
+    }
+}
+
+/// One captured frame: tile change detection always runs (it counts the changed tiles and keeps
+/// the tile hashes current), then the scheduler decides what goes out.
+fn encode_frame(
+    enc: &mut Encoding,
+    frame: &Frame,
+    now: Duration,
+    video: &VideoSetup,
+    transport: &Transport,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    let tiles = enc
+        .encoder
+        .encode(header(enc, frame), &frame.pixels, frame.stride, false, out);
+    let changed = match &tiles {
+        Ok(Some(stats)) => stats.tiles,
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "encode failed");
+            return;
+        }
+    };
+    let available = enc.peer_video && video.codecs.is_some();
+    let plan = enc
+        .scheduler
+        .plan(changed, tile_count(frame), now, available);
+    tracing::trace!(changed, total = tile_count(frame), ?plan, "frame plan");
+    match plan {
+        FramePlan::Tiles => {
+            if matches!(tiles, Ok(Some(_))) {
+                send(enc, out, transport);
+            }
+        }
+        FramePlan::TilesKey => {
+            enc.encoder.request_key();
+            send_tiles(enc, frame, true, transport, out);
+        }
+        FramePlan::Video { key } => {
+            if let Err(e) = send_video(enc, frame, key, video, transport, out) {
+                tracing::info!(error = %e, "video failed: lossless tiles for a while");
+                enc.video = None;
+                enc.scheduler.video_failed(now);
+                enc.encoder.request_key();
+                send_tiles(enc, frame, true, transport, out);
+            }
+        }
+    }
+}
+
+/// Re-encode `frame` as tiles (a key frame when the tile encoder has one pending) and send it.
+fn send_tiles(
+    enc: &mut Encoding,
+    frame: &Frame,
+    key: bool,
+    transport: &Transport,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    match enc
+        .encoder
+        .encode(header(enc, frame), &frame.pixels, frame.stride, key, out)
+    {
+        Ok(Some(_)) => send(enc, out, transport),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "encode failed"),
+    }
+}
+
+fn send_video(
+    enc: &mut Encoding,
+    frame: &Frame,
+    key: bool,
+    video: &VideoSetup,
+    transport: &Transport,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    if enc.video.is_none() {
+        let codecs = video.codecs.as_ref().ok_or("no video codecs")?;
+        let encoder = codecs
+            .encoder(frame.size, video.bits_per_second, 60)
+            .map_err(|e| e.to_string())?;
+        tracing::info!(encoder = encoder.name(), "video on");
+        enc.video = Some(encoder);
+        enc.video_key = true;
+    }
+    let encoder = enc.video.as_mut().ok_or("no encoder")?;
+    let mut access_unit = Vec::new();
+    let encoded = encoder
+        .encode(
+            &frame.pixels,
+            frame.stride,
+            frame.size,
+            key || enc.video_key,
+            &mut access_unit,
+        )
+        .map_err(|e| e.to_string())?;
+    enc.video_key = false;
+    let mut header = header(enc, frame);
+    header.key = encoded.key;
+    write_video(header, &access_unit, out).map_err(|e| e.to_string())?;
+    send(enc, out, transport);
+    Ok(())
+}
+
+/// Send one encoded frame; a refused one is dropped and the next of either kind becomes a key.
+fn send(enc: &mut Encoding, frame: &[u8], transport: &Transport) {
+    enc.seq += 1;
+    match transport.send_media(enc.peer, Arc::from(frame)) {
+        Ok(()) => {}
+        Err(LinkError::Congested) => {
+            enc.encoder.request_key();
+            enc.video_key = true;
+        }
+        Err(e) => tracing::debug!(error = ?e, "media send failed"),
     }
 }
 
@@ -222,6 +398,8 @@ pub enum DestCmd {
 
 struct Decoding {
     decoder: TileDecoder,
+    /// Created at the first H.264 frame.
+    video: Option<Box<dyn VideoDecoder>>,
     last: u64,
     pending: BTreeMap<u64, Arc<[u8]>>,
     gap_since: Option<Instant>,
@@ -235,11 +413,12 @@ pub fn start_destination(
     host: Option<HostHandle>,
     ids: ProxyIds,
     engine: Sender<Event>,
+    video: VideoSetup,
 ) -> Sender<DestCmd> {
     let (tx, rx) = mpsc::channel::<DestCmd>();
     let spawned = std::thread::Builder::new()
         .name("media-decode".into())
-        .spawn(move || decode_loop(&rx, host.as_ref(), &ids, &engine));
+        .spawn(move || decode_loop(&rx, host.as_ref(), &ids, &engine, &video));
     if let Err(e) = spawned {
         tracing::error!(error = %e, "could not start the media decoder");
     }
@@ -251,6 +430,7 @@ fn decode_loop(
     host: Option<&HostHandle>,
     ids: &ProxyIds,
     engine: &Sender<Event>,
+    video: &VideoSetup,
 ) {
     let mut decoders: HashMap<ProjectionKey, Decoding> = HashMap::new();
     loop {
@@ -275,6 +455,7 @@ fn decode_loop(
                 let Some(id) = ids.id(key) else { continue };
                 let d = decoders.entry(key).or_insert_with(|| Decoding {
                     decoder: TileDecoder::new(),
+                    video: None,
                     last: 0,
                     pending: BTreeMap::new(),
                     gap_since: None,
@@ -283,14 +464,14 @@ fn decode_loop(
                 if header.key && header.seq > d.last {
                     // A key frame supersedes everything older.
                     d.pending.retain(|seq, _| *seq > header.seq);
-                    apply(d, key, id, &data, header.seq, host, engine, ids);
+                    apply(d, key, id, &data, header.seq, host, engine, ids, video);
                 } else if header.seq > d.last && d.pending.len() < MAX_PENDING {
                     d.pending.insert(header.seq, data);
                 }
                 // Apply whatever is now consecutive.
                 while let Some(data) = d.pending.remove(&(d.last + 1)) {
                     let seq = d.last + 1;
-                    apply(d, key, id, &data, seq, host, engine, ids);
+                    apply(d, key, id, &data, seq, host, engine, ids, video);
                 }
                 d.gap_since = if d.pending.is_empty() {
                     None
@@ -325,17 +506,30 @@ fn apply(
     host: Option<&HostHandle>,
     engine: &Sender<Event>,
     ids: &ProxyIds,
+    video: &VideoSetup,
 ) {
-    match d.decoder.apply(data) {
-        Ok((header, dirty)) => {
+    let result = match read_codec(data) {
+        Ok(Codec::H264) => apply_video(d, data, video),
+        Ok(Codec::Tiles) => {
+            d.decoder
+                .apply(data)
+                .map_err(|e| e.to_string())
+                .map(|(header, dirty)| {
+                    let (pixels, size) = d.decoder.canvas();
+                    (header, Arc::from(pixels), size, dirty)
+                })
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    match result {
+        Ok((header, pixels, size, dirty)) => {
             d.last = seq.max(header.seq);
             ids.shown(key, data.len());
             if let Some(host) = host {
-                let (pixels, size) = d.decoder.canvas();
                 let _ = host.send(HostCommand::Frame {
                     id,
                     size,
-                    pixels: Arc::from(pixels),
+                    pixels,
                     dirty,
                 });
             }
@@ -351,4 +545,55 @@ fn apply(
             }
         }
     }
+}
+
+type Applied = (
+    FrameHeader,
+    Arc<[u8]>,
+    crosspane_types::geom::PixelSize,
+    Vec<crosspane_types::geom::PixelRect>,
+);
+
+/// Decode an H.264 frame and crop the coded image to the frame's real size.
+fn apply_video(d: &mut Decoding, data: &[u8], video: &VideoSetup) -> Result<Applied, String> {
+    use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
+    let (header, access_unit) = read_video(data).map_err(|e: MediaError| e.to_string())?;
+    if d.video.is_none() {
+        let codecs = video
+            .codecs
+            .as_ref()
+            .ok_or("this node can't decode video")?;
+        let decoder = codecs.decoder().map_err(|e| e.to_string())?;
+        tracing::info!(decoder = decoder.name(), "video decoding on");
+        d.video = Some(decoder);
+    }
+    let decoder = d.video.as_mut().ok_or("no decoder")?;
+    let mut coded = Vec::new();
+    let coded_size = decoder
+        .decode(access_unit, &mut coded)
+        .map_err(|e| e.to_string())?;
+    let (w, h) = (header.width, header.height);
+    if coded_size.width < w || coded_size.height < h {
+        return Err("decoded frame smaller than its header".into());
+    }
+    let pixels: Arc<[u8]> = if coded_size.width == w && coded_size.height == h {
+        Arc::from(coded)
+    } else {
+        let src_row = coded_size.width as usize * 4;
+        let row = w as usize * 4;
+        let mut cropped = Vec::with_capacity(row * h as usize);
+        for y in 0..h as usize {
+            cropped.extend_from_slice(&coded[y * src_row..y * src_row + row]);
+        }
+        Arc::from(cropped)
+    };
+    let size = PixelSize::new(w, h);
+    let dirty = vec![PixelRect::new(
+        point2(0, 0),
+        point2(
+            i32::try_from(w).unwrap_or(i32::MAX),
+            i32::try_from(h).unwrap_or(i32::MAX),
+        ),
+    )];
+    Ok((header, pixels, size, dirty))
 }

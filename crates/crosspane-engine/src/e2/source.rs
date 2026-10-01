@@ -12,7 +12,7 @@ use crosspane_protocol::projection::{
     BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjInput, ProjectionEndReason as Reason,
     ProjectionMessage as Message, WindowSummary,
 };
-use crosspane_types::geom::{PixelSize, PointDevice};
+use crosspane_types::geom::{PixelSize, PointDevice, RectLogical};
 use crosspane_types::id::{NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
@@ -39,6 +39,12 @@ pub(super) struct Source {
     stream: Option<StreamId>,
     resizing: bool,
     latest_resize: Option<(PixelSize, f64)>,
+    /// The size the destination last asked for (Accepted or Resize).
+    wanted: Option<PixelSize>,
+    /// The window's frame when the last park or resize finished.
+    parked_frame: Option<RectLogical>,
+    /// When the window last moved by itself and was parked again.
+    last_repark: Option<MonoTime>,
     last_seq: u32,
     parked_scale: f64,
     last_activation: Option<MonoTime>,
@@ -107,6 +113,9 @@ impl E2 {
                 stream: None,
                 resizing: false,
                 latest_resize: None,
+                wanted: None,
+                parked_frame: None,
+                last_repark: None,
                 last_seq: 0,
                 parked_scale: scale,
                 last_activation: None,
@@ -226,6 +235,7 @@ impl E2 {
                 }
                 source.stage = Stage::Parking(now.saturating_add(START_TIMEOUT));
                 source.parked_scale = *scale;
+                source.wanted = Some(*size);
                 out.push(Output::Park {
                     window: source.window,
                     size: *size,
@@ -239,7 +249,16 @@ impl E2 {
                 }));
                 self.end_source(projection, Reason::Failed, true, now, out);
             }
+            Message::Resize { size, scale, .. }
+                if source.stage == Stage::Live
+                    && !source.resizing
+                    && source.wanted == Some(*size)
+                    && source.parked_scale == *scale =>
+            {
+                // Nothing to do: the window is already parked at this size and scale.
+            }
             Message::Resize { size, scale, .. } if sane_size(*size) => {
+                source.wanted = Some(*size);
                 if source.stage != Stage::Live || source.resizing {
                     source.latest_resize = Some((*size, *scale));
                 } else {
@@ -253,8 +272,23 @@ impl E2 {
                 }
             }
             Message::Focus { focused: true, .. } if source.stage == Stage::Live => {
+                let previous = self.focused;
                 if source.activate(now, out) {
+                    if self.focus_before.is_none()
+                        && let Some(previous) = previous
+                        && !self.sources.values().any(|s| s.window == previous)
+                    {
+                        self.focus_before = Some(previous);
+                    }
                     self.focused = None;
+                }
+            }
+            Message::Focus { focused: false, .. } if source.stage == Stage::Live => {
+                if let Some(window) = self.focus_before.take()
+                    && self.windows.contains_key(&window)
+                    && !self.sources.values().any(|s| s.window == window)
+                {
+                    out.push(Output::ActivateWindow { window });
                 }
             }
             Message::KeyFrameRequest { .. } if source.stage == Stage::Live => {
@@ -276,6 +310,7 @@ impl E2 {
             out.push(Output::Restore { window });
             return;
         }
+        let frame = self.windows.get(&window).map(|w| w.frame);
         let Some((&projection, source)) = self.sources.iter_mut().find(|(_, s)| {
             s.window == window && (matches!(s.stage, Stage::Parking(_)) || s.resizing)
         }) else {
@@ -296,6 +331,7 @@ impl E2 {
             return;
         };
         source.parked = Some(parked);
+        source.parked_frame = frame;
         if initial {
             let (target, crop) = match parking {
                 ParkingKind::Twin => (CaptureTarget::Display(parked.display), Some(parked.content)),
@@ -552,7 +588,39 @@ impl E2 {
             .min()
     }
 
-    pub(super) fn window_changed(&self, window: &WindowInfo, out: &mut Vec<Output>) {
+    pub(super) fn window_changed(
+        &mut self,
+        window: &WindowInfo,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        // A parked window that moved or resized by itself (e.g. a bar appeared on, or left, its
+        // twin display and changed the work area) gets parked again at the wanted size, so the
+        // capture crop and the destination's geometry follow it. Compared with its frame when
+        // the last park finished, and at most every REPARK_GAP: parking itself moves the window
+        // for a moment, and that must not start a loop.
+        for source in self.sources.values_mut() {
+            let moved = source
+                .parked_frame
+                .is_some_and(|f| !same_frame(f, window.frame));
+            if source.window == window.id
+                && source.stage == Stage::Live
+                && !source.resizing
+                && moved
+                && source
+                    .last_repark
+                    .is_none_or(|t| now.saturating_duration_since(t) >= REPARK_GAP)
+                && let Some(size) = source.wanted
+            {
+                source.resizing = true;
+                source.last_repark = Some(now);
+                out.push(Output::ResizeParked {
+                    window: source.window,
+                    size,
+                    scale: source.parked_scale,
+                });
+            }
+        }
         if self
             .windows
             .get(&window.id)
@@ -615,6 +683,17 @@ impl Source {
             });
         }
     }
+}
+
+/// The least time between two re-parks of a window that moved by itself.
+const REPARK_GAP: Duration = Duration::from_secs(2);
+
+/// Frames within half a logical pixel are the same (Hyprland reports whole pixels; float noise).
+fn same_frame(a: RectLogical, b: RectLogical) -> bool {
+    (a.origin.x - b.origin.x).abs() < 0.5
+        && (a.origin.y - b.origin.y).abs() < 0.5
+        && (a.size.width - b.size.width).abs() < 0.5
+        && (a.size.height - b.size.height).abs() < 0.5
 }
 
 fn sane_size(size: PixelSize) -> bool {

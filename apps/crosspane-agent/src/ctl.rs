@@ -78,6 +78,8 @@ pub enum Request {
         allow_input: bool,
     },
     PairStatus,
+    /// Machines on the network with a pairing window open.
+    PairScan,
     /// Initiator: the codes match (or not).
     PairConfirm {
         accept: bool,
