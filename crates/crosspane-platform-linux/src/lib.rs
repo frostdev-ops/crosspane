@@ -8,3 +8,5 @@ pub mod logind;
 pub mod permissions;
 pub mod secret_service;
 pub mod tray;
+#[cfg(feature = "ffmpeg")]
+pub mod video;
