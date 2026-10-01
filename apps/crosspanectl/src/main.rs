@@ -102,7 +102,7 @@ enum PairAction {
         #[arg(long)]
         allow_input: bool,
     },
-    /// Join the pairing window of the machine at ADDR (host:port, its normal port).
+    /// Join the pairing window of a machine: its name as `pair scan` shows it, or host:port.
     Join {
         addr: String,
         #[arg(long)]
@@ -110,6 +110,8 @@ enum PairAction {
     },
     /// Show the pairing state (the code, or the candidates to pick from).
     Status,
+    /// List machines on the network with a pairing window open.
+    Scan,
     /// Confirm (yes) or reject (no) the code on the listening machine.
     Confirm { answer: String },
     /// Pick candidate N (1–3) on the joining machine.
@@ -175,13 +177,27 @@ fn main() -> Result<()> {
             }
             PairAction::Join { addr, allow_input } => {
                 use std::net::ToSocketAddrs;
-                let resolved = addr
-                    .to_socket_addrs()
-                    .with_context(|| format!("resolve {addr}"))?
-                    .next()
-                    .context("no address")?;
+                // A name from `pair scan` first, then host:port.
+                let offered = call(&json!({"cmd": "pair_scan"})).ok().and_then(|offers| {
+                    offers.as_array()?.iter().find_map(|o| {
+                        (o["name"].as_str()? == addr.as_str())
+                            .then(|| o["addr"].as_str().map(str::to_owned))
+                            .flatten()
+                    })
+                });
+                let resolved = match offered {
+                    Some(a) => a.parse().context("bad address from discovery")?,
+                    None => addr
+                        .to_socket_addrs()
+                        .with_context(|| {
+                            format!("no machine called {addr} is pairing, and it isn't host:port")
+                        })?
+                        .next()
+                        .context("no address")?,
+                };
                 json!({"cmd": "pair_join", "addr": resolved.to_string(), "allow_input": allow_input})
             }
+            PairAction::Scan => json!({"cmd": "pair_scan"}),
             PairAction::Status => json!({"cmd": "pair_status"}),
             PairAction::Confirm { answer } => {
                 json!({"cmd": "pair_confirm", "accept": matches!(answer.as_str(), "yes" | "y")})
@@ -478,6 +494,21 @@ fn print_result(command: &Command, result: &Value) {
             }
             if let Some(e) = result["error"].as_str() {
                 println!("error: {e}");
+            }
+        }
+        Command::Pair {
+            action: PairAction::Scan,
+        } => {
+            let offers = result.as_array().cloned().unwrap_or_default();
+            if offers.is_empty() {
+                println!("no machine is pairing (open a pairing window there first)");
+            }
+            for o in offers {
+                println!(
+                    "{}  {}",
+                    o["name"].as_str().unwrap_or("?"),
+                    o["addr"].as_str().unwrap_or("?")
+                );
             }
         }
         Command::Windows { .. } => {

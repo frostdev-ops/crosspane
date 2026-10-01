@@ -202,7 +202,7 @@ fn run() -> Result<()> {
         identity,
         port: config.port,
     };
-    let agent = agent::Agent::new(
+    let mut agent = agent::Agent::new(
         node,
         config.name,
         engine,
@@ -212,6 +212,7 @@ fn run() -> Result<()> {
         local_displays,
         e2,
     );
+    agent.start_discovery();
     run_loop(agent, startup, rx, tx, host.map(|(host, _)| host))
 }
 

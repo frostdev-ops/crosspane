@@ -86,6 +86,18 @@ impl Net {
     }
 
     /// Keep `addr` connected: dial now, and again whenever the connection drops.
+    /// One connection attempt to `addr` (a discovered candidate), no retries. Paired peers are
+    /// recognised by their keys in the handshake; anything else simply fails.
+    pub fn dial_once(&self, addr: SocketAddr) {
+        let transport = self.transport.clone();
+        self.runtime.spawn(async move {
+            match transport.connect(addr).await {
+                Ok(node) => tracing::debug!(%addr, peer = %node.short(), "connected (discovered)"),
+                Err(e) => tracing::trace!(%addr, error = %e, "discovered candidate not reachable"),
+            }
+        });
+    }
+
     pub fn dial(&self, addr: SocketAddr) {
         let Ok(mut dialing) = self.dialing.lock() else {
             return;
