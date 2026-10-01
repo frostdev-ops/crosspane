@@ -550,6 +550,13 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 reason,
             })
         }
+        // WP-2.13 puts these on the wire.
+        ProjectionMessage::ListWindows { .. }
+        | ProjectionMessage::WindowList { .. }
+        | ProjectionMessage::Pull { .. }
+        | ProjectionMessage::BrowseRefused { .. } => {
+            return Err(WireError::BadValue("window browsing is not encodable yet"));
+        }
     };
     Ok(pb::Projection { body: Some(body) })
 }

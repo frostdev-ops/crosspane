@@ -10,6 +10,7 @@ pub mod arrange;
 pub mod journal;
 pub mod layout;
 pub mod lease;
+pub mod remap;
 pub mod router;
 
 pub use crosspane_platform::{Edge, MotionKind, PortalId};

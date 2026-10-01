@@ -12,7 +12,7 @@ use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{
     Capability, ControlMessage, InputMessage, Placement, PointerMessage, Refusal,
 };
-use crosspane_protocol::projection::{ParkingKind, ProjectionEndReason};
+use crosspane_protocol::projection::{BrowsableWindow, ParkingKind, ProjectionEndReason};
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{PixelRect, PixelSize, PointDevice};
 use crosspane_types::hid::{HidUsage, MouseButton};
@@ -77,6 +77,16 @@ pub enum Command {
     Project { window: WindowId, to: NodeId },
     /// E2: end a projection (either role) and return the window to its source.
     Return(ProjectionKey),
+    /// E2 (WP-2.13): ask `peer` for the windows this node may pull. The answer comes back as
+    /// `Output::BrowseResult` with the same `request` (the caller's correlation number).
+    Browse { peer: NodeId, request: u32 },
+    /// E2 (WP-2.13): ask `peer` to project its `window` here. Success shows up as a normal
+    /// projection; a refusal as `Output::BrowseResult { result: Err(..) }` with this `request`.
+    Pull {
+        peer: NodeId,
+        window: WindowId,
+        request: u32,
+    },
 }
 
 /// Names one projection anywhere in the workspace: projection ids are unique per source node.
@@ -294,6 +304,13 @@ pub enum Output {
     },
     CloseProxy {
         key: ProjectionKey,
+    },
+    /// E2 (WP-2.13): `peer`'s answer to `Command::Browse` or `Command::Pull` number `request`. A
+    /// pull that succeeds has no result here (its projection starts instead).
+    BrowseResult {
+        peer: NodeId,
+        request: u32,
+        result: Result<Vec<BrowsableWindow>, Refusal>,
     },
 }
 

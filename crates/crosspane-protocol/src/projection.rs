@@ -11,7 +11,7 @@
 
 use crosspane_types::geom::{PixelSize, PointDevice};
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::ProjectionId;
+use crosspane_types::id::{ProjectionId, WindowId};
 use crosspane_types::input::ScrollDelta;
 
 use crate::msg::Refusal;
@@ -23,6 +23,20 @@ pub struct WindowSummary {
     /// Hyprland window class or macOS bundle identifier.
     pub app_id: String,
 }
+
+/// One window a source lets a peer pull (`Capability::WindowBrowse`, WP-2.13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowsableWindow {
+    /// The source's id for the window, opaque to the destination: it only sends it back in `Pull`.
+    pub window: WindowId,
+    pub summary: WindowSummary,
+    /// The window's content size in the source's device pixels.
+    pub size: PixelSize,
+}
+
+/// At most this many windows in one `WindowList`; a source with more sends the first ones in its
+/// own order.
+pub const MAX_BROWSE_WINDOWS: usize = 256;
 
 /// How the source keeps the real window while it is projected (03 §4.3), reported to the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -113,6 +127,20 @@ pub enum ProjectionMessage {
         projection: ProjectionId,
         reason: ProjectionEndReason,
     },
+    /// Destination → source: list the windows this node may pull. Needs `WindowBrowse` granted by
+    /// the source. `request` is the requester's, echoed in the answer.
+    ListWindows { request: u32 },
+    /// Source → destination: the answer to `ListWindows` (at most [`MAX_BROWSE_WINDOWS`]).
+    WindowList {
+        request: u32,
+        windows: Vec<BrowsableWindow>,
+    },
+    /// Destination → source: project `window` to me. Needs `WindowBrowse`. The source answers
+    /// with a normal `Start` (the projection then runs as if the source's user had started it),
+    /// or with `BrowseRefused`.
+    Pull { request: u32, window: WindowId },
+    /// Source → destination: `ListWindows` or `Pull` number `request` refused.
+    BrowseRefused { request: u32, reason: Refusal },
 }
 
 /// Destination → source input for a projected window, on the input stream. `seq` increases per

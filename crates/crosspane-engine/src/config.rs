@@ -1,9 +1,11 @@
 //! Engine configuration.
 
 use core::time::Duration;
+use std::collections::BTreeMap;
 
 use crosspane_input::accel::AccelProfile;
 use crosspane_input::layout::LayoutOptions;
+use crosspane_input::remap::RemapProfile;
 use crosspane_platform::Chord;
 use crosspane_types::hid::HidUsage;
 use crosspane_types::id::NodeId;
@@ -22,6 +24,8 @@ pub struct EngineConfig {
     pub accel: AccelProfile,
     /// Injection pauses this long after the last local physical input on a target (04 §6).
     pub local_override_pause: Duration,
+    /// Modifier remap profile per target (WP-1.31); targets not listed get `RemapProfile::None`.
+    pub remap: BTreeMap<NodeId, RemapProfile>,
 }
 
 impl EngineConfig {
@@ -42,6 +46,7 @@ impl EngineConfig {
             layout: LayoutOptions::default(),
             accel: AccelProfile::default(),
             local_override_pause: Duration::from_secs(1),
+            remap: BTreeMap::new(),
         }
     }
 }
