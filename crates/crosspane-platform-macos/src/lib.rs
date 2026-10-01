@@ -18,4 +18,5 @@ pub mod permissions;
 pub mod private_vdisplay;
 pub mod session;
 pub mod tray;
+pub mod video;
 pub mod windows;
