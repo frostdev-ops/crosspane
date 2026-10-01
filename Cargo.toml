@@ -66,7 +66,10 @@ objc2-app-kit = "0.3.2"
 objc2-application-services = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
 objc2-foundation = "0.3.2"
+objc2-screen-capture-kit = "0.3.2"
 security-framework = "3.7.0"
 
 [workspace.lints.rust]
