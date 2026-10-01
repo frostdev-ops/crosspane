@@ -2,7 +2,10 @@
 
 use libfuzzer_sys::fuzz_target;
 
-// Written in WP-1.1 (input_stream, pointer_datagram) and WP-1.2 (control_stream).
+use crosspane_protocol::wire::{decode_pointer, encode_pointer};
+
 fuzz_target!(|data: &[u8]| {
-    let _ = data;
+    if let Ok(msg) = decode_pointer(data) {
+        assert_eq!(encode_pointer(&msg).unwrap(), data);
+    }
 });
