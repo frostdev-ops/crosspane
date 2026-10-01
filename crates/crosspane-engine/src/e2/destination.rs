@@ -36,6 +36,9 @@ pub(super) struct Destination {
     resize: Option<(PixelSize, f64)>,
     resize_due: Option<MonoTime>,
     last_resize: Option<MonoTime>,
+    /// The size and scale last sent to the source (Accepted or Resize): a proxy that reports
+    /// the same size again is not a resize (window systems repeat configures).
+    last_sent: Option<(PixelSize, f64)>,
     last_heartbeat: MonoTime,
     heartbeat_due: Option<MonoTime>,
     last_keyframe: Option<MonoTime>,
@@ -219,6 +222,7 @@ impl E2 {
                     resize: None,
                     resize_due: None,
                     last_resize: None,
+                    last_sent: None,
                     last_heartbeat: now,
                     heartbeat_due: None,
                     last_keyframe: None,
@@ -272,6 +276,7 @@ impl E2 {
             Ok((size, scale)) => {
                 destination.open = true;
                 destination.open_due = None;
+                destination.last_sent = Some((size, scale));
                 destination.last_heartbeat = now;
                 destination.heartbeat_due = now.checked_add(HEARTBEAT_IDLE);
                 send(
@@ -330,6 +335,13 @@ impl E2 {
         };
         let mut sent = true;
         match event {
+            ProxyEvent::Resized { size, scale }
+                if destination.last_sent == Some((*size, *scale)) =>
+            {
+                // The same size again; drop any coalesced resize that would undo it.
+                destination.resize = None;
+                destination.resize_due = None;
+            }
             ProxyEvent::Resized { size, scale } => {
                 if destination
                     .last_resize
@@ -338,6 +350,7 @@ impl E2 {
                     destination.resize = None;
                     destination.resize_due = None;
                     destination.last_resize = Some(now);
+                    destination.last_sent = Some((*size, *scale));
                     send(
                         key.source,
                         Message::Resize {
@@ -549,8 +562,11 @@ impl E2 {
                 .is_some_and(|deadline| deadline <= now)
             {
                 destination.resize_due = None;
-                if let Some((size, scale)) = destination.resize.take() {
+                if let Some((size, scale)) = destination.resize.take()
+                    && destination.last_sent != Some((size, scale))
+                {
                     destination.last_resize = Some(now);
+                    destination.last_sent = Some((size, scale));
                     send(
                         key.source,
                         Message::Resize {

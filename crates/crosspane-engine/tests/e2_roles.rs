@@ -2912,3 +2912,46 @@ proptest! {
     }
 
 }
+
+#[test]
+fn a_parked_window_that_moves_by_itself_is_parked_again_at_the_wanted_size() {
+    let mut f = startup(3);
+    let mut moved = window(WINDOW);
+    // A bar appeared on the twin display: the work area, and the window with it, moved down.
+    moved.frame = RectLogical::new(
+        PointLogical::new(0.0, 26.0),
+        SizeLogical::new(320.25, 214.25),
+    );
+    let out = f.handle(Input::Windows(WindowEvent::Changed(moved.clone())), 80);
+    assert_eq!(
+        out,
+        vec![Output::ResizeParked {
+            window: WINDOW,
+            size: size(),
+            scale: 2.0,
+        }]
+    );
+    // While that resize runs, further moves wait for its result.
+    moved.frame = RectLogical::new(
+        PointLogical::new(0.0, 0.0),
+        SizeLogical::new(320.25, 240.25),
+    );
+    assert!(
+        f.handle(Input::Windows(WindowEvent::Changed(moved.clone())), 90)
+            .is_empty()
+    );
+    f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Ok(parked(WINDOW, PlatformParking::Twin, size())),
+        },
+        100,
+    );
+    // The same frame again (a title change, say) is not a move.
+    moved.title = "renamed".into();
+    let out = f.handle(Input::Windows(WindowEvent::Changed(moved)), 110);
+    assert!(
+        !out.iter().any(|o| matches!(o, Output::ResizeParked { .. })),
+        "{out:?}"
+    );
+}

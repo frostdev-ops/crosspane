@@ -4,7 +4,7 @@
 //! Commands on stdin, one per line:
 //!   abs X Y        absolute pointer position on the first output (pixels)
 //!   rel DX DY      relative pointer motion
-//!   btn down|up    left button
+//!   btn [left|right|middle] down|up    a pointer button (left by default)
 //!   key CODE down|up   evdev key code
 //!   sleep MS
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -130,13 +130,18 @@ mod imp {
                     pointer.motion(now_ms(), dx.parse().unwrap(), dy.parse().unwrap());
                     pointer.frame();
                 }
-                ["btn", s] => {
+                ["btn", s] | ["btn", "left", s] | ["btn", "right", s] | ["btn", "middle", s] => {
                     let state = if *s == "down" {
                         wl_pointer::ButtonState::Pressed
                     } else {
                         wl_pointer::ButtonState::Released
                     };
-                    pointer.button(now_ms(), 0x110, state);
+                    let code = match parts.get(1).copied() {
+                        Some("right") => 0x111,
+                        Some("middle") => 0x112,
+                        _ => 0x110,
+                    };
+                    pointer.button(now_ms(), code, state);
                     pointer.frame();
                 }
                 ["key", code, s] => {

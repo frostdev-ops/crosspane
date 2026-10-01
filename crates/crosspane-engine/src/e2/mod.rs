@@ -135,7 +135,7 @@ impl E2 {
             }
             Input::Windows(event) => match event {
                 WindowEvent::Added(window) | WindowEvent::Changed(window) => {
-                    self.window_changed(window, out);
+                    self.window_changed(window, now, out);
                     self.windows.insert(window.id, window.clone());
                 }
                 WindowEvent::Removed(window) => {

@@ -227,15 +227,24 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
         // Motion stopped during video and no new frame came: plan on the last frame so the
         // scheduler can leave video with its lossless key frame.
         for enc in streams.values_mut() {
+            tracing::trace!(
+                in_video = enc.scheduler.in_video(),
+                idle_ms = enc.last_at.elapsed().as_millis() as u64,
+                has_last = enc.last.is_some(),
+                "idle check"
+            );
             if enc.scheduler.in_video()
                 && enc.last_at.elapsed() >= Duration::from_millis(200)
                 && let Some(frame) = enc.last.clone()
             {
                 let total = tile_count(&frame);
                 let available = enc.peer_video && video.codecs.is_some();
-                if enc.scheduler.plan(0, total, now, available) == FramePlan::TilesKey {
+                let plan = enc.scheduler.plan(0, total, now, available);
+                tracing::debug!(?plan, "idle plan during video");
+                if plan == FramePlan::TilesKey {
                     enc.encoder.request_key();
                     send_tiles(enc, &frame, true, transport, &mut out);
+                    tracing::debug!(seq = enc.seq, "lossless refresh after motion");
                 }
             }
         }
@@ -280,10 +289,11 @@ fn encode_frame(
         }
     };
     let available = enc.peer_video && video.codecs.is_some();
-    match enc
+    let plan = enc
         .scheduler
-        .plan(changed, tile_count(frame), now, available)
-    {
+        .plan(changed, tile_count(frame), now, available);
+    tracing::trace!(changed, total = tile_count(frame), ?plan, "frame plan");
+    match plan {
         FramePlan::Tiles => {
             if matches!(tiles, Ok(Some(_))) {
                 send(enc, out, transport);
