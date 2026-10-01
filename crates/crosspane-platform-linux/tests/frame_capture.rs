@@ -9,12 +9,13 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{
-    CaptureTarget, Frame, FrameCapture, FrameEvent, IoGate, PlatformError, StreamEndReason,
-    StreamId,
+    CaptureTarget, Frame, FrameCapture, FrameEvent, IoGate, PlatformError, PointerInjector,
+    StreamEndReason, StreamId,
 };
 use crosspane_platform_linux::hyprland::frame_capture::HyprlandFrameCapture;
+use crosspane_platform_linux::hyprland::inject::connect;
 use crosspane_platform_linux::hyprland::ipc::HyprIpc;
-use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
+use crosspane_types::geom::{PixelRect, PixelSize, PointDevice, euclid::point2};
 use crosspane_types::id::{DisplayId, WindowId};
 
 fn nested_script() -> PathBuf {
@@ -254,6 +255,7 @@ fn frame_matching(
                 return frame;
             }
             FrameEvent::Frame { .. } => (),
+            FrameEvent::Cursor { .. } | FrameEvent::CursorDefault { .. } => (),
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -267,6 +269,7 @@ fn ended(events: &mpsc::Receiver<FrameEvent>, stream: StreamId, reason: StreamEn
             .unwrap()
         {
             FrameEvent::Frame { .. } => (),
+            FrameEvent::Cursor { .. } | FrameEvent::CursorDefault { .. } => (),
             FrameEvent::Ended {
                 stream: id,
                 reason: why,
@@ -378,6 +381,8 @@ fn pixels_damage_crop_gate_and_stop() {
                 blocked.push(stream);
             }
             FrameEvent::Frame { .. } if blocked.is_empty() => (),
+            FrameEvent::Cursor { .. } if blocked.is_empty() => (),
+            FrameEvent::CursorDefault { .. } if blocked.is_empty() => (),
             other => panic!("frame after gate shutdown: {other:?}"),
         }
     }
@@ -506,6 +511,7 @@ fn continuously_animating_window_at_60_fps() {
         events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
     {
         match event {
+            FrameEvent::Cursor { .. } | FrameEvent::CursorDefault { .. } => (),
             FrameEvent::Frame { stream: id, frame } => {
                 assert_eq!(id, stream);
                 if at >= start {
@@ -542,4 +548,87 @@ fn continuously_animating_window_at_60_fps() {
         start.elapsed().as_secs_f64()
     );
     capture.stop(stream).unwrap();
+}
+
+#[test]
+fn cursor_image_and_stop() {
+    let Some(ipc) = dedicated("cursor_image_and_stop") else {
+        return;
+    };
+    let display = DisplayId(ipc.monitor_ids().unwrap().remove(0).1);
+    let gate = open_gate();
+    // Ensure the nest has a pointer device before the capture worker binds its seat.
+    let (_keys, mut pointer) = connect(gate.clone(), ipc.clone()).unwrap();
+    let mut capture = HyprlandFrameCapture::new(gate, ipc.clone()).unwrap();
+    let (send, events) = mpsc::channel();
+    let stream = capture
+        .start(
+            CaptureTarget::Display(display),
+            None,
+            60,
+            Arc::new(move |event| {
+                let _ = send.send(event);
+            }),
+        )
+        .unwrap();
+    // Preserve the first cursor event queued during start: an unchanged cursor may never
+    // produce a second frame. Obtain dimensions without consuming capture events.
+    let monitors = ipc.json("monitors").unwrap();
+    let monitor = monitors
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|monitor| monitor["id"].as_u64() == Some(u64::from(display.0)))
+        .unwrap();
+    let width = monitor["width"].as_f64().unwrap();
+    let height = monitor["height"].as_f64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    pointer
+        .move_to(display, PointDevice::new(width / 2.0, height / 2.0))
+        .unwrap();
+    let image = loop {
+        match events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap()
+        {
+            FrameEvent::Cursor {
+                stream: id,
+                cursor: Some(image),
+            } => {
+                assert_eq!(id, stream);
+                break Some(image);
+            }
+            FrameEvent::CursorDefault { stream: id } => {
+                assert_eq!(id, stream);
+                break None;
+            }
+            FrameEvent::Frame { .. } => (),
+            other => panic!("unexpected cursor capture event: {other:?}"),
+        }
+    };
+    if let Some(image) = image {
+        assert!(image.size.width > 0 && image.size.width <= 256);
+        assert!(image.size.height > 0 && image.size.height <= 256);
+        assert_eq!(
+            image.pixels.len(),
+            image.size.width as usize * image.size.height as usize * 4
+        );
+        assert!(image.hotspot.0 < image.size.width && image.hotspot.1 < image.size.height);
+        assert!(
+            image
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] == 255)
+        );
+    }
+
+    capture.stop(stream).unwrap();
+    // Drain events already delivered before stop; Ended is the stream's terminal barrier.
+    ended(&events, stream, StreamEndReason::Requested);
+    pointer
+        .move_to(display, PointDevice::new(width / 4.0, height / 4.0))
+        .unwrap();
+    assert!(events.recv_timeout(Duration::from_millis(250)).is_err());
 }

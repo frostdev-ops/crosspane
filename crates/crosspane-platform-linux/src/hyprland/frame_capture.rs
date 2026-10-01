@@ -1,4 +1,14 @@
 //! CPU output capture through ext-image-copy-capture-v1. Native objects belong to one thread.
+//!
+//! Hyprland 0.56.2 cannot capture compositor-drawn themed or cursor-shape-v1 cursors. In
+//! `src/managers/screenshare/CursorshareSession.cpp`, `render()` clears the cursor frame:
+//! ```text
+//! } else if (!cursorImage.pBuffer || !cursorImage.surface || !cursorImage.bufferTex) {
+//!     // render clear when cursor is probably hidden
+//! ```
+//! Only client-surface cursors provide pixels. Themed cursors have no client surface and produce
+//! transparent frames, indistinguishable from a truly hidden cursor. While entered, those frames
+//! report `FrameEvent::CursorDefault`; this backend never reports a hidden cursor.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,7 +22,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{
-    CaptureTarget, EventSink, Frame, FrameCapture, FrameEvent, IoGate, PlatformError,
+    CaptureTarget, CursorImage, EventSink, Frame, FrameCapture, FrameEvent, IoGate, PlatformError,
     StreamEndReason, StreamId,
 };
 use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
@@ -20,7 +30,7 @@ use crosspane_types::id::DisplayId;
 use crosspane_types::time::MonoTime;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_output, wl_registry, wl_shm, wl_shm_pool,
+    wl_buffer, wl_callback, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::ext::image_capture_source::v1::client::{
@@ -28,6 +38,9 @@ use wayland_protocols::ext::image_capture_source::v1::client::{
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
 };
 use wayland_protocols::ext::image_copy_capture::v1::client::{
+    ext_image_copy_capture_cursor_session_v1::{
+        self as cursor_protocol, ExtImageCopyCaptureCursorSessionV1,
+    },
     ext_image_copy_capture_frame_v1::{self as frame_protocol, ExtImageCopyCaptureFrameV1},
     ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
     ext_image_copy_capture_session_v1::{self as session_protocol, ExtImageCopyCaptureSessionV1},
@@ -39,6 +52,7 @@ use super::ipc::HyprIpc;
 // indefinitely waiting for source damage: IoGate has no notification API.
 const CALL_TIMEOUT: Duration = Duration::from_millis(1800);
 const GATE_POLL: Duration = Duration::from_millis(10);
+const CURSOR_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_u64.div_ceil(30));
 
 /// Bounded command handle for all output capture streams on one Wayland connection.
 #[derive(Debug)]
@@ -261,6 +275,7 @@ struct Buffer {
     proxy: wl_buffer::WlBuffer,
     size: PixelSize,
     stride: u32,
+    format: wl_shm::Format,
 }
 
 impl Buffer {
@@ -269,10 +284,18 @@ impl Buffer {
         qh: &QueueHandle<State>,
         constraints: &Constraints,
     ) -> Result<Self, PlatformError> {
+        Self::with_format(shm, qh, constraints, choose_format(&constraints.formats)?)
+    }
+
+    fn with_format(
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<State>,
+        constraints: &Constraints,
+        format: wl_shm::Format,
+    ) -> Result<Self, PlatformError> {
         let size = constraints
             .size
             .ok_or_else(|| backend("missing buffer size"))?;
-        let format = choose_format(&constraints.formats)?;
         let stride = size
             .width
             .checked_mul(4)
@@ -303,6 +326,7 @@ impl Buffer {
             proxy,
             size,
             stride,
+            format,
         })
     }
 
@@ -429,6 +453,230 @@ struct Capture {
     constraints_revision: u64,
 }
 
+#[derive(Clone, Copy)]
+struct CursorData(StreamId);
+
+struct CursorFrame {
+    proxy: ExtImageCopyCaptureFrameV1,
+    // A hotspot received after ready belongs to the next image, not this one.
+    ready_hotspot: Option<(i32, i32)>,
+}
+
+#[derive(Default)]
+struct CursorHistory {
+    // The outer None means this stream has never reported a cursor; the inner None is default.
+    last: Option<Option<CursorImage>>,
+}
+
+impl CursorHistory {
+    fn changed(&mut self, image: &Option<CursorImage>) -> bool {
+        if self.last.as_ref() == Some(image) {
+            return false;
+        }
+        self.last = Some(image.clone());
+        true
+    }
+}
+
+fn cursor_event(stream: StreamId, cursor: Option<CursorImage>) -> FrameEvent {
+    match cursor {
+        Some(image) => FrameEvent::Cursor {
+            stream,
+            cursor: Some(image),
+        },
+        None => FrameEvent::CursorDefault { stream },
+    }
+}
+
+struct CursorCapture {
+    proxy: ExtImageCopyCaptureCursorSessionV1,
+    session: ExtImageCopyCaptureSessionV1,
+    entered: bool,
+    hotspot: (i32, i32),
+    incoming: Constraints,
+    constraints: Option<Constraints>,
+    constraints_pending: bool,
+    reallocate: bool,
+    buffer: Option<Buffer>,
+    frame: Option<CursorFrame>,
+    next_slot: Instant,
+    history: CursorHistory,
+}
+
+impl CursorCapture {
+    fn new(
+        manager: &ExtImageCopyCaptureManagerV1,
+        source: &ExtImageCaptureSourceV1,
+        pointer: &wl_pointer::WlPointer,
+        qh: &QueueHandle<State>,
+        id: StreamId,
+    ) -> Self {
+        let proxy = manager.create_pointer_cursor_session(source, pointer, qh, CursorData(id));
+        // Exactly one base capture session for this cursor session's entire lifetime.
+        let session = proxy.get_capture_session(qh, CursorData(id));
+        Self {
+            proxy,
+            session,
+            entered: false,
+            hotspot: (0, 0),
+            incoming: Constraints::default(),
+            constraints: None,
+            constraints_pending: true,
+            reallocate: false,
+            buffer: None,
+            frame: None,
+            next_slot: Instant::now(),
+            history: CursorHistory::default(),
+        }
+    }
+
+    fn cancel_frame(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            frame.proxy.destroy();
+        }
+    }
+
+    fn destroy(mut self) {
+        self.cancel_frame();
+        self.session.destroy();
+        self.proxy.destroy();
+        self.buffer.take();
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        (self.entered
+            && self.frame.is_none()
+            && self.constraints.is_some()
+            && !self.constraints_pending)
+            .then_some(self.next_slot)
+    }
+
+    fn advance(
+        &mut self,
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<State>,
+        id: StreamId,
+        gate: &IoGate,
+    ) -> Result<Option<Option<CursorImage>>, PlatformError> {
+        let mut changed = None;
+        if let Some(hotspot) = self.frame.as_ref().and_then(|frame| frame.ready_hotspot) {
+            self.cancel_frame();
+            self.next_slot = Instant::now() + CURSOR_INTERVAL;
+            if self.entered && !self.constraints_pending {
+                let buffer = self
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| backend("missing cursor buffer"))?;
+                let (size, pixels) = buffer.copy(None)?;
+                let image = cursor_image(size, hotspot, &pixels, buffer.format)?;
+                if self.history.changed(&image) {
+                    changed = Some(image);
+                }
+            }
+        }
+        if self.frame.is_some()
+            || !self.entered
+            || self.constraints_pending
+            || Instant::now() < self.next_slot
+        {
+            return Ok(changed);
+        }
+        if self.reallocate {
+            let constraints = self
+                .constraints
+                .as_ref()
+                .ok_or_else(|| backend("missing cursor constraints"))?;
+            // Preserve alpha if the compositor offers both formats. XRGB's unused byte is
+            // explicitly made opaque during conversion; it is not an alpha channel.
+            let format = [wl_shm::Format::Argb8888, wl_shm::Format::Xrgb8888]
+                .into_iter()
+                .find(|format| constraints.formats.contains(format))
+                .ok_or(PlatformError::Unsupported(
+                    "BGRA-compatible cursor SHM required",
+                ))?;
+            self.buffer = Some(Buffer::with_format(shm, qh, constraints, format)?);
+            self.reallocate = false;
+        }
+        if !gate.is_open() {
+            return Ok(None);
+        }
+        if let Some(buffer) = &self.buffer {
+            let proxy = self.session.create_frame(qh, CursorData(id));
+            proxy.attach_buffer(&buffer.proxy);
+            proxy.damage_buffer(0, 0, buffer.size.width as i32, buffer.size.height as i32);
+            proxy.capture();
+            self.frame = Some(CursorFrame {
+                proxy,
+                ready_hotspot: None,
+            });
+            self.next_slot = Instant::now() + CURSOR_INTERVAL;
+        }
+        Ok(changed)
+    }
+}
+
+fn cursor_image(
+    size: PixelSize,
+    hotspot: (i32, i32),
+    pixels: &[u8],
+    format: wl_shm::Format,
+) -> Result<Option<CursorImage>, PlatformError> {
+    (size.width as usize)
+        .checked_mul(size.height as usize)
+        .and_then(|length| length.checked_mul(4))
+        .filter(|length| *length > 0 && *length == pixels.len())
+        .ok_or_else(|| backend("invalid cursor pixels"))?;
+    let has_alpha = format == wl_shm::Format::Argb8888;
+    if has_alpha && pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0) {
+        // Transparency cannot distinguish a hidden cursor from a compositor-drawn cursor.
+        return Ok(None);
+    }
+    let longest = size.width.max(size.height);
+    let scaled = if longest > 256 {
+        PixelSize::new(
+            (u64::from(size.width) * 256 / u64::from(longest)).max(1) as u32,
+            (u64::from(size.height) * 256 / u64::from(longest)).max(1) as u32,
+        )
+    } else {
+        size
+    };
+    let mut straight = Vec::new();
+    straight
+        .try_reserve_exact(scaled.width as usize * scaled.height as usize * 4)
+        .map_err(backend)?;
+    for y in 0..scaled.height {
+        let source_y = u64::from(y) * u64::from(size.height) / u64::from(scaled.height);
+        for x in 0..scaled.width {
+            let source_x = u64::from(x) * u64::from(size.width) / u64::from(scaled.width);
+            let offset = (source_y * u64::from(size.width) + source_x) as usize * 4;
+            let pixel = &pixels[offset..offset + 4];
+            let alpha = if has_alpha { pixel[3] } else { 255 };
+            if alpha == 0 {
+                straight.extend_from_slice(&[0; 4]);
+            } else {
+                for &channel in &pixel[..3] {
+                    let channel =
+                        (u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha);
+                    straight.push(channel.min(255) as u8);
+                }
+                straight.push(alpha);
+            }
+        }
+    }
+    let scale_hotspot = |coordinate: i32, original: u32, scaled: u32| {
+        let clamped = (coordinate.max(0) as u32).min(original - 1);
+        (u64::from(clamped) * u64::from(scaled) / u64::from(original)) as u32
+    };
+    Ok(Some(CursorImage {
+        size: scaled,
+        hotspot: (
+            scale_hotspot(hotspot.0, size.width, scaled.width),
+            scale_hotspot(hotspot.1, size.height, scaled.height),
+        ),
+        pixels: straight.into(),
+    }))
+}
+
 struct Stream {
     output: u32,
     source: ExtImageCaptureSourceV1,
@@ -448,6 +696,8 @@ struct Stream {
     /// Consecutive `failed` frames with an unspecific reason (Hyprland reports those across output
     /// mode changes); the stream ends only after several in a row.
     unknown_failures: u32,
+    cursor_started: bool,
+    cursor: Option<CursorCapture>,
 }
 
 /// Consecutive unspecific frame failures before a stream ends with `Failed`.
@@ -455,6 +705,9 @@ const MAX_UNKNOWN_FAILURES: u32 = 5;
 
 impl Stream {
     fn destroy(mut self) {
+        if let Some(cursor) = self.cursor.take() {
+            cursor.destroy();
+        }
         if let Some(capture) = self.capture.take() {
             capture.proxy.destroy();
         }
@@ -474,12 +727,36 @@ struct State {
     manager: Option<ExtImageCopyCaptureManagerV1>,
     sources: Option<ExtOutputImageCaptureSourceManagerV1>,
     shm: Option<wl_shm::WlShm>,
+    seat: Option<wl_seat::WlSeat>,
+    seat_name: Option<u32>,
+    pointer: Option<wl_pointer::WlPointer>,
     outputs: HashMap<u32, Output>,
     streams: HashMap<StreamId, Stream>,
     synced: bool,
 }
 
 impl State {
+    fn stop_cursor(&mut self, id: StreamId, error: impl std::fmt::Display) {
+        if let Some(stream) = self.streams.get_mut(&id)
+            && let Some(cursor) = stream.cursor.take()
+        {
+            tracing::debug!(stream = id.0, %error, "cursor reporting stopped");
+            cursor.destroy();
+        }
+    }
+
+    fn release_pointer(&mut self) {
+        let ids: Vec<_> = self.streams.keys().copied().collect();
+        for id in ids {
+            self.stop_cursor(id, "seat pointer unavailable");
+        }
+        if let Some(pointer) = self.pointer.take()
+            && wayland_client::Proxy::version(&pointer) >= 3
+        {
+            pointer.release();
+        }
+    }
+
     fn end(&mut self, id: StreamId, reason: StreamEndReason) {
         if let Some(mut stream) = self.streams.remove(&id) {
             let reason = if self.gate.is_open() {
@@ -571,6 +848,9 @@ impl Worker {
                 manager: None,
                 sources: None,
                 shm: None,
+                seat: None,
+                seat_name: None,
+                pointer: None,
                 outputs: HashMap::new(),
                 streams: HashMap::new(),
                 synced: false,
@@ -619,13 +899,24 @@ impl Worker {
                 if let Err(error) = self.advance(id) {
                     self.state.start_failed(id, error);
                 }
+                self.state.check_gate();
+                if let Err(error) = self.advance_cursor(id) {
+                    self.state.stop_cursor(id, error);
+                }
             }
             let deadline = self
                 .state
                 .streams
                 .values()
-                .filter(|stream| stream.capture.is_none() && stream.constraints.is_some())
-                .map(|stream| stream.next_slot)
+                .flat_map(|stream| {
+                    [
+                        (stream.capture.is_none() && stream.constraints.is_some())
+                            .then_some(stream.next_slot),
+                        stream.cursor.as_ref().and_then(CursorCapture::deadline),
+                    ]
+                    .into_iter()
+                    .flatten()
+                })
                 .min()
                 .unwrap_or_else(|| Instant::now() + GATE_POLL)
                 .min(Instant::now() + GATE_POLL);
@@ -736,8 +1027,56 @@ impl Worker {
                 full_damage: true,
                 unknown_failures: 0,
                 constraints_revision: 0,
+                cursor_started: false,
+                cursor: None,
             },
         );
+        Ok(())
+    }
+
+    fn advance_cursor(&mut self, id: StreamId) -> Result<(), PlatformError> {
+        let Some(stream) = self.state.streams.get_mut(&id) else {
+            return Ok(());
+        };
+        // The output's constraints and first buffer must be ready before adding its cursor
+        // session. An unavailable cursor path is attempted only once per stream.
+        if stream.pending.is_some() {
+            return Ok(());
+        }
+        if !stream.cursor_started {
+            stream.cursor_started = true;
+            match (&self.state.manager, &self.state.pointer) {
+                (Some(manager), Some(pointer)) => {
+                    stream.cursor = Some(CursorCapture::new(
+                        manager,
+                        &stream.source,
+                        pointer,
+                        &self.qh,
+                        id,
+                    ));
+                }
+                _ => tracing::debug!(
+                    stream = id.0,
+                    "cursor capture manager or seat pointer unavailable"
+                ),
+            }
+        }
+        let Some(cursor) = stream.cursor.as_mut() else {
+            return Ok(());
+        };
+        let shm = self
+            .state
+            .shm
+            .as_ref()
+            .ok_or(PlatformError::Unsupported("cursor wl_shm required"))?;
+        let changed = cursor.advance(shm, &self.qh, id, &self.state.gate)?;
+        if !self.state.gate.is_open() {
+            self.state.end_all(StreamEndReason::Blocked);
+            return Ok(());
+        }
+        if let Some(cursor) = changed {
+            emit(&stream.sink, cursor_event(id, cursor));
+        }
         Ok(())
     }
 
@@ -928,6 +1267,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "ext_output_image_capture_source_manager_v1" => {
                     state.sources = Some(registry.bind(name, 1, qh, ()))
                 }
+                "wl_seat" if state.seat_name.is_none() => {
+                    state.seat_name = Some(name);
+                    state.seat = Some(registry.bind(name, version.min(9), qh, ()));
+                }
                 "wl_output" if version >= 4 => {
                     state.outputs.insert(
                         name,
@@ -940,6 +1283,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 _ => (),
             },
             wl_registry::Event::GlobalRemove { name } => {
+                if state.seat_name == Some(name) {
+                    state.release_pointer();
+                    if let Some(seat) = state.seat.take()
+                        && wayland_client::Proxy::version(&seat) >= 5
+                    {
+                        seat.release();
+                    }
+                }
                 let ids: Vec<_> = state
                     .streams
                     .iter()
@@ -953,6 +1304,31 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
             }
             _ => (),
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        state.check_gate();
+        if state.seat.as_ref() != Some(seat) {
+            return;
+        }
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            let has_pointer = matches!(capabilities, WEnum::Value(value)
+                if value.contains(wl_seat::Capability::Pointer));
+            if has_pointer && state.pointer.is_none() {
+                state.pointer = Some(seat.get_pointer(qh, ()));
+            } else if !has_pointer {
+                state.release_pointer();
+            }
         }
     }
 }
@@ -984,6 +1360,122 @@ impl Dispatch<wl_callback::WlCallback, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         state.synced = true;
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureCursorSessionV1, CursorData> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtImageCopyCaptureCursorSessionV1,
+        event: cursor_protocol::Event,
+        data: &CursorData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        state.check_gate();
+        let Some(cursor) = state
+            .streams
+            .get_mut(&data.0)
+            .and_then(|stream| stream.cursor.as_mut())
+        else {
+            return;
+        };
+        if &cursor.proxy != proxy {
+            return;
+        }
+        match event {
+            cursor_protocol::Event::Enter => cursor.entered = true,
+            cursor_protocol::Event::Leave => {
+                cursor.entered = false;
+                // A paused/off-output frame can be blank indefinitely. Cancel it instead of
+                // accidentally reporting that blank image after a later enter.
+                cursor.cancel_frame();
+            }
+            cursor_protocol::Event::Hotspot { x, y } => cursor.hotspot = (x, y),
+            _ => (), // Position is deliberately not part of cursor shape reporting.
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, CursorData> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtImageCopyCaptureSessionV1,
+        event: session_protocol::Event,
+        data: &CursorData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        state.check_gate();
+        let Some(cursor) = state
+            .streams
+            .get_mut(&data.0)
+            .and_then(|stream| stream.cursor.as_mut())
+        else {
+            return;
+        };
+        if &cursor.session != proxy {
+            return;
+        }
+        match event {
+            session_protocol::Event::BufferSize { width, height } => {
+                cursor.constraints_pending = true;
+                cursor.incoming.size = Some(PixelSize::new(width, height));
+            }
+            session_protocol::Event::ShmFormat { format } => {
+                cursor.constraints_pending = true;
+                if let WEnum::Value(format) = format {
+                    cursor.incoming.formats.push(format);
+                }
+            }
+            session_protocol::Event::DmabufDevice { .. }
+            | session_protocol::Event::DmabufFormat { .. } => cursor.constraints_pending = true,
+            session_protocol::Event::Done => {
+                // Destroy the old frame before replacing its buffer. No new frame uses a partial
+                // constraint batch, or the size/format of a superseded batch.
+                cursor.cancel_frame();
+                cursor.constraints = Some(std::mem::take(&mut cursor.incoming));
+                cursor.constraints_pending = false;
+                cursor.reallocate = true;
+            }
+            session_protocol::Event::Stopped => {
+                state.stop_cursor(data.0, "cursor capture session stopped");
+            }
+            _ => (),
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, CursorData> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtImageCopyCaptureFrameV1,
+        event: frame_protocol::Event,
+        data: &CursorData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        state.check_gate();
+        let Some(cursor) = state
+            .streams
+            .get_mut(&data.0)
+            .and_then(|stream| stream.cursor.as_mut())
+        else {
+            return;
+        };
+        let Some(frame) = cursor.frame.as_mut() else {
+            return;
+        };
+        if &frame.proxy != proxy {
+            return;
+        }
+        match event {
+            frame_protocol::Event::Ready => frame.ready_hotspot = Some(cursor.hotspot),
+            frame_protocol::Event::Failed { reason } => {
+                state.stop_cursor(data.0, format_args!("cursor frame failed: {reason:?}"));
+            }
+            _ => (),
+        }
     }
 }
 
@@ -1088,6 +1580,7 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, StreamId> for State {
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
+delegate_noop!(State: ignore wl_pointer::WlPointer);
 delegate_noop!(State: ignore ExtImageCopyCaptureManagerV1);
 delegate_noop!(State: ignore ExtOutputImageCaptureSourceManagerV1);
 delegate_noop!(State: ignore ExtImageCaptureSourceV1);
@@ -1096,6 +1589,126 @@ delegate_noop!(State: ignore ExtImageCaptureSourceV1);
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn image(size: PixelSize, hotspot: (i32, i32), pixels: &[u8]) -> Option<CursorImage> {
+        cursor_image(size, hotspot, pixels, wl_shm::Format::Argb8888).unwrap()
+    }
+
+    #[test]
+    fn cursor_unpremultiply() {
+        let cursor = image(
+            PixelSize::new(4, 1),
+            (0, 0),
+            &[32, 64, 128, 128, 17, 23, 99, 255, 200, 20, 0, 0, 2, 1, 0, 1],
+        )
+        .unwrap();
+        assert_eq!(
+            cursor.pixels.as_ref(),
+            &[
+                64, 128, 255, 128, 17, 23, 99, 255, 0, 0, 0, 0, 255, 255, 0, 1
+            ]
+        );
+        let xrgb = cursor_image(
+            PixelSize::new(1, 1),
+            (0, 0),
+            &[17, 23, 99, 0],
+            wl_shm::Format::Xrgb8888,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(xrgb.pixels.as_ref(), &[17, 23, 99, 255]);
+    }
+
+    #[test]
+    fn cursor_transparent_frame_uses_default() {
+        let stream = StreamId(1);
+        for pixels in [[0; 8], [99, 22, 33, 0, 0, 0, 0, 0]] {
+            assert!(matches!(
+                cursor_event(stream, image(PixelSize::new(2, 1), (0, 0), &pixels)),
+                FrameEvent::CursorDefault { stream: id } if id == stream
+            ));
+        }
+        assert!(matches!(
+            cursor_event(stream, image(PixelSize::new(2, 1), (0, 0), &[0, 0, 0, 0, 0, 0, 0, 1])),
+            FrameEvent::Cursor { stream: id, cursor: Some(_) } if id == stream
+        ));
+    }
+
+    #[test]
+    fn cursor_hotspot_clamp() {
+        let pixels = [255; 3 * 2 * 4];
+        assert_eq!(
+            image(PixelSize::new(3, 2), (-10, i32::MAX), &pixels)
+                .unwrap()
+                .hotspot,
+            (0, 1)
+        );
+        assert_eq!(
+            image(PixelSize::new(3, 2), (2, 0), &pixels)
+                .unwrap()
+                .hotspot,
+            (2, 0)
+        );
+    }
+
+    #[test]
+    fn cursor_downscale_300_by_200() {
+        let mut pixels = vec![255; 300 * 200 * 4];
+        let offset = (100 * 300 + 150) * 4;
+        pixels[offset..offset + 4].copy_from_slice(&[10, 20, 30, 255]);
+        let cursor = image(PixelSize::new(300, 200), (150, 100), &pixels).unwrap();
+        assert_eq!(cursor.size, PixelSize::new(256, 170));
+        assert_eq!(cursor.hotspot, (128, 85));
+        assert_eq!(cursor.pixels.len(), 256 * 170 * 4);
+        let offset = (85 * 256 + 128) * 4;
+        assert_eq!(&cursor.pixels[offset..offset + 4], &[10, 20, 30, 255]);
+        assert_eq!(
+            image(PixelSize::new(300, 200), (i32::MAX, i32::MAX), &pixels)
+                .unwrap()
+                .hotspot,
+            (255, 169)
+        );
+    }
+
+    #[test]
+    fn cursor_same_as_last_suppression() {
+        let mut history = CursorHistory::default();
+        let cursor = image(PixelSize::new(2, 1), (0, 0), &[255; 8]);
+        assert!(history.changed(&cursor));
+        assert!(!history.changed(&cursor));
+        let hotspot = image(PixelSize::new(2, 1), (1, 0), &[255; 8]);
+        assert!(history.changed(&hotspot));
+        assert!(!history.changed(&hotspot));
+        let pixels = image(PixelSize::new(2, 1), (1, 0), &[254; 8]);
+        assert!(history.changed(&pixels));
+        assert!(history.changed(&None));
+        assert!(!history.changed(&None));
+        assert!(history.changed(&cursor));
+        let stream = StreamId(1);
+        let mut image_default_image = CursorHistory::default();
+        let events: Vec<_> = [cursor.clone(), None, cursor.clone()]
+            .into_iter()
+            .filter(|image| image_default_image.changed(image))
+            .map(|image| cursor_event(stream, image))
+            .collect();
+        assert!(matches!(
+            events.as_slice(),
+            [FrameEvent::Cursor { stream: first, cursor: Some(first_image) },
+             FrameEvent::CursorDefault { stream: default },
+             FrameEvent::Cursor { stream: last, cursor: Some(last_image) }]
+                if *first == stream && *default == stream && *last == stream && first_image == last_image
+        ));
+        let mut default_default = CursorHistory::default();
+        let events: Vec<_> = [None, None]
+            .into_iter()
+            .filter(|image| default_default.changed(image))
+            .map(|image| cursor_event(stream, image))
+            .collect();
+        assert!(matches!(
+            events.as_slice(),
+            [FrameEvent::CursorDefault { stream: id }] if *id == stream
+        ));
+    }
 
     #[test]
     fn damage_translation_into_crop_space() {
