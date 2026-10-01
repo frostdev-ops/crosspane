@@ -5,9 +5,17 @@
 //! preferring top-right, so the twin touches other displays only at a point. In v0, if
 //! WindowServer normalizes every corner into edge adjacency, accept its reported origin
 //! and warn: the physical pointer can reach the twin. No input is used to test isolation.
+//! Descriptor capacity is fixed at 8192×8192 pixels so modes can grow after parking.
+//! The macOS 27 lifecycle probe confirmed growth to that full capacity at 2×.
+//! Destination scales above 1 use a 2× twin (even for fractional scales or scales above 2).
+//! applySettings publishes modes but may leave the old mode selected; public CoreGraphics
+//! selects the requested mode before its pixel and logical dimensions are polled.
+//! Parking operations are serialized across native waits and must run on a worker thread,
+//! never the AppKit main thread, which must keep servicing on_main/spawn_on_main.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -20,14 +28,15 @@ use crosspane_platform::{Parked, ParkingKind, PlatformError, WindowParking};
 use crosspane_types::geom::{PixelRect, PixelSize, PointLogical, RectLogical, SizeLogical, euclid};
 use crosspane_types::id::{DisplayId, WindowId};
 use dispatch2::DispatchQueue;
-use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool};
-use objc2_core_foundation::CGSize;
+use objc2::runtime::{AnyClass, AnyObject, Bool, Method, Sel};
+use objc2::{MainThreadMarker, msg_send, sel};
+use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CGSize};
 use objc2_core_graphics::{
     CGBeginDisplayConfiguration, CGCancelDisplayConfiguration, CGCompleteDisplayConfiguration,
-    CGConfigureDisplayOrigin, CGConfigureOption, CGDisplayBounds, CGDisplayCopyDisplayMode,
-    CGDisplayMode, CGError, CGGetActiveDisplayList,
+    CGConfigureDisplayOrigin, CGConfigureOption, CGDisplayBounds, CGDisplayCopyAllDisplayModes,
+    CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplaySetDisplayMode, CGError,
+    CGGetActiveDisplayList, kCGDisplayShowDuplicateLowResolutionModes,
 };
 use objc2_foundation::{NSArray, NSString};
 
@@ -37,6 +46,7 @@ use crate::windows::{AxWindow, RawWindow, WindowQuery, require_accessibility, va
 const MAIN_WAIT: Duration = Duration::from_secs(2);
 const AX_WAIT: Duration = Duration::from_secs(2);
 const DISPLAY_WAIT: Duration = Duration::from_secs(1);
+const MAX_PIXELS: u32 = 8192;
 
 thread_local! {
     // Accessed exclusively inside on_main/spawn_on_main. Native objects never cross threads.
@@ -45,12 +55,86 @@ thread_local! {
 
 fn classes() -> Result<[&'static AnyClass; 4], PlatformError> {
     let missing = || PlatformError::Unsupported("CGVirtualDisplay unavailable");
-    Ok([
+    let classes = [
         AnyClass::get(c"CGVirtualDisplay").ok_or_else(missing)?,
         AnyClass::get(c"CGVirtualDisplayDescriptor").ok_or_else(missing)?,
         AnyClass::get(c"CGVirtualDisplaySettings").ok_or_else(missing)?,
         AnyClass::get(c"CGVirtualDisplayMode").ok_or_else(missing)?,
-    ])
+    ];
+    let drift = || PlatformError::Unsupported("CGVirtualDisplay API changed");
+    for class in classes {
+        // Check the public class-message ABI before sending the capability query or allocating.
+        for (selector, expected) in [
+            (sel!(alloc), c"@16@0:8"),
+            (sel!(instancesRespondToSelector:), c"B24@0:8:16"),
+        ] {
+            if !encoding_matches(
+                method_encoding(class.class_method(selector).ok_or_else(drift)?),
+                expected,
+            ) {
+                return Err(drift());
+            }
+        }
+    }
+    for (class, selector, expected) in api_methods(classes) {
+        let method = class.instance_method(selector).ok_or_else(drift)?;
+        if !encoding_matches(method_encoding(method), expected) {
+            return Err(drift());
+        }
+        // SAFETY: NSObject +instancesRespondToSelector:(SEL) -> BOOL, checked above as B24@0:8:16.
+        let responds: Bool = unsafe { msg_send![class, instancesRespondToSelector: selector] };
+        if !responds.as_bool() {
+            return Err(drift());
+        }
+    }
+    Ok(classes)
+}
+
+fn api_methods(
+    [display, descriptor, settings, mode]: [&'static AnyClass; 4],
+) -> [(&'static AnyClass, Sel, &'static CStr); 16] {
+    [
+        (descriptor, sel!(init), c"@16@0:8"),
+        (descriptor, sel!(setQueue:), c"v24@0:8@16"),
+        (descriptor, sel!(setName:), c"v24@0:8@16"),
+        (descriptor, sel!(setMaxPixelsWide:), c"v20@0:8I16"),
+        (descriptor, sel!(setMaxPixelsHigh:), c"v20@0:8I16"),
+        (
+            descriptor,
+            sel!(setSizeInMillimeters:),
+            c"v32@0:8{CGSize=dd}16",
+        ),
+        (descriptor, sel!(setProductID:), c"v20@0:8I16"),
+        (descriptor, sel!(setVendorID:), c"v20@0:8I16"),
+        (descriptor, sel!(setSerialNum:), c"v20@0:8I16"),
+        (settings, sel!(init), c"@16@0:8"),
+        (settings, sel!(setHiDPI:), c"v20@0:8I16"),
+        (settings, sel!(setModes:), c"v24@0:8@16"),
+        (
+            mode,
+            sel!(initWithWidth:height:refreshRate:),
+            c"@32@0:8I16I20d24",
+        ),
+        (display, sel!(initWithDescriptor:), c"@24@0:8@16"),
+        (display, sel!(applySettings:), c"B24@0:8@16"),
+        (display, sel!(displayID), c"I16@0:8"),
+    ]
+}
+
+fn method_encoding(method: &Method) -> Option<&CStr> {
+    // SAFETY: method is a live runtime Method from class_getInstanceMethod/class_getClassMethod;
+    // method_getTypeEncoding returns a runtime-owned immutable string or null.
+    let raw = unsafe { objc2::ffi::method_getTypeEncoding(method) };
+    if raw.is_null() {
+        None
+    } else {
+        // SAFETY: the non-null runtime encoding is NUL-terminated and lives as long as the Method.
+        Some(unsafe { CStr::from_ptr(raw) })
+    }
+}
+
+fn encoding_matches(observed: Option<&CStr>, expected: &CStr) -> bool {
+    observed == Some(expected)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,26 +150,17 @@ impl Mode {
         if pixels.width == 0 || pixels.height == 0 || !scale.is_finite() || scale <= 0.0 {
             return Err(PlatformError::Backend("invalid twin size or scale".into()));
         }
-        // Modes have integer logical dimensions. Round up so odd sizes retain the last pixel.
-        let width = (f64::from(pixels.width) / scale).ceil();
-        let height = (f64::from(pixels.height) / scale).ceil();
-        if width > f64::from(u32::MAX) || height > f64::from(u32::MAX) {
-            return Err(PlatformError::Backend(
-                "twin mode exceeds native dimensions".into(),
+        if pixels.width > MAX_PIXELS || pixels.height > MAX_PIXELS {
+            return Err(PlatformError::Unsupported(
+                "CGVirtualDisplay maximum is 8192x8192 pixels",
             ));
         }
-        let width = width as u32;
-        let height = height as u32;
-        let hidpi = u32::from(scale >= 2.0);
+        // The API offers 1× or 2× density. Round odd HiDPI sizes up to retain every pixel.
+        let hidpi = u32::from(scale > 1.0);
         let density = if hidpi == 1 { 2 } else { 1 };
-        let pixels = PixelSize::new(
-            width
-                .checked_mul(density)
-                .ok_or_else(|| PlatformError::Backend("twin pixel width overflow".into()))?,
-            height
-                .checked_mul(density)
-                .ok_or_else(|| PlatformError::Backend("twin pixel height overflow".into()))?,
-        );
+        let width = pixels.width.div_ceil(density);
+        let height = pixels.height.div_ceil(density);
+        let pixels = PixelSize::new(width * density, height * density);
         Ok(Self {
             pixels,
             width,
@@ -168,8 +243,8 @@ impl VirtualDisplay {
             unsafe {
                 let _: () = msg_send![&*descriptor, setQueue: DispatchQueue::main() as *const DispatchQueue];
                 let _: () = msg_send![&*descriptor, setName: &*name];
-                let _: () = msg_send![&*descriptor, setMaxPixelsWide: mode.pixels.width];
-                let _: () = msg_send![&*descriptor, setMaxPixelsHigh: mode.pixels.height];
+                let _: () = msg_send![&*descriptor, setMaxPixelsWide: MAX_PIXELS];
+                let _: () = msg_send![&*descriptor, setMaxPixelsHigh: MAX_PIXELS];
                 let _: () = msg_send![&*descriptor, setSizeInMillimeters: CGSize::new(logical.width * 25.4 / 110.0, logical.height * 25.4 / 110.0)];
                 let _: () = msg_send![&*descriptor, setProductID: 0xC001_u32];
                 let _: () = msg_send![&*descriptor, setVendorID: 0xF05D_u32];
@@ -221,7 +296,8 @@ impl VirtualDisplay {
         let serial = self.serial;
         on_main(MAIN_WAIT, move |_| {
             DISPLAYS.with(|displays| displays.borrow_mut().remove(&serial));
-        })
+        })?;
+        wait_display(self.id, false)
     }
 }
 
@@ -273,6 +349,63 @@ fn wait_display(id: DisplayId, present: bool) -> Result<(), PlatformError> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn wait_mode(id: DisplayId, mode: Mode) -> Result<(), PlatformError> {
+    let deadline = Instant::now() + DISPLAY_WAIT;
+    let mut selected = false;
+    let options = CFDictionary::from_slices(
+        // SAFETY: the public immutable CoreGraphics option key is available since macOS 10.8.
+        &[unsafe { kCGDisplayShowDuplicateLowResolutionModes }],
+        &[CFBoolean::new(true)],
+    );
+    loop {
+        if active_displays()?.contains(&id.0)
+            && let Some(actual) = CGDisplayCopyDisplayMode(id.0)
+        {
+            let bounds = CGDisplayBounds(id.0);
+            let logical = mode.logical();
+            if matches_mode(&actual, mode)
+                && bounds.size.width == logical.width
+                && bounds.size.height == logical.height
+            {
+                return Ok(());
+            }
+            if !selected {
+                // SAFETY: the options contain the public CFString key with a CFBoolean value.
+                let modes =
+                    unsafe { CGDisplayCopyAllDisplayModes(id.0, Some(options.as_opaque())) };
+                if let Some(modes) = modes {
+                    // SAFETY: CGDisplayCopyAllDisplayModes returns an array of CGDisplayModeRef.
+                    let modes: CFRetained<CFArray<CGDisplayMode>> =
+                        unsafe { CFRetained::cast_unchecked(modes) };
+                    for candidate in &*modes {
+                        if matches_mode(&candidate, mode) {
+                            cg_result(
+                                // SAFETY: id belongs to our twin, the mode is from its advertised list,
+                                // and no options dictionary is supplied. This is a process-lived change.
+                                unsafe { CGDisplaySetDisplayMode(id.0, Some(&candidate), None) },
+                                "select twin mode",
+                            )?;
+                            selected = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(PlatformError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn matches_mode(actual: &CGDisplayMode, mode: Mode) -> bool {
+    CGDisplayMode::pixel_width(Some(actual)) == mode.pixels.width as usize
+        && CGDisplayMode::pixel_height(Some(actual)) == mode.pixels.height as usize
+        && CGDisplayMode::width(Some(actual)) == mode.width as usize
+        && CGDisplayMode::height(Some(actual)) == mode.height as usize
 }
 
 fn display_frame(id: u32) -> Result<RectLogical, PlatformError> {
@@ -424,9 +557,11 @@ struct Entry {
 }
 
 /// M2 parking. Only numeric display handles cross the main-thread boundary.
+/// All WindowParking calls must run on a worker thread, never the AppKit main thread:
+/// the serial state mutex spans bounded mode/placement waits that need the main queue.
 #[derive(Debug)]
 pub struct MacTwinParking {
-    // geometry(&self) must also run the kill switch when a parked window becomes inaccessible.
+    // ponytail: one serial lock across native waits; use a command worker if concurrency matters.
     state: Mutex<TwinState>,
 }
 
@@ -439,7 +574,8 @@ struct TwinState {
 }
 
 impl MacTwinParking {
-    /// Look up every private class before doing anything; the caller can report an M1 fallback.
+    /// Validate every private class, selector and observed macOS 27 ABI before doing anything;
+    /// the caller can report an M1 fallback if the API is absent or has changed.
     pub fn new(journal: PathBuf) -> Result<MacTwinParking, PlatformError> {
         classes()?;
         let entries = read_journal(&journal)?;
@@ -454,6 +590,11 @@ impl MacTwinParking {
     }
 
     fn state(&self) -> Result<MutexGuard<'_, TwinState>, PlatformError> {
+        if MainThreadMarker::new().is_some() {
+            return Err(PlatformError::Unsupported(
+                "MacTwinParking must be called from a worker thread",
+            ));
+        }
         self.state.lock().map_err(|_| {
             PlatformError::Backend("twin parking state poisoned; journal retained".into())
         })
@@ -491,7 +632,14 @@ impl TwinState {
         write_journal(&self.journal, &self.entries)?;
         let ax = AxWindow::find(&raw, Instant::now() + AX_WAIT)?;
         ax.restore(entry.frame)?;
-        let actual = ax.frame()?;
+        let mut actual = ax.frame()?;
+        if (actual.size.width - entry.frame.size.width).abs() > 2.0
+            || (actual.size.height - entry.frame.size.height).abs() > 2.0
+        {
+            // AXSize was written on the twin first and may have been clamped there.
+            ax.resize(entry.frame.size)?;
+            actual = ax.frame()?;
+        }
         if !same_frame(actual, entry.frame) {
             return Err(PlatformError::Backend(
                 "window refused original frame; journal retained".into(),
@@ -502,6 +650,9 @@ impl TwinState {
 
     fn restore(&mut self, window: WindowId) -> Result<bool, PlatformError> {
         if !self.entries.contains_key(&window) {
+            if let Some(display) = self.displays.remove(&window) {
+                display.release()?;
+            }
             return Ok(false);
         }
         let restored = self.restore_frame(window);
@@ -542,16 +693,34 @@ impl TwinState {
         let raw = self.window(window)?;
         let ax = AxWindow::find(&raw, Instant::now() + AX_WAIT)?;
         let original = ax.frame()?;
+        let inserted = !self.entries.contains_key(&window);
         self.entries.entry(window).or_insert(Entry {
             pid: raw.pid,
             frame: original,
         });
         write_journal(&self.journal, &self.entries)?;
-        let display = VirtualDisplay::create(mode)?;
+        let setup = (|| {
+            let display = VirtualDisplay::create(mode)?;
+            if let Err(error) = wait_mode(display.id, mode) {
+                if let Err(cleanup) = display.release() {
+                    tracing::warn!(%cleanup, "twin setup cleanup queued on main thread");
+                }
+                return Err(error);
+            }
+            Ok(display)
+        })();
+        let display = match setup {
+            Ok(display) => display,
+            Err(error) => {
+                if inserted {
+                    self.remove_entry(window)?;
+                }
+                return Err(error);
+            }
+        };
         let id = display.id;
         self.displays.insert(window, display);
         let result = (|| {
-            wait_display(id, true)?;
             let placement = place_twin(id)?;
             // Use a fresh AX deadline after display creation; no expired message may move a window.
             let raw = self.window(window)?;
@@ -571,7 +740,7 @@ impl TwinState {
             write_journal(&self.journal, &self.entries)?;
             let display = self.displays.get(&window).ok_or(PlatformError::NotFound)?;
             display.apply(mode)?;
-            wait_display(display.id, true)?;
+            wait_mode(display.id, mode)?;
             // Mode changes can alter the arrangement. Re-isolate before moving the window again.
             let placement = place_twin(display.id)?;
             let raw = self.window(window)?;
@@ -587,42 +756,22 @@ impl TwinState {
         require_accessibility()?;
         let raw = self.window(window)?;
         let frame = AxWindow::find(&raw, Instant::now() + AX_WAIT)?.frame()?;
-        let bounds = CGDisplayBounds(display.id.0);
-        let mode = CGDisplayCopyDisplayMode(display.id.0).ok_or(PlatformError::NotFound)?;
-        let scale_x = CGDisplayMode::pixel_width(Some(&mode)) as f64 / bounds.size.width;
-        let scale_y = CGDisplayMode::pixel_height(Some(&mode)) as f64 / bounds.size.height;
-        if !valid_frame(frame)
-            || !scale_x.is_finite()
-            || !scale_y.is_finite()
-            || scale_x <= 0.0
-            || scale_y <= 0.0
-        {
-            return Err(PlatformError::Backend("invalid twin geometry".into()));
+        if !active_displays()?.contains(&display.id.0) {
+            return Err(PlatformError::NotFound);
         }
-        let edges = [
-            ((frame.min_x() - bounds.origin.x) * scale_x).floor(),
-            ((frame.min_y() - bounds.origin.y) * scale_y).floor(),
-            ((frame.max_x() - bounds.origin.x) * scale_x).ceil(),
-            ((frame.max_y() - bounds.origin.y) * scale_y).ceil(),
-        ];
-        if edges
-            .iter()
-            .any(|v| !v.is_finite() || *v < 0.0 || *v > f64::from(i32::MAX))
-            || edges[2] > CGDisplayMode::pixel_width(Some(&mode)) as f64
-            || edges[3] > CGDisplayMode::pixel_height(Some(&mode)) as f64
-        {
-            return Err(PlatformError::Backend(
-                "window did not fit entirely on its twin".into(),
-            ));
-        }
+        let bounds = display_frame(display.id.0).map_err(|_| PlatformError::Timeout)?;
+        let mode = CGDisplayCopyDisplayMode(display.id.0).ok_or(PlatformError::Timeout)?;
+        let pixels = PixelSize::new(
+            u32::try_from(CGDisplayMode::pixel_width(Some(&mode)))
+                .map_err(|_| PlatformError::Backend("twin pixel width overflow".into()))?,
+            u32::try_from(CGDisplayMode::pixel_height(Some(&mode)))
+                .map_err(|_| PlatformError::Backend("twin pixel height overflow".into()))?,
+        );
         Ok(Parked {
             window,
             kind: ParkingKind::Twin,
             display: display.id,
-            content: PixelRect::new(
-                euclid::Point2D::new(edges[0] as i32, edges[1] as i32),
-                euclid::Point2D::new(edges[2] as i32, edges[3] as i32),
-            ),
+            content: content(frame, bounds, pixels)?,
         })
     }
 }
@@ -650,7 +799,12 @@ impl WindowParking for MacTwinParking {
         let mut state = self.state()?;
         let result = state.geometry(window);
         result.map_err(|error| {
-            if state.displays.contains_key(&window) {
+            if state.displays.contains_key(&window)
+                && matches!(
+                    error,
+                    PlatformError::NotFound | PlatformError::PermissionDenied(_)
+                )
+            {
                 state.abort(window, error)
             } else {
                 error
@@ -665,12 +819,29 @@ impl WindowParking for MacTwinParking {
     fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
         let mut state = self.state()?;
         let mut restored = Vec::new();
-        for window in state.entries.keys().copied().collect::<Vec<_>>() {
-            if state.restore(window)? {
-                restored.push(window);
+        let mut first_error = None;
+        let windows: std::collections::BTreeSet<_> = state
+            .entries
+            .keys()
+            .chain(state.displays.keys())
+            .copied()
+            .collect();
+        for window in windows {
+            match state.restore(window) {
+                Ok(true) => restored.push(window),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "twin recovery failed; continuing with remaining windows");
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
-        Ok(restored)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(restored),
+        }
     }
 }
 
@@ -695,6 +866,49 @@ fn same_frame(a: RectLogical, b: RectLogical) -> bool {
         && (a.origin.y - b.origin.y).abs() <= 2.0
         && (a.size.width - b.size.width).abs() <= 2.0
         && (a.size.height - b.size.height).abs() <= 2.0
+}
+
+fn content(
+    frame: RectLogical,
+    bounds: RectLogical,
+    pixels: PixelSize,
+) -> Result<PixelRect, PlatformError> {
+    if !valid_frame(frame)
+        || !valid_frame(bounds)
+        || pixels.width == 0
+        || pixels.height == 0
+        || pixels.width > i32::MAX as u32
+        || pixels.height > i32::MAX as u32
+    {
+        return Err(PlatformError::Backend("invalid twin geometry".into()));
+    }
+    let clipped = frame
+        .intersection(&bounds)
+        .filter(|frame| valid_frame(*frame))
+        .ok_or_else(|| PlatformError::Backend("window has no content on its twin".into()))?;
+    let scale_x = f64::from(pixels.width) / bounds.size.width;
+    let scale_y = f64::from(pixels.height) / bounds.size.height;
+    let edges = [
+        ((clipped.min_x() - bounds.min_x()) * scale_x)
+            .floor()
+            .clamp(0.0, f64::from(pixels.width)),
+        ((clipped.min_y() - bounds.min_y()) * scale_y)
+            .floor()
+            .clamp(0.0, f64::from(pixels.height)),
+        ((clipped.max_x() - bounds.min_x()) * scale_x)
+            .ceil()
+            .clamp(0.0, f64::from(pixels.width)),
+        ((clipped.max_y() - bounds.min_y()) * scale_y)
+            .ceil()
+            .clamp(0.0, f64::from(pixels.height)),
+    ];
+    if edges.iter().any(|v| !v.is_finite()) {
+        return Err(PlatformError::Backend("invalid twin pixel geometry".into()));
+    }
+    Ok(PixelRect::new(
+        euclid::Point2D::new(edges[0] as i32, edges[1] as i32),
+        euclid::Point2D::new(edges[2] as i32, edges[3] as i32),
+    ))
 }
 
 fn io_error(error: std::io::Error) -> PlatformError {
@@ -791,6 +1005,24 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn encoding_comparison_fails_closed() {
+        assert!(encoding_matches(
+            Some(c"@32@0:8I16I20d24"),
+            c"@32@0:8I16I20d24"
+        ));
+        for observed in [
+            None,
+            Some(c"@40@0:8Q16Q24d32"),
+            Some(c"@32@0:8i16i20d24"),
+            Some(c"@32@0:8I16I24d24"),
+            Some(c"@32@0:8I16I20d24junk"),
+        ] {
+            assert!(!encoding_matches(observed, c"@32@0:8I16I20d24"));
+        }
+        assert!(!encoding_matches(Some(c"c24@0:8@16"), c"B24@0:8@16"));
+    }
+
+    #[test]
     #[allow(clippy::unwrap_used)]
     fn mode_size_and_logical_math() {
         for (size, scale, logical, hidpi) in [
@@ -803,6 +1035,18 @@ pub(crate) mod tests {
             (
                 PixelSize::new(1600, 1200),
                 2.0,
+                SizeLogical::new(800.0, 600.0),
+                1,
+            ),
+            (
+                PixelSize::new(1600, 1200),
+                1.5,
+                SizeLogical::new(800.0, 600.0),
+                1,
+            ),
+            (
+                PixelSize::new(1600, 1200),
+                3.0,
                 SizeLogical::new(800.0, 600.0),
                 1,
             ),
@@ -833,6 +1077,48 @@ pub(crate) mod tests {
             assert!(Mode::new(PixelSize::new(1600, 1200), scale).is_err());
         }
         assert!(Mode::new(PixelSize::new(0, 1200), 2.0).is_err());
+        assert!(Mode::new(PixelSize::new(MAX_PIXELS, MAX_PIXELS), 2.0).is_ok());
+        for size in [
+            PixelSize::new(MAX_PIXELS + 1, 1200),
+            PixelSize::new(1600, MAX_PIXELS + 1),
+        ] {
+            assert!(matches!(
+                Mode::new(size, 2.0),
+                Err(PlatformError::Unsupported(_))
+            ));
+        }
+        let bounds = RectLogical::new(
+            PointLogical::new(1800.0, -600.0),
+            SizeLogical::new(800.0, 600.0),
+        );
+        let pixels = PixelSize::new(1600, 1200);
+        let frame = RectLogical::new(
+            PointLogical::new(1790.0, -610.0),
+            SizeLogical::new(900.0, 700.0),
+        );
+        assert_eq!(
+            content(frame, bounds, pixels).unwrap(),
+            PixelRect::new(euclid::Point2D::new(0, 0), euclid::Point2D::new(1600, 1200))
+        );
+        let frame = RectLogical::new(
+            PointLogical::new(1830.0, -580.0),
+            SizeLogical::new(200.0, 100.0),
+        );
+        assert_eq!(
+            content(frame, bounds, pixels).unwrap(),
+            PixelRect::new(euclid::Point2D::new(60, 40), euclid::Point2D::new(460, 240))
+        );
+        assert!(
+            content(
+                RectLogical::new(
+                    PointLogical::new(2600.0, -600.0),
+                    SizeLogical::new(10.0, 10.0)
+                ),
+                bounds,
+                pixels
+            )
+            .is_err()
+        );
         let real = [RectLogical::new(
             PointLogical::zero(),
             SizeLogical::new(800.0, 600.0),
@@ -909,32 +1195,50 @@ pub(crate) mod tests {
                 timestamp.abs_diff(now)
             );
         }
-        let display =
-            VirtualDisplay::create(Mode::new(PixelSize::new(1600, 1200), 2.0).unwrap()).unwrap();
+        let classes = classes().expect("constructor API preflight");
+        for (class, selector, expected) in api_methods(classes) {
+            println!(
+                "ABI: {:?} {:?} {:?}",
+                class.name(),
+                selector.name(),
+                method_encoding(class.instance_method(selector).unwrap()).unwrap()
+            );
+            assert!(encoding_matches(
+                method_encoding(class.instance_method(selector).unwrap()),
+                expected
+            ));
+        }
+        let initial = Mode::new(PixelSize::new(1600, 1200), 2.0).unwrap();
+        let display = VirtualDisplay::create(initial).unwrap();
         let id = display.id;
         // All assertions happen while the RAII display handle is alive, so unwind releases it.
-        wait_display(id, true).unwrap();
-        let deadline = Instant::now() + DISPLAY_WAIT;
-        let mode = loop {
-            if let Some(mode) = CGDisplayCopyDisplayMode(id.0)
-                && CGDisplayMode::pixel_width(Some(&mode)) == 1600
-                && CGDisplayMode::pixel_height(Some(&mode)) == 1200
-            {
-                break mode;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "active twin mode did not become 1600x1200"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(CGDisplayMode::pixel_width(Some(&mode)), 1600);
-        assert_eq!(CGDisplayMode::pixel_height(Some(&mode)), 1200);
+        wait_mode(id, initial).unwrap();
         println!(
             "created twin {:?}: 1600x1200 pixels, bounds={:?}",
             id,
             CGDisplayBounds(id.0)
         );
+        let larger = Mode::new(PixelSize::new(MAX_PIXELS, MAX_PIXELS), 2.0).unwrap();
+        display.apply(larger).unwrap();
+        if let Err(error) = wait_mode(id, larger) {
+            display.release().unwrap();
+            println!("twin {:?} released and absent after failed growth", id);
+            panic!("larger mode did not settle: {error}");
+        }
+        println!(
+            "grew twin {:?}: {}x{} pixels, descriptor maximum={}x{}, bounds={:?}",
+            id,
+            larger.pixels.width,
+            larger.pixels.height,
+            MAX_PIXELS,
+            MAX_PIXELS,
+            CGDisplayBounds(id.0)
+        );
+        assert!(matches!(
+            Mode::new(PixelSize::new(MAX_PIXELS + 1, MAX_PIXELS), 2.0),
+            Err(PlatformError::Unsupported(_))
+        ));
+        wait_mode(id, larger).unwrap();
         let placement = place_twin(id);
         if let Ok(placement) = placement.as_ref() {
             println!(

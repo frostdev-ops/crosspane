@@ -1,5 +1,6 @@
 //! Also compiled as a standalone GUI driver by the two tests below: libtest owns the
 //! process's main thread, while AppKit needs it running main_thread::run_app().
+//! The display-only probe grows its mode to the descriptor maximum without moving windows.
 #![cfg(all(target_os = "macos", feature = "private-vdisplay"))]
 #![allow(unexpected_cfgs, clippy::unwrap_used, clippy::expect_used)]
 
