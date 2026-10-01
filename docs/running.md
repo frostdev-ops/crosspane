@@ -135,3 +135,18 @@ Everything is also available from the command line:
 
 `crosspanectl status` shows peers, layout, projections (with received frames), missing
 permissions and recent notices.
+
+## Known limitations (v0)
+
+- **Notifications** that your notification daemon shows on the output where a projected window is
+  parked appear in that projected window (they're captured with it). Pinning the daemon to a real
+  output (e.g. mako's `output=`) avoids it.
+- **Cursor shape:** over a projected window the cursor is the destination's own arrow; text and
+  resize cursors aren't synced yet.
+- **Picking windows:** a peer's windows must be allowed once (`crosspanectl allow <peer> browse` on
+  that peer). Window titles from a Mac need Screen Recording there.
+- **Layout** is set by side (left/right/above/below), not by dragging displays in millimetres.
+- **Video:** H.264 needs a build with `--features video` (FFmpeg 9 on Linux; built in on the Mac);
+  without it everything is lossless tiles, which is fine on a wired LAN but heavy for full-screen
+  video over Wi-Fi.
+
