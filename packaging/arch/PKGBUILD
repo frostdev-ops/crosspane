@@ -1,0 +1,54 @@
+# Arch / AUR package for Crosspane (05 "Packaging"). Builds the agent and crosspanectl from git
+# and installs the systemd user unit. While the repository is private, build it locally:
+#   cd packaging/arch && makepkg -si
+pkgname=crosspane-git
+pkgver=r0.0000000
+pkgrel=1
+pkgdesc="One keyboard and mouse, and projected windows, across your Mac and Hyprland machines"
+arch=('x86_64' 'aarch64')
+url="https://github.com/frostdev-ops/crosspane"
+license=('GPL-3.0-or-later')
+depends=('dbus' 'ffmpeg' 'libxkbcommon' 'vulkan-icd-loader' 'wayland')
+makedepends=('cargo' 'clang' 'git')
+optdepends=('hyprland: the supported Linux desktop'
+            'waybar: shows the tray icon'
+            'walker: menu for crosspanectl pick (or fuzzel, wofi, rofi)')
+provides=('crosspane')
+conflicts=('crosspane')
+source=("crosspane::git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd crosspane
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd crosspane
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd crosspane
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p crosspane-agent -p crosspanectl
+}
+
+check() {
+  cd crosspane
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release -p crosspane-input -p crosspane-protocol -p crosspane-engine
+}
+
+package() {
+  cd crosspane
+  install -Dm755 target/release/crosspane-agent "$pkgdir/usr/bin/crosspane-agent"
+  install -Dm755 target/release/crosspanectl "$pkgdir/usr/bin/crosspanectl"
+  sed 's|%h/.local/bin/crosspane-agent|/usr/bin/crosspane-agent|' \
+    packaging/linux/crosspane-agent.service \
+    | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/crosspane-agent.service"
+  install -Dm644 docs/running.md "$pkgdir/usr/share/doc/crosspane/running.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
