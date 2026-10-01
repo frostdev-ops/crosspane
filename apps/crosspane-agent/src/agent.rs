@@ -764,6 +764,7 @@ impl Agent {
                 size,
             } => {
                 let id = self.proxy_ids.open(key);
+                let title = self.badged(key.source, &title);
                 self.titles.insert(key, (title.clone(), 0));
                 let sent = self
                     .host
@@ -806,6 +807,7 @@ impl Agent {
                 }
             }
             Output::ProxyTitle { key, title } => {
+                let title = self.badged(key.source, &title);
                 if let Some(entry) = self.titles.get_mut(&key) {
                     entry.0.clone_from(&title);
                 }
@@ -1471,6 +1473,16 @@ impl Agent {
     }
 
     /// The opt-in latency overlay: frame rate and latency in each projected window's title.
+    /// A proxy's title starts with its source machine's name (04 §5: a projected window always
+    /// says where it comes from; the window title is drawn by this OS, not by the remote content).
+    fn badged(&self, source: NodeId, title: &str) -> String {
+        let from = self
+            .peers
+            .get(&source)
+            .map_or_else(|| source.short(), |info| info.name.clone());
+        format!("{from} › {title}")
+    }
+
     fn latency_titles(&mut self) {
         let keys: Vec<ProjectionKey> = self.titles.keys().copied().collect();
         for key in keys {
