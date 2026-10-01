@@ -44,6 +44,21 @@ impl std::fmt::Debug for Platform {
     }
 }
 
+/// Run `f` on a short-lived worker thread and wait for it. Mac parking refuses the main thread (its
+/// waits need the main queue); at startup nothing needs that queue, since twin displays died with
+/// the previous process and restoring a frame is Accessibility only.
+#[cfg(target_os = "macos")]
+fn off_main<T: Send>(
+    f: impl FnOnce() -> Result<T, PlatformError> + Send,
+) -> Result<T, PlatformError> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(f)
+            .join()
+            .unwrap_or_else(|_| Err(PlatformError::Backend("parking recovery panicked".into())))
+    })
+}
+
 /// The OS key store alone, for commands that need the identity but must not start the backends
 /// (starting them recovers parked windows, which would undo a running agent's projections).
 #[cfg(target_os = "linux")]
@@ -197,7 +212,7 @@ pub fn create(
                 )));
             }
             (Some(mut twin), mirror) => {
-                if let Err(e) = twin.recover() {
+                if let Err(e) = off_main(|| twin.recover()) {
                     tracing::error!(error = %e, "could not restore windows parked on virtual displays");
                 }
                 parking = mirror;
@@ -211,7 +226,7 @@ pub fn create(
             "mac_virtual_display needs a build with the private-vdisplay feature; mirroring (M1)"
         );
     }
-    if let Some(Err(e)) = parking.as_mut().map(|p| p.recover()) {
+    if let Some(Err(e)) = parking.as_mut().map(|p| off_main(|| p.recover())) {
         tracing::error!(error = %e, "could not restore parked windows");
     }
     let windows = optional("windows", MacWindows::new());
