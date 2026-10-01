@@ -4,6 +4,7 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod audio;
 pub mod capture;
 pub mod clock;
 pub mod displays;
