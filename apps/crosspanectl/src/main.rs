@@ -603,8 +603,11 @@ fn print_status(s: &Value) {
             .as_f64()
             .map(|r| format!("{r:.2} ms"))
             .unwrap_or_else(|| "-".into());
+        let link = p["link"]
+            .as_str()
+            .map_or_else(String::new, |link| format!("  link {link}"));
         println!(
-            "  peer {} ({})  {}  rtt {}",
+            "  peer {} ({})  {}  rtt {}{link}",
             p["name"].as_str().unwrap_or("?"),
             short(&p["node"]),
             if p["connected"] == json!(true) {

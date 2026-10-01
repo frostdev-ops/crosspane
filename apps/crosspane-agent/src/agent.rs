@@ -13,8 +13,8 @@ use crosspane_engine::{
 };
 use crosspane_input::arrange::{self, Side};
 use crosspane_platform::{
-    CaptureEvent, EventSink, FrameEvent, OverlayEvent, Permission, PermissionState, PlatformError,
-    StreamId, WindowEvent,
+    CaptureEvent, EventSink, FrameEvent, LinkClass, OverlayEvent, Permission, PermissionState,
+    PlatformError, StreamId, WindowEvent,
 };
 use crosspane_protocol::link::{LinkEvent, PeerLink};
 use crosspane_protocol::msg::{Capability, ControlMessage, Placement, Refusal, RevocationNotice};
@@ -48,6 +48,8 @@ pub enum Event {
     Tray(crosspane_platform::TrayEvent),
     /// mDNS discovery saw a change (WP-1.6).
     Discovery(crosspane_transport::discovery::DiscoveryEvent),
+    /// The network interfaces changed (WP-1.7/1.8).
+    Links(Vec<crosspane_platform::Interface>),
 }
 
 /// What the loop knows about a peer.
@@ -109,6 +111,11 @@ pub struct Agent {
     /// at the last readout.
     latency_overlay: bool,
     titles: HashMap<ProjectionKey, (String, u64)>,
+    /// This node's interfaces, and the link class of the path to each connected peer (03 §2).
+    interfaces: Vec<crosspane_platform::Interface>,
+    paths: HashMap<NodeId, LinkClass>,
+    /// `config.video_mbps`: `None` picks the bitrate from the path's link class.
+    video_mbps: Option<u32>,
     /// Clock samples per peer, (round trip, offset) in ns, from the ping exchange.
     clocks: HashMap<NodeId, VecDeque<(u64, i64)>>,
     last_ping: Instant,
@@ -129,6 +136,7 @@ pub struct E2Wiring {
     /// `config.crossing`.
     pub crossing: bool,
     pub latency_overlay: bool,
+    pub video_mbps: Option<u32>,
     pub identity: Arc<crosspane_security::identity::DeviceIdentity>,
     pub port: u16,
     pub revocations: crate::revocations::Issued,
@@ -139,6 +147,8 @@ const HOUSEKEEPING: Duration = Duration::from_secs(1);
 /// Clock-offset pings to every peer (for frame latency).
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const CLOCK_SAMPLES: usize = 8;
+/// Above this smoothed RTT a "wired" path has a slower hop on the way (usually the peer's Wi-Fi).
+const WIRED_RTT: Duration = Duration::from_millis(3);
 const PERMISSION_CHECK: Duration = Duration::from_secs(2);
 /// How long a browse or pull waits for the peer's answer.
 const BROWSE_WAIT: Duration = Duration::from_secs(5);
@@ -180,16 +190,42 @@ impl TrayState {
 }
 
 /// A candidate's addresses, best first: IPv4, then global IPv6, then link-local IPv6 (at most 3).
-fn dial_order(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
-    let rank = |a: &SocketAddr| match a {
+fn family_rank(a: &SocketAddr) -> u8 {
+    match a {
         SocketAddr::V4(_) => 0,
         SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() => 2,
         SocketAddr::V6(_) => 1,
+    }
+}
+
+fn class_rank(class: LinkClass) -> u8 {
+    match class {
+        LinkClass::DirectUsb4Tb => 0,
+        LinkClass::DirectEthernet => 1,
+        LinkClass::Lan => 2,
+        LinkClass::Wifi => 3,
+        _ => 4,
+    }
+}
+
+/// The class of the local interface the OS would send to `remote` from: a connected UDP socket
+/// learns its source address without sending anything.
+fn local_class(interfaces: &[crosspane_platform::Interface], remote: SocketAddr) -> LinkClass {
+    let unspecified: SocketAddr = match remote {
+        SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
     };
-    let mut sorted = addrs.to_vec();
-    sorted.sort_by_key(rank);
-    sorted.truncate(3);
-    sorted
+    let source = std::net::UdpSocket::bind(unspecified)
+        .and_then(|socket| socket.connect(remote).map(|()| socket))
+        .and_then(|socket| socket.local_addr())
+        .map(|local| local.ip());
+    let Ok(source) = source else {
+        return LinkClass::Unknown;
+    };
+    interfaces
+        .iter()
+        .find(|i| i.addrs.contains(&source))
+        .map_or(LinkClass::Unknown, |i| i.class)
 }
 
 /// A window as one menu line: "title — app", shortened.
@@ -267,6 +303,9 @@ impl Agent {
             events: e2.events,
             crossing: e2.crossing,
             latency_overlay: e2.latency_overlay,
+            interfaces: Vec::new(),
+            paths: HashMap::new(),
+            video_mbps: e2.video_mbps,
             titles: HashMap::new(),
             clocks: HashMap::new(),
             last_ping: Instant::now(),
@@ -339,6 +378,10 @@ impl Agent {
             // `run` stops the loop for this one.
             Event::Shutdown => {}
             Event::Discovery(event) => self.on_discovery(event),
+            Event::Links(interfaces) => {
+                self.interfaces = interfaces;
+                self.update_paths();
+            }
             Event::Tray(crosspane_platform::TrayEvent::Chosen(id)) => {
                 if let Some(action) = self.tray.actions.get(&id).cloned() {
                     self.tray_action(action);
@@ -393,6 +436,7 @@ impl Agent {
                     if let Some(link) = self.net.link(peer) {
                         self.links.insert(peer, link);
                     }
+                    self.update_paths();
                     self.feed(Input::PeerUp { peer });
                     self.feed(Input::PeerDisplays {
                         peer,
@@ -657,6 +701,7 @@ impl Agent {
                         peer,
                         video: has("h264"),
                         cursor: has("cursor"),
+                        bits_per_second: self.video_bits(peer),
                     });
                 }
                 self.pending
@@ -1190,7 +1235,7 @@ impl Agent {
             DiscoveryEvent::Found(candidate) => {
                 let fresh = !self.candidates.contains_key(&candidate.instance);
                 if self.paired_peer_offline() && fresh {
-                    for addr in dial_order(&candidate.addrs) {
+                    for addr in self.dial_order(&candidate.addrs) {
                         self.net.dial_once(addr);
                     }
                 }
@@ -1235,7 +1280,7 @@ impl Agent {
                     .candidates
                     .values()
                     .take(16)
-                    .flat_map(|c| dial_order(&c.addrs))
+                    .flat_map(|c| self.dial_order(&c.addrs))
                     .collect();
                 for addr in addrs {
                     self.net.dial_once(addr);
@@ -1250,7 +1295,7 @@ impl Agent {
             .values()
             .filter_map(|c| {
                 let name = c.pairing_name.clone()?;
-                let addr = dial_order(&c.addrs).into_iter().next()?;
+                let addr = self.dial_order(&c.addrs).into_iter().next()?;
                 Some((name, addr))
             })
             .collect()
@@ -1260,6 +1305,61 @@ impl Agent {
         self.peers
             .get(&node)
             .map_or_else(|| node.short(), |info| info.name.clone())
+    }
+
+    /// The link class of each connected peer's current path (03 §2): the interface the OS routes
+    /// the peer's address through.
+    fn update_paths(&mut self) {
+        let mut paths = HashMap::new();
+        for (peer, link) in &self.links {
+            if let Some(remote) = link.remote_addr() {
+                let mut class = local_class(&self.interfaces, remote);
+                // Each end sees only its own interface: a wired one here may meet Wi-Fi on the
+                // peer's side. A wired path answers in well under a millisecond, so measured RTT
+                // refines the class (03 §2).
+                if matches!(
+                    class,
+                    LinkClass::Lan | LinkClass::DirectEthernet | LinkClass::DirectUsb4Tb
+                ) && link.rtt().is_some_and(|rtt| rtt > WIRED_RTT)
+                {
+                    class = LinkClass::Wifi;
+                }
+                paths.insert(*peer, class);
+            }
+        }
+        for (peer, class) in &paths {
+            if self.paths.get(peer) != Some(class) {
+                tracing::info!(peer = %peer.short(), link = ?class, "path to peer");
+            }
+        }
+        self.paths = paths;
+    }
+
+    /// The video bitrate for streams to `peer`: the configured one, or one for its link class
+    /// (03 §7.4).
+    fn video_bits(&self, peer: NodeId) -> u32 {
+        let mbps = self
+            .video_mbps
+            .unwrap_or_else(|| match self.paths.get(&peer) {
+                Some(LinkClass::DirectUsb4Tb | LinkClass::DirectEthernet) => 150,
+                Some(LinkClass::Lan) => 50,
+                _ => 20,
+            });
+        mbps.saturating_mul(1_000_000)
+    }
+
+    /// Candidate addresses, best first: by the link class of the local interface they route
+    /// through (faster links first), then IPv4 before global IPv6 before link-local. At most 3.
+    fn dial_order(&self, addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut sorted = addrs.to_vec();
+        sorted.sort_by_key(|a| {
+            (
+                class_rank(local_class(&self.interfaces, *a)),
+                family_rank(a),
+            )
+        });
+        sorted.truncate(3);
+        sorted
     }
 
     /// An NTP-style sample: the peer's clock minus ours is ((t1 - t0) + (t2 - t3)) / 2. The
@@ -1319,6 +1419,7 @@ impl Agent {
             self.last_ping = Instant::now();
             let t0 = platform::now().as_nanos();
             self.broadcast(&ControlMessage::Ping { t0 });
+            self.update_paths();
         }
         if self.latency_overlay {
             self.latency_titles();
@@ -2025,6 +2126,7 @@ impl Agent {
             "name": self.name,
             "listening": self.net.local_addr().to_string(),
             "gate_open": self.platform.gate.is_open(),
+            "armed": self.engine.armed(),
             "session": format!("{:?}", self.platform.session.state()),
             "backends": format!("{:?}", self.platform),
             "permissions": self.platform.permissions.required().into_iter().map(|p| {
@@ -2037,6 +2139,7 @@ impl Agent {
                 "name": info.name,
                 "connected": info.connected,
                 "rtt_ms": info.rtt.map(|r| r.as_secs_f64() * 1000.0),
+                "link": self.paths.get(node).map(|c| format!("{c:?}")),
                 "displays": info.displays.iter().map(display_json).collect::<Vec<_>>(),
                 "features": info.features,
                 "grants": self.trust.with(|t| t.peers().iter().find(|e| e.node == *node).map(|e| {
@@ -2179,6 +2282,15 @@ pub fn subscribe_platform(platform: &mut Platform, tx: &Sender<Event>) {
         })) {
             tracing::warn!(error = %e, "overlay events unavailable");
             platform.overlay = None;
+        }
+    }
+    if let Some(links) = &mut platform.links {
+        let links_tx = sink(tx);
+        if let Err(e) = links.subscribe(std::sync::Arc::new(move |interfaces| {
+            let _ = links_tx.send(Event::Links(interfaces));
+        })) {
+            tracing::warn!(error = %e, "network interface updates unavailable");
+            platform.links = None;
         }
     }
     if let Some(tray) = &mut platform.tray {

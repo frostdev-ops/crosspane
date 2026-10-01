@@ -146,6 +146,8 @@ pub enum SourceCmd {
         video: bool,
         /// The peer shows cursor shapes (it advertised `cursor`).
         cursor: bool,
+        /// Video bitrate for this stream (from the path's link class, 03 §7.4).
+        bits_per_second: u32,
     },
     Frame {
         stream: StreamId,
@@ -179,6 +181,7 @@ struct Encoding {
     last_at: Instant,
     /// The peer shows cursor shapes.
     peer_cursor: bool,
+    bits_per_second: u32,
     /// The newest cursor the capture reported, and whether the peer still needs it.
     cursor: Option<Shape>,
     cursor_dirty: bool,
@@ -189,7 +192,6 @@ struct Encoding {
 #[derive(Clone)]
 pub struct VideoSetup {
     pub codecs: Option<Arc<dyn VideoCodecs>>,
-    pub bits_per_second: u32,
 }
 
 /// Start the encoder thread; capture sinks and the engine loop send it `SourceCmd`s.
@@ -225,6 +227,7 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                 peer,
                 video: peer_video,
                 cursor: peer_cursor,
+                bits_per_second,
             } => {
                 let cursor = early_cursors.remove(&stream);
                 streams.insert(
@@ -241,6 +244,7 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                         last: None,
                         last_at: Instant::now(),
                         peer_cursor,
+                        bits_per_second,
                         cursor_dirty: cursor.is_some(),
                         cursor,
                         cursor_seq: 0,
@@ -413,7 +417,7 @@ fn send_video(
     if enc.video.is_none() {
         let codecs = video.codecs.as_ref().ok_or("no video codecs")?;
         let encoder = codecs
-            .encoder(frame.size, video.bits_per_second, 60)
+            .encoder(frame.size, enc.bits_per_second, 60)
             .map_err(|e| e.to_string())?;
         tracing::info!(encoder = encoder.name(), "video on");
         enc.video = Some(encoder);

@@ -28,6 +28,8 @@ pub struct Platform {
     pub frames: Option<Box<dyn FrameCapture>>,
     /// The tray / menu-bar icon (WP-1.34).
     pub tray: Option<Box<dyn TrayHost>>,
+    /// Network interfaces and their link class (WP-1.7/1.8, 03 §2).
+    pub links: Option<Box<dyn crosspane_platform::LinkInfo>>,
 }
 
 impl std::fmt::Debug for Platform {
@@ -190,6 +192,9 @@ pub fn create(
         windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
         parking: parking.map(|p| Box::new(p) as Box<dyn WindowParking>),
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
+        links: Some(Box::new(
+            crosspane_platform_linux::link::SysfsLinkInfo::new(),
+        )),
         tray: optional("tray", crosspane_platform_linux::tray::SniTray::new())
             .map(|t| Box::new(t) as Box<dyn TrayHost>),
         gate,
@@ -278,6 +283,7 @@ pub fn create(
         parking,
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
         tray: Some(Box::new(crosspane_platform_macos::tray::MacTray::new())),
+        links: Some(Box::new(crosspane_platform_macos::link::MacLinkInfo::new())),
         gate,
     })
 }
