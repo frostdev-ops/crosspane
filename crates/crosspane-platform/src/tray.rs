@@ -48,7 +48,10 @@ pub enum TrayItem {
     },
     Separator,
     /// A nested menu. An empty one is shown disabled.
-    Submenu { label: String, items: Vec<TrayItem> },
+    Submenu {
+        label: String,
+        items: Vec<TrayItem>,
+    },
 }
 
 /// The whole tray: icon state, tooltip and menu.
