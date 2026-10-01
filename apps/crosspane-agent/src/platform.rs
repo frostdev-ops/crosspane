@@ -187,6 +187,10 @@ pub fn exit_deadline(after: std::time::Duration) {
         });
 }
 
+/// The border a Hyprland window wears while it is mirrored to another machine (04 §5).
+#[cfg(target_os = "linux")]
+const MIRROR_BORDER: &str = "rgb(ff8800)";
+
 #[cfg(target_os = "linux")]
 pub fn create(
     state_dir: &std::path::Path,
@@ -195,8 +199,8 @@ pub fn create(
     use anyhow::Context;
     use crosspane_platform_linux::hyprland::{
         capture::HyprlandCapture, displays::HyprlandDisplays, frame_capture::HyprlandFrameCapture,
-        hotkeys::HyprlandHotkeys, inject, ipc::HyprIpc, overlay::HyprlandOverlay,
-        parking::HyprlandParking, windows::HyprlandWindows,
+        hotkeys::HyprlandHotkeys, inject, ipc::HyprIpc, mirror::HyprlandMirrorParking,
+        overlay::HyprlandOverlay, parking::HyprlandParking, windows::HyprlandWindows,
     };
     use crosspane_platform_linux::{logind::LogindSession, permissions::LinuxPermissions};
 
@@ -207,13 +211,24 @@ pub fn create(
         .context("logind session state (required: Crosspane fails closed without it)")?;
     let displays = HyprlandDisplays::new(ipc.clone()).context("Hyprland displays")?;
     // No window is lost (04 §8 invariant 4): undo a previous run's parking before anything else.
-    let mut parking = optional(
+    // Windows go on twin outputs (M2); where those can't be made, they are mirrored in place with
+    // a marked border (M1, the reported fallback).
+    let mut twin = optional(
         "parking",
         HyprlandParking::new(ipc.clone(), state_dir.join("parking.json")),
     );
-    if let Some(parking) = &mut parking {
-        use crosspane_platform::WindowParking as _;
-        match parking.recover() {
+    let mut mirror = optional(
+        "mirror parking",
+        HyprlandMirrorParking::new(ipc.clone(), state_dir.join("mirror.json"), MIRROR_BORDER),
+    );
+    for backend in [
+        twin.as_mut().map(|p| p as &mut dyn WindowParking),
+        mirror.as_mut().map(|p| p as &mut dyn WindowParking),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match backend.recover() {
             Ok(restored) if !restored.is_empty() => {
                 tracing::warn!(
                     count = restored.len(),
@@ -224,6 +239,15 @@ pub fn create(
             Err(e) => tracing::error!(error = %e, "could not restore parked windows"),
         }
     }
+    let parking: Option<Box<dyn WindowParking>> = match (twin, mirror) {
+        (Some(twin), Some(mirror)) => Some(Box::new(crate::twin::TwinOrMirror::new(
+            Box::new(twin),
+            Box::new(mirror),
+        ))),
+        (Some(twin), None) => Some(Box::new(twin)),
+        (None, Some(mirror)) => Some(Box::new(mirror)),
+        (None, None) => None,
+    };
     let windows = optional("windows", HyprlandWindows::new(ipc.clone()));
     let frames = optional(
         "frame capture",
@@ -257,7 +281,7 @@ pub fn create(
         keystore: keystore(),
         permissions: Box::new(LinuxPermissions),
         windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
-        parking: parking.map(|p| Box::new(p) as Box<dyn WindowParking>),
+        parking,
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
         links: Some(Box::new(
             crosspane_platform_linux::link::SysfsLinkInfo::new(),

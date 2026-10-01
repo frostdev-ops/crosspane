@@ -654,12 +654,12 @@ impl Agent {
                 scale,
             } => {
                 let result = match &mut self.platform.parking {
-                    Some(p) => p.park(window, size, scale).map_err(failure),
+                    Some(p) => p.park(window, size, scale).map_err(|error| {
+                        tracing::warn!(%error, "parking failed");
+                        failure(error)
+                    }),
                     None => Err(Failure::Other),
                 };
-                if let Err(f) = &result {
-                    tracing::warn!(failure = ?f, "parking failed");
-                }
                 self.pending.push_back(Input::Parked { window, result });
             }
             Output::ResizeParked {
@@ -668,7 +668,10 @@ impl Agent {
                 scale,
             } => {
                 let result = match &mut self.platform.parking {
-                    Some(p) => p.resize(window, size, scale).map_err(failure),
+                    Some(p) => p.resize(window, size, scale).map_err(|error| {
+                        tracing::warn!(%error, "resizing a parked window failed");
+                        failure(error)
+                    }),
                     None => Err(Failure::Other),
                 };
                 self.pending.push_back(Input::Parked { window, result });

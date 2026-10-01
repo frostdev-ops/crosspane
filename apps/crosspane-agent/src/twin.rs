@@ -1,7 +1,8 @@
-//! Mac window parking with the opt-in virtual display (D7, `mac_virtual_display`): park on a
-//! private-API twin display (M2) when it can be made, and mirror in place (M1, the reported
-//! fallback) when it can't, e.g. because the API changed (`Unsupported`). Each window stays with
-//! the backend that parked it until it is restored.
+//! Window parking on a twin display (M2) when one can be made, and mirror in place (M1, the
+//! reported fallback) when it can't (`Unsupported`): on the Mac the opt-in private-API virtual
+//! display (D7, `mac_virtual_display`) may be missing; on Hyprland a headless output may fail to
+//! allocate (a nested Hyprland always does). Each window stays with the backend that parked it
+//! until it is restored.
 
 use std::collections::BTreeSet;
 
@@ -45,10 +46,7 @@ impl WindowParking for TwinOrMirror {
         }
         match self.twin.park(window, size, scale) {
             Err(PlatformError::Unsupported(why)) => {
-                tracing::warn!(
-                    why,
-                    "no virtual display: this window is mirrored instead (M1)"
-                );
+                tracing::warn!(why, "no twin display: this window is mirrored instead (M1)");
                 let parked = self.mirror.park(window, size, scale)?;
                 self.mirrored.insert(window);
                 Ok(parked)

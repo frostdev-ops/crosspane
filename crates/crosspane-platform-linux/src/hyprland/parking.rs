@@ -318,14 +318,23 @@ impl WindowParking for HyprlandParking {
                 "hl.workspace_rule({{ workspace = \"name:{}\", monitor = \"{}\", default = true, gaps_in = 0, gaps_out = 0, border_size = 0, no_rounding = true, no_shadow = true, decorate = false }})",
                 entry.workspace, entry.output
             ))?;
-            if self.monitor(&entry.output)?.is_none() {
-                expect_ok(
-                    &self
-                        .ipc
-                        .request(&format!("output create headless {}", entry.output))?,
-                )?;
+            // A twin that can't be brought up (a nested Hyprland can't allocate headless
+            // outputs) means M2 is unavailable here: `Unsupported`, so the agent mirrors the
+            // window instead (M1, the reported fallback).
+            let twin = (|| {
+                if self.monitor(&entry.output)?.is_none() {
+                    expect_ok(
+                        &self
+                            .ipc
+                            .request(&format!("output create headless {}", entry.output))?,
+                    )?;
+                }
+                self.set_mode(&entry, size, scale)
+            })();
+            if let Err(error) = twin {
+                tracing::warn!(%error, output = entry.output, "no twin output");
+                return Err(PlatformError::Unsupported("twin output unavailable"));
             }
-            self.set_mode(&entry, size, scale)?;
             if entry.original.fullscreen != 0 {
                 self.ipc.dispatch(&format!(
                     "hl.dsp.window.fullscreen({{ window = \"address:{address}\", action = \"unset\" }})"

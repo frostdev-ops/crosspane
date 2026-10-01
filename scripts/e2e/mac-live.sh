@@ -64,9 +64,12 @@ e2() {
   read -r at size address <<< "$(proxy)"
   echo "ok: proxy $size at $at"
   crosspanectl status | grep -A1 "showing window" | sed 's/^/   /'
-  grim -g "$at $size" "$work/proxy.png"
-  cargo run -q -p crosspane-testapp -- pattern --size "$size" --out "$work/pattern.ppm"
-  python3 - "$work/proxy.png" "$work/pattern.ppm" <<'PY'
+  # The decoded picture (before drawing: the proxy's node-coloured edge isn't in it).
+  proj=$(crosspanectl status | awk '/^  projection / && /showing window/ {split($2, k, ":"); print k[2]; exit}')
+  snap=$(crosspanectl snapshot macbook "$proj")
+  read -r _ snapw snaph < <(head -c 64 "$snap" | tr -s ' \n' ' ' | cut -d' ' -f1-3)
+  cargo run -q -p crosspane-testapp -- pattern --size "${snapw}x${snaph}" --out "$work/pattern.ppm"
+  python3 - "$snap" "$work/pattern.ppm" <<'PY'
 import sys
 from PIL import Image, ImageChops
 shot = Image.open(sys.argv[1]).convert("RGB")
@@ -81,7 +84,12 @@ PY
   # Type into the proxy: focus it, then a few letters (no Enter).
   hyprctl dispatch "hl.dsp.focus({window=\"address:$address\"})" >/dev/null 2>&1 || true
   sleep 0.5
-  { for k in 35 18 38 38 24; do echo "key $k down"; echo "sleep 20"; echo "key $k up"; echo "sleep 20"; done; echo "sleep 300"; } | vinput
+  # Type only into the proxy: if anything else has focus, the letters would land there.
+  if [ "$(hyprctl -j activewindow | jq -r .address)" = "$address" ]; then
+    { for k in 35 18 38 38 24; do echo "key $k down"; echo "sleep 20"; echo "key $k up"; echo "sleep 20"; done; echo "sleep 300"; } | vinput
+  else
+    echo "note: the proxy didn't take focus; not typing"
+  fi
   sleep 1
   local keys
   keys=$(mac "grep -c event...key /tmp/cp-e2test.events 2>/dev/null || true")

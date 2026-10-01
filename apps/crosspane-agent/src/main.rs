@@ -12,10 +12,12 @@ mod platform;
 mod revocations;
 mod tray;
 mod trust;
-// Twin-or-mirror parking is used only by macOS builds with `private-vdisplay`; its tests run
-// everywhere.
+// Twin-or-mirror parking: Hyprland, and macOS builds with `private-vdisplay`.
 #[cfg_attr(
-    not(all(target_os = "macos", feature = "private-vdisplay")),
+    not(any(
+        target_os = "linux",
+        all(target_os = "macos", feature = "private-vdisplay")
+    )),
     allow(dead_code)
 )]
 mod twin;
