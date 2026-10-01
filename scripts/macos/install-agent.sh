@@ -3,7 +3,10 @@
 # Run from the repository on the Mac, in a login shell. Re-running upgrades in place; macOS
 # permissions stay granted because the signing identity and bundle ID don't change.
 #
-#   scripts/macos/install-agent.sh [--features private-vdisplay]
+#   scripts/macos/install-agent.sh [--features private-vdisplay,video]
+#
+# Without `video` the agent has no H.264: it neither offers nor accepts video, and every projection
+# to or from this Mac falls back to lossless tiles.
 set -euo pipefail
 repo=$(cd -- "${BASH_SOURCE[0]%/*}/../.." && pwd -P)
 cd "$repo"

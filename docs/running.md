@@ -77,8 +77,8 @@ machine whose keyboard you use. Changes to `config.toml` apply after `crosspanec
 
   Logs: `journalctl --user -u crosspane-agent`. Without systemd, run `crosspane-agent run`
   inside the Hyprland session.
-- **Mac:** `scripts/macos/install-agent.sh` (add `--features private-vdisplay` for the D7
-  window hiding) builds, signs and installs `~/Applications/Crosspane.app` (with the settings app
+- **Mac:** `scripts/macos/install-agent.sh --features video` (add `private-vdisplay`, i.e.
+  `--features private-vdisplay,video`, for the D7 window hiding) builds, signs and installs `~/Applications/Crosspane.app` (with the settings app
   inside), starts it at login (LaunchAgent `io.frostdev.crosspane.agent`) and puts `crosspanectl`
   in `~/.cargo/bin`. Logs: `~/Library/Logs/Crosspane/agent.log`. Re-run it to upgrade.
 - **Arch:** `packaging/arch/PKGBUILD` builds all three and installs the user unit and a
