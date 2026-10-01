@@ -13,6 +13,7 @@
 
 mod hub;
 mod link;
+pub mod pairing;
 mod session;
 mod tls;
 
