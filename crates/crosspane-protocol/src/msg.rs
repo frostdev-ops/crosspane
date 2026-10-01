@@ -1,5 +1,6 @@
 //! The logical message model. Field meanings are frozen; encodings live in [`crate::wire`].
 
+use crosspane_types::audio::{AudioKind, AudioStreamId};
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{PointDevice, PointMm};
 use crosspane_types::hid::{HidUsage, MouseButton};
@@ -128,9 +129,14 @@ pub enum ControlMessage {
         lock_keys: LockKeys,
     },
     /// Target → controller: the session is accepted; input may flow.
-    ControlStarted { session: SessionId },
+    ControlStarted {
+        session: SessionId,
+    },
     /// Target → controller: the session is refused.
-    ControlRefused { session: SessionId, reason: Refusal },
+    ControlRefused {
+        session: SessionId,
+        reason: Refusal,
+    },
     /// Either side: the session is over. The target releases everything it injected for it.
     EndControl {
         session: SessionId,
@@ -141,13 +147,37 @@ pub enum ControlMessage {
     /// A signed revocation of a lost or stolen device (04 §4).
     Revocation(RevocationNotice),
     /// Clock-offset estimation (03 §8): the receiver answers with `Pong`.
-    Ping { t0: u64 },
+    Ping {
+        t0: u64,
+    },
     /// `t0` echoed; `t1` = receive time and `t2` = send time on the responder's clock (ns).
-    Pong { t0: u64, t1: u64, t2: u64 },
+    Pong {
+        t0: u64,
+        t1: u64,
+        t2: u64,
+    },
     /// The sender is about to close the connection; `message` is for logs and UI.
-    Goodbye { message: String },
+    Goodbye {
+        message: String,
+    },
     /// E2 window projection (docs/wp/E2-v0.md).
     Projection(crate::projection::ProjectionMessage),
+    /// D8: feature-negotiated audio; channels must equal kind.format().channels.
+    AudioOpen {
+        stream: AudioStreamId,
+        kind: AudioKind,
+        channels: u8,
+    },
+    AudioOpened {
+        stream: AudioStreamId,
+    },
+    AudioRefused {
+        stream: AudioStreamId,
+        reason: Refusal,
+    },
+    AudioClose {
+        stream: AudioStreamId,
+    },
 }
 
 /// Why an E1 session ended.
@@ -203,6 +233,10 @@ pub enum Capability {
     WindowBrowse,
     /// The peer may open proxy windows here.
     WindowPresent,
+    /// The peer may play sound on this node's default speakers. Default off.
+    AudioSpeaker,
+    /// The peer may capture this node's default microphone. Default off.
+    AudioMic,
 }
 
 /// "Node `issuer` revokes `revoked`" (04 §4), signed by the issuer's device key over

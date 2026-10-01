@@ -46,7 +46,7 @@ jobs:
           tool: cargo-nextest,cargo-deny
       - name: Install system libraries
         # libxkbcommon for the Hyprland backends; lavapipe for the software-GPU render tests.
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev pkg-config mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libopus-dev libpipewire-0.3-dev libclang-dev pkg-config cmake mesa-vulkan-drivers
       - name: Check formatting
         run: cargo fmt --check
       - name: Check lints
@@ -89,6 +89,10 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest,cargo-deny
+      - name: Locate system Opus
+        run: |
+          test -f "$(brew --prefix opus)/lib/libopus.dylib"
+          echo "OPUS_LIB_DIR=$(brew --prefix opus)" >> "$GITHUB_ENV"
       - name: Check formatting
         run: cargo fmt --check
       - name: Check lints
@@ -137,6 +141,10 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest,cargo-deny
+      - name: Locate system Opus
+        run: |
+          test -f "$(brew --prefix opus)/lib/libopus.dylib"
+          echo "OPUS_LIB_DIR=$(brew --prefix opus)" >> "$GITHUB_ENV"
       - name: Check formatting
         run: cargo fmt --check
       - name: Check lints

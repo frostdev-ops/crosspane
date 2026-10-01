@@ -27,6 +27,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod audio;
 pub mod capture;
 pub mod display;
 pub mod error;
@@ -42,6 +43,10 @@ pub mod sink;
 pub mod tray;
 pub mod window;
 
+pub use audio::{
+    AudioCapture, AudioDeviceError, AudioEvent, AudioFormat, AudioHost, AudioKind, AudioPlayback,
+    AudioStop, VirtualPorts,
+};
 pub use capture::{
     CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, Edge, EndReason,
     InputCapture, MotionKind, PortalId,

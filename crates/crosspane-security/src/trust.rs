@@ -292,6 +292,8 @@ mod grants_serde {
                 Capability::WindowShare => Ok("WindowShare"),
                 Capability::WindowBrowse => Ok("WindowBrowse"),
                 Capability::WindowPresent => Ok("WindowPresent"),
+                Capability::AudioSpeaker => Ok("AudioSpeaker"),
+                Capability::AudioMic => Ok("AudioMic"),
                 _ => Err(serde::ser::Error::custom("unknown capability")),
             })
             .collect();
@@ -309,6 +311,8 @@ mod grants_serde {
                 "WindowShare" => Ok(Capability::WindowShare),
                 "WindowBrowse" => Ok(Capability::WindowBrowse),
                 "WindowPresent" => Ok(Capability::WindowPresent),
+                "AudioSpeaker" => Ok(Capability::AudioSpeaker),
+                "AudioMic" => Ok(Capability::AudioMic),
                 _ => Err(serde::de::Error::custom("unknown capability")),
             })
             .collect()

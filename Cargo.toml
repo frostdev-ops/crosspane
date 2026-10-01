@@ -31,6 +31,10 @@ aws-lc-rs = "1.18.1"
 clap = { version = "4.6.7", features = ["derive"] }
 euclid = { version = "0.22.14", features = ["serde"] }
 font8x8 = "0.3.1"
+opus = "=0.3.1"
+audiopus_sys = { version = "=0.2.2", features = ["dynamic"] }
+pipewire = "=0.10.1"
+rtrb = "=0.4.0"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 pollster = "1.0.1"
 proptest = "1.11.0"

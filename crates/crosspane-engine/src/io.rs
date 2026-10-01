@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crosspane_platform::{
-    CaptureEvent, CaptureId, CapturePortal, CaptureStart, CaptureTarget, HotkeyEvent, Overlay,
-    OverlayEvent, OverlayId, Parked, PortalId, SessionEvent, StreamEndReason, StreamId,
+    AudioEvent, CaptureEvent, CaptureId, CapturePortal, CaptureStart, CaptureTarget, HotkeyEvent,
+    Overlay, OverlayEvent, OverlayId, Parked, PortalId, SessionEvent, StreamEndReason, StreamId,
     WindowEvent,
 };
 use crosspane_protocol::link::LinkEvent;
@@ -13,6 +13,7 @@ use crosspane_protocol::msg::{
     Capability, ControlMessage, InputMessage, Placement, PointerMessage, Refusal,
 };
 use crosspane_protocol::projection::{BrowsableWindow, ParkingKind, ProjectionEndReason};
+use crosspane_types::audio::{AudioKind, AudioStreamId};
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{PixelRect, PixelSize, PointDevice};
 use crosspane_types::hid::{HidUsage, MouseButton};
@@ -96,6 +97,25 @@ pub struct ProjectionKey {
     pub projection: ProjectionId,
 }
 
+/// Identifies one audio session on an authenticated connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AudioKey {
+    pub peer: NodeId,
+    pub stream: AudioStreamId,
+    /// Local monotonically increasing admission generation; never reused, including reconnects.
+    /// Not sent on the wire. Async callbacks and device handles must retain the complete key.
+    pub generation: u64,
+}
+
+/// Which PCM endpoint the agent binds to the codec/network worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AudioEndpoint {
+    VirtualSpeaker,
+    VirtualMicrophone,
+    LocalCapture,
+    LocalPlayback,
+}
+
 /// What happened on a proxy window (E2 destination).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -134,6 +154,20 @@ pub enum ProxyEvent {
 pub enum Input {
     /// A timer fired: deliver at or after [`crate::Engine::next_deadline`].
     Tick,
+    // ---- Audio (D8) ----
+    Audio(AudioEvent),
+    /// Delivered after PeerUp, only when Hello negotiated the audio feature. False removes it.
+    AudioPeer {
+        peer: NodeId,
+        name: String,
+        available: bool,
+    },
+    /// Physical device open completion. Cancelled or expired opens must be closed on arrival.
+    AudioDeviceOpened {
+        key: AudioKey,
+        kind: AudioKind,
+        result: Result<(), Failure>,
+    },
     Capture(CaptureEvent),
     /// The result of [`Output::BeginCapture`].
     CaptureBegun {
@@ -169,6 +203,11 @@ pub enum Input {
     InjectDone {
         id: InjectId,
         ok: bool,
+    },
+    /// The user-visible local microphone indicator is actually shown for this admitted request.
+    AudioIndicatorShown {
+        key: AudioKey,
+        visible: bool,
     },
     // ---- E2 (docs/wp/E2-v0.md) ----
     /// This node's windows (from `WindowSource`).
@@ -206,6 +245,42 @@ pub enum Input {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Output {
+    // ---- Audio (D8) ----
+    AddAudioPeer {
+        peer: NodeId,
+        name: String,
+    },
+    RemoveAudioPeer {
+        peer: NodeId,
+    },
+    /// The agent opens a mono 48 kHz physical capture and replies with AudioDeviceOpened.
+    OpenAudioCapture {
+        key: AudioKey,
+    },
+    CloseAudioCapture {
+        key: AudioKey,
+    },
+    /// The agent opens stereo 48 kHz physical playback and replies with AudioDeviceOpened.
+    OpenAudioPlayback {
+        key: AudioKey,
+    },
+    CloseAudioPlayback {
+        key: AudioKey,
+    },
+    /// Start only after admission and endpoint acquisition. No microphone samples precede it.
+    StartAudioStream {
+        key: AudioKey,
+        kind: AudioKind,
+        endpoint: AudioEndpoint,
+    },
+    StopAudioStream {
+        key: AudioKey,
+    },
+    /// Complete local physical-device usage state. Show before opening capture; clear after stop.
+    AudioIndicators {
+        microphones: Vec<AudioKey>,
+        speakers: Vec<AudioKey>,
+    },
     SetPortals(Vec<CapturePortal>),
     /// Turn `InputCapture::set_monitor_local_activity` on or off (local override on a target).
     MonitorLocalActivity(bool),
@@ -318,6 +393,13 @@ pub enum Output {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Notice {
+    MicInUseBy(NodeId),
+    SpeakerInUseBy(NodeId),
+    AudioRefused {
+        peer: NodeId,
+        kind: AudioKind,
+        reason: Refusal,
+    },
     LostConnection(NodeId),
     TargetLocked(NodeId),
     Refused {

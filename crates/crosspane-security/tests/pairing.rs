@@ -557,7 +557,7 @@ proptest! {
         spki in prop::collection::vec(any::<u8>(), 1..=128),
         name in prop::collection::vec(any::<char>(), 1..=16)
             .prop_map(|chars| chars.into_iter().collect::<String>()),
-        grants in prop::sample::subsequence(CAPS.to_vec(), 0..=4),
+        grants in prop::sample::subsequence([CAPS.as_slice(), &[Capability::AudioSpeaker, Capability::AudioMic]].concat(), 0..=6),
         reason in prop::sample::select(REASONS.to_vec()),
     ) {
         for msg in [
@@ -618,10 +618,10 @@ fn codec_every_rejection_case() {
         payload.push(0);
         reject(&payload);
     }
-    for code in [0, 5, 255] {
+    for code in [0, 7, 255] {
         reject(&[4, 1, b'a', 1, code]);
     }
-    for code in 1..=4 {
+    for code in 1..=6 {
         reject(&[4, 1, b'a', 2, code, code]);
     }
     for count in [9, 255] {

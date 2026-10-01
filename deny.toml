@@ -39,3 +39,8 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [advisories]
+# Owner-approved 2026-10-01: audiopus_sys 0.2.2 is unmaintained.
+# Its reported CMake 4 bundled-build failure is avoided by the mandatory dynamic
+# feature and system libopus; Linux/Mac synthetic linkage probes pass.
+# This exception covers this informational advisory only, not vulnerabilities.
+ignore = ["RUSTSEC-2026-0150"]
