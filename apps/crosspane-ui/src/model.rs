@@ -19,6 +19,8 @@ pub struct Status {
     pub layout: Vec<Placement>,
     pub notices: Vec<String>,
     pub projections: Vec<Projection>,
+    /// Edge crossing is armed (false after a release or panic). Missing in older agents.
+    pub armed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -47,6 +49,8 @@ pub struct Peer {
     pub rtt_ms: Option<f64>,
     pub displays: Vec<Display>,
     pub grants: Vec<String>,
+    /// The link class of the path to it (`Lan`, `Wifi`, `DirectUsb4Tb`, …), if known.
+    pub link: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

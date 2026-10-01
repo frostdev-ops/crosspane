@@ -2126,6 +2126,7 @@ impl Agent {
             "name": self.name,
             "listening": self.net.local_addr().to_string(),
             "gate_open": self.platform.gate.is_open(),
+            "armed": self.engine.armed(),
             "session": format!("{:?}", self.platform.session.state()),
             "backends": format!("{:?}", self.platform),
             "permissions": self.platform.permissions.required().into_iter().map(|p| {

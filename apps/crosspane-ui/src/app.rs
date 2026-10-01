@@ -299,8 +299,8 @@ impl Settings {
             if ui.button("Panic").clicked() {
                 self.action(Request::Panic);
             }
-            // The frozen status has no armed/disarmed field.
-            if ui.button("Rearm").clicked() {
+            // Older agents don't report it: then the button is always there.
+            if status.armed != Some(true) && ui.button("Rearm").clicked() {
                 self.action(Request::Rearm);
             }
         });
@@ -330,6 +330,15 @@ impl Settings {
                         peer.rtt_ms
                             .map_or_else(|| "RTT: —".into(), |rtt| format!("RTT: {rtt:.1} ms")),
                     );
+                    if let Some(link) = &peer.link {
+                        ui.label(match link.as_str() {
+                            "DirectUsb4Tb" => "USB4 / Thunderbolt",
+                            "DirectEthernet" => "direct cable",
+                            "Lan" => "wired LAN",
+                            "Wifi" => "Wi-Fi",
+                            _ => "network",
+                        });
+                    }
                 });
                 ui.horizontal(|ui| {
                     for capability in ["input", "share", "browse", "present"] {
