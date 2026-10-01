@@ -12,9 +12,13 @@ brew install opus
 export OPUS_LIB_DIR=${OPUS_LIB_DIR:-$(brew --prefix opus)}
 ```
 
-The Mac build and install helpers set this variable automatically. Crosspane.app
-links Homebrew's `/opt/homebrew/opt/opus/lib/libopus.0.dylib` dynamically; the bundle
-does not embed it. Keep Homebrew Opus installed while using the agent.
+The Mac build and install helpers set this variable automatically. Homebrew Opus
+and `OPUS_LIB_DIR` remain build prerequisites. As of `f15c311`,
+`scripts/macos/bundle.sh` embeds all recursively linked Homebrew dylibs (including
+libopus) in `Crosspane.app/Contents/Frameworks`, rewrites their load commands to
+bundle-relative paths, and signs the libraries with the bundle identity for the
+hardened runtime. The resulting app does not require installed Homebrew Opus at
+runtime.
 
 ```sh
 cargo build --release -p crosspane-agent -p crosspanectl
