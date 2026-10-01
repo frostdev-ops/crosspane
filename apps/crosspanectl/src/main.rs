@@ -1,3 +1,128 @@
-//! CLI for status, pair, project/pick/return, release, panic, and diagnostics.
+//! CLI for the running agent: status, release, panic, re-arm, layout, dial. It speaks the agent's
+//! control socket (one JSON request and response per line).
 
-fn main() {}
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde_json::{Value, json};
+
+#[derive(Debug, Parser)]
+#[command(name = "crosspanectl", version, about = "Control the running Crosspane agent")]
+struct Cli {
+    /// Print the raw JSON response.
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Show this node, its peers, the layout and recent notices.
+    Status,
+    /// Give input back to this machine now.
+    Release,
+    /// End every session and disarm crossing until re-armed.
+    Panic,
+    /// Re-arm edge crossing after a release or panic.
+    Rearm,
+    /// Put a peer (name or node-id prefix) on a side of this machine.
+    Layout { peer: String, side: Side },
+    /// Connect to a peer at ADDR (host:port) now.
+    Dial { addr: String },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Side {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+fn socket_path() -> Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        Ok(tmp.join("crosspane/agent.sock"))
+    } else {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
+        Ok(PathBuf::from(runtime).join("crosspane/agent.sock"))
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let request = match &cli.command {
+        Command::Status => json!({"cmd": "status"}),
+        Command::Release => json!({"cmd": "release"}),
+        Command::Panic => json!({"cmd": "panic"}),
+        Command::Rearm => json!({"cmd": "rearm"}),
+        Command::Layout { peer, side } => {
+            let side = format!("{side:?}").to_lowercase();
+            json!({"cmd": "layout", "peer": peer, "side": side})
+        }
+        Command::Dial { addr } => {
+            use std::net::ToSocketAddrs;
+            let resolved = addr
+                .to_socket_addrs()
+                .with_context(|| format!("resolve {addr}"))?
+                .next()
+                .context("no address")?;
+            json!({"cmd": "dial", "addr": resolved.to_string()})
+        }
+    };
+    let path = socket_path()?;
+    let stream = UnixStream::connect(&path)
+        .with_context(|| format!("is crosspane-agent running? ({})", path.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut writer = stream.try_clone()?;
+    writeln!(writer, "{request}")?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let response: Value = serde_json::from_str(&line).context("bad response from agent")?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    }
+    if response["ok"] != json!(true) {
+        bail!("{}", response["error"].as_str().unwrap_or("request failed"));
+    }
+    if !cli.json {
+        print_result(&cli.command, &response["result"]);
+    }
+    Ok(())
+}
+
+fn print_result(command: &Command, result: &Value) {
+    match command {
+        Command::Status => print_status(result),
+        _ => println!("{}", result.as_str().unwrap_or(&result.to_string())),
+    }
+}
+
+fn print_status(s: &Value) {
+    let short = |v: &Value| v.as_str().map(|t| t.chars().take(12).collect::<String>()).unwrap_or_default();
+    println!("{} ({})  listening on {}", s["name"].as_str().unwrap_or("?"), short(&s["node"]), s["listening"].as_str().unwrap_or("?"));
+    println!("  session: {}   input gate: {}", s["session"].as_str().unwrap_or("?"), if s["gate_open"] == json!(true) { "open" } else { "closed" });
+    println!("  backends: {}", s["backends"].as_str().unwrap_or("?"));
+    for d in s["displays"].as_array().into_iter().flatten() {
+        println!("  display {} {}  {}x{} @{} scale  {}x{} mm", d["id"], d["name"].as_str().unwrap_or(""), d["pixels"][0], d["pixels"][1], d["scale"], d["mm"][0], d["mm"][1]);
+    }
+    let peers = s["peers"].as_array().cloned().unwrap_or_default();
+    if peers.is_empty() {
+        println!("  no peers");
+    }
+    for p in peers {
+        let rtt = p["rtt_ms"].as_f64().map(|r| format!("{r:.2} ms")).unwrap_or_else(|| "-".into());
+        println!("  peer {} ({})  {}  rtt {}", p["name"].as_str().unwrap_or("?"), short(&p["node"]), if p["connected"] == json!(true) { "connected" } else { "offline" }, rtt);
+    }
+    for l in s["layout"].as_array().into_iter().flatten() {
+        println!("  layout {}:{} at ({:.0}, {:.0}) mm v{}", l["node"].as_str().unwrap_or("?"), l["display"], l["origin_mm"][0].as_f64().unwrap_or(0.0), l["origin_mm"][1].as_f64().unwrap_or(0.0), l["version"]);
+    }
+    for n in s["notices"].as_array().into_iter().flatten() {
+        println!("  notice: {}", n.as_str().unwrap_or(""));
+    }
+}

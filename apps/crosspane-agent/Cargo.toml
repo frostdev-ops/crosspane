@@ -13,17 +13,24 @@ workspace = true
 [dependencies]
 crosspane-types.workspace = true
 crosspane-engine.workspace = true
-crosspane-transport.workspace = true
-crosspane-render.workspace = true
+crosspane-input.workspace = true
 crosspane-platform.workspace = true
+crosspane-protocol.workspace = true
+crosspane-security.workspace = true
+crosspane-transport.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 crosspane-platform-linux.workspace = true
+rustix.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crosspane-platform-macos.workspace = true
