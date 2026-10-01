@@ -62,11 +62,15 @@ start() {
         echo "hypr-nested: $name is already running" >&2
         exit 1
     fi
-    [[ -n ${WAYLAND_DISPLAY:-} ]] || { echo "hypr-nested: needs a parent Wayland session (WAYLAND_DISPLAY)" >&2; exit 1; }
+    # Implementer runs (scripts/lead/run-wp.sh) have no WAYLAND_DISPLAY, so nothing they run can
+    # reach the live session by accident; only this script gets the parent display, to open the
+    # nested instance's window.
+    local parent=${WAYLAND_DISPLAY:-${CROSSPANE_PARENT_WAYLAND_DISPLAY:-}}
+    [[ -n $parent ]] || { echo "hypr-nested: needs a parent Wayland session (WAYLAND_DISPLAY)" >&2; exit 1; }
     rm -rf -- "$state"
     mkdir -p -- "$state"
     local t0=$SECONDS
-    env -u HYPRLAND_INSTANCE_SIGNATURE -u WAYLAND_SOCKET \
+    env -u HYPRLAND_INSTANCE_SIGNATURE -u WAYLAND_SOCKET WAYLAND_DISPLAY="$parent" \
         CROSSPANE_NESTED_WIDTH="$width" CROSSPANE_NESTED_HEIGHT="$height" \
         setsid Hyprland --config "$config" >"$state/stdout.log" 2>&1 </dev/null &
     echo $! >"$state/pid"
@@ -83,7 +87,7 @@ start() {
     done
     local wl
     wl=$(timeout 5 hyprctl instances -j | jq -r --arg sig "$sig" '.[] | select(.instance == $sig) | .wl_socket')
-    printf 'export HYPRLAND_INSTANCE_SIGNATURE=%q\nexport WAYLAND_DISPLAY=%q\n' "$sig" "$wl" >"$state/env"
+    printf 'export HYPRLAND_INSTANCE_SIGNATURE=%q\nexport WAYLAND_DISPLAY=%q\nexport CROSSPANE_NESTED_HYPR=1\n' "$sig" "$wl" >"$state/env"
     printf 'hypr-nested: %s started in %ss\n  instance %s\n  wayland  %s\n' "$name" "$((SECONDS - t0))" "$sig" "$wl"
 }
 
