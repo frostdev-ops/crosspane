@@ -8,6 +8,7 @@ use crosspane_engine::io::{HUD, TARGET_INDICATOR};
 use crosspane_engine::{Command, EngineConfig, Failure, Input, Notice, Output};
 use crosspane_input::Held;
 use crosspane_input::layout::{Layout, Placed};
+use crosspane_input::remap::RemapProfile;
 use crosspane_platform::{
     CaptureEvent, CaptureId, CaptureStart, EndReason as CaptureEnd, HotkeyEvent, LockState,
     MotionKind, OverlayAnchor, OverlayEvent, PortalId, Rgb8, SessionEvent, SessionState,
@@ -1089,6 +1090,161 @@ fn router_drops_duplicate_downs_unknown_ups_and_preserves_input_sequence() {
     );
     assert_eq!(transitions(&f.send(key(KEY, false, f.now)))[0].2, 4);
     assert!(f.send(key(KEY, false, f.now)).is_empty());
+}
+
+#[test]
+fn ctrl_c_uses_target_profile_and_heartbeats_list_mapped_keys() {
+    let ctrl = HidUsage::keyboard(0xE0);
+    let gui = HidUsage::keyboard(0xE3);
+    let c = HidUsage::keyboard(0x06);
+    for profile in [RemapProfile::None, RemapProfile::SwapCtrlGui] {
+        let mut cfg = config();
+        if profile != RemapProfile::None {
+            cfg.remap.insert(B, profile);
+        }
+        let mut f = Fixture::new(cfg, 2);
+        // Locally handled keys never acquire a remote mapping.
+        assert!(f.send(key(ctrl, true, f.now)).is_empty());
+        assert!(f.send(key(ctrl, false, f.now)).is_empty());
+        let (session, _) = f.controlling(vec![]);
+        let mapped = profile.map(ctrl);
+        let mut out = f.send(key(ctrl, true, f.now));
+        assert!(f.send(key(ctrl, true, f.now)).is_empty());
+        // An unknown physical up must not release another key's mapped usage.
+        assert!(f.send(key(gui, false, f.now)).is_empty());
+        out.extend(f.send(key(c, true, f.now)));
+        out.extend(f.send(key(c, false, f.now)));
+        out.extend(f.send(key(ctrl, false, f.now)));
+        let expected: Vec<_> = [(mapped, true), (c, true), (c, false), (mapped, false)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (usage, down))| Output::SendInput {
+                peer: B,
+                msg: InputMessage::Key {
+                    session,
+                    seq: index as u32 + 1,
+                    usage,
+                    down,
+                },
+            })
+            .collect();
+        assert_eq!(out, expected);
+        assert!(f.send(key(ctrl, false, f.now)).is_empty());
+
+        f.send(key(ctrl, true, f.now));
+        assert_eq!(
+            heartbeat(&f.send(Input::Tick)),
+            (session, 6, vec![mapped], vec![])
+        );
+        assert_eq!(
+            transitions(&f.send(key(ctrl, false, f.now))),
+            vec![(B, session, 7, Held::Key(mapped), false)]
+        );
+    }
+}
+
+#[test]
+fn crossing_releases_remapped_key_on_old_target_and_drops_its_physical_up() {
+    let ctrl = HidUsage::keyboard(0xE0);
+    let gui = HidUsage::keyboard(0xE3);
+    for next_profile in [RemapProfile::None, RemapProfile::SwapCtrlGui] {
+        let mut cfg = config();
+        cfg.remap.insert(B, RemapProfile::SwapCtrlGui);
+        if next_profile != RemapProfile::None {
+            cfg.remap.insert(C, next_profile);
+        }
+        let mut f = Fixture::new(cfg, 3);
+        f.up(C);
+        let (session, _) = f.controlling(vec![]);
+        assert_eq!(
+            transitions(&f.send(key(ctrl, true, f.now))),
+            vec![(B, session, 1, Held::Key(gui), true)]
+        );
+        let out = f.raw(1, 2000.0);
+        // Switching ends B's session through release_all before C is activated.
+        assert_eq!(
+            transitions(&out),
+            vec![(B, session, 2, Held::Key(gui), false)]
+        );
+        assert_end(&out, B, session, EndReason::Released);
+        let (peer, next, _, _, _) = start(&out);
+        assert_eq!(peer, C);
+        assert!(
+            f.send(control(C, ControlMessage::ControlStarted { session: next }))
+                .is_empty()
+        );
+
+        let mapped = next_profile.map(gui);
+        assert_eq!(
+            transitions(&f.send(key(gui, true, f.now))),
+            vec![(C, next, 1, Held::Key(mapped), true)]
+        );
+        assert!(f.send(key(ctrl, false, f.now)).is_empty());
+        assert_eq!(
+            heartbeat(&f.send(Input::Tick)),
+            (next, 2, vec![mapped], vec![])
+        );
+        assert_eq!(
+            transitions(&f.send(key(gui, false, f.now))),
+            vec![(C, next, 3, Held::Key(mapped), false)]
+        );
+        assert_eq!(
+            transitions(&f.send(key(ctrl, true, f.now))),
+            vec![(C, next, 4, Held::Key(next_profile.map(ctrl)), true)]
+        );
+        assert_eq!(
+            transitions(&f.send(key(ctrl, false, f.now))),
+            vec![(C, next, 5, Held::Key(next_profile.map(ctrl)), false)]
+        );
+    }
+}
+
+#[test]
+fn control_end_releases_mapped_key_and_later_physical_up_sends_nothing() {
+    let ctrl = HidUsage::keyboard(0xE0);
+    let gui = HidUsage::keyboard(0xE3);
+    for command in [Some(Command::ReleaseControl), Some(Command::Panic), None] {
+        let mut cfg = config();
+        cfg.remap.insert(B, RemapProfile::SwapCtrlGui);
+        let mut f = Fixture::new(cfg, 2);
+        let (session, capture) = f.controlling(vec![MODIFIERS[1], MODIFIERS[2]]);
+        assert_eq!(
+            transitions(&f.send(key(ctrl, true, f.now))),
+            vec![(B, session, 1, Held::Key(gui), true)]
+        );
+        let input = command.map_or_else(|| key(ESC, true, f.now), Input::Command);
+        let out = f.send(input);
+        assert_returns(&out);
+        assert_eq!(
+            transitions(&out),
+            vec![(B, session, 2, Held::Key(gui), false)]
+        );
+        assert_end(
+            &out,
+            B,
+            session,
+            if command == Some(Command::Panic) {
+                EndReason::Panic
+            } else {
+                EndReason::Released
+            },
+        );
+        assert!(f.send(key(ctrl, false, f.now)).is_empty());
+        f.ended(1, capture);
+        assert!(f.send(key(ctrl, false, f.now)).is_empty());
+
+        f.send(Input::Command(Command::Rearm));
+        let (next, _) = f.controlling(vec![]);
+        assert_eq!(
+            transitions(&f.send(key(gui, true, f.now))),
+            vec![(B, next, 1, Held::Key(ctrl), true)]
+        );
+        assert!(f.send(key(ctrl, false, f.now)).is_empty());
+        assert_eq!(
+            transitions(&f.send(key(gui, false, f.now))),
+            vec![(B, next, 2, Held::Key(ctrl), false)]
+        );
+    }
 }
 
 #[test]

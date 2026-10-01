@@ -155,6 +155,8 @@ pub struct ControllerE1 {
     portals: Vec<CapturePortal>,
     accelerator: Accelerator,
     router: Router,
+    // The router tracks physical keys; wire usages are fixed at each routed press.
+    key_mappings: BTreeMap<HidUsage, HidUsage>,
     chord_keys: BTreeSet<HidUsage>,
     // Includes downs after Started but before activation completes, which aren't routed.
     capture_buttons: BTreeSet<MouseButton>,
@@ -183,6 +185,7 @@ impl ControllerE1 {
             portals: Vec::new(),
             accelerator: Accelerator::new(config.accel),
             router: Router::new(),
+            key_mappings: BTreeMap::new(),
             chord_keys: BTreeSet::new(),
             capture_buttons: BTreeSet::new(),
             phase: Phase::Idle,
@@ -666,7 +669,26 @@ impl ControllerE1 {
         if let Some(peer) = self.router.route(item, down, c.session.peer)
             && peer == c.session.peer
         {
-            c.session.transition(item, down, now, out);
+            let wire_item = match item {
+                Held::Key(physical) => {
+                    let mapped = if down {
+                        let mapped = self
+                            .config
+                            .remap
+                            .get(&peer)
+                            .copied()
+                            .unwrap_or_default()
+                            .map(physical);
+                        self.key_mappings.insert(physical, mapped);
+                        mapped
+                    } else {
+                        self.key_mappings.remove(&physical).unwrap_or(physical)
+                    };
+                    Held::Key(mapped)
+                }
+                Held::Button(_) => item,
+            };
+            c.session.transition(wire_item, down, now, out);
             if down
                 && matches!(item, Held::Key(_))
                 && self
@@ -679,7 +701,10 @@ impl ControllerE1 {
             {
                 // Release the excess key rather than silently omitting a held key from State.
                 self.router.route(item, false, peer);
-                c.session.transition(item, false, now, out);
+                if let Held::Key(physical) = item {
+                    self.key_mappings.remove(&physical);
+                }
+                c.session.transition(wire_item, false, now, out);
             }
         }
     }
@@ -911,19 +936,26 @@ impl ControllerE1 {
         out: &mut Vec<Output>,
     ) {
         let held = self.router.release_all(session.peer);
-        if self.peers.contains(&session.peer) {
-            for item in held {
+        let connected = self.peers.contains(&session.peer);
+        for item in held {
+            let item = match item {
+                Held::Key(physical) => {
+                    Held::Key(self.key_mappings.remove(&physical).unwrap_or(physical))
+                }
+                Held::Button(_) => item,
+            };
+            if connected {
                 session.transition(item, false, now, out);
             }
-            if send_end {
-                out.push(Output::SendControl {
-                    peer: session.peer,
-                    msg: ControlMessage::EndControl {
-                        session: session.id,
-                        reason,
-                    },
-                });
-            }
+        }
+        if connected && send_end {
+            out.push(Output::SendControl {
+                peer: session.peer,
+                msg: ControlMessage::EndControl {
+                    session: session.id,
+                    reason,
+                },
+            });
         }
     }
 
@@ -1078,7 +1110,9 @@ impl ControllerE1 {
                     let mut held_buttons = Vec::new();
                     for item in held {
                         match item {
-                            Held::Key(k) => held_keys.push(k),
+                            Held::Key(k) => {
+                                held_keys.push(self.key_mappings.get(&k).copied().unwrap_or(k));
+                            }
                             Held::Button(b) => held_buttons.push(b),
                         }
                     }
