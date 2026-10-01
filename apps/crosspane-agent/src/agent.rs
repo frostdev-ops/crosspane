@@ -25,7 +25,7 @@ use crosspane_types::id::{ProjectionId, WindowId};
 use serde_json::{Value, json};
 
 use crate::ctl::{Request, Response};
-use crate::media::{DestCmd, ProxyIds, SourceCmd};
+use crate::media::{DestCmd, ProxyIds, Shape, SourceCmd};
 use crate::net::Net;
 use crate::platform::{self, Platform};
 use crate::tray::{self, PairingView, PeerView, RemoteWindows, TrayAction, TrayView};
@@ -569,6 +569,11 @@ impl Agent {
                                     let _ = media.send(SourceCmd::Frame { stream, frame });
                                 }
                                 FrameEvent::Cursor { stream, cursor } => {
+                                    let cursor = cursor.map_or(Shape::Hidden, Shape::Image);
+                                    let _ = media.send(SourceCmd::Cursor { stream, cursor });
+                                }
+                                FrameEvent::CursorDefault { stream } => {
+                                    let cursor = Shape::Default;
                                     let _ = media.send(SourceCmd::Cursor { stream, cursor });
                                 }
                                 FrameEvent::Ended { stream, reason } => {

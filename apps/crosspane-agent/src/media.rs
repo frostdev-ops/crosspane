@@ -25,7 +25,7 @@ use crosspane_media::hybrid::{FramePlan, HybridConfig, HybridScheduler};
 use crosspane_media::tiles::{TileDecoder, TileEncoder};
 use crosspane_media::wire::{
     Codec, FrameHeader, MediaError, TILE, read_codec, read_cursor, read_header, read_video,
-    write_cursor, write_video,
+    write_cursor, write_default_cursor, write_video,
 };
 use crosspane_platform::{CursorImage, Frame, StreamId};
 use crosspane_protocol::link::LinkError;
@@ -107,6 +107,14 @@ impl ProxyIds {
 // Source side
 // ---------------------------------------------------------------------------------------------
 
+/// The cursor a capture reported (`FrameEvent::Cursor` / `CursorDefault`).
+#[derive(Clone)]
+pub enum Shape {
+    Image(CursorImage),
+    Hidden,
+    Default,
+}
+
 pub enum SourceCmd {
     /// A capture stream started for `projection`, to be sent to `peer`.
     Start {
@@ -124,7 +132,7 @@ pub enum SourceCmd {
     },
     Cursor {
         stream: StreamId,
-        cursor: Option<CursorImage>,
+        cursor: Shape,
     },
     Stop {
         stream: StreamId,
@@ -150,9 +158,8 @@ struct Encoding {
     last_at: Instant,
     /// The peer shows cursor shapes.
     peer_cursor: bool,
-    /// The newest cursor the capture reported (`Some(None)`: hidden), and whether the peer still
-    /// needs it.
-    cursor: Option<Option<CursorImage>>,
+    /// The newest cursor the capture reported, and whether the peer still needs it.
+    cursor: Option<Shape>,
     cursor_dirty: bool,
     cursor_seq: u64,
 }
@@ -179,7 +186,7 @@ pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> Sender<Sour
 fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSetup) {
     let mut streams: HashMap<StreamId, Encoding> = HashMap::new();
     // Cursors reported before the stream's Start arrived (the capture thread may be first).
-    let mut early_cursors: HashMap<StreamId, Option<CursorImage>> = HashMap::new();
+    let mut early_cursors: HashMap<StreamId, Shape> = HashMap::new();
     let mut out = Vec::new();
     let epoch = Instant::now();
     loop {
@@ -419,8 +426,8 @@ fn send_cursor(enc: &mut Encoding, transport: &Transport, out: &mut Vec<u8>) {
     }
     const HIDDEN: [u8; 4] = [0; 4];
     let (size, hotspot, pixels) = match cursor {
-        Some(c) => (c.size, c.hotspot, &c.pixels[..]),
-        None => (
+        Shape::Image(c) => (c.size, c.hotspot, &c.pixels[..]),
+        Shape::Hidden | Shape::Default => (
             crosspane_types::geom::PixelSize::new(1, 1),
             (0, 0),
             &HIDDEN[..],
@@ -434,7 +441,12 @@ fn send_cursor(enc: &mut Encoding, transport: &Transport, out: &mut Vec<u8>) {
         width: size.width,
         height: size.height,
     };
-    if let Err(e) = write_cursor(header, hotspot, pixels, out) {
+    let written = if matches!(cursor, Shape::Default) {
+        write_default_cursor(header, out)
+    } else {
+        write_cursor(header, hotspot, pixels, out)
+    };
+    if let Err(e) = written {
         tracing::debug!(error = %e, "cursor image not sendable");
         return;
     }
@@ -645,6 +657,10 @@ fn apply_cursor(d: &mut Decoding, id: u64, data: &[u8], host: Option<&HostHandle
     }
     d.cursor_seq = frame.header.seq;
     if let Some(host) = host {
+        if frame.default {
+            let _ = host.send(HostCommand::DefaultCursor { id });
+            return;
+        }
         let _ = host.send(HostCommand::SetCursor {
             id,
             size: crosspane_types::geom::PixelSize::new(frame.header.width, frame.header.height),
