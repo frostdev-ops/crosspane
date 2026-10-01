@@ -2,7 +2,7 @@
 # Start, inspect and stop a Hyprland instance nested in the owner's live session, for automated
 # platform tests and spikes (docs/wp/WP-0.11.md).
 #
-#   scripts/hypr-nested.sh start [--name N] [--width W --height H]
+#   scripts/hypr-nested.sh start [--name N] [--width W --height H] [--config FILE]
 #   scripts/hypr-nested.sh env|status|stop [--name N]
 #
 # Safety rules (AGENTS.md, R19):
@@ -33,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --name) name=${2:?}; shift 2 ;;
         --width) width=${2:?}; shift 2 ;;
         --height) height=${2:?}; shift 2 ;;
+        --config) config=$(cd -- "$(dirname -- "${2:?}")" && pwd -P)/$(basename -- "$2"); shift 2 ;;
         *) usage ;;
     esac
 done

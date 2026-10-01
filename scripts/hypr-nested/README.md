@@ -10,7 +10,8 @@ scripts/hypr-nested.sh status
 scripts/hypr-nested.sh stop
 ```
 
-- `--name N` runs several instances side by side; `--width`/`--height` set the nested monitor mode.
+- `--name N` runs several instances side by side; `--width`/`--height` set the nested monitor mode;
+  `--config FILE` uses another Lua config (e.g. a spike's copy with XWayland enabled).
 - Headless outputs for parking tests are created inside the nested instance:
   `hyprctl output create headless <name>` after `eval "$(… env)"`.
 - Hyprland 0.56 has no headless-only start. The nested instance is a window of class `aquamarine`
