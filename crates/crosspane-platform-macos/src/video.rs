@@ -11,9 +11,9 @@ use objc2_core_foundation::{
 };
 use objc2_core_media::{
     CMBlockBuffer, CMSampleBuffer, CMTime, CMTimeFlags, CMVideoFormatDescription,
-    CMVideoFormatDescriptionCreateFromH264ParameterSets,
+    CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideoFormatDescriptionGetDimensions,
     CMVideoFormatDescriptionGetH264ParameterSetAtIndex, kCMBlockBufferAssureMemoryNowFlag,
-    kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_H264,
+    kCMSampleAttachmentKey_NotSync, kCMTimeInvalid, kCMVideoCodecType_H264,
 };
 use objc2_core_video::{
     CVImageBuffer, CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
@@ -25,10 +25,11 @@ use objc2_core_video::{
 use objc2_video_toolbox::{
     VTCompressionSession, VTDecodeFrameFlags, VTDecodeInfoFlags,
     VTDecompressionOutputCallbackRecord, VTDecompressionSession, VTEncodeInfoFlags,
-    VTSessionCopyProperty, VTSessionSetProperty, kVTCompressionPropertyKey_AllowFrameReordering,
-    kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_ExpectedFrameRate,
-    kVTCompressionPropertyKey_MaxKeyFrameInterval, kVTCompressionPropertyKey_ProfileLevel,
-    kVTCompressionPropertyKey_RealTime, kVTDecompressionPropertyKey_RealTime,
+    VTIsHardwareDecodeSupported, VTSessionCopyProperty, VTSessionSetProperty,
+    kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
+    kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
+    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
+    kVTDecompressionPropertyKey_RealTime,
     kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
     kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_High_AutoLevel,
     kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
@@ -37,6 +38,7 @@ use objc2_video_toolbox::{
 };
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
+const MAX_DECODE_DIMENSION: u32 = 8192;
 type EncodedFrame = Result<(EncodedVideo, Vec<u8>), CodecError>;
 type DecodedFrame = Result<(PixelSize, Vec<u8>), CodecError>;
 
@@ -65,12 +67,9 @@ impl VideoCodecs for VtCodecs {
     }
 
     fn decoder(&self) -> Result<Box<dyn VideoDecoder>, CodecError> {
-        Ok(Box::new(Decoder {
-            sps: Vec::new(),
-            pps: Vec::new(),
-            session: None,
-            last_reference: None,
-        }))
+        // SAFETY: Public capability probe with a documented H.264 codec identifier, no session needed.
+        let supported = unsafe { VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) };
+        Ok(Box::new(Decoder::new(supported)?))
     }
 }
 
@@ -79,6 +78,16 @@ fn status(code: i32, operation: &str) -> Result<(), CodecError> {
         Ok(())
     } else {
         Err(CodecError::Failed(format!("{operation}: OSStatus {code}")))
+    }
+}
+
+fn create_status(code: i32, operation: &str) -> Result<(), CodecError> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(CodecError::Unavailable(format!(
+            "{operation}: OSStatus {code}"
+        )))
     }
 }
 
@@ -131,12 +140,14 @@ fn coded_size(size: PixelSize) -> Result<PixelSize, CodecError> {
 }
 
 struct Encoder {
-    session: CFRetained<VTCompressionSession>,
-    // Stable callback address, kept alive until after session invalidation in Drop.
-    _callback: Box<mpsc::Sender<EncodedFrame>>,
+    session: Option<CFRetained<VTCompressionSession>>,
+    // Keep the native session first. The raw Box is explicitly reclaimed after teardown in Drop,
+    // so callback lifetime does not depend on automatic field drop order.
+    callback: *mut mpsc::Sender<EncodedFrame>,
     output: mpsc::Receiver<EncodedFrame>,
     size: PixelSize,
     bitrate: u32,
+    applied_bitrate: u32,
     fps: u32,
     frame: i64,
     first: bool,
@@ -148,12 +159,29 @@ unsafe impl Send for Encoder {}
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        // SAFETY: A live owned session; invalidation ends callbacks before their sender is dropped.
-        unsafe { self.session.invalidate() };
+        self.reset();
+        // SAFETY: This pointer came from Box::into_raw and is reclaimed exactly once, after all
+        // frames were drained and the native session invalidated. No callback can still borrow it.
+        unsafe { drop(Box::from_raw(self.callback)) };
     }
 }
 
 impl Encoder {
+    fn reset(&mut self) {
+        if let Some(session) = self.session.take() {
+            // SAFETY: Live owned session, with its callback allocation still live. Invalid time
+            // drains all pending frames before invalidation, including after a failed encode.
+            unsafe {
+                let _ = session.complete_frames(kCMTimeInvalid);
+                session.invalidate();
+            }
+        }
+        for _ in self.output.try_iter() {}
+        self.first = true;
+        self.frame = 0;
+        self.applied_bitrate = 0;
+    }
+
     fn new(size: PixelSize, bitrate: u32, fps: u32) -> Result<Self, CodecError> {
         let coded = coded_size(size)?;
         let (tx, output) = mpsc::channel();
@@ -185,58 +213,59 @@ impl Encoder {
                 NonNull::from(&mut session),
             )
         };
-        if code != 0 {
-            return Err(CodecError::Unavailable(format!(
-                "VTCompressionSessionCreate: OSStatus {code}"
-            )));
-        }
+        create_status(code, "VTCompressionSessionCreate")?;
         let session = NonNull::new(session).ok_or_else(|| missing("compression session"))?;
         // SAFETY: Successful Create transfers the session's +1 reference.
         let session = unsafe { CFRetained::from_raw(session) };
         let encoder = Self {
-            session,
-            _callback: callback,
+            session: Some(session),
+            callback: Box::into_raw(callback),
             output,
             size,
             bitrate,
+            applied_bitrate: bitrate,
             fps,
             frame: 0,
             first: true,
         };
+        let session = encoder
+            .session
+            .as_deref()
+            .ok_or_else(|| missing("compression session"))?;
         // SAFETY: Immutable public property keys. Each value has the property's documented type.
         unsafe {
             set(
-                encoder.session.as_ref(),
+                session.as_ref(),
                 kVTCompressionPropertyKey_RealTime,
                 CFBoolean::new(true).as_ref(),
             )?;
             set(
-                encoder.session.as_ref(),
+                session.as_ref(),
                 kVTCompressionPropertyKey_AllowFrameReordering,
                 CFBoolean::new(false).as_ref(),
             )?;
             set(
-                encoder.session.as_ref(),
+                session.as_ref(),
                 kVTCompressionPropertyKey_ProfileLevel,
                 kVTProfileLevel_H264_High_AutoLevel.as_ref(),
             )?;
             set(
-                encoder.session.as_ref(),
+                session.as_ref(),
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
                 CFNumber::new_i32(i32::MAX).as_ref(),
             )?;
             set(
-                encoder.session.as_ref(),
+                session.as_ref(),
                 kVTCompressionPropertyKey_ExpectedFrameRate,
                 CFNumber::new_i32(fps as i32).as_ref(),
             )?;
             set(
-                encoder.session.as_ref(),
+                session.as_ref(),
                 kVTCompressionPropertyKey_AverageBitRate,
                 CFNumber::new_i64(i64::from(bitrate)).as_ref(),
             )?;
             status(
-                encoder.session.prepare_to_encode_frames(),
+                session.prepare_to_encode_frames(),
                 "VTCompressionSessionPrepareToEncodeFrames",
             )?;
         }
@@ -263,21 +292,26 @@ impl VideoEncoder for Encoder {
         if (stride as usize) < row || pixels.len() < needed {
             return Err(CodecError::BadInput("short BGRA rows"));
         }
-        if self.size != size {
+        if self.size != size || self.session.is_none() {
+            self.reset();
             *self = Self::new(size, self.bitrate, self.fps)?;
         }
-        if self.bitrate == 0 {
-            return Err(CodecError::BadInput("bitrate must be positive"));
-        }
+        let session = self
+            .session
+            .as_deref()
+            .ok_or_else(|| missing("compression session"))?;
         let image = input_buffer(pixels, stride as usize, size, coded)?;
         let force = force_key || self.first;
         // SAFETY: Immutable public property keys, with boolean/numeric values of the required types.
         let properties = unsafe {
-            set(
-                self.session.as_ref(),
-                kVTCompressionPropertyKey_AverageBitRate,
-                CFNumber::new_i64(i64::from(self.bitrate)).as_ref(),
-            )?;
+            if self.applied_bitrate != self.bitrate {
+                set(
+                    session.as_ref(),
+                    kVTCompressionPropertyKey_AverageBitRate,
+                    CFNumber::new_i64(i64::from(self.bitrate)).as_ref(),
+                )?;
+                self.applied_bitrate = self.bitrate;
+            }
             CFDictionary::from_slices(
                 &[kVTEncodeFrameOptionKey_ForceKeyFrame],
                 &[CFBoolean::new(force)],
@@ -301,7 +335,7 @@ impl VideoEncoder for Encoder {
         // this frame's callback, which sends only owned Rust data. No per-frame refcon is borrowed.
         let result = unsafe {
             status(
-                self.session.encode_frame(
+                session.encode_frame(
                     &image,
                     timestamp,
                     duration,
@@ -313,7 +347,7 @@ impl VideoEncoder for Encoder {
             )
             .and_then(|()| {
                 status(
-                    self.session.complete_frames(timestamp),
+                    session.complete_frames(timestamp),
                     "VTCompressionSessionCompleteFrames",
                 )
             })
@@ -333,26 +367,31 @@ impl VideoEncoder for Encoder {
                     "forced frame was not a key frame".into(),
                 ))
             } else {
+                out.try_reserve_exact(frame.1.len())
+                    .map_err(|_| CodecError::Failed("encoded output allocation failed".into()))?;
                 Ok(frame)
             }
         });
         match result {
             Ok((encoded, bytes)) => {
-                *out = bytes;
+                out.extend_from_slice(&bytes);
                 self.first = false;
                 Ok(encoded)
             }
             Err(error) => {
                 // A failed/dropped frame must not leave callback output or references for the next
-                // call. Recreate the session and force its first frame to IDR.
-                *self = Self::new(size, self.bitrate, self.fps)?;
+                // call. Tear down now; the next encode creates a fresh session and starts on IDR.
+                // If recreation fails, session stays None, so a later call retries cleanly.
+                self.reset();
                 Err(error)
             }
         }
     }
 
     fn set_bitrate(&mut self, bits_per_second: u32) {
-        self.bitrate = bits_per_second;
+        if bits_per_second != 0 {
+            self.bitrate = bits_per_second;
+        }
     }
     fn name(&self) -> &str {
         // RequireHardwareAcceleratedVideoEncoder disallows software fallback. The low-latency
@@ -470,7 +509,7 @@ fn annex_b_sample(sample: &CMSampleBuffer) -> EncodedFrame {
             sample.format_description(),
         )
     };
-    let mut key = true; // Absence of NotSync is CoreMedia's sync-sample convention.
+    let mut sync = true; // Absence of NotSync is CoreMedia's sync-sample convention.
     if let Some(attachments) = attachments {
         // SAFETY: CoreMedia's attachment array contains CF dictionaries with CFString keys and CF values.
         let attachments = unsafe { &*ptr::from_ref(&*attachments).cast::<CFArray<CFType>>() };
@@ -485,42 +524,10 @@ fn annex_b_sample(sample: &CMSampleBuffer) -> EncodedFrame {
             unsafe { &*ptr::from_ref(dictionary).cast::<CFDictionary<CFString, CFType>>() };
         // SAFETY: Immutable exported CFString key.
         if let Some(value) = dictionary.get(unsafe { kCMSampleAttachmentKey_NotSync }) {
-            key = !value
+            sync = !value
                 .downcast_ref::<CFBoolean>()
                 .ok_or_else(|| missing("NotSync boolean"))?
                 .as_bool();
-        }
-    }
-    let mut out = Vec::new();
-    if key {
-        let format = format.ok_or_else(|| missing("H.264 format description"))?;
-        for index in 0..2 {
-            let mut bytes = ptr::null();
-            let mut len = 0;
-            let mut header_len = 0;
-            status(
-                // SAFETY: Live H.264 format; writable outputs. The returned parameter bytes remain
-                // owned by the retained format and are copied before releasing it.
-                unsafe {
-                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                        &format,
-                        index,
-                        &mut bytes,
-                        &mut len,
-                        ptr::null_mut(),
-                        &mut header_len,
-                    )
-                },
-                "CMVideoFormatDescriptionGetH264ParameterSetAtIndex",
-            )?;
-            if bytes.is_null() || len == 0 || len > isize::MAX as usize || header_len != 4 {
-                return Err(CodecError::Failed(
-                    "invalid H.264 parameter set or NAL length size".into(),
-                ));
-            }
-            out.extend_from_slice(&START_CODE);
-            // SAFETY: The retained format supplies len live bytes, checked above.
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts(bytes, len) });
         }
     }
     let block = block.ok_or_else(|| missing("AVCC buffer"))?;
@@ -538,7 +545,67 @@ fn annex_b_sample(sample: &CMSampleBuffer) -> EncodedFrame {
         },
         "CMBlockBufferCopyDataBytes",
     )?;
-    let mut remaining = avcc.as_slice();
+    let nals = avcc_nals(&avcc)?;
+    let key = nals.iter().any(|nal| nal[0] & 31 == 5);
+    if key && !sync {
+        return Err(CodecError::Failed(
+            "IDR sample has a NotSync attachment".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    if key {
+        let format = format.ok_or_else(|| missing("H.264 format description"))?;
+        for index in 0..2 {
+            let mut bytes = ptr::null();
+            let mut len = 0;
+            let mut header_len = 0;
+            let mut count = 0;
+            status(
+                // SAFETY: Live H.264 format; writable outputs. The returned parameter bytes remain
+                // owned by the retained format and are copied before releasing it.
+                unsafe {
+                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        &format,
+                        index,
+                        &mut bytes,
+                        &mut len,
+                        &mut count,
+                        &mut header_len,
+                    )
+                },
+                "CMVideoFormatDescriptionGetH264ParameterSetAtIndex",
+            )?;
+            if bytes.is_null()
+                || len == 0
+                || len > isize::MAX as usize
+                || header_len != 4
+                || count != 2
+            {
+                return Err(CodecError::Failed(
+                    "invalid H.264 parameter set or NAL length size".into(),
+                ));
+            }
+            // SAFETY: The retained format supplies len live bytes, checked above.
+            let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+            if bytes[0] & 0x80 != 0 || bytes[0] & 31 != 7 + index as u8 {
+                return Err(CodecError::Failed(
+                    "unexpected H.264 parameter-set NAL type".into(),
+                ));
+            }
+            out.extend_from_slice(&START_CODE);
+            out.extend_from_slice(bytes);
+        }
+    }
+    for nal in nals {
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(nal);
+    }
+    Ok((EncodedVideo { key }, out))
+}
+
+fn avcc_nals(avcc: &[u8]) -> Result<Vec<&[u8]>, CodecError> {
+    let mut nals = Vec::new();
+    let mut remaining = avcc;
     while !remaining.is_empty() {
         let length = remaining
             .get(..4)
@@ -548,14 +615,16 @@ fn annex_b_sample(sample: &CMSampleBuffer) -> EncodedFrame {
         if length == 0 || length > remaining.len() {
             return Err(CodecError::BadInput("invalid AVCC NAL length"));
         }
-        out.extend_from_slice(&START_CODE);
-        out.extend_from_slice(&remaining[..length]);
+        if remaining[0] & 0x80 != 0 {
+            return Err(CodecError::BadInput("invalid AVCC NAL"));
+        }
+        nals.push(&remaining[..length]);
         remaining = &remaining[length..];
     }
     if avcc.is_empty() {
         return Err(missing("H.264 NAL units"));
     }
-    Ok((EncodedVideo { key }, out))
+    Ok(nals)
 }
 
 struct Decoder {
@@ -565,12 +634,29 @@ struct Decoder {
     last_reference: Option<u32>,
 }
 
+impl Decoder {
+    fn new(hardware_supported: bool) -> Result<Self, CodecError> {
+        if !hardware_supported {
+            return Err(CodecError::Unavailable(
+                "hardware H.264 decode is not supported".into(),
+            ));
+        }
+        Ok(Self {
+            sps: Vec::new(),
+            pps: Vec::new(),
+            session: None,
+            last_reference: None,
+        })
+    }
+}
+
 struct DecodeSession {
     session: CFRetained<VTDecompressionSession>,
     format: CFRetained<CMVideoFormatDescription>,
-    _callback: Box<mpsc::Sender<DecodedFrame>>,
+    // Raw Box ownership makes callback teardown independent of this field's drop order.
+    callback: *mut mpsc::Sender<DecodedFrame>,
     output: mpsc::Receiver<DecodedFrame>,
-    hardware: bool,
+    hardware: Option<bool>,
     frame_num_bits: u32,
 }
 
@@ -580,16 +666,26 @@ unsafe impl Send for DecodeSession {}
 
 impl Drop for DecodeSession {
     fn drop(&mut self) {
-        // SAFETY: This session is owned and every decode was synchronous; invalidation ends use of
-        // its boxed callback context before the context is dropped.
-        unsafe { self.session.invalidate() };
+        // SAFETY: The session and its callback allocation remain live throughout draining and
+        // invalidation. Reclaim the Box exactly once afterwards, before any fields are dropped.
+        unsafe {
+            let _ = self.session.wait_for_asynchronous_frames();
+            self.session.invalidate();
+            drop(Box::from_raw(self.callback));
+        }
     }
 }
 
 impl DecodeSession {
     fn new(sps: &[u8], pps: &[u8]) -> Result<Self, CodecError> {
         let frame_num_bits = frame_num_bits(sps)?;
-        let mut pointers = [NonNull::from(&sps[0]), NonNull::from(&pps[0])];
+        if pps.is_empty() {
+            return Err(CodecError::BadInput("missing PPS"));
+        }
+        let mut pointers = [
+            NonNull::new(sps.as_ptr().cast_mut()).ok_or(CodecError::BadInput("missing SPS"))?,
+            NonNull::new(pps.as_ptr().cast_mut()).ok_or(CodecError::BadInput("missing PPS"))?,
+        ];
         let mut lengths = [sps.len(), pps.len()];
         let mut format = ptr::null();
         status(
@@ -610,6 +706,9 @@ impl DecodeSession {
         let format = NonNull::new(format.cast_mut()).ok_or_else(|| missing("decoder format"))?;
         // SAFETY: Successful Create transfers the format's +1 reference.
         let format = unsafe { CFRetained::from_raw(format) };
+        // SAFETY: A live H.264 format description; this getter only reads its encoded dimensions.
+        let dimensions = unsafe { CMVideoFormatDescriptionGetDimensions(&format) };
+        decode_size(dimensions.width, dimensions.height)?;
         let (tx, output) = mpsc::channel();
         let mut callback = Box::new(tx);
         let record = VTDecompressionOutputCallbackRecord {
@@ -642,20 +741,16 @@ impl DecodeSession {
                 NonNull::from(&mut session),
             )
         };
-        if code != 0 {
-            return Err(CodecError::Unavailable(format!(
-                "VTDecompressionSessionCreate: OSStatus {code}"
-            )));
-        }
+        create_status(code, "VTDecompressionSessionCreate")?;
         let session = NonNull::new(session).ok_or_else(|| missing("decompression session"))?;
         // SAFETY: Successful Create transfers the session's +1 reference.
         let session = unsafe { CFRetained::from_raw(session) };
         let mut decoder = Self {
             session,
             format,
-            _callback: callback,
+            callback: Box::into_raw(callback),
             output,
-            hardware: false,
+            hardware: None,
             frame_num_bits,
         };
         // SAFETY: Immutable public keys and documented boolean property value.
@@ -668,12 +763,16 @@ impl DecodeSession {
             decoder.hardware = hardware(
                 decoder.session.as_ref(),
                 kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-            )?;
+            )
+            .ok();
         }
         Ok(decoder)
     }
 
     fn decode(&self, avcc: &[u8]) -> DecodedFrame {
+        if avcc.is_empty() {
+            return Err(CodecError::BadInput("missing AVCC data"));
+        }
         let mut block = ptr::null_mut();
         status(
             // SAFETY: A null memory block requests a CoreMedia-owned allocation of avcc.len() bytes;
@@ -700,7 +799,8 @@ impl DecodeSession {
             // SAFETY: The nonempty slice has avcc.len() readable bytes, copied into the block's allocation.
             unsafe {
                 CMBlockBuffer::replace_data_bytes(
-                    NonNull::from(&avcc[0]).cast(),
+                    NonNull::new(avcc.as_ptr().cast_mut().cast())
+                        .ok_or(CodecError::BadInput("missing AVCC data"))?,
                     &block,
                     0,
                     avcc.len(),
@@ -795,8 +895,10 @@ impl VideoDecoder for Decoder {
             let mut avcc = Vec::new();
             for nal in nals {
                 if matches!(nal[0] & 31, 1 | 5) {
-                    let mut bits = Bits::new(&nal[1..]);
-                    bits.ue()?; // first_mb_in_slice
+                    // A slice prefix holds the three Exp-Golomb values and up to 16 frame_num
+                    // bits. Bound the copy even when the untrusted slice payload is very large.
+                    let mut bits = Bits::new(&nal[1..nal.len().min(33)]);
+                    let first_mb = bits.ue()?;
                     let slice_type = bits.ue()?;
                     if slice_type > 9 || slice_type % 5 == 1 {
                         return Err(CodecError::BadInput("B-frames are not supported"));
@@ -805,7 +907,7 @@ impl VideoDecoder for Decoder {
                     let frame_num = bits.read(session.frame_num_bits)?;
                     let reference = nal[0] & 0x60 != 0;
                     let slice = (frame_num, reference, nal[0] & 31 == 5);
-                    if picture.is_some_and(|previous| previous != slice) {
+                    if picture.is_some_and(|previous| previous != slice || first_mb == 0) {
                         return Err(CodecError::BadInput("multiple pictures in one access unit"));
                     }
                     picture = Some(slice);
@@ -840,7 +942,10 @@ impl VideoDecoder for Decoder {
         })();
         match result {
             Ok((size, pixels)) => {
-                *out = pixels;
+                out.try_reserve_exact(pixels.len().saturating_sub(out.len()))
+                    .map_err(|_| CodecError::Failed("decoded output allocation failed".into()))?;
+                out.clear();
+                out.extend_from_slice(&pixels);
                 Ok(size)
             }
             Err(error) => {
@@ -853,8 +958,11 @@ impl VideoDecoder for Decoder {
 
     fn name(&self) -> &str {
         match &self.session {
-            Some(session) if session.hardware => "VideoToolbox (hardware)",
-            Some(_) => "VideoToolbox (software)",
+            Some(session) => match session.hardware {
+                Some(true) => "VideoToolbox (hardware)",
+                Some(false) => "VideoToolbox (software)",
+                None => "VideoToolbox (hardware required; status unknown)",
+            },
             None => "VideoToolbox",
         }
     }
@@ -908,8 +1016,20 @@ impl Bits {
 }
 
 fn frame_num_bits(sps: &[u8]) -> Result<u32, CodecError> {
+    if sps
+        .first()
+        .is_none_or(|header| header & 0x80 != 0 || header & 31 != 7)
+    {
+        return Err(CodecError::BadInput("invalid SPS NAL"));
+    }
     let mut bits = Bits::new(&sps[1..]);
     let profile = bits.read(8)?;
+    if !matches!(
+        profile,
+        66 | 77 | 88 | 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        return Err(CodecError::BadInput("unsupported H.264 profile"));
+    }
     bits.read(16)?; // constraint flags and level_idc
     bits.ue()?; // seq_parameter_set_id
     if matches!(
@@ -1012,10 +1132,10 @@ fn copy_image(image: &CVPixelBuffer) -> DecodedFrame {
     }
     let width = CVPixelBufferGetWidth(image);
     let height = CVPixelBufferGetHeight(image);
-    let size = PixelSize::new(
-        u32::try_from(width).map_err(|_| missing("valid width"))?,
-        u32::try_from(height).map_err(|_| missing("valid height"))?,
-    );
+    let size = decode_size(
+        i32::try_from(width).map_err(|_| missing("valid width"))?,
+        i32::try_from(height).map_err(|_| missing("valid height"))?,
+    )?;
     if coded_size(size)? != size {
         return Err(CodecError::Failed(
             "decoder output has odd dimensions".into(),
@@ -1040,7 +1160,9 @@ fn copy_image(image: &CVPixelBuffer) -> DecodedFrame {
         // SAFETY: CoreVideo supplies len live bytes under the read-only lock; stride/extent were
         // checked. The slice is borrowed only while locked, and no native pointer escapes.
         let source = unsafe { std::slice::from_raw_parts(base, len) };
-        let mut out = Vec::with_capacity(width * 4 * height);
+        let mut out = Vec::new();
+        out.try_reserve_exact(width * 4 * height)
+            .map_err(|_| CodecError::Failed("decoded image allocation failed".into()))?;
         for row in source.chunks_exact(stride).take(height) {
             out.extend_from_slice(&row[..width * 4]);
         }
@@ -1053,4 +1175,418 @@ fn copy_image(image: &CVPixelBuffer) -> DecodedFrame {
     );
     unlocked?;
     copied
+}
+
+fn decode_size(width: i32, height: i32) -> Result<PixelSize, CodecError> {
+    if width <= 0
+        || height <= 0
+        || width > MAX_DECODE_DIMENSION as i32
+        || height > MAX_DECODE_DIMENSION as i32
+    {
+        return Err(CodecError::Failed(
+            "H.264 dimensions exceed the 8192-per-axis limit or are invalid".into(),
+        ));
+    }
+    Ok(PixelSize::new(width as u32, height as u32))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn available<T>(result: Result<T, CodecError>) -> Option<T> {
+        match result {
+            Ok(codec) => Some(codec),
+            Err(CodecError::Unavailable(reason)) => {
+                eprintln!("skipped: VideoToolbox unavailable: {reason}");
+                None
+            }
+            Err(error) => panic!("VideoToolbox factory: {error}"),
+        }
+    }
+
+    #[derive(Default)]
+    struct Writer(Vec<bool>);
+
+    impl Writer {
+        fn bit(&mut self, value: bool) {
+            self.0.push(value);
+        }
+
+        fn uint(&mut self, value: u32, count: u32) {
+            for bit in (0..count).rev() {
+                self.bit(value & (1 << bit) != 0);
+            }
+        }
+
+        fn ue(&mut self, value: u32) {
+            let code = value + 1;
+            let count = 32 - code.leading_zeros();
+            for _ in 1..count {
+                self.bit(false);
+            }
+            self.uint(code, count);
+        }
+
+        fn nal(mut self, header: u8) -> Vec<u8> {
+            self.bit(true); // rbsp_stop_one_bit
+            while !self.0.len().is_multiple_of(8) {
+                self.bit(false);
+            }
+            let mut out = vec![header];
+            let mut zeros = 0;
+            for bits in self.0.as_chunks::<8>().0 {
+                let byte = bits
+                    .iter()
+                    .fold(0u8, |value, bit| value << 1 | u8::from(*bit));
+                if zeros == 2 && byte <= 3 {
+                    out.push(3);
+                    zeros = 0;
+                }
+                out.push(byte);
+                zeros = if byte == 0 { zeros + 1 } else { 0 };
+            }
+            out
+        }
+    }
+
+    fn sps(width_in_mbs: u32, scaling_lists: bool) -> Vec<u8> {
+        let mut bits = Writer::default();
+        bits.uint(100, 8); // High profile
+        bits.uint(0, 8); // constraint flags
+        bits.uint(51, 8); // level
+        bits.ue(0); // SPS id
+        bits.ue(1); // 4:2:0
+        bits.ue(0);
+        bits.ue(0); // 8-bit luma/chroma
+        bits.bit(false); // transform bypass
+        bits.bit(scaling_lists);
+        if scaling_lists {
+            for index in 0..8 {
+                bits.bit(true);
+                for _ in 0..if index < 6 { 16 } else { 64 } {
+                    bits.ue(0);
+                } // signed delta_scale = 0
+            }
+        }
+        bits.ue(0); // log2_max_frame_num_minus4
+        bits.ue(2); // pic_order_cnt_type
+        bits.ue(1); // one reference frame
+        bits.bit(false); // no frame_num gaps
+        bits.ue(width_in_mbs - 1);
+        bits.ue(1); // 32 pixels high
+        bits.bit(true); // frame_mbs_only
+        bits.bit(true); // direct_8x8_inference
+        bits.bit(false); // no cropping
+        bits.bit(false); // no VUI
+        bits.nal(0x67)
+    }
+
+    fn pps() -> Vec<u8> {
+        let mut bits = Writer::default();
+        bits.ue(0);
+        bits.ue(0); // PPS/SPS ids
+        bits.bit(false);
+        bits.bit(false); // CAVLC, no bottom-field POC
+        bits.ue(0);
+        bits.ue(0);
+        bits.ue(0); // one slice group, default reference counts
+        bits.bit(false);
+        bits.uint(0, 2); // no weighted prediction
+        bits.ue(0);
+        bits.ue(0);
+        bits.ue(0); // signed QP/QS/chroma offsets = 0
+        bits.bit(true);
+        bits.bit(false);
+        bits.bit(false); // deblocking, constrained intra, redundant pictures
+        bits.nal(0x68)
+    }
+
+    fn unit(nals: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nal in nals {
+            out.extend_from_slice(&START_CODE);
+            out.extend_from_slice(nal);
+        }
+        out
+    }
+
+    fn slice(header: u8, slice_type: u32, frame_num: u32, frame_num_bits: u32) -> Vec<u8> {
+        let mut bits = Writer::default();
+        bits.ue(0);
+        bits.ue(slice_type);
+        bits.ue(0); // first MB, slice type, PPS id
+        bits.uint(frame_num, frame_num_bits);
+        bits.nal(header)
+    }
+
+    fn encoded_fixture() -> Option<Vec<u8>> {
+        let size = PixelSize::new(32, 32);
+        let mut encoder = available(VtCodecs::new().encoder(size, 8_000_000, 30))?;
+        let pixels = [48, 150, 208, 255].repeat(32 * 32);
+        let mut packet = Vec::new();
+        assert!(
+            encoder
+                .encode(&pixels, 128, size, false, &mut packet)
+                .unwrap()
+                .key
+        );
+        Some(packet)
+    }
+
+    #[test]
+    fn negative_annex_b_inputs() {
+        let cases: &[(&str, &[u8])] = &[
+            ("empty", &[]),
+            ("no start code", &[0x65, 0x80]),
+            ("garbage prefix", &[9, 0, 0, 1, 0x65]),
+            ("empty NAL", &[0, 0, 1, 0, 0, 1]),
+            ("forbidden bit", &[0, 0, 1, 0xe5, 0x80]),
+        ];
+        for (name, data) in cases {
+            let mut decoder = Decoder::new(true).unwrap();
+            let mut out = vec![11, 22, 33];
+            assert!(decoder.decode(data, &mut out).is_err(), "{name}");
+            assert_eq!(out, [11, 22, 33], "{name}");
+        }
+        for avcc in [
+            &[][..],
+            &[0, 0, 0][..],
+            &[0, 0, 0, 0][..],
+            &[0, 0, 0, 2, 0x65][..],
+        ] {
+            assert!(avcc_nals(avcc).is_err());
+        }
+        let nals = avcc_nals(&[0, 0, 0, 2, 0x65, 0x80]).unwrap();
+        assert_eq!(nals[0][0] & 31, 5);
+    }
+
+    #[test]
+    fn negative_sps_and_scaling_lists() {
+        for sps in [
+            &[][..],
+            &[0x67][..],
+            &[0xff; 16][..],
+            &[0x67, 0xff, 0xff, 0xff, 0xff][..],
+        ] {
+            assert!(frame_num_bits(sps).is_err(), "invalid SPS {sps:?}");
+            let mut decoder = Decoder::new(true).unwrap();
+            assert!(
+                decoder
+                    .decode(&unit(&[sps, &pps(), &[0x65]]), &mut Vec::new())
+                    .is_err()
+            );
+        }
+        let sps = sps(2, true);
+        assert!(sps.len() > 32, "scaling lists exceed a slice-sized prefix");
+        assert_eq!(frame_num_bits(&sps).unwrap(), 4);
+        let mut decoder = Decoder::new(true).unwrap();
+        assert!(
+            decoder
+                .decode(&unit(&[&sps, &pps(), &[0x65]]), &mut Vec::new())
+                .is_err()
+        );
+        assert!(
+            frame_num_bits(&sps[..32]).is_err(),
+            "truncated scaling lists"
+        );
+        let mut decoder = Decoder::new(true).unwrap();
+        assert!(
+            decoder
+                .decode(&unit(&[&sps[..32], &pps(), &[0x65]]), &mut Vec::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn negative_access_units() {
+        let Some(packet) = encoded_fixture() else {
+            return;
+        };
+        let nals = annex_b_nals(&packet).unwrap();
+        let sps = nals.iter().find(|nal| nal[0] & 31 == 7).unwrap();
+        let pps = nals.iter().find(|nal| nal[0] & 31 == 8).unwrap();
+        let frame_num_bits = frame_num_bits(sps).unwrap();
+        let b = slice(0x65, 1, 0, frame_num_bits);
+        let first = slice(0x65, 2, 0, frame_num_bits);
+        let cases = [
+            (
+                "truncated slice header",
+                unit(&[sps, pps, &[0x65]]),
+                "truncated H.264 header",
+            ),
+            (
+                "B-slice",
+                unit(&[sps, pps, &b]),
+                "B-frames are not supported",
+            ),
+            ("SPS-only", unit(&[sps]), "slice before SPS/PPS"),
+            (
+                "two pictures",
+                unit(&[sps, pps, &first, &first]),
+                "multiple pictures in one access unit",
+            ),
+        ];
+        for (name, data, message) in cases {
+            let mut decoder = Decoder::new(true).unwrap();
+            let mut out = vec![11, 22, 33];
+            let error = decoder.decode(&data, &mut out).unwrap_err();
+            if let CodecError::Unavailable(reason) = error {
+                eprintln!("skipped: {reason}");
+                return;
+            }
+            assert!(error.to_string().contains(message), "{name}: {error}");
+            assert_eq!(out, [11, 22, 33], "{name}");
+        }
+    }
+
+    #[test]
+    fn mutated_real_access_units_do_not_panic() {
+        let Some(packet) = encoded_fixture() else {
+            return;
+        };
+        let Some(mut decoder) = available(VtCodecs::new().decoder()) else {
+            return;
+        };
+        let mut out = Vec::new();
+        for index in 0..512 {
+            let mut data = packet.clone();
+            if index % 2 == 0 {
+                let position = index / 2 % data.len();
+                data[position] ^= 1 << (index / (2 * data.len()) % 8);
+            } else {
+                data.truncate(index / 2 % data.len());
+            }
+            let result = catch_unwind(AssertUnwindSafe(|| decoder.decode(&data, &mut out)));
+            assert!(result.is_ok(), "mutation {index} panicked");
+        }
+        eprintln!(
+            "512 real access-unit mutations (bit flips/truncations) returned without panicking"
+        );
+    }
+
+    #[test]
+    fn factory_availability() {
+        assert!(matches!(
+            Decoder::new(false),
+            Err(CodecError::Unavailable(_))
+        ));
+        assert!(matches!(
+            create_status(-12908, "VTCompressionSessionCreate"),
+            Err(CodecError::Unavailable(_))
+        ));
+        assert!(create_status(0, "VTCompressionSessionCreate").is_ok());
+        // SAFETY: Public H.264 capability probe, with no session or callback involved.
+        let supported = unsafe { VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) };
+        assert_eq!(VtCodecs::new().decoder().is_ok(), supported);
+        let _ = available(VtCodecs::new().encoder(PixelSize::new(32, 32), 8_000_000, 30));
+    }
+
+    #[test]
+    fn decode_dimensions_capped_before_session_creation() {
+        assert_eq!(decode_size(8192, 8192).unwrap(), PixelSize::new(8192, 8192));
+        for (width, height) in [(8193, 32), (32, 8193), (0, 32), (-1, 32)] {
+            assert!(matches!(
+                decode_size(width, height),
+                Err(CodecError::Failed(_))
+            ));
+        }
+        let error = DecodeSession::new(&sps(513, false), &pps()).err().unwrap();
+        assert!(matches!(error, CodecError::Failed(_)));
+        assert!(
+            error.to_string().contains("8192"),
+            "dimension check must happen before allocating a VT session: {error}"
+        );
+    }
+
+    #[test]
+    fn bitrate_and_clean_restart() {
+        let size = PixelSize::new(32, 32);
+        let Some(mut encoder) = available(Encoder::new(size, 8_000_000, 30)) else {
+            return;
+        };
+        let pixels = [48, 150, 208, 255].repeat(32 * 32);
+        let mut out = Vec::new();
+        encoder.encode(&pixels, 128, size, false, &mut out).unwrap();
+        encoder.set_bitrate(0);
+        assert_eq!(encoder.bitrate, 8_000_000);
+        encoder.set_bitrate(1_000_000);
+        assert_eq!(encoder.applied_bitrate, 8_000_000);
+        encoder.encode(&pixels, 128, size, false, &mut out).unwrap();
+        assert_eq!(encoder.applied_bitrate, 1_000_000);
+        encoder.encode(&pixels, 128, size, false, &mut out).unwrap();
+        assert_eq!(encoder.applied_bitrate, 1_000_000);
+        let image = input_buffer(&pixels, 128, size, size).unwrap();
+        let timestamp = CMTime {
+            value: 3,
+            timescale: 30,
+            flags: CMTimeFlags::Valid,
+            epoch: 0,
+        };
+        status(
+            // SAFETY: Live test-owned session and image; the boxed refcon remains live. Submit one
+            // frame without CompleteFrames so reset must drain any callback before invalidation.
+            unsafe {
+                encoder.session.as_deref().unwrap().encode_frame(
+                    &image,
+                    timestamp,
+                    CMTime {
+                        value: 1,
+                        ..timestamp
+                    },
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            "test pending encode",
+        )
+        .unwrap();
+        encoder.reset();
+        assert!(encoder.session.is_none());
+        assert!(encoder.output.try_recv().is_err());
+        assert!(encoder.first);
+        // Failed attempts leave the reset state ready to retry, then the next valid input is IDR.
+        assert!(
+            encoder
+                .encode(&[], 0, PixelSize::new(0, 0), false, &mut out)
+                .is_err()
+        );
+        assert!(encoder.session.is_none());
+        let result = match encoder.encode(&pixels, 128, size, false, &mut out) {
+            Err(CodecError::Unavailable(reason)) => {
+                eprintln!("skipped: restart unavailable: {reason}");
+                return;
+            }
+            result => result.unwrap(),
+        };
+        assert!(result.key);
+    }
+
+    #[test]
+    fn unknown_hardware_diagnostic_is_non_fatal() {
+        let Some(packet) = encoded_fixture() else {
+            return;
+        };
+        let nals = annex_b_nals(&packet).unwrap();
+        let sps = nals.iter().find(|nal| nal[0] & 31 == 7).unwrap();
+        let pps = nals.iter().find(|nal| nal[0] & 31 == 8).unwrap();
+        let Some(mut session) = available(DecodeSession::new(sps, pps)) else {
+            return;
+        };
+        let unknown = CFString::from_str("CrosspaneUnsupportedHardwareDiagnostic");
+        session.hardware = hardware(session.session.as_ref(), &unknown).ok();
+        assert_eq!(session.hardware, None);
+        let mut decoder = Decoder::new(true).unwrap();
+        decoder.sps = sps.to_vec();
+        decoder.pps = pps.to_vec();
+        decoder.session = Some(session);
+        assert_eq!(
+            decoder.decode(&packet, &mut Vec::new()).unwrap(),
+            PixelSize::new(32, 32)
+        );
+        assert!(decoder.name().contains("status unknown"));
+    }
 }

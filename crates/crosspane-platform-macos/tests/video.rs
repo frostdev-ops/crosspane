@@ -4,9 +4,20 @@
 use std::process::Command;
 use std::time::Instant;
 
-use crosspane_media::codec::VideoCodecs;
+use crosspane_media::codec::{CodecError, VideoCodecs};
 use crosspane_platform_macos::video::VtCodecs;
 use crosspane_types::geom::PixelSize;
+
+fn available<T>(result: Result<T, CodecError>) -> Option<T> {
+    match result {
+        Ok(codec) => Some(codec),
+        Err(CodecError::Unavailable(reason)) => {
+            eprintln!("skipped: VideoToolbox unavailable: {reason}");
+            None
+        }
+        Err(error) => panic!("VideoToolbox factory: {error}"),
+    }
+}
 
 fn synthetic(size: PixelSize, frame: u32) -> (Vec<u8>, u32) {
     let stride = size.width * 4 + 12; // Exercise copying rows with source padding.
@@ -95,13 +106,20 @@ fn psnr(
 
 fn round_trip(size: PixelSize) {
     let codecs = VtCodecs::new();
-    let mut encoder = codecs
-        .encoder(size, 8_000_000, 30)
-        .expect("hardware H.264 encoder");
-    let mut decoder = codecs.decoder().unwrap();
-    let mut encoded = vec![0xff; 100];
-    let mut decoded = vec![0xff; 100];
+    let Some(mut encoder) = available(codecs.encoder(size, 8_000_000, 30)) else {
+        return;
+    };
+    let Some(mut decoder) = available(codecs.decoder()) else {
+        return;
+    };
     let expected = PixelSize::new((size.width + 1) & !1, (size.height + 1) & !1);
+    let mut encoded =
+        Vec::with_capacity(expected.width as usize * expected.height as usize * 4 + 1024);
+    let mut decoded = Vec::with_capacity(expected.width as usize * expected.height as usize * 4);
+    encoded.extend_from_slice(&[0xff; 100]);
+    decoded.extend_from_slice(&[0xff; 100]);
+    let encoded_pointer = encoded.as_ptr();
+    let decoded_pointer = decoded.as_ptr();
     let mut encode_time = 0.0;
     let mut decode_time = 0.0;
     let mut bytes = 0usize;
@@ -114,6 +132,11 @@ fn round_trip(size: PixelSize) {
             .encode(&pixels, stride, size, force_key, &mut encoded)
             .unwrap();
         encode_time += start.elapsed().as_secs_f64();
+        assert_eq!(
+            encoded.as_ptr(),
+            encoded_pointer,
+            "reuse the caller's encode allocation"
+        );
         assert_eq!(result.key, frame == 0 || force_key);
         assert_key(&encoded, result.key);
         assert!(!encoded.is_empty());
@@ -121,6 +144,11 @@ fn round_trip(size: PixelSize) {
         let start = Instant::now();
         let coded = decoder.decode(&encoded, &mut decoded).unwrap();
         decode_time += start.elapsed().as_secs_f64();
+        assert_eq!(
+            decoded.as_ptr(),
+            decoded_pointer,
+            "reuse the caller's decode allocation"
+        );
         assert_eq!(coded, expected);
         assert_eq!(
             decoded.len(),
@@ -134,7 +162,9 @@ fn round_trip(size: PixelSize) {
         );
         // Every IDR must also decode in an entirely fresh decoder.
         if result.key {
-            let mut fresh = codecs.decoder().unwrap();
+            let Some(mut fresh) = available(codecs.decoder()) else {
+                return;
+            };
             let mut independent = Vec::new();
             assert_eq!(fresh.decode(&encoded, &mut independent).unwrap(), expected);
             assert_eq!(independent, decoded);
@@ -176,8 +206,12 @@ fn round_trip_odd_101x75() {
 fn size_change_and_non_idr_recovery() {
     let codecs = VtCodecs::new();
     let size = PixelSize::new(320, 240);
-    let mut encoder = codecs.encoder(size, 8_000_000, 30).unwrap();
-    let mut decoder = codecs.decoder().unwrap();
+    let Some(mut encoder) = available(codecs.encoder(size, 8_000_000, 30)) else {
+        return;
+    };
+    let Some(mut decoder) = available(codecs.decoder()) else {
+        return;
+    };
     let mut packet = Vec::new();
     let mut decoded = Vec::new();
     let (pixels, stride) = synthetic(size, 0);
@@ -252,7 +286,9 @@ fn detailed_motion(size: PixelSize, frame: u32) -> (Vec<u8>, u32) {
 fn set_bitrate_reduces_average_frame_size() {
     let codecs = VtCodecs::new();
     let size = PixelSize::new(1280, 720);
-    let mut encoder = codecs.encoder(size, 8_000_000, 30).unwrap();
+    let Some(mut encoder) = available(codecs.encoder(size, 8_000_000, 30)) else {
+        return;
+    };
     let mut packet = Vec::new();
     let mut averages = Vec::new();
     for bitrate in [8_000_000, 1_000_000] {
@@ -332,7 +368,9 @@ fn ffmpeg_annex_b_interop() {
         units.push(unit);
     }
     assert_eq!(units.len(), 10, "one access unit per x264 picture");
-    let mut decoder = VtCodecs::new().decoder().unwrap();
+    let Some(mut decoder) = available(VtCodecs::new().decoder()) else {
+        return;
+    };
     let mut pixels = Vec::new();
     for (index, unit) in units.iter().enumerate() {
         assert_eq!(
@@ -355,7 +393,9 @@ fn ffmpeg_annex_b_interop() {
         units.len(),
         decoder.name()
     );
-    let mut missing_reference = VtCodecs::new().decoder().unwrap();
+    let Some(mut missing_reference) = available(VtCodecs::new().decoder()) else {
+        return;
+    };
     missing_reference.decode(&units[0], &mut pixels).unwrap();
     let result = missing_reference.decode(&units[2], &mut pixels);
     assert!(
