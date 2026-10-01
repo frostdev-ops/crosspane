@@ -84,7 +84,12 @@ PY
   # Type into the proxy: focus it, then a few letters (no Enter).
   hyprctl dispatch "hl.dsp.focus({window=\"address:$address\"})" >/dev/null 2>&1 || true
   sleep 0.5
-  { for k in 35 18 38 38 24; do echo "key $k down"; echo "sleep 20"; echo "key $k up"; echo "sleep 20"; done; echo "sleep 300"; } | vinput
+  # Type only into the proxy: if anything else has focus, the letters would land there.
+  if [ "$(hyprctl -j activewindow | jq -r .address)" = "$address" ]; then
+    { for k in 35 18 38 38 24; do echo "key $k down"; echo "sleep 20"; echo "key $k up"; echo "sleep 20"; done; echo "sleep 300"; } | vinput
+  else
+    echo "note: the proxy didn't take focus; not typing"
+  fi
   sleep 1
   local keys
   keys=$(mac "grep -c event...key /tmp/cp-e2test.events 2>/dev/null || true")

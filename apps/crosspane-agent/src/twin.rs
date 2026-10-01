@@ -46,10 +46,7 @@ impl WindowParking for TwinOrMirror {
         }
         match self.twin.park(window, size, scale) {
             Err(PlatformError::Unsupported(why)) => {
-                tracing::warn!(
-                    why,
-                    "no twin display: this window is mirrored instead (M1)"
-                );
+                tracing::warn!(why, "no twin display: this window is mirrored instead (M1)");
                 let parked = self.mirror.park(window, size, scale)?;
                 self.mirrored.insert(window);
                 Ok(parked)
