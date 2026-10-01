@@ -27,6 +27,7 @@ crosspane-platform-macos = { path = "crates/crosspane-platform-macos" }
 
 # External crates (09 §2). Versions checked 2026-09-30.
 anyhow = "1.0.104"
+aws-lc-rs = "1.18.1"
 clap = { version = "4.6.7", features = ["derive"] }
 euclid = { version = "0.22.14", features = ["serde"] }
 pollster = "1.0.1"

@@ -40,6 +40,8 @@ pub const KIND_ACK: u8 = 0x06;
 pub const KIND_STATUS: u8 = 0x07;
 pub const KIND_POINTER: u8 = 0x20;
 pub const KIND_CONTROL: u8 = 0x40;
+/// Pairing messages on a pairing connection; the payload is encoded by `crosspane-security`.
+pub const KIND_PAIRING: u8 = 0x60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[non_exhaustive]
