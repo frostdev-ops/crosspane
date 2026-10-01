@@ -6,6 +6,7 @@ pub mod frame_capture;
 pub mod hotkeys;
 pub mod inject;
 pub mod ipc;
+pub mod mirror;
 pub mod overlay;
 pub mod parking;
 pub mod windows;
