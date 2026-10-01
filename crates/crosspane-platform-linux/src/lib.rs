@@ -4,6 +4,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod hyprland;
+pub mod link;
 pub mod logind;
 pub mod permissions;
 pub mod secret_service;
