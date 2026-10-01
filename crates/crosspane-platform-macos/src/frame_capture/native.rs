@@ -538,6 +538,10 @@ impl Stream {
             None
         }
     }
+
+    pub fn cursor_crop(&self) -> Option<PixelRect> {
+        self.crop
+    }
 }
 
 type Completion = (

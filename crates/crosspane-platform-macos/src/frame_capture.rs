@@ -1,11 +1,13 @@
 //! ScreenCaptureKit CPU capture. Native control objects belong to a background worker;
 //! sample callbacks run on a private serial dispatch queue, never the AppKit main queue.
 
+mod cursor;
 mod native;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{
@@ -31,6 +33,7 @@ struct Delivery {
     last: Option<Instant>,
     size: Option<PixelSize>,
     full_damage: bool,
+    cursor: cursor::StreamCursor,
 }
 
 struct Shared {
@@ -38,6 +41,8 @@ struct Shared {
     // ponytail: one lock serializes copies and events; split per stream if copy throughput matters.
     deliveries: Mutex<BTreeMap<StreamId, Delivery>>,
     commands: mpsc::Sender<Command>,
+    cursor_wake: Condvar,
+    shutdown: AtomicBool,
 }
 
 impl Shared {
@@ -48,6 +53,7 @@ impl Shared {
     fn end(&self, id: StreamId, reason: StreamEndReason) -> bool {
         let mut deliveries = self.deliveries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(delivery) = deliveries.remove(&id) {
+            self.cursor_wake.notify_all();
             if delivery.active {
                 let reason = if self.permitted() {
                     reason
@@ -69,6 +75,7 @@ impl Shared {
                 delivery.sink.send(FrameEvent::Ended { stream, reason });
             }
         }
+        self.cursor_wake.notify_all();
     }
 
     fn frame(&self, id: StreamId, sample: &CMSampleBuffer) {
@@ -148,6 +155,7 @@ enum Command {
 pub struct MacFrameCapture {
     shared: Arc<Shared>,
     next: u64,
+    cursor_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl fmt::Debug for MacFrameCapture {
@@ -165,13 +173,27 @@ impl MacFrameCapture {
             gate,
             deliveries: Mutex::new(BTreeMap::new()),
             commands,
+            cursor_wake: Condvar::new(),
+            shutdown: AtomicBool::new(false),
         });
         let worker_shared = shared.clone();
         std::thread::Builder::new()
             .name("mac-frame-capture".into())
             .spawn(move || worker(worker_shared, receiver))
             .map_err(|e| PlatformError::Backend(format!("spawn frame capture worker: {e}")))?;
-        Ok(Self { shared, next: 1 })
+        let cursor_shared = shared.clone();
+        let cursor_worker = std::thread::Builder::new()
+            .name("mac-capture-cursor".into())
+            .spawn(move || cursor::watch(cursor_shared))
+            .map_err(|e| {
+                let _ = shared.commands.send(Command::Shutdown);
+                PlatformError::Backend(format!("spawn cursor watcher: {e}"))
+            })?;
+        Ok(Self {
+            shared,
+            next: 1,
+            cursor_worker: Some(cursor_worker),
+        })
     }
 
     fn call(&self, command: impl FnOnce(Instant, Reply) -> Command) -> Result<(), PlatformError> {
@@ -241,12 +263,16 @@ impl FrameCapture for MacFrameCapture {
 
 impl Drop for MacFrameCapture {
     fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Release);
         self.shared.end_all(if self.shared.permitted() {
             StreamEndReason::Requested
         } else {
             StreamEndReason::Blocked
         });
         let _ = self.shared.commands.send(Command::Shutdown);
+        if let Some(worker) = self.cursor_worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -313,6 +339,7 @@ fn worker(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                                     last: None,
                                     size: None,
                                     full_damage: true,
+                                    cursor: cursor::StreamCursor::new(target, crop),
                                 },
                             );
                         if let Err(error) = stream.start(deadline, &wait) {
@@ -331,6 +358,7 @@ fn worker(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                         if let Some(delivery) = deliveries.get_mut(&id) {
                             delivery.active = true;
                         }
+                        shared.cursor_wake.notify_all();
                         streams.insert(id, stream);
                         Ok(())
                     })();
@@ -354,6 +382,8 @@ fn worker(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                         if let Some(delivery) = deliveries.get_mut(&id) {
                             delivery.full_damage = true;
                             delivery.crop = streams.get(&id).and_then(native::Stream::cpu_crop);
+                            delivery.cursor.crop =
+                                streams.get(&id).and_then(native::Stream::cursor_crop);
                         }
                     } else if matches!(result, Err(PlatformError::Timeout)) {
                         // The OS may apply a timed-out configuration later. End the stream rather
@@ -424,6 +454,7 @@ fn worker(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                                 }
                                 delivery.scale = stream.scale;
                                 delivery.crop = stream.cpu_crop();
+                                delivery.cursor.crop = stream.cursor_crop();
                             }
                         }
                     }

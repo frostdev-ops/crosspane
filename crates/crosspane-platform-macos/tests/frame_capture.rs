@@ -1,5 +1,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(unexpected_cfgs)]
+#![cfg_attr(crosspane_cursor_driver, allow(dead_code, unused_imports))]
 
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -249,7 +251,7 @@ fn live_textedit_capture_resize_and_blocked_end() {
                 assert_eq!(reason, StreamEndReason::Blocked);
                 break;
             }
-            FrameEvent::Frame { .. } => {} // Frames queued before closing the gate.
+            FrameEvent::Frame { .. } | FrameEvent::Cursor { .. } => {} // Queued before gate close.
             _ => panic!("unexpected frame event"),
         }
     }
@@ -259,4 +261,247 @@ fn live_textedit_capture_resize_and_blocked_end() {
     );
     drop(capture);
     drop(fixture);
+}
+
+// Like private_vdisplay.rs, compile this file as a small driver: libtest owns main, but
+// the cursor watcher's AppKit calls require a running main-thread application loop.
+#[cfg(not(crosspane_cursor_driver))]
+#[test]
+fn live_main_display_cursor() {
+    if std::env::var("CROSSPANE_MAC_LIVE").as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: cursor capture requires CROSSPANE_MAC_LIVE=1 in the lead's GUI session"
+        );
+        return;
+    }
+    let deps = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let executable = deps.join(format!("capture-cursor-gui-{}", std::process::id()));
+    let mut compiler = std::process::Command::new("rustc");
+    compiler
+        .args(["--edition=2024", "--cfg", "crosspane_cursor_driver", "-L"])
+        .arg(format!("dependency={}", deps.display()));
+    for name in [
+        "crosspane_platform",
+        "crosspane_platform_macos",
+        "crosspane_types",
+        "block2",
+        "objc2",
+        "objc2_app_kit",
+        "objc2_core_graphics",
+        "objc2_core_media",
+        "objc2_foundation",
+        "objc2_screen_capture_kit",
+    ] {
+        let prefix = format!("lib{name}-");
+        let version = if name == "objc2" {
+            Some("objc2-0.6.4/".to_owned())
+        } else if name.starts_with("objc2_") {
+            Some(format!("{}-0.3.2/", name.replace('_', "-")))
+        } else {
+            None
+        };
+        let library = std::fs::read_dir(&deps)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+                    && path.extension().is_some_and(|ext| ext == "rlib")
+            })
+            .filter(|path| {
+                version.as_ref().is_none_or(|version| {
+                    let stem = path.file_stem().unwrap().to_string_lossy();
+                    let info = deps.join(format!("{}.d", stem.trim_start_matches("lib")));
+                    std::fs::read_to_string(info).is_ok_and(|info| info.contains(version))
+                })
+            })
+            .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
+            .unwrap_or_else(|| panic!("missing compiled dependency {name}"));
+        compiler
+            .arg("--extern")
+            .arg(format!("{name}={}", library.display()));
+    }
+    assert!(
+        compiler
+            .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/frame_capture.rs"))
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = std::process::Command::new(&executable)
+        .env("CROSSPANE_MAC_LIVE", "1")
+        .status()
+        .unwrap();
+    std::fs::remove_file(executable).unwrap();
+    assert!(status.success(), "cursor GUI driver failed: {status}");
+}
+
+#[cfg(crosspane_cursor_driver)]
+fn main() {
+    assert_eq!(std::env::var("CROSSPANE_MAC_LIVE").as_deref(), Ok("1"));
+    std::thread::spawn(|| {
+        let result = std::panic::catch_unwind(cursor_capture_test);
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    });
+    crosspane_platform_macos::main_thread::run_app().expect("AppKit run loop");
+}
+
+#[cfg(crosspane_cursor_driver)]
+fn cursor_capture_test() {
+    use crosspane_types::id::DisplayId;
+    use objc2_app_kit::NSCursor;
+    use objc2_core_graphics::{
+        CGDisplayBounds, CGError, CGMainDisplayID, CGWarpMouseCursorPosition,
+    };
+    use objc2_foundation::{NSArray, NSPoint};
+    use objc2_screen_capture_kit::SCWindow;
+
+    assert!(
+        CGPreflightScreenCaptureAccess(),
+        "lead must use a granted responsible identity"
+    );
+    let display = CGMainDisplayID();
+    let bounds = CGDisplayBounds(display);
+    assert!(bounds.size.width > 0.0 && bounds.size.height > 0.0);
+    let (tx, response) = mpsc::channel();
+    let callback = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            // SAFETY: Live nullable completion arguments are borrowed only during this callback;
+            // all SCK objects stay on its thread. Only the scalar backing scale crosses threads.
+            let scale = unsafe {
+                assert!(error.is_null());
+                content
+                    .as_ref()
+                    .expect("SCK content")
+                    .displays()
+                    .iter()
+                    .find(|d| d.displayID() == display)
+                    .map(|d| {
+                        SCContentFilter::initWithDisplay_excludingWindows(
+                            SCContentFilter::alloc(),
+                            &d,
+                            &NSArray::<SCWindow>::new(),
+                        )
+                        .pointPixelScale()
+                    })
+            };
+            tx.send(scale).unwrap();
+        },
+    );
+    // SAFETY: Documented completion signature; SCK copies the block for asynchronous use.
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&callback) };
+    let scale = f64::from(
+        response
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap(),
+    );
+    let gate = IoGate::new();
+    gate.set_session_permits(true);
+    gate.set_engine_permits(true);
+    let mut capture = MacFrameCapture::new(gate).expect("Screen Recording granted");
+    let (tx, rx) = mpsc::channel();
+    let stream = capture
+        .start(
+            CaptureTarget::Display(DisplayId(display)),
+            None,
+            30,
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        )
+        .expect("main display capture");
+    // Lead-run only: the WP explicitly permits pointer warping in this live test.
+    assert_eq!(
+        CGWarpMouseCursorPosition(NSPoint::new(bounds.origin.x + 10.0, bounds.origin.y + 10.0,)),
+        CGError::Success
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (image, points) = loop {
+        match rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("Some(cursor) within two seconds")
+        {
+            FrameEvent::Cursor {
+                stream: received,
+                cursor: Some(image),
+            } => {
+                assert_eq!(received, stream);
+                let points = crosspane_platform_macos::main_thread::on_main(
+                    Duration::from_millis(100),
+                    |_| {
+                        #[allow(deprecated)]
+                        let cursor = NSCursor::currentSystemCursor();
+                        eprintln!("GUI currentSystemCursor: {cursor:?}");
+                        cursor
+                            .expect("system cursor available in GUI")
+                            .image()
+                            .size()
+                    },
+                )
+                .unwrap();
+                let width = (points.width * scale).round();
+                let height = (points.height * scale).round();
+                let fit = (256.0 / width.max(height)).min(1.0);
+                let expected =
+                    PixelSize::new((width * fit).round() as u32, (height * fit).round() as u32);
+                // A cursor queued before the warp can have the previous app's shape. Require
+                // a sample matching the now-stationary pointer's source at the SCK density.
+                if image.size == expected {
+                    break (image, points);
+                }
+            }
+            FrameEvent::Ended { reason, .. } => panic!("capture ended: {reason:?}"),
+            _ => {}
+        }
+    };
+    assert!(image.size.width > 0 && image.size.height > 0);
+    assert!(image.size.width <= 256 && image.size.height <= 256);
+    assert_eq!(
+        image.pixels.len(),
+        image.size.width as usize * image.size.height as usize * 4
+    );
+    assert!(image.hotspot.0 < image.size.width && image.hotspot.1 < image.size.height);
+    assert!(
+        image
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] == 255)
+    );
+    eprintln!(
+        "GUI cursor: source={points:?}, scale={scale}, pixels={:?}, hotspot={:?}",
+        image.size, image.hotspot
+    );
+    capture.stop(stream).unwrap();
+    loop {
+        if let FrameEvent::Ended {
+            stream: received,
+            reason,
+        } = rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        {
+            assert_eq!(received, stream);
+            assert_eq!(reason, StreamEndReason::Requested);
+            break;
+        }
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_millis(250)).is_err(),
+        "no events after Ended"
+    );
+    let dropping = Instant::now();
+    drop(capture);
+    assert!(
+        dropping.elapsed() < Duration::from_secs(1),
+        "cursor watcher stops within one second"
+    );
 }
