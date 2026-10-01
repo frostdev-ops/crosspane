@@ -319,6 +319,7 @@ impl RegionScheduler {
         }
         self.tiles.resize(total as usize, BusyTile::default());
         let mut busy: Option<TileRect> = None;
+        let mut busy_count = 0_u32;
         for (i, tile) in self.tiles.iter_mut().enumerate() {
             if tile
                 .last_change
@@ -338,6 +339,7 @@ impl RegionScheduler {
                     height: 1,
                 };
                 busy = Some(busy.map_or(point, |rect| rect.union(point)));
+                busy_count += 1;
             }
         }
         if !video_available {
@@ -354,14 +356,29 @@ impl RegionScheduler {
         };
         let x = busy.x.saturating_sub(1);
         let y = busy.y.saturating_sub(1);
-        let candidate = TileRect {
+        let mut candidate = TileRect {
             x,
             y,
             width: (busy.x + busy.width + 1).min(tiles_x) - x,
             height: (busy.y + busy.height + 1).min(tiles_y) - y,
         };
+        let area = candidate.width * candidate.height;
+        // A region covering most of the window gains nothing over whole-window video and costs a
+        // sub-rectangle (a copy for encoders that take whole buffers, an IDR each time it moves
+        // by a tile): use the whole window (lead tuning, WP-2.31).
+        if area * 4 >= total * 3 {
+            candidate = TileRect {
+                x: 0,
+                y: 0,
+                width: tiles_x,
+                height: tiles_y,
+            };
+        }
         let Some(current) = self.region else {
-            if candidate.width * candidate.height < self.config.min_tiles {
+            // Scattered small changes (a clock here, a spinner there) are cheaper as lossless tiles
+            // than as video of the large box around them: the busy tiles must fill a quarter of
+            // their bounding box, like the whole-window scheduler's 25% (lead tuning, WP-2.31).
+            if area < self.config.min_tiles || busy_count * 4 < busy.width * busy.height {
                 return RegionPlan::Tiles;
             }
             self.region = Some(candidate);

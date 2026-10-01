@@ -192,6 +192,13 @@ permissions and recent notices.
   crashed the compositor once (02 §3.3), so it is off. `CROSSPANE_HYPR_CURSORS=1` in the agent's
   environment turns it on, and even then it only covers apps that draw their own cursor (GTK3,
   Firefox, Xwayland), not GTK4, Qt 6 or Chromium.
+- **GPU paths** (docs/wp/GPU-v0.md) are on by default. On Hyprland, captures go straight into GPU
+  memory (DMA-BUF) and NVENC encodes from it; on the Mac, captured frames are hashed on the GPU and
+  VideoToolbox encodes and decodes without CPU copies. `CROSSPANE_GPU=0` in the agent's environment
+  turns them off (CPU paths, as before); the agent logs "GPU frame capture on (DMA-BUF)" on Linux.
+- **Region video:** when only part of a projected window moves, only that rectangle goes as video
+  and the rest stays lossless. `CROSSPANE_REGION_VIDEO=0` on the *destination* keeps sources on
+  whole-window video.
 - **If Hyprland restarts** (e.g. after a crash), the agent notices that its instance is gone,
   exits and is started again by systemd on the new one.
 - **Picking windows:** a peer's windows must be allowed once (`crosspanectl allow <peer> browse` on

@@ -692,32 +692,24 @@ fn external_packed_stale_refresh_errors_commit_and_keys() {
                 .is_none()
         );
     }
-    assert!(encoder.key_pending(small));
+    // Region captures don't count toward the periodic key frame (lead change, WP-2.31): it
+    // would send the moving region losslessly.
+    assert!(!encoder.key_pending(small));
     let scan = encoder.scan_external(small, &[0]).unwrap();
-    let periodic = encoder
-        .emit_region(
-            scan,
-            header(small, 300),
-            TilePixels::Packed(&packed),
-            Some(cover),
-            false,
-            &mut out,
-        )
-        .unwrap()
-        .unwrap();
-    assert!(periodic.key);
-    assert_eq!(periodic.tiles, 1);
-    let scan = encoder.scan_external(small, &[0]).unwrap();
-    encoder
-        .emit_region(
-            scan,
-            header(small, 301),
-            TilePixels::Packed(&packed),
-            Some(cover),
-            false,
-            &mut out,
-        )
-        .unwrap();
+    assert!(
+        encoder
+            .emit_region(
+                scan,
+                header(small, 300),
+                TilePixels::Packed(&packed),
+                Some(cover),
+                false,
+                &mut out,
+            )
+            .unwrap()
+            .is_none()
+    );
+    // A requested key frame still goes out, region or not, and sends every tile.
     encoder.request_key();
     let scan = encoder.scan_external(small, &[0]).unwrap();
     assert!(
@@ -733,5 +725,164 @@ fn external_packed_stale_refresh_errors_commit_and_keys() {
             .unwrap()
             .unwrap()
             .key
+    );
+}
+
+fn packed_tile(pixels: &[u8], size: PixelSize, tx: u32, ty: u32) -> Vec<u8> {
+    let mut tile = Vec::new();
+    for y in ty * 64..((ty + 1) * 64).min(size.height) {
+        let x0 = tx * 64;
+        let x1 = ((tx + 1) * 64).min(size.width);
+        let row = (y * size.width) as usize * 4;
+        tile.extend_from_slice(&pixels[row + x0 as usize * 4..row + x1 as usize * 4]);
+    }
+    tile
+}
+
+/// `tiles_to_send` names exactly the tiles `emit_region` reads (WP-2.31 gathers only those):
+/// a source holding just those tiles always suffices, and the frame carries all of them.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn tiles_to_send_is_exactly_what_emit_region_reads() {
+    let size = PixelSize::new(450, 260);
+    let (nx, ny) = (size.width.div_ceil(64), size.height.div_ceil(64));
+    let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+    let mut encoder = TileEncoder::new();
+    let mut frame = vec![0_u8; (size.width * size.height * 4) as usize];
+    let mut committed = frame.clone();
+    let mut out = Vec::new();
+    for seq in 1..400_u64 {
+        for _ in 0..rng.random_range(0..6) {
+            let (tx, ty) = (rng.random_range(0..nx), rng.random_range(0..ny));
+            paint(&mut frame, size, tx, ty, rng.random::<u8>());
+        }
+        let video = rng.random_bool(0.5).then(|| {
+            let (x, y) = (rng.random_range(0..nx), rng.random_range(0..ny));
+            TileRect {
+                x,
+                y,
+                width: rng.random_range(1..=nx - x),
+                height: rng.random_range(1..=ny - y),
+            }
+        });
+        let force_key = rng.random_bool(0.05);
+        let scan = if rng.random_bool(0.5) {
+            encoder.scan(size, &frame, size.width * 4).unwrap()
+        } else {
+            let changed: Vec<(u32, u32)> = (0..ny)
+                .flat_map(|ty| (0..nx).map(move |tx| (tx, ty)))
+                .filter(|&(tx, ty)| {
+                    packed_tile(&frame, size, tx, ty) != packed_tile(&committed, size, tx, ty)
+                })
+                .collect();
+            encoder
+                .scan_external(size, &bitmap(size, &changed))
+                .unwrap()
+        };
+        let bits = encoder.tiles_to_send(&scan, video, force_key);
+        let source = Packed {
+            tiles: (0..ny)
+                .flat_map(|ty| (0..nx).map(move |tx| (tx, ty)))
+                .map(|(tx, ty)| {
+                    let i = (ty * nx + tx) as usize;
+                    if bits[i / 32] & (1 << (i % 32)) != 0 {
+                        packed_tile(&frame, size, tx, ty)
+                    } else {
+                        Vec::new() // wrong length: emit fails if it reads this tile
+                    }
+                })
+                .collect(),
+            nx,
+        };
+        let wanted: u32 = bits.iter().map(|w| w.count_ones()).sum();
+        let stats = encoder
+            .emit_region(
+                scan,
+                header(size, seq),
+                TilePixels::Packed(&source),
+                video,
+                force_key,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(stats.map_or(0, |s| s.tiles), wanted, "capture {seq}");
+        committed.clone_from(&frame);
+    }
+}
+
+/// Region video never brings a periodic (collision-repair) key frame: it would send the moving
+/// region losslessly. Pure tile captures still do, every 300.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn no_periodic_key_frames_during_region_video() {
+    let size = PixelSize::new(256, 192);
+    let frame = vec![7_u8; (size.width * size.height * 4) as usize];
+    let region = TileRect {
+        x: 1,
+        y: 1,
+        width: 2,
+        height: 1,
+    };
+    let mut encoder = TileEncoder::new();
+    let mut out = Vec::new();
+    let mut emit = |encoder: &mut TileEncoder, seq: u64, video: Option<TileRect>| {
+        let scan = encoder.scan(size, &frame, size.width * 4).unwrap();
+        encoder
+            .emit_region(
+                scan,
+                header(size, seq),
+                TilePixels::Strided {
+                    pixels: &frame,
+                    stride: size.width * 4,
+                },
+                video,
+                false,
+                &mut out,
+            )
+            .unwrap()
+    };
+    assert!(emit(&mut encoder, 1, None).is_some_and(|s| s.key));
+    for seq in 2..1000 {
+        assert!(
+            emit(&mut encoder, seq, Some(region)).is_none_or(|s| !s.key),
+            "key frame during region video at capture {seq}"
+        );
+    }
+    // Region over: its stale tiles go out, then tile captures count toward the periodic key.
+    assert_eq!(emit(&mut encoder, 1000, None).map(|s| s.tiles), Some(2));
+    let first_key = (1001..1400).find(|&seq| emit(&mut encoder, seq, None).is_some_and(|s| s.key));
+    assert_eq!(first_key, Some(1299)); // 300 tile captures after the region, counting 1000
+}
+
+/// Lead tuning (WP-2.31): a region covering most of the window becomes the whole window, and
+/// scattered busy tiles that fill under a quarter of their box stay lossless.
+#[test]
+fn large_regions_snap_and_sparse_changes_stay_lossless() {
+    let size = PixelSize::new(640, 384); // 10 × 6 tiles
+    let mut scheduler = RegionScheduler::new(RegionConfig::default());
+    let mut plan = |ms, tiles: &[(u32, u32)]| {
+        scheduler.plan(10, 6, &bitmap(size, tiles), Duration::from_millis(ms), true)
+    };
+    // Two busy corners: a 10 × 6 box with 2 busy tiles is far below a quarter.
+    for ms in [0, 33, 66, 99] {
+        assert_eq!(plan(ms, &[(0, 0), (9, 5)]), RegionPlan::Tiles);
+    }
+    // A busy 7 × 4 block (+ margin: 9 × 6 of 10 × 6) snaps to the whole window.
+    let block: Vec<(u32, u32)> = (1..8).flat_map(|x| (1..5).map(move |y| (x, y))).collect();
+    let mut last = RegionPlan::Tiles;
+    for ms in [1000, 1033, 1066] {
+        last = plan(ms, &block);
+    }
+    assert_eq!(
+        last,
+        RegionPlan::Video {
+            region: TileRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 6
+            },
+            key: true
+        }
     );
 }

@@ -813,6 +813,7 @@ dependencies = [
  "crosspane-security",
  "crosspane-transport",
  "crosspane-types",
+ "pollster",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -820,6 +821,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wgpu",
  "zeroize",
 ]
 
