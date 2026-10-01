@@ -212,6 +212,119 @@ fn portal_hit(portal: Portal, point: CGPoint, dx: f64, dy: f64) -> Option<f64> {
         .then(|| (device - portal.portal.from) / (portal.portal.to - portal.portal.from))
 }
 
+/// Pointer buttons (numbers 0..=255) the tap has seen go down without a matching up. A cache of
+/// what is believed held: `CGEventSource::button_state` is the authority and reconciles it
+/// whenever it may be stale, since a disabled or timed-out tap can miss an up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeldButtons([u64; 4]);
+
+impl HeldButtons {
+    const CAPACITY: usize = 256;
+
+    fn get(&self, number: usize) -> bool {
+        number < Self::CAPACITY && self.0[number / 64] & (1 << (number % 64)) != 0
+    }
+
+    fn set(&mut self, number: usize, down: bool) {
+        if number < Self::CAPACITY {
+            let bit = 1 << (number % 64);
+            if down {
+                self.0[number / 64] |= bit;
+            } else {
+                self.0[number / 64] &= !bit;
+            }
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.0.iter().any(|word| *word != 0)
+    }
+}
+
+/// One non-injected pointer event, as far as E1 edge detection cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerInput {
+    /// `MouseMoved`: no button was down when the OS made the event.
+    Moved,
+    /// `LeftMouseDragged`, `RightMouseDragged` or `OtherMouseDragged`: a button was down.
+    Dragged,
+    ButtonDown(usize),
+    ButtonUp(usize),
+}
+
+/// What the tap emits for one pointer event, and the pressed set that follows it.
+#[derive(Debug, Default, PartialEq)]
+struct EdgeUpdate {
+    /// `EdgePressed` for each portal under the pointer, with its position along the stretch.
+    press: Vec<(PortalId, f64)>,
+    /// `EdgeReleased`, in ascending portal order.
+    release: Vec<PortalId>,
+    /// The pressed set after this event.
+    pressed: HashSet<PortalId>,
+}
+
+/// Pure E1 edge-eligibility decision; the tap feeds it and emits its result. A portal is pressed
+/// only by pointer motion with no local button held, so a drag (a window resize, a selection, a
+/// window move) never starts a crossing that `begin()` would refuse after the handshake work.
+///
+/// - `Dragged` is itself proof that a button is down. This also covers the instant between a
+///   release and the tap seeing it, when `button_state` already reads "up" for a stale drag.
+/// - `Moved` first reconciles the cache against `os_button_down`: a button whose up the tap missed
+///   (disabled tap, timeout) is dropped, so it cannot block crossing for ever. The query runs only
+///   when the cache is non-empty, which keeps the common motion path free of native calls.
+/// - `ButtonDown` releases every pressed portal at once, cancelling any push-to-cross delay.
+/// - `ButtonUp` never presses: a portal becomes eligible again only on later motion.
+fn edge_update(
+    input: PointerInput,
+    buttons: &mut HeldButtons,
+    os_button_down: impl Fn(usize) -> bool,
+    pressed: &HashSet<PortalId>,
+    hits: &[(PortalId, f64)],
+) -> EdgeUpdate {
+    let release_all = || {
+        let mut release: Vec<_> = pressed.iter().copied().collect();
+        release.sort();
+        EdgeUpdate {
+            release,
+            ..EdgeUpdate::default()
+        }
+    };
+    match input {
+        PointerInput::ButtonDown(number) => {
+            buttons.set(number, true);
+            release_all()
+        }
+        PointerInput::ButtonUp(number) => {
+            buttons.set(number, false);
+            EdgeUpdate {
+                pressed: pressed.clone(),
+                ..EdgeUpdate::default()
+            }
+        }
+        PointerInput::Dragged => release_all(),
+        PointerInput::Moved => {
+            if buttons.any() {
+                for number in 0..HeldButtons::CAPACITY {
+                    if buttons.get(number) && !os_button_down(number) {
+                        buttons.set(number, false);
+                    }
+                }
+                if buttons.any() {
+                    return release_all();
+                }
+            }
+            let now: HashSet<_> = hits.iter().map(|(id, _)| *id).collect();
+            let mut release: Vec<_> = pressed.difference(&now).copied().collect();
+            release.sort();
+            EdgeUpdate {
+                press: hits.to_vec(),
+                release,
+                pressed: now,
+            }
+        }
+    }
+}
+
 fn modifier_down(keycode: u16, flags: CGEventFlags) -> Option<bool> {
     // Apple's public IOKit/hidsystem/IOLLEvent.h NX_DEVICE* masks distinguish held sides.
     let mask = match keycode {
@@ -873,6 +986,8 @@ struct TapState {
     local_keys: [bool; 128],
     suppressed_keys: [u64; 128],
     suppressed_buttons: [u64; 256],
+    /// Every button the tap saw go down and not yet up, whether or not capture suppressed it.
+    held_buttons: HeldButtons,
 }
 
 impl TapState {
@@ -1238,6 +1353,35 @@ impl TapState {
         }
     }
 
+    /// Runs one pointer event through the pure edge decision and emits what it asks for.
+    fn edge_input(&mut self, input: PointerInput, hits: &[(PortalId, f64)], at: MonoTime) {
+        let update = edge_update(
+            input,
+            &mut self.held_buttons,
+            |number| {
+                u32::try_from(number)
+                    .is_ok_and(|number| CGEventSource::button_state(SESSION, CGMouseButton(number)))
+            },
+            &self.pressed,
+            hits,
+        );
+        for (portal, position) in update.press {
+            self.shared.event(
+                0,
+                CaptureEvent::EdgePressed {
+                    portal,
+                    position,
+                    at,
+                },
+            );
+        }
+        for portal in update.release {
+            self.shared
+                .event(0, CaptureEvent::EdgeReleased { portal, at });
+        }
+        self.pressed = update.pressed;
+    }
+
     /// Returns true only when the OS should receive this event.
     fn event(&mut self, kind: CGEventType, event: &CGEvent) -> bool {
         if self.shared.dead.load(Ordering::Acquire) {
@@ -1306,30 +1450,20 @@ impl TapState {
             } else if self.subscribed {
                 self.sync_portals();
                 let location = CGEvent::location(Some(event));
-                let mut pressed = HashSet::new();
-                for portal in self.portals.iter() {
-                    if let Some(position) = portal_hit(*portal, location, dx, dy) {
-                        pressed.insert(portal.portal.id);
-                        self.shared.event(
-                            0,
-                            CaptureEvent::EdgePressed {
-                                portal: portal.portal.id,
-                                position,
-                                at,
-                            },
-                        );
-                    }
-                }
-                for portal in self.pressed.difference(&pressed) {
-                    self.shared.event(
-                        0,
-                        CaptureEvent::EdgeReleased {
-                            portal: *portal,
-                            at,
-                        },
-                    );
-                }
-                self.pressed = pressed;
+                let hits: Vec<_> = self
+                    .portals
+                    .iter()
+                    .filter_map(|portal| {
+                        portal_hit(*portal, location, dx, dy)
+                            .map(|position| (portal.portal.id, position))
+                    })
+                    .collect();
+                let input = if kind == CGEventType::MouseMoved {
+                    PointerInput::Moved
+                } else {
+                    PointerInput::Dragged
+                };
+                self.edge_input(input, &hits, at);
             }
             return !capturing || self.shared.dead.load(Ordering::Acquire);
         }
@@ -1421,6 +1555,17 @@ impl TapState {
             if index >= self.suppressed_buttons.len() {
                 return !capturing;
             }
+            // Track every local button, suppressed or not. A down also releases any pressed
+            // portal at once; an up never presses one, so only later motion can.
+            self.edge_input(
+                if button_down {
+                    PointerInput::ButtonDown(index)
+                } else {
+                    PointerInput::ButtonUp(index)
+                },
+                &[],
+                at,
+            );
             if self.suppressed_buttons[index] != 0 {
                 if button_up {
                     let pressed_in = self.suppressed_buttons[index];
@@ -1626,6 +1771,7 @@ fn run_tap(
         local_keys: [false; 128],
         suppressed_keys: [0; 128],
         suppressed_buttons: [0; 256],
+        held_buttons: HeldButtons::default(),
     }));
     let mut guard = TapGuard {
         state,
@@ -1992,6 +2138,478 @@ mod tests {
             };
             assert_eq!(portal_hit(portal, outside, dx, dy), None);
         }
+    }
+
+    const BUTTONS: [usize; 6] = [0, 1, 2, 3, 4, 7];
+
+    fn ids(values: &[u32]) -> HashSet<PortalId> {
+        values.iter().copied().map(PortalId).collect()
+    }
+
+    fn hit(id: u32) -> (PortalId, f64) {
+        (PortalId(id), 0.5)
+    }
+
+    /// Fails the test if the decision asks the OS anything.
+    fn no_query(number: usize) -> bool {
+        panic!("button_state queried for button {number} on a path that must not query");
+    }
+
+    #[test]
+    fn held_buttons_cover_every_number() {
+        let mut held = HeldButtons::default();
+        assert!(!held.any());
+        for number in [0, 1, 2, 3, 4, 7, 63, 64, 127, 128, 255] {
+            held.set(number, true);
+            assert!(held.get(number));
+            assert!(held.any());
+            held.set(number, false);
+            assert!(!held.get(number));
+            assert!(!held.any());
+        }
+        held.set(256, true);
+        held.set(usize::MAX, true);
+        assert!(!held.any());
+        assert!(!held.get(256));
+    }
+
+    #[test]
+    fn drag_across_a_portal_presses_nothing() {
+        for button in BUTTONS {
+            let mut held = HeldButtons::default();
+            let mut pressed = HashSet::new();
+            let down = edge_update(
+                PointerInput::ButtonDown(button),
+                &mut held,
+                no_query,
+                &pressed,
+                &[],
+            );
+            assert_eq!(down, EdgeUpdate::default());
+            // Repeated dragged motion across the stretch, as in the 2026-10-01 resize drag.
+            for _ in 0..5 {
+                let update = edge_update(
+                    PointerInput::Dragged,
+                    &mut held,
+                    no_query,
+                    &pressed,
+                    &[hit(1), hit(2)],
+                );
+                assert_eq!(update, EdgeUpdate::default(), "button {button}");
+                pressed = update.pressed;
+            }
+            assert!(held.get(button));
+        }
+    }
+
+    #[test]
+    fn a_drag_is_held_even_when_the_tap_missed_the_down() {
+        // Tap re-enabled mid-drag: no down was seen, and button_state may already read "up".
+        let mut held = HeldButtons::default();
+        let update = edge_update(
+            PointerInput::Dragged,
+            &mut held,
+            |_| false,
+            &HashSet::new(),
+            &[hit(1)],
+        );
+        assert_eq!(update, EdgeUpdate::default());
+    }
+
+    #[test]
+    fn button_down_while_pressing_releases_at_once() {
+        for button in BUTTONS {
+            let mut held = HeldButtons::default();
+            let pressed = ids(&[3, 1]);
+            let update = edge_update(
+                PointerInput::ButtonDown(button),
+                &mut held,
+                no_query,
+                &pressed,
+                &[hit(1), hit(3)],
+            );
+            assert_eq!(update.release, vec![PortalId(1), PortalId(3)]);
+            assert!(update.press.is_empty());
+            assert!(update.pressed.is_empty());
+            assert!(held.get(button));
+        }
+    }
+
+    #[test]
+    fn button_up_at_the_edge_never_presses_and_later_motion_does() {
+        for button in BUTTONS {
+            let mut held = HeldButtons::default();
+            edge_update(
+                PointerInput::ButtonDown(button),
+                &mut held,
+                no_query,
+                &HashSet::new(),
+                &[],
+            );
+            let up = edge_update(
+                PointerInput::ButtonUp(button),
+                &mut held,
+                no_query,
+                &HashSet::new(),
+                &[hit(1)],
+            );
+            assert_eq!(up, EdgeUpdate::default(), "button {button}");
+            assert!(!held.any());
+            let moved = edge_update(
+                PointerInput::Moved,
+                &mut held,
+                no_query,
+                &up.pressed,
+                &[hit(1)],
+            );
+            assert_eq!(moved.press, vec![hit(1)]);
+            assert!(moved.release.is_empty());
+            assert_eq!(moved.pressed, ids(&[1]));
+        }
+    }
+
+    #[test]
+    fn the_last_up_decides_not_the_first() {
+        let mut held = HeldButtons::default();
+        let none = HashSet::new();
+        for button in [0, 1] {
+            edge_update(
+                PointerInput::ButtonDown(button),
+                &mut held,
+                no_query,
+                &none,
+                &[],
+            );
+        }
+        edge_update(PointerInput::ButtonUp(0), &mut held, no_query, &none, &[]);
+        // Right is still down in the OS too, so a Moved (synthetic tools can send one) stays quiet.
+        let update = edge_update(
+            PointerInput::Moved,
+            &mut held,
+            |number| number == 1,
+            &none,
+            &[hit(1)],
+        );
+        assert_eq!(update, EdgeUpdate::default());
+        edge_update(PointerInput::ButtonUp(1), &mut held, no_query, &none, &[]);
+        let update = edge_update(PointerInput::Moved, &mut held, no_query, &none, &[hit(1)]);
+        assert_eq!(update.press, vec![hit(1)]);
+    }
+
+    #[test]
+    fn a_missed_up_is_reconciled_from_button_state() {
+        for button in BUTTONS {
+            let mut held = HeldButtons::default();
+            let none = HashSet::new();
+            edge_update(
+                PointerInput::ButtonDown(button),
+                &mut held,
+                no_query,
+                &none,
+                &[],
+            );
+            // The up never reached the tap. button_state says the button is held: no press.
+            let queried = std::cell::RefCell::new(Vec::new());
+            let still_down = edge_update(
+                PointerInput::Moved,
+                &mut held,
+                |number| {
+                    queried.borrow_mut().push(number);
+                    true
+                },
+                &none,
+                &[hit(1)],
+            );
+            assert_eq!(still_down, EdgeUpdate::default());
+            assert!(held.get(button));
+            // button_state says it is up: the stale entry is dropped and motion presses.
+            queried.borrow_mut().clear();
+            let reconciled = edge_update(
+                PointerInput::Moved,
+                &mut held,
+                |number| {
+                    queried.borrow_mut().push(number);
+                    false
+                },
+                &none,
+                &[hit(1)],
+            );
+            assert_eq!(*queried.borrow(), vec![button], "only the tracked button");
+            assert!(!held.any());
+            assert_eq!(reconciled.press, vec![hit(1)]);
+            assert_eq!(reconciled.pressed, ids(&[1]));
+            // Reconciled for good: the next motion needs no query.
+            let next = edge_update(
+                PointerInput::Moved,
+                &mut held,
+                no_query,
+                &reconciled.pressed,
+                &[hit(1)],
+            );
+            assert_eq!(next.press, vec![hit(1)]);
+        }
+    }
+
+    #[test]
+    fn a_missed_up_still_held_in_the_os_releases_a_pressed_portal() {
+        let mut held = HeldButtons::default();
+        held.set(0, true);
+        let update = edge_update(
+            PointerInput::Moved,
+            &mut held,
+            |_| true,
+            &ids(&[1]),
+            &[hit(1)],
+        );
+        assert_eq!(update.release, vec![PortalId(1)]);
+        assert!(update.press.is_empty());
+        assert!(update.pressed.is_empty());
+    }
+
+    #[test]
+    fn plain_motion_keeps_the_press_and_release_behaviour() {
+        let mut held = HeldButtons::default();
+        // Entering, staying on and leaving a stretch; no button, so no native query.
+        let enter = edge_update(
+            PointerInput::Moved,
+            &mut held,
+            no_query,
+            &HashSet::new(),
+            &[hit(1)],
+        );
+        assert_eq!(enter.press, vec![hit(1)]);
+        assert!(enter.release.is_empty());
+        let stay = edge_update(
+            PointerInput::Moved,
+            &mut held,
+            no_query,
+            &enter.pressed,
+            &[hit(1)],
+        );
+        assert_eq!(stay.press, vec![hit(1)]);
+        assert!(stay.release.is_empty());
+        let swap = edge_update(
+            PointerInput::Moved,
+            &mut held,
+            no_query,
+            &stay.pressed,
+            &[hit(2)],
+        );
+        assert_eq!(swap.press, vec![hit(2)]);
+        assert_eq!(swap.release, vec![PortalId(1)]);
+        let leave = edge_update(PointerInput::Moved, &mut held, no_query, &swap.pressed, &[]);
+        assert!(leave.press.is_empty());
+        assert_eq!(leave.release, vec![PortalId(2)]);
+        assert!(leave.pressed.is_empty());
+    }
+
+    // The tap's own state machine, fed synthetic CGEvents. Creating an event needs no TCC grant
+    // and nothing is posted; every path below avoids button_state, so the result does not
+    // depend on the session's real mouse.
+    fn tap_fixture() -> (TapState, Receiver<Delivery>) {
+        let (shared, receiver) = shared_fixture();
+        let display = Display {
+            id: DisplayId(1),
+            bounds: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(100.0, 100.0)),
+            scale: 1.0,
+        };
+        let portals = Arc::new(vec![Portal {
+            display,
+            portal: CapturePortal {
+                id: PortalId(1),
+                display: display.id,
+                edge: Edge::Right,
+                from: 0.0,
+                to: 100.0,
+            },
+        }]);
+        *shared.portals.lock().unwrap() = portals.clone();
+        let (_commands, commands) = mpsc::channel();
+        (
+            TapState {
+                shared,
+                commands,
+                tap: None,
+                portal_config: portals.clone(),
+                portals,
+                pressed: HashSet::new(),
+                subscribed: true,
+                monitor: false,
+                last_activity: None,
+                last_secure_poll: Instant::now(),
+                last_geometry_poll: Instant::now(),
+                blinded: false,
+                lock_keys: LockKeys::default(),
+                display: None,
+                local_keys: [false; 128],
+                suppressed_keys: [0; 128],
+                suppressed_buttons: [0; 256],
+                held_buttons: HeldButtons::default(),
+            },
+            receiver,
+        )
+    }
+
+    /// A synthetic pointer event at the right edge (x = 100) of the fixture display.
+    fn pointer(kind: CGEventType, button: u32, injected: bool) -> CFRetained<CGEvent> {
+        let event =
+            CGEvent::new_mouse_event(None, kind, CGPoint::new(100.0, 50.0), CGMouseButton(button))
+                .expect("synthetic mouse event");
+        CGEvent::set_double_value_field(Some(&event), CGEventField::MouseEventDeltaX, 5.0);
+        if injected {
+            CGEvent::set_integer_value_field(
+                Some(&event),
+                CGEventField::EventSourceUserData,
+                INJECTED,
+            );
+        }
+        event
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum EdgeSeen {
+        Pressed(u32),
+        Released(u32),
+    }
+
+    fn edge_events(receiver: &Receiver<Delivery>) -> Vec<EdgeSeen> {
+        receiver
+            .try_iter()
+            .filter_map(|delivery| match delivery {
+                Delivery::Event(0, CaptureEvent::EdgePressed { portal, .. }) => {
+                    Some(EdgeSeen::Pressed(portal.0))
+                }
+                Delivery::Event(0, CaptureEvent::EdgeReleased { portal, .. }) => {
+                    Some(EdgeSeen::Released(portal.0))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tap_drag_at_the_edge_never_presses_and_delivery_is_native() {
+        for (down, dragged, up, button) in [
+            (
+                CGEventType::LeftMouseDown,
+                CGEventType::LeftMouseDragged,
+                CGEventType::LeftMouseUp,
+                0,
+            ),
+            (
+                CGEventType::RightMouseDown,
+                CGEventType::RightMouseDragged,
+                CGEventType::RightMouseUp,
+                1,
+            ),
+            (
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseDragged,
+                CGEventType::OtherMouseUp,
+                3,
+            ),
+        ] {
+            let (mut tap, receiver) = tap_fixture();
+            // Pointer reaches the edge: pressed.
+            assert!(tap.event(
+                CGEventType::MouseMoved,
+                &pointer(CGEventType::MouseMoved, 0, false)
+            ));
+            assert_eq!(edge_events(&receiver), [EdgeSeen::Pressed(1)]);
+            // Button goes down at the edge: released at once, event still delivered to the OS.
+            assert!(tap.event(down, &pointer(down, button, false)));
+            assert_eq!(edge_events(&receiver), [EdgeSeen::Released(1)]);
+            assert!(tap.pressed.is_empty());
+            // The drag runs along the edge: no press, every event delivered to the OS.
+            for _ in 0..3 {
+                assert!(tap.event(dragged, &pointer(dragged, button, false)));
+            }
+            assert!(edge_events(&receiver).is_empty());
+            // The up at the edge presses nothing and is delivered to the OS.
+            assert!(tap.event(up, &pointer(up, button, false)));
+            assert!(edge_events(&receiver).is_empty());
+            assert!(!tap.held_buttons.any());
+            // Only later motion presses again.
+            assert!(tap.event(
+                CGEventType::MouseMoved,
+                &pointer(CGEventType::MouseMoved, 0, false)
+            ));
+            assert_eq!(edge_events(&receiver), [EdgeSeen::Pressed(1)]);
+        }
+    }
+
+    #[test]
+    fn tap_ignores_injected_pointer_events() {
+        let (mut tap, receiver) = tap_fixture();
+        // Injected motion at the edge neither presses nor drags.
+        for kind in [
+            CGEventType::MouseMoved,
+            CGEventType::LeftMouseDragged,
+            CGEventType::OtherMouseDragged,
+        ] {
+            assert!(tap.event(kind, &pointer(kind, 0, true)));
+        }
+        assert!(edge_events(&receiver).is_empty());
+        // A real press, then an injected down and up: no release, and no held button recorded.
+        assert!(tap.event(
+            CGEventType::MouseMoved,
+            &pointer(CGEventType::MouseMoved, 0, false)
+        ));
+        assert_eq!(edge_events(&receiver), [EdgeSeen::Pressed(1)]);
+        for kind in [CGEventType::LeftMouseDown, CGEventType::RightMouseDown] {
+            assert!(tap.event(kind, &pointer(kind, 0, true)));
+        }
+        assert!(edge_events(&receiver).is_empty());
+        assert!(!tap.held_buttons.any());
+        assert_eq!(tap.pressed, ids(&[1]));
+        // And an injected up cannot clear a button the user really holds.
+        assert!(tap.event(
+            CGEventType::LeftMouseDown,
+            &pointer(CGEventType::LeftMouseDown, 0, false)
+        ));
+        assert_eq!(edge_events(&receiver), [EdgeSeen::Released(1)]);
+        assert!(tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, true)
+        ));
+        assert!(tap.held_buttons.get(0));
+    }
+
+    #[test]
+    fn tap_tracks_a_button_pressed_during_capture() {
+        let (mut tap, receiver) = tap_fixture();
+        let display = tap.portals[0].display;
+        tap.display = Some(display);
+        tap.shared
+            .active
+            .store(1 << 2 | EFFECTIVE, Ordering::Release);
+        tap.shared.capturing.store(true, Ordering::Release);
+        // Captured: the down is swallowed and remembered.
+        assert!(!tap.event(
+            CGEventType::LeftMouseDown,
+            &pointer(CGEventType::LeftMouseDown, 0, false)
+        ));
+        assert!(tap.held_buttons.get(0));
+        assert_eq!(tap.suppressed_buttons[0], 1);
+        // Capture ends with the button still down.
+        tap.shared.finish(EndReason::Requested, None).unwrap();
+        let _ = edge_events(&receiver);
+        assert!(tap.event(
+            CGEventType::LeftMouseDragged,
+            &pointer(CGEventType::LeftMouseDragged, 0, false)
+        ));
+        assert!(edge_events(&receiver).is_empty());
+        // The suppressed up is still swallowed, then the button no longer blocks a press.
+        assert!(!tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, false)
+        ));
+        assert!(!tap.held_buttons.any());
+        assert!(tap.event(
+            CGEventType::MouseMoved,
+            &pointer(CGEventType::MouseMoved, 0, false)
+        ));
+        assert_eq!(edge_events(&receiver), [EdgeSeen::Pressed(1)]);
     }
 
     #[test]
