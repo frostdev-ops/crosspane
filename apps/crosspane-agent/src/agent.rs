@@ -2241,8 +2241,18 @@ impl Agent {
                             source,
                             projection: ProjectionId(projection),
                         };
-                        self.feed(Input::Command(Command::Return(key)));
-                        Response::ok(json!("returning"))
+                        if self.projections.contains_key(&key) {
+                            self.feed(Input::Command(Command::Return(key)));
+                            Response::ok(json!("returning"))
+                        } else {
+                            // A window ID here is a common slip: projections have their own
+                            // numbers, shown by `crosspanectl status`.
+                            Response::err(format!(
+                                "no projection {projection} from that source; `crosspanectl \
+                                 status` lists them (\"projecting window N\" or \"showing \
+                                 window N\")"
+                            ))
+                        }
                     }
                 }
             }

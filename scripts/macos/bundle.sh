@@ -65,6 +65,31 @@ for extra in "${extras[@]+"${extras[@]}"}"; do
     /bin/cp -- "$extra" "$app/Contents/MacOS/${extra##*/}"
     /bin/chmod 755 "$app/Contents/MacOS/${extra##*/}"
 done
+# Homebrew libraries the executables link (e.g. libopus, WP-3.0) go inside the bundle and are
+# signed with its identity: the hardened runtime refuses libraries signed by another team.
+frameworks=$app/Contents/Frameworks
+embedded=()
+embed() {
+    local exe=$1 lib base
+    while read -r lib; do
+        [[ $lib == /opt/homebrew/* || $lib == /usr/local/* ]] || continue
+        base=${lib##*/}
+        if [[ ! -f $frameworks/$base ]]; then
+            /bin/mkdir -p "$frameworks"
+            /bin/cp -L -- "$lib" "$frameworks/$base"
+            /bin/chmod 755 "$frameworks/$base"
+            /usr/bin/install_name_tool -id "@rpath/$base" "$frameworks/$base" 2>/dev/null
+            embedded+=("$frameworks/$base")
+            embed "$frameworks/$base"
+        fi
+        /usr/bin/install_name_tool -change "$lib" "@executable_path/../Frameworks/$base" "$exe" \
+            2>/dev/null
+    done < <(/usr/bin/otool -L "$exe" | /usr/bin/tail -n +2 | /usr/bin/awk '{print $1}')
+}
+embed "$app/Contents/MacOS/$name"
+for extra in "${extras[@]+"${extras[@]}"}"; do
+    embed "$app/Contents/MacOS/${extra##*/}"
+done
 plist=$app/Contents/Info.plist
 /usr/bin/plutil -create xml1 "$plist"
 for key in CFBundleIdentifier CFBundleName CFBundleExecutable CFBundlePackageType \
@@ -89,6 +114,9 @@ if [[ $ui_element == true ]]; then
     /usr/bin/plutil -insert LSUIElement -bool true "$plist"
 fi
 sign=(/usr/bin/codesign --force --timestamp=none --options runtime -s "$identity")
+for lib in "${embedded[@]+"${embedded[@]}"}"; do
+    "$script_dir/run-in-gui.sh" -- "${sign[@]}" "$lib"
+done
 for extra in "${extras[@]+"${extras[@]}"}"; do
     "$script_dir/run-in-gui.sh" -- "${sign[@]}" "$app/Contents/MacOS/${extra##*/}"
 done

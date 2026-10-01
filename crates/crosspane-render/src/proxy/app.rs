@@ -267,9 +267,14 @@ impl App {
                     }
                 }
             }
-            HostCommand::Video { id, size, picture } => {
+            HostCommand::Video {
+                id,
+                size,
+                rect,
+                picture,
+            } => {
                 if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
-                    match window.presenter.set_video(&gpu.device, size, picture) {
+                    match window.presenter.set_video(&gpu.device, size, rect, picture) {
                         Ok(()) => window.window.request_redraw(),
                         Err(error) => {
                             tracing::warn!(id, %error, "proxy frame rejected");
@@ -278,11 +283,16 @@ impl App {
                     }
                 }
             }
-            HostCommand::VideoNative { id, size, picture } => {
+            HostCommand::VideoNative {
+                id,
+                size,
+                rect,
+                picture,
+            } => {
                 if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
                     match window
                         .presenter
-                        .set_native_video(&gpu.device, size, picture)
+                        .set_native_video(&gpu.device, size, rect, picture)
                     {
                         Ok(()) => window.window.request_redraw(),
                         Err(error) => {
