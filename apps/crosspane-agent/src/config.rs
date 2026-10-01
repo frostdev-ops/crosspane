@@ -33,6 +33,9 @@ pub struct Config {
     /// Modifier remap profile per peer name, applied while this node controls that peer:
     /// `none`, `swap-ctrl-gui` (Ctrl ↔ ⌘/Super) or `swap-alt-gui` (Alt ↔ ⌘/Super).
     pub remap: BTreeMap<String, RemapProfile>,
+    /// E2 video bitrate in Mbit/s while windows show motion (WP-2.14); 0 turns video off and
+    /// keeps every projection on lossless tiles.
+    pub video_mbps: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,6 +56,7 @@ impl Default for Config {
             crossing: true,
             mac_virtual_display: false,
             remap: BTreeMap::new(),
+            video_mbps: 20,
         }
     }
 }

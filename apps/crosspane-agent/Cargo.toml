@@ -34,6 +34,8 @@ zeroize.workspace = true
 # The owner-approved private-API module (D7): hide projected Mac windows on a CGVirtualDisplay twin.
 # Off by default; a build with it still needs `mac_virtual_display = true` in config.toml.
 private-vdisplay = ["crosspane-platform-macos/private-vdisplay"]
+# H.264 for windows with motion (WP-2.14): FFmpeg on Linux, VideoToolbox on macOS.
+video = ["crosspane-platform-linux/ffmpeg"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 crosspane-platform-linux.workspace = true

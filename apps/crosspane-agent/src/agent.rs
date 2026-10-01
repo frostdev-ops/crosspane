@@ -54,6 +54,8 @@ pub enum Event {
 #[derive(Debug, Default)]
 struct PeerInfo {
     name: String,
+    /// What its `Hello` advertised (e.g. `h264`).
+    features: Vec<String>,
     displays: Vec<DisplayInfo>,
     connected: bool,
     rtt: Option<Duration>,
@@ -362,6 +364,7 @@ impl Agent {
                     tracing::info!(peer = %peer.short(), %name, "peer connected");
                     let info = self.peers.entry(peer).or_default();
                     info.name = name;
+                    info.features = hello.features.clone();
                     info.displays = hello.displays.clone();
                     info.connected = true;
                     if let Some(link) = self.net.link(peer) {
@@ -571,10 +574,15 @@ impl Agent {
                 };
                 if let Ok(stream) = result {
                     self.streams.insert(stream, projection);
+                    let video = self
+                        .peers
+                        .get(&peer)
+                        .is_some_and(|p| p.features.iter().any(|f| f == "h264"));
                     let _ = self.source_media.send(SourceCmd::Start {
                         stream,
                         projection,
                         peer,
+                        video,
                     });
                 }
                 self.pending

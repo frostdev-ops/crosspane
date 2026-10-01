@@ -62,6 +62,25 @@ fn off_main<T: Send>(
     })
 }
 
+/// The video codecs for E2's motion path (WP-2.14), if this build and machine have them.
+pub fn video_codecs() -> Option<std::sync::Arc<dyn crosspane_media::codec::VideoCodecs>> {
+    #[cfg(all(target_os = "linux", feature = "video"))]
+    {
+        match crosspane_platform_linux::video::FfmpegCodecs::new() {
+            Ok(c) => return Some(std::sync::Arc::new(c)),
+            Err(e) => tracing::warn!(error = %e, "no video codecs: lossless tiles only"),
+        }
+    }
+    #[cfg(all(target_os = "macos", feature = "video"))]
+    {
+        return Some(std::sync::Arc::new(
+            crosspane_platform_macos::video::VtCodecs::new(),
+        ));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// The OS key store alone, for commands that need the identity but must not start the backends
 /// (starting them recovers parked windows, which would undo a running agent's projections).
 #[cfg(target_os = "linux")]
