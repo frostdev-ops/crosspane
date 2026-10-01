@@ -10,6 +10,8 @@ use crate::{Edge, PortalId};
 pub const TOUCH_TOLERANCE_MM: f64 = 2.0;
 /// Shared edge stretches shorter than this don't form portals.
 pub const MIN_PORTAL_MM: f64 = 10.0;
+/// Inward normal distance required before an entry edge can cross back.
+pub const REARM_MM: f64 = 1.5;
 
 /// One display placed on the shared canvas.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -299,15 +301,20 @@ pub enum Step {
 pub struct PointerTracker {
     display: GlobalDisplayId,
     position: PointDevice,
+    // One flag per current-display edge; all portals on a disarmed edge are blocked.
+    disarmed: [bool; 4],
 }
 
 impl PointerTracker {
     /// Start at a display-local device point; `None` if the display isn't in `layout`.
     pub fn new(layout: &Layout, display: GlobalDisplayId, position: PointDevice) -> Option<Self> {
         let placed = layout.get(display)?;
+        let position = placed.geometry.clamp_device(position);
+        let point = placed.origin + placed.geometry.device_to_mm(position).to_vector();
         Some(Self {
             display,
-            position: placed.geometry.clamp_device(position),
+            position,
+            disarmed: EDGES.map(|edge| normal_distance(placed.rect(), point, edge) <= REARM_MM),
         })
     }
 
@@ -320,7 +327,7 @@ impl PointerTracker {
     ///   clamped at the edge, keeping the other axis's motion (it slides).
     /// - Moving onto a touching display of the **same** node continues there (`On`).
     /// - Leaving through a portal yields `Crossed` with `Layout::entry`'s point; the tracker then
-    ///   sits there.
+    ///   sits there with its entry edge disarmed until it moves inward by `REARM_MM`.
     /// - A step longer than the display is processed so it can't tunnel past an edge.
     pub fn step(&mut self, layout: &Layout, delta: VectorMm) -> Step {
         let mut remaining = VectorMm::new(
@@ -332,12 +339,18 @@ impl PointerTracker {
         };
         let mut point = display.origin + display.geometry.device_to_mm(self.position).to_vector();
         loop {
+            self.rearm(display.rect(), point);
             let Some((fraction, edge)) = first_edge(display.rect(), point, remaining) else {
                 point += remaining;
                 self.position = display.geometry.clamp_device(local_device(display, point));
+                self.rearm(
+                    display.rect(),
+                    display.origin + display.geometry.device_to_mm(self.position).to_vector(),
+                );
                 return self.on();
             };
             point += remaining * fraction;
+            self.rearm(display.rect(), point);
             remaining *= 1.0 - fraction;
             let coordinate = along(point, edge);
 
@@ -349,6 +362,7 @@ impl PointerTracker {
                         .is_some_and(|(start, end)| coordinate >= start && coordinate < end)
             }) {
                 self.display = next.id;
+                self.disarmed = [false; 4];
                 display = next;
                 // Keep the geometric boundary until the remaining motion has been consumed;
                 // clamping at every same-node transition would lose a pixel on reverse motion.
@@ -359,7 +373,8 @@ impl PointerTracker {
             let coordinate_device =
                 (coordinate - span_origin(display, edge)) * density(display, edge);
             if let Some(portal) = layout.portals.iter().find(|portal| {
-                portal.from == display.id
+                !self.disarmed[edge_index(edge)]
+                    && portal.from == display.id
                     && portal.edge == edge
                     && coordinate_device >= portal.start
                     && coordinate_device <= portal.end
@@ -368,6 +383,8 @@ impl PointerTracker {
                 if let Some((target, position)) = layout.entry(portal.id, fraction) {
                     self.display = target;
                     self.position = position;
+                    self.disarmed = [false; 4];
+                    self.disarmed[edge_index(opposite(edge))] = true;
                     return Step::Crossed {
                         portal: portal.id,
                         display: target,
@@ -385,11 +402,39 @@ impl PointerTracker {
         }
     }
 
+    fn rearm(&mut self, rect: RectMm, point: PointMm) {
+        for edge in EDGES {
+            if normal_distance(rect, point, edge) >= REARM_MM {
+                self.disarmed[edge_index(edge)] = false;
+            }
+        }
+    }
+
     fn on(&self) -> Step {
         Step::On {
             display: self.display,
             position: self.position,
         }
+    }
+}
+
+const EDGES: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+
+fn edge_index(edge: Edge) -> usize {
+    match edge {
+        Edge::Left => 0,
+        Edge::Right => 1,
+        Edge::Top => 2,
+        Edge::Bottom => 3,
+    }
+}
+
+fn normal_distance(rect: RectMm, point: PointMm, edge: Edge) -> f64 {
+    match edge {
+        Edge::Left => point.x - rect.min().x,
+        Edge::Right => rect.max().x - point.x,
+        Edge::Top => point.y - rect.min().y,
+        Edge::Bottom => rect.max().y - point.y,
     }
 }
 
