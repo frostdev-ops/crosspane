@@ -134,7 +134,9 @@ pub trait CaptureAbort: Send + Sync {
 /// **Ending a capture** (`end`, loss or abort): the engine releases every key and button it routed
 /// to the remote node. For keys and buttons whose downs were suppressed locally, the backend keeps
 /// suppressing their repeats and their eventual ups, and doesn't treat them as new downs if a new
-/// capture starts while they're still held. Anything pressed after the end goes to the local OS
+/// capture starts while they're still held. On platforms that deliver such a stray release
+/// harmlessly (Wayland: the newly focused client sees the key in `wl_keyboard.enter`, not as a
+/// press), the backend needn't suppress it (amendment 1, P6a). Anything pressed after the end goes to the local OS
 /// at once. Dropping the backend ends any capture within the 50 ms budget.
 pub trait InputCapture: Send {
     /// Replace the set of portals atomically: on failure the previous set stays in force.
@@ -151,8 +153,10 @@ pub trait InputCapture: Send {
     ///   emits `Started { id }` before any capture event. Any failure or timeout rolls back
     ///   everything partial, and nothing requested can activate later.
     /// - Fails with [`PlatformError::Locked`] if the I/O gate is closed,
-    ///   [`PlatformError::PointerButtonHeld`] if a pointer button is held (or can't be proved not
-    ///   held), and [`PlatformError::SecureInput`] if the keyboard is blinded.
+    ///   [`PlatformError::PointerButtonHeld`] if a pointer button is known to be held, and
+    ///   [`PlatformError::SecureInput`] if the keyboard is blinded. Where the platform's implicit
+    ///   grab keeps the edge from being entered during a drag (Wayland), "no button event since
+    ///   the edge was entered" counts as not held (amendment 1, P6a).
     /// - The caller shows the capture indicator and waits for it to be visible *before* calling this
     ///   (04 §8 invariant 5).
     /// - A key already down at activation is reported in [`CaptureStart::held_keys`], not as a

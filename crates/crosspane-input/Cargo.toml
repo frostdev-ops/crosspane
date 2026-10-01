@@ -12,3 +12,9 @@ workspace = true
 
 [dependencies]
 crosspane-types.workspace = true
+crosspane-platform.workspace = true
+crosspane-protocol.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
