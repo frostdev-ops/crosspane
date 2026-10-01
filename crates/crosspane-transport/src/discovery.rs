@@ -18,8 +18,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mdns_sd::{
-    DaemonEvent, IfKind, Receiver, RecvTimeoutError, ResolvedService, ScopedIp, ServiceDaemon,
-    ServiceEvent, ServiceInfo,
+    DaemonEvent, IfKind, IfPredicate, Receiver, RecvTimeoutError, ResolvedService, ScopedIp,
+    ServiceDaemon, ServiceEvent, ServiceInfo,
 };
 
 /// The DNS-SD service type.
@@ -78,14 +78,14 @@ const DROP_STEP: Duration = Duration::from_millis(500);
 /// the old one (it did not recover within the 25 s we waited). A node that has just announced one
 /// TXT is heard again about 1.1 s later (the second announcement), so a change needs more than
 /// 2.2 s of quiet before it. Measured on the desktop: changes 2.4 s apart always arrived, 2.0 s
-/// apart sometimes never did.
+/// apart sometimes never did. The registration at start counts as a change.
 const CHANGE_SPACING: Duration = Duration::from_millis(2500);
 
 /// What the background thread and the owner share.
 #[derive(Default)]
 struct Shared {
-    /// The nodes currently seen, by instance id.
-    candidates: Mutex<HashMap<String, Candidate>>,
+    /// The nodes currently seen.
+    seen: Mutex<Seen>,
     /// The pairing name this node advertises, and when it last changed.
     advert: Mutex<Advert>,
 }
@@ -110,15 +110,14 @@ impl Advert {
                 .is_none_or(|changed| changed.elapsed() >= CHANGE_SPACING)
     }
 
-    /// Re-registers the service with the wanted name. That announces it again, and mdns-sd does
-    /// not probe the already-owned name again.
+    /// Re-registers the service with the wanted name, which announces it again.
     fn send(
         &mut self,
         daemon: &ServiceDaemon,
         instance: &str,
         port: u16,
     ) -> Result<(), DiscoveryError> {
-        let info = advertisement(instance, port, self.wanted.as_deref(), false)?;
+        let info = advertisement(instance, port, self.wanted.as_deref())?;
         daemon.register(info).map_err(mdns_error)?;
         self.sent = self.wanted.clone();
         self.last_change = Some(Instant::now());
@@ -156,7 +155,7 @@ impl Discovery {
         events: Box<dyn Fn(DiscoveryEvent) + Send + Sync>,
     ) -> Result<Discovery, DiscoveryError> {
         let instance = new_instance_id();
-        let info = advertisement(&instance, port, None, true)?;
+        let info = advertisement(&instance, port, None)?;
         let fullname = info.get_fullname().to_string();
 
         let daemon = ServiceDaemon::new().map_err(mdns_error)?;
@@ -178,20 +177,18 @@ impl Discovery {
         info: ServiceInfo,
         events: Box<dyn Fn(DiscoveryEvent) + Send + Sync>,
     ) -> Result<Discovery, DiscoveryError> {
-        // This node is for other machines: loopback addresses are useless to them. mdns-sd
-        // enables loopback interfaces by default.
-        daemon
-            .disable_interface(IfKind::LoopbackV4)
-            .map_err(mdns_error)?;
-        daemon
-            .disable_interface(IfKind::LoopbackV6)
-            .map_err(mdns_error)?;
-
         let monitor = daemon.monitor().map_err(mdns_error)?;
         let browse = daemon.browse(SERVICE_TYPE).map_err(mdns_error)?;
         daemon.register(info).map_err(mdns_error)?;
 
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            seen: Mutex::default(),
+            // The registration just made counts as a change.
+            advert: Mutex::new(Advert {
+                last_change: Some(Instant::now()),
+                ..Advert::default()
+            }),
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let browser = Browser {
@@ -230,10 +227,10 @@ impl Discovery {
     ///
     /// The name is cut to 63 bytes at a character boundary. An empty name counts as `None`.
     ///
-    /// Changes reach the network at least 2.5 s apart (`CHANGE_SPACING`). A change that
-    /// comes sooner than that after the previous one returns `Ok` at once and is sent by the
-    /// background thread when its time has come, so only the latest of several rapid changes is
-    /// sent at all.
+    /// Changes reach the network at least 2.5 s apart (`CHANGE_SPACING`), and the first one at
+    /// least 2.5 s after `start`. A change that comes sooner than that returns `Ok` at once and is
+    /// sent by the background thread when its time has come, so only the latest of several rapid
+    /// changes is sent at all.
     pub fn set_pairing_name(&self, name: Option<&str>) -> Result<(), DiscoveryError> {
         let wanted = name.map(cut_name).filter(|name| !name.is_empty());
         let mut advert = lock(&self.shared.advert);
@@ -250,7 +247,11 @@ impl Discovery {
 
     /// The nodes currently seen, not including this one.
     pub fn candidates(&self) -> Vec<Candidate> {
-        let mut all: Vec<Candidate> = lock(&self.shared.candidates).values().cloned().collect();
+        let mut all: Vec<Candidate> = lock(&self.shared.seen)
+            .nodes
+            .values()
+            .map(|(_, candidate)| candidate.clone())
+            .collect();
         all.sort_by(|a, b| a.instance.cmp(&b.instance));
         all
     }
@@ -312,8 +313,12 @@ impl Browser {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             while let Ok(event) = monitor.try_recv() {
-                if let DaemonEvent::Error(error) = event {
-                    tracing::warn!(%error, "mDNS daemon error");
+                match event {
+                    DaemonEvent::Error(error) => tracing::warn!(%error, "mDNS daemon error"),
+                    DaemonEvent::NameChange(change) => {
+                        tracing::warn!(?change, "mDNS name conflict, a name was changed");
+                    }
+                    _ => {}
                 }
             }
             self.send_due_change();
@@ -344,27 +349,10 @@ impl Browser {
         if !resolved.ty_domain.eq_ignore_ascii_case(SERVICE_TYPE) {
             return;
         }
-        let Some(instance) = instance_of(&resolved.fullname) else {
+        let Some((id, generation)) = other_node(&self.own, &resolved.fullname) else {
             return;
         };
-        if is_own(&self.own, instance) {
-            return;
-        }
-        let event = {
-            let mut seen = lock(&self.shared.candidates);
-            match candidate_from(instance, resolved) {
-                Some(candidate) if seen.get(instance) == Some(&candidate) => None,
-                Some(_) if !seen.contains_key(instance) && seen.len() >= MAX_CANDIDATES => None,
-                Some(candidate) => {
-                    seen.insert(instance.to_string(), candidate.clone());
-                    Some(DiscoveryEvent::Found(candidate))
-                }
-                // No longer usable (for example, its `v` disappeared): it is gone for us.
-                None => seen.remove(instance).map(|_| DiscoveryEvent::Lost {
-                    instance: instance.to_string(),
-                }),
-            }
-        };
+        let event = lock(&self.shared.seen).update(id, generation, candidate_from(id, resolved));
         // Not under the lock: the callback may call `candidates()`.
         if let Some(event) = event {
             self.emit(event);
@@ -372,17 +360,12 @@ impl Browser {
     }
 
     fn on_removed(&self, fullname: &str) {
-        let Some(instance) = instance_of(fullname) else {
+        let Some((id, generation)) = other_node(&self.own, fullname) else {
             return;
         };
-        if is_own(&self.own, instance) {
-            return;
-        }
-        let was_seen = lock(&self.shared.candidates).remove(instance).is_some();
-        if was_seen {
-            self.emit(DiscoveryEvent::Lost {
-                instance: instance.to_string(),
-            });
+        let event = lock(&self.shared.seen).remove(id, generation);
+        if let Some(event) = event {
+            self.emit(event);
         }
     }
 
@@ -392,15 +375,84 @@ impl Browser {
     }
 }
 
-/// `instance` is our own advertisement, or its renamed form after a name conflict (`<id> (2)`).
-fn is_own(own: &str, instance: &str) -> bool {
-    let Some(prefix) = instance.get(..own.len()) else {
-        return false;
-    };
-    prefix.eq_ignore_ascii_case(own)
-        && instance
-            .get(own.len()..)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(" ("))
+/// The stable id and name generation of the node that advertised `<label>.<SERVICE_TYPE>`, or
+/// `None` if that is not a node to report: not a name of ours, or this node itself, in any
+/// renamed form.
+fn other_node<'a>(own: &str, fullname: &'a str) -> Option<(&'a str, u32)> {
+    let (id, generation) = split_rename(instance_of(fullname)?);
+    (!id.eq_ignore_ascii_case(own)).then_some((id, generation))
+}
+
+/// Splits a name conflict's rename `<id> (N)` into the id and N. mdns-sd renames a service
+/// whose name seems to be taken to `<id> (2)`, then `<id> (3)` and so on; a plain `<id>` is
+/// generation 1. The id is the node's stable identity.
+fn split_rename(label: &str) -> (&str, u32) {
+    if let Some(body) = label.strip_suffix(')')
+        && let Some((id, number)) = body.rsplit_once(" (")
+        && !id.is_empty()
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(number) = number.parse::<u32>()
+    {
+        return (id, number);
+    }
+    (label, 1)
+}
+
+/// The nodes currently seen, by stable id.
+///
+/// A node whose advertisement was renamed (see [`split_rename`]) stays one node: the newest
+/// generation of its name wins, and what is still cached under an older generation is ignored,
+/// including when it expires.
+#[derive(Default)]
+struct Seen {
+    /// Stable id to the generation of the name we know it by, and what it advertises.
+    nodes: HashMap<String, (u32, Candidate)>,
+}
+
+impl Seen {
+    /// What a resolved advertisement says about a node (`None`: nothing usable). Returns the
+    /// event to report, if any.
+    fn update(
+        &mut self,
+        id: &str,
+        generation: u32,
+        candidate: Option<Candidate>,
+    ) -> Option<DiscoveryEvent> {
+        let Some(candidate) = candidate else {
+            return self.remove(id, generation);
+        };
+        if let Some((known, old)) = self.nodes.get_mut(id) {
+            if *known > generation {
+                return None;
+            }
+            *known = generation;
+            if *old == candidate {
+                return None;
+            }
+            *old = candidate.clone();
+            return Some(DiscoveryEvent::Found(candidate));
+        }
+        if self.nodes.len() >= MAX_CANDIDATES {
+            return None;
+        }
+        self.nodes
+            .insert(id.to_string(), (generation, candidate.clone()));
+        Some(DiscoveryEvent::Found(candidate))
+    }
+
+    /// The advertisement of generation `generation` of `id` is gone or unusable.
+    fn remove(&mut self, id: &str, generation: u32) -> Option<DiscoveryEvent> {
+        match self.nodes.get(id) {
+            Some((known, _)) if *known <= generation => {
+                self.nodes.remove(id);
+                Some(DiscoveryEvent::Lost {
+                    instance: id.to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The instance label of `<instance>.<SERVICE_TYPE>`.
@@ -479,13 +531,16 @@ fn is_unicast_link_local(addr: &Ipv6Addr) -> bool {
 /// This node's advertisement: no addresses given (mdns-sd tracks the host's), TXT `v` and, in
 /// pairing mode, `n`.
 ///
-/// A new name is probed for before it is announced; `probe` is false when re-announcing a name
-/// this node already owns.
+/// The name is not probed for. The instance id is 64 random bits, so it is not taken, and probing
+/// is worse than useless here: while a probe is in flight mdns-sd takes this node's own
+/// announcements, looped back by the host, for another responder claiming the name, and renames
+/// the service to `<id> (2)`, `<id> (3)`, ... A change of the TXT record (the pairing name) is
+/// such an announcement, and macOS, whose probes on `en0` and `lo0` finish at different times,
+/// ran into it every time.
 fn advertisement(
     instance: &str,
     port: u16,
     pairing_name: Option<&str>,
-    probe: bool,
 ) -> Result<ServiceInfo, DiscoveryError> {
     let mut properties = vec![(TXT_VERSION.to_string(), PROTOCOL_VERSION.to_string())];
     if let Some(name) = pairing_name {
@@ -494,7 +549,13 @@ fn advertisement(
     let host = format!("{instance}.local.");
     let mut info = ServiceInfo::new(SERVICE_TYPE, instance, &host, "", port, &properties[..])
         .map_err(mdns_error)?;
-    info.set_requires_probe(probe);
+    info.set_requires_probe(false);
+    // This node is for other machines: its loopback addresses, including macOS's `fe80::1` on
+    // `lo0`, are useless to them. (The daemon still listens on loopback: the host delivers the
+    // copies of our own multicasts there, which is how two nodes on one host see each other.)
+    info.set_interfaces(vec![IfKind::Predicate(IfPredicate::new(|interface| {
+        !interface.is_loopback() && interface.name != "lo" && interface.name != "lo0"
+    }))]);
     Ok(info.enable_addr_auto())
 }
 
@@ -593,16 +654,141 @@ mod tests {
     }
 
     #[test]
-    fn our_own_instance_is_recognised_even_after_a_conflict_rename() {
+    fn a_conflict_rename_is_split_off_the_stable_id() {
+        assert_eq!(split_rename("0123456789abcdef"), ("0123456789abcdef", 1));
+        assert_eq!(
+            split_rename("0123456789abcdef (2)"),
+            ("0123456789abcdef", 2)
+        );
+        assert_eq!(
+            split_rename("0123456789abcdef (18)"),
+            ("0123456789abcdef", 18)
+        );
+        // Only one trailing " (N)" is a rename.
+        assert_eq!(split_rename("id (2) (3)"), ("id (2)", 3));
+        for not_a_rename in [
+            "id (x)",
+            "id ()",
+            "id (+2)",
+            "id (-2)",
+            "id(2)",
+            "id (2",
+            "id 2)",
+            " (2)",
+            "(2)",
+            "",
+            "id (99999999999)",
+        ] {
+            assert_eq!(
+                split_rename(not_a_rename),
+                (not_a_rename, 1),
+                "{not_a_rename}"
+            );
+        }
+    }
+
+    #[test]
+    fn our_own_advertisement_is_never_another_node_in_any_form() {
         let own = "0123456789abcdef";
-        assert!(is_own(own, "0123456789abcdef"));
-        assert!(is_own(own, "0123456789ABCDEF"));
-        assert!(is_own(own, "0123456789abcdef (2)"));
-        assert!(!is_own(own, "0123456789abcdee"));
-        assert!(!is_own(own, "0123456789abcdef0"));
-        assert!(!is_own(own, "0123456789abcde"));
-        assert!(!is_own(own, "0123456789abcdé"));
-        assert!(!is_own(own, ""));
+        let full = |label: &str| format!("{label}.{SERVICE_TYPE}");
+        assert_eq!(
+            other_node(own, &full("0123456789abcdee")),
+            Some(("0123456789abcdee", 1))
+        );
+        assert_eq!(
+            other_node(own, &full("fedcba9876543210 (7)")),
+            Some(("fedcba9876543210", 7))
+        );
+        for ours in [
+            "0123456789abcdef",
+            "0123456789ABCDEF",
+            "0123456789abcdef (2)",
+            "0123456789abcdef (18)",
+        ] {
+            assert_eq!(other_node(own, &full(ours)), None, "{ours}");
+        }
+        // Something else that merely starts like us is another node.
+        assert!(other_node(own, &full("0123456789abcdef0")).is_some());
+        assert!(other_node(own, &full("0123456789abcdef (x)")).is_some());
+        assert_eq!(other_node(own, "0123456789abcdef._other._udp.local."), None);
+    }
+
+    fn candidate(id: &str, name: Option<&str>, port: u16) -> Candidate {
+        Candidate {
+            instance: id.to_string(),
+            addrs: vec![SocketAddr::new(Ipv4Addr::new(10, 0, 0, 7).into(), port)],
+            version: 1,
+            pairing_name: name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_renamed_advertisement_updates_the_same_node() {
+        let id = "0123456789abcdef";
+        let mut seen = Seen::default();
+        let plain = candidate(id, None, 4000);
+        assert_eq!(
+            seen.update(id, 1, Some(plain.clone())),
+            Some(DiscoveryEvent::Found(plain.clone()))
+        );
+        assert_eq!(seen.update(id, 1, Some(plain.clone())), None, "no change");
+
+        // The same node, renamed after a name conflict: one node, with the stable id.
+        let named = candidate(id, Some("Desk"), 4000);
+        assert_eq!(
+            seen.update(id, 2, Some(named.clone())),
+            Some(DiscoveryEvent::Found(named.clone()))
+        );
+        assert_eq!(seen.nodes.len(), 1);
+        assert_eq!(seen.nodes[id].1, named);
+
+        // What is still cached under the old name is stale: ignored, and so is its expiry.
+        assert_eq!(seen.update(id, 1, Some(plain.clone())), None);
+        assert_eq!(seen.remove(id, 1), None);
+        assert_eq!(seen.nodes[id].1, named);
+
+        // A newer generation with the same content changes nothing visible.
+        assert_eq!(seen.update(id, 3, Some(named.clone())), None);
+        assert_eq!(seen.remove(id, 2), None, "generation 3 is the current one");
+        assert_eq!(
+            seen.remove(id, 3),
+            Some(DiscoveryEvent::Lost {
+                instance: id.to_string()
+            })
+        );
+        assert!(seen.nodes.is_empty());
+        assert_eq!(seen.remove(id, 3), None);
+    }
+
+    #[test]
+    fn an_unusable_advertisement_makes_the_node_lost() {
+        let id = "0123456789abcdef";
+        let mut seen = Seen::default();
+        seen.update(id, 1, Some(candidate(id, None, 4000)));
+        // Its current generation turns unusable (say, the version key is gone).
+        assert_eq!(
+            seen.update(id, 1, None),
+            Some(DiscoveryEvent::Lost {
+                instance: id.to_string()
+            })
+        );
+        assert_eq!(seen.update(id, 1, None), None);
+    }
+
+    #[test]
+    fn at_most_so_many_nodes_are_tracked() {
+        let mut seen = Seen::default();
+        for n in 0..MAX_CANDIDATES + 10 {
+            let id = format!("{n:016x}");
+            seen.update(&id, 1, Some(candidate(&id, None, 4000)));
+        }
+        assert_eq!(seen.nodes.len(), MAX_CANDIDATES);
+        // A known node still updates when the table is full.
+        let id = format!("{:016x}", 0);
+        assert!(
+            seen.update(&id, 1, Some(candidate(&id, Some("Desk"), 4000)))
+                .is_some()
+        );
     }
 
     #[test]
@@ -634,7 +820,7 @@ mod tests {
 
     #[test]
     fn the_advertisement_is_a_random_name_and_the_version() {
-        let info = advertisement("0123456789abcdef", 4000, None, true).unwrap();
+        let info = advertisement("0123456789abcdef", 4000, None).unwrap();
         assert_eq!(
             info.get_fullname(),
             format!("0123456789abcdef.{SERVICE_TYPE}")
@@ -646,11 +832,13 @@ mod tests {
         let keys: Vec<&str> = info.get_properties().iter().map(|p| p.key()).collect();
         assert_eq!(keys, ["v"]);
 
-        let named = advertisement("0123456789abcdef", 4000, Some(&"é".repeat(100)), false).unwrap();
+        let named = advertisement("0123456789abcdef", 4000, Some(&"é".repeat(100))).unwrap();
         assert_eq!(
             named.get_property_val_str("n"),
             Some("é".repeat(31).as_str())
         );
+        // Neither is probed for.
+        assert!(!info.requires_probe());
         assert!(!named.requires_probe());
     }
 

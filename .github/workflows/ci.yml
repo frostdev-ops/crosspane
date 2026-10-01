@@ -96,6 +96,8 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace --locked --no-tests=pass
         env:
+          # The runner is a launchd agent: no Local Network grant, so no LAN multicast (02 §3.2).
+          CROSSPANE_NO_MULTICAST: "1"
           CROSSPANE_REQUIRE_GPU: "1"
       - name: Check the opt-in private-API module (D7)
         run: |
