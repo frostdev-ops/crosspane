@@ -418,6 +418,11 @@ fn stacked_panels() {
     assert!(
         matches!(tracker.step(&layout, VectorMm::new(0.0, 1_000.0)), Step::Crossed { display, .. } if display == bottom.id)
     );
+    // Move inward first: the entry edge now rejects immediate reverse jitter.
+    assert!(matches!(
+        tracker.step(&layout, VectorMm::new(0.0, 2.0)),
+        Step::On { .. }
+    ));
     assert!(
         matches!(tracker.step(&layout, VectorMm::new(0.0, -1_000.0)), Step::Crossed { display, .. } if display == top.id)
     );
@@ -645,5 +650,113 @@ fn portal_ids_are_deterministic() {
     );
     for (portal, id) in original.portals().iter().zip(1_u32..) {
         assert_eq!(portal.id, PortalId(id));
+    }
+}
+
+// Each orientation uses an unequal pixel density to exercise canvas-mm distances.
+fn hysteresis_case(edge: Edge) -> (Layout, GlobalDisplayId, GlobalDisplayId, VectorMm) {
+    let a = panel(1, 1, 0.0, 0.0, 100.0, 200.0);
+    let (x, y, outward) = match edge {
+        Edge::Left => (-100.0, 0.0, VectorMm::new(-1.0, 0.0)),
+        Edge::Right => (100.0, 0.0, VectorMm::new(1.0, 0.0)),
+        Edge::Top => (0.0, -200.0, VectorMm::new(0.0, -1.0)),
+        Edge::Bottom => (0.0, 200.0, VectorMm::new(0.0, 1.0)),
+    };
+    let b = panel(2, 1, x, y, 100.0, 200.0);
+    (layout(vec![a, b]), a.id, b.id, outward)
+}
+
+fn enter(
+    layout: &Layout,
+    a: GlobalDisplayId,
+    b: GlobalDisplayId,
+    outward: VectorMm,
+) -> PointerTracker {
+    let mut tracker = PointerTracker::new(layout, a, PointDevice::new(500.0, 500.0)).unwrap();
+    assert!(
+        matches!(tracker.step(layout, outward * 300.0), Step::Crossed { display, .. } if display == b)
+    );
+    tracker
+}
+
+#[test]
+fn entry_reverse_jitter_clamps_without_crossing() {
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        let (layout, a, b, outward) = hysteresis_case(edge);
+        let mut tracker = enter(&layout, a, b, outward);
+        let before = layout.to_canvas(b, tracker.position().1).unwrap();
+        assert!(
+            matches!(tracker.step(&layout, outward * -0.5), Step::On { display, .. } if display == b)
+        );
+        let placed = layout.get(b).unwrap();
+        let expected = placed.geometry.clamp_device(
+            placed
+                .geometry
+                .mm_to_device((before - placed.origin).to_point() + outward * -0.5),
+        );
+        assert_position(tracker.position(), (b, expected));
+    }
+}
+
+#[test]
+fn inward_motion_rearms_deliberate_return() {
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        let (layout, a, b, outward) = hysteresis_case(edge);
+        for inward in [2.0, crosspane_input::layout::REARM_MM] {
+            let mut tracker = enter(&layout, a, b, outward);
+            assert!(
+                matches!(tracker.step(&layout, outward * inward), Step::On { display, .. } if display == b)
+            );
+            assert!(
+                matches!(tracker.step(&layout, outward * -3.0), Step::Crossed { display, .. } if display == a)
+            );
+        }
+    }
+}
+
+#[test]
+fn tracker_created_at_entry_disarms_near_edge() {
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        let (layout, a, b, outward) = hysteresis_case(edge);
+        let portal = layout
+            .portals()
+            .iter()
+            .find(|portal| portal.from == a)
+            .unwrap();
+        let (_, entry) = layout.entry(portal.id, 0.5).unwrap();
+        let mut tracker = PointerTracker::new(&layout, b, entry).unwrap();
+        assert!(
+            matches!(tracker.step(&layout, outward * -0.5), Step::On { display, .. } if display == b)
+        );
+        assert!(matches!(
+            tracker.step(&layout, outward * 2.0),
+            Step::On { .. }
+        ));
+        assert!(
+            matches!(tracker.step(&layout, outward * -3.0), Step::Crossed { display, .. } if display == a)
+        );
+    }
+}
+
+#[test]
+fn disarmed_edge_sliding_preserves_tangent_motion() {
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        let (layout, a, b, outward) = hysteresis_case(edge);
+        let mut tracker = enter(&layout, a, b, outward);
+        let before = layout.to_canvas(b, tracker.position().1).unwrap();
+        let tangent = VectorMm::new(outward.y * 7.0, outward.x * 7.0);
+        assert!(
+            matches!(tracker.step(&layout, outward * -0.5 + tangent), Step::On { display, .. } if display == b)
+        );
+        let after = layout.to_canvas(b, tracker.position().1).unwrap();
+        if vertical(edge) {
+            near(after.y - before.y, tangent.y);
+        } else {
+            near(after.x - before.x, tangent.x);
+        }
+        // Sliding alone never re-arms the normal direction.
+        assert!(
+            matches!(tracker.step(&layout, outward * -3.0), Step::On { display, .. } if display == b)
+        );
     }
 }
