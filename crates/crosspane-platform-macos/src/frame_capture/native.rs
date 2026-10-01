@@ -1,10 +1,16 @@
+use std::any::Any;
 use std::ptr;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak, mpsc};
 use std::time::Instant;
 
 use block2::RcBlock;
+use crosspane_media::codec::NativeInput;
+use crosspane_media::picture::{YuvColour, YuvMatrix};
 use crosspane_platform::{
-    CaptureTarget, Frame, Permission, PlatformError, StreamEndReason, StreamId,
+    CaptureTarget, Frame, FrameImage, NativeImage, Permission, PlatformError, StreamEndReason,
+    StreamId,
 };
 use crosspane_types::geom::{PixelRect, PixelSize};
 use crosspane_types::id::DisplayId;
@@ -13,7 +19,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::{
-    CFArray, CFDictionary, CFNumber, CFString, CFType, CGPoint, CGRect, CGSize,
+    CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
     CGDisplayCopyDisplayMode, CGDisplayMode, CGRectMakeWithDictionaryRepresentation,
@@ -21,10 +27,10 @@ use objc2_core_graphics::{
 };
 use objc2_core_media::{CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetDataSize,
-    CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
-    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
-    kCVPixelFormatType_32BGRA,
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetDataSize, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
+    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+    CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
 };
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
@@ -395,7 +401,7 @@ fn configuration(
         config.setShowsCursor(false);
         config.setCapturesAudio(false);
         config.setCaptureMicrophone(false);
-        config.setQueueDepth(3);
+        config.setQueueDepth(5);
         // SCStream.h documents this for display-bound windows/apps, not independent windows.
         // Set it explicitly; the independent-window filter's child behavior needs live validation.
         config.setIncludeChildWindows(true);
@@ -629,6 +635,125 @@ fn dirty_rect(rect: CGRect, scale: f64, region: PixelRect) -> Option<PixelRect> 
     ))
 }
 
+pub(super) static HELD_BUFFERS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub(crate) struct SckImage {
+    pub(crate) buffer: CFRetained<CVPixelBuffer>,
+    pub(crate) region: PixelRect,
+    pub(crate) access: Mutex<()>,
+}
+
+// SAFETY: The retained completed SCK buffer is immutable pixel storage. CPU mappings and
+// encoder submissions are serialized by access; its CF retain/release is thread-safe.
+unsafe impl Send for SckImage {}
+// SAFETY: Same immutable storage and serialized access contract as Send above.
+unsafe impl Sync for SckImage {}
+
+impl SckImage {
+    pub(crate) fn new(buffer: CFRetained<CVPixelBuffer>, region: PixelRect) -> Self {
+        HELD_BUFFERS.fetch_add(1, Ordering::Relaxed);
+        Self {
+            buffer,
+            region,
+            access: Mutex::new(()),
+        }
+    }
+}
+
+impl Drop for SckImage {
+    fn drop(&mut self) {
+        HELD_BUFFERS.fetch_sub(1, Ordering::Relaxed);
+        // The CFRetained field releases its reference after this method returns.
+    }
+}
+
+struct ReadLock<'a>(&'a CVPixelBuffer);
+
+impl Drop for ReadLock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: Balances the successful read-only lock, also if the reader panics.
+        unsafe { CVPixelBufferUnlockBaseAddress(self.0, CVPixelBufferLockFlags::ReadOnly) };
+    }
+}
+
+impl NativeImage for SckImage {
+    fn size(&self) -> PixelSize {
+        PixelSize::new(
+            (self.region.max.x - self.region.min.x) as u32,
+            (self.region.max.y - self.region.min.y) as u32,
+        )
+    }
+
+    fn read(&self, f: &mut dyn FnMut(&[u8], u32)) -> Result<(), PlatformError> {
+        let _access = self.access.lock().unwrap_or_else(|e| e.into_inner());
+        let buffer = &self.buffer;
+        let invalid = || PlatformError::Unsupported("unmappable SCK BGRA buffer");
+        let full = PixelSize::new(
+            u32::try_from(CVPixelBufferGetWidth(buffer)).map_err(|_| invalid())?,
+            u32::try_from(CVPixelBufferGetHeight(buffer)).map_err(|_| invalid())?,
+        );
+        checked_crop(Some(self.region), full)?;
+        if CVPixelBufferGetPixelFormatType(buffer) != kCVPixelFormatType_32BGRA {
+            return Err(invalid());
+        }
+        // SAFETY: Live BGRA buffer, read-only mapping serialized by access.
+        if unsafe { CVPixelBufferLockBaseAddress(buffer, CVPixelBufferLockFlags::ReadOnly) } != 0 {
+            return Err(invalid());
+        }
+        let _lock = ReadLock(buffer);
+        let stride = CVPixelBufferGetBytesPerRow(buffer);
+        let len = CVPixelBufferGetDataSize(buffer);
+        let base = CVPixelBufferGetBaseAddress(buffer).cast::<u8>();
+        let offset = (self.region.min.y as usize)
+            .checked_mul(stride)
+            .and_then(|n| n.checked_add(self.region.min.x as usize * 4))
+            .ok_or_else(invalid)?;
+        let needed = (self.size().height as usize - 1)
+            .checked_mul(stride)
+            .and_then(|n| n.checked_add(self.size().width as usize * 4))
+            .ok_or_else(invalid)?;
+        if base.is_null()
+            || stride < full.width as usize * 4
+            || len > isize::MAX as usize
+            || offset.checked_add(needed).is_none_or(|end| end > len)
+        {
+            return Err(invalid());
+        }
+        let stride = u32::try_from(stride).map_err(|_| invalid())?;
+        // SAFETY: The crop extent is checked against the locked allocation. The slice contains
+        // only the required strided rows and cannot escape the callback's mapping lifetime.
+        f(
+            unsafe { std::slice::from_raw_parts(base.add(offset), needed) },
+            stride,
+        );
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CaptureInput(pub(crate) Arc<dyn NativeImage>);
+
+impl NativeInput for CaptureInput {
+    fn size(&self) -> PixelSize {
+        self.0.size()
+    }
+    fn colour(&self) -> YuvColour {
+        YuvColour {
+            matrix: YuvMatrix::Bt709,
+            full_range: false,
+        }
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
 fn copy_rows(
     source: &[u8],
     source_stride: usize,
@@ -657,7 +782,7 @@ fn copy_rows(
     Some((stride, pixels.into()))
 }
 
-pub(super) fn copy_sample(
+pub(super) fn native_sample(
     sample: &CMSampleBuffer,
     scale: f64,
     crop: Option<PixelRect>,
@@ -697,29 +822,6 @@ pub(super) fn copy_sample(
         u32::try_from(CVPixelBufferGetHeight(&image)).ok()?,
     );
     let region = checked_crop(crop, size).ok()?;
-    // SAFETY: A live nonplanar BGRA pixel buffer, locked and unlocked with the same read-only flag.
-    if unsafe { CVPixelBufferLockBaseAddress(&image, CVPixelBufferLockFlags::ReadOnly) } != 0 {
-        return None;
-    }
-    let copied = (|| {
-        // Base address is accessed only under the successful read-only lock.
-        let base = CVPixelBufferGetBaseAddress(&image).cast::<u8>();
-        let len = CVPixelBufferGetDataSize(&image);
-        if base.is_null() || len > isize::MAX as usize {
-            return None;
-        }
-        // SAFETY: CoreVideo reports the size of the locked buffer's live allocation. The slice
-        // is borrowed only while locked; copy_rows checks strides and bounds before accessing it.
-        let bytes = unsafe { std::slice::from_raw_parts(base, len) };
-        copy_rows(bytes, CVPixelBufferGetBytesPerRow(&image), size, region)
-    })();
-    // SAFETY: This balances the successful lock above, including every copy-failure path.
-    let unlock =
-        unsafe { CVPixelBufferUnlockBaseAddress(&image, CVPixelBufferLockFlags::ReadOnly) };
-    if unlock != 0 {
-        return None;
-    }
-    let (stride, pixels) = copied?;
     let damage = dictionary.get(dirty_key).and_then(|value| {
         let rects = value.downcast_ref::<CFArray>()?;
         // SAFETY: SCK's dirtyRects array contains CF dictionary objects.
@@ -754,16 +856,13 @@ pub(super) fn copy_sample(
     } else {
         clock::now()
     };
-    Some(Frame::cpu(
-        PixelSize::new(
-            (region.max.x - region.min.x) as u32,
-            (region.max.y - region.min.y) as u32,
-        ),
-        stride,
-        pixels,
+    let image = Arc::new(SckImage::new(image, region));
+    Some(Frame {
+        size: image.size(),
+        image: FrameImage::Native(image),
         damage,
         at,
-    ))
+    })
 }
 
 fn key(string: &NSString) -> &objc2_core_foundation::CFType {
@@ -775,6 +874,88 @@ fn key(string: &NSString) -> &objc2_core_foundation::CFType {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_crop_maps_in_place_packs_and_releases() {
+        use objc2_core_video::CVPixelBufferCreate;
+        use std::ptr::NonNull;
+        let baseline = super::super::held_capture_buffers();
+        let mut raw = ptr::null_mut();
+        // SAFETY: Valid BGRA dimensions and writable output pointer.
+        assert_eq!(
+            // SAFETY: Valid dimensions and writable output; ownership transferred on success.
+            unsafe {
+                CVPixelBufferCreate(
+                    None,
+                    4,
+                    3,
+                    kCVPixelFormatType_32BGRA,
+                    None,
+                    NonNull::from(&mut raw),
+                )
+            },
+            0
+        );
+        // SAFETY: Successful Create transfers its +1 reference.
+        let buffer = unsafe { CFRetained::from_raw(NonNull::new(raw).unwrap()) };
+        // SAFETY: Exclusively owned test buffer, balanced write lock/unlock.
+        assert_eq!(
+            // SAFETY: Exclusively owned buffer; balanced lock/unlock below.
+            unsafe { CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::empty()) },
+            0
+        );
+        let stride = CVPixelBufferGetBytesPerRow(&buffer);
+        let base = CVPixelBufferGetBaseAddress(&buffer).cast::<u8>();
+        // SAFETY: Initialize the entire live locked allocation, then write in-bounds pixels.
+        unsafe {
+            ptr::write_bytes(base, 0, CVPixelBufferGetDataSize(&buffer));
+            for y in 0..3 {
+                for x in 0..16 {
+                    *base.add(y * stride + x) = (y * 16 + x) as u8;
+                }
+            }
+            assert_eq!(
+                CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty()),
+                0
+            );
+        }
+        let image: Arc<dyn NativeImage> = Arc::new(SckImage::new(
+            buffer,
+            PixelRect::new([1, 1].into(), [3, 3].into()),
+        ));
+        assert_eq!(super::super::held_capture_buffers(), baseline + 1);
+        let input = super::super::capture_input(&image).unwrap();
+        let frame = Frame {
+            size: image.size(),
+            image: FrameImage::Native(image),
+            damage: None,
+            at: crosspane_types::time::MonoTime::ZERO,
+        };
+        frame
+            .with_pixels(|pixels, row| {
+                assert_eq!(row as usize, stride);
+                // SAFETY: In-bounds pointer arithmetic in the same retained allocation.
+                assert_eq!(pixels.as_ptr(), unsafe { base.add(stride + 4) });
+                assert_eq!(&pixels[..8], &[20, 21, 22, 23, 24, 25, 26, 27]);
+                assert_eq!(
+                    &pixels[stride..stride + 8],
+                    &[36, 37, 38, 39, 40, 41, 42, 43]
+                );
+            })
+            .unwrap();
+        let (packed, row) = frame.to_cpu().unwrap();
+        assert_eq!(row, 8);
+        assert_eq!(
+            &*packed,
+            &[
+                20, 21, 22, 23, 24, 25, 26, 27, 36, 37, 38, 39, 40, 41, 42, 43
+            ]
+        );
+        drop(frame);
+        assert_eq!(super::super::held_capture_buffers(), baseline + 1);
+        drop(input);
+        assert_eq!(super::super::held_capture_buffers(), baseline);
+    }
 
     #[test]
     fn crop_refresh_only_for_displays_outside_cached_size() {
@@ -896,7 +1077,7 @@ mod tests {
                     FrameEvent::Frame { stream, frame } => {
                         assert_eq!(stream, id);
                         if frame.size == expected {
-                            let (pixels, stride) = frame.cpu_pixels().unwrap();
+                            let (pixels, stride) = frame.to_cpu().unwrap();
                             assert_eq!(stride, expected.width * 4);
                             assert_eq!(pixels.len(), stride as usize * expected.height as usize);
                             break;

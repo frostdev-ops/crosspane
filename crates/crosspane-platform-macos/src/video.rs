@@ -1,11 +1,16 @@
 //! Synchronous, low-latency H.264 through the public VideoToolbox APIs.
 
+use std::any::Any;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
-use crosspane_media::codec::{CodecError, EncodedVideo, VideoCodecs, VideoDecoder, VideoEncoder};
+use crate::frame_capture::{CaptureInput, SckImage};
+use crosspane_media::codec::{
+    CodecError, EncodedVideo, NativeInput, NativeInputPool, VideoCodecs, VideoDecoder, VideoEncoder,
+};
 use crosspane_media::picture::{Nv12, YuvColour, YuvMatrix};
+use crosspane_platform::NativeImage;
 use crosspane_types::geom::PixelSize;
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
@@ -27,8 +32,10 @@ use objc2_core_video::{
     kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferTransferFunction_sRGB,
     kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4,
     kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrixKey, kCVPixelBufferHeightKey,
-    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
-    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
+    kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferPoolAllocationThresholdKey,
+    kCVPixelBufferWidthKey, kCVPixelFormatType_32BGRA,
+    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
     kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
 };
 use objc2_video_toolbox::{
@@ -200,6 +207,8 @@ struct Encoder {
     fallback: bool,
     fallback_logged: bool,
     transfer: &'static CFString,
+    nv12: bool,
+    pool: Option<Arc<InputPool>>,
 }
 
 // SAFETY: VT sessions have no thread affinity. &mut self serializes all use; callbacks access
@@ -232,6 +241,10 @@ impl Encoder {
     }
 
     fn new(size: PixelSize, bitrate: u32, fps: u32) -> Result<Self, CodecError> {
+        Self::new_format(size, bitrate, fps, false)
+    }
+
+    fn new_format(size: PixelSize, bitrate: u32, fps: u32, nv12: bool) -> Result<Self, CodecError> {
         let coded = coded_size(size)?;
         let (tx, output) = mpsc::channel();
         let mut callback = Box::new(tx);
@@ -246,7 +259,11 @@ impl Encoder {
                 &[CFBoolean::new(true), CFBoolean::new(true)],
             )
         };
-        let attributes = bgra_attributes(coded);
+        let attributes = if nv12 {
+            input_attributes(coded, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        } else {
+            bgra_attributes(coded)
+        };
         // SAFETY: Valid even dimensions, H.264, documented callback signature and a stable boxed
         // sender. The out pointer is writable; the specification remains live for this call.
         let code = unsafe {
@@ -282,6 +299,8 @@ impl Encoder {
             fallback_logged: false,
             // SAFETY: Immutable exported colour constant.
             transfer: unsafe { kCVImageBufferTransferFunction_sRGB },
+            nv12,
+            pool: None,
         };
         let session = encoder
             .session
@@ -351,6 +370,18 @@ impl Encoder {
         tracing::debug!(transfer = %encoder.transfer, "VideoToolbox encoder colour transfer");
         Ok(encoder)
     }
+
+    fn ensure_format(&mut self, size: PixelSize, nv12: bool) -> Result<(), CodecError> {
+        if self.size != size || self.nv12 != nv12 || self.session.is_none() {
+            let fallback = self.fallback;
+            let fallback_logged = self.fallback_logged;
+            self.reset();
+            *self = Self::new_format(size, self.bitrate, self.fps, nv12)?;
+            self.fallback = fallback;
+            self.fallback_logged = fallback_logged;
+        }
+        Ok(())
+    }
 }
 
 impl VideoEncoder for Encoder {
@@ -372,14 +403,7 @@ impl VideoEncoder for Encoder {
         if (stride as usize) < row || pixels.len() < needed {
             return Err(CodecError::BadInput("short BGRA rows"));
         }
-        if self.size != size || self.session.is_none() {
-            let fallback = self.fallback;
-            let fallback_logged = self.fallback_logged;
-            self.reset();
-            *self = Self::new(size, self.bitrate, self.fps)?;
-            self.fallback = fallback;
-            self.fallback_logged = fallback_logged;
-        }
+        self.ensure_format(size, false)?;
         let session = self
             .session
             .as_deref()
@@ -399,6 +423,119 @@ impl VideoEncoder for Encoder {
             }
             input_buffer(pixels, stride as usize, size, coded)?
         };
+        self.submit(&image, force_key, out)
+    }
+
+    fn input_pool(
+        &mut self,
+        size: PixelSize,
+    ) -> Result<Option<Arc<dyn NativeInputPool>>, CodecError> {
+        self.ensure_format(size, true)?;
+        if self.pool.is_none() {
+            let session = self
+                .session
+                .as_deref()
+                .ok_or_else(|| missing("compression session"))?;
+            // SAFETY: Live prepared session; the getter retains its pool.
+            let pool =
+                unsafe { session.pixel_buffer_pool() }.ok_or_else(|| missing("NV12 input pool"))?;
+            self.pool = Some(Arc::new(InputPool {
+                pool,
+                size: coded_size(size)?,
+            }));
+        }
+        Ok(self
+            .pool
+            .as_ref()
+            .map(|pool| Arc::clone(pool) as Arc<dyn NativeInputPool>))
+    }
+
+    fn encode_native(
+        &mut self,
+        input: &dyn NativeInput,
+        size: PixelSize,
+        force_key: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<EncodedVideo, CodecError> {
+        out.clear();
+        let coded = coded_size(size)?;
+        if let Some(input) = input.as_any().downcast_ref::<PoolInput>() {
+            if input.size() != coded
+                || self.size != size
+                || !self.nv12
+                || self.session.is_none()
+                || !self
+                    .pool
+                    .as_ref()
+                    .is_some_and(|pool| ptr::eq(&*pool.pool, &*input.pool))
+            {
+                return Err(CodecError::BadInput("foreign or stale VT pool input"));
+            }
+            return self.submit(&input.buffer, force_key, out);
+        }
+        let input = input
+            .as_any()
+            .downcast_ref::<CaptureInput>()
+            .and_then(|input| input.0.as_any().downcast_ref::<SckImage>())
+            .ok_or(CodecError::BadInput("foreign native input"))?;
+        if input.size() != size {
+            return Err(CodecError::BadInput("capture size mismatch"));
+        }
+        self.ensure_format(size, false)?;
+        // VT encodes a whole buffer. A capture that is exactly its buffer (the twin display, which
+        // SCK crops with sourceRect) goes in as is; a region of a larger buffer (window capture)
+        // or an odd size (VT can't repeat the last column and row as `encode` pads) is copied,
+        // and only that region. SCK's buffer is never modified.
+        let full = PixelSize::new(
+            CVPixelBufferGetWidth(&input.buffer) as u32,
+            CVPixelBufferGetHeight(&input.buffer) as u32,
+        );
+        if coded != size || full != size || input.region.min.x != 0 || input.region.min.y != 0 {
+            return self.copy_capture(input, size, force_key, out);
+        }
+        let _access = input.access.lock().unwrap_or_else(|e| e.into_inner());
+        self.submit(&input.buffer, force_key, out)
+    }
+
+    fn set_bitrate(&mut self, bits_per_second: u32) {
+        if bits_per_second != 0 {
+            self.bitrate = bits_per_second;
+        }
+    }
+    fn name(&self) -> &str {
+        "VideoToolbox (hardware required)"
+    }
+}
+
+impl Encoder {
+    fn copy_capture(
+        &mut self,
+        input: &SckImage,
+        size: PixelSize,
+        force_key: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<EncodedVideo, CodecError> {
+        let coded = coded_size(size)?;
+        let mut image = None;
+        input
+            .read(&mut |pixels, stride| {
+                image = Some(input_buffer(pixels, stride as usize, size, coded));
+            })
+            .map_err(|_| missing("capture mapping for crop/padding"))?;
+        let image = image.ok_or_else(|| missing("mapped capture"))??;
+        self.submit(&image, force_key, out)
+    }
+
+    fn submit(
+        &mut self,
+        image: &CVPixelBuffer,
+        force_key: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<EncodedVideo, CodecError> {
+        let session = self
+            .session
+            .as_deref()
+            .ok_or_else(|| missing("compression session"))?;
         // SAFETY: Public colour keys and live buffer; attachments retain their values.
         unsafe {
             for (key, value) in [
@@ -450,7 +587,7 @@ impl VideoEncoder for Encoder {
         let result = unsafe {
             status(
                 session.encode_frame(
-                    &image,
+                    image,
                     timestamp,
                     duration,
                     Some(properties.as_ref()),
@@ -501,17 +638,6 @@ impl VideoEncoder for Encoder {
             }
         }
     }
-
-    fn set_bitrate(&mut self, bits_per_second: u32) {
-        if bits_per_second != 0 {
-            self.bitrate = bits_per_second;
-        }
-    }
-    fn name(&self) -> &str {
-        // RequireHardwareAcceleratedVideoEncoder disallows software fallback. The low-latency
-        // encoder does not expose UsingHardwareAcceleratedVideoEncoder on all macOS versions.
-        "VideoToolbox (hardware required)"
-    }
 }
 
 fn input_buffer(
@@ -542,6 +668,10 @@ fn input_buffer(
 }
 
 fn bgra_attributes(size: PixelSize) -> CFRetained<CFDictionary<CFString, CFType>> {
+    input_attributes(size, kCVPixelFormatType_32BGRA)
+}
+
+fn input_attributes(size: PixelSize, format: u32) -> CFRetained<CFDictionary<CFString, CFType>> {
     let surface = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
     // SAFETY: Immutable public keys with documented CFNumber/dictionary values.
     unsafe {
@@ -551,14 +681,105 @@ fn bgra_attributes(size: PixelSize) -> CFRetained<CFDictionary<CFString, CFType>
                 kCVPixelBufferWidthKey,
                 kCVPixelBufferHeightKey,
                 kCVPixelBufferIOSurfacePropertiesKey,
+                kCVPixelBufferMetalCompatibilityKey,
             ],
             &[
-                CFNumber::new_i64(i64::from(kCVPixelFormatType_32BGRA)).as_ref(),
+                CFNumber::new_i64(i64::from(format)).as_ref(),
                 CFNumber::new_i64(i64::from(size.width)).as_ref(),
                 CFNumber::new_i64(i64::from(size.height)).as_ref(),
                 surface.as_ref(),
+                CFBoolean::new(true).as_ref(),
             ],
         )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InputPool {
+    pool: CFRetained<CVPixelBufferPool>,
+    size: PixelSize,
+}
+
+// SAFETY: CoreVideo pools support concurrent allocation; CF retain/release is thread-safe.
+unsafe impl Send for InputPool {}
+// SAFETY: The immutable wrapper only calls the pool's thread-safe allocator.
+unsafe impl Sync for InputPool {}
+
+#[derive(Debug)]
+pub(crate) struct PoolInput {
+    pub(crate) buffer: CFRetained<CVPixelBuffer>,
+    pool: CFRetained<CVPixelBufferPool>,
+    size: PixelSize,
+}
+
+// SAFETY: Ownership keeps storage alive. Writers must finish before encode_native as required
+// by NativeInput; this wrapper does not expose a safe mutable mapping.
+unsafe impl Send for PoolInput {}
+// SAFETY: Shared references only expose immutable metadata; mutation requires external GPU/FFI
+// synchronization under NativeInput's completed-writer contract.
+unsafe impl Sync for PoolInput {}
+
+impl NativeInput for PoolInput {
+    fn size(&self) -> PixelSize {
+        self.size
+    }
+    fn colour(&self) -> YuvColour {
+        YuvColour {
+            matrix: YuvMatrix::Bt709,
+            full_range: false,
+        }
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// Retain pool identity in each input, so inputs surviving a session change are rejected.
+impl NativeInputPool for InputPool {
+    fn size(&self) -> PixelSize {
+        self.size
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn acquire(&self) -> Result<Arc<dyn NativeInput>, CodecError> {
+        let mut image = ptr::null_mut();
+        // SAFETY: Public threshold key and numeric CF value. CoreVideo returns immediately with
+        // kCVReturnWouldExceedAllocationThreshold when all eight buffers are retained/in flight.
+        let attributes = unsafe {
+            CFDictionary::from_slices(
+                &[kCVPixelBufferPoolAllocationThresholdKey],
+                &[&*CFNumber::new_i32(8)],
+            )
+        };
+        // SAFETY: Live pool, correctly typed auxiliary attributes and writable output pointer.
+        status(
+            // SAFETY: Live pool, typed auxiliary attributes and writable out pointer.
+            unsafe {
+                CVPixelBufferPool::create_pixel_buffer_with_aux_attributes(
+                    None,
+                    &self.pool,
+                    Some(attributes.as_ref()),
+                    NonNull::from(&mut image),
+                )
+            },
+            "CVPixelBufferPoolCreatePixelBufferWithAuxAttributes",
+        )?;
+        let image = NonNull::new(image).ok_or_else(|| missing("NV12 pool buffer"))?;
+        // SAFETY: Successful Create transfers a +1 reference.
+        let buffer = unsafe { CFRetained::from_raw(image) };
+        if CVPixelBufferGetPixelFormatType(&buffer)
+            != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || CVPixelBufferGetWidth(&buffer) != self.size.width as usize
+            || CVPixelBufferGetHeight(&buffer) != self.size.height as usize
+        {
+            return Err(missing("matching NV12 pool buffer"));
+        }
+        Ok(Arc::new(PoolInput {
+            buffer,
+            pool: self.pool.clone(),
+            size: self.size,
+        }))
     }
 }
 
@@ -1605,6 +1826,283 @@ fn decode_size(width: i32, height: i32) -> Result<PixelSize, CodecError> {
 mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn moving_pattern(size: PixelSize, frame: u32) -> Vec<u8> {
+        let mut pixels = Vec::new();
+        for y in 0..size.height {
+            for x in 0..size.width {
+                let value = if (x / 16 + frame / 2) % 8 < 3 && (y / 16 + frame / 3) % 6 < 3 {
+                    [48, 150, 208, 255]
+                } else {
+                    [80, 96, 112, 255]
+                };
+                pixels.extend_from_slice(&value);
+            }
+        }
+        pixels
+    }
+
+    fn surface_buffer(size: PixelSize) -> CFRetained<CVPixelBuffer> {
+        let attributes = bgra_attributes(size);
+        let mut raw = ptr::null_mut();
+        // SAFETY: Valid dimensions, IOSurface attributes and writable output pointer.
+        assert_eq!(
+            // SAFETY: Valid IOSurface attributes, BGRA dimensions and writable out pointer.
+            unsafe {
+                CVPixelBufferCreate(
+                    None,
+                    size.width as usize,
+                    size.height as usize,
+                    kCVPixelFormatType_32BGRA,
+                    Some(attributes.as_ref()),
+                    NonNull::from(&mut raw),
+                )
+            },
+            0
+        );
+        // SAFETY: Successful Create transfers its +1 reference.
+        unsafe { CFRetained::from_raw(NonNull::new(raw).unwrap()) }
+    }
+
+    fn quality(source: &[u8], decoded: &[u8], size: PixelSize, coded: PixelSize) -> f64 {
+        let mut error = 0.0;
+        for y in 0..size.height as usize {
+            for x in 0..size.width as usize {
+                for c in 0..3 {
+                    let delta = f64::from(source[(y * size.width as usize + x) * 4 + c])
+                        - f64::from(decoded[(y * coded.width as usize + x) * 4 + c]);
+                    error += delta * delta;
+                }
+            }
+        }
+        10.0 * (255.0 * 255.0 * f64::from(size.width) * f64::from(size.height) * 3.0 / error)
+            .log10()
+    }
+
+    fn fill_nv12(input: &PoolInput, pixels: &[u8], size: PixelSize) {
+        let buffer = &input.buffer;
+        // SAFETY: Test exclusively owns input and completes all writes before encoding.
+        assert_eq!(
+            // SAFETY: Test-owned buffer; writes finish before encoding and unlocking.
+            unsafe { CVPixelBufferLockBaseAddress(buffer, CVPixelBufferLockFlags::empty()) },
+            0
+        );
+        let y_base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0).cast::<u8>();
+        let uv_base = CVPixelBufferGetBaseAddressOfPlane(buffer, 1).cast::<u8>();
+        let y_stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0);
+        let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1);
+        let rgb = |x: u32, y: u32| {
+            let offset = (y.min(size.height - 1) * size.width + x.min(size.width - 1)) as usize * 4;
+            let p = &pixels[offset..offset + 4];
+            let (r, g, b) = (f64::from(p[2]), f64::from(p[1]), f64::from(p[0]));
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            [
+                16.0 + luma * 219.0 / 255.0,
+                128.0 + (b - luma) / (2.0 * (1.0 - 0.0722)) * 224.0 / 255.0,
+                128.0 + (r - luma) / (2.0 * (1.0 - 0.2126)) * 224.0 / 255.0,
+            ]
+        };
+        for y in 0..input.size.height {
+            for x in 0..input.size.width {
+                // SAFETY: Checked pool geometry, locked luma plane, in-bounds row/column.
+                unsafe {
+                    *y_base.add(y as usize * y_stride + x as usize) = rgb(x, y)[0].round() as u8;
+                }
+            }
+        }
+        for y in (0..input.size.height).step_by(2) {
+            for x in (0..input.size.width).step_by(2) {
+                let values = [rgb(x, y), rgb(x + 1, y), rgb(x, y + 1), rgb(x + 1, y + 1)];
+                for c in 1..3 {
+                    let value = values.iter().map(|v| v[c]).sum::<f64>() / 4.0;
+                    // SAFETY: Locked interleaved chroma plane; coded dimensions are even.
+                    unsafe {
+                        *uv_base.add(y as usize / 2 * uv_stride + x as usize + c - 1) =
+                            value.round() as u8;
+                    }
+                }
+            }
+        }
+        // SAFETY: Balances the write lock after all plane writes complete.
+        assert_eq!(
+            // SAFETY: Balances the successful write lock above.
+            unsafe { CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags::empty()) },
+            0
+        );
+    }
+
+    #[test]
+    fn native_bgra_and_crops_match_cpu_quality() {
+        use crosspane_types::geom::PixelRect;
+        for (size, crop) in [
+            (PixelSize::new(160, 96), false),
+            (PixelSize::new(159, 95), false),
+            (PixelSize::new(160, 96), true),
+            (PixelSize::new(159, 95), true),
+        ] {
+            let Some(mut native) = available(Encoder::new(size, 8_000_000, 30)) else {
+                return;
+            };
+            let mut cpu = Encoder::new(size, 8_000_000, 30).unwrap();
+            let mut native_decoder = Decoder::new(true).unwrap();
+            let mut cpu_decoder = Decoder::new(true).unwrap();
+            let mut packet = Vec::new();
+            let mut decoded = Vec::new();
+            let full = PixelSize::new(
+                size.width + if crop { 32 } else { 0 },
+                size.height + if crop { 24 } else { 0 },
+            );
+            let (left, top) = if crop { (8, 4) } else { (0, 0) };
+            let mut scores = [0.0, 0.0];
+            for frame in 0..60 {
+                let source = moving_pattern(size, frame);
+                let mut full_pixels = vec![0; full.width as usize * full.height as usize * 4];
+                for y in 0..size.height as usize {
+                    let offset = ((y + top) * full.width as usize + left) * 4;
+                    let row = size.width as usize * 4;
+                    full_pixels[offset..offset + row]
+                        .copy_from_slice(&source[y * row..(y + 1) * row]);
+                }
+                let buffer = fill_input_buffer(
+                    surface_buffer(full),
+                    &full_pixels,
+                    full.width as usize * 4,
+                    full,
+                    full,
+                )
+                .unwrap();
+                let image: Arc<dyn NativeImage> = Arc::new(SckImage::new(
+                    buffer,
+                    PixelRect::new(
+                        [left as i32, top as i32].into(),
+                        [
+                            left as i32 + size.width as i32,
+                            top as i32 + size.height as i32,
+                        ]
+                        .into(),
+                    ),
+                ));
+                let input = crate::frame_capture::capture_input(&image).unwrap();
+                let force = frame == 30;
+                let result = native
+                    .encode_native(&*input, size, force, &mut packet)
+                    .unwrap();
+                assert_eq!(result.key, frame == 0 || force);
+                let coded = native_decoder.decode(&packet, &mut decoded).unwrap();
+                assert_eq!(coded, coded_size(size).unwrap());
+                let native_score = quality(&source, &decoded, size, coded);
+                scores[0] += native_score;
+                cpu.encode(&source, size.width * 4, size, force, &mut packet)
+                    .unwrap();
+                let coded = cpu_decoder.decode(&packet, &mut decoded).unwrap();
+                let cpu_score = quality(&source, &decoded, size, coded);
+                scores[1] += cpu_score;
+                assert!(
+                    (native_score - cpu_score).abs() <= 0.5,
+                    "BGRA frame {frame}: native={native_score}, CPU={cpu_score}"
+                );
+            }
+            eprintln!(
+                "native BGRA {size:?} crop={crop}: PSNR native={} CPU={}",
+                scores[0] / 60.0,
+                scores[1] / 60.0
+            );
+            assert!((scores[0] - scores[1]).abs() / 60.0 <= 0.5);
+        }
+    }
+
+    #[test]
+    fn native_nv12_quality_exhaustion_and_switch_to_bgra() {
+        for size in [PixelSize::new(160, 96), PixelSize::new(159, 95)] {
+            let Some(mut encoder) = available(Encoder::new(size, 8_000_000, 30)) else {
+                return;
+            };
+            let Some(pool) = available(encoder.input_pool(size)) else {
+                return;
+            };
+            let pool = pool.unwrap();
+            assert_eq!(pool.size(), coded_size(size).unwrap());
+            let mut held = Vec::new();
+            loop {
+                match pool.acquire() {
+                    Ok(input) => {
+                        held.push(input);
+                        assert!(held.len() <= 8);
+                    }
+                    Err(CodecError::Failed(reason)) => {
+                        eprintln!("pool exhausted with {} held: {reason}", held.len());
+                        break;
+                    }
+                    Err(error) => panic!("unexpected pool error: {error}"),
+                }
+            }
+            assert!(!held.is_empty());
+            assert!(matches!(pool.acquire(), Err(CodecError::Failed(_))));
+            held.pop();
+            let freed = pool.acquire().unwrap();
+            drop(freed);
+            drop(held);
+            let mut cpu = Encoder::new(size, 8_000_000, 30).unwrap();
+            let mut decoder = Decoder::new(true).unwrap();
+            let mut cpu_decoder = Decoder::new(true).unwrap();
+            let mut packet = Vec::new();
+            let mut decoded = Vec::new();
+            let mut scores = [0.0, 0.0];
+            for frame in 0..60 {
+                let pixels = moving_pattern(size, frame);
+                let input = pool.acquire().unwrap();
+                assert_eq!(
+                    input.colour(),
+                    YuvColour {
+                        matrix: YuvMatrix::Bt709,
+                        full_range: false
+                    }
+                );
+                fill_nv12(
+                    input.as_any().downcast_ref::<PoolInput>().unwrap(),
+                    &pixels,
+                    size,
+                );
+                let result = encoder
+                    .encode_native(&*input, size, frame == 30, &mut packet)
+                    .unwrap();
+                assert_eq!(result.key, frame == 0 || frame == 30);
+                let coded = decoder.decode(&packet, &mut decoded).unwrap();
+                let native_score = quality(&pixels, &decoded, size, coded);
+                scores[0] += native_score;
+                cpu.encode(&pixels, size.width * 4, size, frame == 30, &mut packet)
+                    .unwrap();
+                let coded = cpu_decoder.decode(&packet, &mut decoded).unwrap();
+                let cpu_score = quality(&pixels, &decoded, size, coded);
+                scores[1] += cpu_score;
+                // VT's own BGRA conversion and the test's reference NV12 differ slightly per
+                // frame; the average below must stay within 0.5 dB.
+                assert!(
+                    (native_score - cpu_score).abs() <= 1.0,
+                    "NV12 frame {frame}: native={native_score}, CPU={cpu_score}"
+                );
+            }
+            eprintln!(
+                "NV12 {size:?}: PSNR native={} CPU={}",
+                scores[0] / 60.0,
+                scores[1] / 60.0
+            );
+            assert!((scores[0] - scores[1]).abs() / 60.0 <= 0.5);
+            let stale = pool.acquire().unwrap();
+            let pixels = moving_pattern(size, 0);
+            assert!(
+                encoder
+                    .encode(&pixels, size.width * 4, size, false, &mut packet)
+                    .unwrap()
+                    .key
+            );
+            assert!(matches!(
+                encoder.encode_native(&*stale, size, false, &mut packet),
+                Err(CodecError::BadInput(_))
+            ));
+            assert!(packet.is_empty());
+        }
+    }
 
     fn available<T>(result: Result<T, CodecError>) -> Option<T> {
         match result {
