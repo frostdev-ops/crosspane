@@ -147,6 +147,8 @@ const HOUSEKEEPING: Duration = Duration::from_secs(1);
 /// Clock-offset pings to every peer (for frame latency).
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const CLOCK_SAMPLES: usize = 8;
+/// Above this smoothed RTT a "wired" path has a slower hop on the way (usually the peer's Wi-Fi).
+const WIRED_RTT: Duration = Duration::from_millis(3);
 const PERMISSION_CHECK: Duration = Duration::from_secs(2);
 /// How long a browse or pull waits for the peer's answer.
 const BROWSE_WAIT: Duration = Duration::from_secs(5);
@@ -1311,7 +1313,18 @@ impl Agent {
         let mut paths = HashMap::new();
         for (peer, link) in &self.links {
             if let Some(remote) = link.remote_addr() {
-                paths.insert(*peer, local_class(&self.interfaces, remote));
+                let mut class = local_class(&self.interfaces, remote);
+                // Each end sees only its own interface: a wired one here may meet Wi-Fi on the
+                // peer's side. A wired path answers in well under a millisecond, so measured RTT
+                // refines the class (03 §2).
+                if matches!(
+                    class,
+                    LinkClass::Lan | LinkClass::DirectEthernet | LinkClass::DirectUsb4Tb
+                ) && link.rtt().is_some_and(|rtt| rtt > WIRED_RTT)
+                {
+                    class = LinkClass::Wifi;
+                }
+                paths.insert(*peer, class);
             }
         }
         for (peer, class) in &paths {
