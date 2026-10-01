@@ -33,9 +33,13 @@ euclid = { version = "0.22.14", features = ["serde"] }
 pollster = "1.0.1"
 proptest = "1.11.0"
 prost = "0.14.4"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tracing = "0.1.44"
 wgpu = "30.0.1"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
 zerocopy = { version = "0.8.59", features = ["derive"] }

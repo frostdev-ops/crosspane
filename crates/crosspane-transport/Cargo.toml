@@ -14,3 +14,11 @@ workspace = true
 crosspane-types.workspace = true
 crosspane-protocol.workspace = true
 crosspane-security.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
