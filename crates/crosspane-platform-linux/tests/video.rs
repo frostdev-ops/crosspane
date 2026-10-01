@@ -681,3 +681,318 @@ fn nv12_decode_cpu_timing() {
         "WP-2.23 single-thread CPU, 120 frames 2560x1440: BGRA {old:.3} ms/frame, NV12 {new:.3} ms/frame"
     );
 }
+
+#[cfg(feature = "cuda")]
+mod cuda {
+    use super::*;
+    use crosspane_media::codec::NativeInputPool;
+    use crosspane_platform_linux::video::{Nv12Layout, nv12_buffer};
+    use std::sync::Arc;
+
+    fn device(nvidia: bool) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
+            .into_iter()
+            .find(|adapter| (adapter.get_info().vendor == 0x10de) == nvidia);
+        let Some(adapter) = adapter else {
+            eprintln!("SKIP CUDA: no matching Vulkan adapter (NVIDIA={nvidia})");
+            return None;
+        };
+        eprintln!("WP-2.29 Vulkan adapter: {:?}", adapter.get_info());
+        Some(
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap(),
+        )
+    }
+
+    type NativeSetup = (
+        Box<dyn VideoEncoder>,
+        Arc<dyn NativeInputPool>,
+        wgpu::Device,
+        wgpu::Queue,
+    );
+
+    fn native(size: PixelSize) -> Option<NativeSetup> {
+        // SAFETY: only check availability of the system driver, without any CUDA calls.
+        if unsafe { libloading::Library::new("libcuda.so.1") }.is_err() {
+            eprintln!("SKIP CUDA: libcuda.so.1 unavailable");
+            return None;
+        }
+        let (device, queue) = device(true)?;
+        let codecs = FfmpegCodecs::new().unwrap().with_gpu(device.clone());
+        let mut encoder = encoder(&codecs, size);
+        if encoder.name() != "h264_nvenc" {
+            eprintln!("SKIP CUDA: NVENC unavailable");
+            return None;
+        }
+        let pool = encoder
+            .input_pool(size)
+            .unwrap()
+            .expect("NVIDIA CUDA setup must succeed (check driver/setup errors)");
+        Some((encoder, pool, device, queue))
+    }
+
+    // Fill reusable host staging data; these test uploads replace WP-2.25's GPU writer.
+    fn pattern(bgra: &mut [u8], size: PixelSize, index: u32) {
+        for y in 0..size.height {
+            for x in 0..size.width {
+                let moving = ((x + index * 6) / 80 + (y + index * 4) / 80) % 2;
+                let value = (40 + (x + y) * 130 / (size.width + size.height) + moving * 30) as u8;
+                let offset = (y as usize * size.width as usize + x as usize) * 4;
+                bgra[offset..offset + 4].copy_from_slice(&[value / 2 + 30, value, value + 30, 255]);
+            }
+        }
+    }
+    fn nv12(bgra: &[u8], size: PixelSize, layout: Nv12Layout, bytes: &mut [u8]) {
+        let coded = padded(size);
+        bytes.fill(0);
+        let rgb = |x: u32, y: u32| {
+            let offset =
+                ((y.min(size.height - 1) * size.width + x.min(size.width - 1)) * 4) as usize;
+            let b = f64::from(bgra[offset]);
+            let g = f64::from(bgra[offset + 1]);
+            let r = f64::from(bgra[offset + 2]);
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            [
+                16.0 + luma * 219.0 / 255.0,
+                128.0 + (b - luma) * 224.0 / (255.0 * 1.8556),
+                128.0 + (r - luma) * 224.0 / (255.0 * 1.5748),
+            ]
+        };
+        for y in 0..coded.height {
+            for x in 0..coded.width {
+                bytes[layout.y_offset as usize
+                    + y as usize * layout.y_pitch as usize
+                    + x as usize] = rgb(x, y)[0].round() as u8;
+            }
+        }
+        for y in (0..coded.height).step_by(2) {
+            for x in (0..coded.width).step_by(2) {
+                let samples = [rgb(x, y), rgb(x + 1, y), rgb(x, y + 1), rgb(x + 1, y + 1)];
+                let offset = layout.uv_offset as usize
+                    + y as usize / 2 * layout.uv_pitch as usize
+                    + x as usize;
+                for channel in 1..3 {
+                    bytes[offset + channel - 1] =
+                        (samples.iter().map(|s| s[channel]).sum::<f64>() / 4.0).round() as u8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_nv12_moving_pattern_sizes_and_idrs() {
+        let first = PixelSize::new(1280, 720);
+        let Some((mut native, mut pool, device, queue)) = native(first) else {
+            return;
+        };
+        let codecs = FfmpegCodecs::new().unwrap();
+        let mut cpu = encoder(&codecs, first);
+        let mut native_decoder = codecs.decoder().unwrap();
+        let mut cpu_decoder = codecs.decoder().unwrap();
+        let mut colour_decoder = codecs.decoder_nv12().unwrap();
+        let mut picture = crosspane_media::picture::Nv12::default();
+        assert_eq!(
+            native_decoder.name(),
+            "h264",
+            "run with the software decoder"
+        );
+        let mut native_packet = Vec::new();
+        let mut cpu_packet = Vec::new();
+        let mut native_pixels = Vec::new();
+        let mut cpu_pixels = Vec::new();
+        for size in [first, PixelSize::new(641, 359), PixelSize::new(960, 540)] {
+            let next_pool = native.input_pool(size).unwrap().unwrap();
+            if pool.size() != padded(size) {
+                assert!(!Arc::ptr_eq(&pool, &next_pool));
+            }
+            pool = next_pool;
+            assert_eq!(pool.size(), padded(size));
+            let mut bgra = vec![0; size.width as usize * size.height as usize * 4];
+            // The only native frame storage is the four persistent wgpu buffers. Frame metadata
+            // and AVBuffer leases may allocate; native frames never call av_frame_get_buffer.
+            let slots: Vec<_> = (0..4).map(|_| pool.acquire().unwrap()).collect();
+            assert!(pool.acquire().is_err());
+            let identities: Vec<_> = slots
+                .iter()
+                .map(|slot| nv12_buffer(slot.as_ref()).unwrap().0.clone())
+                .collect();
+            let (buffer, layout) = nv12_buffer(slots[0].as_ref()).unwrap();
+            eprintln!("WP-2.29 size {size:?}, layout {layout:?}");
+            for offset in [
+                layout.y_offset,
+                layout.uv_offset,
+                u64::from(layout.y_pitch),
+                u64::from(layout.uv_pitch),
+            ] {
+                assert_eq!(offset % 256, 0);
+            }
+            let mut staging = vec![0; buffer.size() as usize];
+            drop(slots);
+            let mut native_quality = 0.0;
+            let mut cpu_quality = 0.0;
+            for index in 0..120 {
+                pattern(&mut bgra, size, index);
+                nv12(&bgra, size, layout, &mut staging);
+                let input = pool.acquire().unwrap();
+                let (buffer, actual) = nv12_buffer(input.as_ref()).unwrap();
+                assert_eq!(actual, layout);
+                assert!(
+                    identities.contains(buffer),
+                    "no per-frame native frame storage allocation"
+                );
+                queue.write_buffer(buffer, 0, &staging);
+                queue.submit([]);
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let forced = index == 37 || index == 91;
+                let encoded = native
+                    .encode_native(input.as_ref(), size, forced, &mut native_packet)
+                    .unwrap();
+                assert_eq!(encoded.key, index == 0 || forced);
+                if encoded.key {
+                    assert_idr(&native_packet);
+                }
+                if index == 0 {
+                    colour_decoder
+                        .decode_nv12(&native_packet, &mut picture)
+                        .unwrap();
+                    assert_eq!(
+                        input.colour(),
+                        crosspane_media::picture::YuvColour::default()
+                    );
+                    assert_eq!(picture.colour, input.colour());
+                }
+                let encoded_cpu = cpu
+                    .encode(&bgra, size.width * 4, size, forced, &mut cpu_packet)
+                    .unwrap();
+                assert_eq!(encoded_cpu.key, index == 0 || forced);
+                assert_eq!(
+                    native_decoder
+                        .decode(&native_packet, &mut native_pixels)
+                        .unwrap(),
+                    padded(size)
+                );
+                assert_eq!(
+                    cpu_decoder.decode(&cpu_packet, &mut cpu_pixels).unwrap(),
+                    padded(size)
+                );
+                native_quality += psnr(&bgra, size.width as usize * 4, &native_pixels, size);
+                cpu_quality += psnr(&bgra, size.width as usize * 4, &cpu_pixels, size);
+            }
+            native_quality /= 120.0;
+            cpu_quality /= 120.0;
+            eprintln!(
+                "WP-2.29 {size:?}: native PSNR {native_quality:.3} dB; CPU {cpu_quality:.3} dB"
+            );
+            // CPU packed RGB uses NVENC's BT.601 conversion, while native NV12 uses BT.709.
+            // Their rounding differs: native can be more than 0.5 dB BETTER. Check the real
+            // quality requirement (no regression beyond 0.5 dB), without rejecting improvement.
+            assert!(native_quality + 0.5 >= cpu_quality);
+            // Switching paths must rebuild and emit IDR, in either direction.
+            assert!(
+                native
+                    .encode(&bgra, size.width * 4, size, false, &mut native_packet)
+                    .unwrap()
+                    .key
+            );
+            let input = pool.acquire().unwrap();
+            let (buffer, _) = nv12_buffer(input.as_ref()).unwrap();
+            queue.write_buffer(buffer, 0, &staging);
+            queue.submit([]);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            assert!(
+                native
+                    .encode_native(input.as_ref(), size, false, &mut native_packet)
+                    .unwrap()
+                    .key
+            );
+            native.set_bitrate(BITRATE / 2);
+            assert!(
+                native
+                    .encode_native(input.as_ref(), size, false, &mut native_packet)
+                    .unwrap()
+                    .key
+            );
+            native.set_bitrate(BITRATE);
+        }
+    }
+
+    #[test]
+    fn cuda_non_nvidia_falls_back() {
+        let Some((device, _)) = device(false) else {
+            return;
+        };
+        let codecs = FfmpegCodecs::new().unwrap().with_gpu(device);
+        let size = PixelSize::new(1280, 720);
+        let mut encoder = encoder(&codecs, size);
+        assert!(encoder.input_pool(size).unwrap().is_none());
+        let pixels = vec![128; size.width as usize * size.height as usize * 4];
+        assert!(
+            encoder
+                .encode(&pixels, size.width * 4, size, false, &mut Vec::new())
+                .unwrap()
+                .key
+        );
+    }
+
+    // Linux getrusage ABI: two timeval fields and fourteen long counters.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Usage {
+        user: [std::ffi::c_long; 2],
+        system: [std::ffi::c_long; 2],
+        counters: [std::ffi::c_long; 14],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: std::ffi::c_int, usage: *mut Usage) -> std::ffi::c_int;
+    }
+    fn cpu_seconds() -> f64 {
+        let mut usage = Usage::default();
+        // SAFETY: RUSAGE_THREAD (1) writes this Linux rusage layout to valid storage.
+        assert_eq!(unsafe { getrusage(1, &mut usage) }, 0);
+        (usage.user[0] + usage.system[0]) as f64
+            + (usage.user[1] + usage.system[1]) as f64 / 1_000_000.0
+    }
+    #[test]
+    fn cuda_cpu_time_1440p() {
+        let size = PixelSize::new(2560, 1440);
+        let Some((mut native, pool, device, queue)) = native(size) else {
+            return;
+        };
+        let codecs = FfmpegCodecs::new().unwrap();
+        let mut cpu = encoder(&codecs, size);
+        let mut bgra = vec![0; size.width as usize * size.height as usize * 4];
+        pattern(&mut bgra, size, 0);
+        let input = pool.acquire().unwrap();
+        let (buffer, layout) = nv12_buffer(input.as_ref()).unwrap();
+        let mut staging = vec![0; buffer.size() as usize];
+        nv12(&bgra, size, layout, &mut staging);
+        queue.write_buffer(buffer, 0, &staging);
+        queue.submit([]);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let mut out = Vec::new();
+        native
+            .encode_native(input.as_ref(), size, false, &mut out)
+            .unwrap();
+        cpu.encode(&bgra, size.width * 4, size, false, &mut out)
+            .unwrap();
+        let start = cpu_seconds();
+        for _ in 0..120 {
+            native
+                .encode_native(input.as_ref(), size, false, &mut out)
+                .unwrap();
+        }
+        let native_ms = (cpu_seconds() - start) * 1000.0 / 120.0;
+        let start = cpu_seconds();
+        for _ in 0..120 {
+            cpu.encode(&bgra, size.width * 4, size, false, &mut out)
+                .unwrap();
+        }
+        let cpu_ms = (cpu_seconds() - start) * 1000.0 / 120.0;
+        eprintln!(
+            "WP-2.29 getrusage(RUSAGE_THREAD) 2560x1440: native {native_ms:.3} ms/frame, CPU BGRA {cpu_ms:.3} ms/frame (encode only, warmed sessions)"
+        );
+    }
+}
