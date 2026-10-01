@@ -10,6 +10,7 @@ use crosspane_types::{
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 
 mod app;
+mod cursor;
 mod gpu;
 mod input;
 
@@ -39,6 +40,14 @@ pub enum HostCommand {
         size: PixelSize,
         pixels: Arc<[u8]>,
         dirty: Vec<PixelRect>,
+    },
+    /// The source's cursor over this proxy (03 §4.6, WP-2.16): BGRA with straight alpha, `size`
+    /// pixels at the content's density, click point `hotspot`. All-transparent hides the cursor.
+    SetCursor {
+        id: u64,
+        size: PixelSize,
+        hotspot: (u32, u32),
+        pixels: Arc<[u8]>,
     },
     /// Close every proxy and leave the event loop.
     Shutdown,
@@ -79,6 +88,14 @@ impl fmt::Debug for HostCommand {
                 .field("bytes", &pixels.len())
                 .field("dirty", dirty)
                 .finish(),
+            Self::SetCursor {
+                id, size, hotspot, ..
+            } => f
+                .debug_struct("SetCursor")
+                .field("id", id)
+                .field("size", size)
+                .field("hotspot", hotspot)
+                .finish_non_exhaustive(),
             Self::Shutdown => f.write_str("Shutdown"),
             Self::Run(_) => f.write_str("Run(..)"),
         }

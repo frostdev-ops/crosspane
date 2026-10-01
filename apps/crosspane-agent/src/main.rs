@@ -174,7 +174,8 @@ fn run() -> Result<()> {
         },
         bits_per_second: config.video_mbps.saturating_mul(1_000_000),
     };
-    let mut features = vec!["e1".to_owned()];
+    // `cursor`: this node shows the source's cursor shapes on its proxies (WP-2.16).
+    let mut features = vec!["e1".to_owned(), "cursor".to_owned()];
     if video.codecs.is_some() {
         features.push("h264".to_owned());
     }

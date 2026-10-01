@@ -562,6 +562,9 @@ impl Agent {
                                 FrameEvent::Frame { stream, frame } => {
                                     let _ = media.send(SourceCmd::Frame { stream, frame });
                                 }
+                                FrameEvent::Cursor { stream, cursor } => {
+                                    let _ = media.send(SourceCmd::Cursor { stream, cursor });
+                                }
                                 FrameEvent::Ended { stream, reason } => {
                                     let _ = events
                                         .send(Event::Input(Input::CaptureEnded { stream, reason }));
@@ -574,15 +577,17 @@ impl Agent {
                 };
                 if let Ok(stream) = result {
                     self.streams.insert(stream, projection);
-                    let video = self
-                        .peers
-                        .get(&peer)
-                        .is_some_and(|p| p.features.iter().any(|f| f == "h264"));
+                    let has = |feature: &str| {
+                        self.peers
+                            .get(&peer)
+                            .is_some_and(|p| p.features.iter().any(|f| f == feature))
+                    };
                     let _ = self.source_media.send(SourceCmd::Start {
                         stream,
                         projection,
                         peer,
-                        video,
+                        video: has("h264"),
+                        cursor: has("cursor"),
                     });
                 }
                 self.pending

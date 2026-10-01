@@ -112,7 +112,7 @@ fn video_rejects_bad_magic_version_and_unknown_codecs() {
         (0, 0, MediaError::BadMagic),
         (4, 0, MediaError::BadVersion),
         (4, 2, MediaError::BadVersion),
-        (6, 2, MediaError::BadCodec),
+        (6, 3, MediaError::BadCodec),
         (6, 255, MediaError::BadCodec),
     ] {
         let mut data = video(false, &[]);
