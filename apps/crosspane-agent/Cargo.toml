@@ -39,7 +39,7 @@ video = ["crosspane-platform-linux/ffmpeg"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 crosspane-platform-linux.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crosspane-platform-macos.workspace = true

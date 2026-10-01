@@ -8,6 +8,11 @@ Description=Crosspane agent (one keyboard and mouse, projected windows)
 PartOf=graphical-session.target
 After=graphical-session.target
 Requisite=graphical-session.target
+# Hyprland can restart in place after a crash without ending the session; the agent then exits
+# (status 75) and is started again. The first tries may still see the old instance in the user
+# manager's environment, so allow a run of quick restarts.
+StartLimitIntervalSec=120
+StartLimitBurst=30
 
 [Service]
 ExecStart=%h/.local/bin/crosspane-agent run
@@ -16,7 +21,7 @@ Environment=RUST_LOG=info
 KillSignal=SIGTERM
 TimeoutStopSec=10
 Restart=on-failure
-RestartSec=2
+RestartSec=3
 
 [Install]
 WantedBy=graphical-session.target

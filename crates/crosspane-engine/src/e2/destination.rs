@@ -267,13 +267,19 @@ impl E2 {
             });
             return;
         }
-        let Some(destination) = self.destinations.get(&key) else {
+        let Some(destination) = self.destinations.get_mut(&key) else {
             return;
         };
         match msg {
             Message::Geometry { size, parking, .. }
                 if destination.open && destination.suspended.is_none() =>
             {
+                // The proxy is sized to the source's content. When it reports that size back,
+                // the source already has it: echoing it as a Resize would bounce any mismatch
+                // (an app's minimum size, a bar on the twin output) between the nodes forever.
+                if let Some((_, scale)) = destination.current.or(destination.last_sent) {
+                    destination.last_sent = Some((*size, scale));
+                }
                 out.push(Output::ProxyGeometry {
                     key,
                     size: *size,

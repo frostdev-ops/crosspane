@@ -560,6 +560,7 @@ fn cursor_image_and_stop() {
     // Ensure the nest has a pointer device before the capture worker binds its seat.
     let (_keys, mut pointer) = connect(gate.clone(), ipc.clone()).unwrap();
     let mut capture = HyprlandFrameCapture::new(gate, ipc.clone()).unwrap();
+    capture.set_cursor_capture(true);
     let (send, events) = mpsc::channel();
     let stream = capture
         .start(
@@ -631,4 +632,40 @@ fn cursor_image_and_stop() {
         .move_to(display, PointDevice::new(width / 4.0, height / 4.0))
         .unwrap();
     assert!(events.recv_timeout(Duration::from_millis(250)).is_err());
+}
+
+#[test]
+fn no_cursor_session_by_default() {
+    let Some(ipc) = dedicated("no_cursor_session_by_default") else {
+        return;
+    };
+    let display = DisplayId(ipc.monitor_ids().unwrap().remove(0).1);
+    let gate = open_gate();
+    let (_keys, mut pointer) = connect(gate.clone(), ipc.clone()).unwrap();
+    let mut capture = HyprlandFrameCapture::new(gate, ipc.clone()).unwrap();
+    let (send, events) = mpsc::channel();
+    let stream = capture
+        .start(
+            CaptureTarget::Display(display),
+            None,
+            60,
+            Arc::new(move |event| {
+                let _ = send.send(event);
+            }),
+        )
+        .unwrap();
+    pointer
+        .move_to(display, PointDevice::new(100.0, 100.0))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let mut frames = 0;
+    while let Ok(event) = events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        match event {
+            FrameEvent::Frame { .. } => frames += 1,
+            other => panic!("unexpected event without cursor capture: {other:?}"),
+        }
+    }
+    assert!(frames > 0, "no frames delivered");
+    capture.stop(stream).unwrap();
+    ended(&events, stream, StreamEndReason::Requested);
 }

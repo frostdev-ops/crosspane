@@ -128,6 +128,65 @@ pub fn now() -> MonoTime {
     }
 }
 
+/// Call `lost` (once, from another thread) when the Hyprland instance this agent belongs to dies.
+///
+/// Hyprland restarts in place after a crash (Omarchy's `start-hyprland`) without ending the
+/// graphical session, so the service manager doesn't stop the agent with it: on 2026-10-01 an agent
+/// sat on a dead instance for hours, unable to capture, inject or park. The instance's
+/// `hyprland.lock` names its process; nothing is sent over the compositor's IPC to check it.
+#[cfg(target_os = "linux")]
+pub fn watch_compositor(lost: impl FnOnce() + Send + 'static) {
+    let (Some(runtime), Ok(signature)) = (
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var("HYPRLAND_INSTANCE_SIGNATURE"),
+    ) else {
+        return;
+    };
+    let lock = std::path::Path::new(&runtime)
+        .join("hypr")
+        .join(signature)
+        .join("hyprland.lock");
+    let Some(pid) = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|text| text.lines().next()?.trim().parse::<u32>().ok())
+    else {
+        tracing::warn!(path = %lock.display(), "no Hyprland instance lock: not watching the compositor");
+        return;
+    };
+    let alive = move || {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .is_ok_and(|comm| comm.trim() == "Hyprland")
+    };
+    let spawned = std::thread::Builder::new()
+        .name("compositor-watch".into())
+        .spawn(move || {
+            while alive() {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            lost();
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "could not watch the compositor");
+    }
+}
+
+/// End this process if it is still running after `after`. A clean exit can hang once the display
+/// server is gone (Xlib's I/O-error handler calls `exit` too, and two racing `exit`s deadlock).
+pub fn exit_deadline(after: std::time::Duration) {
+    let _ = std::thread::Builder::new()
+        .name("exit-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(after);
+            tracing::error!("the agent did not stop in time; killing it");
+            #[cfg(target_os = "linux")]
+            let _ = rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            );
+            std::process::abort();
+        });
+}
+
 #[cfg(target_os = "linux")]
 pub fn create(
     state_dir: &std::path::Path,
@@ -170,6 +229,14 @@ pub fn create(
         "frame capture",
         HyprlandFrameCapture::new(gate.clone(), ipc.clone()),
     );
+    // Hyprland 0.56.2 can crash while a cursor session is open (frame_capture module docs), so
+    // remote cursor shapes from Hyprland sources are opt-in.
+    if let Some(frames) = &frames
+        && std::env::var("CROSSPANE_HYPR_CURSORS").as_deref() == Ok("1")
+    {
+        tracing::warn!("Hyprland cursor capture is on (CROSSPANE_HYPR_CURSORS=1)");
+        frames.set_cursor_capture(true);
+    }
     let (keys, pointer) = match optional("injection", inject::connect(gate.clone(), ipc)) {
         Some((k, p)) => (
             Some(Box::new(k) as Box<dyn KeyInjector>),

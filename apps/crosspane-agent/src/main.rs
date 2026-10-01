@@ -21,6 +21,7 @@ mod trust;
 mod twin;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -83,6 +84,26 @@ enum TrustAction {
     List,
     /// Forget a peer (by node-id prefix or name).
     Remove { peer: String },
+}
+
+/// Set when the agent stops because it can't carry on (its compositor or window host is gone): it
+/// then exits with a failure status, so the service manager starts it again.
+static RESTART: AtomicBool = AtomicBool::new(false);
+
+/// The exit status after a clean stop: 75 (`EX_TEMPFAIL`) when [`RESTART`] is set.
+fn stop_status() -> i32 {
+    if RESTART.load(Ordering::Acquire) {
+        75
+    } else {
+        0
+    }
+}
+
+/// Stop cleanly and exit with a failure status, killing the process if that takes too long.
+fn stop_for_restart(events: &std::sync::mpsc::Sender<agent::Event>) {
+    RESTART.store(true, Ordering::Release);
+    let _ = events.send(agent::Event::Shutdown);
+    platform::exit_deadline(std::time::Duration::from_secs(5));
 }
 
 fn main() -> Result<()> {
@@ -258,6 +279,16 @@ fn run() -> Result<()> {
     let pins: Arc<dyn crosspane_transport::PinStore> = Arc::new(trust.clone());
     let net = net::Net::start(config.port, identity.clone(), pins, hello, tx.clone())?;
     stop_on_signal(&net.runtime(), tx.clone());
+    #[cfg(target_os = "linux")]
+    platform::watch_compositor({
+        let tx = tx.clone();
+        move || {
+            tracing::error!(
+                "the Hyprland instance this agent belongs to is gone; stopping, to start again on the new one"
+            );
+            stop_for_restart(&tx);
+        }
+    });
     for peer in &config.peers {
         net.dial(peer.addr);
     }
@@ -342,18 +373,26 @@ fn run_loop(
     match host {
         Some(host) => {
             let host_tx = tx.clone();
+            let stop_tx = tx.clone();
             std::thread::Builder::new()
                 .name("engine".into())
                 .spawn(move || {
                     exit_on_panic("engine", || agent.run(startup, &rx));
                     drop(tx);
-                    std::process::exit(0);
+                    std::process::exit(stop_status());
                 })
                 .context("spawn engine thread")?;
-            host.run(Box::new(move |event| {
+            if let Err(error) = host.run(Box::new(move |event| {
                 let _ = host_tx.send(agent::Event::Host(event));
-            }))
-            .context("proxy host")?;
+            })) {
+                // Usually the display server went away. The engine thread stops cleanly and ends
+                // the process.
+                tracing::error!(%error, "the proxy window host failed; stopping");
+                stop_for_restart(&stop_tx);
+                loop {
+                    std::thread::park();
+                }
+            }
             Ok(())
         }
         None => {
@@ -364,7 +403,7 @@ fn run_loop(
                     .spawn(move || {
                         exit_on_panic("engine", || agent.run(startup, &rx));
                         drop(tx);
-                        std::process::exit(0);
+                        std::process::exit(stop_status());
                     })
                     .context("spawn engine thread")?;
                 crosspane_platform_macos::main_thread::run_app()?;
@@ -374,6 +413,9 @@ fn run_loop(
             {
                 let _keep = tx;
                 agent.run(startup, &rx);
+                if RESTART.load(Ordering::Acquire) {
+                    bail!("stopped to be started again");
+                }
                 Ok(())
             }
         }

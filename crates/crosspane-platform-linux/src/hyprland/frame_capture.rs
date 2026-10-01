@@ -9,6 +9,12 @@
 //! Only client-surface cursors provide pixels. Themed cursors have no client surface and produce
 //! transparent frames, indistinguishable from a truly hidden cursor. While entered, those frames
 //! report `FrameEvent::CursorDefault`; this backend never reports a hidden cursor.
+//!
+//! **Cursor capture is off unless [`HyprlandFrameCapture::set_cursor_capture`] turns it on.**
+//! Hyprland 0.56.2 crashed (SEGV in `CCursorshareSession::copy` → `sendPresentationTime`, a frame
+//! used after it was freed) when a layer surface was destroyed while a cursor session was active
+//! (2026-10-01, the live session). Without a cursor session that compositor path is never reached;
+//! the destination then keeps its default cursor (02 §3.3).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -63,6 +69,7 @@ pub struct HyprlandFrameCapture {
     thread: Option<JoinHandle<()>>,
     next_id: u64,
     gate: Arc<IoGate>,
+    cursors: Arc<AtomicBool>,
 }
 
 struct Lookup {
@@ -97,10 +104,12 @@ impl HyprlandFrameCapture {
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
         let worker_gate = gate.clone();
+        let cursors = Arc::new(AtomicBool::new(false));
+        let worker_cursors = cursors.clone();
         let thread = std::thread::Builder::new()
             .name("hypr-frames".into())
             .spawn(move || {
-                let mut worker = match Worker::new(worker_gate, &worker_shutdown) {
+                let mut worker = match Worker::new(worker_gate, worker_cursors, &worker_shutdown) {
                     Ok(worker) => worker,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -172,7 +181,14 @@ impl HyprlandFrameCapture {
             thread: Some(thread),
             next_id: 1,
             gate,
+            cursors,
         })
+    }
+
+    /// Report cursor shapes (`FrameEvent::Cursor` / `CursorDefault`) for streams started from now
+    /// on. Off by default: see the module documentation for the Hyprland crash it avoids.
+    pub fn set_cursor_capture(&self, enabled: bool) {
+        self.cursors.store(enabled, Ordering::Release);
     }
 
     fn call(&self, request: Request, deadline: Instant) -> Result<(), PlatformError> {
@@ -724,6 +740,8 @@ struct Output {
 
 struct State {
     gate: Arc<IoGate>,
+    /// Whether new streams open a cursor session.
+    cursors: Arc<AtomicBool>,
     manager: Option<ExtImageCopyCaptureManagerV1>,
     sources: Option<ExtOutputImageCaptureSourceManagerV1>,
     shm: Option<wl_shm::WlShm>,
@@ -834,7 +852,11 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(gate: Arc<IoGate>, shutdown: &AtomicBool) -> Result<Self, PlatformError> {
+    fn new(
+        gate: Arc<IoGate>,
+        cursors: Arc<AtomicBool>,
+        shutdown: &AtomicBool,
+    ) -> Result<Self, PlatformError> {
         let connection = Connection::connect_to_env().map_err(backend)?;
         let queue = connection.new_event_queue();
         let qh = queue.handle();
@@ -845,6 +867,7 @@ impl Worker {
             qh,
             state: State {
                 gate,
+                cursors,
                 manager: None,
                 sources: None,
                 shm: None,
@@ -1046,6 +1069,7 @@ impl Worker {
         if !stream.cursor_started {
             stream.cursor_started = true;
             match (&self.state.manager, &self.state.pointer) {
+                _ if !self.state.cursors.load(Ordering::Acquire) => (),
                 (Some(manager), Some(pointer)) => {
                     stream.cursor = Some(CursorCapture::new(
                         manager,

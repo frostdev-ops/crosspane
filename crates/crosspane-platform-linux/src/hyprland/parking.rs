@@ -32,6 +32,8 @@ const PARK_ORIGIN_X: i64 = 1 << 20;
 const PARK_STRIDE: i64 = 1 << 14;
 /// How long to wait for Hyprland to apply a mode or move a window.
 const SETTLE: Duration = Duration::from_millis(1500);
+/// Mode changes one settle may make for a bar that arrived late on the twin output.
+const MAX_REPADS: u32 = 2;
 
 /// Where a window was before it was parked.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -58,6 +60,12 @@ pub struct HyprlandParking {
     ipc: HyprIpc,
     journal: PathBuf,
     entries: BTreeMap<u64, Entry>,
+    /// Per parked window, the largest area bars have reserved on its twin output (left, top,
+    /// right, bottom; logical pixels). It only grows: a bar re-creates its surface after every
+    /// mode change and is briefly gone, and shrinking the mode then makes it re-create the surface
+    /// again. On 2026-10-01 that loop changed one twin's mode hundreds of times and Hyprland
+    /// 0.56.2 crashed.
+    padding: BTreeMap<u64, [u32; 4]>,
 }
 
 impl HyprlandParking {
@@ -77,6 +85,7 @@ impl HyprlandParking {
             ipc,
             journal,
             entries,
+            padding: BTreeMap::new(),
         })
     }
 
@@ -124,9 +133,22 @@ impl HyprlandParking {
     }
 
     /// Set the twin output's mode and wait until Hyprland reports it.
-    fn set_mode(&self, entry: &Entry, size: PixelSize, scale: f64) -> Result<(), PlatformError> {
+    fn set_mode(
+        &mut self,
+        entry: &Entry,
+        size: PixelSize,
+        scale: f64,
+    ) -> Result<(), PlatformError> {
         let reserved = self.reserved(&entry.output)?;
-        self.set_mode_padded(entry, size, scale, reserved)
+        let padding = self.grow_padding(entry.window, reserved);
+        self.set_mode_padded(entry, size, scale, padding)
+    }
+
+    /// Grow the padding remembered for `window` to cover `reserved`, and return it.
+    fn grow_padding(&mut self, window: u64, reserved: [u32; 4]) -> [u32; 4] {
+        let padding = self.padding.entry(window).or_default();
+        *padding = covering(*padding, reserved);
+        *padding
     }
 
     /// The area other clients reserve on `output` (bars' exclusive zones), in logical pixels:
@@ -156,6 +178,13 @@ impl HyprlandParking {
         let scale = sane_scale(scale);
         let (w, h) = padded_mode(size, scale, reserved);
         let x = PARK_ORIGIN_X + entry.slot * PARK_STRIDE;
+        // Every mode change reconfigures the output and makes bars re-create their surfaces;
+        // don't make one that changes nothing.
+        if let Some(m) = self.monitor(&entry.output)?
+            && has_mode(&m, (w, h), scale, x)
+        {
+            return Ok(());
+        }
         self.ipc.eval(&format!(
             "hl.monitor({{ output = \"{}\", mode = \"{w}x{h}@60\", position = \"{x}x0\", scale = {scale} }})",
             entry.output
@@ -226,6 +255,7 @@ impl HyprlandParking {
             )?;
         }
         self.entries.remove(&window);
+        self.padding.remove(&window);
         self.save()
     }
 }
@@ -379,21 +409,28 @@ impl WindowParking for HyprlandParking {
 impl HyprlandParking {
     /// Wait until the window sits on its twin output, then report its geometry.
     fn settle(
-        &self,
+        &mut self,
         window: WindowId,
         size: PixelSize,
         scale: f64,
     ) -> Result<Parked, PlatformError> {
-        let entry = self.entries.get(&window.0).ok_or(PlatformError::NotFound)?;
+        let entry = self
+            .entries
+            .get(&window.0)
+            .cloned()
+            .ok_or(PlatformError::NotFound)?;
         let (w, h) = mode_size(size, sane_scale(scale));
         let deadline = Instant::now() + SETTLE;
-        let mut padded_for = self.reserved(&entry.output)?;
+        let mut repads = 0;
         loop {
-            // A bar can arrive on the new output after its mode was set: pad again.
+            // A bar can arrive on the new output after its mode was set: pad for it, a bounded
+            // number of times. A bar that is (briefly) gone never shrinks the padding.
             let reserved = self.reserved(&entry.output)?;
-            if reserved != padded_for {
-                self.set_mode_padded(entry, size, scale, reserved)?;
-                padded_for = reserved;
+            let padding = self.padding.get(&window.0).copied().unwrap_or_default();
+            if repads < MAX_REPADS && covering(padding, reserved) != padding {
+                repads += 1;
+                let padding = self.grow_padding(window.0, reserved);
+                self.set_mode_padded(&entry, size, scale, padding)?;
             }
             let client = self.client(window)?.ok_or(PlatformError::NotFound)?;
             let monitor = self
@@ -456,6 +493,29 @@ fn stable_id(client: &Value) -> Option<u64> {
         .get("stableId")
         .and_then(Value::as_str)
         .and_then(|s| u64::from_str_radix(s, 16).ok())
+}
+
+/// The smallest padding that covers both `a` and `b`, side by side.
+fn covering(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].max(b[2]),
+        a[3].max(b[3]),
+    ]
+}
+
+/// Whether `monitor` (from `hyprctl monitors -j`) already has this mode, scale and position.
+fn has_mode(monitor: &Value, (w, h): (u32, u32), scale: f64, x: i64) -> bool {
+    let int = |key: &str| monitor.get(key).and_then(Value::as_i64);
+    int("width") == Some(i64::from(w))
+        && int("height") == Some(i64::from(h))
+        && int("x") == Some(x)
+        && int("y") == Some(0)
+        && monitor
+            .get("scale")
+            .and_then(Value::as_f64)
+            .is_some_and(|s| (s - scale).abs() < 1e-3)
 }
 
 /// A mode whose size is a whole number of logical pixels at `scale` (Hyprland rejects others).
@@ -533,6 +593,34 @@ mod tests {
         assert_eq!(sane_scale(1.25), 1.0);
         assert_eq!(sane_scale(2.0), 2.0);
         assert_eq!(sane_scale(f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn padding_only_grows() {
+        let dir = std::env::temp_dir().join(format!("cp-pad-{}", std::process::id()));
+        let ipc = HyprIpc::new("none", &dir, Duration::from_millis(10));
+        let mut p = HyprlandParking::new(ipc, dir.join("parking.json")).unwrap();
+        assert_eq!(p.grow_padding(5, [0, 26, 0, 0]), [0, 26, 0, 0]);
+        // The bar re-creating its surface: briefly nothing reserved. The padding stays.
+        assert_eq!(p.grow_padding(5, [0, 0, 0, 0]), [0, 26, 0, 0]);
+        assert_eq!(p.grow_padding(5, [0, 20, 0, 10]), [0, 26, 0, 10]);
+        assert_eq!(p.grow_padding(6, [0, 0, 0, 0]), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn existing_modes_are_recognised() {
+        let m =
+            serde_json::json!({"width": 1072, "height": 990, "x": 1048576, "y": 0, "scale": 2.0});
+        assert!(has_mode(&m, (1072, 990), 2.0, 1_048_576));
+        assert!(!has_mode(&m, (1072, 938), 2.0, 1_048_576));
+        assert!(!has_mode(&m, (1072, 990), 1.0, 1_048_576));
+        assert!(!has_mode(&m, (1072, 990), 2.0, 1_064_960));
+        assert!(!has_mode(
+            &serde_json::json!({}),
+            (1072, 990),
+            2.0,
+            1_048_576
+        ));
     }
 
     #[test]

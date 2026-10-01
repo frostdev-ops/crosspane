@@ -172,10 +172,13 @@ permissions and recent notices.
   parked appear in that projected window (they're captured with it). Pinning the daemon to a real
   output (e.g. mako's `output=`) avoids it.
 - **Cursor shape:** over a projected window the cursor takes the source app's shape (text beam,
-  hand, resize arrows) when the source can see it: on a Mac source (needs Screen Recording), and
-  on Hyprland for apps that draw their own cursor (GTK3, Firefox, Xwayland). Hyprland doesn't
-  hand out its own themed cursors (apps using the cursor-shape protocol, e.g. GTK4, Qt 6,
-  Chromium), so over those the cursor is the destination's default arrow.
+  hand, resize arrows) when the source can see it: on a Mac source (needs Screen Recording).
+  Windows from Hyprland show the destination's default arrow: Hyprland 0.56.2's cursor capture
+  crashed the compositor once (02 §3.3), so it is off. `CROSSPANE_HYPR_CURSORS=1` in the agent's
+  environment turns it on, and even then it only covers apps that draw their own cursor (GTK3,
+  Firefox, Xwayland), not GTK4, Qt 6 or Chromium.
+- **If Hyprland restarts** (e.g. after a crash), the agent notices that its instance is gone,
+  exits and is started again by systemd on the new one.
 - **Picking windows:** a peer's windows must be allowed once (`crosspanectl allow <peer> browse` on
   that peer). Window titles from a Mac need Screen Recording there.
 - **Video:** H.264 needs a build with `--features video` (FFmpeg 9 on Linux; built in on the Mac);
