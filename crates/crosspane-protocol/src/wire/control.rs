@@ -284,6 +284,8 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
             t1: *t1,
             t2: *t2,
         }),
+        // Encoded by WP-2.3; until then a projection message can't be sent.
+        ControlMessage::Projection(_) => return Err(WireError::UnknownControl),
         ControlMessage::Goodbye { message } => {
             check_len(message.len(), MAX_STRING, "goodbye message")?;
             Body::Goodbye(pb::Goodbye {
