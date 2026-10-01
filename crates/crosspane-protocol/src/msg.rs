@@ -144,6 +144,8 @@ pub enum ControlMessage {
     Pong { t0: u64, t1: u64, t2: u64 },
     /// The sender is about to close the connection; `message` is for logs and UI.
     Goodbye { message: String },
+    /// E2 window projection (docs/wp/E2-v0.md).
+    Projection(crate::projection::ProjectionMessage),
 }
 
 /// Why an E1 session ended.
