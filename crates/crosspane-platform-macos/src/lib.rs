@@ -7,9 +7,12 @@
 pub mod capture;
 pub mod clock;
 pub mod displays;
+pub mod frame_capture;
 pub mod inject;
 pub mod keychain;
 pub mod main_thread;
 pub mod overlay;
+pub mod parking;
 pub mod permissions;
 pub mod session;
+pub mod windows;
