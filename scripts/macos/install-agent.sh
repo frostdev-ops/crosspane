@@ -11,6 +11,8 @@ set -euo pipefail
 repo=$(cd -- "${BASH_SOURCE[0]%/*}/../.." && pwd -P)
 cd "$repo"
 label=io.frostdev.crosspane.agent
+# crosspane-media links the system libopus (WP-3.0): Homebrew's `opus`, as in CI.
+export OPUS_LIB_DIR=${OPUS_LIB_DIR:-$(brew --prefix opus)}
 cargo build --release --locked -p crosspane-agent "$@"
 cargo build --release --locked -p crosspanectl -p crosspane-ui
 scripts/macos/bundle.sh --bin target/release/crosspane-agent --id "$label" --name Crosspane \
