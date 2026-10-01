@@ -3,7 +3,8 @@
 //! One QUIC connection per peer pair, mutually authenticated with pinned P-256 device keys (TLS
 //! 1.3, RFC 7250 raw public keys, ALPN `crosspane/1`, no 0-RTT, no resumption). Each side opens
 //! two unidirectional streams, `control` (priority 50) and `input` (priority 100), and pointer
-//! motion travels as datagrams. The engine sees all of it as a
+//! motion travels as datagrams. E2 media frames each get a unidirectional stream of their own
+//! (type `0x03`, priority 10) through [`Transport::send_media`]. The engine sees all of it as a
 //! [`PeerLink`] per peer plus [`LinkEvent`](crosspane_protocol::link::LinkEvent)s.
 //!
 //! Discovery, link classification, path selection, heartbeats and clock-offset estimation are
@@ -13,6 +14,7 @@
 
 mod hub;
 mod link;
+mod media;
 mod session;
 mod tls;
 
@@ -31,7 +33,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crosspane_protocol::link::{LinkEventSink, PeerLink};
+use crosspane_protocol::link::{LinkError, LinkEventSink, PeerLink};
 use crosspane_protocol::msg::{ControlMessage, Hello};
 use crosspane_protocol::wire::encode_control;
 use crosspane_security::identity::DeviceIdentity;
@@ -47,9 +49,20 @@ pub const DEFAULT_PORT: u16 = 47_811;
 const KEEP_ALIVE: Duration = Duration::from_secs(1);
 /// A peer silent for this long is dead.
 const IDLE_TIMEOUT_MS: u32 = 10_000;
-/// Streams a peer may have open to us. Two are expected (control and input); a few more are
-/// allowed so a third is seen and refused as a protocol error instead of silently stalling.
-const MAX_PEER_UNI_STREAMS: u8 = 4;
+/// Streams a peer may have open to us. Two are long-lived (control and input); the rest carry one
+/// media frame each. A few more than two are allowed so a stray control or input stream is seen
+/// and refused as a protocol error instead of silently stalling.
+const MAX_PEER_UNI_STREAMS: u8 = 64;
+/// What a peer may send on one stream before we read it: the largest media frame.
+const STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+/// What a peer may send on the whole connection before we read it. Larger than the unfinished
+/// media a peer may have (64 MiB) plus everything control and input can queue, so media alone can
+/// never use up the connection's credit and stall them.
+const CONNECTION_RECEIVE_WINDOW: u32 = 96 * 1024 * 1024;
+/// What we may buffer, unacknowledged, across all our streams: the same reasoning on the sending
+/// side. quinn's default (about 10 MB) is shared by every stream, so a few large frames would
+/// make a control or input write wait for them to be acknowledged.
+const SEND_WINDOW: u64 = 80 * 1024 * 1024;
 /// Datagram buffers are small on purpose: a stale pointer position is worth less than a fresh one.
 const DATAGRAM_RECEIVE_BUFFER: usize = 64 * 1024;
 const DATAGRAM_SEND_BUFFER: usize = 16 * 1024;
@@ -134,9 +147,12 @@ impl Transport {
         let mut quic = quinn::TransportConfig::default();
         quic.keep_alive_interval(Some(KEEP_ALIVE));
         quic.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))));
-        // Everything rides on the two uni streams and datagrams; bidirectional streams are refused.
+        // Everything rides on uni streams and datagrams; bidirectional streams are refused.
         quic.max_concurrent_bidi_streams(VarInt::from_u32(0));
         quic.max_concurrent_uni_streams(VarInt::from_u32(u32::from(MAX_PEER_UNI_STREAMS)));
+        quic.stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW));
+        quic.receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW));
+        quic.send_window(SEND_WINDOW);
         quic.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
         quic.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
         let quic = Arc::new(quic);
@@ -182,6 +198,28 @@ impl Transport {
     /// A send handle for a connected peer; `None` if not connected.
     pub fn link(&self, peer: NodeId) -> Option<Box<dyn PeerLink>> {
         self.inner.link(peer)
+    }
+
+    /// Queue one E2 media frame to `peer` on a new unidirectional stream (type byte `0x03`, then
+    /// the frame, then FIN), below control and input in priority. Never blocks, and the stream is
+    /// written by a task, so the frame's `Arc` is held until the peer has acknowledged all of it.
+    ///
+    /// The frame is a `crosspane-media` CPF1 payload; only its projection id and key-frame flag
+    /// are read here, to apply the limits below. At most 3 frames per projection and 64 MiB of
+    /// media per peer may be unfinished (not yet fully received by the peer) at once.
+    /// - `Err(LinkError::Closed)` if there is no live connection to `peer`.
+    /// - `Err(LinkError::Congested)` if accepting the frame would exceed those limits. It is
+    ///   **not** sent, and the caller must make its next frame a key frame: a dropped delta would
+    ///   corrupt the receiver's canvas. A key frame may exceed the per-projection count (never the
+    ///   byte limit), so one can always follow once the bytes drain.
+    /// - `Err(LinkError::Invalid(..))` for a frame over 64 MiB, which the peer would refuse; no
+    ///   frame that large ever succeeds.
+    ///
+    /// Frames of one projection can arrive out of order, and a frame still unfinished when the
+    /// connection closes is lost without notice. The receiver gets each complete frame as
+    /// [`LinkEvent::Media`](crosspane_protocol::link::LinkEvent::Media).
+    pub fn send_media(&self, peer: NodeId, frame: Arc<[u8]>) -> Result<(), LinkError> {
+        self.inner.send_media(peer, frame)
     }
 
     /// Peers with a live connection, sorted.

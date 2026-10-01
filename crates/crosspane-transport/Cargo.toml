@@ -21,4 +21,5 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+crosspane-media.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
