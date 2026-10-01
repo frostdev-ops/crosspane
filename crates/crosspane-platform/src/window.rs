@@ -99,12 +99,24 @@ pub struct Parked {
 /// - Every change is journaled on disk *before* it is made, so a crash can be undone.
 /// - Implementations never minimise and never close the app's window (03 §4.1).
 pub trait WindowParking: Send {
-    /// Park `window` with a content size of `size` device pixels (best effort: the app may refuse;
-    /// the returned geometry is what it took).
-    fn park(&mut self, window: WindowId, size: PixelSize) -> Result<Parked, PlatformError>;
+    /// Park `window` with a content size of `size` device pixels at `scale` device pixels per
+    /// logical unit (the destination's scale: a twin display uses it, so the app renders at the
+    /// destination's density). Best effort: the app may refuse a size; the returned geometry is
+    /// what it took.
+    fn park(
+        &mut self,
+        window: WindowId,
+        size: PixelSize,
+        scale: f64,
+    ) -> Result<Parked, PlatformError>;
 
-    /// Resize a parked window's content. Returns the geometry it actually took.
-    fn resize(&mut self, window: WindowId, size: PixelSize) -> Result<Parked, PlatformError>;
+    /// Resize a parked window's content (and change the scale). Returns the geometry it took.
+    fn resize(
+        &mut self,
+        window: WindowId,
+        size: PixelSize,
+        scale: f64,
+    ) -> Result<Parked, PlatformError>;
 
     /// The current geometry of a parked window (it may have moved or resized itself).
     fn geometry(&self, window: WindowId) -> Result<Parked, PlatformError>;
