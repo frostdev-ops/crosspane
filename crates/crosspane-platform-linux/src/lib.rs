@@ -3,6 +3,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod audio;
 #[cfg(feature = "gpu")]
 pub mod dmabuf;
 pub mod hyprland;
