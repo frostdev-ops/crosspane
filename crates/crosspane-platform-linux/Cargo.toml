@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 crosspane-types.workspace = true
+crosspane-media.workspace = true
 crosspane-platform.workspace = true
 
 [features]
