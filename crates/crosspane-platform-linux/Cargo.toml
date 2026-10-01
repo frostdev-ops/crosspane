@@ -14,9 +14,14 @@ workspace = true
 crosspane-types.workspace = true
 crosspane-platform.workspace = true
 
+[features]
+ffmpeg = ["dep:ffmpeg-next"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 font8x8.workspace = true
 ksni.workspace = true
+# H.264 through FFmpeg (WP-2.14b); off by default because CI images ship an older FFmpeg.
+ffmpeg-next = { workspace = true, optional = true }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
