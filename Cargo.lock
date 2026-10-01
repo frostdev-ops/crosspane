@@ -432,7 +432,11 @@ dependencies = [
 name = "crosspane-input"
 version = "0.0.0"
 dependencies = [
+ "crosspane-platform",
+ "crosspane-protocol",
  "crosspane-types",
+ "proptest",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
