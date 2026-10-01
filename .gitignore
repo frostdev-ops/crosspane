@@ -1,0 +1,31 @@
+# Build output
+/target/
+**/*.rs.bk
+*.profraw
+*.profdata
+perf.data*
+
+# Work-package worktrees (one per delegated WP; see docs/plan/11 §Delegation mechanics)
+/.worktrees/
+
+# Fuzzing (cargo-fuzz)
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+
+# Spikes: build output and raw measurement data. Raw captures (e.g. the P3 frame corpus) live
+# outside the repo in ~/span-data/; spike reports commit only summaries and CSVs.
+/spikes/**/target/
+/spikes/**/out/
+
+# Machine-local configuration (signing identity, Team ID, host names)
+*.local.toml
+.env
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

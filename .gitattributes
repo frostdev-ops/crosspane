@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+*.rs    diff=rust
+*.md    diff=markdown
+
+# Binary files. Whether render goldens use Git LFS is decided when the first ones appear.
+*.png   binary
+*.jpg   binary
+*.webp  binary
+*.raw   binary
+*.bin   binary
+*.yuv   binary
+*.h264  binary
+*.hevc  binary
+*.uf2   binary
