@@ -44,6 +44,7 @@ pub const KIND_PROJ_SCROLL: u8 = 0x0A;
 pub const KIND_PROJ_MOTION: u8 = 0x0B;
 pub const KIND_PROJ_HELD: u8 = 0x0C;
 pub const KIND_POINTER: u8 = 0x20;
+pub const KIND_AUDIO: u8 = 0x21;
 pub const KIND_CONTROL: u8 = 0x40;
 /// Pairing messages on a pairing connection; the payload is encoded by `crosspane-security`.
 pub const KIND_PAIRING: u8 = 0x60;

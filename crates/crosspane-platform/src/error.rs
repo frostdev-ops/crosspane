@@ -12,6 +12,8 @@ pub enum Permission {
     Accessibility,
     /// macOS Input Monitoring (event taps).
     InputMonitoring,
+    /// macOS Microphone (audio capture through public CoreAudio APIs).
+    Microphone,
 }
 
 #[derive(Debug, Error)]

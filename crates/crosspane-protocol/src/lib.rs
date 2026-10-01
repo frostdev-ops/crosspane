@@ -9,6 +9,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod audio;
 pub mod link;
 pub mod msg;
 pub mod negotiate;
@@ -20,4 +21,4 @@ pub mod wire;
 pub const ALPN: &[u8] = b"crosspane/1";
 
 /// Minor protocol version, negotiated in [`msg::Hello`]: both sides use `min(local, remote)`.
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 1;

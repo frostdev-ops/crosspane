@@ -1,5 +1,6 @@
 //! Control-stream encoding (protobuf, schema in docs/wp/WP-1.2.md). Implemented in WP-1.2.
 
+use crosspane_types::audio::{AudioKind, AudioStreamId};
 use crosspane_types::color::ColorSpace;
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{
@@ -269,6 +270,8 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
                         Capability::WindowShare => pb::Capability::WindowShare,
                         Capability::WindowBrowse => pb::Capability::WindowBrowse,
                         Capability::WindowPresent => pb::Capability::WindowPresent,
+                        Capability::AudioSpeaker => pb::Capability::AudioSpeaker,
+                        Capability::AudioMic => pb::Capability::AudioMic,
                     }) as i32
                 })
                 .collect();
@@ -288,6 +291,34 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
             t0: *t0,
             t1: *t1,
             t2: *t2,
+        }),
+        ControlMessage::AudioOpen {
+            stream,
+            kind,
+            channels,
+        } => {
+            check_audio_stream(stream.0 as u32)?;
+            if u16::from(*channels) != kind.format().channels {
+                return Err(WireError::BadValue("audio channels"));
+            }
+            Body::AudioOpen(pb::AudioOpen {
+                stream: u32::from(stream.0),
+                kind: match kind {
+                    AudioKind::Speaker => 1,
+                    AudioKind::Microphone => 2,
+                },
+                channels: u32::from(*channels),
+            })
+        }
+        ControlMessage::AudioOpened { stream } => Body::AudioOpened(pb::AudioStream {
+            stream: check_audio_stream(u32::from(stream.0))?.0.into(),
+        }),
+        ControlMessage::AudioRefused { stream, reason } => Body::AudioRefused(pb::AudioRefused {
+            stream: check_audio_stream(u32::from(stream.0))?.0.into(),
+            reason: projection_refusal_to_pb(*reason),
+        }),
+        ControlMessage::AudioClose { stream } => Body::AudioClose(pb::AudioStream {
+            stream: check_audio_stream(u32::from(stream.0))?.0.into(),
         }),
         ControlMessage::Projection(message) => Body::Projection(projection_to_pb(message)?),
         ControlMessage::Goodbye { message } => {
@@ -391,6 +422,8 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
                     Ok(pb::Capability::WindowShare) => Ok(Capability::WindowShare),
                     Ok(pb::Capability::WindowBrowse) => Ok(Capability::WindowBrowse),
                     Ok(pb::Capability::WindowPresent) => Ok(Capability::WindowPresent),
+                    Ok(pb::Capability::AudioSpeaker) => Ok(Capability::AudioSpeaker),
+                    Ok(pb::Capability::AudioMic) => Ok(Capability::AudioMic),
                     _ => Err(WireError::BadValue("capability")),
                 })
                 .collect::<Result<_, _>>()?;
@@ -411,6 +444,31 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
             t1: pong.t1,
             t2: pong.t2,
         },
+        Body::AudioOpen(open) => {
+            let kind = match open.kind {
+                1 => AudioKind::Speaker,
+                2 => AudioKind::Microphone,
+                _ => return Err(WireError::BadValue("audio kind")),
+            };
+            if open.channels != u32::from(kind.format().channels) {
+                return Err(WireError::BadValue("audio channels"));
+            }
+            ControlMessage::AudioOpen {
+                stream: check_audio_stream(open.stream)?,
+                kind,
+                channels: open.channels as u8,
+            }
+        }
+        Body::AudioOpened(open) => ControlMessage::AudioOpened {
+            stream: check_audio_stream(open.stream)?,
+        },
+        Body::AudioRefused(refused) => ControlMessage::AudioRefused {
+            stream: check_audio_stream(refused.stream)?,
+            reason: projection_refusal_from_pb(refused.reason)?,
+        },
+        Body::AudioClose(close) => ControlMessage::AudioClose {
+            stream: check_audio_stream(close.stream)?,
+        },
         Body::Projection(projection) => ControlMessage::Projection(projection_from_pb(projection)?),
         Body::Goodbye(goodbye) => {
             check_len(goodbye.message.len(), MAX_STRING, "goodbye message")?;
@@ -419,6 +477,14 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
             }
         }
     })
+}
+
+fn check_audio_stream(stream: u32) -> Result<AudioStreamId, WireError> {
+    let value = u16::try_from(stream).map_err(|_| WireError::BadValue("audio stream"))?;
+    if value == 0 {
+        return Err(WireError::BadValue("audio stream"));
+    }
+    Ok(AudioStreamId(value))
 }
 
 fn check_projection_string(value: &str) -> Result<(), WireError> {
@@ -738,6 +804,27 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
 
 // Handwritten prost definitions matching proto/control_v1.proto; no protoc/build script.
 mod pb {
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct AudioOpen {
+        #[prost(uint32, tag = "1")]
+        pub stream: u32,
+        #[prost(uint32, tag = "2")]
+        pub kind: u32,
+        #[prost(uint32, tag = "3")]
+        pub channels: u32,
+    }
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct AudioStream {
+        #[prost(uint32, tag = "1")]
+        pub stream: u32,
+    }
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct AudioRefused {
+        #[prost(uint32, tag = "1")]
+        pub stream: u32,
+        #[prost(uint32, tag = "2")]
+        pub reason: u32,
+    }
     #[derive(Clone, PartialEq, prost::Message)]
     pub struct Projection {
         #[prost(
@@ -925,7 +1012,7 @@ mod pb {
     pub struct ControlMessage {
         #[prost(
             oneof = "control_message::Body",
-            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13"
+            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
         )]
         pub body: Option<control_message::Body>,
     }
@@ -959,6 +1046,14 @@ mod pb {
             Goodbye(super::Goodbye),
             #[prost(message, tag = "13")]
             Projection(super::Projection),
+            #[prost(message, tag = "14")]
+            AudioOpen(super::AudioOpen),
+            #[prost(message, tag = "15")]
+            AudioOpened(super::AudioStream),
+            #[prost(message, tag = "16")]
+            AudioRefused(super::AudioRefused),
+            #[prost(message, tag = "17")]
+            AudioClose(super::AudioStream),
         }
     }
 
@@ -1121,6 +1216,8 @@ mod pb {
         WindowShare = 2,
         WindowBrowse = 3,
         WindowPresent = 4,
+        AudioSpeaker = 5,
+        AudioMic = 6,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

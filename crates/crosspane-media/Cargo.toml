@@ -15,6 +15,10 @@ crosspane-types.workspace = true
 lz4_flex.workspace = true
 thiserror.workspace = true
 xxhash-rust.workspace = true
+opus.workspace = true
+# Unify the binding feature so macOS links installed libopus instead of a bundled/static fallback.
+audiopus_sys.workspace = true
+crosspane-protocol.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

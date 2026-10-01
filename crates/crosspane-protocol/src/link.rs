@@ -34,6 +34,12 @@ pub trait PeerLink: Send {
     /// Send a pointer datagram: unreliable, latest wins. May return [`LinkError::Congested`].
     fn send_motion(&mut self, msg: &PointerMessage) -> Result<(), LinkError>;
 
+    /// Feature-negotiated audio datagram. Congestion drops audio, never the reliable control
+    /// messages. The default keeps older adapters source-compatible until audio integration.
+    fn send_audio(&mut self, _packet: &crate::audio::AudioPacket) -> Result<(), LinkError> {
+        Err(LinkError::Invalid("audio is unavailable"))
+    }
+
     /// Send on the control stream: reliable, ordered.
     fn send_control(&mut self, msg: &ControlMessage) -> Result<(), LinkError>;
 
@@ -55,6 +61,10 @@ pub trait PeerLink: Send {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum LinkEvent {
+    Audio {
+        peer: NodeId,
+        packet: crate::audio::AudioPacket,
+    },
     Input {
         peer: NodeId,
         msg: InputMessage,

@@ -8,11 +8,13 @@ use crosspane_security::trust::{PeerEntry, Revoked, TrustError, TrustStore, defa
 use crosspane_types::id::NodeId;
 use proptest::prelude::*;
 
-const CAPABILITIES: [Capability; 4] = [
+const CAPABILITIES: [Capability; 6] = [
     Capability::InputAccept,
     Capability::WindowShare,
     Capability::WindowBrowse,
     Capability::WindowPresent,
+    Capability::AudioSpeaker,
+    Capability::AudioMic,
 ];
 
 fn entry(identity: &DeviceIdentity) -> PeerEntry {

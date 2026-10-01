@@ -14,3 +14,4 @@ workspace = true
 crosspane-types.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+rtrb.workspace = true

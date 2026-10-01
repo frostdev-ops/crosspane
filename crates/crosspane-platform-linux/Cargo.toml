@@ -20,6 +20,8 @@ crosspane-platform.workspace = true
 ffmpeg = ["dep:ffmpeg-next"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+pipewire.workspace = true
+rtrb.workspace = true
 font8x8.workspace = true
 ksni.workspace = true
 # H.264 through FFmpeg (WP-2.14b); off by default because CI images ship an older FFmpeg.

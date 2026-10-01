@@ -16,6 +16,10 @@ message ControlMessage {
     Pong pong = 11;
     Goodbye goodbye = 12;
     Projection projection = 13;
+    AudioOpen audio_open = 14;
+    AudioStream audio_opened = 15;
+    AudioRefused audio_refused = 16;
+    AudioStream audio_close = 17;
   }
 }
 
@@ -47,7 +51,7 @@ message ControlRefused { uint64 session = 1; Refusal reason = 2; }
 enum EndReason { END_REASON_UNSPECIFIED = 0; END_REASON_RELEASED = 1; END_REASON_PANIC = 2; END_REASON_TARGET_LOCKED = 3; END_REASON_CONTROLLER_LOCKED = 4; END_REASON_LINK_LOST = 5; END_REASON_REVOKED = 6; }
 message EndControl { uint64 session = 1; EndReason reason = 2; }
 
-enum Capability { CAPABILITY_UNSPECIFIED = 0; CAPABILITY_INPUT_ACCEPT = 1; CAPABILITY_WINDOW_SHARE = 2; CAPABILITY_WINDOW_BROWSE = 3; CAPABILITY_WINDOW_PRESENT = 4; }
+enum Capability { CAPABILITY_UNSPECIFIED = 0; CAPABILITY_INPUT_ACCEPT = 1; CAPABILITY_WINDOW_SHARE = 2; CAPABILITY_WINDOW_BROWSE = 3; CAPABILITY_WINDOW_PRESENT = 4; CAPABILITY_AUDIO_SPEAKER = 5; CAPABILITY_AUDIO_MIC = 6; }
 message Grants { repeated Capability capabilities = 1; }
 
 message Revocation { bytes revoked = 1; bytes issuer = 2; uint64 issued_at_ms = 3; bytes signature = 4; }
@@ -165,3 +169,8 @@ message ProjectionBrowseRefused {
   uint32 request = 1;
   uint32 reason = 2; // Same 1..5 codes as Refusal above.
 }
+
+// D8: kind 1 speaker(stereo), 2 microphone(mono); stream 1..65535.
+message AudioOpen { uint32 stream = 1; uint32 kind = 2; uint32 channels = 3; }
+message AudioStream { uint32 stream = 1; }
+message AudioRefused { uint32 stream = 1; uint32 reason = 2; }
