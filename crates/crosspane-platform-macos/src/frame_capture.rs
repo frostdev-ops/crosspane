@@ -379,11 +379,13 @@ fn worker(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                     if result.is_ok() {
                         let mut deliveries =
                             shared.deliveries.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(delivery) = deliveries.get_mut(&id) {
+                        if let Some(delivery) = deliveries.get_mut(&id)
+                            && let Some(stream) = streams.get(&id)
+                        {
                             delivery.full_damage = true;
-                            delivery.crop = streams.get(&id).and_then(native::Stream::cpu_crop);
-                            delivery.cursor.crop =
-                                streams.get(&id).and_then(native::Stream::cursor_crop);
+                            delivery.scale = stream.scale;
+                            delivery.crop = stream.cpu_crop();
+                            delivery.cursor.crop = stream.cursor_crop();
                         }
                     } else if matches!(result, Err(PlatformError::Timeout)) {
                         // The OS may apply a timed-out configuration later. End the stream rather
