@@ -1,5 +1,6 @@
 //! Lifecycle, focus guard and content-to-display input mapping on the window owner.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crosspane_input::Held;
@@ -13,7 +14,7 @@ use crosspane_protocol::projection::{
     ProjectionMessage as Message, WindowSummary,
 };
 use crosspane_types::geom::{PixelSize, PointDevice, RectLogical};
-use crosspane_types::id::{NodeId, ProjectionId, WindowId};
+use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
 use super::{E2, GRACE, send};
@@ -578,7 +579,7 @@ impl E2 {
                 self.ledgers.inject(InjectCmd::Scroll(*delta), out);
             }
             ProjInput::Key { usage, down, .. } => {
-                if *down && self.focused != Some(source.window) {
+                if *down && !focus_on(&self.windows, self.focused, source.window, parked.display) {
                     if source.activate(now, out) {
                         self.focused = None;
                     }
@@ -614,7 +615,10 @@ impl E2 {
             return;
         };
         source.focus_wanted = false;
-        if focused == Some(source.window) {
+        if source
+            .parked
+            .is_some_and(|p| focus_on(&self.windows, focused, source.window, p.display))
+        {
             return;
         }
         if source.activate(now, out) {
@@ -866,6 +870,28 @@ impl Source {
                 scale,
             });
         }
+    }
+}
+
+/// Whether the OS focus is on this projection: the projected window itself, or another window of
+/// the same app on the display it is parked on. On macOS an app's popups, completion lists and
+/// sheets are windows of their own (Safari's address-bar suggestions take focus as soon as they
+/// appear), and nothing but the projection lives on a twin display. Keys never go to another app.
+fn focus_on(
+    windows: &BTreeMap<WindowId, WindowInfo>,
+    focused: Option<WindowId>,
+    window: WindowId,
+    display: DisplayId,
+) -> bool {
+    let Some(focused) = focused else {
+        return false;
+    };
+    if focused == window {
+        return true;
+    }
+    match (windows.get(&focused), windows.get(&window)) {
+        (Some(f), Some(w)) => f.pid.is_some() && f.pid == w.pid && f.display == Some(display),
+        _ => false,
     }
 }
 
