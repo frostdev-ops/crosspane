@@ -124,7 +124,9 @@ impl Net {
                     Err(e) => {
                         tracing::debug!(%addr, error = %e, "dial failed");
                         tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(10));
+                        // Short: a projection waiting out its grace period (WP-2.15) needs the
+                        // link back within 20 s of the outage ending.
+                        backoff = (backoff * 2).min(Duration::from_secs(3));
                     }
                 }
             }
