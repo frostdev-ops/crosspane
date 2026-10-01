@@ -418,6 +418,12 @@ impl Agent {
                     info.connected = false;
                     info.rtt = None;
                 }
+                // Projections from this peer stay open through the grace period (WP-2.15); a
+                // resumed one starts a new stream whose sequence numbers start again, so the
+                // decoder state goes now. The proxy keeps showing its last frame.
+                for key in self.projections.keys().filter(|k| k.source == *peer) {
+                    let _ = self.dest_media.send(DestCmd::Forget(*key));
+                }
             }
             _ => {}
         }
