@@ -273,7 +273,10 @@ fn run() -> Result<()> {
     if video.codecs.is_some() {
         features.push("h264".to_owned());
         // Region video (WP-2.32): this node shows a video rectangle over its lossless canvas.
-        features.push("h264roi".to_owned());
+        // `CROSSPANE_REGION_VIDEO=0` keeps peers on whole-window video (comparisons, escape hatch).
+        if std::env::var("CROSSPANE_REGION_VIDEO").as_deref() != Ok("0") {
+            features.push("h264roi".to_owned());
+        }
     }
     let hello = Hello {
         minor: crosspane_protocol::PROTOCOL_MINOR,

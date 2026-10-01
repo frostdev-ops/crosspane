@@ -281,7 +281,7 @@ impl TileEncoder {
         force_key: bool,
     ) -> Vec<u32> {
         let size = scan.size;
-        let key = force_key || self.key_pending(size);
+        let key = force_key || self.key_due(size, video);
         let tiles_x = size.width.div_ceil(TILE);
         let total = scan.total as usize;
         let mut bits = vec![0_u32; total.div_ceil(32)];
@@ -304,9 +304,16 @@ impl TileEncoder {
     /// Whether the next `emit`/`emit_from` of a capture of `size` will be a key frame even
     /// without `force_key` (requested, periodic, size change, or nothing committed yet).
     pub fn key_pending(&self, size: PixelSize) -> bool {
+        self.key_due(size, None)
+    }
+
+    /// The periodic key frame (collision repair) waits while a video region is out: it would
+    /// send the moving region losslessly too. Captures sent as region video don't count toward
+    /// it either, so motion stopping doesn't bring a whole-window key frame.
+    fn key_due(&self, size: PixelSize, video: Option<TileRect>) -> bool {
         self.key_requested
             || self.size != Some(size)
-            || self.frames_since_key >= KEY_FRAME_INTERVAL - 1
+            || (video.is_none() && self.frames_since_key >= KEY_FRAME_INTERVAL - 1)
     }
 
     fn validate_scan(&self, scan: &TileScan, header: FrameHeader) -> Result<(), MediaError> {
@@ -331,7 +338,7 @@ impl TileEncoder {
     ) -> Result<Option<EncodeStats>, MediaError> {
         let size = scan.size;
         let (tiles_x, tiles_y) = tile_grid(size.width, size.height)?;
-        let key = force_key || self.key_pending(size);
+        let key = force_key || self.key_due(size, video);
         header.key = key;
         let mut stale = if self.size == Some(size) {
             self.stale.clone()
@@ -382,7 +389,13 @@ impl TileEncoder {
         self.hashes = scan.kind.into_hashes();
         self.generation = Arc::new(());
         self.key_requested = false;
-        self.frames_since_key = if key { 0 } else { self.frames_since_key + 1 };
+        self.frames_since_key = if key {
+            0
+        } else if video.is_some() {
+            self.frames_since_key
+        } else {
+            self.frames_since_key + 1
+        };
         if !key && count == 0 {
             out.clear();
             return Ok(None);

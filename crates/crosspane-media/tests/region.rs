@@ -692,32 +692,24 @@ fn external_packed_stale_refresh_errors_commit_and_keys() {
                 .is_none()
         );
     }
-    assert!(encoder.key_pending(small));
+    // Region captures don't count toward the periodic key frame (lead change, WP-2.31): it
+    // would send the moving region losslessly.
+    assert!(!encoder.key_pending(small));
     let scan = encoder.scan_external(small, &[0]).unwrap();
-    let periodic = encoder
-        .emit_region(
-            scan,
-            header(small, 300),
-            TilePixels::Packed(&packed),
-            Some(cover),
-            false,
-            &mut out,
-        )
-        .unwrap()
-        .unwrap();
-    assert!(periodic.key);
-    assert_eq!(periodic.tiles, 1);
-    let scan = encoder.scan_external(small, &[0]).unwrap();
-    encoder
-        .emit_region(
-            scan,
-            header(small, 301),
-            TilePixels::Packed(&packed),
-            Some(cover),
-            false,
-            &mut out,
-        )
-        .unwrap();
+    assert!(
+        encoder
+            .emit_region(
+                scan,
+                header(small, 300),
+                TilePixels::Packed(&packed),
+                Some(cover),
+                false,
+                &mut out,
+            )
+            .unwrap()
+            .is_none()
+    );
+    // A requested key frame still goes out, region or not, and sends every tile.
     encoder.request_key();
     let scan = encoder.scan_external(small, &[0]).unwrap();
     assert!(
@@ -816,4 +808,48 @@ fn tiles_to_send_is_exactly_what_emit_region_reads() {
         assert_eq!(stats.map_or(0, |s| s.tiles), wanted, "capture {seq}");
         committed.clone_from(&frame);
     }
+}
+
+/// Region video never brings a periodic (collision-repair) key frame: it would send the moving
+/// region losslessly. Pure tile captures still do, every 300.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn no_periodic_key_frames_during_region_video() {
+    let size = PixelSize::new(256, 192);
+    let frame = vec![7_u8; (size.width * size.height * 4) as usize];
+    let region = TileRect {
+        x: 1,
+        y: 1,
+        width: 2,
+        height: 1,
+    };
+    let mut encoder = TileEncoder::new();
+    let mut out = Vec::new();
+    let mut emit = |encoder: &mut TileEncoder, seq: u64, video: Option<TileRect>| {
+        let scan = encoder.scan(size, &frame, size.width * 4).unwrap();
+        encoder
+            .emit_region(
+                scan,
+                header(size, seq),
+                TilePixels::Strided {
+                    pixels: &frame,
+                    stride: size.width * 4,
+                },
+                video,
+                false,
+                &mut out,
+            )
+            .unwrap()
+    };
+    assert!(emit(&mut encoder, 1, None).is_some_and(|s| s.key));
+    for seq in 2..1000 {
+        assert!(
+            emit(&mut encoder, seq, Some(region)).is_none_or(|s| !s.key),
+            "key frame during region video at capture {seq}"
+        );
+    }
+    // Region over: its stale tiles go out, then tile captures count toward the periodic key.
+    assert_eq!(emit(&mut encoder, 1000, None).map(|s| s.tiles), Some(2));
+    let first_key = (1001..1400).find(|&seq| emit(&mut encoder, seq, None).is_some_and(|s| s.key));
+    assert_eq!(first_key, Some(1299)); // 300 tile captures after the region, counting 1000
 }
