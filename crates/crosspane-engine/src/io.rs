@@ -231,15 +231,18 @@ pub enum Output {
     EngineGate(bool),
     Notice(Notice),
     // ---- E2 source (docs/wp/E2-v0.md) ----
-    /// `WindowParking::park`; answer with `Input::Parked`.
+    /// `WindowParking::park` with the destination's content size and scale (from `Accepted`);
+    /// answer with `Input::Parked`.
     Park {
         window: WindowId,
         size: PixelSize,
+        scale: f64,
     },
-    /// `WindowParking::resize`; answer with `Input::Parked`.
+    /// `WindowParking::resize` (from `Resize`); answer with `Input::Parked`.
     ResizeParked {
         window: WindowId,
         size: PixelSize,
+        scale: f64,
     },
     /// `WindowParking::restore`.
     Restore {

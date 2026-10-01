@@ -38,6 +38,11 @@ pub const KIND_LOCK_KEYS: u8 = 0x04;
 pub const KIND_STATE: u8 = 0x05;
 pub const KIND_ACK: u8 = 0x06;
 pub const KIND_STATUS: u8 = 0x07;
+pub const KIND_PROJ_KEY: u8 = 0x08;
+pub const KIND_PROJ_BUTTON: u8 = 0x09;
+pub const KIND_PROJ_SCROLL: u8 = 0x0A;
+pub const KIND_PROJ_MOTION: u8 = 0x0B;
+pub const KIND_PROJ_HELD: u8 = 0x0C;
 pub const KIND_POINTER: u8 = 0x20;
 pub const KIND_CONTROL: u8 = 0x40;
 /// Pairing messages on a pairing connection; the payload is encoded by `crosspane-security`.
