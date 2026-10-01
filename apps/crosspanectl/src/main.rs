@@ -106,6 +106,7 @@ enum Command {
     },
     /// End a projection and give the window back to its source.
     Return {
+        /// The projection number from `crosspanectl status` (not a window ID).
         projection: u64,
         /// The source peer (default: this machine).
         #[arg(long)]

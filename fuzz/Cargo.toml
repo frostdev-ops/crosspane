@@ -11,6 +11,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+crosspane-types = { path = "../crates/crosspane-types" }
 crosspane-protocol = { path = "../crates/crosspane-protocol" }
 crosspane-media = { path = "../crates/crosspane-media" }
 libfuzzer-sys = "0.4.13"
@@ -39,6 +40,20 @@ bench = false
 [[bin]]
 name = "media_frame"
 path = "fuzz_targets/media_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audio_datagram"
+path = "fuzz_targets/audio_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audio_jitter"
+path = "fuzz_targets/audio_jitter.rs"
 test = false
 doc = false
 bench = false

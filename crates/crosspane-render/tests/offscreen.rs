@@ -445,7 +445,7 @@ fn nv12_matches_reference() -> Result<()> {
                             0xC05F_A123,
                         ));
                         presenter
-                            .set_video(&device, visible, picture.clone())
+                            .set_video(&device, visible, full(visible), picture.clone())
                             .map_err(anyhow::Error::msg)?;
                         presenter.set_edge([211, 45, 137], 2);
                         let target = PixelSize::new(69, 53);
@@ -485,7 +485,7 @@ fn canvas_video_canvas_switching() -> Result<()> {
         )?;
         let picture = Arc::new(random_picture(size, 6, YuvColour::default(), 41));
         presenter
-            .set_video(&device, size, picture.clone())
+            .set_video(&device, size, full(size), picture.clone())
             .map_err(anyhow::Error::msg)?;
         compare_video(
             &readback(&device, &queue, &mut presenter, format, size)?,
@@ -518,11 +518,11 @@ fn superseded_pictures_never_reach_upload() -> Result<()> {
     let first = Arc::new(random_picture(size, 0, YuvColour::default(), 42));
     let dropped = Arc::downgrade(&first);
     presenter
-        .set_video(&device, size, first)
+        .set_video(&device, size, full(size), first)
         .map_err(anyhow::Error::msg)?;
     let second = Arc::new(random_picture(size, 7, YuvColour::default(), 43));
     presenter
-        .set_video(&device, size, second.clone())
+        .set_video(&device, size, full(size), second.clone())
         .map_err(anyhow::Error::msg)?;
     ensure!(
         dropped.upgrade().is_none(),
@@ -547,7 +547,7 @@ fn superseded_pictures_never_reach_upload() -> Result<()> {
     let pending = Arc::new(random_picture(size, 0, YuvColour::default(), 44));
     let dropped = Arc::downgrade(&pending);
     presenter
-        .set_video(&device, size, pending)
+        .set_video(&device, size, full(size), pending)
         .map_err(anyhow::Error::msg)?;
     let canvas = pattern(size, 0);
     presenter
@@ -569,7 +569,7 @@ fn superseded_pictures_never_reach_upload() -> Result<()> {
     for visible in [PixelSize::new(0, 1), PixelSize::new(39, 32)] {
         assert!(
             presenter
-                .set_video(&device, visible, second.clone())
+                .set_video(&device, visible, full(visible), second.clone())
                 .is_err()
         );
     }
@@ -577,7 +577,7 @@ fn superseded_pictures_never_reach_upload() -> Result<()> {
     invalid.y.clear();
     assert!(
         presenter
-            .set_video(&device, size, Arc::new(invalid))
+            .set_video(&device, size, full(size), Arc::new(invalid))
             .is_err()
     );
     compare(
@@ -711,7 +711,12 @@ fn native_pictures_import_or_copy() -> Result<()> {
             let (imports_before, uploads_before) =
                 (imports.load(Ordering::Relaxed), presenter.video_uploads);
             presenter
-                .set_native_video(&device, visible, Arc::new(FakeNative(picture.clone())))
+                .set_native_video(
+                    &device,
+                    visible,
+                    full(visible),
+                    Arc::new(FakeNative(picture.clone())),
+                )
                 .map_err(anyhow::Error::msg)?;
             let actual =
                 readback_importing(&device, &queue, &mut presenter, format, target, import)?;
@@ -727,7 +732,7 @@ fn native_pictures_import_or_copy() -> Result<()> {
             // A CPU picture after an imported one gets its own upload textures again.
             let cpu = Arc::new(random_picture(coded, 0, colour, seed + 100));
             presenter
-                .set_video(&device, visible, cpu.clone())
+                .set_video(&device, visible, full(visible), cpu.clone())
                 .map_err(anyhow::Error::msg)?;
             let actual = readback(&device, &queue, &mut presenter, format, target)?;
             compare_video(&actual, &cpu, visible, target, 2)?;
@@ -739,7 +744,7 @@ fn native_pictures_import_or_copy() -> Result<()> {
         };
         ensure!(
             presenter
-                .set_native_video(&device, visible, Arc::new(FakeNative(odd)))
+                .set_native_video(&device, visible, full(visible), Arc::new(FakeNative(odd)))
                 .is_err()
         );
         ensure!(
@@ -747,6 +752,7 @@ fn native_pictures_import_or_copy() -> Result<()> {
                 .set_native_video(
                     &device,
                     PixelSize::new(65, 45),
+                    full(PixelSize::new(65, 45)),
                     Arc::new(FakeNative(random_picture(
                         coded,
                         0,
@@ -756,6 +762,274 @@ fn native_pictures_import_or_copy() -> Result<()> {
                 )
                 .is_err()
         );
+    }
+    Ok(())
+}
+
+fn compare_region(
+    actual: &[u8],
+    canvas: &[u8],
+    size: PixelSize,
+    picture: &Nv12,
+    rect: PixelRect,
+    canvas_tiles: &[PixelRect],
+) -> Result<()> {
+    let visible = PixelSize::new(rect.width() as u32, rect.height() as u32);
+    let mut video = Vec::new();
+    nv12_to_bgra(picture, visible, &mut video)?;
+    for y in 0..size.height {
+        for x in 0..size.width {
+            let at = (y * size.width + x) as usize * 4;
+            let pixel = point2(x as i32, y as i32);
+            let canvas_wins = canvas_tiles.iter().any(|dirty| {
+                x / 64 >= dirty.min.x as u32 / 64
+                    && x / 64 < (dirty.max.x as u32).div_ceil(64)
+                    && y / 64 >= dirty.min.y as u32 / 64
+                    && y / 64 < (dirty.max.y as u32).div_ceil(64)
+            });
+            if rect.contains(pixel) && !canvas_wins {
+                let source =
+                    ((y - rect.min.y as u32) * visible.width + x - rect.min.x as u32) as usize * 4;
+                for (got, want) in actual[at..at + 4].iter().zip(&video[source..source + 4]) {
+                    ensure!(
+                        got.abs_diff(*want) <= 1,
+                        "region video ({x},{y}): {got} vs {want}"
+                    );
+                }
+            } else {
+                ensure!(
+                    actual[at..at + 4] == canvas[at..at + 4],
+                    "region canvas ({x},{y})"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn video_regions_and_canvas_tiles() -> Result<()> {
+    exercise_video_regions(false)
+}
+
+#[test]
+fn native_video_region_over_canvas() -> Result<()> {
+    exercise_video_regions(true)
+}
+
+fn exercise_video_regions(native: bool) -> Result<()> {
+    let Some((device, queue)) = device()? else {
+        return Ok(());
+    };
+    let size = PixelSize::new(269, 211);
+    let importer = |device: &wgpu::Device, picture: &dyn NativePicture| {
+        fake_import(&queue, device, picture, picture.size().height / 2)
+    };
+    let import: Option<gpu::Import<'_>> = if native { Some(&importer) } else { None };
+    let set_picture = |presenter: &mut Presenter, rect: PixelRect, picture: Arc<Nv12>| {
+        if native {
+            presenter.set_native_video(
+                &device,
+                size,
+                rect,
+                Arc::new(FakeNative((*picture).clone())),
+            )
+        } else {
+            presenter.set_video(&device, size, rect, picture)
+        }
+    };
+    // Interior and right/bottom partial tiles; coded padding must never appear.
+    for rect in [
+        PixelRect::new(point2(64, 64), point2(192, 192)),
+        PixelRect::new(point2(128, 64), point2(269, 211)),
+    ] {
+        for format in [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ] {
+            let mut presenter = Presenter::new(&device, format);
+            let mut canvas = pattern(size, 0);
+            presenter
+                .upload(&device, &queue, size, &canvas, &[full(size)])
+                .map_err(anyhow::Error::msg)?;
+            let picture = Arc::new(random_picture(
+                PixelSize::new(144, 148),
+                7,
+                YuvColour::default(),
+                53,
+            ));
+            set_picture(&mut presenter, rect, picture.clone()).map_err(anyhow::Error::msg)?;
+            compare_region(
+                &readback_importing(&device, &queue, &mut presenter, format, size, import)?,
+                &canvas,
+                size,
+                &picture,
+                rect,
+                &[],
+            )?;
+            // A tiny dirty rectangle switches its entire tile to canvas, preserving the
+            // previously uploaded canvas outside the dirty pixels in that tile.
+            let dirty = PixelRect::new(
+                rect.min + point2(3, 4).to_vector(),
+                rect.min + point2(9, 11).to_vector(),
+            );
+            let new_canvas = pattern(size, 1);
+            for y in dirty.min.y..dirty.max.y {
+                let start = (y as u32 * size.width + dirty.min.x as u32) as usize * 4;
+                let end = start + dirty.width() as usize * 4;
+                canvas[start..end].copy_from_slice(&new_canvas[start..end]);
+            }
+            presenter
+                .upload(&device, &queue, size, &new_canvas, &[dirty])
+                .map_err(anyhow::Error::msg)?;
+            compare_region(
+                &readback_importing(&device, &queue, &mut presenter, format, size, import)?,
+                &canvas,
+                size,
+                &picture,
+                rect,
+                &[dirty],
+            )?;
+            let smaller = PixelRect::new(point2(192, 128), point2(256, 192));
+            let second = Arc::new(random_picture(
+                PixelSize::new(66, 68),
+                3,
+                YuvColour::default(),
+                54,
+            ));
+            set_picture(&mut presenter, smaller, second.clone()).map_err(anyhow::Error::msg)?;
+            compare_region(
+                &readback_importing(&device, &queue, &mut presenter, format, size, import)?,
+                &canvas,
+                size,
+                &second,
+                smaller,
+                &[],
+            )?;
+            // Cancelling a moved pending region must not revive the previous picture
+            // at its old position, even though its tiles still say video.
+            set_picture(&mut presenter, rect, picture.clone()).map_err(anyhow::Error::msg)?;
+            presenter
+                .upload(&device, &queue, size, &canvas, &[rect])
+                .map_err(anyhow::Error::msg)?;
+            compare(
+                &readback_importing(&device, &queue, &mut presenter, format, size, import)?,
+                &canvas,
+                "cancelled region cannot revive old video",
+            )?;
+            // Arrival ordering also applies before the newest picture has been uploaded.
+            set_picture(&mut presenter, rect, picture.clone()).map_err(anyhow::Error::msg)?;
+            presenter
+                .upload(&device, &queue, size, &canvas, &[dirty])
+                .map_err(anyhow::Error::msg)?;
+            compare_region(
+                &readback_importing(&device, &queue, &mut presenter, format, size, import)?,
+                &canvas,
+                size,
+                &picture,
+                rect,
+                &[dirty],
+            )?;
+            if native {
+                ensure!(
+                    presenter.video_uploads == 0,
+                    "region importer copied a picture"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn source_map_size_changes_and_invalid_regions() -> Result<()> {
+    let Some((device, queue)) = device()? else {
+        return Ok(());
+    };
+    for format in [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    ] {
+        let mut presenter = Presenter::new(&device, format);
+        let old = PixelSize::new(192, 192);
+        let size = PixelSize::new(141, 133);
+        let picture = Arc::new(random_picture(
+            PixelSize::new(80, 70),
+            0,
+            YuvColour::default(),
+            56,
+        ));
+        presenter
+            .upload(&device, &queue, old, &pattern(old, 0), &[full(old)])
+            .map_err(anyhow::Error::msg)?;
+        let rect = PixelRect::new(point2(64, 64), point2(141, 133));
+        presenter
+            .set_video(&device, size, rect, picture.clone())
+            .map_err(anyhow::Error::msg)?;
+        let grey: Vec<u8> = [32, 32, 32, 255].repeat((size.width * size.height) as usize);
+        compare_region(
+            &readback(&device, &queue, &mut presenter, format, size)?,
+            &grey,
+            size,
+            &picture,
+            rect,
+            &[],
+        )?;
+        for invalid in [
+            PixelRect::new(point2(64, 64), point2(64, 128)),
+            PixelRect::new(point2(-64, 0), point2(64, 64)),
+            PixelRect::new(point2(1, 64), point2(64, 128)),
+            PixelRect::new(point2(64, 64), point2(140, 128)),
+            PixelRect::new(point2(64, 64), point2(192, 128)),
+            full(size),
+        ] {
+            ensure!(
+                presenter
+                    .set_video(&device, size, invalid, picture.clone())
+                    .is_err()
+            );
+            ensure!(
+                presenter
+                    .set_native_video(
+                        &device,
+                        size,
+                        invalid,
+                        Arc::new(FakeNative((*picture).clone()))
+                    )
+                    .is_err()
+            );
+        }
+        // Invalid arrivals cannot mutate either layer or the map.
+        compare_region(
+            &readback(&device, &queue, &mut presenter, format, size)?,
+            &grey,
+            size,
+            &picture,
+            rect,
+            &[],
+        )?;
+        let canvas = pattern(old, 1);
+        presenter
+            .upload(&device, &queue, old, &canvas, &[full(old)])
+            .map_err(anyhow::Error::msg)?;
+        compare(
+            &readback(&device, &queue, &mut presenter, format, old)?,
+            &canvas,
+            "Frame size change clears video",
+        )?;
+        // Same-size video after the reset proves old canvas selections were reset too.
+        let rect = PixelRect::new(point2(64, 64), point2(128, 128));
+        presenter
+            .set_video(&device, old, rect, picture.clone())
+            .map_err(anyhow::Error::msg)?;
+        compare_region(
+            &readback(&device, &queue, &mut presenter, format, old)?,
+            &canvas,
+            old,
+            &picture,
+            rect,
+            &[],
+        )?;
     }
     Ok(())
 }
