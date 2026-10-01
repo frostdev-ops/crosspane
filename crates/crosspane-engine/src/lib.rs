@@ -14,6 +14,7 @@ pub mod e2;
 pub mod io;
 
 use crosspane_input::journal::{Journal, JournalError};
+use crosspane_platform::CaptureEvent;
 use crosspane_types::time::MonoTime;
 
 pub use config::EngineConfig;
@@ -46,6 +47,8 @@ impl Engine {
         let (target, mut out) = TargetE1::new(&config, journal, now)?;
         let (e2, e2_out) = E2::new(&config, e2_journal, now)?;
         out.extend(e2_out);
+        // The engine permits I/O from the start (after recovery); only a panic closes its side.
+        out.push(Output::EngineGate(true));
         let controller = ControllerE1::new(&config, now);
         Ok((
             Engine {
@@ -66,9 +69,28 @@ impl Engine {
             Input::Command(Command::Rearm) => out.push(Output::EngineGate(true)),
             _ => {}
         }
-        self.controller.handle(&input, now, &mut out);
+        // While another node controls this one, this node's own portals are inert: the injected
+        // pointer enters at an edge, and crossing out from there would bounce control straight
+        // back (found in the nested end-to-end test).
+        let was_controlled = self.target.is_controlled();
+        let edge_event = matches!(
+            &input,
+            Input::Capture(CaptureEvent::EdgePressed { .. } | CaptureEvent::EdgeReleased { .. })
+        );
+        if !(was_controlled && edge_event) {
+            self.controller.handle(&input, now, &mut out);
+        }
         self.target.handle(&input, now, &mut out);
         self.e2.handle(&input, now, &mut out);
+        let controlled = self.target.is_controlled();
+        if controlled {
+            out.retain(|o| !matches!(o, Output::SetPortals(_)));
+            if !was_controlled {
+                out.push(Output::SetPortals(Vec::new()));
+            }
+        } else if was_controlled {
+            out.push(Output::SetPortals(self.controller.portals().to_vec()));
+        }
         out
     }
 

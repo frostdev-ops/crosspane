@@ -158,7 +158,15 @@ pub struct ProxyHost {
 
 impl ProxyHost {
     pub fn new() -> Result<(ProxyHost, HostHandle), HostError> {
-        Self::from_loop(EventLoop::<HostCommand>::with_user_event().build()?)
+        #[allow(unused_mut)]
+        let mut builder = EventLoop::<HostCommand>::with_user_event();
+        // Crosspane is a menu-bar app: no Dock icon, never steals activation on its own.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        }
+        Self::from_loop(builder.build()?)
     }
 
     /// Linux tests only: build the event loop on a non-main thread (Wayland allows it).

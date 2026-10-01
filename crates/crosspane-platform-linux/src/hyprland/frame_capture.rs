@@ -358,6 +358,17 @@ fn capture_rect(size: PixelSize, crop: Option<PixelRect>) -> Result<PixelRect, P
     Ok(rect)
 }
 
+/// The crop clamped to the buffer. Across a resize the crop and the buffer briefly disagree (the
+/// output's mode changes before the owner's next `set_crop`); that is never fatal. `None` if
+/// nothing of the crop is inside the buffer.
+fn clamped_crop(size: PixelSize, crop: Option<PixelRect>) -> Option<PixelRect> {
+    let width = i32::try_from(size.width).ok()?;
+    let height = i32::try_from(size.height).ok()?;
+    let full = PixelRect::new(point2(0, 0), point2(width, height));
+    let rect = crop.map_or(Some(full), |crop| crop.intersection(&full))?;
+    (rect.max.x > rect.min.x && rect.max.y > rect.min.y).then_some(rect)
+}
+
 fn translate_damage(damage: &[[i32; 4]], crop: PixelRect) -> Vec<PixelRect> {
     damage
         .iter()
@@ -434,7 +445,13 @@ struct Stream {
     interval: Duration,
     full_damage: bool,
     constraints_revision: u64,
+    /// Consecutive `failed` frames with an unspecific reason (Hyprland reports those across output
+    /// mode changes); the stream ends only after several in a row.
+    unknown_failures: u32,
 }
+
+/// Consecutive unspecific frame failures before a stream ends with `Failed`.
+const MAX_UNKNOWN_FAILURES: u32 = 5;
 
 impl Stream {
     fn destroy(mut self) {
@@ -647,12 +664,12 @@ impl Worker {
                     .get_mut(&id)
                     .ok_or(PlatformError::NotFound)
                     .and_then(|stream| {
-                        if let Some(size) = stream
-                            .constraints
-                            .as_ref()
-                            .and_then(|constraints| constraints.size)
-                        {
-                            capture_rect(size, crop)?;
+                        // Validated against the buffer at use (clamped): the output may be
+                        // resizing right now, so the current constraints can be stale.
+                        if crop.is_some_and(|c| {
+                            c.max.x <= c.min.x || c.max.y <= c.min.y || c.min.x < 0 || c.min.y < 0
+                        }) {
+                            return Err(backend("crop must be nonempty and non-negative"));
                         }
                         stream.crop = crop;
                         stream.full_damage = true;
@@ -717,6 +734,7 @@ impl Worker {
                 next_slot: Instant::now(),
                 interval: Duration::from_nanos(1_000_000_000_u64.div_ceil(u64::from(max_fps))),
                 full_damage: true,
+                unknown_failures: 0,
                 constraints_revision: 0,
             },
         );
@@ -735,6 +753,7 @@ impl Worker {
             return Err(PlatformError::Timeout);
         }
         if stream.capture.as_ref().is_some_and(|capture| capture.ready) {
+            stream.unknown_failures = 0;
             let capture = stream
                 .capture
                 .take()
@@ -750,8 +769,10 @@ impl Worker {
                 .buffer
                 .as_ref()
                 .ok_or_else(|| backend("missing frame buffer"))?;
-            let rect = capture_rect(buffer.size, stream.crop)?;
-            let (size, pixels) = buffer.copy(stream.crop)?;
+            let Some(rect) = clamped_crop(buffer.size, stream.crop) else {
+                return Ok(());
+            };
+            let (size, pixels) = buffer.copy(Some(rect))?;
             let at = capture.at.map(Ok).unwrap_or_else(now)?;
             let damage = if stream.full_damage {
                 Some(vec![PixelRect::new(
@@ -791,12 +812,9 @@ impl Worker {
                 .constraints
                 .as_ref()
                 .ok_or_else(|| backend("missing buffer constraints"))?;
-            capture_rect(
-                constraints
-                    .size
-                    .ok_or_else(|| backend("missing buffer size"))?,
-                stream.crop,
-            )?;
+            constraints
+                .size
+                .ok_or_else(|| backend("missing buffer size"))?;
             let shm = self
                 .state
                 .shm
@@ -1050,6 +1068,14 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, StreamId> for State {
                     }
                     WEnum::Value(frame_protocol::FailureReason::Stopped) => {
                         state.end(*id, StreamEndReason::TargetGone)
+                    }
+                    // Unspecific failures happen across output mode changes: treat them like a
+                    // constraint change and retry, unless they keep happening.
+                    _ if stream.unknown_failures + 1 < MAX_UNKNOWN_FAILURES => {
+                        stream.unknown_failures += 1;
+                        stream.buffer.take();
+                        stream.reallocate = stream.constraints.is_some();
+                        stream.full_damage = true;
                     }
                     _ => state.end(*id, StreamEndReason::Failed),
                 }

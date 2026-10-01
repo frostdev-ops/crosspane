@@ -97,6 +97,10 @@ jobs:
         run: cargo nextest run --workspace --locked --no-tests=pass
         env:
           CROSSPANE_REQUIRE_GPU: "1"
+      - name: Check the opt-in private-API module (D7)
+        run: |
+          cargo clippy -p crosspane-platform-macos --all-targets --features private-vdisplay --locked -- -D warnings
+          cargo nextest run -p crosspane-platform-macos --features private-vdisplay --locked --no-tests=pass
       - name: Build documentation
         run: cargo doc --workspace --no-deps --locked
         env:

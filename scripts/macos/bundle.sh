@@ -72,6 +72,11 @@ for key in CFBundleIdentifier CFBundleName CFBundleExecutable CFBundlePackageTyp
     /usr/bin/plutil -insert "$key" -string "$value" "$plist"
 done
 /usr/bin/plutil -insert NSHighResolutionCapable -bool true "$plist"
+# macOS 15+ asks the user before an app may reach the local network; without this the agent's
+# QUIC sends to LAN peers fail with "No route to host".
+/usr/bin/plutil -insert NSLocalNetworkUsageDescription -string \
+    'Crosspane connects to your other computers on the local network to share the keyboard, mouse and windows.' \
+    "$plist"
 if [[ $ui_element == true ]]; then
     /usr/bin/plutil -insert LSUIElement -bool true "$plist"
 fi
