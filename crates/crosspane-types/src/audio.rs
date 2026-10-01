@@ -41,7 +41,9 @@ impl AudioFormat {
     }
 }
 
-/// Unique across both initiators on a peer connection. Zero is invalid. The smaller NodeId
-/// allocates odd IDs and the larger allocates even IDs, never reusing one before link close.
+/// Unique across both initiators for a peer. Zero is invalid. The smaller NodeId allocates odd
+/// IDs and the larger allocates even IDs. Since WP-3.0b an ID is never reused for a peer for the
+/// lifetime of the agent process, across connection replacement and reconnects alike (exhaustion
+/// refuses, never wraps). Counters are not durable: a restarted peer starts over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AudioStreamId(pub u16);

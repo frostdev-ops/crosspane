@@ -30,6 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
+rtrb.workspace = true
 zeroize.workspace = true
 
 [features]

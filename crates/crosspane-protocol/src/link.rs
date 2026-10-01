@@ -89,6 +89,14 @@ pub enum LinkEvent {
         peer: NodeId,
         error: LinkError,
     },
+    /// An authenticated connection silently superseded the one an already announced logical link
+    /// was using (duplicate-connection handover; WP-3.0b): its first Hello, which may carry
+    /// different features. Delivered before that connection's later events; the ordinary Hello
+    /// is still delivered once per logical link, and no `Closed` is synthesised for the handover.
+    HelloRefresh {
+        peer: NodeId,
+        hello: crate::msg::Hello,
+    },
 }
 
 /// Receives [`LinkEvent`]s. Never blocks (see `crosspane_platform::EventSink` for the same rules).

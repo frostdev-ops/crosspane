@@ -29,6 +29,7 @@ crosspane-media.workspace = true
 crosspane-platform.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+rtrb.workspace = true
 wgpu = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-io-surface = { workspace = true, optional = true }

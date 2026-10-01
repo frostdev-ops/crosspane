@@ -209,6 +209,21 @@ pub enum Input {
         key: AudioKey,
         visible: bool,
     },
+    /// The peer's connection was silently replaced (`LinkEvent::HelloRefresh`; WP-3.0b): end every
+    /// audio session with it, pending or active, keeping its stream-ID allocation, replay
+    /// high-water, admission generations and retained device demand.
+    AudioConnectionReplaced {
+        peer: NodeId,
+    },
+    /// The agent's audio worker failed this exact session; only the matching complete key ends.
+    AudioStreamFailed {
+        key: AudioKey,
+    },
+    /// Whether this node can host microphones at all. Defaults to false; production speaker-v0
+    /// never sets it true, so microphone admissions are refused without opening any device.
+    AudioMicrophoneSupport {
+        available: bool,
+    },
     // ---- E2 (docs/wp/E2-v0.md) ----
     /// This node's windows (from `WindowSource`).
     Windows(WindowEvent),
