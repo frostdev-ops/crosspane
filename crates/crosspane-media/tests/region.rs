@@ -853,3 +853,36 @@ fn no_periodic_key_frames_during_region_video() {
     let first_key = (1001..1400).find(|&seq| emit(&mut encoder, seq, None).is_some_and(|s| s.key));
     assert_eq!(first_key, Some(1299)); // 300 tile captures after the region, counting 1000
 }
+
+/// Lead tuning (WP-2.31): a region covering most of the window becomes the whole window, and
+/// scattered busy tiles that fill under a quarter of their box stay lossless.
+#[test]
+fn large_regions_snap_and_sparse_changes_stay_lossless() {
+    let size = PixelSize::new(640, 384); // 10 × 6 tiles
+    let mut scheduler = RegionScheduler::new(RegionConfig::default());
+    let mut plan = |ms, tiles: &[(u32, u32)]| {
+        scheduler.plan(10, 6, &bitmap(size, tiles), Duration::from_millis(ms), true)
+    };
+    // Two busy corners: a 10 × 6 box with 2 busy tiles is far below a quarter.
+    for ms in [0, 33, 66, 99] {
+        assert_eq!(plan(ms, &[(0, 0), (9, 5)]), RegionPlan::Tiles);
+    }
+    // A busy 7 × 4 block (+ margin: 9 × 6 of 10 × 6) snaps to the whole window.
+    let block: Vec<(u32, u32)> = (1..8).flat_map(|x| (1..5).map(move |y| (x, y))).collect();
+    let mut last = RegionPlan::Tiles;
+    for ms in [1000, 1033, 1066] {
+        last = plan(ms, &block);
+    }
+    assert_eq!(
+        last,
+        RegionPlan::Video {
+            region: TileRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 6
+            },
+            key: true
+        }
+    );
+}
