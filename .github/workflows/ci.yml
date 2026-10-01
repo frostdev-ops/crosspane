@@ -44,12 +44,13 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest,cargo-deny
+      - name: Install system libraries
+        # libxkbcommon for the Hyprland backends; lavapipe for the software-GPU render tests.
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev pkg-config mesa-vulkan-drivers
       - name: Check formatting
         run: cargo fmt --check
       - name: Check lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Install lavapipe
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - name: Run tests
         run: cargo nextest run --workspace --locked --no-tests=pass
         env:
