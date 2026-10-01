@@ -1,4 +1,6 @@
-//! Real-time Annex B H.264 through libavcodec (WP-2.14b).
+//! Real-time Annex B H.264 through libavcodec, with NVDEC / VA-API decoding.
+
+use std::{ptr, sync::OnceLock};
 
 use crosspane_media::codec::{CodecError, EncodedVideo, VideoCodecs, VideoDecoder, VideoEncoder};
 use crosspane_types::geom::PixelSize;
@@ -25,6 +27,8 @@ impl Backend {
 #[derive(Debug)]
 pub struct FfmpegCodecs {
     preferred: Backend,
+    // Cache failures too: a forced, unavailable device must not be re-probed on every call.
+    decoder_backend: OnceLock<Result<DecoderBackend, String>>,
 }
 
 impl FfmpegCodecs {
@@ -36,16 +40,119 @@ impl FfmpegCodecs {
         match Session::new(Backend::Nvenc, size, 8_000_000, 30) {
             Ok(_) => Ok(Self {
                 preferred: Backend::Nvenc,
+                decoder_backend: OnceLock::new(),
             }),
             Err(nvenc) => match Session::new(Backend::X264, size, 8_000_000, 30) {
                 Ok(_) => Ok(Self {
                     preferred: Backend::X264,
+                    decoder_backend: OnceLock::new(),
                 }),
                 Err(x264) => Err(CodecError::Unavailable(format!(
                     "h264_nvenc: {nvenc}; libx264: {x264}"
                 ))),
             },
         }
+    }
+
+    fn choose_decoder(&self) -> Result<DecoderBackend, CodecError> {
+        // Software decoding is the default: on the dev machine (RTX 3080 Ti, Ryzen 7800X3D) NVDEC
+        // plus the transfer to system memory is slower than FFmpeg's software decoder (3440×1440:
+        // 10.5 ms against 5.4 ms; WP-2.14d), and latency matters more than CPU here. `hardware`
+        // takes the first working of CUDA and VA-API (for machines with weaker CPUs).
+        let forced = match std::env::var("CROSSPANE_VIDEO_DECODER") {
+            Ok(value) => match value.as_str() {
+                "software" => Some(DecoderBackend::Software),
+                "hardware" => None,
+                "cuda" => Some(DecoderBackend::Cuda),
+                "vaapi" => Some(DecoderBackend::Vaapi),
+                _ => {
+                    return Err(CodecError::Unavailable(
+                        "CROSSPANE_VIDEO_DECODER must be software, hardware, cuda or vaapi".into(),
+                    ));
+                }
+            },
+            Err(std::env::VarError::NotPresent) => Some(DecoderBackend::Software),
+            Err(error) => return Err(CodecError::Unavailable(error.to_string())),
+        };
+        if forced == Some(DecoderBackend::Software) {
+            return Ok(DecoderBackend::Software);
+        }
+
+        // Use the existing encoder's low-delay IDR path. Four large, aligned colour blocks
+        // check both geometry and pixel reconstruction without making lossy edges the probe.
+        let size = PixelSize::new(256, 256);
+        let mut source = Vec::with_capacity(256 * 256 * 4);
+        for y in 0..256 {
+            for x in 0..256 {
+                let colour = match (x / 128, y / 128) {
+                    (0, 0) => [48, 80, 112, 255],
+                    (1, 0) => [112, 80, 48, 255],
+                    (0, 1) => [96, 144, 192, 255],
+                    _ => [192, 144, 96, 255],
+                };
+                source.extend_from_slice(&colour);
+            }
+        }
+        let mut encoded = Vec::new();
+        let probe = self.encoder(size, 8_000_000, 30).and_then(|mut encoder| {
+            encoder
+                .encode(&source, size.width * 4, size, true, &mut encoded)
+                .map(|_| ())
+        });
+        if let Err(error) = probe {
+            return if forced.is_some() {
+                Err(CodecError::Unavailable(format!(
+                    "hardware IDR probe: {error}"
+                )))
+            } else {
+                Ok(DecoderBackend::Software)
+            };
+        }
+        for backend in [DecoderBackend::Cuda, DecoderBackend::Vaapi] {
+            if forced.is_some_and(|forced| forced != backend) {
+                continue;
+            }
+            let result = FfmpegDecoder::new(backend).and_then(|mut decoder| {
+                let mut pixels = Vec::new();
+                let decoded_size = decoder.decode(&encoded, &mut pixels)?;
+                if !decoder.hardware_frame || decoded_size != size || pixels.len() != source.len() {
+                    return Err(CodecError::Failed(
+                        "probe did not produce a hardware frame".into(),
+                    ));
+                }
+                let mut squared_error = 0_u64;
+                for (original, decoded) in source
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(pixels.as_chunks::<4>().0)
+                {
+                    if decoded[3] != 255 {
+                        return Err(CodecError::Failed("probe returned incorrect alpha".into()));
+                    }
+                    for channel in 0..3 {
+                        squared_error +=
+                            u64::from(original[channel].abs_diff(decoded[channel])).pow(2);
+                    }
+                }
+                // PSNR >= 30 dB against the known input (alpha is checked separately).
+                if squared_error as f64 / (256.0 * 256.0 * 3.0) > 65.025 {
+                    return Err(CodecError::Failed("probe returned incorrect pixels".into()));
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => return Ok(backend),
+                Err(error) if forced.is_some() => {
+                    return Err(CodecError::Unavailable(format!(
+                        "{}: {error}",
+                        backend.name()
+                    )));
+                }
+                Err(_) => (),
+            }
+        }
+        Ok(DecoderBackend::Software)
     }
 }
 
@@ -80,26 +187,12 @@ impl VideoCodecs for FfmpegCodecs {
     }
 
     fn decoder(&self) -> Result<Box<dyn VideoDecoder>, CodecError> {
-        let codec = ffmpeg::decoder::find_by_name("h264")
-            .ok_or_else(|| CodecError::Unavailable("h264 decoder not found".into()))?;
-        let mut context = codec_context(codec)
-            .map_err(|error| CodecError::Unavailable(error.to_string()))?
-            .decoder();
-        context.set_flags(codec::Flags::LOW_DELAY);
-        context.set_threading(codec::threading::Config::kind(
-            codec::threading::Type::Slice,
-        ));
-        context.check(codec::decoder::Check::EXPLODE | codec::decoder::Check::BITSTREAM);
-        context.conceal(codec::decoder::Conceal::empty());
-        let decoder = context
-            .video()
-            .map_err(|error| CodecError::Unavailable(error.to_string()))?;
-        Ok(Box::new(FfmpegDecoder {
-            decoder,
-            scaler: None,
-            needs_key: true,
-            references: ReferenceSequence::new(),
-        }))
+        let backend = self
+            .decoder_backend
+            .get_or_init(|| self.choose_decoder().map_err(|error| error.to_string()))
+            .as_ref()
+            .map_err(|error| CodecError::Unavailable(error.clone()))?;
+        Ok(Box::new(FfmpegDecoder::new(*backend)?))
     }
 }
 
@@ -369,15 +462,151 @@ impl VideoEncoder for FfmpegEncoder {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecoderBackend {
+    Cuda,
+    Vaapi,
+    Software,
+}
+
+impl DecoderBackend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cuda => "h264 (cuda)",
+            Self::Vaapi => "h264 (vaapi)",
+            Self::Software => "h264",
+        }
+    }
+
+    fn pixel(self) -> Pixel {
+        match self {
+            Self::Cuda => Pixel::CUDA,
+            Self::Vaapi => Pixel::VAAPI,
+            Self::Software => Pixel::None,
+        }
+    }
+}
+
+fn open_decoder(backend: DecoderBackend) -> Result<codec::decoder::Video, CodecError> {
+    let codec = ffmpeg::decoder::find_by_name("h264")
+        .ok_or_else(|| CodecError::Unavailable("h264 decoder not found".into()))?;
+    let mut context = codec_context(codec)?.decoder();
+    context.set_flags(codec::Flags::LOW_DELAY);
+    context.set_threading(codec::threading::Config::kind(
+        codec::threading::Type::Slice,
+    ));
+    context.check(codec::decoder::Check::EXPLODE | codec::decoder::Check::BITSTREAM);
+    context.conceal(codec::decoder::Conceal::empty());
+    if backend != DecoderBackend::Software {
+        let device_type = match backend {
+            DecoderBackend::Cuda => ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            DecoderBackend::Vaapi => ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            DecoderBackend::Software => ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+        };
+        // SAFETY: context exclusively owns a non-null AVCodecContext whose hw_device_ctx is
+        // initially null. Create directly into that field, transferring the one AVBufferRef
+        // to libavcodec: ffmpeg-next's Context::drop calls avcodec_free_context, which unrefs
+        // it on every exit (including a failed open). FFmpeg creates/owns hw_frames_ctx and
+        // its references; we never manually unref either field. Null device/options select
+        // FFmpeg's defaults. The callbacks below have no borrowed state or thread affinity.
+        let result = unsafe {
+            let context = context.as_mut_ptr();
+            (*context).get_format = Some(match backend {
+                DecoderBackend::Cuda => cuda_format,
+                _ => vaapi_format,
+            });
+            ffmpeg::ffi::av_hwdevice_ctx_create(
+                &mut (*context).hw_device_ctx,
+                device_type,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if result < 0 {
+            return Err(failed(ffmpeg::Error::from(result)));
+        }
+    }
+    context.video().map_err(failed)
+}
+
+// Both callbacks are panic-free by construction: no allocation, indexing, arithmetic that can
+// overflow, or panicking Rust calls. FFmpeg supplies a valid, NONE-terminated format list.
+unsafe extern "C" fn cuda_format(
+    _context: *mut ffmpeg::ffi::AVCodecContext,
+    formats: *const ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    // SAFETY: forwards FFmpeg's format list unchanged to the selector.
+    unsafe { choose_format(formats, ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA) }
+}
+
+unsafe extern "C" fn vaapi_format(
+    _context: *mut ffmpeg::ffi::AVCodecContext,
+    formats: *const ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    // SAFETY: forwards FFmpeg's format list unchanged to the selector.
+    unsafe { choose_format(formats, ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI) }
+}
+
+unsafe fn choose_format(
+    mut formats: *const ffmpeg::ffi::AVPixelFormat,
+    hardware: ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    let mut software = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+    if formats.is_null() {
+        return software;
+    }
+    // SAFETY: FFmpeg's callback contract guarantees readable formats through the NONE sentinel;
+    // av_pix_fmt_desc_get returns a static descriptor (or null). We retain no pointers.
+    unsafe {
+        while *formats != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            let format = *formats;
+            if format == hardware {
+                return hardware;
+            }
+            let descriptor = ffmpeg::ffi::av_pix_fmt_desc_get(format);
+            if software == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE
+                && !descriptor.is_null()
+                && (*descriptor).flags & ffmpeg::ffi::AV_PIX_FMT_FLAG_HWACCEL as u64 == 0
+            {
+                software = format;
+            }
+            formats = formats.add(1);
+        }
+    }
+    software
+}
+
 struct FfmpegDecoder {
-    decoder: codec::decoder::Video,
+    // None only after permanent hardware fallback, until the next IDR opens software.
+    decoder: Option<codec::decoder::Video>,
+    backend: DecoderBackend,
+    hardware_failures: u8,
+    hardware_frame: bool,
+    // NV12 → YUV420P for hardware frames, and then (or directly, for software) → BGRA.
+    planarizer: Option<Scaler>,
     scaler: Option<Scaler>,
     needs_key: bool,
     references: ReferenceSequence,
 }
 
 impl FfmpegDecoder {
-    fn frame(&mut self, data: &[u8]) -> Result<frame::Video, CodecError> {
+    fn new(backend: DecoderBackend) -> Result<Self, CodecError> {
+        let decoder =
+            open_decoder(backend).map_err(|error| CodecError::Unavailable(error.to_string()))?;
+        Ok(Self {
+            decoder: Some(decoder),
+            backend,
+            hardware_failures: 0,
+            hardware_frame: false,
+            planarizer: None,
+            scaler: None,
+            needs_key: true,
+            references: ReferenceSequence::new(),
+        })
+    }
+
+    fn check(&mut self, data: &[u8]) -> Result<(), CodecError> {
         if data.is_empty() || data.len() > i32::MAX as usize || !annex_b(data) {
             return Err(CodecError::Failed("invalid Annex B access unit".into()));
         }
@@ -385,26 +614,36 @@ impl FfmpegDecoder {
         if self.needs_key && !idr {
             return Err(CodecError::Failed("decoder needs an IDR".into()));
         }
-        if idr {
-            // An IDR must also recover from an earlier malformed packet or different stream.
-            self.decoder.flush();
+        self.references.check(data)
+    }
+
+    fn frame(&mut self, data: &[u8]) -> Result<frame::Video, CodecError> {
+        if self.decoder.is_none() {
+            self.decoder = Some(open_decoder(self.backend)?);
         }
-        self.references.check(data)?;
+        let decoder = self
+            .decoder
+            .as_mut()
+            .ok_or_else(|| CodecError::Failed("decoder session missing".into()))?;
+        if nal_types(data).any(|kind| kind == 5) {
+            // An IDR must also recover from an earlier malformed packet or different stream.
+            decoder.flush();
+        }
         let mut packet = ffmpeg::Packet::new(data.len());
         packet
             .data_mut()
             .ok_or_else(|| CodecError::Failed("packet allocation failed".into()))?
             .copy_from_slice(data);
-        self.decoder.send_packet(&packet).map_err(failed)?;
+        decoder.send_packet(&packet).map_err(failed)?;
         let mut decoded = frame::Video::empty();
-        self.decoder.receive_frame(&mut decoded).map_err(failed)?;
+        decoder.receive_frame(&mut decoded).map_err(failed)?;
         if decoded.is_corrupt() || decoded.has_decode_errors() {
             return Err(CodecError::Failed(
                 "corrupt frame or missing reference".into(),
             ));
         }
         let mut extra = frame::Video::empty();
-        match self.decoder.receive_frame(&mut extra) {
+        match decoder.receive_frame(&mut extra) {
             Err(error) if again(error) => (),
             Err(error) => return Err(failed(error)),
             Ok(()) => {
@@ -413,8 +652,32 @@ impl FfmpegDecoder {
                 ));
             }
         }
-        self.needs_key = false;
-        Ok(decoded)
+        self.hardware_frame =
+            self.backend != DecoderBackend::Software && decoded.format() == self.backend.pixel();
+        if self.hardware_frame {
+            let mut transferred = frame::Video::empty();
+            // SAFETY: inspecting this owned frame's allocation does not dereference it.
+            if unsafe { transferred.as_ptr().is_null() } {
+                return Err(CodecError::Failed(
+                    "transfer frame allocation failed".into(),
+                ));
+            }
+            // SAFETY: decoded owns a hardware frame and its hw_frames_ctx reference for the
+            // whole call. The empty destination lets FFmpeg allocate a compatible CPU format
+            // (usually NV12). Each frame wrapper calls av_frame_free once, releasing all its
+            // buffer/frames references, on success and failure alike.
+            let result = unsafe {
+                ffmpeg::ffi::av_hwframe_transfer_data(transferred.as_mut_ptr(), decoded.as_ptr(), 0)
+            };
+            if result < 0 {
+                return Err(failed(ffmpeg::Error::from(result)));
+            }
+            // Hardware surfaces transfer as NV12. Give BGRA conversion planar 4:2:0, as the
+            // software decoder does, so both paths run the same swscale converter.
+            planar_from_nv12(&mut self.planarizer, transferred)
+        } else {
+            Ok(decoded)
+        }
     }
 
     fn convert(
@@ -428,35 +691,17 @@ impl FfmpegDecoder {
                 "decoder returned an odd coded size".into(),
             ));
         }
-        let definition = scaling::context::Definition {
-            format: decoded.format(),
-            width: size.width,
-            height: size.height,
-        };
-        if self
-            .scaler
-            .as_ref()
-            .is_none_or(|scaler| *scaler.0.input() != definition)
-        {
-            self.scaler = Some(Scaler(
-                scaling::Context::get(
-                    decoded.format(),
-                    size.width,
-                    size.height,
-                    Pixel::BGRA,
-                    size.width,
-                    size.height,
-                    scaling::Flags::BILINEAR,
-                )
-                .map_err(failed)?,
-            ));
-        }
         let mut bgra = video_frame(Pixel::BGRA, size)?;
-        let scaler = self
-            .scaler
-            .as_mut()
-            .ok_or_else(|| CodecError::Failed("decoder scaler missing".into()))?;
-        scaler.0.run(decoded, &mut bgra).map_err(failed)?;
+        cached_scaler(
+            &mut self.scaler,
+            decoded.format(),
+            Pixel::BGRA,
+            size,
+            scaling::Flags::BILINEAR,
+        )?
+        .0
+        .run(decoded, &mut bgra)
+        .map_err(failed)?;
         let row_bytes = size.width as usize * 4;
         let length = row_bytes
             .checked_mul(size.height as usize)
@@ -477,11 +722,40 @@ impl FfmpegDecoder {
 
 impl VideoDecoder for FfmpegDecoder {
     fn decode(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<PixelSize, CodecError> {
-        let result = self.frame(data).and_then(|frame| self.convert(&frame, out));
+        // Header/gap/needs-IDR rejections do not count as hardware failures: they never reach
+        // libavcodec. A successful decode/transfer resets the consecutive failure count.
+        let result = self.check(data).and_then(|()| match self.frame(data) {
+            Ok(frame) => {
+                self.hardware_failures = 0;
+                self.convert(&frame, out)
+            }
+            Err(error) => {
+                if self.backend != DecoderBackend::Software {
+                    self.hardware_failures += 1;
+                    if self.hardware_failures == 3 {
+                        tracing::warn!(
+                            backend = self.backend.name(),
+                            "hardware H.264 decoding failed three times; switching to software, awaiting IDR"
+                        );
+                        // Drop the hardware context and its refs now. Open software lazily on
+                        // the next IDR, so even an allocation failure cannot keep hardware alive.
+                        self.decoder = None;
+                        self.planarizer = None;
+                        self.scaler = None;
+                        self.backend = DecoderBackend::Software;
+                    }
+                }
+                Err(error)
+            }
+        });
         if result.is_err() {
-            self.decoder.flush();
+            if let Some(decoder) = &mut self.decoder {
+                decoder.flush();
+            }
             self.needs_key = true;
             self.references.last = None;
+        } else {
+            self.needs_key = false;
         }
         // All decode errors are per-frame failures, including invalid coded geometry.
         result.map_err(|error| match error {
@@ -491,8 +765,79 @@ impl VideoDecoder for FfmpegDecoder {
     }
 
     fn name(&self) -> &str {
-        "h264"
+        self.backend.name()
     }
+}
+
+// Why hardware output goes through planar YUV 4:2:0 before BGRA. H.264 decoding is bit-exact, so
+// NVDEC's NV12 and the software decoder's YUV420P hold identical samples. swscale, however, takes
+// a different route for the two inputs: unscaled YUV420P (even height, no ACCURATE_RND) uses the
+// `yuv2rgb` converter, which replicates each chroma sample, while NV12 has no such converter and
+// takes the general scaler, which interpolates chroma. The BGRA results differ by up to ~47 levels
+// at coloured edges (about 2.5 dB on the test content). An unscaled NV12 → YUV420P conversion only
+// deinterleaves the chroma (swscale's `nv12ToPlanarWrapper`, no arithmetic) and makes both decoders
+// feed the same converter, so equal bitstreams give equal BGRA. The test
+// `hardware_and_software_quality_agree` reports whether the frames are bit-identical.
+//
+// Frames that are not even-sized NV12 are returned untouched (`convert` converts any other format,
+// and rejects odd coded sizes).
+fn planar_from_nv12(
+    slot: &mut Option<Scaler>,
+    nv12: frame::Video,
+) -> Result<frame::Video, CodecError> {
+    let size = PixelSize::new(nv12.width(), nv12.height());
+    if nv12.format() != Pixel::NV12
+        || !size.width.is_multiple_of(2)
+        || !size.height.is_multiple_of(2)
+    {
+        return Ok(nv12);
+    }
+    let mut planar = video_frame(Pixel::YUV420P, size)?;
+    cached_scaler(
+        slot,
+        Pixel::NV12,
+        Pixel::YUV420P,
+        size,
+        scaling::Flags::POINT,
+    )?
+    .0
+    .run(&nv12, &mut planar)
+    .map_err(failed)?;
+    Ok(planar)
+}
+
+// A swscale context converting `from` → `to` at one size, rebuilt only when the input changes.
+fn cached_scaler(
+    slot: &mut Option<Scaler>,
+    from: Pixel,
+    to: Pixel,
+    size: PixelSize,
+    flags: scaling::Flags,
+) -> Result<&mut Scaler, CodecError> {
+    let definition = scaling::context::Definition {
+        format: from,
+        width: size.width,
+        height: size.height,
+    };
+    if slot
+        .as_ref()
+        .is_none_or(|scaler| *scaler.0.input() != definition)
+    {
+        *slot = Some(Scaler(
+            scaling::Context::get(
+                from,
+                size.width,
+                size.height,
+                to,
+                size.width,
+                size.height,
+                flags,
+            )
+            .map_err(failed)?,
+        ));
+    }
+    slot.as_mut()
+        .ok_or_else(|| CodecError::Failed("scaler missing".into()))
 }
 
 fn coded_size(size: PixelSize) -> Result<PixelSize, CodecError> {
