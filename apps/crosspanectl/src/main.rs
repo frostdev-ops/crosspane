@@ -34,6 +34,22 @@ enum Command {
     Layout { peer: String, side: Side },
     /// Connect to a peer at ADDR (host:port) now.
     Dial { addr: String },
+    /// List this machine's windows (ids for `project`).
+    Windows,
+    /// Project one of this machine's windows to a peer.
+    Project {
+        /// Window id from `crosspanectl windows`.
+        window: u64,
+        /// Peer name or node-id prefix.
+        peer: String,
+    },
+    /// End a projection and give the window back to its source.
+    Return {
+        projection: u64,
+        /// The source peer (default: this machine).
+        #[arg(long)]
+        source: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -77,6 +93,11 @@ fn main() -> Result<()> {
                 .context("no address")?;
             json!({"cmd": "dial", "addr": resolved.to_string()})
         }
+        Command::Windows => json!({"cmd": "windows"}),
+        Command::Project { window, peer } => json!({"cmd": "project", "window": window, "peer": peer}),
+        Command::Return { projection, source } => {
+            json!({"cmd": "return", "projection": projection, "source": source})
+        }
     };
     let path = socket_path()?;
     let stream = UnixStream::connect(&path)
@@ -102,6 +123,18 @@ fn main() -> Result<()> {
 fn print_result(command: &Command, result: &Value) {
     match command {
         Command::Status => print_status(result),
+        Command::Windows => {
+            for w in result.as_array().into_iter().flatten() {
+                println!(
+                    "{:>12}  {:<24} {}x{}  {}",
+                    w["id"],
+                    w["app"].as_str().unwrap_or(""),
+                    w["size"][0],
+                    w["size"][1],
+                    w["title"].as_str().unwrap_or("")
+                );
+            }
+        }
         _ => println!("{}", result.as_str().unwrap_or(&result.to_string())),
     }
 }
@@ -124,6 +157,9 @@ fn print_status(s: &Value) {
     }
     for l in s["layout"].as_array().into_iter().flatten() {
         println!("  layout {}:{} at ({:.0}, {:.0}) mm v{}", l["node"].as_str().unwrap_or("?"), l["display"], l["origin_mm"][0].as_f64().unwrap_or(0.0), l["origin_mm"][1].as_f64().unwrap_or(0.0), l["version"]);
+    }
+    for p in s["projections"].as_array().into_iter().flatten() {
+        println!("  projection {}:{}  {}", p["source"].as_str().unwrap_or("?"), p["projection"], p["text"].as_str().unwrap_or(""));
     }
     for n in s["notices"].as_array().into_iter().flatten() {
         println!("  notice: {}", n.as_str().unwrap_or(""));
