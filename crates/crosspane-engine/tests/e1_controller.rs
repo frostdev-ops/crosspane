@@ -3,15 +3,15 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
-use crosspane_engine::e1::controller::ControllerE1;
+use crosspane_engine::e1::controller::{ControllerE1, REARM_FALLBACK};
 use crosspane_engine::io::{HUD, TARGET_INDICATOR};
 use crosspane_engine::{Command, EngineConfig, Failure, Input, Notice, Output};
 use crosspane_input::Held;
 use crosspane_input::layout::{Layout, Placed};
 use crosspane_input::remap::RemapProfile;
 use crosspane_platform::{
-    CaptureEvent, CaptureId, CaptureStart, EndReason as CaptureEnd, HotkeyEvent, LockState,
-    MotionKind, OverlayAnchor, OverlayEvent, PortalId, Rgb8, SessionEvent, SessionState,
+    CaptureEvent, CaptureId, CapturePortal, CaptureStart, EndReason as CaptureEnd, HotkeyEvent,
+    LockState, MotionKind, OverlayAnchor, OverlayEvent, PortalId, Rgb8, SessionEvent, SessionState,
 };
 use crosspane_protocol::link::{LinkError, LinkEvent};
 use crosspane_protocol::msg::{
@@ -2475,7 +2475,15 @@ fn incoming_start() -> Input {
 }
 
 fn exclusive_step(engine: &mut crosspane_engine::Engine, input: Input, ms: u64) -> Vec<Output> {
-    let out = engine.handle(input, time(ms));
+    exclusive_step_at(engine, input, time(ms))
+}
+
+fn exclusive_step_at(
+    engine: &mut crosspane_engine::Engine,
+    input: Input,
+    now: MonoTime,
+) -> Vec<Output> {
+    let out = engine.handle(input, now);
     assert!(engine.controlling().is_none() || engine.controlled_by().is_none());
     if engine.controlled_by().is_some() {
         assert!(!out.iter().any(|o| matches!(
@@ -2827,4 +2835,517 @@ fn pointer_return_guard_survives_layout_portal_id_reassignment() {
         start(&f.send(Input::Overlay(OverlayEvent::Visible(HUD)))).0,
         C
     );
+}
+
+// WP-2.41: portals restored under the pointer after an incoming E1 session.
+
+fn incoming_start_as(session: u64) -> Input {
+    control(
+        B,
+        ControlMessage::StartControl {
+            session: SessionId(session),
+            entry_display: DisplayId(1),
+            entry: PointDevice::new(500.0, 500.0),
+            lock_keys: LockKeys::default(),
+        },
+    )
+}
+
+fn incoming_end(session: u64) -> Input {
+    control(
+        B,
+        ControlMessage::EndControl {
+            session: SessionId(session),
+            reason: EndReason::Released,
+        },
+    )
+}
+
+fn edge_pressed(portal: PortalId, at: MonoTime) -> Input {
+    Input::Capture(CaptureEvent::EdgePressed {
+        portal,
+        position: 0.5,
+        at,
+    })
+}
+
+fn edge_released(portal: PortalId, at: MonoTime) -> Input {
+    Input::Capture(CaptureEvent::EdgeReleased { portal, at })
+}
+
+fn shows_hud(out: &[Output]) -> bool {
+    out.iter()
+        .any(|o| matches!(o, Output::ShowOverlay { id, .. } if *id == HUD))
+}
+
+fn sends_start(out: &[Output]) -> bool {
+    out.iter().any(|o| {
+        matches!(
+            o,
+            Output::SendControl {
+                msg: ControlMessage::StartControl { .. },
+                ..
+            }
+        )
+    })
+}
+
+// An engine and the time of its latest input: delivery to the engine never goes backwards.
+struct Host {
+    engine: crosspane_engine::Engine,
+    last: MonoTime,
+}
+
+impl std::ops::Deref for Host {
+    type Target = crosspane_engine::Engine;
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl Host {
+    // This node (A) with B up and allowed to control it; returns the A -> B portal.
+    fn with(config: EngineConfig) -> (Host, PortalId) {
+        let (engine, portal) = exclusive_engine_with(config);
+        let host = Host {
+            engine,
+            last: time(0),
+        };
+        (host, portal)
+    }
+
+    // Deliver `input` at `at`, which is never earlier than the previous delivery.
+    fn step(&mut self, input: Input, at: MonoTime) -> Vec<Output> {
+        assert!(
+            at >= self.last,
+            "time went backwards: {at:?} after {:?}",
+            self.last
+        );
+        self.last = at;
+        exclusive_step_at(&mut self.engine, input, at)
+    }
+}
+
+// B starts controlling this node: it becomes a target and its portals are removed.
+fn begin_incoming(host: &mut Host, session: u64, at: MonoTime) {
+    host.step(incoming_start_as(session), at);
+    assert_eq!(host.controlled_by(), Some(B));
+}
+
+// B ends the session (as after a refused capture). Returns the outputs of the end, which restore
+// the portals.
+fn finish_incoming(host: &mut Host, session: u64, at: MonoTime) -> Vec<Output> {
+    let out = host.step(incoming_end(session), at);
+    assert_eq!(host.controlled_by(), None);
+    out
+}
+
+// A whole session from `start_ms` to `end_ms`, with nothing in between.
+fn incoming_session(host: &mut Host, session: u64, start_ms: u64, end_ms: u64) -> Vec<Output> {
+    assert!(start_ms < end_ms);
+    begin_incoming(host, session, time(start_ms));
+    finish_incoming(host, session, time(end_ms))
+}
+
+fn restored(out: &[Output]) -> Vec<CapturePortal> {
+    out.iter()
+        .rev()
+        .find_map(|o| match o {
+            Output::SetPortals(portals) => Some(portals.clone()),
+            _ => None,
+        })
+        .expect("SetPortals")
+}
+
+// A press against a restored portal changes nothing at all: no push, HUD or handshake.
+fn assert_ignored(host: &mut Host, portal: PortalId, at: MonoTime) {
+    let out = host.step(edge_pressed(portal, at), at);
+    assert!(out.is_empty(), "press at {at:?} was not ignored: {out:?}");
+    assert_eq!(host.controlling(), None);
+}
+
+// A deliberate press: the HUD appears, and its confirmation sends the handshake to B.
+fn assert_crosses(host: &mut Host, portal: PortalId, at: MonoTime) {
+    let out = host.step(edge_pressed(portal, at), at);
+    assert!(shows_hud(&out), "press at {at:?} did not cross: {out:?}");
+    let out = host.step(Input::Overlay(OverlayEvent::Visible(HUD)), at);
+    assert!(sends_start(&out), "no handshake after the HUD: {out:?}");
+}
+
+#[test]
+fn restored_portal_ignores_presses_until_released_then_crosses_normally() {
+    for push_delay in [0, 100] {
+        let mut cfg = config();
+        cfg.push_to_cross = Duration::from_millis(push_delay);
+        let (mut host, portal) = Host::with(cfg);
+        let out = incoming_session(&mut host, 90, 1, 5);
+        let restored = restored(&out);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, portal);
+        // The injected pointer still rests at the entry edge: every press repeats, none crosses,
+        // however long the push delay has been satisfied.
+        for ms in [6, 106, 206, 500, 900] {
+            assert_ignored(&mut host, portal, time(ms));
+        }
+        // With no HUD requested there is nothing for a late confirmation to continue.
+        assert!(
+            host.step(Input::Overlay(OverlayEvent::Visible(HUD)), time(901))
+                .is_empty()
+        );
+        assert!(!sends_start(&host.step(Input::Tick, time(950))));
+        // The first release re-arms the portal; a fresh press crosses normally.
+        assert!(
+            host.step(edge_released(portal, time(960)), time(960))
+                .is_empty()
+        );
+        if push_delay > 0 {
+            // The push-to-cross delay counts from the fresh press, as before.
+            let out = host.step(edge_pressed(portal, time(970)), time(970));
+            assert!(!shows_hud(&out) && !sends_start(&out), "{out:?}");
+            assert_crosses(&mut host, portal, time(970 + push_delay));
+        } else {
+            assert_crosses(&mut host, portal, time(970));
+        }
+        // The handshake to B is under way.
+        assert_eq!(host.controlling(), Some(B));
+    }
+}
+
+#[test]
+fn restored_portal_rearms_after_the_fallback_without_a_release() {
+    let (mut host, portal) = Host::with(config());
+    incoming_session(&mut host, 90, 1, 5);
+    let rearm = time(5).saturating_add(REARM_FALLBACK);
+    assert_ignored(&mut host, portal, time(6));
+    assert_ignored(&mut host, portal, time(500));
+    // Ignored presses neither extend nor shorten the window.
+    assert_ignored(
+        &mut host,
+        portal,
+        MonoTime::from_nanos(rearm.as_nanos() - 1),
+    );
+    assert_crosses(&mut host, portal, rearm);
+}
+
+#[test]
+fn failed_incoming_sessions_never_start_a_reverse_crossing_until_a_release() {
+    // Codex trace (finding 3): the peer starts control, its capture is refused, it ends the
+    // session, and the restored edge keeps reporting presses under the stationary pointer.
+    let (mut host, portal) = Host::with(config());
+    // Delivery times only ever increase: each session starts 300 ms after the previous one.
+    for (index, start) in [10u64, 310, 610].into_iter().enumerate() {
+        let session = 90 + index as u64;
+        // The peer starts control: this node becomes its target and its portals are removed.
+        begin_incoming(&mut host, session, time(start));
+        // A press while controlled is dropped by the engine, as the portals are gone.
+        let out = host.step(edge_pressed(portal, time(start + 20)), time(start + 20));
+        assert!(out.is_empty(), "session {session}: {out:?}");
+        assert_eq!(host.controlled_by(), Some(B));
+        // The peer's capture is refused and it ends the session: the portals are restored.
+        let out = finish_incoming(&mut host, session, time(start + 50));
+        assert_eq!(restored(&out).len(), 1);
+        // The restored edge keeps reporting presses under the stationary pointer.
+        for ms in [start + 51, start + 150] {
+            assert_ignored(&mut host, portal, time(ms));
+        }
+        let out = host.step(Input::Tick, time(start + 200));
+        assert!(!sends_start(&out), "session {session}");
+    }
+    // The fallback counts from the last restore (660 ms): by now the first session's (1060 ms)
+    // and the second's (1360 ms) have passed, but this one's (1660 ms) hasn't.
+    for ms in [811, 1100, 1500] {
+        assert_ignored(&mut host, portal, time(ms));
+    }
+    // The first release re-arms the portal, well before the fallback.
+    host.step(edge_released(portal, time(1501)), time(1501));
+    assert_crosses(&mut host, portal, time(1502));
+}
+
+#[test]
+fn portals_that_appear_after_the_restore_are_not_disarmed() {
+    let (mut host, portal) = Host::with(config());
+    begin_incoming(&mut host, 90, time(1));
+    // The link drops during the session: B's portal isn't among those restored.
+    host.step(
+        Input::Link(LinkEvent::Closed {
+            peer: B,
+            error: LinkError::Closed,
+        }),
+        time(2),
+    );
+    assert_eq!(host.controlled_by(), None);
+    // B reconnects: its portal is new, so a press crosses at once.
+    host.step(Input::PeerUp { peer: B }, time(3));
+    assert_crosses(&mut host, portal, time(4));
+}
+
+// A joins C on its left within the fallback window: sorting hands A -> B's old portal ID to
+// A -> C. Returns the engine (restored at 5 ms), A -> B's new portal and A -> C's.
+fn restored_then_joined_by_c() -> (Host, PortalId, PortalId) {
+    let (mut host, original) = Host::with(config());
+    incoming_session(&mut host, 90, 1, 5);
+    let placements = placements(&[(A, 0.0, 0.0), (B, 100.0, 0.0), (C, -100.0, 0.0)], 2);
+    let layout = layout_from(&placements);
+    let (a_to_b, a_to_c) = (portal_to(&layout, B), portal_to(&layout, C));
+    assert_eq!(a_to_c, original, "premise: the old ID now names A -> C");
+    assert_ne!(a_to_b, original);
+    host.step(
+        Input::PeerDisplays {
+            peer: C,
+            displays: vec![display(1)],
+        },
+        time(6),
+    );
+    host.step(Input::Layout(placements), time(7));
+    host.step(Input::PeerUp { peer: C }, time(8));
+    (host, a_to_b, a_to_c)
+}
+
+// One display per node at the given positions (mm), e.g. C at (-100, 0) is left of A.
+fn placements(nodes: &[(NodeId, f64, f64)], version: u64) -> Vec<Placement> {
+    nodes
+        .iter()
+        .map(|&(node, x, y)| Placement {
+            node,
+            display: DisplayId(1),
+            origin: PointMm::new(x, y),
+            version,
+        })
+        .collect()
+}
+
+fn layout_from(placements: &[Placement]) -> Layout {
+    Layout::new(
+        placements
+            .iter()
+            .map(|p| Placed {
+                id: GlobalDisplayId {
+                    node: p.node,
+                    display: p.display,
+                },
+                geometry: display(1).geometry,
+                origin: p.origin,
+            })
+            .collect(),
+        config().layout,
+    )
+    .unwrap()
+}
+
+// The ID of A's portal to `node`'s display in `layout`.
+fn portal_to(layout: &Layout, node: NodeId) -> PortalId {
+    layout
+        .portals()
+        .iter()
+        .find(|p| p.from.node == A && p.to.node == node)
+        .unwrap()
+        .id
+}
+
+#[test]
+fn layout_change_keeps_only_the_same_restored_portal_disarmed() {
+    let (mut host, a_to_b, _) = restored_then_joined_by_c();
+    // The portal that was restored stays disarmed under its new ID, until its own release.
+    assert_ignored(&mut host, a_to_b, time(9));
+    assert_ignored(&mut host, a_to_b, time(500));
+    host.step(edge_released(a_to_b, time(501)), time(501));
+    assert_crosses(&mut host, a_to_b, time(502));
+}
+
+#[test]
+fn a_release_re_arms_only_its_own_portal_and_unrelated_portals_cross() {
+    let (mut host, a_to_b, a_to_c) = restored_then_joined_by_c();
+    // C wasn't restored (it joined afterwards): unaffected by the disarm, and its release is
+    // not A -> B's.
+    host.step(edge_released(a_to_c, time(9)), time(9));
+    assert_ignored(&mut host, a_to_b, time(10));
+    assert_crosses(&mut host, a_to_c, time(11));
+}
+
+#[test]
+fn a_restored_portal_that_goes_away_is_armed_when_it_returns() {
+    let (mut host, portal) = Host::with(config());
+    incoming_session(&mut host, 90, 1, 5);
+    let b_at = |x: f64, version| Input::Layout(placements(&[(A, 0.0, 0.0), (B, x, 0.0)], version));
+    // Moving B away removes the shared edge, then putting it back restores the portal: only
+    // portals still offered keep a disarm, so this one is new again.
+    let out = host.step(b_at(300.0, 2), time(6));
+    assert_eq!(restored(&out), vec![]);
+    let out = host.step(b_at(100.0, 3), time(7));
+    assert_eq!(restored(&out)[0].id, portal);
+    assert_crosses(&mut host, portal, time(8));
+}
+
+// The incident ordering: the session start removed the portals, so the Linux capture emitted an
+// `EdgeReleased` stamped at the start (11 ms). The refused session was over (restore at 60 ms)
+// before that event reached the engine (62 ms).
+fn restored_with_a_stale_release_in_flight() -> (Host, PortalId) {
+    let (mut host, portal) = Host::with(config());
+    incoming_session(&mut host, 90, 10, 60);
+    let out = host.step(edge_released(portal, time(11)), time(62));
+    assert!(out.is_empty());
+    (host, portal)
+}
+
+#[test]
+fn a_release_stamped_before_the_restore_does_not_re_arm_but_a_later_one_does() {
+    let (mut host, portal) = restored_with_a_stale_release_in_flight();
+    // The stale release left the portal disarmed: the restored strip's presses still don't cross.
+    assert_ignored(&mut host, portal, time(63));
+    // Nor does one stamped an instant before the restore, however late it is delivered.
+    let just_before = MonoTime::from_nanos(time(60).as_nanos() - 1);
+    let out = host.step(edge_released(portal, just_before), time(64));
+    assert!(out.is_empty());
+    assert_ignored(&mut host, portal, time(65));
+    // The pointer really leaving the restored strip re-arms it.
+    let out = host.step(edge_released(portal, time(70)), time(70));
+    assert!(out.is_empty());
+    assert_crosses(&mut host, portal, time(71));
+}
+
+#[test]
+fn a_release_stamped_at_the_restore_instant_re_arms() {
+    let (mut host, portal) = Host::with(config());
+    incoming_session(&mut host, 90, 10, 60);
+    // Not earlier than the restore, so not stale.
+    host.step(edge_released(portal, time(60)), time(62));
+    assert_crosses(&mut host, portal, time(63));
+}
+
+#[test]
+fn a_stale_release_leaves_the_fallback_as_the_backstop() {
+    let (mut host, portal) = restored_with_a_stale_release_in_flight();
+    let rearm = time(60).saturating_add(REARM_FALLBACK);
+    assert_ignored(&mut host, portal, time(63));
+    assert_ignored(
+        &mut host,
+        portal,
+        MonoTime::from_nanos(rearm.as_nanos() - 1),
+    );
+    assert_crosses(&mut host, portal, rearm);
+}
+
+// C on A's left, B on its right and D above it: A's portals sort Left, Right, Top, so their IDs
+// are 1 (A -> C), 2 (A -> B) and 3 (A -> D). All three are restored at 5 ms.
+struct Around {
+    host: Host,
+    // The layout after C goes away, and A -> B's and A -> D's portals in it.
+    without_c: Vec<Placement>,
+    b_after: PortalId,
+    d_after: PortalId,
+    // A -> B's portal before C went away (ID 2).
+    b_before: PortalId,
+}
+
+fn restored_around_a() -> Around {
+    let d = NodeId([4; 32]);
+    let with_c = placements(
+        &[
+            (A, 0.0, 0.0),
+            (B, 100.0, 0.0),
+            (C, -100.0, 0.0),
+            (d, 0.0, -100.0),
+        ],
+        2,
+    );
+    let without_c = placements(&[(A, 0.0, 0.0), (B, 100.0, 0.0), (d, 0.0, -100.0)], 3);
+    let (before, after) = (layout_from(&with_c), layout_from(&without_c));
+    let (b_before, b_after, d_after) = (
+        portal_to(&before, B),
+        portal_to(&after, B),
+        portal_to(&after, d),
+    );
+    // Premise: with C gone, A -> D shifts into the ID A -> B had.
+    assert_eq!(d_after, b_before);
+    assert_ne!(b_after, b_before);
+
+    let (mut host, _) = Host::with(config());
+    for peer in [C, d] {
+        host.step(
+            Input::PeerDisplays {
+                peer,
+                displays: vec![display(1)],
+            },
+            time(0),
+        );
+    }
+    host.step(Input::Layout(with_c), time(0));
+    for peer in [C, d] {
+        host.step(Input::PeerUp { peer }, time(0));
+    }
+    let out = incoming_session(&mut host, 90, 1, 5);
+    assert_eq!(restored(&out).len(), 3);
+    Around {
+        host,
+        without_c,
+        b_after,
+        d_after,
+        b_before,
+    }
+}
+
+#[test]
+fn a_queued_release_cannot_re_arm_another_portal_after_an_id_reassignment() {
+    let Around {
+        mut host,
+        without_c,
+        b_after,
+        d_after,
+        b_before,
+    } = restored_around_a();
+    // The platform stamped a release for A -> B (ID 2) at 9 ms; it is still queued.
+    let queued = edge_released(b_before, time(9));
+    // At 10 ms C goes away. An earlier portal is removed, so A -> D shifts into ID 2.
+    host.step(Input::Layout(without_c), time(10));
+    // Delivered at 11 ms, ID 2 names A -> D, which is not the portal the platform meant: the
+    // release is ambiguous and re-arms nothing.
+    assert!(host.step(queued, time(11)).is_empty());
+    assert_ignored(&mut host, d_after, time(12));
+    assert_ignored(&mut host, b_after, time(12));
+    // A release stamped after the change is unambiguous and re-arms its own portal only.
+    assert!(
+        host.step(edge_released(d_after, time(13)), time(13))
+            .is_empty()
+    );
+    assert_ignored(&mut host, b_after, time(14));
+    assert_crosses(&mut host, d_after, time(15));
+}
+
+#[test]
+fn a_mapping_change_leaves_each_entry_its_original_fallback_deadline() {
+    let Around {
+        mut host,
+        without_c,
+        b_after,
+        d_after,
+        ..
+    } = restored_around_a();
+    host.step(Input::Layout(without_c), time(10));
+    // Neither the restore time (5 ms) nor the mapping change (10 ms) moves the 1 s deadline.
+    let rearm = time(5).saturating_add(REARM_FALLBACK);
+    assert_ignored(&mut host, b_after, time(500));
+    assert_ignored(
+        &mut host,
+        d_after,
+        MonoTime::from_nanos(rearm.as_nanos() - 1),
+    );
+    assert_crosses(&mut host, d_after, rearm);
+}
+
+#[test]
+fn a_rebuild_that_moves_no_portal_does_not_make_a_queued_release_ambiguous() {
+    let Around {
+        mut host, b_before, ..
+    } = restored_around_a();
+    let queued = edge_released(b_before, time(9));
+    // An unrelated display refresh at 10 ms rebuilds the layout with every portal where it was.
+    host.step(
+        Input::PeerDisplays {
+            peer: B,
+            displays: vec![display(1)],
+        },
+        time(10),
+    );
+    assert!(host.step(queued, time(11)).is_empty());
+    assert_crosses(&mut host, b_before, time(12));
 }

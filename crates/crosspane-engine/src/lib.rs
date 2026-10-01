@@ -137,6 +137,9 @@ impl Engine {
                 out.push(Output::SetPortals(Vec::new()));
             }
         } else if was_controlled {
+            // The pointer is still where the controller left it, often at the entry edge: the
+            // restored portals must not turn that into a crossing of this node's own.
+            self.controller.portals_restored(now);
             out.push(Output::SetPortals(self.controller.portals().to_vec()));
         }
         out
