@@ -863,6 +863,10 @@ impl VideoDecoder for FfmpegDecoder {
         })
     }
 
+    fn decode_nv12(&mut self, data: &[u8], out: &mut Nv12) -> Result<(), CodecError> {
+        FfmpegDecoder::decode_nv12(self, data, out)
+    }
+
     fn name(&self) -> &str {
         self.backend.name()
     }
