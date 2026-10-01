@@ -1,6 +1,10 @@
-use std::{sync::mpsc, time::Duration};
+use std::{
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
+use crosspane_media::picture::{Nv12, YuvColour, YuvMatrix, nv12_to_bgra};
 use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
 
 // Compile the private implementation, without adding a public testing API to the frozen host.
@@ -82,7 +86,7 @@ fn bit_exact_noise_gradients_checkerboard() -> Result<()> {
                 presenter
                     .upload(&device, &queue, size, &bytes, &[full(size)])
                     .map_err(anyhow::Error::msg)?;
-                let actual = readback(&device, &queue, &presenter, format, size)?;
+                let actual = readback(&device, &queue, &mut presenter, format, size)?;
                 compare(
                     &actual,
                     &bytes,
@@ -96,7 +100,7 @@ fn bit_exact_noise_gradients_checkerboard() -> Result<()> {
             // A larger window must preserve the top-left canvas and fill exposed area #202020.
             let target_size = PixelSize::new(width + 3, height + 2);
             let canvas = pattern(size, 2);
-            let actual = readback(&device, &queue, &presenter, format, target_size)?;
+            let actual = readback(&device, &queue, &mut presenter, format, target_size)?;
             for y in 0..target_size.height {
                 for x in 0..target_size.width {
                     let offset = (y as usize * target_size.width as usize + x as usize) * 4;
@@ -117,7 +121,7 @@ fn bit_exact_noise_gradients_checkerboard() -> Result<()> {
                 width.saturating_sub(2).max(1),
                 height.saturating_sub(2).max(1),
             );
-            let actual = readback(&device, &queue, &presenter, format, cropped)?;
+            let actual = readback(&device, &queue, &mut presenter, format, cropped)?;
             let expected: Vec<_> = canvas
                 .chunks_exact(width as usize * 4)
                 .take(cropped.height as usize)
@@ -148,6 +152,10 @@ fn dirty_rect_partial_updates_are_exact() -> Result<()> {
             let updated = pattern(size, 1);
             let dirty = [
                 PixelRect::new(
+                    point2((width / 2) as i32, 0),
+                    point2(width as i32, height.div_ceil(3) as i32),
+                ),
+                PixelRect::new(
                     point2(0, 0),
                     point2(width.div_ceil(2) as i32, height.div_ceil(2) as i32),
                 ),
@@ -167,7 +175,7 @@ fn dirty_rect_partial_updates_are_exact() -> Result<()> {
                 }
             }
             compare(
-                &readback(&device, &queue, &presenter, format, size)?,
+                &readback(&device, &queue, &mut presenter, format, size)?,
                 &expected,
                 "dirty update",
             )?;
@@ -182,7 +190,7 @@ fn dirty_rect_partial_updates_are_exact() -> Result<()> {
             );
             assert!(presenter.upload(&device, &queue, size, &[], &[]).is_err());
             compare(
-                &readback(&device, &queue, &presenter, format, size)?,
+                &readback(&device, &queue, &mut presenter, format, size)?,
                 &expected,
                 "empty/invalid damage is unchanged",
             )?;
@@ -210,10 +218,11 @@ fn compare(actual: &[u8], expected: &[u8], description: &str) -> Result<()> {
 fn readback(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    presenter: &Presenter,
+    presenter: &mut Presenter,
     format: wgpu::TextureFormat,
     size: PixelSize,
 ) -> Result<Vec<u8>> {
+    presenter.prepare_video(device, queue);
     let extent = wgpu::Extent3d {
         width: size.width,
         height: size.height,
@@ -306,7 +315,7 @@ fn edge_preserves_pattern_and_grey() -> Result<()> {
             .map_err(anyhow::Error::msg)?;
         for edge in [2, 8] {
             presenter.set_edge(accent, edge);
-            let actual = readback(&device, &queue, &presenter, format, size)?;
+            let actual = readback(&device, &queue, &mut presenter, format, size)?;
             for y in 0..size.height {
                 for x in 0..size.width {
                     let offset = (y * size.width + x) as usize * 4;
@@ -336,5 +345,226 @@ fn edge_preserves_pattern_and_grey() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn random_picture(size: PixelSize, padding: u32, colour: YuvColour, seed: u32) -> Nv12 {
+    let stride = size.width + padding;
+    // Exercise the shortest valid final row as well as padded rows.
+    let mut picture = Nv12 {
+        size,
+        y: vec![0; ((size.height - 1) * stride + size.width) as usize],
+        uv: vec![0; ((size.height / 2 - 1) * stride + size.width) as usize],
+        y_stride: stride,
+        uv_stride: stride,
+        colour,
+    };
+    let mut random = seed;
+    for sample in picture.y.iter_mut().chain(&mut picture.uv) {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        *sample = random as u8;
+    }
+    picture
+}
+
+fn compare_video(
+    actual: &[u8],
+    picture: &Nv12,
+    visible: PixelSize,
+    target: PixelSize,
+    edge: u32,
+) -> Result<()> {
+    let mut expected = Vec::new();
+    nv12_to_bgra(picture, visible, &mut expected)?;
+    for y in 0..target.height {
+        for x in 0..target.width {
+            let at = (y * target.width + x) as usize * 4;
+            if x < edge || y < edge || target.width - x <= edge || target.height - y <= edge {
+                for (got, want) in actual[at..at + 4].iter().zip([137, 45, 211, 255]) {
+                    ensure!(got.abs_diff(want) <= 1, "video accent at ({x},{y})");
+                }
+            } else if x < visible.width && y < visible.height {
+                let source = (y * visible.width + x) as usize * 4;
+                for (got, want) in actual[at..at + 4].iter().zip(&expected[source..source + 4]) {
+                    ensure!(
+                        got.abs_diff(*want) <= 1,
+                        "NV12 reference at ({x},{y}): {got} vs {want}"
+                    );
+                }
+            } else {
+                ensure!(
+                    actual[at..at + 4] == [32, 32, 32, 255],
+                    "coded padding shown at ({x},{y})"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nv12_matches_reference() -> Result<()> {
+    let Some((device, queue)) = device()? else {
+        return Ok(());
+    };
+    for format in [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    ] {
+        let mut presenter = Presenter::new(&device, format);
+        for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709] {
+            for full_range in [false, true] {
+                for padding in [0, 7] {
+                    let coded = PixelSize::new(64, 48);
+                    for visible in [coded, PixelSize::new(61, 45)] {
+                        let picture = Arc::new(random_picture(
+                            coded,
+                            padding,
+                            YuvColour { matrix, full_range },
+                            0xC05F_A123,
+                        ));
+                        presenter
+                            .set_video(&device, visible, picture.clone())
+                            .map_err(anyhow::Error::msg)?;
+                        presenter.set_edge([211, 45, 137], 2);
+                        let target = PixelSize::new(69, 53);
+                        let actual = readback(&device, &queue, &mut presenter, format, target)?;
+                        compare_video(&actual, &picture, visible, target, 2)?;
+                        // Same picture persists over a redraw; a smaller window crops at top-left.
+                        let target = PixelSize::new(39, 33);
+                        let actual = readback(&device, &queue, &mut presenter, format, target)?;
+                        compare_video(&actual, &picture, visible, target, 2)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn canvas_video_canvas_switching() -> Result<()> {
+    let Some((device, queue)) = device()? else {
+        return Ok(());
+    };
+    let size = PixelSize::new(38, 32);
+    for format in [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    ] {
+        let mut presenter = Presenter::new(&device, format);
+        let first = pattern(size, 0);
+        presenter
+            .upload(&device, &queue, size, &first, &[full(size)])
+            .map_err(anyhow::Error::msg)?;
+        compare(
+            &readback(&device, &queue, &mut presenter, format, size)?,
+            &first,
+            "first canvas",
+        )?;
+        let picture = Arc::new(random_picture(size, 6, YuvColour::default(), 41));
+        presenter
+            .set_video(&device, size, picture.clone())
+            .map_err(anyhow::Error::msg)?;
+        compare_video(
+            &readback(&device, &queue, &mut presenter, format, size)?,
+            &picture,
+            size,
+            size,
+            0,
+        )?;
+        let last = pattern(size, 1);
+        presenter
+            .upload(&device, &queue, size, &last, &[full(size)])
+            .map_err(anyhow::Error::msg)?;
+        compare(
+            &readback(&device, &queue, &mut presenter, format, size)?,
+            &last,
+            "last canvas",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn superseded_pictures_never_reach_upload() -> Result<()> {
+    let Some((device, queue)) = device()? else {
+        return Ok(());
+    };
+    let size = PixelSize::new(38, 32);
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let mut presenter = Presenter::new(&device, format);
+    let first = Arc::new(random_picture(size, 0, YuvColour::default(), 42));
+    let dropped = Arc::downgrade(&first);
+    presenter
+        .set_video(&device, size, first)
+        .map_err(anyhow::Error::msg)?;
+    let second = Arc::new(random_picture(size, 7, YuvColour::default(), 43));
+    presenter
+        .set_video(&device, size, second.clone())
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        dropped.upgrade().is_none(),
+        "superseded pending picture retained"
+    );
+    ensure!(
+        presenter.video_uploads == 0,
+        "pending pictures uploaded on arrival"
+    );
+    // readback calls prepare_video, which consumes only the remaining slot.
+    compare_video(
+        &readback(&device, &queue, &mut presenter, format, size)?,
+        &second,
+        size,
+        size,
+        0,
+    )?;
+    ensure!(
+        presenter.video_uploads == 1,
+        "superseded picture was uploaded"
+    );
+    let pending = Arc::new(random_picture(size, 0, YuvColour::default(), 44));
+    let dropped = Arc::downgrade(&pending);
+    presenter
+        .set_video(&device, size, pending)
+        .map_err(anyhow::Error::msg)?;
+    let canvas = pattern(size, 0);
+    presenter
+        .upload(&device, &queue, size, &canvas, &[full(size)])
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        dropped.upgrade().is_none(),
+        "canvas did not cancel pending video"
+    );
+    compare(
+        &readback(&device, &queue, &mut presenter, format, size)?,
+        &canvas,
+        "canvas supersedes video",
+    )?;
+    ensure!(
+        presenter.video_uploads == 1,
+        "canvas-cancelled picture was uploaded"
+    );
+    for visible in [PixelSize::new(0, 1), PixelSize::new(39, 32)] {
+        assert!(
+            presenter
+                .set_video(&device, visible, second.clone())
+                .is_err()
+        );
+    }
+    let mut invalid = (*second).clone();
+    invalid.y.clear();
+    assert!(
+        presenter
+            .set_video(&device, size, Arc::new(invalid))
+            .is_err()
+    );
+    compare(
+        &readback(&device, &queue, &mut presenter, format, size)?,
+        &canvas,
+        "invalid video leaves canvas unchanged",
+    )?;
     Ok(())
 }

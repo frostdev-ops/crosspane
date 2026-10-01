@@ -3,6 +3,7 @@
 use std::{ptr, sync::OnceLock};
 
 use crosspane_media::codec::{CodecError, EncodedVideo, VideoCodecs, VideoDecoder, VideoEncoder};
+use crosspane_media::picture::{Nv12, YuvColour, YuvMatrix};
 use crosspane_types::geom::PixelSize;
 use ffmpeg_next::{self as ffmpeg, codec, format::Pixel, frame, software::scaling};
 
@@ -52,6 +53,16 @@ impl FfmpegCodecs {
                 ))),
             },
         }
+    }
+
+    /// Open the selected decoder with access to its NV12 output method.
+    pub fn decoder_nv12(&self) -> Result<FfmpegDecoder, CodecError> {
+        let backend = self
+            .decoder_backend
+            .get_or_init(|| self.choose_decoder().map_err(|error| error.to_string()))
+            .as_ref()
+            .map_err(|error| CodecError::Unavailable(error.clone()))?;
+        FfmpegDecoder::new(*backend)
     }
 
     fn choose_decoder(&self) -> Result<DecoderBackend, CodecError> {
@@ -187,12 +198,7 @@ impl VideoCodecs for FfmpegCodecs {
     }
 
     fn decoder(&self) -> Result<Box<dyn VideoDecoder>, CodecError> {
-        let backend = self
-            .decoder_backend
-            .get_or_init(|| self.choose_decoder().map_err(|error| error.to_string()))
-            .as_ref()
-            .map_err(|error| CodecError::Unavailable(error.clone()))?;
-        Ok(Box::new(FfmpegDecoder::new(*backend)?))
+        Ok(Box::new(self.decoder_nv12()?))
     }
 }
 
@@ -239,6 +245,21 @@ impl Session {
         context.set_max_bit_rate(bitrate as usize);
         context.set_gop(GOP);
         context.set_max_b_frames(0);
+        // NVENC's packed RGB conversion is BT.601 limited. FFmpeg's
+        // nvenc_setup_h264_config also forces BT470BG/MPEG in the bitstream for RGB input.
+        // Keep the context consistent with that conversion; planar input uses our BT.709 scaler.
+        let matrix = if matches!(backend, Backend::Nvenc)
+            && matches!(input_format, Pixel::BGRA | Pixel::BGRZ)
+        {
+            ffmpeg::color::Space::BT470BG
+        } else {
+            ffmpeg::color::Space::BT709
+        };
+        context.set_colorspace(matrix);
+        context.set_color_range(ffmpeg::color::Range::MPEG);
+        context.set_color_primaries(ffmpeg::color::Primaries::BT709);
+        context
+            .set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::IEC61966_2_1);
         // Never enable GLOBAL_HEADER: every IDR carries its SPS and PPS in-band.
         let mut options = ffmpeg::Dictionary::new();
         options.set("bf", "0");
@@ -273,7 +294,7 @@ impl Session {
             }
         }
         let encoder = context.open_as_with(codec, options).map_err(failed)?;
-        let scaler = if input_format == Pixel::YUV420P {
+        let mut scaler = if input_format == Pixel::YUV420P {
             Some(Scaler(
                 scaling::Context::get(
                     Pixel::BGRA,
@@ -289,6 +310,26 @@ impl Session {
         } else {
             None
         };
+        if let Some(scaler) = &mut scaler {
+            // SAFETY: the context is exclusively borrowed and live; sws_getCoefficients
+            // returns static tables. RGB input is full range, YUV output is BT.709 limited.
+            let result = unsafe {
+                let coefficients = ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_ITU709);
+                ffmpeg::ffi::sws_setColorspaceDetails(
+                    scaler.0.as_mut_ptr(),
+                    coefficients,
+                    1,
+                    coefficients,
+                    0,
+                    0,
+                    1 << 16,
+                    1 << 16,
+                )
+            };
+            if result < 0 {
+                return Err(failed(ffmpeg::Error::from(result)));
+            }
+        }
         Ok(Self { encoder, scaler })
     }
 
@@ -577,7 +618,8 @@ unsafe fn choose_format(
     software
 }
 
-struct FfmpegDecoder {
+/// H.264 decoder supporting both legacy BGRA and NV12 output.
+pub struct FfmpegDecoder {
     // None only after permanent hardware fallback, until the next IDR opens software.
     decoder: Option<codec::decoder::Video>,
     backend: DecoderBackend,
@@ -588,6 +630,15 @@ struct FfmpegDecoder {
     scaler: Option<Scaler>,
     needs_key: bool,
     references: ReferenceSequence,
+}
+
+impl std::fmt::Debug for FfmpegDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FfmpegDecoder")
+            .field("backend", &self.backend)
+            .field("needs_key", &self.needs_key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FfmpegDecoder {
@@ -672,9 +723,15 @@ impl FfmpegDecoder {
             if result < 0 {
                 return Err(failed(ffmpeg::Error::from(result)));
             }
-            // Hardware surfaces transfer as NV12. Give BGRA conversion planar 4:2:0, as the
-            // software decoder does, so both paths run the same swscale converter.
-            planar_from_nv12(&mut self.planarizer, transferred)
+            // SAFETY: both frames are owned and live. Copy colour metadata and other
+            // properties separately: av_hwframe_transfer_data only transfers the planes.
+            let result = unsafe {
+                ffmpeg::ffi::av_frame_copy_props(transferred.as_mut_ptr(), decoded.as_ptr())
+            };
+            if result < 0 {
+                return Err(failed(ffmpeg::Error::from(result)));
+            }
+            Ok(transferred)
         } else {
             Ok(decoded)
         }
@@ -692,16 +749,39 @@ impl FfmpegDecoder {
             ));
         }
         let mut bgra = video_frame(Pixel::BGRA, size)?;
-        cached_scaler(
+        let scaler = cached_scaler(
             &mut self.scaler,
             decoded.format(),
             Pixel::BGRA,
             size,
             scaling::Flags::BILINEAR,
-        )?
-        .0
-        .run(decoded, &mut bgra)
-        .map_err(failed)?;
+        )?;
+        // SAFETY: exclusively borrowed live scaler and static coefficient tables. Honour
+        // signalled colour for the legacy BGRA path as well as the NV12 reference converter.
+        let result = unsafe {
+            let matrix = if decoded.color_space() == ffmpeg::color::Space::BT709 {
+                ffmpeg::ffi::SWS_CS_ITU709
+            } else {
+                ffmpeg::ffi::SWS_CS_ITU601
+            };
+            let coefficients = ffmpeg::ffi::sws_getCoefficients(matrix);
+            let full = decoded.color_range() == ffmpeg::color::Range::JPEG
+                || decoded.format() == Pixel::YUVJ420P;
+            ffmpeg::ffi::sws_setColorspaceDetails(
+                scaler.0.as_mut_ptr(),
+                coefficients,
+                i32::from(full),
+                coefficients,
+                1,
+                0,
+                1 << 16,
+                1 << 16,
+            )
+        };
+        if result < 0 {
+            return Err(failed(ffmpeg::Error::from(result)));
+        }
+        scaler.0.run(decoded, &mut bgra).map_err(failed)?;
         let row_bytes = size.width as usize * 4;
         let length = row_bytes
             .checked_mul(size.height as usize)
@@ -720,14 +800,18 @@ impl FfmpegDecoder {
     }
 }
 
-impl VideoDecoder for FfmpegDecoder {
-    fn decode(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<PixelSize, CodecError> {
+impl FfmpegDecoder {
+    fn decode_picture<T>(
+        &mut self,
+        data: &[u8],
+        output: impl FnOnce(&mut Self, frame::Video) -> Result<T, CodecError>,
+    ) -> Result<T, CodecError> {
         // Header/gap/needs-IDR rejections do not count as hardware failures: they never reach
         // libavcodec. A successful decode/transfer resets the consecutive failure count.
         let result = self.check(data).and_then(|()| match self.frame(data) {
             Ok(frame) => {
                 self.hardware_failures = 0;
-                self.convert(&frame, out)
+                output(self, frame)
             }
             Err(error) => {
                 if self.backend != DecoderBackend::Software {
@@ -764,9 +848,99 @@ impl VideoDecoder for FfmpegDecoder {
         })
     }
 
+    /// Decode into tightly packed planes: both strides equal the coded width.
+    /// Existing plane allocations are reused. IDR recovery and errors match BGRA decoding.
+    pub fn decode_nv12(&mut self, data: &[u8], out: &mut Nv12) -> Result<(), CodecError> {
+        self.decode_picture(data, |_, frame| copy_nv12(&frame, out))
+    }
+}
+
+impl VideoDecoder for FfmpegDecoder {
+    fn decode(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<PixelSize, CodecError> {
+        self.decode_picture(data, |decoder, frame| {
+            let frame = planar_from_nv12(&mut decoder.planarizer, frame)?;
+            decoder.convert(&frame, out)
+        })
+    }
+
     fn name(&self) -> &str {
         self.backend.name()
     }
+}
+
+fn copy_nv12(frame: &frame::Video, out: &mut Nv12) -> Result<(), CodecError> {
+    let size = PixelSize::new(frame.width(), frame.height());
+    if coded_size(size)? != size {
+        return Err(CodecError::Failed(
+            "decoder returned an odd coded size".into(),
+        ));
+    }
+    let planar = match frame.format() {
+        Pixel::YUV420P | Pixel::YUVJ420P => true,
+        Pixel::NV12 => false,
+        _ => {
+            return Err(CodecError::Failed(
+                "decoder returned unsupported NV12 source format".into(),
+            ));
+        }
+    };
+    let width = size.width as usize;
+    let height = size.height as usize;
+    let length = width
+        .checked_mul(height)
+        .ok_or_else(|| CodecError::Failed("decoded buffer size overflow".into()))?;
+    // Validate the source rows before modifying output. FFmpeg normally supplies padded strides.
+    let planes = [
+        (0, height, width),
+        (1, height / 2, if planar { width / 2 } else { width }),
+        (2, height / 2, width / 2),
+    ];
+    for &(plane, rows, bytes) in &planes[..if planar { 3 } else { 2 }] {
+        let stride = frame.stride(plane);
+        let needed = (rows - 1)
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or_else(|| CodecError::Failed("decoded plane size overflow".into()))?;
+        if stride < bytes || frame.data(plane).len() < needed {
+            return Err(CodecError::Failed(
+                "decoded plane shorter than its size".into(),
+            ));
+        }
+    }
+    out.y
+        .try_reserve(length.saturating_sub(out.y.len()))
+        .map_err(|error| CodecError::Failed(error.to_string()))?;
+    out.uv
+        .try_reserve((length / 2).saturating_sub(out.uv.len()))
+        .map_err(|error| CodecError::Failed(error.to_string()))?;
+    out.y.resize(length, 0);
+    out.uv.resize(length / 2, 0);
+    for (row, dest) in out.y.chunks_exact_mut(width).enumerate() {
+        dest.copy_from_slice(&frame.data(0)[row * frame.stride(0)..][..width]);
+    }
+    for (row, dest) in out.uv.chunks_exact_mut(width).enumerate() {
+        if planar {
+            let u = &frame.data(1)[row * frame.stride(1)..][..width / 2];
+            let v = &frame.data(2)[row * frame.stride(2)..][..width / 2];
+            for ((pair, u), v) in dest.as_chunks_mut::<2>().0.iter_mut().zip(u).zip(v) {
+                pair.copy_from_slice(&[*u, *v]);
+            }
+        } else {
+            dest.copy_from_slice(&frame.data(1)[row * frame.stride(1)..][..width]);
+        }
+    }
+    out.size = size;
+    out.y_stride = size.width;
+    out.uv_stride = size.width;
+    out.colour = YuvColour {
+        matrix: match frame.color_space() {
+            ffmpeg::color::Space::BT470BG | ffmpeg::color::Space::SMPTE170M => YuvMatrix::Bt601,
+            _ => YuvMatrix::Bt709,
+        },
+        full_range: frame.color_range() == ffmpeg::color::Range::JPEG
+            || frame.format() == Pixel::YUVJ420P,
+    };
+    Ok(())
 }
 
 // Why hardware output goes through planar YUV 4:2:0 before BGRA. H.264 decoding is bit-exact, so
@@ -803,6 +977,12 @@ fn planar_from_nv12(
     .0
     .run(&nv12, &mut planar)
     .map_err(failed)?;
+    // SAFETY: both frames are live, independently owned frames; preserve the colour
+    // description when changing only the chroma layout for legacy BGRA conversion.
+    let result = unsafe { ffmpeg::ffi::av_frame_copy_props(planar.as_mut_ptr(), nv12.as_ptr()) };
+    if result < 0 {
+        return Err(failed(ffmpeg::Error::from(result)));
+    }
     Ok(planar)
 }
 
@@ -1090,4 +1270,339 @@ fn again(error: ffmpeg::Error) -> bool {
 
 fn failed(error: ffmpeg::Error) -> CodecError {
     CodecError::Failed(error.to_string())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod nv12_tests {
+    use super::*;
+    use crosspane_media::picture::nv12_to_bgra;
+
+    const PATCHES: [[u8; 4]; 12] = [
+        [0, 0, 255, 255],
+        [0, 255, 0, 255],
+        [255, 0, 0, 255],
+        [255, 255, 0, 255],
+        [255, 0, 255, 255],
+        [0, 255, 255, 255],
+        [255, 255, 255, 255],
+        [0, 0, 0, 255],
+        [128, 128, 128, 255],
+        [48, 80, 112, 255],
+        [112, 80, 48, 255],
+        [96, 144, 192, 255],
+    ];
+
+    fn patches(size: PixelSize, offset: usize) -> Vec<u8> {
+        let mut source = Vec::new();
+        for y in 0..size.height {
+            for x in 0..size.width {
+                source.extend_from_slice(&PATCHES[((y / 64 * 4 + x / 64) as usize + offset) % 12]);
+            }
+        }
+        source
+    }
+
+    fn session(backend: Backend, size: PixelSize) -> Option<Session> {
+        ffmpeg::init().unwrap();
+        match Session::new(backend, size, 20_000_000, 30) {
+            Ok(session) => Some(session),
+            Err(error) if matches!(backend, Backend::Nvenc) => {
+                eprintln!("SKIP h264_nvenc: {error}");
+                None
+            }
+            Err(error) => panic!("libx264 must open: {error}"),
+        }
+    }
+
+    fn hardware(backend: DecoderBackend, packet: &[u8]) -> Option<FfmpegDecoder> {
+        match FfmpegDecoder::new(backend).and_then(|mut decoder| {
+            decoder.decode_nv12(packet, &mut Nv12::default())?;
+            if !decoder.hardware_frame {
+                return Err(CodecError::Failed("no hardware frame produced".into()));
+            }
+            Ok(decoder)
+        }) {
+            Ok(decoder) => Some(decoder),
+            Err(error) => {
+                eprintln!("SKIP {}: {error}", backend.name());
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn colour_round_trip() {
+        for backend in [Backend::X264, Backend::Nvenc] {
+            for size in [PixelSize::new(256, 256), PixelSize::new(250, 142)] {
+                let Some(mut encoder) = session(backend, size) else {
+                    continue;
+                };
+                let signalled = encoder.encoder.colorspace();
+                let expected = if signalled == ffmpeg::color::Space::BT470BG {
+                    YuvMatrix::Bt601
+                } else {
+                    YuvMatrix::Bt709
+                };
+                let mut software = FfmpegDecoder::new(DecoderBackend::Software).unwrap();
+                let mut cuda = None;
+                let mut errors = [[0_u8; 3]; 2];
+                let mut packet = Vec::new();
+                let mut picture = Nv12::default();
+                // Rotate through all twelve colours even where fewer than twelve blocks fit.
+                for index in 0..3 {
+                    let source = patches(size, index * 4);
+                    packet.clear();
+                    encoder
+                        .encode(
+                            &source,
+                            size.width as usize * 4,
+                            size,
+                            true,
+                            index as i64,
+                            &mut packet,
+                        )
+                        .unwrap();
+                    if index == 0 {
+                        cuda = hardware(DecoderBackend::Cuda, &packet);
+                    }
+                    for (pair, decoder) in std::iter::once(&mut software)
+                        .chain(cuda.iter_mut())
+                        .enumerate()
+                    {
+                        decoder.decode_nv12(&packet, &mut picture).unwrap();
+                        assert_eq!(
+                            picture.colour,
+                            YuvColour {
+                                matrix: expected,
+                                full_range: false
+                            }
+                        );
+                        assert_eq!(decoder.decoder.as_ref().unwrap().color_space(), signalled);
+                        assert_eq!(
+                            decoder.decoder.as_ref().unwrap().color_range(),
+                            ffmpeg::color::Range::MPEG
+                        );
+                        assert_eq!(
+                            decoder.decoder.as_ref().unwrap().color_primaries(),
+                            ffmpeg::color::Primaries::BT709
+                        );
+                        assert_eq!(
+                            decoder
+                                .decoder
+                                .as_ref()
+                                .unwrap()
+                                .color_transfer_characteristic(),
+                            ffmpeg::color::TransferCharacteristic::IEC61966_2_1
+                        );
+                        let mut bgra = Vec::new();
+                        nv12_to_bgra(&picture, size, &mut bgra).unwrap();
+                        for top in (0..size.height).step_by(64) {
+                            for left in (0..size.width).step_by(64) {
+                                let x = left + (size.width - left).min(64) / 2;
+                                let y = top + (size.height - top).min(64) / 2;
+                                let at = (y * size.width + x) as usize * 4;
+                                for channel in 0..3 {
+                                    errors[pair][channel] = errors[pair][channel]
+                                        .max(source[at + channel].abs_diff(bgra[at + channel]));
+                                }
+                            }
+                        }
+                    }
+                }
+                for (pair, error) in errors
+                    .iter()
+                    .enumerate()
+                    .take(1 + usize::from(cuda.is_some()))
+                {
+                    eprintln!(
+                        "WP-2.23 {} / {} {}x{} max B/G/R error {error:?}",
+                        backend.name(),
+                        if pair == 0 { "software" } else { "cuda" },
+                        size.width,
+                        size.height
+                    );
+                    assert!(error.iter().all(|error| *error <= 8));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nv12_layout() {
+        let size = PixelSize::new(250, 142);
+        let mut encoder = session(Backend::X264, size).unwrap();
+        let mut packet = Vec::new();
+        encoder
+            .encode(
+                &patches(size, 0),
+                size.width as usize * 4,
+                size,
+                true,
+                0,
+                &mut packet,
+            )
+            .unwrap();
+        let mut software = FfmpegDecoder::new(DecoderBackend::Software).unwrap();
+        let mut picture = Nv12::default();
+        software.decode_nv12(&packet, &mut picture).unwrap();
+        picture.validate().unwrap();
+        assert_eq!(picture.y_stride, size.width);
+        assert_eq!(picture.uv_stride, size.width);
+        assert_eq!(picture.y.len(), (size.width * size.height) as usize);
+        assert_eq!(picture.uv.len(), (size.width * size.height / 2) as usize);
+        let y_allocation = picture.y.as_ptr();
+        let uv_allocation = picture.uv.as_ptr();
+        software.decode_nv12(&packet, &mut picture).unwrap();
+        assert_eq!(picture.y.as_ptr(), y_allocation);
+        assert_eq!(picture.uv.as_ptr(), uv_allocation);
+        let raw = software.frame(&packet).unwrap();
+        for y in 0..size.height as usize {
+            assert_eq!(
+                &picture.y[y * size.width as usize..][..size.width as usize],
+                &raw.data(0)[y * raw.stride(0)..][..size.width as usize]
+            );
+        }
+        for y in 0..size.height as usize / 2 {
+            for x in 0..size.width as usize / 2 {
+                assert_eq!(
+                    picture.uv[y * size.width as usize + x * 2],
+                    raw.data(1)[y * raw.stride(1) + x]
+                );
+                assert_eq!(
+                    picture.uv[y * size.width as usize + x * 2 + 1],
+                    raw.data(2)[y * raw.stride(2) + x]
+                );
+            }
+        }
+        for (format, space, range, matrix, full_range) in [
+            (
+                Pixel::NV12,
+                ffmpeg::color::Space::BT709,
+                ffmpeg::color::Range::MPEG,
+                YuvMatrix::Bt709,
+                false,
+            ),
+            (
+                Pixel::NV12,
+                ffmpeg::color::Space::BT470BG,
+                ffmpeg::color::Range::JPEG,
+                YuvMatrix::Bt601,
+                true,
+            ),
+            (
+                Pixel::YUV420P,
+                ffmpeg::color::Space::SMPTE170M,
+                ffmpeg::color::Range::MPEG,
+                YuvMatrix::Bt601,
+                false,
+            ),
+            (
+                Pixel::YUVJ420P,
+                ffmpeg::color::Space::Unspecified,
+                ffmpeg::color::Range::Unspecified,
+                YuvMatrix::Bt709,
+                true,
+            ),
+            (
+                Pixel::NV12,
+                ffmpeg::color::Space::BT2020NCL,
+                ffmpeg::color::Range::Unspecified,
+                YuvMatrix::Bt709,
+                false,
+            ),
+        ] {
+            let mut fixture = video_frame(format, size).unwrap();
+            fixture.set_color_space(space);
+            fixture.set_color_range(range);
+            let planar = format != Pixel::NV12;
+            for (row, source) in picture.y.chunks_exact(size.width as usize).enumerate() {
+                let stride = fixture.stride(0);
+                fixture.data_mut(0)[row * stride..][..size.width as usize].copy_from_slice(source);
+            }
+            for (row, source) in picture.uv.chunks_exact(size.width as usize).enumerate() {
+                if planar {
+                    for (x, pair) in source.as_chunks::<2>().0.iter().enumerate() {
+                        for (plane, value) in [(1, pair[0]), (2, pair[1])] {
+                            let stride = fixture.stride(plane);
+                            fixture.data_mut(plane)[row * stride + x] = value;
+                        }
+                    }
+                } else {
+                    let stride = fixture.stride(1);
+                    fixture.data_mut(1)[row * stride..][..size.width as usize]
+                        .copy_from_slice(source);
+                }
+            }
+            let mut actual = Nv12::default();
+            copy_nv12(&fixture, &mut actual).unwrap();
+            assert_eq!(actual.y, picture.y);
+            assert_eq!(actual.uv, picture.uv);
+            assert_eq!(actual.colour, YuvColour { matrix, full_range });
+        }
+        for backend in [DecoderBackend::Cuda, DecoderBackend::Vaapi] {
+            let Some(mut decoder) = hardware(backend, &packet) else {
+                continue;
+            };
+            let mut actual = Nv12::default();
+            decoder.decode_nv12(&packet, &mut actual).unwrap();
+            assert!(decoder.hardware_frame);
+            assert_eq!(actual.size, picture.size);
+            assert_eq!(actual.colour, picture.colour);
+            assert_eq!(actual.y.len(), picture.y.len());
+            assert_eq!(actual.uv.len(), picture.uv.len());
+            for (a, b) in actual
+                .y
+                .iter()
+                .chain(&actual.uv)
+                .zip(picture.y.iter().chain(&picture.uv))
+            {
+                assert!(a.abs_diff(*b) <= 2);
+            }
+        }
+    }
+
+    #[test]
+    fn nv12_failure_and_size_change() {
+        let mut decoder = FfmpegDecoder::new(DecoderBackend::Software).unwrap();
+        let mut picture = Nv12::default();
+        let mut packet = Vec::new();
+        for size in [PixelSize::new(256, 256), PixelSize::new(250, 142)] {
+            let mut encoder = session(Backend::X264, size).unwrap();
+            let source = patches(size, 0);
+            packet.clear();
+            encoder
+                .encode(&source, size.width as usize * 4, size, true, 0, &mut packet)
+                .unwrap();
+            let idr = packet.clone();
+            packet.clear();
+            encoder
+                .encode(
+                    &source,
+                    size.width as usize * 4,
+                    size,
+                    false,
+                    1,
+                    &mut packet,
+                )
+                .unwrap();
+            let mut fresh = FfmpegDecoder::new(DecoderBackend::Software).unwrap();
+            assert!(matches!(
+                fresh.decode_nv12(&packet, &mut picture),
+                Err(CodecError::Failed(_))
+            ));
+            fresh.decode_nv12(&idr, &mut picture).unwrap();
+            fresh.decode_nv12(&packet, &mut picture).unwrap();
+            decoder.decode_nv12(&idr, &mut picture).unwrap();
+            assert_eq!(picture.size, size);
+            let previous = picture.clone();
+            assert!(matches!(
+                decoder.decode_nv12(&[], &mut picture),
+                Err(CodecError::Failed(_))
+            ));
+            assert_eq!(previous, picture);
+            assert!(decoder.decode_nv12(&packet, &mut picture).is_err());
+            decoder.decode_nv12(&idr, &mut picture).unwrap();
+        }
+    }
 }
