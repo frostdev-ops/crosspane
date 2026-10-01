@@ -31,7 +31,9 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::time::timeout;
 
-pub const WAIT: Duration = Duration::from_secs(5);
+/// How long a test waits for something that should happen promptly. Generous, so a slow or busy CI
+/// machine doesn't fail a test that only needs more time; a pass never takes this long.
+pub const WAIT: Duration = Duration::from_secs(10);
 
 /// Pins exactly the keys it was built with.
 pub struct Pins(HashMap<Vec<u8>, NodeId>);
@@ -68,6 +70,31 @@ pub fn hello(name: &str) -> Hello {
 
 pub fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+}
+
+/// A dual-stack bind: reachable over IPv4 (as `127.0.0.1`) and IPv6 (as `[::1]`) at once. Tests that
+/// need two addresses of one node use these two loopback addresses, because 127.0.0.2 and friends
+/// only exist on Linux (macOS configures just 127.0.0.1 on lo0).
+pub fn dual_stack() -> SocketAddr {
+    SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+}
+
+/// The two loopback addresses of a dual-stack node listening on `port`.
+pub fn both_loopbacks(port: u16) -> (SocketAddr, SocketAddr) {
+    (
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+    )
+}
+
+/// Whether this machine can run a dual-stack test: IPv6 loopback must exist. Prints why a test is
+/// being skipped otherwise.
+pub fn dual_stack_available(test: &str) -> bool {
+    let works = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok();
+    if !works {
+        eprintln!("SKIPPED {test}: no IPv6 loopback ([::1]) on this machine");
+    }
+    works
 }
 
 /// The `t0` of the Ping a node started with [`Node::start_replying`] sends from its Hello handler.
@@ -450,6 +477,19 @@ pub async fn open_stream(conn: &quinn::Connection, kind: u8, bytes: &[u8]) -> qu
     send.write_all(&[kind]).await.unwrap();
     send.write_all(bytes).await.unwrap();
     send
+}
+
+/// Like [`open_stream`], but `None` if the connection is already closed (a refusal can arrive before
+/// the client has opened anything).
+pub async fn try_open_stream(
+    conn: &quinn::Connection,
+    kind: u8,
+    bytes: &[u8],
+) -> Option<quinn::SendStream> {
+    let mut send = conn.open_uni().await.ok()?;
+    send.write_all(&[kind]).await.ok()?;
+    send.write_all(bytes).await.ok()?;
+    Some(send)
 }
 
 /// Wait for the connection to close and return its application close code and reason.

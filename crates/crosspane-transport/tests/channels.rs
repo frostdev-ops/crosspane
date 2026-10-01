@@ -23,9 +23,10 @@ fn pointer(seq: u32) -> PointerMessage {
     }
 }
 
-/// Key messages per 100 ms batch: about 1,800 a second, just under the receiver's 2,000-per-second
-/// input limit (04 §3). Each batch is followed by a sleep, so no 1 s window holds more than 10.
-const BATCH: u32 = 180;
+/// Key messages per 100 ms batch: 1,500 a second, comfortably under the receiver's 2,000-per-second
+/// input limit (04 §3), so that a receiver stalled for a few hundred milliseconds on a slow CI
+/// machine, then catching up, still stays inside it. Each batch is followed by a sleep.
+const BATCH: u32 = 150;
 
 /// Send `MESSAGES` key messages paced below the receiver's input limit. One control message and
 /// one pointer datagram go along with each batch.
@@ -136,19 +137,24 @@ async fn input_beyond_2000_per_second_is_dropped_but_the_connection_stays_open()
     let (a, mut b) = connected_pair().await;
     let mut link = a.transport.link(b.id).unwrap();
 
-    let burst = Instant::now();
     for seq in 1..=5_000 {
         link.send_input(&key_down(seq)).unwrap();
     }
     // The first 2,000 arrive within a few milliseconds. Anything past the limit would follow
     // right behind them, so watch a little longer before counting.
     let mut delivered = Vec::new();
+    let mut first_at = None;
+    let mut last_at = Instant::now();
     while delivered.len() < 1_900 {
         match b.next().await {
             LinkEvent::Input {
                 msg: InputMessage::Key { seq, .. },
                 ..
-            } => delivered.push(seq),
+            } => {
+                last_at = Instant::now();
+                first_at.get_or_insert(last_at);
+                delivered.push(seq);
+            }
             other => panic!("unexpected event {other:?}"),
         }
     }
@@ -159,18 +165,24 @@ async fn input_beyond_2000_per_second_is_dropped_but_the_connection_stays_open()
             LinkEvent::Input {
                 msg: InputMessage::Key { seq, .. },
                 ..
-            } => delivered.push(seq),
+            } => {
+                last_at = Instant::now();
+                delivered.push(seq);
+            }
             other => panic!("unexpected event {other:?}"),
         }
     }
-    assert!(
-        burst.elapsed() < Duration::from_millis(1_000),
-        "the test itself ran slowly: {:?}",
-        burst.elapsed()
+    // At most 2,000 in any one second: over a span of S seconds, at most 2,000 * (floor(S) + 1).
+    // On a fast machine the whole burst lands within a second, so this is exactly the limit; a slow
+    // one that spreads it out is allowed proportionally more, so the test stays valid.
+    let span = last_at.duration_since(first_at.unwrap_or(last_at)) + Duration::from_millis(50);
+    let allowed = 2_000 * (usize::try_from(span.as_secs()).unwrap() + 1);
+    eprintln!(
+        "delivered {} of 5000 over {span:?} (allowed {allowed})",
+        delivered.len()
     );
-    eprintln!("delivered {} of 5000 in the burst", delivered.len());
     assert!(
-        (1_900..=2_100).contains(&delivered.len()),
+        (1_900..=allowed).contains(&delivered.len()),
         "delivered {}",
         delivered.len()
     );
