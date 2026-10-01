@@ -7,6 +7,15 @@ use crosspane_media::picture::{Nv12, YuvColour, YuvMatrix};
 use crosspane_types::geom::PixelSize;
 use ffmpeg_next::{self as ffmpeg, codec, format::Pixel, frame, software::scaling};
 
+#[cfg(feature = "cuda")]
+mod cuda;
+#[cfg(feature = "cuda")]
+use crosspane_media::codec::{NativeInput, NativeInputPool};
+#[cfg(feature = "cuda")]
+pub use cuda::{Nv12Layout, nv12_buffer};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
+
 const GOP: u32 = 100_000;
 
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +37,8 @@ impl Backend {
 #[derive(Debug)]
 pub struct FfmpegCodecs {
     preferred: Backend,
+    #[cfg(feature = "cuda")]
+    gpu: Option<Arc<cuda::Source>>,
     // Cache failures too: a forced, unavailable device must not be re-probed on every call.
     decoder_backend: OnceLock<Result<DecoderBackend, String>>,
 }
@@ -42,17 +53,40 @@ impl FfmpegCodecs {
             Ok(_) => Ok(Self {
                 preferred: Backend::Nvenc,
                 decoder_backend: OnceLock::new(),
+                #[cfg(feature = "cuda")]
+                gpu: None,
             }),
             Err(nvenc) => match Session::new(Backend::X264, size, 8_000_000, 30) {
                 Ok(_) => Ok(Self {
                     preferred: Backend::X264,
                     decoder_backend: OnceLock::new(),
+                    #[cfg(feature = "cuda")]
+                    gpu: None,
                 }),
                 Err(x264) => Err(CodecError::Unavailable(format!(
                     "h264_nvenc: {nvenc}; libx264: {x264}"
                 ))),
             },
         }
+    }
+
+    /// Encoders may take NV12 GPU input on this source Vulkan device when its UUID matches
+    /// CUDA and NVENC works. Setup failure preserves CPU BGRA encoding and returns no pool.
+    #[cfg(feature = "cuda")]
+    pub fn with_gpu(mut self, device: wgpu::Device) -> Self {
+        self.gpu = if matches!(self.preferred, Backend::Nvenc) {
+            match cuda::Source::new(device) {
+                Ok(source) => Some(Arc::new(source)),
+                Err(error) => {
+                    tracing::info!(%error, "CUDA native input unavailable; using CPU BGRA");
+                    None
+                }
+            }
+        } else {
+            tracing::info!("NVENC unavailable; using CPU BGRA");
+            None
+        };
+        self
     }
 
     /// Open the selected decoder with access to its NV12 output method.
@@ -194,6 +228,10 @@ impl VideoCodecs for FfmpegCodecs {
             session: Some(session),
             rebuild: false,
             pts: 0,
+            #[cfg(feature = "cuda")]
+            gpu: self.gpu.clone(),
+            #[cfg(feature = "cuda")]
+            pool: None,
         }))
     }
 
@@ -212,10 +250,40 @@ unsafe impl Send for Scaler {}
 struct Session {
     encoder: codec::encoder::video::Encoder,
     scaler: Option<Scaler>,
+    // Keep registrations valid until encoder drop unregisters every CUDA resource.
+    #[cfg(feature = "cuda")]
+    _native_pool: Option<Arc<cuda::Pool>>,
 }
 
 impl Session {
     fn new(backend: Backend, size: PixelSize, bitrate: u32, fps: u32) -> Result<Self, CodecError> {
+        Self::new_inner(
+            backend,
+            size,
+            bitrate,
+            fps,
+            #[cfg(feature = "cuda")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn new_cuda(
+        size: PixelSize,
+        bitrate: u32,
+        fps: u32,
+        frames: &Arc<cuda::Pool>,
+    ) -> Result<Self, CodecError> {
+        Self::new_inner(Backend::Nvenc, size, bitrate, fps, Some(frames))
+    }
+
+    fn new_inner(
+        backend: Backend,
+        size: PixelSize,
+        bitrate: u32,
+        fps: u32,
+        #[cfg(feature = "cuda")] frames: Option<&Arc<cuda::Pool>>,
+    ) -> Result<Self, CodecError> {
         if bitrate == 0 || fps == 0 || fps > i32::MAX as u32 {
             return Err(CodecError::Failed("invalid bitrate or frame rate".into()));
         }
@@ -235,7 +303,21 @@ impl Session {
             }
             Backend::X264 => Pixel::YUV420P,
         };
+        #[cfg(feature = "cuda")]
+        let input_format = if frames.is_some() {
+            Pixel::CUDA
+        } else {
+            input_format
+        };
         let mut context = codec_context(codec)?.encoder().video().map_err(failed)?;
+        #[cfg(feature = "cuda")]
+        if let Some(frames) = frames {
+            let reference = frames.frames.reference()?;
+            // SAFETY: context is exclusively owned and its initially null field takes the ref.
+            unsafe {
+                (*context.as_mut_ptr()).hw_frames_ctx = reference;
+            }
+        }
         context.set_width(size.width);
         context.set_height(size.height);
         context.set_format(input_format);
@@ -330,7 +412,12 @@ impl Session {
                 return Err(failed(ffmpeg::Error::from(result)));
             }
         }
-        Ok(Self { encoder, scaler })
+        Ok(Self {
+            encoder,
+            scaler,
+            #[cfg(feature = "cuda")]
+            _native_pool: frames.cloned(),
+        })
     }
 
     fn encode(
@@ -360,13 +447,23 @@ impl Session {
                 row[row_bytes..].copy_from_slice(&source[row_bytes - 4..]);
             }
         }
-        let mut input = if let Some(scaler) = &mut self.scaler {
+        let input = if let Some(scaler) = &mut self.scaler {
             let mut converted = video_frame(self.encoder.format(), coded)?;
             scaler.0.run(&packed, &mut converted).map_err(failed)?;
             converted
         } else {
             packed
         };
+        self.send(input, key, pts, out)
+    }
+
+    fn send(
+        &mut self,
+        mut input: frame::Video,
+        key: bool,
+        pts: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<EncodedVideo, CodecError> {
         input.set_pts(Some(pts));
         input.set_kind(if key {
             ffmpeg::picture::Type::I
@@ -428,6 +525,10 @@ struct FfmpegEncoder {
     session: Option<Session>,
     rebuild: bool,
     pts: i64,
+    #[cfg(feature = "cuda")]
+    gpu: Option<Arc<cuda::Source>>,
+    #[cfg(feature = "cuda")]
+    pool: Option<Arc<cuda::Pool>>,
 }
 
 impl VideoEncoder for FfmpegEncoder {
@@ -455,7 +556,11 @@ impl VideoEncoder for FfmpegEncoder {
         if pixels.len() < length {
             return Err(CodecError::BadInput("pixel buffer is too short"));
         }
-        if size != self.size || self.rebuild || self.session.is_none() {
+        let native_session = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.encoder.format() == Pixel::CUDA);
+        if size != self.size || self.rebuild || self.session.is_none() || native_session {
             self.session = None;
             let session = match Session::new(self.backend, coded, self.bitrate, self.fps) {
                 Ok(session) => session,
@@ -483,6 +588,81 @@ impl VideoEncoder for FfmpegEncoder {
             self.pts,
             out,
         );
+        if result.is_err() {
+            self.session = None;
+        } else {
+            self.pts = self.pts.saturating_add(1);
+        }
+        result
+    }
+
+    #[cfg(feature = "cuda")]
+    fn input_pool(
+        &mut self,
+        size: PixelSize,
+    ) -> Result<Option<Arc<dyn NativeInputPool>>, CodecError> {
+        let coded = coded_size(size)?;
+        if self.pool.as_ref().is_some_and(|pool| pool.size() == coded) {
+            return Ok(self
+                .pool
+                .clone()
+                .map(|pool| pool as Arc<dyn NativeInputPool>));
+        }
+        self.pool = None;
+        let Some(source) = &self.gpu else {
+            return Ok(None);
+        };
+        let setup = source.pool(coded).and_then(|pool| {
+            // Probe opening before advertising a pool; setup failure always preserves CPU input.
+            Session::new_cuda(coded, self.bitrate, self.fps, &pool)?;
+            Ok(pool)
+        });
+        match setup {
+            Ok(pool) => {
+                self.pool = Some(pool.clone());
+                Ok(Some(pool))
+            }
+            Err(error) => {
+                tracing::info!(%error, "CUDA NV12 pool unavailable; using CPU BGRA");
+                self.gpu = None;
+                Ok(None)
+            }
+        }
+    }
+
+    /// The caller must finish all GPU writes before this call (wait for the wgpu submission).
+    #[cfg(feature = "cuda")]
+    fn encode_native(
+        &mut self,
+        input: &dyn NativeInput,
+        size: PixelSize,
+        force_key: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<EncodedVideo, CodecError> {
+        out.clear();
+        let coded = coded_size(size)?;
+        let pool = self
+            .pool
+            .as_ref()
+            .filter(|pool| pool.size() == coded)
+            .ok_or(CodecError::BadInput("no pool for this coded size"))?;
+        let frame = pool.frame(input)?;
+        let cpu_session = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.encoder.format() != Pixel::CUDA);
+        if size != self.size || self.rebuild || self.session.is_none() || cpu_session {
+            self.session = None;
+            self.session = Some(Session::new_cuda(coded, self.bitrate, self.fps, pool)?);
+            self.size = size;
+            self.rebuild = false;
+            self.pts = 0;
+        }
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| CodecError::Failed("encoder session missing".into()))?;
+        let result = session.send(frame, force_key || self.pts == 0, self.pts, out);
         if result.is_err() {
             self.session = None;
         } else {
