@@ -296,8 +296,13 @@ fn pixels_damage_crop_gate_and_stop() {
         let _ = send.send(event);
     });
     assert!(matches!(
-        capture.start(CaptureTarget::Window(WindowId(1)), None, 60, sink.clone()),
-        Err(PlatformError::Unsupported(_))
+        capture.start(
+            CaptureTarget::Window(WindowId(u64::MAX)),
+            None,
+            60,
+            sink.clone()
+        ),
+        Err(PlatformError::NotFound)
     ));
     assert!(matches!(
         capture.start(
@@ -668,4 +673,159 @@ fn no_cursor_session_by_default() {
     assert!(frames > 0, "no frames delivered");
     capture.stop(stream).unwrap();
     ended(&events, stream, StreamEndReason::Requested);
+}
+
+// This fixture uses the release binary required by WP-2.18a and never targets the live session.
+#[test]
+fn window_pixels_resize_close_and_unknown_id() {
+    let Some(ipc) = dedicated("window_pixels_resize_close_and_unknown_id") else {
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let binary = root.join("target/release/crosspane-testapp");
+    if !binary.is_file() {
+        assert!(
+            Command::new("cargo")
+                .current_dir(&root)
+                .args(["build", "--release", "--locked", "-p", "crosspane-testapp"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let title = format!("wp218a-window-{}", std::process::id());
+    let child = Command::new(binary)
+        .current_dir(&root)
+        .args(["window", "--title", &title, "--size", "320x240"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = ChildGuard(child);
+    let mut client = serde_json::Value::Null;
+    wait_until(|| {
+        client = ipc
+            .json("clients")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["title"] == title)
+            .cloned()
+            .unwrap_or_default();
+        !client.is_null()
+    });
+    let address = client["address"].as_str().unwrap();
+    let id = WindowId(u64::from_str_radix(client["stableId"].as_str().unwrap(), 16).unwrap());
+    ipc.dispatch(&format!(
+        r#"hl.dsp.window.float({{action="enable",window="address:{address}"}})"#
+    ))
+    .unwrap();
+    ipc.dispatch(&format!(
+        r#"hl.dsp.window.resize({{x=320,y=240,relative=false,window="address:{address}"}})"#
+    ))
+    .unwrap();
+    wait_until(|| {
+        ipc.json("clients")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["address"] == address && c["size"] == serde_json::json!([320, 240]))
+    });
+    let mut capture = HyprlandFrameCapture::new(open_gate(), ipc.clone()).unwrap();
+    // Even an explicitly enabled output cursor option must never create a window cursor session.
+    capture.set_cursor_capture(true);
+    let (send, events) = mpsc::channel();
+    let sink = Arc::new(move |event| {
+        let _ = send.send(event);
+    });
+    assert!(matches!(
+        capture.start(
+            CaptureTarget::Window(WindowId(u64::MAX)),
+            None,
+            60,
+            sink.clone()
+        ),
+        Err(PlatformError::NotFound)
+    ));
+    let stream = capture
+        .start(CaptureTarget::Window(id), None, 60, sink)
+        .unwrap();
+    let wait_frame = |size| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                FrameEvent::Frame {
+                    stream: event_stream,
+                    frame,
+                } => {
+                    assert_eq!(event_stream, stream);
+                    if frame.size == size {
+                        break frame;
+                    }
+                }
+                other => panic!("unexpected window capture event: {other:?}"),
+            }
+        }
+    };
+    let first = wait_frame(PixelSize::new(320, 240));
+    let pixels = first.pixels.as_chunks::<4>().0;
+    assert!(
+        pixels.iter().any(|p| p != &pixels[0]),
+        "window pixels are uniform"
+    );
+    ipc.dispatch(&format!(
+        r#"hl.dsp.window.resize({{x=400,y=280,relative=false,window="address:{address}"}})"#
+    ))
+    .unwrap();
+    wait_frame(PixelSize::new(400, 280));
+    // The testapp stays static for more than a second: no input, redraw trigger or
+    // IPC update is needed to keep a capture waiting for the one subsequent resize.
+    let idle_deadline = Instant::now() + Duration::from_millis(1100);
+    while let Ok(event) =
+        events.recv_timeout(idle_deadline.saturating_duration_since(Instant::now()))
+    {
+        match event {
+            FrameEvent::Frame { frame, .. } => assert_eq!(frame.size, PixelSize::new(400, 280)),
+            other => panic!("unexpected idle window event: {other:?}"),
+        }
+    }
+    ipc.dispatch(&format!(
+        r#"hl.dsp.window.resize({{x=480,y=320,relative=false,window="address:{address}"}})"#
+    ))
+    .unwrap();
+    wait_frame(PixelSize::new(480, 320));
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap()
+        {
+            FrameEvent::Frame { .. } => (),
+            FrameEvent::Ended {
+                stream: event_stream,
+                reason,
+            } => {
+                assert_eq!(
+                    (event_stream, reason),
+                    (stream, StreamEndReason::TargetGone)
+                );
+                break;
+            }
+            other => panic!("unexpected window capture event: {other:?}"),
+        }
+    }
 }
