@@ -64,9 +64,12 @@ e2() {
   read -r at size address <<< "$(proxy)"
   echo "ok: proxy $size at $at"
   crosspanectl status | grep -A1 "showing window" | sed 's/^/   /'
-  grim -g "$at $size" "$work/proxy.png"
-  cargo run -q -p crosspane-testapp -- pattern --size "$size" --out "$work/pattern.ppm"
-  python3 - "$work/proxy.png" "$work/pattern.ppm" <<'PY'
+  # The decoded picture (before drawing: the proxy's node-coloured edge isn't in it).
+  proj=$(crosspanectl status | awk '/^  projection / && /showing window/ {split($2, k, ":"); print k[2]; exit}')
+  snap=$(crosspanectl snapshot macbook "$proj")
+  read -r _ snapw snaph < <(head -c 64 "$snap" | tr -s ' \n' ' ' | cut -d' ' -f1-3)
+  cargo run -q -p crosspane-testapp -- pattern --size "${snapw}x${snaph}" --out "$work/pattern.ppm"
+  python3 - "$snap" "$work/pattern.ppm" <<'PY'
 import sys
 from PIL import Image, ImageChops
 shot = Image.open(sys.argv[1]).convert("RGB")
