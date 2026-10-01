@@ -5,7 +5,7 @@ use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{
     DisplayGeometry, PixelSize, PointDevice, PointLogical, PointMm, SizeMm,
 };
-use crosspane_types::id::{DisplayId, NodeId, SessionId};
+use crosspane_types::id::{DisplayId, NodeId, ProjectionId, SessionId};
 use crosspane_types::input::LockKeys;
 use prost::Message;
 
@@ -13,8 +13,10 @@ use super::{Frame, KIND_CONTROL, MAX_CONTROL_PAYLOAD, WIRE_VERSION, WireError};
 use crate::msg::{
     Capability, ControlMessage, EndReason, Hello, Placement, Refusal, RevocationNotice,
 };
+use crate::projection::{ParkingKind, ProjectionEndReason, ProjectionMessage, WindowSummary};
 
 const MAX_STRING: usize = 256;
+const MAX_PROJECTION_STRING: usize = 1024;
 const MAX_FEATURE: usize = 64;
 const MAX_FEATURES: usize = 64;
 const MAX_DISPLAYS: usize = 16;
@@ -284,8 +286,7 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
             t1: *t1,
             t2: *t2,
         }),
-        // Encoded by WP-2.3; until then a projection message can't be sent.
-        ControlMessage::Projection(_) => return Err(WireError::UnknownControl),
+        ControlMessage::Projection(message) => Body::Projection(projection_to_pb(message)?),
         ControlMessage::Goodbye { message } => {
             check_len(message.len(), MAX_STRING, "goodbye message")?;
             Body::Goodbye(pb::Goodbye {
@@ -407,6 +408,7 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
             t1: pong.t1,
             t2: pong.t2,
         },
+        Body::Projection(projection) => ControlMessage::Projection(projection_from_pb(projection)?),
         Body::Goodbye(goodbye) => {
             check_len(goodbye.message.len(), MAX_STRING, "goodbye message")?;
             ControlMessage::Goodbye {
@@ -416,13 +418,382 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
     })
 }
 
+fn check_projection_string(value: &str) -> Result<(), WireError> {
+    check_len(value.len(), MAX_PROJECTION_STRING, "projection string")
+}
+
+fn check_projection_scale(scale: f64) -> Result<(), WireError> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(WireError::BadValue("projection scale"));
+    }
+    Ok(())
+}
+
+fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireError> {
+    use pb::projection::Body;
+
+    let body = match message {
+        ProjectionMessage::Start {
+            projection,
+            window,
+            size,
+        } => {
+            check_projection_string(&window.title)?;
+            check_projection_string(&window.app_id)?;
+            Body::Start(pb::ProjectionStart {
+                projection: projection.0,
+                title: window.title.clone(),
+                app_id: window.app_id.clone(),
+                pixel_w: size.width,
+                pixel_h: size.height,
+            })
+        }
+        ProjectionMessage::Accepted {
+            projection,
+            size,
+            scale,
+        } => {
+            check_projection_scale(*scale)?;
+            Body::Accepted(pb::ProjectionAccepted {
+                projection: projection.0,
+                pixel_w: size.width,
+                pixel_h: size.height,
+                scale: *scale,
+            })
+        }
+        ProjectionMessage::Refused { projection, reason } => {
+            let reason = match reason {
+                Refusal::Permission => 1,
+                Refusal::Locked => 2,
+                Refusal::SecureInput => 3,
+                Refusal::Busy => 4,
+                Refusal::InjectorFailed => 5,
+            };
+            Body::Refused(pb::ProjectionRefused {
+                projection: projection.0,
+                reason,
+            })
+        }
+        ProjectionMessage::Resize {
+            projection,
+            size,
+            scale,
+        } => {
+            check_projection_scale(*scale)?;
+            Body::Resize(pb::ProjectionResize {
+                projection: projection.0,
+                pixel_w: size.width,
+                pixel_h: size.height,
+                scale: *scale,
+            })
+        }
+        ProjectionMessage::Geometry {
+            projection,
+            size,
+            parking,
+        } => {
+            let parking = match parking {
+                ParkingKind::Twin => 1,
+                ParkingKind::Mirror => 2,
+            };
+            Body::Geometry(pb::ProjectionGeometry {
+                projection: projection.0,
+                pixel_w: size.width,
+                pixel_h: size.height,
+                parking,
+            })
+        }
+        ProjectionMessage::Title { projection, title } => {
+            check_projection_string(title)?;
+            Body::Title(pb::ProjectionTitle {
+                projection: projection.0,
+                title: title.clone(),
+            })
+        }
+        ProjectionMessage::Focus {
+            projection,
+            focused,
+        } => Body::Focus(pb::ProjectionFocus {
+            projection: projection.0,
+            focused: *focused,
+        }),
+        ProjectionMessage::KeyFrameRequest { projection } => {
+            Body::KeyFrameRequest(pb::ProjectionKeyFrameRequest {
+                projection: projection.0,
+            })
+        }
+        ProjectionMessage::End { projection, reason } => {
+            let reason = match reason {
+                ProjectionEndReason::Returned => 1,
+                ProjectionEndReason::WindowClosed => 2,
+                ProjectionEndReason::Revoked => 3,
+                ProjectionEndReason::Locked => 4,
+                ProjectionEndReason::LinkLost => 5,
+                ProjectionEndReason::Failed => 6,
+            };
+            Body::End(pb::ProjectionEnd {
+                projection: projection.0,
+                reason,
+            })
+        }
+        ProjectionMessage::Close { projection, reason } => {
+            let reason = match reason {
+                ProjectionEndReason::Returned => 1,
+                ProjectionEndReason::WindowClosed => 2,
+                ProjectionEndReason::Revoked => 3,
+                ProjectionEndReason::Locked => 4,
+                ProjectionEndReason::LinkLost => 5,
+                ProjectionEndReason::Failed => 6,
+            };
+            Body::Close(pb::ProjectionClose {
+                projection: projection.0,
+                reason,
+            })
+        }
+    };
+    Ok(pb::Projection { body: Some(body) })
+}
+
+fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, WireError> {
+    use pb::projection::Body;
+
+    Ok(match projection.body.ok_or(WireError::UnknownControl)? {
+        Body::Start(start) => {
+            check_projection_string(&start.title)?;
+            check_projection_string(&start.app_id)?;
+            ProjectionMessage::Start {
+                projection: ProjectionId(start.projection),
+                window: WindowSummary {
+                    title: start.title,
+                    app_id: start.app_id,
+                },
+                size: PixelSize::new(start.pixel_w, start.pixel_h),
+            }
+        }
+        Body::Accepted(accepted) => {
+            check_projection_scale(accepted.scale)?;
+            ProjectionMessage::Accepted {
+                projection: ProjectionId(accepted.projection),
+                size: PixelSize::new(accepted.pixel_w, accepted.pixel_h),
+                scale: accepted.scale,
+            }
+        }
+        Body::Refused(refused) => {
+            let reason = match refused.reason {
+                1 => Refusal::Permission,
+                2 => Refusal::Locked,
+                3 => Refusal::SecureInput,
+                4 => Refusal::Busy,
+                5 => Refusal::InjectorFailed,
+                _ => return Err(WireError::BadValue("projection refusal")),
+            };
+            ProjectionMessage::Refused {
+                projection: ProjectionId(refused.projection),
+                reason,
+            }
+        }
+        Body::Resize(resize) => {
+            check_projection_scale(resize.scale)?;
+            ProjectionMessage::Resize {
+                projection: ProjectionId(resize.projection),
+                size: PixelSize::new(resize.pixel_w, resize.pixel_h),
+                scale: resize.scale,
+            }
+        }
+        Body::Geometry(geometry) => {
+            let parking = match geometry.parking {
+                1 => ParkingKind::Twin,
+                2 => ParkingKind::Mirror,
+                _ => return Err(WireError::BadValue("projection parking")),
+            };
+            ProjectionMessage::Geometry {
+                projection: ProjectionId(geometry.projection),
+                size: PixelSize::new(geometry.pixel_w, geometry.pixel_h),
+                parking,
+            }
+        }
+        Body::Title(title) => {
+            check_projection_string(&title.title)?;
+            ProjectionMessage::Title {
+                projection: ProjectionId(title.projection),
+                title: title.title,
+            }
+        }
+        Body::Focus(focus) => ProjectionMessage::Focus {
+            projection: ProjectionId(focus.projection),
+            focused: focus.focused,
+        },
+        Body::KeyFrameRequest(request) => ProjectionMessage::KeyFrameRequest {
+            projection: ProjectionId(request.projection),
+        },
+        Body::End(end) => {
+            let reason = match end.reason {
+                1 => ProjectionEndReason::Returned,
+                2 => ProjectionEndReason::WindowClosed,
+                3 => ProjectionEndReason::Revoked,
+                4 => ProjectionEndReason::Locked,
+                5 => ProjectionEndReason::LinkLost,
+                6 => ProjectionEndReason::Failed,
+                _ => return Err(WireError::BadValue("projection end reason")),
+            };
+            ProjectionMessage::End {
+                projection: ProjectionId(end.projection),
+                reason,
+            }
+        }
+        Body::Close(close) => {
+            let reason = match close.reason {
+                1 => ProjectionEndReason::Returned,
+                2 => ProjectionEndReason::WindowClosed,
+                3 => ProjectionEndReason::Revoked,
+                4 => ProjectionEndReason::Locked,
+                5 => ProjectionEndReason::LinkLost,
+                6 => ProjectionEndReason::Failed,
+                _ => return Err(WireError::BadValue("projection end reason")),
+            };
+            ProjectionMessage::Close {
+                projection: ProjectionId(close.projection),
+                reason,
+            }
+        }
+    })
+}
+
 // Handwritten prost definitions matching proto/control_v1.proto; no protoc/build script.
 mod pb {
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct Projection {
+        #[prost(oneof = "projection::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+        pub body: Option<projection::Body>,
+    }
+
+    pub mod projection {
+        #[derive(Clone, PartialEq, prost::Oneof)]
+        pub enum Body {
+            #[prost(message, tag = "1")]
+            Start(super::ProjectionStart),
+            #[prost(message, tag = "2")]
+            Accepted(super::ProjectionAccepted),
+            #[prost(message, tag = "3")]
+            Refused(super::ProjectionRefused),
+            #[prost(message, tag = "4")]
+            Resize(super::ProjectionResize),
+            #[prost(message, tag = "5")]
+            Geometry(super::ProjectionGeometry),
+            #[prost(message, tag = "6")]
+            Title(super::ProjectionTitle),
+            #[prost(message, tag = "7")]
+            Focus(super::ProjectionFocus),
+            #[prost(message, tag = "8")]
+            KeyFrameRequest(super::ProjectionKeyFrameRequest),
+            #[prost(message, tag = "9")]
+            End(super::ProjectionEnd),
+            #[prost(message, tag = "10")]
+            Close(super::ProjectionClose),
+        }
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct ProjectionStart {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(string, tag = "2")]
+        pub title: String,
+        #[prost(string, tag = "3")]
+        pub app_id: String,
+        #[prost(uint32, tag = "4")]
+        pub pixel_w: u32,
+        #[prost(uint32, tag = "5")]
+        pub pixel_h: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionAccepted {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub pixel_w: u32,
+        #[prost(uint32, tag = "3")]
+        pub pixel_h: u32,
+        #[prost(double, tag = "4")]
+        pub scale: f64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionRefused {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub reason: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionResize {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub pixel_w: u32,
+        #[prost(uint32, tag = "3")]
+        pub pixel_h: u32,
+        #[prost(double, tag = "4")]
+        pub scale: f64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionGeometry {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub pixel_w: u32,
+        #[prost(uint32, tag = "3")]
+        pub pixel_h: u32,
+        #[prost(uint32, tag = "4")]
+        pub parking: u32,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct ProjectionTitle {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(string, tag = "2")]
+        pub title: String,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionFocus {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(bool, tag = "2")]
+        pub focused: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionKeyFrameRequest {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionEnd {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub reason: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionClose {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub reason: u32,
+    }
+
     #[derive(Clone, PartialEq, prost::Message)]
     pub struct ControlMessage {
         #[prost(
             oneof = "control_message::Body",
-            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12"
+            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13"
         )]
         pub body: Option<control_message::Body>,
     }
@@ -454,6 +825,8 @@ mod pb {
             Pong(super::Pong),
             #[prost(message, tag = "12")]
             Goodbye(super::Goodbye),
+            #[prost(message, tag = "13")]
+            Projection(super::Projection),
         }
     }
 

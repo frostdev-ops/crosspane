@@ -3,8 +3,8 @@
 use crosspane_protocol::msg::{InputMessage, MAX_HELD_KEYS, PointerMessage, Refusal, TargetStatus};
 use crosspane_protocol::wire::{
     Frame, FrameDecoder, HEADER_LEN, KIND_ACK, KIND_BUTTON, KIND_KEY, KIND_LOCK_KEYS, KIND_POINTER,
-    KIND_SCROLL, KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION, WireError, decode_input,
-    decode_pointer, encode_input, encode_pointer,
+    KIND_PROJ_HELD, KIND_SCROLL, KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION,
+    WireError, decode_input, decode_pointer, encode_input, encode_pointer,
 };
 use crosspane_types::geom::{PointDevice, VectorLogical};
 use crosspane_types::hid::{HidUsage, MouseButton};
@@ -349,7 +349,7 @@ fn rejects_reserved_bytes() {
 #[test]
 fn rejects_unknown_kind() {
     for kind in 0u8..=255 {
-        if !(KIND_KEY..=KIND_STATUS).contains(&kind) {
+        if !(KIND_KEY..=KIND_PROJ_HELD).contains(&kind) {
             let bytes = header(kind, 0);
             let frame = one_frame(&bytes);
             assert_eq!(decode_input(&frame), Err(WireError::BadKind(kind)));
