@@ -559,7 +559,8 @@ fn pull_runs_the_same_projection_path_and_checks_window_present() {
                 Message::Geometry {
                     projection: ID,
                     size: size(),
-                    parking: ParkingKind::Twin
+                    parking: ParkingKind::Twin,
+                    answers: 0
                 }
             ),
             Output::Notice(Notice::ProjectionStarted {

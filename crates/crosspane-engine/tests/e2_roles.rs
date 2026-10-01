@@ -88,6 +88,24 @@ fn accepted() -> Message {
         scale: 2.0,
     }
 }
+/// What a destination sends when a suspended projection resumes: `Accepted`, then a fresh
+/// numbered `Resize` for the same size (so a request the disconnect discarded can't strand the
+/// correlation of the source's answers).
+fn resume_messages(size: PixelSize, scale: f64, request: u32) -> Vec<Message> {
+    vec![
+        Message::Accepted {
+            projection: ID,
+            size,
+            scale,
+        },
+        Message::Resize {
+            projection: ID,
+            request,
+            size,
+            scale,
+        },
+    ]
+}
 fn closed(peer: NodeId) -> Input {
     Input::Link(LinkEvent::Closed {
         peer,
@@ -319,6 +337,18 @@ fn inputs(out: &[Output]) -> Vec<ProjInput> {
         })
         .collect()
 }
+/// What a Twin-parked source sends to answer request `answers` with the window at `size`.
+fn sent_geometry(size: PixelSize, answers: u32) -> Output {
+    Output::SendControl {
+        peer: B,
+        msg: ControlMessage::Projection(Message::Geometry {
+            projection: ID,
+            size,
+            parking: ParkingKind::Twin,
+            answers,
+        }),
+    }
+}
 fn up() -> InjectCmd {
     InjectCmd::Key {
         usage: KEY,
@@ -387,7 +417,8 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
         vec![Message::Geometry {
             projection: ID,
             size: size(),
-            parking: ParkingKind::Twin
+            parking: ParkingKind::Twin,
+            answers: 0
         }]
     );
     assert!(matches!(
@@ -450,6 +481,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
                 B,
                 Message::Resize {
                     projection: ID,
+                    request: 1,
                     size: resized,
                     scale: 1.5
                 }
@@ -467,6 +499,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
             B,
             Message::Resize {
                 projection: ID,
+                request: 2,
                 size: size(),
                 scale: 1.0,
             },
@@ -478,6 +511,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
             B,
             Message::Resize {
                 projection: ID,
+                request: 3,
                 size: PixelSize::new(900, 700),
                 scale: 1.0,
             },
@@ -501,10 +535,12 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
     );
     assert_eq!(
         messages(&out),
+        // It answers the request that was running (1), not the newer one queued behind it (3).
         vec![Message::Geometry {
             projection: ID,
             size: resized,
-            parking: ParkingKind::Twin
+            parking: ParkingKind::Twin,
+            answers: 1
         }]
     );
     assert_eq!(
@@ -1207,6 +1243,7 @@ fn destination_grants_open_accept_refusal_and_geometry() {
         )),
         vec![accepted()]
     );
+    // The first geometry tells the host the parking kind, even at the proxy's own size.
     assert_eq!(
         f.handle(
             control(
@@ -1214,7 +1251,8 @@ fn destination_grants_open_accept_refusal_and_geometry() {
                 Message::Geometry {
                     projection: ID,
                     size: size(),
-                    parking: ParkingKind::Twin
+                    parking: ParkingKind::Twin,
+                    answers: 0
                 }
             ),
             0
@@ -1228,16 +1266,24 @@ fn destination_grants_open_accept_refusal_and_geometry() {
     // The source's content differs from the proxy (an app minimum, say). The proxy follows it,
     // and reporting that size back is not a new request; a size of the user's own still is.
     let content = PixelSize::new(size().width + 52, size().height);
-    f.handle(
-        control(
-            A,
-            Message::Geometry {
-                projection: ID,
-                size: content,
-                parking: ParkingKind::Twin,
-            },
+    assert_eq!(
+        f.handle(
+            control(
+                A,
+                Message::Geometry {
+                    projection: ID,
+                    size: content,
+                    parking: ParkingKind::Twin,
+                    answers: 0
+                },
+            ),
+            0,
         ),
-        0,
+        vec![Output::ProxyGeometry {
+            key: key(A),
+            size: content,
+            parking: ParkingKind::Twin
+        }]
     );
     assert!(
         messages(&f.proxy(
@@ -1257,8 +1303,11 @@ fn destination_grants_open_accept_refusal_and_geometry() {
             },
             200
         )),
+        // The source is at a different size than it was asked for, so the user's size is a
+        // genuine request, not a repeat.
         vec![Message::Resize {
             projection: ID,
+            request: 1,
             size: size(),
             scale: 2.0
         }]
@@ -1522,6 +1571,7 @@ fn heartbeat_resize_and_keyframe_cadences_use_exact_deadlines() {
         messages(&f.handle(Input::Tick, 601)),
         vec![Message::Resize {
             projection: ID,
+            request: 2,
             size: PixelSize::new(900, 480),
             scale: 1.5
         }]
@@ -1808,6 +1858,7 @@ fn late_parking_and_resize_results_always_restore_even_on_failure() {
                         B,
                         Message::Resize {
                             projection: ID,
+                            request: 1,
                             size: PixelSize::new(800, 600),
                             scale: 1.0,
                         },
@@ -1859,6 +1910,7 @@ fn unanswered_parking_expires_and_removed_windows_clear_pending_cleanup() {
                     B,
                     Message::Resize {
                         projection: ID,
+                        request: 1,
                         size: size(),
                         scale: 1.0,
                     },
@@ -1941,13 +1993,17 @@ fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
             (size(), 2.0, false),
         ] {
             let mut f = startup(stage);
-            for (size, scale) in [(PixelSize::new(700, 500), 3.0), (wanted, scale)] {
+            for (request, (size, scale)) in [(PixelSize::new(700, 500), 3.0), (wanted, scale)]
+                .into_iter()
+                .enumerate()
+            {
                 assert!(
                     f.handle(
                         control(
                             B,
                             Message::Resize {
                                 projection: ID,
+                                request: request as u32 + 1,
                                 size,
                                 scale
                             }
@@ -1985,7 +2041,8 @@ fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
                         scale,
                     }]
                 } else {
-                    vec![]
+                    // Already the actual size and scale: answered at once, no platform work.
+                    vec![sent_geometry(size(), 2)]
                 }
             );
         }
@@ -1997,6 +2054,7 @@ fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
             B,
             Message::Resize {
                 projection: ID,
+                request: 1,
                 size: size(),
                 scale: 2.0,
             },
@@ -2031,7 +2089,7 @@ fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
 }
 
 #[test]
-fn source_rejects_invalid_sizes_without_parking_or_overwriting_valid_resize() {
+fn source_refuses_invalid_sizes_without_parking_but_answers_them() {
     for bad in [
         PixelSize::new(0, 1),
         PixelSize::new(1, 0),
@@ -2065,19 +2123,80 @@ fn source_rejects_invalid_sizes_without_parking_or_overwriting_valid_resize() {
         assert_eq!(f.e2.next_deadline(), None);
         for stage in 0..4 {
             let mut f = startup(stage);
+            let out = f.handle(
+                control(
+                    B,
+                    Message::Resize {
+                        projection: ID,
+                        request: 1,
+                        size: bad,
+                        scale: 1.0,
+                    },
+                ),
+                50,
+            );
+            // No platform work either way. Live: answered at once with the actual size, so the
+            // destination never waits for an answer that can't come. Before that it is queued,
+            // and answered the moment the window is live.
+            if stage == 3 {
+                assert_eq!(out, vec![sent_geometry(size(), 1)]);
+            } else {
+                assert!(out.is_empty());
+                if stage < 1 {
+                    f.handle(control(B, accepted()), 51);
+                }
+                if stage < 2 {
+                    f.handle(
+                        Input::Parked {
+                            window: WINDOW,
+                            result: Ok(parked(WINDOW, PlatformParking::Twin, size())),
+                        },
+                        52,
+                    );
+                }
+                let out = f.handle(
+                    Input::CaptureStarted {
+                        projection: ID,
+                        result: Ok(StreamId(1)),
+                    },
+                    53,
+                );
+                assert_eq!(out, vec![sent_geometry(size(), 1)]);
+            }
+            // The watermark moved: an older request is stale, a newer one is processed.
             assert!(
                 f.handle(
                     control(
                         B,
                         Message::Resize {
                             projection: ID,
-                            size: bad,
-                            scale: 1.0
-                        }
+                            request: 1,
+                            size: PixelSize::new(800, 600),
+                            scale: 1.0,
+                        },
                     ),
-                    50
+                    60,
                 )
                 .is_empty()
+            );
+            assert_eq!(
+                f.handle(
+                    control(
+                        B,
+                        Message::Resize {
+                            projection: ID,
+                            request: 2,
+                            size: PixelSize::new(800, 600),
+                            scale: 1.0,
+                        },
+                    ),
+                    61,
+                ),
+                vec![Output::ResizeParked {
+                    window: WINDOW,
+                    size: PixelSize::new(800, 600),
+                    scale: 1.0
+                }]
             );
         }
     }
@@ -2108,6 +2227,7 @@ fn source_rejects_invalid_sizes_without_parking_or_overwriting_valid_resize() {
             B,
             Message::Resize {
                 projection: ID,
+                request: 1,
                 size: size(),
                 scale: 1.0,
             },
@@ -2119,12 +2239,15 @@ fn source_rejects_invalid_sizes_without_parking_or_overwriting_valid_resize() {
             B,
             Message::Resize {
                 projection: ID,
+                request: 2,
                 size: PixelSize::new(0, 0),
                 scale: 2.0,
             },
         ),
         41,
     );
+    // The refused request replaced the queued valid one: neither does platform work, and the
+    // newest (the refused one) is answered when the window goes live.
     assert_eq!(
         f.handle(
             Input::CaptureStarted {
@@ -2133,11 +2256,7 @@ fn source_rejects_invalid_sizes_without_parking_or_overwriting_valid_resize() {
             },
             50
         ),
-        vec![Output::ResizeParked {
-            window: WINDOW,
-            size: size(),
-            scale: 1.0
-        }]
+        vec![sent_geometry(size(), 2)]
     );
 }
 
@@ -2585,7 +2704,8 @@ fn pending_proxy_ignores_geometry_and_title_but_honours_close_and_lost() {
                     Message::Geometry {
                         projection: ID,
                         size: size(),
-                        parking: ParkingKind::Twin
+                        parking: ParkingKind::Twin,
+                        answers: 0
                     }
                 ),
                 0
@@ -3236,10 +3356,13 @@ fn grace_round_trip_keeps_parking_and_proxy_and_resumes_input() {
         let accepted_out = destination.handle(control(A, messages(&resumed)[0].clone()), 101);
         assert_eq!(
             accepted_out,
-            vec![Output::SendControl {
-                peer: A,
-                msg: ControlMessage::Projection(accepted()),
-            }]
+            resume_messages(size(), 2.0, 1)
+                .into_iter()
+                .map(|msg| Output::SendControl {
+                    peer: A,
+                    msg: ControlMessage::Projection(msg),
+                })
+                .collect::<Vec<_>>()
         );
         let capture = source.handle(control(B, accepted()), 102);
         let parking = if kind == PlatformParking::Twin {
@@ -3270,7 +3393,8 @@ fn grace_round_trip_keeps_parking_and_proxy_and_resumes_input() {
                     msg: ControlMessage::Projection(Message::Geometry {
                         projection: ID,
                         size: size(),
-                        parking
+                        parking,
+                        answers: 0
                     })
                 },
             ]
@@ -3526,7 +3650,7 @@ fn grace_drops_restart_the_deadline_in_suspension_and_during_resume() {
         );
         assert_eq!(
             messages(&destination.handle(control(A, start()), now)),
-            vec![accepted()]
+            resume_messages(size(), 2.0, stream as u32 - 1)
         );
         assert!(matches!(
             source.handle(control(B, accepted()), now)[0],
@@ -3594,6 +3718,7 @@ fn grace_resume_resizes_changed_size_or_scale_before_capture() {
                     } else {
                         ParkingKind::Mirror
                     },
+                    answers: 0,
                 }]
             );
             assert_eq!(out.len(), 2);
@@ -3717,15 +3842,9 @@ fn grace_destination_accepts_the_latest_proxy_size_without_reopening() {
     }
     assert!(f.handle(Input::Tick, 100).is_empty());
     let out = f.handle(control(A, start()), 200);
-    assert_eq!(
-        messages(&out),
-        vec![Message::Accepted {
-            projection: ID,
-            size: current,
-            scale: 1.25
-        }]
-    );
-    assert_eq!(out.len(), 1);
+    // The resume asks again, for the size the proxy has now, with the next request number.
+    assert_eq!(messages(&out), resume_messages(current, 1.25, 2));
+    assert_eq!(out.len(), 2);
     assert!(f.handle(control(A, start()), 201).is_empty());
     let heartbeat_out = f.handle(Input::Tick, 450);
     assert_eq!(inputs(&heartbeat_out).len(), 1);
@@ -3758,7 +3877,7 @@ fn grace_pending_proxy_open_finishes_without_sending_on_the_closed_link() {
         }
         let out = f.handle(control(A, start()), 3);
         if opens_before_start {
-            assert_eq!(messages(&out), vec![accepted()]);
+            assert_eq!(messages(&out), resume_messages(size(), 2.0, 1));
         } else {
             assert!(out.is_empty());
             assert_eq!(f.e2.next_deadline(), Some(ms(10_003)));
@@ -3786,6 +3905,7 @@ fn grace_resume_waits_for_old_parking_and_capture_results_and_drops_queued_resiz
                     B,
                     Message::Resize {
                         projection: ID,
+                        request: 1,
                         size: PixelSize::new(700, 500),
                         scale: 2.0,
                     },
@@ -3797,6 +3917,7 @@ fn grace_resume_waits_for_old_parking_and_capture_results_and_drops_queued_resiz
                     B,
                     Message::Resize {
                         projection: ID,
+                        request: 2,
                         size: PixelSize::new(900, 700),
                         scale: 2.0,
                     },

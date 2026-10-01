@@ -557,6 +557,7 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
         }),
         ProjectionMessage::Resize {
             projection,
+            request,
             size,
             scale,
         } => {
@@ -566,12 +567,14 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 pixel_w: size.width,
                 pixel_h: size.height,
                 scale: *scale,
+                request: *request,
             })
         }
         ProjectionMessage::Geometry {
             projection,
             size,
             parking,
+            answers,
         } => {
             let parking = match parking {
                 ParkingKind::Twin => 1,
@@ -582,6 +585,7 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 pixel_w: size.width,
                 pixel_h: size.height,
                 parking,
+                answers: *answers,
             })
         }
         ProjectionMessage::Title { projection, title } => {
@@ -701,6 +705,7 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
             check_projection_scale(resize.scale)?;
             ProjectionMessage::Resize {
                 projection: ProjectionId(resize.projection),
+                request: resize.request,
                 size: PixelSize::new(resize.pixel_w, resize.pixel_h),
                 scale: resize.scale,
             }
@@ -715,6 +720,7 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
                 projection: ProjectionId(geometry.projection),
                 size: PixelSize::new(geometry.pixel_w, geometry.pixel_h),
                 parking,
+                answers: geometry.answers,
             }
         }
         Body::Title(title) => {
@@ -912,6 +918,8 @@ mod pb {
         pub pixel_h: u32,
         #[prost(double, tag = "4")]
         pub scale: f64,
+        #[prost(uint32, tag = "5")]
+        pub request: u32,
     }
 
     #[derive(Clone, Copy, PartialEq, prost::Message)]
@@ -924,6 +932,8 @@ mod pb {
         pub pixel_h: u32,
         #[prost(uint32, tag = "4")]
         pub parking: u32,
+        #[prost(uint32, tag = "5")]
+        pub answers: u32,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

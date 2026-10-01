@@ -239,10 +239,9 @@ impl App {
                     return;
                 }
                 if let Some(window) = self.windows.get_mut(&id) {
-                    let result = window.window.request_inner_size(fit(
-                        logical_size(size, window.window.scale_factor()),
-                        screen(window.window.current_monitor().as_ref()),
-                    ));
+                    // The source's size is exact: no opening fit and no logical rounding, or the
+                    // window system's answer would differ from it and be sent back as a resize.
+                    let result = window.window.request_inner_size(content_request(size));
                     if let Some(actual) = result {
                         self.resized(id, actual, window_scale(&self.windows, id));
                     }
@@ -329,6 +328,13 @@ impl App {
             HostCommand::Run(function) => function(),
         }
         self.check_gpu();
+    }
+
+    fn geometry_changed(&mut self, id: u64, report: Report) {
+        if report.stale {
+            tracing::debug!(id, size = ?report.size, scale = report.scale, "window event payload was stale");
+        }
+        self.resized(id, report.size, report.scale);
     }
 
     fn resized(&mut self, id: u64, size: PhysicalSize<u32>, scale: f64) {
@@ -477,13 +483,16 @@ impl ApplicationHandler<HostCommand> for App {
                 }
                 (self.events)(HostEvent::Focus { id, focused });
             }
+            // What is reported is the window as it is now, never the event's own payload: winit's
+            // macOS `Resized` is a frame snapshot taken when the event was queued, and delivery
+            // can come after later native changes.
             WindowEvent::Resized(size) => {
-                let scale = window.window.scale_factor();
-                self.resized(id, size, scale);
+                let report = reported(Change::Resized(size), sample(&window.window));
+                self.geometry_changed(id, report);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                let size = window.window.inner_size();
-                self.resized(id, size, scale_factor);
+                let report = reported(Change::ScaleFactor(scale_factor), sample(&window.window));
+                self.geometry_changed(id, report);
             }
             WindowEvent::CloseRequested => (self.events)(HostEvent::CloseRequested { id }),
             WindowEvent::Destroyed => self.remove(id, true),
@@ -646,6 +655,51 @@ impl ProxyWindow {
 fn pixel_size(size: PhysicalSize<u32>) -> PixelSize {
     PixelSize::new(size.width, size.height)
 }
+
+/// A window event saying the window's geometry changed, as winit delivers it.
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    /// `WindowEvent::Resized`: the size when the event was queued.
+    Resized(PhysicalSize<u32>),
+    /// `WindowEvent::ScaleFactorChanged`: the scale when the event was queued.
+    ScaleFactor(f64),
+}
+
+/// What a geometry event reports to the engine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Report {
+    size: PhysicalSize<u32>,
+    scale: f64,
+    /// The event's own payload disagreed with the window as it is now.
+    stale: bool,
+}
+
+/// The window's actual content size and scale, sampled together.
+fn sample(window: &Window) -> (PhysicalSize<u32>, f64) {
+    (window.inner_size(), window.scale_factor())
+}
+
+/// What a geometry event reports: the window's `actual` size and scale, sampled together when
+/// the event is handled. The event's own payload only says that something changed; it may be
+/// older than later native changes, and reporting it would tell the engine the user resized the
+/// proxy to a size it no longer has.
+fn reported(change: Change, actual: (PhysicalSize<u32>, f64)) -> Report {
+    let stale = match change {
+        Change::Resized(size) => size != actual.0,
+        Change::ScaleFactor(scale) => scale != actual.1,
+    };
+    Report {
+        size: actual.0,
+        scale: actual.1,
+        stale,
+    }
+}
+
+/// The size to request for a `SetContentSize`: the exact physical content size. Only the opening
+/// size is fitted to the screen (`fit`); the size the source reports back is applied as it is.
+fn content_request(size: PixelSize) -> PhysicalSize<u32> {
+    PhysicalSize::new(size.width, size.height)
+}
 fn logical_size(size: PixelSize, scale: f64) -> LogicalSize<f64> {
     LogicalSize::new(
         f64::from(size.width) / scale,
@@ -682,6 +736,66 @@ fn window_scale(windows: &HashMap<u64, ProxyWindow>, id: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geometry_events_report_the_sampled_size_and_scale_not_their_payload() {
+        let report = |size: (u32, u32), scale| Report {
+            size: PhysicalSize::new(size.0, size.1),
+            scale,
+            stale: false,
+        };
+        let actual = (PhysicalSize::new(800, 600), 2.0);
+        // A stale snapshot A (the window has since become B): B is reported, never A.
+        assert_eq!(
+            reported(Change::Resized(PhysicalSize::new(700, 500)), actual),
+            Report {
+                stale: true,
+                ..report((800, 600), 2.0)
+            }
+        );
+        // A current one is reported as it is.
+        assert_eq!(
+            reported(Change::Resized(PhysicalSize::new(800, 600)), actual),
+            report((800, 600), 2.0)
+        );
+        // A deferred scale change: the size and scale come from the same sample, so the size
+        // that went with the new scale is reported with it (not the queued scale alone).
+        let moved = (PhysicalSize::new(1600, 1200), 2.0);
+        assert_eq!(
+            reported(Change::ScaleFactor(1.0), moved),
+            Report {
+                stale: true,
+                ..report((1600, 1200), 2.0)
+            }
+        );
+        assert_eq!(
+            reported(Change::ScaleFactor(2.0), moved),
+            report((1600, 1200), 2.0)
+        );
+    }
+
+    #[test]
+    fn content_size_requests_are_exact_physical_sizes() {
+        // Odd sizes: 777x433 at scale 2 is 388.5x216.5 logical, which `fit` floors to 388x216
+        // (776x432 physical), a size that is not the one the source reported.
+        let laptop = Some(LogicalSize::new(1512.0, 982.0));
+        assert_eq!(
+            fit(logical_size(PixelSize::new(777, 433), 2.0), laptop),
+            LogicalSize::new(388.0, 216.0)
+        );
+        assert_eq!(
+            content_request(PixelSize::new(777, 433)),
+            PhysicalSize::new(777, 433)
+        );
+        // Beyond the opening fit: on a 1512x982 logical screen at scale 2 it would cap 2800x1600
+        // physical to 2720x1554. The request is neither capped nor reshaped.
+        let size = PixelSize::new(2800, 1600);
+        assert_eq!(
+            fit(logical_size(size, 2.0), laptop),
+            LogicalSize::new(1360.0, 777.0)
+        );
+        assert_eq!(content_request(size), PhysicalSize::new(2800, 1600));
+    }
 
     #[test]
     fn proxies_fit_the_screen() {

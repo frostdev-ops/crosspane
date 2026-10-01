@@ -44,7 +44,17 @@ pub(super) struct Source {
     capture_pending: bool,
     resizing: bool,
     resume_geometry: Option<(PixelSize, f64)>,
-    latest_resize: Option<(PixelSize, f64)>,
+    /// The newest resize request received but not started (latest value wins), with its number.
+    latest_resize: Option<(PixelSize, f64, u32)>,
+    /// The newest `Resize` request number received (0 before any): a request that isn't newer is
+    /// a duplicate or arrived out of order.
+    received: u32,
+    /// The newest request number this projection has finished processing (0 before any): its
+    /// `Geometry` says so, so the destination knows which of its requests the geometry reflects.
+    answered: u32,
+    /// The request number of the resize in flight (`resizing`); `None` if it isn't a request (a
+    /// re-park, or a resume's). A destination that predates numbers sends 0.
+    inflight: Option<u32>,
     /// The size the destination last asked for (Accepted or Resize).
     wanted: Option<PixelSize>,
     /// The window's frame when the last park or resize finished.
@@ -124,6 +134,9 @@ impl E2 {
                 resizing: false,
                 resume_geometry: None,
                 latest_resize: None,
+                received: 0,
+                answered: 0,
+                inflight: None,
                 wanted: None,
                 parked_frame: None,
                 last_repark: None,
@@ -340,30 +353,12 @@ impl E2 {
                 }));
                 self.end_source(projection, Reason::Failed, true, now, out);
             }
-            Message::Resize { size, scale, .. }
-                if source.stage == Stage::Live
-                    && !source.resizing
-                    && source.wanted == Some(*size)
-                    && source.parked_scale == *scale =>
-            {
-                // Nothing to do: the window is already parked at this size and scale.
-            }
-            Message::Resize { size, scale, .. }
-                if sane_size(*size) && !matches!(source.stage, Stage::Suspended(_)) =>
-            {
-                source.wanted = Some(*size);
-                if source.stage != Stage::Live || source.resizing {
-                    source.latest_resize = Some((*size, *scale));
-                } else {
-                    source.resizing = true;
-                    source.parked_scale = *scale;
-                    out.push(Output::ResizeParked {
-                        window: source.window,
-                        size: *size,
-                        scale: *scale,
-                    });
-                }
-            }
+            Message::Resize {
+                request,
+                size,
+                scale,
+                ..
+            } => source.on_resize(projection, *request, *size, *scale, out),
             Message::Focus { focused: true, .. } if source.stage == Stage::Live => {
                 self.focus_source(projection, now, out);
             }
@@ -409,6 +404,11 @@ impl E2 {
         let initial = matches!(source.stage, Stage::Parking(_));
         // This operation has answered, so ending it must not wait for another Parked result.
         source.resizing = false;
+        // Its request, if it was one, is answered by the geometry below; a newer queued one is
+        // not (it has its own operation).
+        if let Some(request) = source.inflight.take() {
+            source.answered = request;
+        }
         if initial {
             source.stage = Stage::Capturing(now.saturating_add(START_TIMEOUT));
         }
@@ -451,11 +451,12 @@ impl E2 {
                     projection,
                     size,
                     parking,
+                    answers: source.answered,
                 },
                 out,
             );
             source.resizing = false;
-            source.resize_latest(out);
+            source.resize_latest(projection, out);
         }
     }
 
@@ -487,7 +488,7 @@ impl E2 {
                 Ok(stream) => {
                     source.stream = Some(stream);
                     source.stage = Stage::Live;
-                    source.resize_latest(out);
+                    source.resize_latest(projection, out);
                     if source.focus_wanted {
                         self.focus_source(projection, now, out);
                     }
@@ -737,6 +738,7 @@ impl E2 {
                 && let Some(size) = source.wanted
             {
                 source.resizing = true;
+                source.inflight = None;
                 source.last_repark = Some(now);
                 out.push(Output::ResizeParked {
                     window: source.window,
@@ -795,6 +797,7 @@ impl Source {
             && (size != wanted || self.parked_scale != scale)
         {
             self.resizing = true;
+            self.inflight = None;
             self.parked_scale = scale;
             out.push(Output::ResizeParked {
                 window: self.window,
@@ -835,6 +838,7 @@ impl Source {
                 projection,
                 size,
                 parking,
+                answers: self.answered,
             },
             out,
         );
@@ -854,21 +858,88 @@ impl Source {
         true
     }
 
-    fn resize_latest(&mut self, out: &mut Vec<Output>) {
-        if let Some((size, scale)) = self.latest_resize.take()
-            && (self
-                .parked
-                .and_then(geometry)
-                .is_none_or(|(actual, _)| actual != size)
-                || self.parked_scale != scale)
-        {
-            self.resizing = true;
-            self.parked_scale = scale;
-            out.push(Output::ResizeParked {
-                window: self.window,
-                size,
-                scale,
-            });
+    /// A `Resize` from the destination.
+    fn on_resize(
+        &mut self,
+        projection: ProjectionId,
+        request: u32,
+        size: PixelSize,
+        scale: f64,
+        out: &mut Vec<Output>,
+    ) {
+        // Request numbers only grow. One that doesn't is a duplicate, or arrived out of order.
+        // 0 is a destination that predates numbering: always the newest, answered with 0.
+        if request != 0 && request <= self.received {
+            return;
+        }
+        if matches!(self.stage, Stage::Suspended(_)) {
+            return;
+        }
+        self.received = self.received.max(request);
+        // A size outside the sane range is refused, but still a numbered request: it replaces
+        // any queued one and is answered in its turn (with the actual size, no platform work),
+        // so the destination never waits for an answer that can't come.
+        let sane = sane_size(size);
+        if sane {
+            self.wanted = Some(size);
+        }
+        if self.stage != Stage::Live || self.resizing {
+            // Not now: the newest request wins, and the older one is not answered on its own.
+            self.latest_resize = Some((size, scale, request));
+            return;
+        }
+        if !sane {
+            self.answer(projection, request, out);
+            return;
+        }
+        // Satisfied means the window really is this size at this scale. What was asked before
+        // doesn't count: an app's minimum size makes the two differ.
+        let satisfied = self.parked_scale == scale
+            && self.parked.and_then(geometry).map(|(actual, _)| actual) == Some(size);
+        if satisfied {
+            self.answer(projection, request, out);
+        } else {
+            self.begin_resize(size, scale, request, out);
+        }
+    }
+
+    fn begin_resize(&mut self, size: PixelSize, scale: f64, request: u32, out: &mut Vec<Output>) {
+        self.resizing = true;
+        self.parked_scale = scale;
+        self.inflight = Some(request);
+        out.push(Output::ResizeParked {
+            window: self.window,
+            size,
+            scale,
+        });
+    }
+
+    /// Answer `request` with the window's actual geometry, without a platform operation.
+    fn answer(&mut self, projection: ProjectionId, request: u32, out: &mut Vec<Output>) {
+        self.answered = request;
+        if let Some((size, parking)) = self.parked.and_then(geometry) {
+            send(
+                self.peer,
+                Message::Geometry {
+                    projection,
+                    size,
+                    parking,
+                    answers: self.answered,
+                },
+                out,
+            );
+        }
+    }
+
+    fn resize_latest(&mut self, projection: ProjectionId, out: &mut Vec<Output>) {
+        let Some((size, scale, request)) = self.latest_resize.take() else {
+            return;
+        };
+        let actual = self.parked.and_then(geometry).map(|(actual, _)| actual);
+        if !sane_size(size) || (actual == Some(size) && self.parked_scale == scale) {
+            self.answer(projection, request, out);
+        } else {
+            self.begin_resize(size, scale, request, out);
         }
     }
 }

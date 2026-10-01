@@ -7,7 +7,7 @@ use crosspane_input::Held;
 use crosspane_input::timing::{HEARTBEAT_HELD, HEARTBEAT_IDLE};
 use crosspane_protocol::msg::{Capability, InputMessage, MAX_HELD_KEYS, Refusal};
 use crosspane_protocol::projection::{
-    ProjInput, ProjectionEndReason as Reason, ProjectionMessage as Message,
+    ParkingKind, ProjInput, ProjectionEndReason as Reason, ProjectionMessage as Message,
 };
 use crosspane_types::geom::{PixelSize, PointDevice};
 use crosspane_types::id::NodeId;
@@ -20,6 +20,13 @@ use crate::io::{Command, Failure, Notice, Output, ProjectionKey, ProxyEvent};
 // Ceiling of 1 second / 120: rounding downward would exceed 120 Hz.
 const MOTION_SLOT: Duration = Duration::from_nanos(8_333_334);
 const RESIZE_SLOT: Duration = Duration::from_millis(50);
+/// After the last user resize, the user counts as still resizing for this long: the source's
+/// answer is held back that long, so it never fights a drag in progress.
+const RESIZE_QUIET: Duration = Duration::from_millis(250);
+/// How long after a size was asked of the host a matching callback still counts as the host's
+/// own resize. It bounds classification only (a slow callback is read as the user's, costing one
+/// request); the unconfirmed command itself is remembered until confirmed or superseded.
+const COMMAND_TTL: Duration = Duration::from_secs(1);
 const KEYFRAME_SLOT: Duration = Duration::from_millis(200);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_CAP: usize = 16;
@@ -40,8 +47,32 @@ pub(super) struct Destination {
     resize_due: Option<MonoTime>,
     last_resize: Option<MonoTime>,
     /// The size and scale last sent to the source (Accepted or Resize): a proxy that reports
-    /// the same size again is not a resize (window systems repeat configures).
+    /// the same size again is not a resize (window systems repeat configures). Only this side's
+    /// own requests write it, never the source's `Geometry`.
     last_sent: Option<(PixelSize, f64)>,
+    /// The number of the last `Resize` sent: 0 before the first. A `Geometry` resizes the proxy
+    /// only if it answers this one.
+    request: u32,
+    /// The window's actual content size the source reported in answer to `last_sent`'s request:
+    /// `None` while that request is outstanding. (The source parks at the scale it was asked
+    /// for, so the scale can't differ.) A size the user drags back to is a new request when the
+    /// source is known to be at a different one.
+    acknowledged: Option<PixelSize>,
+    /// The newest size asked of the host (`ProxyGeometry`) that the host hasn't confirmed yet,
+    /// with the scale and the time then. A newer command replaces it, so it always equals the
+    /// newest source geometry applied; a matching callback (within `COMMAND_TTL`) confirms it;
+    /// user intent clears it. Its age never makes it irrelevant: it says what the proxy is about
+    /// to be, however late the host reports it. The host reports its own resizes through the
+    /// same event as the user's, so matching is a heuristic only: correctness rests on request
+    /// numbers, and either misreading is restored by one more request.
+    commanded: Option<(PixelSize, f64, MonoTime)>,
+    /// The parking kind of the last `ProxyGeometry` emitted (none before the first).
+    parking: Option<ParkingKind>,
+    /// The user counts as resizing until this time (extended by every user `Resized`).
+    active_until: Option<MonoTime>,
+    /// The source's answer to the newest request, held while the user is resizing: applied when
+    /// the user is quiet. Only ever set while `active_until` is.
+    held_geometry: Option<(PixelSize, ParkingKind)>,
     last_heartbeat: MonoTime,
     heartbeat_due: Option<MonoTime>,
     last_keyframe: Option<MonoTime>,
@@ -91,6 +122,110 @@ impl Destination {
             },
             out,
         )
+    }
+
+    /// Whether the user is resizing the proxy right now (or just was).
+    fn user_active(&self, now: MonoTime) -> bool {
+        self.resize.is_some() || self.active_until.is_some_and(|until| now < until)
+    }
+
+    /// Whether a user resize to `size` at `scale` repeats what the source already has: it is the
+    /// last request, and that is still outstanding or was met exactly. If the source answered
+    /// with another size (an app's minimum), the user's renewed request is a genuine one.
+    fn repeats(&self, size: PixelSize, scale: f64) -> bool {
+        self.last_sent == Some((size, scale))
+            && self.acknowledged.is_none_or(|actual| actual == size)
+    }
+
+    /// Send a `Resize` carrying the next request number. Returns false when the numbers run out.
+    fn send_resize(
+        &mut self,
+        key: ProjectionKey,
+        size: PixelSize,
+        scale: f64,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) -> bool {
+        let Some(request) = self.request.checked_add(1) else {
+            return false;
+        };
+        self.request = request;
+        self.last_resize = Some(now);
+        self.last_sent = Some((size, scale));
+        self.acknowledged = None;
+        // The held answer was to an older request: a newer answer will come.
+        self.held_geometry = None;
+        send(
+            key.source,
+            Message::Resize {
+                projection: key.projection,
+                request,
+                size,
+                scale,
+            },
+            out,
+        );
+        true
+    }
+
+    /// The source's answer to the newest request: resize the proxy to it if it differs, and tell
+    /// the host about a changed parking kind even at an unchanged size.
+    fn apply_geometry(
+        &mut self,
+        key: ProjectionKey,
+        size: PixelSize,
+        parking: ParkingKind,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let Some((current, scale)) = self.current else {
+            return;
+        };
+        // What the proxy is, or is about to be: a size already asked for and not yet confirmed
+        // counts (whatever its age), or an answer that returns to the old size would never be
+        // sent.
+        let expected = self.commanded.map_or(current, |(asked, _, _)| asked);
+        let resizes = expected != size;
+        if !resizes && self.parking == Some(parking) {
+            return;
+        }
+        if resizes {
+            // The proxy is about to have this size, and its callback is the host's own. If it
+            // already has it (the answer undoes an unconfirmed command), there is nothing to
+            // wait for.
+            self.commanded = (size != current).then_some((size, scale, now));
+        }
+        self.parking = Some(parking);
+        out.push(Output::ProxyGeometry { key, size, parking });
+    }
+
+    /// Whether a `Resized` changes nothing: it is the size and scale the proxy already has.
+    /// While a host resize is unconfirmed (commanded, its callback not here yet), `current` is
+    /// not what the window will be, so a report of `current` could just as well be the user
+    /// dragging back onto it, however late the callback is; ignoring that would leave the proxy
+    /// and the source apart with nothing in flight. It is then not "unchanged", and the user's.
+    fn unchanged(&self, size: PixelSize, scale: f64) -> bool {
+        self.current == Some((size, scale))
+            && self
+                .commanded
+                .is_none_or(|(asked, at, _)| (asked, at) == (size, scale))
+    }
+
+    /// A `Resized` from the host (other than one that changes nothing). If it matches the
+    /// unconfirmed host resize this side asked for, and comes within `COMMAND_TTL` of it, it is
+    /// that completing: it confirms the record and the caller sends nothing. Anything else is
+    /// the user's, including a late callback for an older command (the proxy then sits at a size
+    /// the source is no longer at) and a callback that took longer than the TTL.
+    fn programmatic(&mut self, size: PixelSize, scale: f64, now: MonoTime) -> bool {
+        let Some((asked, at, issued)) = self.commanded else {
+            return false;
+        };
+        if asked != size || at != scale || !live(issued, now) {
+            return false;
+        }
+        self.current = Some((size, scale));
+        self.commanded = None;
+        true
     }
 
     fn ups(&mut self, key: ProjectionKey, out: &mut Vec<Output>) {
@@ -199,6 +334,7 @@ impl E2 {
                     destination.suspended = None;
                     if let Some((size, scale)) = destination.current.filter(|_| destination.open) {
                         destination.last_sent = Some((size, scale));
+                        destination.acknowledged = None;
                         destination.last_heartbeat = now;
                         destination.heartbeat_due = now.checked_add(HEARTBEAT_IDLE);
                         send(
@@ -212,6 +348,12 @@ impl E2 {
                         );
                         // A restarted stream's first frame is a key frame (E2-v0, decision 3).
                         // MediaError requests another if that frame cannot be applied.
+                        // Correlation starts afresh: a request the disconnect discarded can
+                        // never be answered, so ask again, for the size the proxy has now.
+                        if !destination.send_resize(key, size, scale, now, out) {
+                            self.end_destination(key, Reason::Failed, false, false, out);
+                            return;
+                        }
                     } else {
                         // The old OpenProxy is still in flight: wait for it, never open twice.
                         destination.open_due = Some(now.saturating_add(OPEN_TIMEOUT));
@@ -254,6 +396,12 @@ impl E2 {
                     resize_due: None,
                     last_resize: None,
                     last_sent: None,
+                    request: 0,
+                    acknowledged: None,
+                    commanded: None,
+                    parking: None,
+                    active_until: None,
+                    held_geometry: None,
                     last_heartbeat: now,
                     heartbeat_due: None,
                     last_keyframe: None,
@@ -271,20 +419,28 @@ impl E2 {
             return;
         };
         match msg {
-            Message::Geometry { size, parking, .. }
-                if destination.open && destination.suspended.is_none() =>
-            {
-                // The proxy is sized to the source's content. When it reports that size back,
-                // the source already has it: echoing it as a Resize would bounce any mismatch
-                // (an app's minimum size, a bar on the twin output) between the nodes forever.
-                if let Some((_, scale)) = destination.current.or(destination.last_sent) {
-                    destination.last_sent = Some((*size, scale));
+            Message::Geometry {
+                size,
+                parking,
+                answers,
+                ..
+            } if destination.open && destination.suspended.is_none() => {
+                // Only the answer to the newest request can resize the proxy. An older one
+                // (including any from a source that predates request numbers) shows the window
+                // as it was before that request: a newer answer will come, and no timer
+                // promotes this one.
+                if *answers == destination.request {
+                    destination.acknowledged = Some(*size);
+                    if destination.user_active(now) {
+                        // Keep only the current answer, until the user is quiet.
+                        destination.held_geometry = Some((*size, *parking));
+                    } else {
+                        // This answer is the newest, even if it needs no command: it
+                        // supersedes any older one still held for the quiet deadline.
+                        destination.held_geometry = None;
+                        destination.apply_geometry(key, *size, *parking, now, out);
+                    }
                 }
-                out.push(Output::ProxyGeometry {
-                    key,
-                    size: *size,
-                    parking: *parking,
-                })
             }
             Message::Title { title, .. } if destination.open && destination.suspended.is_none() => {
                 out.push(Output::ProxyTitle {
@@ -322,6 +478,7 @@ impl E2 {
                     return;
                 }
                 destination.last_sent = Some((size, scale));
+                destination.acknowledged = None;
                 destination.last_heartbeat = now;
                 destination.heartbeat_due = now.checked_add(HEARTBEAT_IDLE);
                 send(
@@ -381,6 +538,17 @@ impl E2 {
             return;
         };
         if let ProxyEvent::Resized { size, scale } = event {
+            if destination.unchanged(*size, *scale) {
+                // Nothing changed (the host can report one change twice).
+                return;
+            }
+            if destination.suspended.is_none() && destination.programmatic(*size, *scale, now) {
+                // The completion of a size this side asked the host for: not the user's.
+                return;
+            }
+            // The user's: it supersedes the outstanding host resize, whose late callback is then
+            // read as the user's too (one harmless extra request).
+            destination.commanded = None;
             destination.current = Some((*size, *scale));
         }
         if destination.suspended.is_some() {
@@ -388,31 +556,22 @@ impl E2 {
         }
         let mut sent = true;
         match event {
-            ProxyEvent::Resized { size, scale }
-                if destination.last_sent == Some((*size, *scale)) =>
-            {
-                // The same size again; drop any coalesced resize that would undo it.
+            ProxyEvent::Resized { size, scale } if destination.repeats(*size, *scale) => {
+                // The user dragged back to the size the source already has; drop any coalesced
+                // resize that would undo it.
+                destination.active_until = Some(now.saturating_add(RESIZE_QUIET));
                 destination.resize = None;
                 destination.resize_due = None;
             }
             ProxyEvent::Resized { size, scale } => {
+                destination.active_until = Some(now.saturating_add(RESIZE_QUIET));
                 if destination
                     .last_resize
                     .is_none_or(|last| now.saturating_duration_since(last) >= RESIZE_SLOT)
                 {
                     destination.resize = None;
                     destination.resize_due = None;
-                    destination.last_resize = Some(now);
-                    destination.last_sent = Some((*size, *scale));
-                    send(
-                        key.source,
-                        Message::Resize {
-                            projection: key.projection,
-                            size: *size,
-                            scale: *scale,
-                        },
-                        out,
-                    );
+                    sent = destination.send_resize(key, *size, *scale, now, out);
                 } else {
                     destination.resize = Some((*size, *scale));
                     destination.resize_due = destination
@@ -575,6 +734,10 @@ impl E2 {
             destination.resize = None;
             destination.resize_due = None;
             destination.last_resize = None;
+            destination.acknowledged = None;
+            destination.commanded = None;
+            destination.active_until = None;
+            destination.held_geometry = None;
             destination.heartbeat_due = None;
             destination.last_keyframe = None;
         }
@@ -642,20 +805,18 @@ impl E2 {
             {
                 destination.resize_due = None;
                 if let Some((size, scale)) = destination.resize.take()
-                    && destination.last_sent != Some((size, scale))
+                    && !destination.repeats(size, scale)
                 {
-                    destination.last_resize = Some(now);
-                    destination.last_sent = Some((size, scale));
-                    send(
-                        key.source,
-                        Message::Resize {
-                            projection: key.projection,
-                            size,
-                            scale,
-                        },
-                        out,
-                    );
+                    sent &= destination.send_resize(key, size, scale, now, out);
                 }
+            }
+            // The user has stopped: the source's answer to the newest request may resize the
+            // proxy now.
+            if destination.resize.is_none()
+                && destination.active_until.is_none_or(|until| until <= now)
+                && let Some((size, parking)) = destination.held_geometry.take()
+            {
+                destination.apply_geometry(key, size, parking, now, out);
             }
             if destination
                 .heartbeat_due
@@ -697,11 +858,21 @@ impl E2 {
                     d.motion_due,
                     d.resize_due,
                     d.heartbeat_due,
+                    // A held answer waits for the user to be quiet (until then, a pending
+                    // resize's own deadline comes first and drops it).
+                    d.held_geometry
+                        .filter(|_| d.resize.is_none())
+                        .and(d.active_until),
                 ]
             })
             .flatten()
             .min()
     }
+}
+
+/// Whether a host resize issued at `issued` is still recognisable at `now`.
+fn live(issued: MonoTime, now: MonoTime) -> bool {
+    now.saturating_duration_since(issued) < COMMAND_TTL
 }
 
 fn transition(held: &mut BTreeSet<Held>, item: Held, down: bool) -> bool {

@@ -191,15 +191,41 @@ proptest! {
     }
 
     #[test]
-    fn round_trip_resize(p in any::<u64>(), size in size(),
+    fn round_trip_resize(p in any::<u64>(), request in any::<u32>(), size in size(),
         scale in finite().prop_filter("positive", |v| *v > 0.0)) {
-        round_trip_control(ProjectionMessage::Resize { projection: ProjectionId(p), size, scale });
+        let message = ProjectionMessage::Resize { projection: ProjectionId(p), request, size, scale };
+        // Field 5 carries the request number, independently of the codec's private pb types.
+        let mut fields = [
+            if p == 0 { Vec::new() } else { number(1, p) },
+            if size.width == 0 { Vec::new() } else { number(2, u64::from(size.width)) },
+            if size.height == 0 { Vec::new() } else { number(3, u64::from(size.height)) },
+            double(4, scale),
+        ]
+        .concat();
+        if request != 0 {
+            fields.extend(number(5, u64::from(request)));
+        }
+        prop_assert_eq!(control_frame(&message), projection_frame(4, &fields));
+        round_trip_control(message);
     }
 
     #[test]
-    fn round_trip_geometry(p in any::<u64>(), size in size(),
+    fn round_trip_geometry(p in any::<u64>(), size in size(), answers in any::<u32>(),
         parking in proptest::sample::select(vec![ParkingKind::Twin, ParkingKind::Mirror])) {
-        round_trip_control(ProjectionMessage::Geometry { projection: ProjectionId(p), size, parking });
+        let message = ProjectionMessage::Geometry { projection: ProjectionId(p), size, parking, answers };
+        let code = if parking == ParkingKind::Twin { 1 } else { 2 };
+        let mut fields = [
+            if p == 0 { Vec::new() } else { number(1, p) },
+            if size.width == 0 { Vec::new() } else { number(2, u64::from(size.width)) },
+            if size.height == 0 { Vec::new() } else { number(3, u64::from(size.height)) },
+            number(4, code),
+        ]
+        .concat();
+        if answers != 0 {
+            fields.extend(number(5, u64::from(answers)));
+        }
+        prop_assert_eq!(control_frame(&message), projection_frame(5, &fields));
+        round_trip_control(message);
     }
 
     #[test]
@@ -705,6 +731,70 @@ fn rejects_unknown_browse_refusal_codes() {
 }
 
 #[test]
+fn request_and_answers_round_trip_at_the_extremes() {
+    for value in [0, 1, 2, u32::MAX - 1, u32::MAX] {
+        round_trip_control(ProjectionMessage::Resize {
+            projection: ProjectionId(u64::MAX),
+            request: value,
+            size: PixelSize::new(777, 433),
+            scale: 2.0,
+        });
+        round_trip_control(ProjectionMessage::Geometry {
+            projection: ProjectionId(u64::MAX),
+            size: PixelSize::new(777, 433),
+            parking: ParkingKind::Twin,
+            answers: value,
+        });
+    }
+}
+
+#[test]
+fn encodings_without_field_five_decode_as_zero() {
+    // A peer that predates request numbers omits field 5; proto3 reads it as 0.
+    let resize = [number(1, 9), number(2, 777), number(3, 433), double(4, 2.0)].concat();
+    assert_eq!(
+        decode_control(&projection_frame(4, &resize)),
+        Ok(ControlMessage::Projection(ProjectionMessage::Resize {
+            projection: ProjectionId(9),
+            request: 0,
+            size: PixelSize::new(777, 433),
+            scale: 2.0,
+        }))
+    );
+    let geometry = [number(1, 9), number(2, 777), number(3, 433), number(4, 2)].concat();
+    assert_eq!(
+        decode_control(&projection_frame(5, &geometry)),
+        Ok(ControlMessage::Projection(ProjectionMessage::Geometry {
+            projection: ProjectionId(9),
+            size: PixelSize::new(777, 433),
+            parking: ParkingKind::Mirror,
+            answers: 0,
+        }))
+    );
+    // With field 5 present, the numbers come through.
+    let resize = [resize, number(5, u64::from(u32::MAX))].concat();
+    assert_eq!(
+        decode_control(&projection_frame(4, &resize)),
+        Ok(ControlMessage::Projection(ProjectionMessage::Resize {
+            projection: ProjectionId(9),
+            request: u32::MAX,
+            size: PixelSize::new(777, 433),
+            scale: 2.0,
+        }))
+    );
+    let geometry = [geometry, number(5, 7)].concat();
+    assert_eq!(
+        decode_control(&projection_frame(5, &geometry)),
+        Ok(ControlMessage::Projection(ProjectionMessage::Geometry {
+            projection: ProjectionId(9),
+            size: PixelSize::new(777, 433),
+            parking: ParkingKind::Mirror,
+            answers: 7,
+        }))
+    );
+}
+
+#[test]
 fn rejects_nonfinite_or_nonpositive_scale() {
     for scale in [
         f64::NAN,
@@ -729,6 +819,7 @@ fn rejects_nonfinite_or_nonpositive_scale() {
             },
             ProjectionMessage::Resize {
                 projection: ProjectionId(1),
+                request: 1,
                 size: PixelSize::new(1, 1),
                 scale,
             },

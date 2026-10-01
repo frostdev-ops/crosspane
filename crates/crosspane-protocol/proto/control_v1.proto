@@ -109,6 +109,7 @@ message ProjectionResize {
   uint32 pixel_w = 2;
   uint32 pixel_h = 3;
   double scale = 4;
+  uint32 request = 5;
 }
 
 message ProjectionGeometry {
@@ -116,6 +117,7 @@ message ProjectionGeometry {
   uint32 pixel_w = 2;
   uint32 pixel_h = 3;
   uint32 parking = 4;
+  uint32 answers = 5;
 }
 
 message ProjectionTitle {

@@ -88,18 +88,22 @@ pub enum ProjectionMessage {
         projection: ProjectionId,
         reason: Refusal,
     },
-    /// Destination → source: the proxy's content area changed.
+    /// Destination → source: the proxy's content area changed. `request` numbers this
+    /// projection's resize requests: 1 for the first, one more for each later one.
     Resize {
         projection: ProjectionId,
+        request: u32,
         size: PixelSize,
         scale: f64,
     },
     /// Source → destination: the window's actual content size and parking, after start or a
-    /// resize. Frames carry their own size too.
+    /// resize. Frames carry their own size too. `answers` is the `request` of the newest Resize
+    /// this geometry reflects (0: none yet, or a source that predates request numbers).
     Geometry {
         projection: ProjectionId,
         size: PixelSize,
         parking: ParkingKind,
+        answers: u32,
     },
     /// Source → destination: the window's title changed.
     Title {
