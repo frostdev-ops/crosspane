@@ -94,6 +94,10 @@ impl ProxyIds {
                 let age = i128::from(now) - local;
                 (0..10_000_000_000).contains(&age).then(|| age as f64 / 1e6)
             });
+            // A frame decoded just after its proxy closed doesn't bring its stats back.
+            if !map.by_key.contains_key(&key) {
+                return;
+            }
             let stats = map.stats.entry(key).or_default();
             stats.frames += 1;
             stats.bytes += bytes as u64;
@@ -186,7 +190,19 @@ struct Encoding {
     cursor: Option<Shape>,
     cursor_dirty: bool,
     cursor_seq: u64,
+    /// A frame was lost or the receiver asked for a key frame: if no new capture comes (captures
+    /// arrive only on damage), the last frame goes again as a key frame.
+    refresh_due: bool,
+    /// When a key-frame request was last honoured (requests closer than `KEY_REQUEST_GAP` are
+    /// ignored: a large key frame can take longer than the receiver's gap timeout to arrive).
+    last_key_request: Option<Instant>,
 }
+
+const KEY_REQUEST_GAP: Duration = Duration::from_secs(1);
+/// How long a cursor or frame that came before its stream's Start is kept.
+const EARLY_TTL: Duration = Duration::from_secs(5);
+/// How long a stream must be idle before a due refresh is sent from the last frame.
+const REFRESH_IDLE: Duration = Duration::from_millis(100);
 
 /// What the encoder thread needs for video.
 #[derive(Clone)]
@@ -199,7 +215,9 @@ pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> Sender<Sour
     let (tx, rx) = mpsc::channel::<SourceCmd>();
     let spawned = std::thread::Builder::new()
         .name("media-encode".into())
-        .spawn(move || encode_loop(&rx, &transport, &video));
+        .spawn(move || {
+            crate::exit_on_panic("media encoder", || encode_loop(&rx, &transport, &video))
+        });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "could not start the media encoder");
     }
@@ -209,7 +227,10 @@ pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> Sender<Sour
 fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSetup) {
     let mut streams: HashMap<StreamId, Encoding> = HashMap::new();
     // Cursors reported before the stream's Start arrived (the capture thread may be first).
-    let mut early_cursors: HashMap<StreamId, Shape> = HashMap::new();
+    let mut early_cursors: HashMap<StreamId, (Shape, Instant)> = HashMap::new();
+    // Frames that came before their stream's Start (the capture thread may be first): a still
+    // window's first frame may be its only one.
+    let mut early_frames: HashMap<StreamId, (Frame, Instant)> = HashMap::new();
     let mut out = Vec::new();
     let epoch = Instant::now();
     loop {
@@ -229,7 +250,10 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                 cursor: peer_cursor,
                 bits_per_second,
             } => {
-                let cursor = early_cursors.remove(&stream);
+                let cursor = early_cursors.remove(&stream).map(|(shape, _)| shape);
+                if let Some((frame, _)) = early_frames.remove(&stream) {
+                    latest.entry(stream).or_insert(frame);
+                }
                 streams.insert(
                     stream,
                     Encoding {
@@ -248,11 +272,20 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                         cursor_dirty: cursor.is_some(),
                         cursor,
                         cursor_seq: 0,
+                        refresh_due: false,
+                        last_key_request: None,
                     },
                 );
             }
             SourceCmd::Frame { stream, frame } => {
-                latest.insert(stream, frame);
+                if streams.contains_key(&stream) {
+                    latest.insert(stream, frame);
+                } else {
+                    early_frames.retain(|_, (_, at)| at.elapsed() < EARLY_TTL);
+                    if early_frames.len() < 8 {
+                        early_frames.insert(stream, (frame, Instant::now()));
+                    }
+                }
             }
             SourceCmd::Cursor { stream, cursor } => match streams.get_mut(&stream) {
                 Some(e) => {
@@ -260,8 +293,9 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                     e.cursor_dirty = true;
                 }
                 None => {
+                    early_cursors.retain(|_, (_, at)| at.elapsed() < EARLY_TTL);
                     if early_cursors.len() < 64 {
-                        early_cursors.insert(stream, cursor);
+                        early_cursors.insert(stream, (cursor, Instant::now()));
                     }
                 }
             },
@@ -269,12 +303,20 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                 streams.remove(&stream);
                 latest.remove(&stream);
                 early_cursors.remove(&stream);
+                early_frames.remove(&stream);
             }
             SourceCmd::RequestKey { projection } => {
                 for e in streams.values_mut().filter(|e| e.projection == projection) {
+                    if e.last_key_request
+                        .is_some_and(|at| at.elapsed() < KEY_REQUEST_GAP)
+                    {
+                        continue;
+                    }
+                    e.last_key_request = Some(Instant::now());
                     e.encoder.request_key();
                     e.video_key = true;
                     e.cursor_dirty = e.cursor.is_some();
+                    e.refresh_due = true;
                 }
             }
         };
@@ -292,9 +334,24 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
             let Some(enc) = streams.get_mut(&stream) else {
                 continue;
             };
+            enc.refresh_due = false;
             encode_frame(enc, &frame, now, video, transport, &mut out);
             enc.last_at = Instant::now();
             enc.last = Some(frame);
+        }
+        // A lost frame or a key-frame request on a window that isn't changing: resend the last
+        // frame as a lossless key frame.
+        for enc in streams.values_mut() {
+            if enc.refresh_due
+                && enc.last_at.elapsed() >= REFRESH_IDLE
+                && let Some(frame) = enc.last.clone()
+            {
+                enc.refresh_due = false;
+                enc.encoder.request_key();
+                enc.video_key = true;
+                send_tiles(enc, &frame, true, transport, &mut out);
+                tracing::debug!(seq = enc.seq, "refresh of an idle stream");
+            }
         }
         // Motion stopped during video and no new frame came: plan on the last frame so the
         // scheduler can leave video with its lossless key frame.
@@ -491,6 +548,7 @@ fn send(enc: &mut Encoding, frame: &[u8], transport: &Transport) {
         Err(LinkError::Congested) => {
             enc.encoder.request_key();
             enc.video_key = true;
+            enc.refresh_due = true;
         }
         Err(e) => tracing::debug!(error = ?e, "media send failed"),
     }
@@ -533,7 +591,11 @@ pub fn start_destination(
     let (tx, rx) = mpsc::channel::<DestCmd>();
     let spawned = std::thread::Builder::new()
         .name("media-decode".into())
-        .spawn(move || decode_loop(&rx, host.as_ref(), &ids, &engine, &video));
+        .spawn(move || {
+            crate::exit_on_panic("media decoder", || {
+                decode_loop(&rx, host.as_ref(), &ids, &engine, &video)
+            })
+        });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "could not start the media decoder");
     }
@@ -729,6 +791,9 @@ fn apply_video(d: &mut Decoding, data: &[u8], video: &VideoSetup) -> Result<Appl
     } else {
         let src_row = coded_size.width as usize * 4;
         let row = w as usize * 4;
+        if coded.len() < src_row * h as usize {
+            return Err("decoded frame shorter than its size".into());
+        }
         let mut cropped = Vec::with_capacity(row * h as usize);
         for y in 0..h as usize {
             cropped.extend_from_slice(&coded[y * src_row..y * src_row + row]);

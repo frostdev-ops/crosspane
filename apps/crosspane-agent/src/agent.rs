@@ -121,6 +121,9 @@ pub struct Agent {
     last_ping: Instant,
     /// When each peer last answered a ping (only peers that answer pings are held to it).
     last_pong: HashMap<NodeId, Instant>,
+    last_titles: Instant,
+    /// The previous liveness check: after a stall of the loop itself, answers may still be queued.
+    last_liveness: Instant,
     pairing: crate::pairing::Pairing,
     identity: Arc<crosspane_security::identity::DeviceIdentity>,
     port: u16,
@@ -149,6 +152,8 @@ const HOUSEKEEPING: Duration = Duration::from_secs(1);
 /// Clock-offset pings to every peer (for frame latency).
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const CLOCK_SAMPLES: usize = 8;
+/// Layout versions at or above this from a peer are refused (see the Layout handler).
+const MAX_LAYOUT_VERSION: u64 = 1 << 48;
 /// A peer that answers pings is considered gone after this long without an answer.
 const UNRESPONSIVE: Duration = Duration::from_secs(15);
 /// Above this smoothed RTT a "wired" path has a slower hop on the way (usually the peer's Wi-Fi).
@@ -202,6 +207,16 @@ fn family_rank(a: &SocketAddr) -> u8 {
     }
 }
 
+/// `::ffff:a.b.c.d` as `a.b.c.d`.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(addr, |v4| {
+            SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+        }),
+        SocketAddr::V4(_) => addr,
+    }
+}
+
 fn class_rank(class: LinkClass) -> u8 {
     match class {
         LinkClass::DirectUsb4Tb => 0,
@@ -215,6 +230,8 @@ fn class_rank(class: LinkClass) -> u8 {
 /// The class of the local interface the OS would send to `remote` from: a connected UDP socket
 /// learns its source address without sending anything.
 fn local_class(interfaces: &[crosspane_platform::Interface], remote: SocketAddr) -> LinkClass {
+    // quinn reports IPv4 peers on its dual-stack socket as IPv4-mapped IPv6.
+    let remote = canonical(remote);
     let unspecified: SocketAddr = match remote {
         SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
@@ -222,7 +239,7 @@ fn local_class(interfaces: &[crosspane_platform::Interface], remote: SocketAddr)
     let source = std::net::UdpSocket::bind(unspecified)
         .and_then(|socket| socket.connect(remote).map(|()| socket))
         .and_then(|socket| socket.local_addr())
-        .map(|local| local.ip());
+        .map(|local| canonical(local).ip());
     let Ok(source) = source else {
         return LinkClass::Unknown;
     };
@@ -314,6 +331,8 @@ impl Agent {
             clocks: HashMap::new(),
             last_ping: Instant::now(),
             last_pong: HashMap::new(),
+            last_titles: Instant::now(),
+            last_liveness: Instant::now(),
             pairing: crate::pairing::Pairing::default(),
             identity: e2.identity,
             port: e2.port,
@@ -424,8 +443,11 @@ impl Agent {
             LinkEvent::Control { peer, msg } => match msg {
                 ControlMessage::Hello(hello) => {
                     let peer = *peer;
-                    // A Hello queued before a forget or revoke: the link is closing.
+                    // A Hello queued before a forget or revoke: close that link.
                     if !self.trust.with(|t| t.get(peer).is_some()) {
+                        if let Some(mut link) = self.net.link(peer) {
+                            link.close("forgotten");
+                        }
                         return;
                     }
                     let name = self
@@ -486,13 +508,18 @@ impl Agent {
                 ControlMessage::Layout(placements) => {
                     // Version 0 is the derived default every node computes for itself; only
                     // explicit placements (version ≥ 1) travel.
+                    // A version near the top would make every later local edit lose (its
+                    // `max + 1` can't exceed it): such placements are refused.
                     let explicit: Vec<Placement> = placements
                         .iter()
                         .copied()
-                        .filter(|p| p.version > 0)
+                        .filter(|p| p.version > 0 && p.version < MAX_LAYOUT_VERSION)
                         .collect();
                     if arrange::merge(&mut self.placements, &explicit) {
+                        // `update_layout` only feeds the engine when its own defaults change, so
+                        // the merged layout goes to the engine here.
                         self.update_layout(false);
+                        self.feed(Input::Layout(self.placements.clone()));
                     }
                     return;
                 }
@@ -840,7 +867,7 @@ impl Agent {
                 }
                 let _ = self.dest_media.send(DestCmd::Forget(key));
             }
-            other => tracing::debug!(output = ?other, "unhandled engine output"),
+            other => tracing::debug!(output = %variant(&other), "unhandled engine output"),
         }
     }
 
@@ -864,7 +891,7 @@ impl Agent {
                 a.and(b)
             }
             (cmd, _, _) => {
-                tracing::debug!(?cmd, "no injector for command");
+                tracing::debug!(cmd = %variant(&cmd), "no injector for command");
                 return false;
             }
         };
@@ -1240,7 +1267,7 @@ impl Agent {
         match event {
             DiscoveryEvent::Found(candidate) => {
                 let fresh = !self.candidates.contains_key(&candidate.instance);
-                if self.paired_peer_offline() && fresh {
+                if self.paired_peer_offline() && fresh && !self.connected_to(&candidate.addrs) {
                     for addr in self.dial_order(&candidate.addrs) {
                         self.net.dial_once(addr);
                     }
@@ -1286,6 +1313,7 @@ impl Agent {
                     .candidates
                     .values()
                     .take(16)
+                    .filter(|c| !self.connected_to(&c.addrs))
                     .flat_map(|c| self.dial_order(&c.addrs))
                     .collect();
                 for addr in addrs {
@@ -1318,6 +1346,15 @@ impl Agent {
     /// look connected for a minute or more. A peer that answers pings but hasn't for
     /// `UNRESPONSIVE` has its link closed, which starts the E2 grace period (WP-2.15) promptly.
     fn close_unresponsive(&mut self) {
+        // If this loop itself stalled, pongs may be waiting in the queue: start the clocks again.
+        let stalled = self.last_liveness.elapsed() > PING_INTERVAL * 2;
+        self.last_liveness = Instant::now();
+        if stalled {
+            for at in self.last_pong.values_mut() {
+                *at = Instant::now();
+            }
+            return;
+        }
         let silent: Vec<NodeId> = self
             .links
             .keys()
@@ -1376,6 +1413,18 @@ impl Agent {
                 _ => 20,
             });
         mbps.saturating_mul(1_000_000)
+    }
+
+    /// Whether one of `addrs` is the address of a live link: dialling it again could make the
+    /// transport replace a healthy connection.
+    fn connected_to(&self, addrs: &[SocketAddr]) -> bool {
+        let live: Vec<std::net::IpAddr> = self
+            .links
+            .values()
+            .filter_map(|link| link.remote_addr())
+            .map(|a| canonical(a).ip())
+            .collect();
+        addrs.iter().any(|a| live.contains(&canonical(*a).ip()))
     }
 
     /// Candidate addresses, best first: by the link class of the local interface they route
@@ -1453,7 +1502,8 @@ impl Agent {
             self.update_paths();
             self.close_unresponsive();
         }
-        if self.latency_overlay {
+        if self.latency_overlay && self.last_titles.elapsed() >= HOUSEKEEPING {
+            self.last_titles = Instant::now();
             self.latency_titles();
         }
         let expired: Vec<u32> = self
@@ -1585,7 +1635,13 @@ impl Agent {
         } else {
             (0.0, 0.0)
         };
-        let version = self.placements.iter().map(|p| p.version).max().unwrap_or(0) + 1;
+        let version = self
+            .placements
+            .iter()
+            .map(|p| p.version)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let fresh: Vec<Placement> = arrange::arrange_node(&self.local_displays)
             .into_iter()
             .map(|(display, origin)| Placement {
@@ -1617,7 +1673,13 @@ impl Agent {
                 })
                 .collect();
         let origins = arrange::place_beside(&ours, &theirs, side);
-        let version = self.placements.iter().map(|p| p.version).max().unwrap_or(0) + 1;
+        let version = self
+            .placements
+            .iter()
+            .map(|p| p.version)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let fresh: Vec<Placement> = theirs
             .iter()
             .zip(origins)
@@ -1650,19 +1712,24 @@ impl Agent {
         if entries.is_empty() {
             return Err("no placements".into());
         }
-        let version = self.placements.iter().map(|p| p.version).max().unwrap_or(0) + 1;
+        let version = self
+            .placements
+            .iter()
+            .map(|p| p.version)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let mut fresh = Vec::new();
         for entry in entries {
             let [x, y] = entry.origin_mm;
             if !(x.is_finite() && y.is_finite() && x.abs() < 1e6 && y.abs() < 1e6) {
                 return Err(format!("bad position for display {}", entry.display));
             }
+            let query = entry.node.trim().to_lowercase();
             let is_self = entry.node == self.name
-                || (!entry.node.is_empty()
-                    && self
-                        .node
-                        .to_string()
-                        .starts_with(&entry.node.to_lowercase()));
+                || (query.len() >= 4
+                    && query.chars().all(|c| c.is_ascii_hexdigit())
+                    && self.node.to_string().starts_with(&query));
             let node = if is_self {
                 self.node
             } else {
@@ -2368,10 +2435,30 @@ fn log_input(input: &Input) {
             crosspane_protocol::msg::InputMessage::Key { .. } => {
                 tracing::debug!(peer = %peer.short(), "in: link key")
             }
-            other => tracing::debug!(peer = %peer.short(), msg = ?other, "in: link input"),
+            other => {
+                tracing::debug!(peer = %peer.short(), msg = %variant(other), "in: link input")
+            }
         },
-        other => tracing::debug!(input = ?other, "in"),
+        // Many inputs can carry key usages (held-key states, proxy keys, recoveries): log only
+        // the variant, except for the few known to hold none.
+        Input::Link(LinkEvent::Control { peer, .. }) => {
+            tracing::debug!(peer = %peer.short(), "in: control")
+        }
+        Input::Windows(_) | Input::Session(_) | Input::PeerUp { .. } => {
+            tracing::debug!(input = ?input, "in")
+        }
+        other => tracing::debug!(input = %variant(other), "in"),
     }
+}
+
+/// The variant path of a value's `Debug` form ("Proxy", "Capture(Key"), without its fields: log
+/// lines must never carry key usages (04 §7).
+fn variant(value: &impl std::fmt::Debug) -> String {
+    let text = format!("{value:?}");
+    let end = text
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':' || c == '('))
+        .unwrap_or(text.len());
+    text[..end].trim_end_matches('(').to_owned()
 }
 
 fn log_output(output: &Output) {
@@ -2395,7 +2482,11 @@ fn log_output(output: &Output) {
         } => {
             tracing::debug!(peer = %peer.short(), down, "out: send key")
         }
-        other => tracing::debug!(output = ?other, "out"),
+        Output::SendInput { peer, msg } => {
+            tracing::debug!(peer = %peer.short(), msg = %variant(msg), "out: send input")
+        }
+        Output::Inject { id, cmd } => tracing::debug!(?id, cmd = %variant(cmd), "out: inject"),
+        other => tracing::debug!(output = %variant(other), "out"),
     }
 }
 
