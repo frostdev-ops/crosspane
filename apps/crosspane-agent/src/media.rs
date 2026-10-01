@@ -779,11 +779,25 @@ fn apply(
                     Some(picture) => HostCommand::VideoNative {
                         id,
                         size,
+                        rect: crosspane_types::geom::PixelRect::new(
+                            crosspane_types::geom::euclid::point2(0, 0),
+                            crosspane_types::geom::euclid::point2(
+                                size.width as i32,
+                                size.height as i32,
+                            ),
+                        ),
                         picture: Arc::clone(picture),
                     },
                     None => HostCommand::Video {
                         id,
                         size,
+                        rect: crosspane_types::geom::PixelRect::new(
+                            crosspane_types::geom::euclid::point2(0, 0),
+                            crosspane_types::geom::euclid::point2(
+                                size.width as i32,
+                                size.height as i32,
+                            ),
+                        ),
                         picture: Arc::clone(&d.picture),
                     },
                 }
