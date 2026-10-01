@@ -61,6 +61,13 @@ pub enum LinkEvent {
         peer: NodeId,
         msg: ControlMessage,
     },
+    /// E2: one complete media frame (a `crosspane-media` CPF1 payload) from `peer`, delivered when
+    /// its stream finished. Frames of one projection can complete out of order; the receiver
+    /// orders them by the frame header's `seq`.
+    Media {
+        peer: NodeId,
+        data: std::sync::Arc<[u8]>,
+    },
     /// The link to `peer` closed or failed.
     Closed {
         peer: NodeId,
