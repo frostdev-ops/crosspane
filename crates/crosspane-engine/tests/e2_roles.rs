@@ -2955,3 +2955,55 @@ fn a_parked_window_that_moves_by_itself_is_parked_again_at_the_wanted_size() {
         "{out:?}"
     );
 }
+
+#[test]
+fn focus_goes_back_to_the_previous_window_when_the_proxy_loses_focus() {
+    let mut f = startup(3);
+    let other = WindowId(WINDOW.0 + 100);
+    f.handle(Input::Windows(WindowEvent::Added(window(other))), 40);
+    f.handle(Input::Windows(WindowEvent::Focused(Some(other))), 41);
+    let out = f.handle(
+        control(
+            B,
+            Message::Focus {
+                projection: ID,
+                focused: true,
+            },
+        ),
+        50,
+    );
+    assert!(
+        out.contains(&Output::ActivateWindow { window: WINDOW }),
+        "{out:?}"
+    );
+    let out = f.handle(
+        control(
+            B,
+            Message::Focus {
+                projection: ID,
+                focused: false,
+            },
+        ),
+        60,
+    );
+    assert!(
+        out.contains(&Output::ActivateWindow { window: other }),
+        "{out:?}"
+    );
+    // Only once: a second loss of focus has nothing to restore.
+    let out = f.handle(
+        control(
+            B,
+            Message::Focus {
+                projection: ID,
+                focused: false,
+            },
+        ),
+        70,
+    );
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Output::ActivateWindow { .. })),
+        "{out:?}"
+    );
+}

@@ -34,6 +34,10 @@ pub struct E2 {
     windows: BTreeMap<WindowId, WindowInfo>,
     scales: BTreeMap<DisplayId, f64>,
     focused: Option<WindowId>,
+    /// The window that had focus before a parked window was activated for its proxy: focus
+    /// goes back to it when the proxy loses focus, so this node's own new windows don't open
+    /// on the invisible twin display.
+    focus_before: Option<WindowId>,
     next_projection: Option<u64>,
     sources: BTreeMap<ProjectionId, Source>,
     destinations: BTreeMap<ProjectionKey, Destination>,
@@ -77,6 +81,7 @@ impl E2 {
                 windows: BTreeMap::new(),
                 scales: BTreeMap::new(),
                 focused: None,
+                focus_before: None,
                 next_projection: Some(1),
                 sources: BTreeMap::new(),
                 destinations: BTreeMap::new(),

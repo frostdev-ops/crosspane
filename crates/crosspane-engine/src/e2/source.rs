@@ -272,8 +272,23 @@ impl E2 {
                 }
             }
             Message::Focus { focused: true, .. } if source.stage == Stage::Live => {
+                let previous = self.focused;
                 if source.activate(now, out) {
+                    if self.focus_before.is_none()
+                        && let Some(previous) = previous
+                        && !self.sources.values().any(|s| s.window == previous)
+                    {
+                        self.focus_before = Some(previous);
+                    }
                     self.focused = None;
+                }
+            }
+            Message::Focus { focused: false, .. } if source.stage == Stage::Live => {
+                if let Some(window) = self.focus_before.take()
+                    && self.windows.contains_key(&window)
+                    && !self.sources.values().any(|s| s.window == window)
+                {
+                    out.push(Output::ActivateWindow { window });
                 }
             }
             Message::KeyFrameRequest { .. } if source.stage == Stage::Live => {
