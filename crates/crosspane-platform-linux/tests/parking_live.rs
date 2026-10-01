@@ -54,10 +54,16 @@ fn park_resize_restore_live() {
     }
     let ipc = HyprIpc::from_env().unwrap();
     let before = monitors(&ipc);
-    assert!(before.iter().all(|m| !m.0.starts_with(OUTPUT_PREFIX)), "leftover twin outputs");
+    assert!(
+        before.iter().all(|m| !m.0.starts_with(OUTPUT_PREFIX)),
+        "leftover twin outputs"
+    );
 
     let class = format!("crosspane-park-live-{}", std::process::id());
-    ipc.dispatch(&format!("hl.dsp.exec_cmd(\"foot --app-id {class} sleep 120\")")).unwrap();
+    ipc.dispatch(&format!(
+        "hl.dsp.exec_cmd(\"foot --app-id {class} sleep 120\")"
+    ))
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let c = loop {
         if let Some(c) = client(&ipc, &class) {
@@ -74,24 +80,43 @@ fn park_resize_restore_live() {
     let mut parking = HyprlandParking::new(ipc.clone(), journal.clone()).unwrap();
 
     let t = Instant::now();
-    let parked = parking.park(window, PixelSize::new(1600, 1200), 2.0).unwrap();
+    let parked = parking
+        .park(window, PixelSize::new(1600, 1200), 2.0)
+        .unwrap();
     eprintln!("parked in {:?}: {parked:?}", t.elapsed());
-    assert!(std::fs::read_to_string(&journal).unwrap().contains(&address));
+    assert!(
+        std::fs::read_to_string(&journal)
+            .unwrap()
+            .contains(&address)
+    );
     assert_eq!(parked.content.width(), 1600);
     assert_eq!(parked.content.height(), 1200);
     let during = monitors(&ipc);
-    let real: Vec<_> = during.iter().filter(|m| !m.0.starts_with(OUTPUT_PREFIX)).cloned().collect();
+    let real: Vec<_> = during
+        .iter()
+        .filter(|m| !m.0.starts_with(OUTPUT_PREFIX))
+        .cloned()
+        .collect();
     assert_eq!(real, before, "a real monitor moved or changed");
     assert!(during.iter().any(|m| m.0.starts_with(OUTPUT_PREFIX)));
 
-    let resized = parking.resize(window, PixelSize::new(1200, 900), 2.0).unwrap();
+    let resized = parking
+        .resize(window, PixelSize::new(1200, 900), 2.0)
+        .unwrap();
     eprintln!("resized: {resized:?}");
-    assert_eq!((resized.content.width(), resized.content.height()), (1200, 900));
+    assert_eq!(
+        (resized.content.width(), resized.content.height()),
+        (1200, 900)
+    );
 
     parking.restore(window).unwrap();
     let c = client(&ipc, &class).unwrap();
     assert_eq!(c["workspace"]["name"].as_str().unwrap(), original_ws);
-    assert_eq!(monitors(&ipc), before, "twin output not removed or monitors changed");
+    assert_eq!(
+        monitors(&ipc),
+        before,
+        "twin output not removed or monitors changed"
+    );
     assert!(std::fs::read_to_string(&journal).unwrap().trim() == "[]");
 
     // Crash recovery: park, forget the in-memory state, recover from the journal alone.
@@ -104,6 +129,9 @@ fn park_resize_restore_live() {
     assert_eq!(c["workspace"]["name"].as_str().unwrap(), original_ws);
     assert_eq!(monitors(&ipc), before);
 
-    ipc.dispatch(&format!("hl.dsp.window.close({{ window = \"address:{address}\" }})")).unwrap();
+    ipc.dispatch(&format!(
+        "hl.dsp.window.close({{ window = \"address:{address}\" }})"
+    ))
+    .unwrap();
     let _ = std::fs::remove_file(&journal);
 }
