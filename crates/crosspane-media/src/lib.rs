@@ -5,5 +5,6 @@
 
 pub mod codec;
 pub mod hybrid;
+pub mod picture;
 pub mod tiles;
 pub mod wire;
