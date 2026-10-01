@@ -12,3 +12,9 @@ workspace = true
 
 [dependencies]
 crosspane-types.workspace = true
+lz4_flex.workspace = true
+thiserror.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

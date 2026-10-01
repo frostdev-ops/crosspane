@@ -10,35 +10,51 @@
 
 pub mod config;
 pub mod e1;
+pub mod e2;
 pub mod io;
 
 use crosspane_input::journal::{Journal, JournalError};
 use crosspane_types::time::MonoTime;
 
 pub use config::EngineConfig;
-pub use io::{Command, Failure, InjectCmd, InjectId, Input, Notice, Output};
+pub use io::{
+    Command, Failure, InjectCmd, InjectId, Input, Notice, Output, ProjectionKey, ProxyEvent,
+};
 
 use e1::controller::ControllerE1;
 use e1::target::TargetE1;
+use e2::E2;
 
-/// One node's engine: the E1 controller and target roles side by side.
+/// One node's engine: the E1 controller and target roles and the E2 roles side by side.
 #[derive(Debug)]
 pub struct Engine {
     controller: ControllerE1,
     target: TargetE1,
+    e2: E2,
 }
 
 impl Engine {
-    /// Start the engine. The returned outputs include crash recovery from `journal` (04 §8
-    /// invariant 2), which the agent runs before anything else.
+    /// Start the engine. The returned outputs include crash recovery from both journals (04 §8
+    /// invariant 2): `journal` for E1 injection, `e2_journal` for input injected into projected
+    /// windows. The agent runs them before anything else.
     pub fn new(
         config: EngineConfig,
         journal: Box<dyn Journal>,
+        e2_journal: Box<dyn Journal>,
         now: MonoTime,
     ) -> Result<(Engine, Vec<Output>), JournalError> {
-        let (target, out) = TargetE1::new(&config, journal, now)?;
+        let (target, mut out) = TargetE1::new(&config, journal, now)?;
+        let (e2, e2_out) = E2::new(&config, e2_journal, now)?;
+        out.extend(e2_out);
         let controller = ControllerE1::new(&config, now);
-        Ok((Engine { controller, target }, out))
+        Ok((
+            Engine {
+                controller,
+                target,
+                e2,
+            },
+            out,
+        ))
     }
 
     /// Handle one input. Panic (04 §6) closes the engine side of the I/O gate before either role
@@ -52,14 +68,19 @@ impl Engine {
         }
         self.controller.handle(&input, now, &mut out);
         self.target.handle(&input, now, &mut out);
+        self.e2.handle(&input, now, &mut out);
         out
     }
 
     /// When the agent must deliver the next [`Input::Tick`].
     pub fn next_deadline(&self) -> Option<MonoTime> {
-        match (self.controller.next_deadline(), self.target.next_deadline()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [
+            self.controller.next_deadline(),
+            self.target.next_deadline(),
+            self.e2.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }

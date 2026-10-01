@@ -12,6 +12,7 @@
 pub mod link;
 pub mod msg;
 pub mod negotiate;
+pub mod projection;
 pub mod wire;
 
 /// ALPN protocol ID: the major version (04 §3). A different major version is refused with a clear
