@@ -57,6 +57,17 @@ use wayland_protocols::ext::image_copy_capture::v1::client::{
     ext_image_copy_capture_session_v1::{self as session_protocol, ExtImageCopyCaptureSessionV1},
 };
 
+#[cfg(feature = "gpu")]
+use crate::dmabuf::{Export, Gpu, Image};
+#[cfg(feature = "gpu")]
+use std::sync::Mutex;
+#[cfg(feature = "gpu")]
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+    zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
+    zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+};
+
 use super::ipc::HyprIpc;
 
 // Leave scheduling margin inside the frozen two-second call bound. Poll even when a capture is
@@ -68,6 +79,10 @@ const CURSOR_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_u64.div_cei
 /// Bounded command handle for all output and window capture streams on one Wayland connection.
 #[derive(Debug)]
 pub struct HyprlandFrameCapture {
+    #[cfg(feature = "gpu")]
+    gpu: Arc<Mutex<Option<Gpu>>>,
+    #[cfg(feature = "gpu")]
+    main_device: Arc<Mutex<Option<u64>>>,
     commands: mpsc::Sender<Command>,
     lookups: mpsc::Sender<Lookup>,
     shutdown: Arc<AtomicBool>,
@@ -113,6 +128,14 @@ struct Command {
 impl HyprlandFrameCapture {
     /// Connect to `$WAYLAND_DISPLAY`; requires the output source and image copy extensions.
     pub fn new(gate: Arc<IoGate>, ipc: HyprIpc) -> Result<Self, PlatformError> {
+        #[cfg(feature = "gpu")]
+        let gpu = Arc::new(Mutex::new(None));
+        #[cfg(feature = "gpu")]
+        let worker_gpu = gpu.clone();
+        #[cfg(feature = "gpu")]
+        let main_device = Arc::new(Mutex::new(None));
+        #[cfg(feature = "gpu")]
+        let worker_main_device = main_device.clone();
         let (commands, receiver) = mpsc::channel();
         let (ready, result) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -123,7 +146,15 @@ impl HyprlandFrameCapture {
         let thread = std::thread::Builder::new()
             .name("hypr-frames".into())
             .spawn(move || {
-                let mut worker = match Worker::new(worker_gate, worker_cursors, &worker_shutdown) {
+                let mut worker = match Worker::new(
+                    worker_gate,
+                    worker_cursors,
+                    &worker_shutdown,
+                    #[cfg(feature = "gpu")]
+                    worker_gpu,
+                    #[cfg(feature = "gpu")]
+                    worker_main_device,
+                ) {
                     Ok(worker) => worker,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -222,6 +253,10 @@ impl HyprlandFrameCapture {
             return Err(backend(error));
         }
         Ok(Self {
+            #[cfg(feature = "gpu")]
+            gpu,
+            #[cfg(feature = "gpu")]
+            main_device,
             commands,
             lookups,
             shutdown,
@@ -230,6 +265,26 @@ impl HyprlandFrameCapture {
             gate,
             cursors,
         })
+    }
+
+    /// Open a Vulkan device on the compositor's linux-dmabuf main device, requesting supported
+    /// `wanted` features. Streams started from now on may use DMA-BUF; errors leave shm enabled.
+    #[cfg(feature = "gpu")]
+    pub fn enable_gpu(
+        &self,
+        wanted: wgpu::Features,
+    ) -> Result<(wgpu::Device, wgpu::Queue), PlatformError> {
+        let node = self
+            .main_device
+            .lock()
+            .map_err(backend)?
+            .ok_or(PlatformError::Unsupported(
+                "linux-dmabuf v4 main device required",
+            ))?;
+        let gpu = Gpu::open(node, wanted)?;
+        let result = (gpu.device.clone(), gpu.queue.clone());
+        *self.gpu.lock().map_err(backend)? = Some(gpu);
+        Ok(result)
     }
 
     /// Report cursor shapes (`FrameEvent::Cursor` / `CursorDefault`) for streams started from now
@@ -328,6 +383,10 @@ fn backend(error: impl std::fmt::Display) -> PlatformError {
 struct Constraints {
     size: Option<PixelSize>,
     formats: Vec<wl_shm::Format>,
+    #[cfg(feature = "gpu")]
+    device: Option<u64>,
+    #[cfg(feature = "gpu")]
+    dmabuf_formats: Vec<(u32, Vec<u64>)>,
 }
 
 struct Buffer {
@@ -414,6 +473,131 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         self.proxy.destroy();
+    }
+}
+
+#[cfg(feature = "gpu")]
+struct Slot {
+    export: Export,
+    proxy: wl_buffer::WlBuffer,
+    free: Arc<AtomicBool>,
+    pending: AtomicBool,
+}
+#[cfg(feature = "gpu")]
+impl Drop for Slot {
+    fn drop(&mut self) {
+        // On connection teardown a pending frame is cancelled by disconnect, not wl_buffer
+        // destruction. The compositor keeps its imported dma-buf reference through cancellation.
+        if !self.pending.load(Ordering::Acquire) {
+            self.proxy.destroy();
+        }
+    }
+}
+#[cfg(feature = "gpu")]
+struct Ring {
+    slots: Vec<Slot>,
+    size: PixelSize,
+    gpu: Gpu,
+}
+#[cfg(feature = "gpu")]
+impl Ring {
+    fn new(
+        gpu: &Gpu,
+        dmabuf: &ZwpLinuxDmabufV1,
+        qh: &QueueHandle<State>,
+        constraints: &Constraints,
+    ) -> Result<Option<Self>, PlatformError> {
+        if constraints.device != Some(gpu.node) {
+            return Ok(None);
+        }
+        let size = constraints
+            .size
+            .ok_or_else(|| backend("missing DMA-BUF size"))?;
+        for (format, offered) in &constraints.dmabuf_formats {
+            if ![0x34325258, 0x34325241].contains(format) {
+                continue;
+            }
+            let modifiers = gpu.modifiers(offered)?;
+            if modifiers.is_empty() {
+                continue;
+            }
+            let mut slots = Vec::new();
+            for _ in 0..4 {
+                let export = Export::new(gpu, size, &modifiers)?;
+                let params = dmabuf.create_params(qh, ());
+                params.add(
+                    export.fd.as_fd(),
+                    0,
+                    export.offset,
+                    export.stride,
+                    (export.modifier >> 32) as u32,
+                    export.modifier as u32,
+                );
+                let proxy = params.create_immed(
+                    size.width as i32,
+                    size.height as i32,
+                    *format,
+                    zwp_linux_buffer_params_v1::Flags::empty(),
+                    qh,
+                    (),
+                );
+                params.destroy();
+                tracing::debug!(
+                    modifier = format_args!("{:#018x}", export.modifier),
+                    "allocated DMA-BUF capture slot"
+                );
+                slots.push(Slot {
+                    export,
+                    proxy,
+                    free: Arc::new(AtomicBool::new(true)),
+                    pending: AtomicBool::new(false),
+                });
+            }
+            return Ok(Some(Self {
+                slots,
+                size,
+                gpu: gpu.clone(),
+            }));
+        }
+        Ok(None)
+    }
+    fn acquire(&self) -> Option<usize> {
+        // Drive release callbacks without waiting for GPU work.
+        let _ = self.gpu.device.poll(wgpu::PollType::Poll);
+        self.slots.iter().position(|slot| {
+            if slot
+                .free
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                slot.pending.store(true, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        })
+    }
+    fn release(&self, index: usize) {
+        self.slots[index].pending.store(false, Ordering::Release);
+        self.slots[index].free.store(true, Ordering::Release);
+    }
+    fn image(
+        &mut self,
+        index: usize,
+        rect: PixelRect,
+    ) -> Result<Arc<dyn crosspane_platform::NativeImage>, PlatformError> {
+        self.slots[index].pending.store(false, Ordering::Release);
+        Ok(Arc::new(Image {
+            texture: self.slots[index].export.texture(&self.gpu, self.size)?,
+            gpu: self.gpu.clone(),
+            size: PixelSize::new(
+                (rect.max.x - rect.min.x) as u32,
+                (rect.max.y - rect.min.y) as u32,
+            ),
+            origin: (rect.min.x as u32, rect.min.y as u32),
+            free: self.slots[index].free.clone(),
+            modifier: self.slots[index].export.modifier,
+        }))
     }
 }
 
@@ -506,6 +690,8 @@ struct PendingStart {
 }
 
 struct Capture {
+    #[cfg(feature = "gpu")]
+    slot: Option<usize>,
     proxy: ExtImageCopyCaptureFrameV1,
     damage: Vec<[i32; 4]>,
     at: Option<MonoTime>,
@@ -738,6 +924,14 @@ fn cursor_image(
 }
 
 struct Stream {
+    #[cfg(feature = "gpu")]
+    gpu: Option<Gpu>,
+    #[cfg(feature = "gpu")]
+    ring: Option<Ring>,
+    #[cfg(feature = "gpu")]
+    gpu_disabled: bool,
+    #[cfg(feature = "gpu")]
+    gpu_ready: bool,
     output: Option<u32>,
     toplevel: Option<ExtForeignToplevelHandleV1>,
     source: ExtImageCaptureSourceV1,
@@ -806,6 +1000,17 @@ fn parse_identifier(value: &str) -> Option<u64> {
 }
 
 struct State {
+    #[cfg(feature = "gpu")]
+    gpu: Arc<Mutex<Option<Gpu>>>,
+    #[cfg(feature = "gpu")]
+    main_device: Arc<Mutex<Option<u64>>>,
+    #[cfg(feature = "gpu")]
+    dmabuf: Option<ZwpLinuxDmabufV1>,
+    #[cfg(feature = "gpu")]
+    feedback: Option<ZwpLinuxDmabufFeedbackV1>,
+    // Retain pending buffers on stream cancellation until the compositor reports completion.
+    #[cfg(feature = "gpu")]
+    retired: HashMap<wayland_client::backend::ObjectId, (ExtImageCopyCaptureFrameV1, Ring)>,
     gate: Arc<IoGate>,
     /// Whether new streams open a cursor session.
     cursors: Arc<AtomicBool>,
@@ -824,6 +1029,31 @@ struct State {
 }
 
 impl State {
+    fn destroy_stream(&mut self, stream: Stream) {
+        #[cfg(feature = "gpu")]
+        let mut stream = stream;
+        #[cfg(feature = "gpu")]
+        if stream
+            .capture
+            .as_ref()
+            .is_some_and(|c| !c.ready && c.slot.is_some())
+        {
+            use wayland_client::Proxy;
+            if let (Some(capture), Some(ring)) = (stream.capture.take(), stream.ring.take()) {
+                self.retired
+                    .insert(capture.proxy.id(), (capture.proxy, ring));
+            }
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(ring) = &stream.ring {
+            // Any pending capture was moved to retired above. Remaining slots are terminal.
+            for slot in &ring.slots {
+                slot.pending.store(false, Ordering::Release);
+            }
+        }
+        stream.destroy();
+    }
+
     fn stop_cursor(&mut self, id: StreamId, error: impl std::fmt::Display) {
         if let Some(stream) = self.streams.get_mut(&id)
             && let Some(cursor) = stream.cursor.take()
@@ -862,11 +1092,11 @@ impl State {
             } else {
                 // Dispose the native session before reporting its terminal event.
                 let sink = stream.sink.clone();
-                stream.destroy();
+                self.destroy_stream(stream);
                 emit(&sink, FrameEvent::Ended { stream: id, reason });
                 return;
             }
-            stream.destroy();
+            self.destroy_stream(stream);
         }
     }
 
@@ -893,7 +1123,7 @@ impl State {
                 let _ = pending.reply.send(Err(error));
             } else {
                 let sink = stream.sink.clone();
-                stream.destroy();
+                self.destroy_stream(stream);
                 emit(
                     &sink,
                     FrameEvent::Ended {
@@ -903,7 +1133,7 @@ impl State {
                 );
                 return;
             }
-            stream.destroy();
+            self.destroy_stream(stream);
         }
     }
 }
@@ -949,6 +1179,8 @@ impl Worker {
         gate: Arc<IoGate>,
         cursors: Arc<AtomicBool>,
         shutdown: &AtomicBool,
+        #[cfg(feature = "gpu")] gpu: Arc<Mutex<Option<Gpu>>>,
+        #[cfg(feature = "gpu")] main_device: Arc<Mutex<Option<u64>>>,
     ) -> Result<Self, PlatformError> {
         let connection = Connection::connect_to_env().map_err(backend)?;
         let queue = connection.new_event_queue();
@@ -959,6 +1191,16 @@ impl Worker {
             queue,
             qh,
             state: State {
+                #[cfg(feature = "gpu")]
+                gpu,
+                #[cfg(feature = "gpu")]
+                main_device,
+                #[cfg(feature = "gpu")]
+                dmabuf: None,
+                #[cfg(feature = "gpu")]
+                feedback: None,
+                #[cfg(feature = "gpu")]
+                retired: HashMap::new(),
                 gate,
                 cursors,
                 manager: None,
@@ -1169,6 +1411,14 @@ impl Worker {
         self.state.streams.insert(
             id,
             Stream {
+                #[cfg(feature = "gpu")]
+                gpu: self.state.gpu.lock().map_err(backend)?.clone(),
+                #[cfg(feature = "gpu")]
+                ring: None,
+                #[cfg(feature = "gpu")]
+                gpu_disabled: false,
+                #[cfg(feature = "gpu")]
+                gpu_ready: false,
                 output,
                 toplevel,
                 source,
@@ -1262,19 +1512,56 @@ impl Worker {
             // A resize can supersede an already captured buffer. Do not deliver old geometry,
             // especially if set_crop now addresses the new output dimensions.
             if capture.constraints_revision != stream.constraints_revision {
+                #[cfg(feature = "gpu")]
+                if let (Some(ring), Some(slot)) = (&stream.ring, capture.slot) {
+                    ring.release(slot);
+                }
                 stream.next_slot = Instant::now();
                 return Ok(());
             }
-            let buffer = stream
-                .buffer
-                .as_ref()
-                .ok_or_else(|| backend("missing frame buffer"))?;
-            let Some(rect) = clamped_crop(buffer.size, stream.crop) else {
-                return Ok(());
+            #[cfg(feature = "gpu")]
+            let native = if let (Some(ring), Some(slot)) = (&mut stream.ring, capture.slot) {
+                stream.gpu_ready = true;
+                if let Some(rect) = clamped_crop(ring.size, stream.crop) {
+                    Some(ring.image(slot, rect)?)
+                } else {
+                    ring.release(slot);
+                    return Ok(());
+                }
+            } else {
+                None
             };
-            let (size, pixels) = buffer.copy(Some(rect))?;
+            #[cfg(not(feature = "gpu"))]
+            let native: Option<Arc<dyn crosspane_platform::NativeImage>> = None;
+            let (size, image, rect) = if let Some(image) = native {
+                let size = image.size();
+                (
+                    size,
+                    crosspane_platform::FrameImage::Native(image),
+                    PixelRect::new(point2(0, 0), point2(size.width as i32, size.height as i32)),
+                )
+            } else {
+                let buffer = stream
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| backend("missing frame buffer"))?;
+                let Some(rect) = clamped_crop(buffer.size, stream.crop) else {
+                    return Ok(());
+                };
+                let (size, pixels) = buffer.copy(Some(rect))?;
+                (
+                    size,
+                    crosspane_platform::FrameImage::Cpu {
+                        stride: size.width * 4,
+                        pixels,
+                    },
+                    rect,
+                )
+            };
             let at = capture.at.map(Ok).unwrap_or_else(now)?;
-            let damage = if stream.full_damage {
+            let damage = if matches!(image, crosspane_platform::FrameImage::Native(_)) {
+                None
+            } else if stream.full_damage {
                 Some(vec![PixelRect::new(
                     point2(0, 0),
                     point2(size.width as i32, size.height as i32),
@@ -1289,12 +1576,17 @@ impl Worker {
                 self.state.end_all(StreamEndReason::Blocked);
                 return Ok(());
             }
-            let frame = Frame::cpu(size, size.width * 4, pixels, damage, at);
+            let frame = Frame {
+                size,
+                image,
+                damage,
+                at,
+            };
             if stream.toplevel.is_some() {
                 // Captures stay outstanding; only delivery is throttled. Replacing a held
                 // frame must describe all changed pixels relative to the last delivered frame.
                 let mut frame = frame;
-                if stream.held.is_some() {
+                if stream.held.is_some() && frame.native().is_none() {
                     frame.damage = Some(vec![PixelRect::new(
                         point2(0, 0),
                         point2(size.width as i32, size.height as i32),
@@ -1328,7 +1620,24 @@ impl Worker {
                 .shm
                 .as_ref()
                 .ok_or(PlatformError::Unsupported("wl_shm required"))?;
-            stream.buffer = Some(Buffer::new(shm, &self.qh, constraints)?);
+            #[cfg(feature = "gpu")]
+            {
+                stream.ring = None;
+                if !stream.gpu_disabled
+                    && let (Some(gpu), Some(dmabuf)) = (&stream.gpu, &self.state.dmabuf)
+                {
+                    stream.ring = Ring::new(gpu, dmabuf, &self.qh, constraints)?;
+                }
+            }
+            #[cfg(feature = "gpu")]
+            let native = stream.ring.is_some();
+            #[cfg(not(feature = "gpu"))]
+            let native = false;
+            stream.buffer = if native {
+                None
+            } else {
+                Some(Buffer::new(shm, &self.qh, constraints)?)
+            };
             stream.reallocate = false;
             stream.full_damage = true;
             if let Some(pending) = stream.pending.take()
@@ -1336,6 +1645,29 @@ impl Worker {
             {
                 self.state.end(id, StreamEndReason::Requested);
                 return Ok(());
+            }
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(ring) = &stream.ring {
+            if !self.state.gate.is_open() {
+                self.state.end_all(StreamEndReason::Blocked);
+                return Ok(());
+            }
+            if let Some(slot) = ring.acquire() {
+                let proxy = stream.session.create_frame(&self.qh, id);
+                proxy.attach_buffer(&ring.slots[slot].proxy);
+                proxy.damage_buffer(0, 0, ring.size.width as i32, ring.size.height as i32);
+                proxy.capture();
+                stream.capture = Some(Capture {
+                    slot: Some(slot),
+                    proxy,
+                    damage: Vec::new(),
+                    at: None,
+                    ready: false,
+                    constraints_revision: stream.constraints_revision,
+                });
+            } else {
+                stream.next_slot = Instant::now() + stream.interval;
             }
         }
         if let Some(buffer) = &stream.buffer {
@@ -1348,6 +1680,8 @@ impl Worker {
             proxy.damage_buffer(0, 0, buffer.size.width as i32, buffer.size.height as i32);
             proxy.capture();
             stream.capture = Some(Capture {
+                #[cfg(feature = "gpu")]
+                slot: None,
                 proxy,
                 damage: Vec::new(),
                 at: None,
@@ -1437,6 +1771,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 interface,
                 version,
             } => match interface.as_str() {
+                #[cfg(feature = "gpu")]
+                "zwp_linux_dmabuf_v1" if version >= 4 => {
+                    let dmabuf: ZwpLinuxDmabufV1 = registry.bind(name, 4, qh, ());
+                    state.feedback = Some(dmabuf.get_default_feedback(qh, ()));
+                    state.dmabuf = Some(dmabuf);
+                }
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "ext_image_copy_capture_manager_v1" => {
                     state.manager = Some(registry.bind(name, 1, qh, ()))
@@ -1765,10 +2105,32 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, StreamId> for State {
             session_protocol::Event::ShmFormat {
                 format: WEnum::Value(format),
             } => stream.incoming.formats.push(format),
+            #[cfg(feature = "gpu")]
+            session_protocol::Event::DmabufDevice { device } => {
+                stream.incoming.device = device.as_slice().try_into().ok().map(u64::from_ne_bytes);
+            }
+            #[cfg(feature = "gpu")]
+            session_protocol::Event::DmabufFormat { format, modifiers } => {
+                if modifiers.len() % 8 == 0 {
+                    stream.incoming.dmabuf_formats.push((
+                        format,
+                        modifiers
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|m| u64::from_ne_bytes(*m))
+                            .collect(),
+                    ));
+                }
+            }
             session_protocol::Event::Done => {
                 if stream.toplevel.is_some() {
                     stream.held = None;
-                    if let Some(capture) = stream.capture.take() {
+                    #[cfg(feature = "gpu")]
+                    let can_cancel = stream.capture.as_ref().is_none_or(|c| c.slot.is_none());
+                    #[cfg(not(feature = "gpu"))]
+                    let can_cancel = true;
+                    if can_cancel && let Some(capture) = stream.capture.take() {
                         capture.proxy.destroy();
                     }
                 }
@@ -1792,6 +2154,24 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, StreamId> for State {
         _: &QueueHandle<Self>,
     ) {
         state.check_gate();
+        #[cfg(feature = "gpu")]
+        {
+            use wayland_client::Proxy;
+            if state.retired.contains_key(&proxy.id()) {
+                if matches!(
+                    event,
+                    frame_protocol::Event::Ready | frame_protocol::Event::Failed { .. }
+                ) && let Some((frame, ring)) = state.retired.remove(&proxy.id())
+                {
+                    for slot in &ring.slots {
+                        slot.pending.store(false, Ordering::Release);
+                    }
+                    frame.destroy();
+                    drop(ring);
+                }
+                return;
+            }
+        }
         let Some(stream) = state.streams.get_mut(id) else {
             return;
         };
@@ -1816,8 +2196,43 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, StreamId> for State {
             frame_protocol::Event::Ready => capture.ready = true,
             frame_protocol::Event::Failed { reason } => {
                 let revision = capture.constraints_revision;
+                #[cfg(feature = "gpu")]
+                let gpu_slot = capture.slot;
+                #[cfg(feature = "gpu")]
+                if gpu_slot.is_some() {
+                    tracing::debug!(stream = id.0, ?reason, "DMA-BUF capture failed");
+                }
+                #[cfg(feature = "gpu")]
+                if let (Some(ring), Some(slot)) = (&stream.ring, gpu_slot) {
+                    ring.release(slot);
+                }
                 if let Some(capture) = stream.capture.take() {
                     capture.proxy.destroy();
+                }
+                #[cfg(feature = "gpu")]
+                if gpu_slot.is_some()
+                    && !stream.gpu_ready
+                    && matches!(
+                        reason,
+                        WEnum::Value(
+                            frame_protocol::FailureReason::BufferConstraints
+                                | frame_protocol::FailureReason::Unknown
+                        )
+                    )
+                {
+                    tracing::info!(
+                        stream = id.0,
+                        ?reason,
+                        "first DMA-BUF capture failed; staying on shm"
+                    );
+                    stream.gpu_disabled = true;
+                    stream.ring = None;
+                    stream.reallocate = stream.constraints.is_some();
+                    return;
+                }
+                #[cfg(feature = "gpu")]
+                if gpu_slot.is_some() {
+                    stream.ring = None;
                 }
                 match reason {
                     WEnum::Value(frame_protocol::FailureReason::BufferConstraints) => {
@@ -1848,6 +2263,29 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, StreamId> for State {
         }
     }
 }
+
+#[cfg(feature = "gpu")]
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxDmabufFeedbackV1,
+        event: zwp_linux_dmabuf_feedback_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } = event
+            && let Ok(bytes) = device.as_slice().try_into()
+            && let Ok(mut main) = state.main_device.lock()
+        {
+            *main = Some(u64::from_ne_bytes(bytes));
+        }
+    }
+}
+#[cfg(feature = "gpu")]
+delegate_noop!(State: ignore ZwpLinuxDmabufV1);
+#[cfg(feature = "gpu")]
+delegate_noop!(State: ignore ZwpLinuxBufferParamsV1);
 
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);

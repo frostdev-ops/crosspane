@@ -3,6 +3,8 @@
 
 #![cfg(target_os = "linux")]
 
+#[cfg(feature = "gpu")]
+pub mod dmabuf;
 pub mod hyprland;
 pub mod link;
 pub mod logind;
