@@ -6,5 +6,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod identity;
 pub mod pairing;
 pub mod rng;
+pub mod trust;
+pub mod window;
