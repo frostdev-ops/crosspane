@@ -53,6 +53,9 @@ pub(super) struct Source {
     last_seq: u32,
     parked_scale: f64,
     last_activation: Option<MonoTime>,
+    /// The destination's proxy has focus but the projection isn't live yet: activate the window
+    /// when it is.
+    focus_wanted: bool,
 }
 
 impl E2 {
@@ -126,6 +129,7 @@ impl E2 {
                 last_seq: 0,
                 parked_scale: scale,
                 last_activation: None,
+                focus_wanted: false,
             },
         );
         Ok(())
@@ -360,16 +364,13 @@ impl E2 {
                 }
             }
             Message::Focus { focused: true, .. } if source.stage == Stage::Live => {
-                let previous = self.focused;
-                if source.activate(now, out) {
-                    if self.focus_before.is_none()
-                        && let Some(previous) = previous
-                        && !self.sources.values().any(|s| s.window == previous)
-                    {
-                        self.focus_before = Some(previous);
-                    }
-                    self.focused = None;
-                }
+                self.focus_source(projection, now, out);
+            }
+            Message::Focus { focused, .. }
+                if matches!(source.stage, Stage::Parking(_) | Stage::Capturing(_)) =>
+            {
+                // A proxy usually has focus as soon as it opens, before the projection is live.
+                source.focus_wanted = *focused;
             }
             Message::Focus { focused: false, .. } if source.stage == Stage::Live => {
                 if let Some(window) = self.focus_before.take()
@@ -486,6 +487,9 @@ impl E2 {
                     source.stream = Some(stream);
                     source.stage = Stage::Live;
                     source.resize_latest(out);
+                    if source.focus_wanted {
+                        self.focus_source(projection, now, out);
+                    }
                 }
                 Err(_) => self.end_source(projection, Reason::Failed, false, now, out),
             }
@@ -598,6 +602,29 @@ impl E2 {
             && !self.ledgers.input(projection, item, down, now, out)
         {
             self.end_source(projection, Reason::Failed, false, now, out);
+        }
+    }
+
+    /// The destination focused the proxy: bring the source window forward, unless the OS already
+    /// reports it focused. Window sources report focus only when it changes, so asking again and
+    /// waiting for a confirmation would wait forever (and hold back every key).
+    fn focus_source(&mut self, projection: ProjectionId, now: MonoTime, out: &mut Vec<Output>) {
+        let focused = self.focused;
+        let Some(source) = self.sources.get_mut(&projection) else {
+            return;
+        };
+        source.focus_wanted = false;
+        if focused == Some(source.window) {
+            return;
+        }
+        if source.activate(now, out) {
+            if self.focus_before.is_none()
+                && let Some(previous) = focused
+                && !self.sources.values().any(|s| s.window == previous)
+            {
+                self.focus_before = Some(previous);
+            }
+            self.focused = None;
         }
     }
 

@@ -47,10 +47,12 @@ e1() {
 
 e2() {
   mac crosspanectl status | grep -q "frames: true" || fail "the Mac can't capture yet (Screen Recording?)"
-  local label=io.frostdev.crosspane.e2test bin='~/src/crosspane/target/release/crosspane-testapp'
-  mac "cd ~/src/crosspane && cargo build -q --release -p crosspane-testapp"
-  mac "launchctl remove $label 2>/dev/null; rm -f /tmp/cp-e2test.events; launchctl submit -l $label -- $bin window --title crosspane-e2test --size 640x480 --events /tmp/cp-e2test.events"
-  trap 'mac "launchctl remove io.frostdev.crosspane.e2test" 2>/dev/null || true' EXIT
+  # A bundled app opened through LaunchServices, like a real one: a bare process can't be made
+  # frontmost, so the focus guard would (rightly) hold back the keys typed into its proxy.
+  local app='~/cp-tools/CrosspaneTestApp.app'
+  mac "cd ~/src/crosspane && cargo build -q --release -p crosspane-testapp && scripts/macos/bundle.sh --bin target/release/crosspane-testapp --id io.frostdev.crosspane.testapp --name CrosspaneTestApp --out ~/cp-tools >/dev/null 2>&1"
+  mac "pkill -f CrosspaneTestApp.app/Contents/MacOS; rm -f /tmp/cp-e2test.events; open -n $app --args window --title crosspane-e2test --size 640x480 --events /tmp/cp-e2test.events"
+  trap 'mac "pkill -f CrosspaneTestApp.app/Contents/MacOS" 2>/dev/null || true' EXIT
   local wid=""
   for _ in $(seq 1 30); do
     wid=$(mac crosspanectl windows | awk '/crosspane-e2test/ {print $1; exit}')
@@ -59,7 +61,10 @@ e2() {
   [ -n "$wid" ] || fail "the Mac test window never appeared"
   mac crosspanectl project "$wid" desktop >/dev/null
   proxy() { hyprctl -j clients | jq -r '.[] | select(.class == "crosspane-proxy") | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1]) \(.address)"' | head -1; }
-  wait_for 15 test -n "$(proxy)" || fail "no proxy window on the desktop"
+  # wait_for runs its command each time, so the check must be a function (not "$(proxy)").
+  has_proxy() { [ -n "$(proxy)" ]; }
+  no_proxy() { [ -z "$(proxy)" ]; }
+  wait_for 15 has_proxy || fail "no proxy window on the desktop"
   sleep 3
   read -r at size address <<< "$(proxy)"
   echo "ok: proxy $size at $at"
@@ -84,6 +89,21 @@ PY
   # Type into the proxy: focus it, then a few letters (no Enter).
   hyprctl dispatch "hl.dsp.focus({window=\"address:$address\"})" >/dev/null 2>&1 || true
   sleep 0.5
+  # Click into the proxy first, as a user would: on the Mac a click is what brings the source app
+  # forward (a background agent's activation requests are ignored since macOS 14), and the focus
+  # guard holds keys back until the Mac reports the source window focused.
+  rect() { hyprctl -j clients | jq -r --arg a "$address" '.[] | select(.address == $a) | "\(.at[0]) \(.at[1]) \(.size[0]) \(.size[1])"'; }
+  read -r rx ry rw rh <<< "$(rect)"
+  hyprctl dispatch "hl.dsp.cursor.move({x=$((rx + rw / 2)), y=$((ry + rh / 2))})" >/dev/null
+  over_proxy() {
+    local cx cy
+    read -r cx cy <<< "$(hyprctl -j cursorpos | jq -r '"\(.x|floor) \(.y|floor)"')"
+    [ "$cx" -gt "$rx" ] && [ "$cx" -lt $((rx + rw)) ] && [ "$cy" -gt "$ry" ] && [ "$cy" -lt $((ry + rh)) ]
+  }
+  if over_proxy && [ "$(hyprctl -j activewindow | jq -r .address)" = "$address" ]; then
+    { echo "btn down"; echo "sleep 40"; echo "btn up"; echo "sleep 200"; } | vinput
+    sleep 1.5
+  fi
   # Type only into the proxy: if anything else has focus, the letters would land there.
   if [ "$(hyprctl -j activewindow | jq -r .address)" = "$address" ]; then
     { for k in 35 18 38 38 24; do echo "key $k down"; echo "sleep 20"; echo "key $k up"; echo "sleep 20"; done; echo "sleep 300"; } | vinput
@@ -97,7 +117,7 @@ PY
   local proj
   proj=$(mac crosspanectl status | awk '/projecting window/ {split($2, k, ":"); print k[2]; exit}')
   mac crosspanectl return "${proj:-1}" >/dev/null
-  wait_for 10 test -z "$(proxy)" || fail "the proxy stayed open after return"
+  wait_for 10 no_proxy || fail "the proxy stayed open after return"
   echo "ok: returned"
 }
 

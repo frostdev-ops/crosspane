@@ -69,15 +69,16 @@ impl WindowSource for MacWindows {
 
     fn activate(&mut self, window: WindowId) -> Result<(), PlatformError> {
         require_accessibility()?;
+        // Off-screen too: a parked window sits on a twin display.
         let raw = self
             .query
-            .list(false)?
+            .list(true)?
             .into_iter()
             .find(|w| w.id == window)
             .ok_or(PlatformError::NotFound)?;
         let deadline = Instant::now() + MAIN_WAIT;
         let pid = raw.pid;
-        on_main(MAIN_WAIT, move |_| {
+        let requested = on_main(MAIN_WAIT, move |_| {
             // on_main may execute a timed-out closure later. Never activate in that case.
             if Instant::now() >= deadline {
                 return Err(PlatformError::Timeout);
@@ -86,16 +87,21 @@ impl WindowSource for MacWindows {
             autoreleasepool(|_| {
                 let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
                     .ok_or(PlatformError::NotFound)?;
-                if app.activateWithOptions(NSApplicationActivationOptions::empty()) {
-                    Ok(())
-                } else {
-                    Err(PlatformError::Backend(
-                        "application rejected activation".into(),
-                    ))
-                }
+                Ok(app.activateWithOptions(NSApplicationActivationOptions::empty()))
             })
-        })??;
-        AxWindow::find(&raw, Instant::now() + Duration::from_secs(1))?.raise()
+        })
+        .and_then(|result| result);
+        // Since macOS 14, activation is cooperative: a background agent's request can be ignored
+        // (or refused). Accessibility's AXFrontmost, the route window managers use, isn't.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let frontmost =
+            AxWindow::application(pid, deadline).set("AXFrontmost", CFBoolean::new(true));
+        if let (Ok(false) | Err(_), Err(error)) = (&requested, &frontmost) {
+            return Err(PlatformError::Backend(format!(
+                "activation refused ({requested:?}); AXFrontmost: {error}"
+            )));
+        }
+        AxWindow::find(&raw, deadline)?.raise()
     }
 
     fn subscribe(&mut self, sink: Arc<dyn EventSink<WindowEvent>>) -> Result<(), PlatformError> {
@@ -458,13 +464,18 @@ impl AxWindow {
         })
     }
 
+    /// The application element of process `pid` (for app-level attributes like AXFrontmost).
+    fn application(pid: i32, deadline: Instant) -> Self {
+        Self {
+            // SAFETY: positive pid obtained from Quartz; creates a retained public AX application object.
+            element: unsafe { AXUIElement::new_application(pid) },
+            deadline,
+        }
+    }
+
     pub(crate) fn find(raw: &RawWindow, deadline: Instant) -> Result<Self, PlatformError> {
         require_accessibility()?;
-        let app = Self {
-            // SAFETY: positive pid obtained from Quartz; creates a retained public AX application object.
-            element: unsafe { AXUIElement::new_application(raw.pid) },
-            deadline,
-        };
+        let app = Self::application(raw.pid, deadline);
         let values = app
             .attribute("AXWindows")?
             .downcast::<CFArray>()
@@ -472,7 +483,14 @@ impl AxWindow {
         // SAFETY: the public AXWindows attribute is an array of AXUIElement CF objects;
         // each element is additionally downcast before use.
         let values = unsafe { values.cast_unchecked::<CFType>() };
-        let mut found = None;
+        // Candidates: the app's AX windows with the Quartz window's title (all of them when it
+        // has none). The frame only picks between several candidates: right after an AX move
+        // or resize, Quartz still reports the old frame for a while, so a lone candidate matches
+        // whatever its frame.
+        let mut candidates = Vec::new();
+        let mut framed = Vec::new();
+        // What each AX window looked like, for the error when none matches.
+        let mut seen = Vec::new();
         for value in values.iter() {
             let element = value
                 .downcast::<AXUIElement>()
@@ -483,29 +501,49 @@ impl AxWindow {
                 Err(PlatformError::NotFound) => continue,
                 Err(error) => return Err(error),
             };
-            let matches = (frame.origin.x - raw.frame.origin.x).abs() <= 2.0
-                && (frame.origin.y - raw.frame.origin.y).abs() <= 2.0
-                && (frame.size.width - raw.frame.size.width).abs() <= 2.0
-                && (frame.size.height - raw.frame.size.height).abs() <= 2.0;
-            if !matches {
-                continue;
-            }
+            seen.push(format!(
+                "({:.0},{:.0} {:.0}x{:.0})",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+            ));
             if !raw.title.is_empty() {
                 let title = window
                     .attribute("AXTitle")?
                     .downcast::<CFString>()
                     .map_err(|_| PlatformError::Backend("AXTitle is not a string".into()))?;
                 if title.to_string() != raw.title {
+                    seen.push(format!("title {:?}", title.to_string()));
                     continue;
                 }
             }
-            if found.is_some() {
+            if (frame.origin.x - raw.frame.origin.x).abs() <= 2.0
+                && (frame.origin.y - raw.frame.origin.y).abs() <= 2.0
+                && (frame.size.width - raw.frame.size.width).abs() <= 2.0
+                && (frame.size.height - raw.frame.size.height).abs() <= 2.0
+            {
+                framed.push(candidates.len());
+            }
+            candidates.push(window);
+        }
+        let pick = match (framed.as_slice(), candidates.len()) {
+            ([one], _) => Some(*one),
+            ([], 1) => Some(0),
+            ([_, _, ..], _) => {
                 return Err(PlatformError::Backend("ambiguous AX window match".into()));
             }
-            found = Some(window);
+            _ => None,
+        };
+        match pick {
+            Some(index) => Ok(candidates.swap_remove(index)),
+            None => Err(PlatformError::Backend(format!(
+                "Quartz window ({:.0},{:.0} {:.0}x{:.0}) has no matching AX window among {} [{}]",
+                raw.frame.origin.x,
+                raw.frame.origin.y,
+                raw.frame.size.width,
+                raw.frame.size.height,
+                values.len(),
+                seen.join(" "),
+            ))),
         }
-        found
-            .ok_or_else(|| PlatformError::Backend("Quartz window has no matching AX window".into()))
     }
 
     pub(crate) fn frame(&self) -> Result<RectLogical, PlatformError> {
