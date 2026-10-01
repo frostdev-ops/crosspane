@@ -1,8 +1,10 @@
 //! `config.toml`: user settings. Created with defaults on first run.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use crosspane_input::remap::RemapProfile;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::{Paths, write_private};
@@ -28,6 +30,9 @@ pub struct Config {
     /// macOS: hide projected windows on a private-API virtual display (D7) instead of mirroring
     /// them in place (M1). Needs a build with the `private-vdisplay` feature; ignored otherwise.
     pub mac_virtual_display: bool,
+    /// Modifier remap profile per peer name, applied while this node controls that peer:
+    /// `none`, `swap-ctrl-gui` (Ctrl ↔ ⌘/Super) or `swap-alt-gui` (Alt ↔ ⌘/Super).
+    pub remap: BTreeMap<String, RemapProfile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +52,7 @@ impl Default for Config {
             force_file_keystore: false,
             crossing: true,
             mac_virtual_display: false,
+            remap: BTreeMap::new(),
         }
     }
 }

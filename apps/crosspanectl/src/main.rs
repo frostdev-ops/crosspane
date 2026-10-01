@@ -36,6 +36,8 @@ enum Command {
     Rearm,
     /// Restart the agent in place (e.g. after granting macOS permissions).
     Restart,
+    /// Unpair a peer (name or node-id prefix): its key is forgotten and the connection ends now.
+    Forget { peer: String },
     /// Put a peer (name or node-id prefix) on a side of this machine.
     Layout { peer: String, side: Side },
     /// Connect to a peer at ADDR (host:port) now.
@@ -114,6 +116,7 @@ fn main() -> Result<()> {
         Command::Panic => json!({"cmd": "panic"}),
         Command::Rearm => json!({"cmd": "rearm"}),
         Command::Restart => json!({"cmd": "restart"}),
+        Command::Forget { peer } => json!({"cmd": "forget", "peer": peer}),
         Command::Layout { peer, side } => {
             let side = format!("{side:?}").to_lowercase();
             json!({"cmd": "layout", "peer": peer, "side": side})

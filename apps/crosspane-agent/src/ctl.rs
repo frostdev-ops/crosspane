@@ -27,6 +27,10 @@ pub enum Request {
     Rearm,
     /// Stop cleanly and start again in place (e.g. after granting OS permissions).
     Restart,
+    /// Unpair a peer (name or node-id prefix) and end its connection now.
+    Forget {
+        peer: String,
+    },
     /// Put a peer (by name or node-id prefix) on a side of this node.
     Layout {
         peer: String,

@@ -646,12 +646,37 @@ impl Agent {
         true
     }
 
+    /// A forgotten (or revoked) peer's connection ends at once (05 scenario 1), not at its next
+    /// handshake: its link is closed and it drops out of the peer list.
+    fn close_untrusted(&mut self) {
+        let trusted: BTreeSet<NodeId> = self
+            .trust
+            .with(|t| t.peers().iter().map(|e| e.node).collect());
+        let gone: Vec<NodeId> = self
+            .links
+            .keys()
+            .chain(self.peers.keys())
+            .filter(|node| !trusted.contains(node))
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for node in gone {
+            tracing::info!(peer = %node.short(), "peer no longer trusted: disconnecting");
+            if let Some(link) = self.links.get_mut(&node) {
+                link.close("forgotten");
+            }
+            self.peers.remove(&node);
+        }
+    }
+
     fn housekeeping(&mut self) {
         if self.last_trust_check.elapsed() >= HOUSEKEEPING {
             self.last_trust_check = Instant::now();
             match self.trust.refresh() {
                 Ok(true) => {
                     tracing::info!("trust store changed");
+                    self.close_untrusted();
                     self.send_grants();
                 }
                 Ok(false) => {}
@@ -947,6 +972,18 @@ impl Agent {
                 self.feed(Input::Command(Command::Panic));
                 Response::ok(json!("panic"))
             }
+            Request::Forget { peer } => match self.find_peer(&peer) {
+                Some(node) => match self.trust.update(|t| Ok(t.forget(node))) {
+                    Ok(Some(entry)) => {
+                        self.close_untrusted();
+                        self.send_grants();
+                        Response::ok(json!(format!("forgot {}", entry.name)))
+                    }
+                    Ok(None) => Response::err(format!("{peer} is not paired")),
+                    Err(e) => Response::err(format!("could not update the trust store: {e}")),
+                },
+                None => Response::err(format!("no peer called {peer}")),
+            },
             Request::Restart => {
                 self.restart_requested = true;
                 Response::ok(json!("restarting"))

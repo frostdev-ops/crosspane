@@ -144,6 +144,14 @@ fn run() -> Result<()> {
     let mut engine_config = EngineConfig::new(node);
     engine_config.push_to_cross =
         std::time::Duration::from_millis(config.push_to_cross_ms.min(200));
+    for (name, profile) in &config.remap {
+        match trust.with(|t| t.peers().iter().find(|e| &e.name == name).map(|e| e.node)) {
+            Some(node) => {
+                engine_config.remap.insert(node, *profile);
+            }
+            None => tracing::warn!(peer = %name, "remap: no paired peer with that name"),
+        }
+    }
     let (engine, startup) = Engine::new(
         engine_config,
         Box::new(journal),
