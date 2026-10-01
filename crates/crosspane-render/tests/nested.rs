@@ -83,6 +83,7 @@ fn nested_proxy_lifecycle() -> Result<()> {
         id: 26,
         title: title.clone(),
         size,
+        accent: [211, 45, 137],
     })?;
     let opened = wait_event(&event_receiver, |event| {
         matches!(event, HostEvent::Opened { id: 26, .. })
