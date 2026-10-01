@@ -5,6 +5,7 @@ use std::ptr::{self, NonNull};
 use std::sync::mpsc;
 
 use crosspane_media::codec::{CodecError, EncodedVideo, VideoCodecs, VideoDecoder, VideoEncoder};
+use crosspane_media::picture::{Nv12, YuvColour, YuvMatrix};
 use crosspane_types::geom::PixelSize;
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
@@ -16,22 +17,33 @@ use objc2_core_media::{
     kCMSampleAttachmentKey_NotSync, kCMTimeInvalid, kCMVideoCodecType_H264,
 };
 use objc2_core_video::{
-    CVImageBuffer, CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
-    CVPixelBufferGetBytesPerRow, CVPixelBufferGetDataSize, CVPixelBufferGetHeight,
-    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelBufferPixelFormatTypeKey,
-    kCVPixelFormatType_32BGRA,
+    CVAttachmentMode, CVImageBuffer, CVPixelBuffer, CVPixelBufferCreate,
+    CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetDataSize, CVPixelBufferGetHeight,
+    CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount,
+    CVPixelBufferGetWidth, CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress,
+    CVPixelBufferLockFlags, CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
+    kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferColorPrimariesKey,
+    kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferTransferFunction_sRGB,
+    kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+    kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrixKey, kCVPixelBufferHeightKey,
+    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
 };
 use objc2_video_toolbox::{
     VTCompressionSession, VTDecodeFrameFlags, VTDecodeInfoFlags,
     VTDecompressionOutputCallbackRecord, VTDecompressionSession, VTEncodeInfoFlags,
-    VTIsHardwareDecodeSupported, VTSessionCopyProperty, VTSessionSetProperty,
-    kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
+    VTIsHardwareDecodeSupported, VTPixelTransferSession, VTSessionCopyProperty,
+    VTSessionSetProperty, kVTCompressionPropertyKey_AllowFrameReordering,
+    kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_ColorPrimaries,
     kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
+    kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_YCbCrMatrix,
     kVTDecompressionPropertyKey_RealTime,
     kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_High_AutoLevel,
+    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+    kVTProfileLevel_H264_High_AutoLevel,
     kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
@@ -40,7 +52,7 @@ use objc2_video_toolbox::{
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 const MAX_DECODE_DIMENSION: u32 = 8192;
 type EncodedFrame = Result<(EncodedVideo, Vec<u8>), CodecError>;
-type DecodedFrame = Result<(PixelSize, Vec<u8>), CodecError>;
+type DecodedFrame = Result<CFRetained<CVPixelBuffer>, CodecError>;
 
 #[derive(Debug, Default)]
 pub struct VtCodecs;
@@ -48,6 +60,40 @@ pub struct VtCodecs;
 impl VtCodecs {
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn nv12_decoder(&self) -> Result<Decoder, CodecError> {
+        // SAFETY: Public capability probe, no session or callback involved.
+        Decoder::new(unsafe { VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) })
+    }
+
+    /// Select the allocation fallback explicitly for comparing encoder input paths.
+    #[doc(hidden)]
+    pub fn encoder_with_fallback(
+        &self,
+        size: PixelSize,
+        bitrate: u32,
+        fps: u32,
+        fallback: bool,
+    ) -> Result<Box<dyn VideoEncoder>, CodecError> {
+        if fps == 0 || fps > i32::MAX as u32 || bitrate == 0 {
+            return Err(CodecError::BadInput(
+                "bitrate and frame rate must be positive",
+            ));
+        }
+        let mut encoder = Encoder::new(size, bitrate, fps)?;
+        encoder.fallback = fallback;
+        if !fallback {
+            let session = encoder
+                .session
+                .as_deref()
+                .ok_or_else(|| missing("compression session"))?;
+            // SAFETY: Live prepared session; the public getter retains its pool.
+            let pool =
+                unsafe { session.pixel_buffer_pool() }.ok_or_else(|| missing("input pool"))?;
+            let _ = pool_buffer(&pool)?;
+        }
+        Ok(Box::new(encoder))
     }
 }
 
@@ -151,6 +197,9 @@ struct Encoder {
     fps: u32,
     frame: i64,
     first: bool,
+    fallback: bool,
+    fallback_logged: bool,
+    transfer: &'static CFString,
 }
 
 // SAFETY: VT sessions have no thread affinity. &mut self serializes all use; callbacks access
@@ -197,6 +246,7 @@ impl Encoder {
                 &[CFBoolean::new(true), CFBoolean::new(true)],
             )
         };
+        let attributes = bgra_attributes(coded);
         // SAFETY: Valid even dimensions, H.264, documented callback signature and a stable boxed
         // sender. The out pointer is writable; the specification remains live for this call.
         let code = unsafe {
@@ -206,7 +256,7 @@ impl Encoder {
                 coded.height as i32,
                 kCMVideoCodecType_H264,
                 Some(specification.as_ref()),
-                None,
+                Some(attributes.as_ref()),
                 None,
                 Some(encoded_callback),
                 ptr::from_mut(&mut *callback).cast(),
@@ -217,7 +267,8 @@ impl Encoder {
         let session = NonNull::new(session).ok_or_else(|| missing("compression session"))?;
         // SAFETY: Successful Create transfers the session's +1 reference.
         let session = unsafe { CFRetained::from_raw(session) };
-        let encoder = Self {
+        // SAFETY: Immutable exported colour constant.
+        let mut encoder = Self {
             session: Some(session),
             callback: Box::into_raw(callback),
             output,
@@ -227,6 +278,10 @@ impl Encoder {
             fps,
             frame: 0,
             first: true,
+            fallback: false,
+            fallback_logged: false,
+            // SAFETY: Immutable exported colour constant.
+            transfer: unsafe { kCVImageBufferTransferFunction_sRGB },
         };
         let session = encoder
             .session
@@ -234,6 +289,30 @@ impl Encoder {
             .ok_or_else(|| missing("compression session"))?;
         // SAFETY: Immutable public property keys. Each value has the property's documented type.
         unsafe {
+            set(
+                session.as_ref(),
+                kVTCompressionPropertyKey_YCbCrMatrix,
+                kCVImageBufferYCbCrMatrix_ITU_R_709_2.as_ref(),
+            )?;
+            set(
+                session.as_ref(),
+                kVTCompressionPropertyKey_ColorPrimaries,
+                kCVImageBufferColorPrimaries_ITU_R_709_2.as_ref(),
+            )?;
+            if set(
+                session.as_ref(),
+                kVTCompressionPropertyKey_TransferFunction,
+                encoder.transfer.as_ref(),
+            )
+            .is_err()
+            {
+                encoder.transfer = kCVImageBufferTransferFunction_ITU_R_709_2;
+                set(
+                    session.as_ref(),
+                    kVTCompressionPropertyKey_TransferFunction,
+                    encoder.transfer.as_ref(),
+                )?;
+            }
             set(
                 session.as_ref(),
                 kVTCompressionPropertyKey_RealTime,
@@ -269,6 +348,7 @@ impl Encoder {
                 "VTCompressionSessionPrepareToEncodeFrames",
             )?;
         }
+        tracing::debug!(transfer = %encoder.transfer, "VideoToolbox encoder colour transfer");
         Ok(encoder)
     }
 }
@@ -293,14 +373,48 @@ impl VideoEncoder for Encoder {
             return Err(CodecError::BadInput("short BGRA rows"));
         }
         if self.size != size || self.session.is_none() {
+            let fallback = self.fallback;
+            let fallback_logged = self.fallback_logged;
             self.reset();
             *self = Self::new(size, self.bitrate, self.fps)?;
+            self.fallback = fallback;
+            self.fallback_logged = fallback_logged;
         }
         let session = self
             .session
             .as_deref()
             .ok_or_else(|| missing("compression session"))?;
-        let image = input_buffer(pixels, stride as usize, size, coded)?;
+        let pooled = if self.fallback {
+            None
+        } else {
+            // SAFETY: Live prepared compression session; getter retains the pool.
+            unsafe { session.pixel_buffer_pool() }.and_then(|pool| pool_buffer(&pool).ok())
+        };
+        let image = if let Some(image) = pooled {
+            fill_input_buffer(image, pixels, stride as usize, size, coded)?
+        } else {
+            if !self.fallback && !self.fallback_logged {
+                tracing::warn!("VideoToolbox input pool unavailable; using allocated BGRA buffers");
+                self.fallback_logged = true;
+            }
+            input_buffer(pixels, stride as usize, size, coded)?
+        };
+        // SAFETY: Public colour keys and live buffer; attachments retain their values.
+        unsafe {
+            for (key, value) in [
+                (
+                    kCVImageBufferYCbCrMatrixKey,
+                    kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                ),
+                (
+                    kCVImageBufferColorPrimariesKey,
+                    kCVImageBufferColorPrimaries_ITU_R_709_2,
+                ),
+                (kCVImageBufferTransferFunctionKey, self.transfer),
+            ] {
+                image.set_attachment(key, value.as_ref(), CVAttachmentMode::ShouldPropagate);
+            }
+        }
         let force = force_key || self.first;
         // SAFETY: Immutable public property keys, with boolean/numeric values of the required types.
         let properties = unsafe {
@@ -424,6 +538,55 @@ fn input_buffer(
     let image = NonNull::new(image).ok_or_else(|| missing("pixel buffer"))?;
     // SAFETY: Successful Create transfers its +1 reference to this owner.
     let image = unsafe { CFRetained::from_raw(image) };
+    fill_input_buffer(image, pixels, stride, size, coded)
+}
+
+fn bgra_attributes(size: PixelSize) -> CFRetained<CFDictionary<CFString, CFType>> {
+    let surface = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
+    // SAFETY: Immutable public keys with documented CFNumber/dictionary values.
+    unsafe {
+        CFDictionary::from_slices(
+            &[
+                kCVPixelBufferPixelFormatTypeKey,
+                kCVPixelBufferWidthKey,
+                kCVPixelBufferHeightKey,
+                kCVPixelBufferIOSurfacePropertiesKey,
+            ],
+            &[
+                CFNumber::new_i64(i64::from(kCVPixelFormatType_32BGRA)).as_ref(),
+                CFNumber::new_i64(i64::from(size.width)).as_ref(),
+                CFNumber::new_i64(i64::from(size.height)).as_ref(),
+                surface.as_ref(),
+            ],
+        )
+    }
+}
+
+fn pool_buffer(pool: &CVPixelBufferPool) -> Result<CFRetained<CVPixelBuffer>, CodecError> {
+    let mut image = ptr::null_mut();
+    status(
+        // SAFETY: Live pool and writable output; successful Create transfers a +1 reference.
+        unsafe { CVPixelBufferPool::create_pixel_buffer(None, pool, NonNull::from(&mut image)) },
+        "CVPixelBufferPoolCreatePixelBuffer",
+    )?;
+    let image = NonNull::new(image).ok_or_else(|| missing("pooled pixel buffer"))?;
+    // SAFETY: Successful Create transfers its +1 reference.
+    Ok(unsafe { CFRetained::from_raw(image) })
+}
+
+fn fill_input_buffer(
+    image: CFRetained<CVPixelBuffer>,
+    pixels: &[u8],
+    stride: usize,
+    size: PixelSize,
+    coded: PixelSize,
+) -> Result<CFRetained<CVPixelBuffer>, CodecError> {
+    if CVPixelBufferGetPixelFormatType(&image) != kCVPixelFormatType_32BGRA
+        || CVPixelBufferGetWidth(&image) != coded.width as usize
+        || CVPixelBufferGetHeight(&image) != coded.height as usize
+    {
+        return Err(missing("matching BGRA input buffer"));
+    }
     status(
         // SAFETY: Exclusively owned, nonplanar BGRA buffer; matching lock/unlock flags.
         unsafe { CVPixelBufferLockBaseAddress(&image, CVPixelBufferLockFlags::empty()) },
@@ -627,11 +790,19 @@ fn avcc_nals(avcc: &[u8]) -> Result<Vec<&[u8]>, CodecError> {
     Ok(nals)
 }
 
-struct Decoder {
+pub struct Decoder {
     sps: Vec<u8>,
     pps: Vec<u8>,
     session: Option<DecodeSession>,
     last_reference: Option<u32>,
+}
+
+impl std::fmt::Debug for Decoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Decoder")
+            .field("last_reference", &self.last_reference)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Decoder {
@@ -658,6 +829,7 @@ struct DecodeSession {
     output: mpsc::Receiver<DecodedFrame>,
     hardware: Option<bool>,
     frame_num_bits: u32,
+    nv12: bool,
 }
 
 // SAFETY: VT and CoreMedia have no thread affinity. &mut Decoder serializes use; callbacks access
@@ -677,7 +849,12 @@ impl Drop for DecodeSession {
 }
 
 impl DecodeSession {
+    #[cfg(test)]
     fn new(sps: &[u8], pps: &[u8]) -> Result<Self, CodecError> {
+        Self::with_output(sps, pps, false)
+    }
+
+    fn with_output(sps: &[u8], pps: &[u8], nv12: bool) -> Result<Self, CodecError> {
         let frame_num_bits = frame_num_bits(sps)?;
         if pps.is_empty() {
             return Err(CodecError::BadInput("missing PPS"));
@@ -722,14 +899,37 @@ impl DecodeSession {
                     &[kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder],
                     &[CFBoolean::new(true)],
                 ),
-                CFDictionary::from_slices(
-                    &[kCVPixelBufferPixelFormatTypeKey],
-                    &[&*CFNumber::new_i64(i64::from(kCVPixelFormatType_32BGRA))],
-                ),
+                {
+                    let formats: CFRetained<CFType> = if nv12 {
+                        let formats = CFArray::<CFType>::from_objects(&[
+                            CFNumber::new_i64(i64::from(
+                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                            ))
+                            .as_ref(),
+                            CFNumber::new_i64(i64::from(
+                                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                            ))
+                            .as_ref(),
+                        ]);
+                        // SAFETY: Every CFArray is a CFType; erasing its element type
+                        // preserves the retained object and ownership.
+                        CFRetained::cast_unchecked(formats)
+                    } else {
+                        CFNumber::new_i64(i64::from(kCVPixelFormatType_32BGRA)).into()
+                    };
+                    let surface = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
+                    CFDictionary::<CFString, CFType>::from_slices(
+                        &[
+                            kCVPixelBufferPixelFormatTypeKey,
+                            kCVPixelBufferIOSurfacePropertiesKey,
+                        ],
+                        &[formats.as_ref(), surface.as_ref()],
+                    )
+                },
             )
         };
         let mut session = ptr::null_mut();
-        // SAFETY: Retained valid H.264 format, BGRA destination attributes and correct callback.
+        // SAFETY: Retained H.264 format, documented destination attributes and correct callback.
         // VT copies the callback record; the boxed sender's address remains stable until invalidation.
         let code = unsafe {
             VTDecompressionSession::create(
@@ -752,6 +952,7 @@ impl DecodeSession {
             output,
             hardware: None,
             frame_num_bits,
+            nv12,
         };
         // SAFETY: Immutable public keys and documented boolean property value.
         unsafe {
@@ -857,13 +1058,21 @@ impl DecodeSession {
     }
 }
 
-impl VideoDecoder for Decoder {
-    fn decode(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<PixelSize, CodecError> {
+impl Decoder {
+    fn decode_image(&mut self, data: &[u8], nv12: bool) -> DecodedFrame {
         let result = (|| {
             let nals = annex_b_nals(data)?;
             let sps = nals.iter().find(|nal| nal[0] & 31 == 7).copied();
             let pps = nals.iter().find(|nal| nal[0] & 31 == 8).copied();
             let idr = nals.iter().any(|nal| nal[0] & 31 == 5);
+            if idr
+                && self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.nv12 != nv12)
+            {
+                self.session = None;
+            }
             if let Some(sps) = sps
                 && self.sps != sps
             {
@@ -885,7 +1094,7 @@ impl VideoDecoder for Decoder {
                 return Err(CodecError::Failed("decoder needs an IDR".into()));
             }
             if self.session.is_none() {
-                self.session = Some(DecodeSession::new(&self.sps, &self.pps)?);
+                self.session = Some(DecodeSession::with_output(&self.sps, &self.pps, nv12)?);
             }
             let session = self
                 .session
@@ -941,6 +1150,41 @@ impl VideoDecoder for Decoder {
             Ok(frame)
         })();
         match result {
+            Ok(image) => Ok(image),
+            Err(error) => {
+                self.last_reference = None;
+                self.session = None;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn decode_nv12(&mut self, data: &[u8], out: &mut Nv12) -> Result<(), CodecError> {
+        let image = self.decode_image(data, true)?;
+        // Preserve references when callers change output between IDRs. At the next IDR,
+        // decode_image can safely rebuild for the requested native output format.
+        let result = if CVPixelBufferGetPixelFormatType(&image) == kCVPixelFormatType_32BGRA {
+            transfer_image(&image, true).and_then(|image| copy_nv12(&image, out))
+        } else {
+            copy_nv12(&image, out)
+        };
+        if result.is_err() {
+            self.session = None;
+            self.last_reference = None;
+        }
+        result
+    }
+}
+
+impl VideoDecoder for Decoder {
+    fn decode(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<PixelSize, CodecError> {
+        let image = self.decode_image(data, false)?;
+        let result = if CVPixelBufferGetPixelFormatType(&image) == kCVPixelFormatType_32BGRA {
+            copy_image(&image)
+        } else {
+            transfer_image(&image, false).and_then(|image| copy_image(&image))
+        };
+        match result {
             Ok((size, pixels)) => {
                 out.try_reserve_exact(pixels.len().saturating_sub(out.len()))
                     .map_err(|_| CodecError::Failed("decoded output allocation failed".into()))?;
@@ -949,8 +1193,8 @@ impl VideoDecoder for Decoder {
                 Ok(size)
             }
             Err(error) => {
-                self.last_reference = None;
                 self.session = None;
+                self.last_reference = None;
                 Err(error)
             }
         }
@@ -1108,7 +1352,7 @@ unsafe extern "C-unwind" fn decoded_callback(
     _duration: CMTime,
 ) {
     // SAFETY: Context is the live boxed sender. VT supplies a nullable image valid during this
-    // callback; copy_image borrows it only while locked and returns owned Rust bytes.
+    // callback; retain it before returning, then copy its planes under a lock on the caller.
     let (sender, image) = unsafe {
         (
             &*context.cast::<mpsc::Sender<DecodedFrame>>(),
@@ -1119,14 +1363,176 @@ unsafe extern "C-unwind" fn decoded_callback(
         if flags.contains(VTDecodeInfoFlags::FrameDropped) {
             return Err(missing("decoded frame"));
         }
-        image
-            .ok_or_else(|| missing("decoded image"))
-            .and_then(copy_image)
+        image.ok_or_else(|| missing("decoded image")).map(|image| {
+            // SAFETY: VT's callback image is live; retain before returning to VT.
+            unsafe { CFRetained::retain(NonNull::from(image)) }
+        })
     });
     let _ = sender.send(result);
 }
 
-fn copy_image(image: &CVPixelBuffer) -> DecodedFrame {
+fn transfer_image(
+    image: &CVPixelBuffer,
+    nv12: bool,
+) -> Result<CFRetained<CVPixelBuffer>, CodecError> {
+    let mut destination = ptr::null_mut();
+    let size = decode_size(
+        CVPixelBufferGetWidth(image) as i32,
+        CVPixelBufferGetHeight(image) as i32,
+    )?;
+    let surface = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
+    let format = if nv12 {
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    } else {
+        kCVPixelFormatType_32BGRA
+    };
+    // SAFETY: Public format and IOSurface keys with documented CF types.
+    let attributes = unsafe {
+        CFDictionary::<CFString, CFType>::from_slices(
+            &[
+                kCVPixelBufferPixelFormatTypeKey,
+                kCVPixelBufferIOSurfacePropertiesKey,
+            ],
+            &[
+                CFNumber::new_i64(i64::from(format)).as_ref(),
+                surface.as_ref(),
+            ],
+        )
+    };
+    let mut transfer = ptr::null_mut();
+    // SAFETY: Live source, documented destination attributes, writable Create outputs.
+    // Create references are owned below, transfer completes before invalidation/release.
+    unsafe {
+        status(
+            CVPixelBufferCreate(
+                None,
+                size.width as usize,
+                size.height as usize,
+                format,
+                Some(attributes.as_ref()),
+                NonNull::from(&mut destination),
+            ),
+            "CVPixelBufferCreate alternate output",
+        )?;
+        let destination = NonNull::new(destination).ok_or_else(|| missing("alternate output"))?;
+        let destination = CFRetained::from_raw(destination);
+        status(
+            VTPixelTransferSession::create(None, NonNull::from(&mut transfer)),
+            "VTPixelTransferSessionCreate",
+        )?;
+        let transfer = NonNull::new(transfer).ok_or_else(|| missing("pixel transfer session"))?;
+        let transfer = CFRetained::from_raw(transfer);
+        if nv12 {
+            set(
+                transfer.as_ref(),
+                kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                kCVImageBufferYCbCrMatrix_ITU_R_709_2.as_ref(),
+            )?;
+            destination.set_attachment(
+                kCVImageBufferYCbCrMatrixKey,
+                kCVImageBufferYCbCrMatrix_ITU_R_709_2.as_ref(),
+                CVAttachmentMode::ShouldPropagate,
+            );
+        }
+        let result = status(
+            transfer.transfer_image(image, &destination),
+            "VTPixelTransferSessionTransferImage",
+        );
+        transfer.invalidate();
+        result?;
+        Ok(destination)
+    }
+}
+
+fn copy_nv12(image: &CVPixelBuffer, out: &mut Nv12) -> Result<(), CodecError> {
+    let format = CVPixelBufferGetPixelFormatType(image);
+    if (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        && format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        || CVPixelBufferGetPlaneCount(image) != 2
+    {
+        return Err(CodecError::Failed("decoder output is not NV12".into()));
+    }
+    let size = decode_size(
+        CVPixelBufferGetWidth(image) as i32,
+        CVPixelBufferGetHeight(image) as i32,
+    )?;
+    if coded_size(size)? != size {
+        return Err(CodecError::Failed(
+            "decoder output has odd dimensions".into(),
+        ));
+    }
+    // SAFETY: Immutable public matrix constants; attachment copy retains its CF value.
+    let matrix = unsafe {
+        image
+            .attachment(kCVImageBufferYCbCrMatrixKey, ptr::null_mut())
+            .and_then(|value| {
+                value.downcast_ref::<CFString>().map(|value| {
+                    if value == kCVImageBufferYCbCrMatrix_ITU_R_601_4 {
+                        YuvMatrix::Bt601
+                    } else {
+                        YuvMatrix::Bt709
+                    }
+                })
+            })
+            .unwrap_or(YuvMatrix::Bt709)
+    };
+    let mut planes = [(ptr::null_mut::<u8>(), 0usize, 0usize); 2];
+    status(
+        // SAFETY: Live two-plane buffer, balanced read-only lock below.
+        unsafe { CVPixelBufferLockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) },
+        "CVPixelBufferLockBaseAddress NV12",
+    )?;
+    let copied = (|| {
+        for (index, plane) in planes.iter_mut().enumerate() {
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(image, index);
+            let height = CVPixelBufferGetHeightOfPlane(image, index);
+            let width = CVPixelBufferGetWidthOfPlane(image, index);
+            let len = stride
+                .checked_mul(height)
+                .filter(|&len| len <= isize::MAX as usize)
+                .ok_or_else(|| missing("valid NV12 extent"))?;
+            let base = CVPixelBufferGetBaseAddressOfPlane(image, index).cast::<u8>();
+            if base.is_null()
+                || stride < size.width as usize
+                || stride > u32::MAX as usize
+                || height != size.height as usize / (index + 1)
+                || width != size.width as usize / (index + 1)
+            {
+                return Err(missing("valid NV12 plane storage"));
+            }
+            *plane = (base, stride, len);
+        }
+        out.y
+            .try_reserve(planes[0].2.saturating_sub(out.y.len()))
+            .map_err(|_| CodecError::Failed("NV12 luma allocation failed".into()))?;
+        out.uv
+            .try_reserve(planes[1].2.saturating_sub(out.uv.len()))
+            .map_err(|_| CodecError::Failed("NV12 chroma allocation failed".into()))?;
+        for (destination, &(base, _, len)) in [&mut out.y, &mut out.uv].into_iter().zip(&planes) {
+            destination.clear();
+            // SAFETY: CoreVideo's locked plane has stride * height bytes; geometry and
+            // address were checked above. Copy completes before unlock; no pointer escapes.
+            destination.extend_from_slice(unsafe { std::slice::from_raw_parts(base, len) });
+        }
+        out.size = size;
+        out.y_stride = planes[0].1 as u32;
+        out.uv_stride = planes[1].1 as u32;
+        out.colour = YuvColour {
+            matrix,
+            full_range: format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        };
+        Ok(())
+    })();
+    // SAFETY: Balances successful read-only lock; source slices no longer exist.
+    let unlocked = status(
+        unsafe { CVPixelBufferUnlockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) },
+        "CVPixelBufferUnlockBaseAddress NV12",
+    );
+    copied?;
+    unlocked
+}
+
+fn copy_image(image: &CVPixelBuffer) -> Result<(PixelSize, Vec<u8>), CodecError> {
     if CVPixelBufferGetPixelFormatType(image) != kCVPixelFormatType_32BGRA {
         return Err(CodecError::Failed("decoder output is not BGRA".into()));
     }
@@ -1482,6 +1888,24 @@ mod tests {
         let supported = unsafe { VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) };
         assert_eq!(VtCodecs::new().decoder().is_ok(), supported);
         let _ = available(VtCodecs::new().encoder(PixelSize::new(32, 32), 8_000_000, 30));
+    }
+
+    #[test]
+    fn pool_attributes_and_transfer() {
+        let Some(encoder) = available(Encoder::new(PixelSize::new(250, 142), 20_000_000, 30))
+        else {
+            return;
+        };
+        // SAFETY: Live prepared test session; public pool getter retains its result.
+        let pool = unsafe { encoder.session.as_deref().unwrap().pixel_buffer_pool() }.unwrap();
+        let image = pool_buffer(&pool).unwrap();
+        assert_eq!(
+            CVPixelBufferGetPixelFormatType(&image),
+            kCVPixelFormatType_32BGRA
+        );
+        assert_eq!(CVPixelBufferGetWidth(&image), 250);
+        assert_eq!(CVPixelBufferGetHeight(&image), 142);
+        eprintln!("pool: BGRA 250x142; transfer={}", encoder.transfer);
     }
 
     #[test]
