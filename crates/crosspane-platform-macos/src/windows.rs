@@ -472,7 +472,12 @@ impl AxWindow {
         // SAFETY: the public AXWindows attribute is an array of AXUIElement CF objects;
         // each element is additionally downcast before use.
         let values = unsafe { values.cast_unchecked::<CFType>() };
-        let mut found = None;
+        // Candidates: the app's AX windows with the Quartz window's title (all of them when it
+        // has none). The frame only picks between several candidates: right after an AX move
+        // or resize, Quartz still reports the old frame for a while, so a lone candidate matches
+        // whatever its frame.
+        let mut candidates = Vec::new();
+        let mut framed = Vec::new();
         // What each AX window looked like, for the error when none matches.
         let mut seen = Vec::new();
         for value in values.iter() {
@@ -489,13 +494,6 @@ impl AxWindow {
                 "({:.0},{:.0} {:.0}x{:.0})",
                 frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
             ));
-            let matches = (frame.origin.x - raw.frame.origin.x).abs() <= 2.0
-                && (frame.origin.y - raw.frame.origin.y).abs() <= 2.0
-                && (frame.size.width - raw.frame.size.width).abs() <= 2.0
-                && (frame.size.height - raw.frame.size.height).abs() <= 2.0;
-            if !matches {
-                continue;
-            }
             if !raw.title.is_empty() {
                 let title = window
                     .attribute("AXTitle")?
@@ -506,13 +504,26 @@ impl AxWindow {
                     continue;
                 }
             }
-            if found.is_some() {
+            if (frame.origin.x - raw.frame.origin.x).abs() <= 2.0
+                && (frame.origin.y - raw.frame.origin.y).abs() <= 2.0
+                && (frame.size.width - raw.frame.size.width).abs() <= 2.0
+                && (frame.size.height - raw.frame.size.height).abs() <= 2.0
+            {
+                framed.push(candidates.len());
+            }
+            candidates.push(window);
+        }
+        let pick = match (framed.as_slice(), candidates.len()) {
+            ([one], _) => Some(*one),
+            ([], 1) => Some(0),
+            ([_, _, ..], _) => {
                 return Err(PlatformError::Backend("ambiguous AX window match".into()));
             }
-            found = Some(window);
-        }
-        found.ok_or_else(|| {
-            PlatformError::Backend(format!(
+            _ => None,
+        };
+        match pick {
+            Some(index) => Ok(candidates.swap_remove(index)),
+            None => Err(PlatformError::Backend(format!(
                 "Quartz window ({:.0},{:.0} {:.0}x{:.0}) has no matching AX window among {} [{}]",
                 raw.frame.origin.x,
                 raw.frame.origin.y,
@@ -520,8 +531,8 @@ impl AxWindow {
                 raw.frame.size.height,
                 values.len(),
                 seen.join(" "),
-            ))
-        })
+            ))),
+        }
     }
 
     pub(crate) fn frame(&self) -> Result<RectLogical, PlatformError> {
