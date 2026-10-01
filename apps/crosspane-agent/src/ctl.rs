@@ -100,6 +100,9 @@ pub enum Request {
     PairPick {
         index: usize,
     },
+    /// Ask the OS to show its permission requests for every missing permission (macOS: the
+    /// "Crosspane would like to…" dialogs, from the agent's own process so they name it).
+    AskPermissions,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
