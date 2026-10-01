@@ -206,3 +206,18 @@ fn decode(record: [u8; RECORD_BYTES as usize]) -> Option<(u8, Held)> {
     };
     Some((op, item))
 }
+
+/// Lets the engine hold any journal behind a `Box<dyn Journal>`.
+impl<J: Journal + ?Sized> Journal for Box<J> {
+    fn record_down(&mut self, item: Held) -> Result<(), JournalError> {
+        (**self).record_down(item)
+    }
+
+    fn record_up(&mut self, item: Held) -> Result<(), JournalError> {
+        (**self).record_up(item)
+    }
+
+    fn held(&self) -> Result<Vec<Held>, JournalError> {
+        (**self).held()
+    }
+}
