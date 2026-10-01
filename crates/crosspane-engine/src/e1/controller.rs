@@ -407,6 +407,16 @@ impl ControllerE1 {
         &self.portals
     }
 
+    /// The node this controller drives (or is crossing to), if any.
+    pub fn target(&self) -> Option<NodeId> {
+        self.session().map(|s| s.peer)
+    }
+
+    /// False after a panic or release until re-armed: edges don't cross.
+    pub fn armed(&self) -> bool {
+        self.armed
+    }
+
     fn update_portals(&mut self, out: &mut Vec<Output>) {
         let portals = if self.armed {
             self.layout.as_ref().map_or_else(Vec::new, |layout| {

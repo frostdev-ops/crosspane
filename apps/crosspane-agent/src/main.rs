@@ -9,6 +9,7 @@ mod net;
 mod pairing;
 mod paths;
 mod platform;
+mod tray;
 mod trust;
 // Twin-or-mirror parking is used only by macOS builds with `private-vdisplay`; its tests run
 // everywhere.
@@ -402,7 +403,7 @@ fn platform_permissions() -> Box<dyn Permissions> {
 }
 
 #[cfg(target_os = "macos")]
-fn open_settings_pane(permission: Permission) {
+pub(crate) fn open_settings_pane(permission: Permission) {
     let url = crosspane_platform_macos::permissions::MacPermissions::settings_url(permission);
     if let Err(e) = std::process::Command::new("/usr/bin/open")
         .arg(url)
@@ -413,7 +414,7 @@ fn open_settings_pane(permission: Permission) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_settings_pane(_permission: Permission) {}
+pub(crate) fn open_settings_pane(_permission: Permission) {}
 
 /// True when running as root (uid 0), which the agent refuses (04 §7).
 fn is_elevated() -> bool {

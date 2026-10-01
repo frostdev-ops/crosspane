@@ -15,6 +15,7 @@ pub mod io;
 
 use crosspane_input::journal::{Journal, JournalError};
 use crosspane_platform::CaptureEvent;
+use crosspane_types::id::NodeId;
 use crosspane_types::time::MonoTime;
 
 pub use config::EngineConfig;
@@ -92,6 +93,21 @@ impl Engine {
             out.push(Output::SetPortals(self.controller.portals().to_vec()));
         }
         out
+    }
+
+    /// The node this node's keyboard and mouse drive right now (E1 controller), if any.
+    pub fn controlling(&self) -> Option<NodeId> {
+        self.controller.target()
+    }
+
+    /// The node driving this one (E1 target), if any.
+    pub fn controlled_by(&self) -> Option<NodeId> {
+        self.target.controller()
+    }
+
+    /// Whether edge crossing is armed (false after a panic or release until re-armed).
+    pub fn armed(&self) -> bool {
+        self.controller.armed()
     }
 
     /// When the agent must deliver the next [`Input::Tick`].

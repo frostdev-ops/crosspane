@@ -226,6 +226,11 @@ impl TargetE1 {
         self.active.is_some()
     }
 
+    /// The node controlling this one, if any.
+    pub fn controller(&self) -> Option<NodeId> {
+        self.active.map(|s| s.controller)
+    }
+
     pub fn next_deadline(&self) -> Option<MonoTime> {
         let pause = self.active.and_then(|s| s.paused_until);
         let retry = if !self.recovery.is_empty() || !self.release_retry.is_empty() {

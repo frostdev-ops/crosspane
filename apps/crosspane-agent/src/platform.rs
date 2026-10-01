@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crosspane_platform::{
     Displays, FrameCapture, GlobalHotkeys, InputCapture, IoGate, KeyInjector, KeyStore,
-    OverlayHost, Permissions, PlatformError, PointerInjector, SessionEvents, WindowParking,
-    WindowSource,
+    OverlayHost, Permissions, PlatformError, PointerInjector, SessionEvents, TrayHost,
+    WindowParking, WindowSource,
 };
 use crosspane_types::time::MonoTime;
 
@@ -26,6 +26,8 @@ pub struct Platform {
     pub windows: Option<Box<dyn WindowSource>>,
     pub parking: Option<Box<dyn WindowParking>>,
     pub frames: Option<Box<dyn FrameCapture>>,
+    /// The tray / menu-bar icon (WP-1.34).
+    pub tray: Option<Box<dyn TrayHost>>,
 }
 
 impl std::fmt::Debug for Platform {
@@ -40,6 +42,7 @@ impl std::fmt::Debug for Platform {
             .field("windows", &self.windows.is_some())
             .field("parking", &self.parking.is_some())
             .field("frames", &self.frames.is_some())
+            .field("tray", &self.tray.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -168,6 +171,8 @@ pub fn create(
         windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
         parking: parking.map(|p| Box::new(p) as Box<dyn WindowParking>),
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
+        tray: optional("tray", crosspane_platform_linux::tray::SniTray::new())
+            .map(|t| Box::new(t) as Box<dyn TrayHost>),
         gate,
     })
 }
@@ -253,6 +258,7 @@ pub fn create(
         windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
         parking,
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
+        tray: Some(Box::new(crosspane_platform_macos::tray::MacTray::new())),
         gate,
     })
 }

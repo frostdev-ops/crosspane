@@ -43,7 +43,29 @@ enum Command {
     /// Connect to a peer at ADDR (host:port) now.
     Dial { addr: String },
     /// List this machine's windows (ids for `project`).
-    Windows,
+    Windows {
+        /// List a peer's windows instead (it must allow this machine to browse).
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Ask a peer to project one of its windows here (ids from `windows --from`).
+    Pull { peer: String, window: u64 },
+    /// Choose one of a peer's windows from a menu and show it here. On Linux the menu is a
+    /// dmenu-style launcher (walker, fuzzel, wofi or rofi, or --menu); on macOS a list dialog.
+    Pick {
+        #[arg(long)]
+        from: String,
+        /// A dmenu-compatible command that reads lines on stdin and prints the chosen one.
+        #[arg(long)]
+        menu: Option<String>,
+    },
+    /// Let a peer use a capability here (input, share, browse, present), or stop with --off.
+    Allow {
+        peer: String,
+        capability: String,
+        #[arg(long)]
+        off: bool,
+    },
     /// Project one of this machine's windows to a peer.
     Project {
         /// Window id from `crosspanectl windows`.
@@ -130,7 +152,15 @@ fn main() -> Result<()> {
                 .context("no address")?;
             json!({"cmd": "dial", "addr": resolved.to_string()})
         }
-        Command::Windows => json!({"cmd": "windows"}),
+        Command::Windows { from: None } => json!({"cmd": "windows"}),
+        Command::Windows { from: Some(peer) } => json!({"cmd": "windows_from", "peer": peer}),
+        Command::Pull { peer, window } => json!({"cmd": "pull", "peer": peer, "window": window}),
+        Command::Pick { from, menu } => return pick(from, menu.as_deref()),
+        Command::Allow {
+            peer,
+            capability,
+            off,
+        } => json!({"cmd": "allow", "peer": peer, "capability": capability, "allow": !off}),
         Command::Pair { action } => match action {
             PairAction::Listen { allow_input } => {
                 json!({"cmd": "pair_listen", "allow_input": allow_input})
@@ -157,15 +187,7 @@ fn main() -> Result<()> {
             json!({"cmd": "return", "projection": projection, "source": source})
         }
     };
-    let path = socket_path()?;
-    let stream = UnixStream::connect(&path)
-        .with_context(|| format!("is crosspane-agent running? ({})", path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut writer = stream.try_clone()?;
-    writeln!(writer, "{request}")?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    let response: Value = serde_json::from_str(&line).context("bad response from agent")?;
+    let response = exchange(&request)?;
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     }
@@ -176,6 +198,142 @@ fn main() -> Result<()> {
         print_result(&cli.command, &response["result"]);
     }
     Ok(())
+}
+
+/// One request and its response on the agent's control socket.
+fn exchange(request: &Value) -> Result<Value> {
+    let path = socket_path()?;
+    let stream = UnixStream::connect(&path)
+        .with_context(|| format!("is crosspane-agent running? ({})", path.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut writer = stream.try_clone()?;
+    writeln!(writer, "{request}")?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    serde_json::from_str(&line).context("bad response from agent")
+}
+
+/// The result of a request, or its error.
+fn call(request: &Value) -> Result<Value> {
+    let response = exchange(request)?;
+    if response["ok"] != json!(true) {
+        bail!("{}", response["error"].as_str().unwrap_or("request failed"));
+    }
+    Ok(response["result"].clone())
+}
+
+/// `crosspanectl pick`: list `peer`'s windows, let the user choose one, pull it.
+fn pick(peer: &str, menu: Option<&str>) -> Result<()> {
+    let windows = call(&json!({"cmd": "windows_from", "peer": peer}))?;
+    let windows: Vec<(u64, String)> = windows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| {
+            let id = w["id"].as_u64()?;
+            let app = w["app"].as_str().unwrap_or("");
+            let title = w["title"].as_str().unwrap_or("");
+            let line = if title.is_empty() {
+                app.to_owned()
+            } else {
+                format!("{title} — {app}")
+            };
+            // One line per window; the menu shows the text, the id rides at the end.
+            Some((id, line.replace(['\n', '\t'], " ")))
+        })
+        .collect();
+    if windows.is_empty() {
+        bail!("{peer} has no windows to show");
+    }
+    let Some(index) = choose(&windows, menu)? else {
+        return Ok(());
+    };
+    let (window, _) = &windows[index];
+    let result = call(&json!({"cmd": "pull", "peer": peer, "window": window}))?;
+    println!("{}", result.as_str().unwrap_or(&result.to_string()));
+    Ok(())
+}
+
+/// Show `windows` in a menu; the index of the chosen one, or `None` if cancelled.
+fn choose(windows: &[(u64, String)], menu: Option<&str>) -> Result<Option<usize>> {
+    let lines: Vec<String> = windows
+        .iter()
+        .enumerate()
+        .map(|(i, (_, text))| format!("{}. {text}", i + 1))
+        .collect();
+    let chosen = if cfg!(target_os = "macos") && menu.is_none() {
+        choose_macos(&lines)?
+    } else {
+        let menu = match menu {
+            Some(m) => m.to_owned(),
+            None => default_menu()
+                .context("no menu program: install walker, fuzzel, wofi or rofi, or pass --menu")?,
+        };
+        run_menu(&menu, &lines)?
+    };
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+    let number: usize = chosen
+        .split('.')
+        .next()
+        .and_then(|n| n.trim().parse().ok())
+        .context("the menu returned something that isn't one of the windows")?;
+    Ok(number.checked_sub(1).filter(|i| *i < windows.len()))
+}
+
+fn default_menu() -> Option<String> {
+    let found = |name: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+    };
+    [
+        ("walker", "walker --dmenu"),
+        ("fuzzel", "fuzzel --dmenu"),
+        ("wofi", "wofi --dmenu"),
+        ("rofi", "rofi -dmenu"),
+    ]
+    .into_iter()
+    .find(|(bin, _)| found(bin))
+    .map(|(_, cmd)| cmd.to_owned())
+}
+
+fn run_menu(menu: &str, lines: &[String]) -> Result<Option<String>> {
+    use std::process::{Command as Process, Stdio};
+    let mut child = Process::new("sh")
+        .arg("-c")
+        .arg(menu)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {menu}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        for line in lines {
+            writeln!(stdin, "{line}")?;
+        }
+    }
+    let output = child.wait_with_output()?;
+    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!chosen.is_empty()).then_some(chosen))
+}
+
+fn choose_macos(lines: &[String]) -> Result<Option<String>> {
+    // AppleScript's `choose from list` needs no special permission.
+    let items = lines
+        .iter()
+        .map(|l| format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        "set c to choose from list {{{items}}} with title \"Crosspane\" with prompt \"Show which window here?\"\nif c is false then return \"\"\nreturn item 1 of c"
+    );
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .context("run osascript")?;
+    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!chosen.is_empty()).then_some(chosen))
 }
 
 fn print_result(command: &Command, result: &Value) {
@@ -207,7 +365,7 @@ fn print_result(command: &Command, result: &Value) {
                 println!("error: {e}");
             }
         }
-        Command::Windows => {
+        Command::Windows { .. } => {
             for w in result.as_array().into_iter().flatten() {
                 println!(
                     "{:>12}  {:<24} {}x{}  {}",

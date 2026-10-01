@@ -16,7 +16,7 @@ use crosspane_platform::{
     StreamId, WindowEvent,
 };
 use crosspane_protocol::link::{LinkEvent, PeerLink};
-use crosspane_protocol::msg::{Capability, ControlMessage, Placement};
+use crosspane_protocol::msg::{Capability, ControlMessage, Placement, Refusal};
 use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::id::NodeId;
@@ -27,6 +27,7 @@ use crate::ctl::{Request, Response};
 use crate::media::{DestCmd, ProxyIds, SourceCmd};
 use crate::net::Net;
 use crate::platform::{self, Platform};
+use crate::tray::{self, PairingView, PeerView, RemoteWindows, TrayAction, TrayView};
 use crate::trust::SharedTrust;
 
 /// Everything the engine loop reacts to.
@@ -42,6 +43,8 @@ pub enum Event {
     Paired(crate::pairing::Paired),
     /// SIGTERM or SIGINT: stop cleanly.
     Shutdown,
+    /// The user chose a tray / menu-bar item.
+    Tray(crosspane_platform::TrayEvent),
 }
 
 /// What the loop knows about a peer.
@@ -77,6 +80,11 @@ pub struct Agent {
     last_permission_check: Instant,
     started: Instant,
     restart_requested: bool,
+    /// ctl requests waiting for a peer's answer (browse and pull), by engine request number.
+    waiters: HashMap<u32, Waiter>,
+    next_request: u32,
+    tray: TrayState,
+    quit_requested: bool,
     // E2 data plane and window host.
     source_media: Sender<SourceCmd>,
     dest_media: Sender<DestCmd>,
@@ -107,6 +115,69 @@ pub struct E2Wiring {
 const NOTICE_HISTORY: usize = 20;
 const HOUSEKEEPING: Duration = Duration::from_secs(1);
 const PERMISSION_CHECK: Duration = Duration::from_secs(2);
+/// How long a browse or pull waits for the peer's answer.
+const BROWSE_WAIT: Duration = Duration::from_secs(5);
+
+/// How often the tray refreshes what it shows.
+const TRAY_UPDATE: Duration = Duration::from_secs(1);
+const TRAY_LOCAL_WINDOWS: Duration = Duration::from_secs(3);
+const TRAY_BROWSE: Duration = Duration::from_secs(5);
+
+/// What the tray menu needs beyond the agent's own state.
+struct TrayState {
+    menu: Option<crosspane_platform::TrayMenu>,
+    actions: BTreeMap<crosspane_platform::TrayItemId, TrayAction>,
+    last_update: Instant,
+    local_windows: Vec<(WindowId, String)>,
+    last_local_windows: Option<Instant>,
+    remote_windows: HashMap<NodeId, RemoteWindows>,
+    /// Browse requests the tray sent, by request number.
+    browses: HashMap<u32, NodeId>,
+    last_browse: Option<Instant>,
+    /// Where the user put each peer (for the check marks).
+    sides: HashMap<NodeId, Side>,
+}
+
+impl TrayState {
+    fn new() -> TrayState {
+        TrayState {
+            menu: None,
+            actions: BTreeMap::new(),
+            last_update: Instant::now(),
+            local_windows: Vec::new(),
+            last_local_windows: None,
+            remote_windows: HashMap::new(),
+            browses: HashMap::new(),
+            last_browse: None,
+            sides: HashMap::new(),
+        }
+    }
+}
+
+/// A window as one menu line: "title — app", shortened.
+fn window_label(title: &str, app: &str) -> String {
+    let text = if title.is_empty() {
+        app.to_owned()
+    } else if app.is_empty() {
+        title.to_owned()
+    } else {
+        format!("{title} — {app}")
+    };
+    if text.chars().count() > 60 {
+        let cut: String = text.chars().take(59).collect();
+        format!("{cut}…")
+    } else {
+        text
+    }
+}
+
+/// A ctl request waiting for a peer.
+struct Waiter {
+    reply: Sender<Response>,
+    peer: NodeId,
+    pull: bool,
+    deadline: Instant,
+}
 const MIN_RUN_BEFORE_RESTART: Duration = Duration::from_secs(30);
 
 impl Agent {
@@ -141,6 +212,10 @@ impl Agent {
             last_permission_check: Instant::now(),
             started: Instant::now(),
             restart_requested: false,
+            waiters: HashMap::new(),
+            next_request: 1,
+            tray: TrayState::new(),
+            quit_requested: false,
             source_media: e2.source_media,
             dest_media: e2.dest_media,
             host: e2.host,
@@ -192,6 +267,11 @@ impl Agent {
                 self.feed(Input::Tick);
             }
             self.housekeeping();
+            self.update_tray();
+            if self.quit_requested {
+                self.shutdown();
+                return;
+            }
             if self.restart_requested || self.permissions_changed() {
                 self.shutdown();
                 restart();
@@ -211,6 +291,11 @@ impl Agent {
         match event {
             // `run` stops the loop for this one.
             Event::Shutdown => {}
+            Event::Tray(crosspane_platform::TrayEvent::Chosen(id)) => {
+                if let Some(action) = self.tray.actions.get(&id).cloned() {
+                    self.tray_action(action);
+                }
+            }
             Event::Input(input) => self.feed(input),
             Event::LocalDisplays(displays) => {
                 if displays == self.local_displays {
@@ -222,6 +307,9 @@ impl Agent {
                 self.update_layout(true);
             }
             Event::Link(event) => self.on_link(event),
+            Event::Ctl(request @ (Request::WindowsFrom { .. } | Request::Pull { .. }), reply) => {
+                self.start_waiting(request, reply);
+            }
             Event::Ctl(request, reply) => {
                 let response = self.on_ctl(request);
                 let _ = reply.send(response);
@@ -499,6 +587,18 @@ impl Agent {
                         .get(&key.source)
                         .map_or_else(|| key.source.short(), |info| info.name.clone());
                     let text = format!("showing window {} of {from}", key.projection.0);
+                    // A pull from this peer is answered by the projection it started.
+                    let pulls: Vec<u32> = self
+                        .waiters
+                        .iter()
+                        .filter(|(_, w)| w.pull && w.peer == key.source)
+                        .map(|(&r, _)| r)
+                        .collect();
+                    for request in pulls {
+                        if let Some(w) = self.waiters.remove(&request) {
+                            let _ = w.reply.send(Response::ok(json!(text.clone())));
+                        }
+                    }
                     self.projections.insert(key, text);
                 } else {
                     self.proxy_ids.close(key);
@@ -521,6 +621,50 @@ impl Agent {
                 if let (Some(h), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
                     let _ = h.send(HostCommand::SetTitle { id, title });
                 }
+            }
+            Output::BrowseResult {
+                peer,
+                request,
+                result,
+            } => {
+                if self.tray.browses.remove(&request).is_some() {
+                    let windows = match result {
+                        Ok(list) => RemoteWindows::List(
+                            list.iter()
+                                .map(|w| {
+                                    (w.window, window_label(&w.summary.title, &w.summary.app_id))
+                                })
+                                .collect(),
+                        ),
+                        Err(Refusal::Permission) => RemoteWindows::NotAllowed,
+                        Err(_) => RemoteWindows::Unknown,
+                    };
+                    self.tray.remote_windows.insert(peer, windows);
+                    return;
+                }
+                let Some(waiter) = self.waiters.remove(&request) else {
+                    return;
+                };
+                let name = self.peer_label(peer);
+                let response = match result {
+                    Ok(windows) => Response::ok(json!(
+                        windows
+                            .iter()
+                            .map(|w| json!({
+                                "id": w.window.0,
+                                "app": w.summary.app_id,
+                                "title": w.summary.title,
+                                "size": [w.size.width, w.size.height],
+                            }))
+                            .collect::<Vec<_>>()
+                    )),
+                    Err(Refusal::Permission) => Response::err(format!(
+                        "{name} doesn't let this machine browse its windows; on {name}, run: crosspanectl allow {} browse",
+                        self.name
+                    )),
+                    Err(reason) => Response::err(format!("{name} refused: {reason:?}")),
+                };
+                let _ = waiter.reply.send(response);
             }
             Output::CloseProxy { key } => {
                 self.projections.remove(&key);
@@ -670,7 +814,261 @@ impl Agent {
         }
     }
 
+    fn start_waiting(&mut self, request: Request, reply: Sender<Response>) {
+        let (peer, window) = match &request {
+            Request::WindowsFrom { peer } => (peer.clone(), None),
+            Request::Pull { peer, window } => (peer.clone(), Some(WindowId(*window))),
+            _ => return,
+        };
+        let Some(node) = self.find_peer(&peer) else {
+            let _ = reply.send(Response::err(format!("no peer called {peer}")));
+            return;
+        };
+        let request = self.next_request;
+        self.next_request = self.next_request.wrapping_add(1).max(1);
+        self.waiters.insert(
+            request,
+            Waiter {
+                reply,
+                peer: node,
+                pull: window.is_some(),
+                deadline: Instant::now() + BROWSE_WAIT,
+            },
+        );
+        let command = match window {
+            None => Command::Browse {
+                peer: node,
+                request,
+            },
+            Some(window) => Command::Pull {
+                peer: node,
+                window,
+                request,
+            },
+        };
+        self.feed(Input::Command(command));
+    }
+
+    /// Rebuild the tray menu (at most every second) and show it if it changed.
+    fn update_tray(&mut self) {
+        if self.platform.tray.is_none() || self.tray.last_update.elapsed() < TRAY_UPDATE {
+            return;
+        }
+        self.tray.last_update = Instant::now();
+        if self
+            .tray
+            .last_local_windows
+            .is_none_or(|t| t.elapsed() >= TRAY_LOCAL_WINDOWS)
+        {
+            self.tray.last_local_windows = Some(Instant::now());
+            if let Some(Ok(list)) = self.platform.windows.as_ref().map(|w| w.windows()) {
+                self.tray.local_windows = list
+                    .iter()
+                    .filter(|w| {
+                        // Untitled windows are mostly helpers (tray proxies, splash screens).
+                        !w.title.trim().is_empty()
+                            && matches!(
+                                w.role,
+                                crosspane_platform::WindowRole::Toplevel
+                                    | crosspane_platform::WindowRole::Dialog
+                            )
+                    })
+                    .map(|w| (w.id, window_label(&w.title, &w.app_id)))
+                    .collect();
+            }
+        }
+        if self
+            .tray
+            .last_browse
+            .is_none_or(|t| t.elapsed() >= TRAY_BROWSE)
+        {
+            self.tray.last_browse = Some(Instant::now());
+            self.tray.browses.clear();
+            let connected: Vec<NodeId> = self
+                .peers
+                .iter()
+                .filter(|(_, p)| p.connected)
+                .map(|(n, _)| *n)
+                .collect();
+            for peer in connected {
+                let request = self.next_request;
+                self.next_request = self.next_request.wrapping_add(1).max(1);
+                self.tray.browses.insert(request, peer);
+                self.feed(Input::Command(Command::Browse { peer, request }));
+            }
+        }
+        let view = self.tray_view();
+        let (menu, actions) = tray::build(&view);
+        if self.tray.menu.as_ref() == Some(&menu) {
+            return;
+        }
+        if let Some(host) = self.platform.tray.as_mut() {
+            match host.set(&menu) {
+                Ok(()) => {
+                    self.tray.menu = Some(menu);
+                    self.tray.actions = actions;
+                }
+                Err(e) => tracing::debug!(error = %e, "tray not shown"),
+            }
+        }
+    }
+
+    fn tray_view(&self) -> TrayView {
+        let trust: Vec<(NodeId, String, bool, bool)> = self.trust.with(|t| {
+            t.peers()
+                .iter()
+                .map(|e| {
+                    (
+                        e.node,
+                        e.name.clone(),
+                        e.granted.contains(&Capability::InputAccept),
+                        e.granted.contains(&Capability::WindowBrowse),
+                    )
+                })
+                .collect()
+        });
+        let peers = trust
+            .into_iter()
+            .map(|(node, name, input, browse)| PeerView {
+                node,
+                name,
+                connected: self.peers.get(&node).is_some_and(|p| p.connected),
+                side: self.tray.sides.get(&node).copied(),
+                windows: self
+                    .tray
+                    .remote_windows
+                    .get(&node)
+                    .cloned()
+                    .unwrap_or_default(),
+                allows_input: input,
+                allows_browse: browse,
+            })
+            .collect();
+        let status = self.pairing.status();
+        let missing_permissions = {
+            let p = &self.platform.permissions;
+            p.required()
+                .into_iter()
+                .filter(|&perm| p.state(perm) != PermissionState::Granted)
+                .collect()
+        };
+        TrayView {
+            name: self.name.clone(),
+            peers,
+            local_windows: self.tray.local_windows.clone(),
+            projections: self
+                .projections
+                .iter()
+                .map(|(k, text)| (*k, text.clone()))
+                .collect(),
+            controlling: self.engine.controlling().map(|n| self.peer_label(n)),
+            controlled_by: self.engine.controlled_by().map(|n| self.peer_label(n)),
+            disarmed: !self.engine.armed(),
+            missing_permissions,
+            pairing: PairingView {
+                phase: status.phase,
+                sas: status.sas,
+                candidates: status.candidates,
+                peer: status.peer,
+                error: status.error,
+                offers: Vec::new(),
+            },
+        }
+    }
+
+    fn tray_action(&mut self, action: TrayAction) {
+        let name = |agent: &Agent, node: NodeId| agent.peer_label(node);
+        let response = match action {
+            TrayAction::Release => self.on_ctl(Request::Release),
+            TrayAction::Panic => self.on_ctl(Request::Panic),
+            TrayAction::Rearm => self.on_ctl(Request::Rearm),
+            TrayAction::Restart => self.on_ctl(Request::Restart),
+            TrayAction::Quit => {
+                self.quit_requested = true;
+                return;
+            }
+            TrayAction::Project { window, to } => {
+                self.feed(Input::Command(Command::Project { window, to }));
+                return;
+            }
+            TrayAction::Pull { peer, window } => {
+                let request = self.next_request;
+                self.next_request = self.next_request.wrapping_add(1).max(1);
+                self.feed(Input::Command(Command::Pull {
+                    peer,
+                    window,
+                    request,
+                }));
+                return;
+            }
+            TrayAction::Return(key) => {
+                self.feed(Input::Command(Command::Return(key)));
+                return;
+            }
+            TrayAction::Layout { peer, side } => {
+                let peer = name(self, peer);
+                self.on_ctl(Request::Layout { peer, side })
+            }
+            TrayAction::Allow {
+                peer,
+                capability,
+                allow,
+            } => {
+                let capability = match capability {
+                    Capability::InputAccept => "input",
+                    Capability::WindowShare => "share",
+                    Capability::WindowBrowse => "browse",
+                    _ => "present",
+                };
+                let peer = name(self, peer);
+                self.on_ctl(Request::Allow {
+                    peer,
+                    capability: capability.to_owned(),
+                    allow,
+                })
+            }
+            TrayAction::PairListen => self.on_ctl(Request::PairListen { allow_input: true }),
+            TrayAction::PairJoin(addr) => self.on_ctl(Request::PairJoin {
+                addr,
+                allow_input: true,
+            }),
+            TrayAction::PairConfirm(accept) => self.on_ctl(Request::PairConfirm { accept }),
+            TrayAction::PairPick(index) => self.on_ctl(Request::PairPick { index }),
+            TrayAction::OpenSettings(permission) => {
+                crate::open_settings_pane(permission);
+                return;
+            }
+        };
+        if let Some(error) = response.error {
+            self.notices.push_back(error);
+        }
+        // Show the effect at once rather than at the next refresh.
+        self.tray.last_update = Instant::now() - TRAY_UPDATE;
+    }
+
+    fn peer_label(&self, node: NodeId) -> String {
+        self.peers
+            .get(&node)
+            .map_or_else(|| node.short(), |info| info.name.clone())
+    }
+
     fn housekeeping(&mut self) {
+        let expired: Vec<u32> = self
+            .waiters
+            .iter()
+            .filter(|(_, w)| w.deadline <= Instant::now())
+            .map(|(&r, _)| r)
+            .collect();
+        for request in expired {
+            if let Some(w) = self.waiters.remove(&request) {
+                let name = self.peer_label(w.peer);
+                let _ = w.reply.send(if w.pull {
+                    Response::ok(json!(format!("asked {name}; no answer yet")))
+                } else {
+                    Response::err(format!("no answer from {name}"))
+                });
+            }
+        }
         if self.last_trust_check.elapsed() >= HOUSEKEEPING {
             self.last_trust_check = Instant::now();
             match self.trust.refresh() {
@@ -972,6 +1370,42 @@ impl Agent {
                 self.feed(Input::Command(Command::Panic));
                 Response::ok(json!("panic"))
             }
+            Request::Allow {
+                peer,
+                capability,
+                allow,
+            } => {
+                let capability = match capability.as_str() {
+                    "input" => Capability::InputAccept,
+                    "share" => Capability::WindowShare,
+                    "browse" => Capability::WindowBrowse,
+                    "present" => Capability::WindowPresent,
+                    other => {
+                        return Response::err(format!(
+                            "unknown capability {other}: use input, share, browse or present"
+                        ));
+                    }
+                };
+                match self.find_peer(&peer) {
+                    Some(node) => match self.trust.update(|t| {
+                        t.set_grant(node, capability, allow)
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                    }) {
+                        Ok(()) => {
+                            self.send_grants();
+                            Response::ok(json!(format!(
+                                "{} {capability:?} for {peer}",
+                                if allow { "allowed" } else { "withdrew" }
+                            )))
+                        }
+                        Err(e) => Response::err(format!("could not update the trust store: {e}")),
+                    },
+                    None => Response::err(format!("no peer called {peer}")),
+                }
+            }
+            Request::WindowsFrom { .. } | Request::Pull { .. } => {
+                Response::err("internal: answered asynchronously")
+            }
             Request::Forget { peer } => match self.find_peer(&peer) {
                 Some(node) => match self.trust.update(|t| Ok(t.forget(node))) {
                     Ok(Some(entry)) => {
@@ -995,7 +1429,10 @@ impl Agent {
             Request::Layout { peer, side } => match self.find_peer(&peer) {
                 None => Response::err(format!("no connected peer matches {peer:?}")),
                 Some(node) => match self.place_peer(node, side) {
-                    Ok(()) => Response::ok(json!("layout updated")),
+                    Ok(()) => {
+                        self.tray.sides.insert(node, side);
+                        Response::ok(json!("layout updated"))
+                    }
                     Err(e) => Response::err(e),
                 },
             },
@@ -1211,6 +1648,15 @@ pub fn subscribe_platform(platform: &mut Platform, tx: &Sender<Event>) {
         })) {
             tracing::warn!(error = %e, "overlay events unavailable");
             platform.overlay = None;
+        }
+    }
+    if let Some(tray) = &mut platform.tray {
+        let tray_tx = sink(tx);
+        if let Err(e) = tray.subscribe(std::sync::Arc::new(move |ev| {
+            let _ = tray_tx.send(Event::Tray(ev));
+        })) {
+            tracing::warn!(error = %e, "tray events unavailable");
+            platform.tray = None;
         }
     }
     if let Some(windows) = &mut platform.windows {

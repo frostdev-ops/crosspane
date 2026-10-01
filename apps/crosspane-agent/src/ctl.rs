@@ -31,6 +31,22 @@ pub enum Request {
     Forget {
         peer: String,
     },
+    /// List the windows `peer` lets this node pull (answered asynchronously).
+    WindowsFrom {
+        peer: String,
+    },
+    /// Ask `peer` to project its window `window` here.
+    Pull {
+        peer: String,
+        window: u64,
+    },
+    /// Grant (`allow`) or withdraw a capability for a peer: `input`, `share`, `browse`,
+    /// `present`.
+    Allow {
+        peer: String,
+        capability: String,
+        allow: bool,
+    },
     /// Put a peer (by name or node-id prefix) on a side of this node.
     Layout {
         peer: String,
