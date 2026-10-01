@@ -3,9 +3,10 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -24,9 +25,9 @@ use objc2_core_foundation::{
     kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
-    CGAssociateMouseAndMouseCursorPosition, CGDisplayBounds, CGDisplayHideCursor,
-    CGDisplayPixelsWide, CGDisplayShowCursor, CGError, CGEvent, CGEventField, CGEventFlags,
-    CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventTapOptions,
+    CGAssociateMouseAndMouseCursorPosition, CGDisplayBounds, CGDisplayCopyDisplayMode,
+    CGDisplayHideCursor, CGDisplayMode, CGDisplayShowCursor, CGError, CGEvent, CGEventField,
+    CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventTapOptions,
     CGEventTapPlacement, CGEventTapProxy, CGEventType, CGGetDisplaysWithPoint, CGMouseButton,
     CGWarpMouseCursorPosition, kCGNullDirectDisplay,
 };
@@ -34,6 +35,7 @@ use objc2_core_graphics::{
 use crate::{clock, permissions};
 
 const CALL_BUDGET: Duration = Duration::from_millis(50);
+const DELIVERY_LIMIT: usize = 4_096;
 const INJECTED: i64 = 0x0043_5049_4E4A;
 const SESSION: CGEventSourceStateID = CGEventSourceStateID::CombinedSessionState;
 const PENDING: u64 = 1;
@@ -47,6 +49,25 @@ const MACH_TICKS: u8 = 2;
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     fn IsSecureEventInputEnabled() -> u8;
+}
+
+// Apple's public CoreGraphics/CGEvent.h. The binding's callback uses NonNull, but disabled-tap
+// notifications may have no event. Use the C pointer signature so NULL is checked before borrowing.
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventTapCreate(
+        tap: CGEventTapLocation,
+        place: CGEventTapPlacement,
+        options: CGEventTapOptions,
+        mask: u64,
+        callback: unsafe extern "C-unwind" fn(
+            CGEventTapProxy,
+            CGEventType,
+            *mut CGEvent,
+            *mut c_void,
+        ) -> *mut CGEvent,
+        info: *mut c_void,
+    ) -> *mut CFMachPort;
 }
 
 fn secure_input() -> bool {
@@ -131,7 +152,7 @@ fn event_time(event: &CGEvent, interpretation: &AtomicU8) -> MonoTime {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Display {
     id: DisplayId,
     bounds: CGRect,
@@ -141,7 +162,14 @@ struct Display {
 impl Display {
     fn read(id: DisplayId) -> Result<Self, PlatformError> {
         let bounds = CGDisplayBounds(id.0);
-        let pixels = CGDisplayPixelsWide(id.0) as f64;
+        let mode = CGDisplayCopyDisplayMode(id.0).ok_or(PlatformError::NotFound)?;
+        let pixels = CGDisplayMode::pixel_width(Some(&mode)) as f64;
+        tracing::debug!(
+            display = id.0,
+            pixel_width = pixels,
+            point_width = bounds.size.width,
+            "capture display geometry"
+        );
         if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 || pixels <= 0.0 {
             return Err(PlatformError::NotFound);
         }
@@ -185,15 +213,20 @@ fn portal_hit(portal: Portal, point: CGPoint, dx: f64, dy: f64) -> Option<f64> {
 }
 
 fn modifier_down(keycode: u16, flags: CGEventFlags) -> Option<bool> {
+    // Apple's public IOKit/hidsystem/IOLLEvent.h NX_DEVICE* masks distinguish held sides.
     let mask = match keycode {
-        0x38 | 0x3c => CGEventFlags::MaskShift,
-        0x3b | 0x3e => CGEventFlags::MaskControl,
-        0x3a | 0x3d => CGEventFlags::MaskAlternate,
-        0x37 | 0x36 => CGEventFlags::MaskCommand,
-        0x3f => CGEventFlags::MaskSecondaryFn,
+        0x38 => 0x2,
+        0x3c => 0x4,
+        0x3b => 0x1,
+        0x3e => 0x2000,
+        0x3a => 0x20,
+        0x3d => 0x40,
+        0x37 => 0x8,
+        0x36 => 0x10,
+        0x3f => CGEventFlags::MaskSecondaryFn.bits(),
         _ => return None,
     };
-    Some(flags.contains(mask))
+    Some(flags.bits() & mask != 0)
 }
 
 fn button(number: i64) -> Option<MouseButton> {
@@ -208,7 +241,7 @@ fn locks(flags: CGEventFlags) -> LockKeys {
     }
 }
 
-fn scroll(continuous: bool, x: f64, y: f64, scale: f64, phase: i64, momentum: i64) -> ScrollDelta {
+fn scroll(continuous: bool, x: f64, y: f64, phase: i64, momentum: i64) -> ScrollDelta {
     let phase = if !continuous {
         ScrollPhase::Discrete
     } else {
@@ -225,10 +258,12 @@ fn scroll(continuous: bool, x: f64, y: f64, scale: f64, phase: i64, momentum: i6
         }
     };
     ScrollDelta {
-        // Keep Quartz's sign and natural-scrolling transformation: no second inversion.
-        v120_x: if continuous { 0 } else { (x * 120.0) as i32 },
+        // ScrollDelta (crosspane-types/src/input.rs): +x scrolls right, +y scrolls up.
+        // Quartz Axis2 has the opposite x sign; Axis1 already has the required y sign.
+        // Natural scrolling is already applied. Smooth deltas stay in logical pixels.
+        v120_x: if continuous { 0 } else { (-x * 120.0) as i32 },
         v120_y: if continuous { 0 } else { (y * 120.0) as i32 },
-        pixels: continuous.then(|| VectorLogical::new(x * scale, y * scale)),
+        pixels: continuous.then(|| VectorLogical::new(-x, y)),
         phase,
         stop_x: false,
         stop_y: false,
@@ -247,6 +282,7 @@ impl Request {
             && Instant::now() < self.deadline
             && self.epoch == shared.epoch.load(Ordering::Acquire)
             && !shared.stop.load(Ordering::Acquire)
+            && !shared.dead.load(Ordering::Acquire)
     }
 }
 
@@ -273,16 +309,72 @@ struct Shared {
     detached: AtomicBool,
     hidden: AtomicBool,
     stop: AtomicBool,
-    output: Sender<Delivery>,
+    dead: AtomicBool,
+    output: SyncSender<Delivery>,
     time: AtomicU8,
     portals: Mutex<Arc<Vec<Portal>>>,
 }
 
+fn restore_flag(
+    flag: &AtomicBool,
+    restore: impl FnOnce() -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    if flag.load(Ordering::Acquire) {
+        restore()?;
+        // A failed native restore remains outstanding for end, abort and Drop to retry.
+        flag.store(false, Ordering::Release);
+    }
+    Ok(())
+}
+
 impl Shared {
-    fn event(&self, token: u64, event: CaptureEvent) {
-        if !self.stop.load(Ordering::Acquire) {
-            let _ = self.output.send(Delivery::Event(token, event));
+    fn available(&self) -> Result<(), PlatformError> {
+        if self.dead.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+            Err(PlatformError::Backend("capture worker stopped".into()))
+        } else {
+            Ok(())
         }
+    }
+
+    fn queue(&self, message: Delivery) -> Result<(), PlatformError> {
+        if self.output.try_send(message).is_err() {
+            // Overflow is terminal: release input immediately; delivery drops its backlog.
+            // Mark dead before recovery so a failed End enqueue cannot recurse into recovery.
+            if !self.dead.swap(true, Ordering::AcqRel) {
+                self.fail();
+            }
+            Err(PlatformError::Backend(
+                "capture delivery unavailable or full".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn fail(&self) {
+        self.dead.store(true, Ordering::Release);
+        let _ = self.finish(EndReason::Lost, None);
+        // Wake an idle receiver; a full channel already has a wake pending.
+        let _ = self.output.try_send(Delivery::Stop);
+    }
+
+    fn event(&self, token: u64, event: CaptureEvent) {
+        if self.available().is_ok() {
+            let _ = self.queue(Delivery::Event(token, event));
+        }
+    }
+
+    fn restore_cursor(&self) -> Result<(), PlatformError> {
+        let associated = restore_flag(&self.detached, || {
+            cg_result(
+                CGAssociateMouseAndMouseCursorPosition(true),
+                "associate cursor",
+            )
+        });
+        let shown = restore_flag(&self.hidden, || {
+            cg_result(CGDisplayShowCursor(kCGNullDirectDisplay), "show cursor")
+        });
+        associated.and(shown)
     }
 
     /// No application locks or wait for the tap. Also cancels queued activation.
@@ -321,22 +413,11 @@ impl Shared {
             Err(active) => {
                 // A recovery may itself be stuck on the tap thread. The watchdog still
                 // restores the cursor and delivers its end without waiting for that recovery.
-                if reason == EndReason::Aborted && active & 3 == RECOVERING {
+                if active & 3 == RECOVERING && expected.is_none_or(|token| active >> 2 == token) {
                     self.capturing.store(false, Ordering::Release);
-                    let result = cg_result(
-                        CGAssociateMouseAndMouseCursorPosition(true),
-                        "abort associate cursor",
-                    );
-                    let shown = if self.hidden.swap(false, Ordering::AcqRel) {
-                        cg_result(
-                            CGDisplayShowCursor(kCGNullDirectDisplay),
-                            "abort show cursor",
-                        )
-                    } else {
-                        Ok(())
-                    };
-                    let _ = self.output.send(Delivery::End(active >> 2, reason));
-                    return result.and(shown);
+                    let result = self.restore_cursor();
+                    let _ = self.queue(Delivery::End(active >> 2, reason));
+                    return result;
                 }
                 return Ok(());
             }
@@ -345,14 +426,15 @@ impl Shared {
             self.epoch.fetch_add(1, Ordering::AcqRel);
         }
         self.capturing.store(false, Ordering::Release);
-        let mut result = Ok(());
-        if self.detached.swap(false, Ordering::AcqRel) || active != 0 {
-            result = cg_result(
+        let mut result = restore_flag(&self.detached, || {
+            cg_result(
                 CGAssociateMouseAndMouseCursorPosition(true),
                 "associate cursor",
-            );
-        }
-        if let Some((display, point)) = warp {
+            )
+        });
+        if active != 0
+            && let Some((display, point)) = warp
+        {
             let warped = Display::read(display)
                 .and_then(|display| display.global(point))
                 .and_then(|point| {
@@ -366,14 +448,12 @@ impl Shared {
                 result = warped;
             }
         }
-        if self.hidden.swap(false, Ordering::AcqRel) {
-            let shown = cg_result(CGDisplayShowCursor(kCGNullDirectDisplay), "show cursor");
-            if result.is_ok() {
-                result = shown;
-            }
-        }
+        let shown = restore_flag(&self.hidden, || {
+            cg_result(CGDisplayShowCursor(kCGNullDirectDisplay), "show cursor")
+        });
+        result = result.and(shown);
         if active & 3 == EFFECTIVE {
-            let _ = self.output.send(Delivery::End(active >> 2, reason));
+            let _ = self.queue(Delivery::End(active >> 2, reason));
         }
         // Do not let another activation overlap recovery or overtake its Ended message.
         self.active.store(0, Ordering::Release);
@@ -390,14 +470,50 @@ impl CaptureAbort for Abort {
     }
 }
 
+struct DeliveryGuard(Arc<Shared>);
+impl Drop for DeliveryGuard {
+    fn drop(&mut self) {
+        // Covers sink failures, channel closure, normal shutdown and unwinding.
+        if self.0.stop.load(Ordering::Acquire) {
+            let _ = self.0.finish(EndReason::Lost, None);
+        } else {
+            self.0.fail();
+        }
+    }
+}
+
+fn send_event(sink: &dyn EventSink<CaptureEvent>, event: CaptureEvent) -> bool {
+    catch_unwind(AssertUnwindSafe(|| sink.send(event))).is_ok()
+}
+
 fn deliver(shared: Arc<Shared>, receiver: Receiver<Delivery>) {
+    let _guard = DeliveryGuard(shared.clone());
     let mut sink: Option<Arc<dyn EventSink<CaptureEvent>>> = None;
     let mut active: Option<(u64, CaptureId)> = None;
     while let Ok(message) = receiver.recv() {
+        if shared.dead.load(Ordering::Acquire) {
+            // Safety notification bypasses the full queue. Dropping the receiver drops every
+            // queued event/reply; none of that capture can follow this Ended.
+            if let Some((_, id)) = active
+                && let Some(sink) = &sink
+            {
+                let _ = send_event(
+                    &**sink,
+                    CaptureEvent::Ended {
+                        id,
+                        reason: EndReason::Lost,
+                    },
+                );
+            }
+            return;
+        }
         match message {
             Delivery::Subscribe(new_sink, locks, blinded) => {
-                new_sink.send(CaptureEvent::LockKeys(locks));
-                new_sink.send(CaptureEvent::KeyboardBlinded(blinded));
+                if !send_event(&*new_sink, CaptureEvent::LockKeys(locks))
+                    || !send_event(&*new_sink, CaptureEvent::KeyboardBlinded(blinded))
+                {
+                    return;
+                }
                 sink = Some(new_sink);
             }
             Delivery::Activate {
@@ -421,8 +537,22 @@ fn deliver(shared: Arc<Shared>, receiver: Receiver<Delivery>) {
                 {
                     if let Some(sink) = &sink {
                         active = Some((token, id));
-                        sink.send(CaptureEvent::Started { id });
-                        Ok(start)
+                        if !send_event(&**sink, CaptureEvent::Started { id }) {
+                            shared.fail();
+                            let _ = reply
+                                .send(Err(PlatformError::Backend("capture sink panicked".into())));
+                            return;
+                        }
+                        if request.valid(&shared)
+                            && shared.gate.is_open()
+                            && shared.active.load(Ordering::Acquire) == token << 2 | EFFECTIVE
+                        {
+                            Ok(start)
+                        } else {
+                            Err(PlatformError::Backend(
+                                "capture lost during activation".into(),
+                            ))
+                        }
                     } else {
                         Err(PlatformError::Backend("capture has no subscription".into()))
                     }
@@ -442,16 +572,19 @@ fn deliver(shared: Arc<Shared>, receiver: Receiver<Delivery>) {
                 // Abort may overtake a callback in progress; it cannot emit after Ended.
                 if (token == 0 || active.is_some_and(|(current, _)| current == token))
                     && let Some(sink) = &sink
+                    && !send_event(&**sink, event)
                 {
-                    sink.send(event);
+                    return;
                 }
             }
             Delivery::End(token, reason) => {
                 if let Some((current, id)) = active
                     && current == token
                 {
-                    if let Some(sink) = &sink {
-                        sink.send(CaptureEvent::Ended { id, reason });
+                    if let Some(sink) = &sink
+                        && !send_event(&**sink, CaptureEvent::Ended { id, reason })
+                    {
+                        return;
                     }
                     active = None;
                 }
@@ -493,6 +626,20 @@ enum Command {
     Monitor(bool, Arc<Request>, Sender<Result<(), PlatformError>>),
 }
 
+impl Command {
+    fn fail(self) {
+        let error = PlatformError::Backend("capture worker stopped".into());
+        match self {
+            Self::Subscribe(_, _, reply) | Self::Monitor(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Begin(_, _, _, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+}
+
 /// One suppressing session event tap. Construction checks both TCC grants without prompts.
 pub struct MacCapture {
     shared: Arc<Shared>,
@@ -512,7 +659,7 @@ impl MacCapture {
     /// Fails with PermissionDenied(InputMonitoring | Accessibility) if either is missing.
     pub fn new(gate: Arc<IoGate>) -> Result<MacCapture, PlatformError> {
         check_permissions()?;
-        let (output, events) = mpsc::channel();
+        let (output, events) = mpsc::sync_channel(DELIVERY_LIMIT);
         let shared = Arc::new(Shared {
             gate,
             output,
@@ -522,6 +669,7 @@ impl MacCapture {
             detached: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
             time: AtomicU8::new(UNKNOWN_TIME),
             portals: Mutex::new(Arc::new(Vec::new())),
         });
@@ -537,7 +685,7 @@ impl MacCapture {
             .name("mac-capture-tap".into())
             .spawn(move || run_tap(tap_shared, receiver, ready))
         {
-            let _ = shared.output.send(Delivery::Stop);
+            let _ = shared.queue(Delivery::Stop);
             return Err(PlatformError::Backend(format!(
                 "spawn capture tap: {error}"
             )));
@@ -551,7 +699,7 @@ impl MacCapture {
             }),
             result => {
                 shared.stop.store(true, Ordering::Release);
-                let _ = shared.output.send(Delivery::Stop);
+                let _ = shared.queue(Delivery::Stop);
                 match result {
                     Ok(Err(error)) => Err(error),
                     _ => Err(PlatformError::Timeout),
@@ -589,6 +737,7 @@ impl MacCapture {
     }
 
     fn send(&self, command: Command) -> Result<(), PlatformError> {
+        self.shared.available()?;
         self.commands
             .send(command)
             .map_err(|_| PlatformError::Backend("capture thread stopped".into()))
@@ -597,6 +746,7 @@ impl MacCapture {
 
 impl InputCapture for MacCapture {
     fn set_portals(&mut self, portals: &[CapturePortal]) -> Result<(), PlatformError> {
+        self.shared.available()?;
         let request = self.request();
         let mut ids = HashSet::new();
         let mut prepared = Vec::with_capacity(portals.len());
@@ -656,6 +806,7 @@ impl InputCapture for MacCapture {
         if !self.shared.gate.is_open() {
             return Err(PlatformError::Locked);
         }
+        self.shared.available()?;
         if secure_input() {
             return Err(PlatformError::SecureInput);
         }
@@ -699,7 +850,7 @@ impl Drop for MacCapture {
         let _ = self.shared.finish(EndReason::Aborted, None);
         self.shared.stop.store(true, Ordering::Release);
         self.wake.wake();
-        let _ = self.shared.output.send(Delivery::Stop);
+        let _ = self.shared.queue(Delivery::Stop);
         // No join: drop/watchdog must work even if the tap is stuck.
     }
 }
@@ -708,11 +859,14 @@ struct TapState {
     shared: Arc<Shared>,
     commands: Receiver<Command>,
     tap: Option<CFRetained<CFMachPort>>,
+    portal_config: Arc<Vec<Portal>>,
     portals: Arc<Vec<Portal>>,
     pressed: HashSet<PortalId>,
     subscribed: bool,
     monitor: bool,
     last_activity: Option<MonoTime>,
+    last_secure_poll: Instant,
+    last_geometry_poll: Instant,
     blinded: bool,
     lock_keys: LockKeys,
     display: Option<Display>,
@@ -728,7 +882,7 @@ impl TapState {
             Ok(current) => current.clone(),
             Err(_) => return,
         };
-        if Arc::ptr_eq(&self.portals, &portals) {
+        if Arc::ptr_eq(&self.portal_config, &portals) {
             return;
         }
         let at = clock::now();
@@ -737,13 +891,14 @@ impl TapState {
             let new = portals.iter().find(|p| p.portal.id == *id);
             let keep = old
                 .zip(new)
-                .is_some_and(|(old, new)| old.portal == new.portal);
+                .is_some_and(|(old, new)| old.portal == new.portal && old.display == new.display);
             if !keep {
                 self.shared
                     .event(0, CaptureEvent::EdgeReleased { portal: *id, at });
             }
             keep
         });
+        self.portal_config = portals.clone();
         self.portals = portals;
     }
 
@@ -766,7 +921,7 @@ impl TapState {
         let result = self.prepare_begin(portal, token, &request);
         match result {
             Ok(start) => {
-                let _ = self.shared.output.send(Delivery::Activate {
+                let _ = self.shared.queue(Delivery::Activate {
                     token,
                     id,
                     start,
@@ -781,12 +936,7 @@ impl TapState {
                     let _ = self.shared.finish_token(EndReason::Lost, token);
                     // Abort may have overtaken an in-flight native setup call. Repair its
                     // completed resources even if that abort already cleared the generation.
-                    if self.shared.detached.swap(false, Ordering::AcqRel) {
-                        let _ = CGAssociateMouseAndMouseCursorPosition(true);
-                    }
-                    if self.shared.hidden.swap(false, Ordering::AcqRel) {
-                        let _ = CGDisplayShowCursor(kCGNullDirectDisplay);
-                    }
+                    let _ = self.shared.restore_cursor();
                 }
                 let _ = reply.send(Err(error));
             }
@@ -818,6 +968,7 @@ impl TapState {
         if self.shared.active.load(Ordering::Acquire) != 0 {
             return Err(PlatformError::Backend("capture already active".into()));
         }
+        self.shared.restore_cursor()?;
         let portal = self
             .portals
             .iter()
@@ -908,12 +1059,22 @@ impl TapState {
     }
 
     fn commands(&mut self) {
+        if self.shared.dead.load(Ordering::Acquire) {
+            while let Ok(command) = self.commands.try_recv() {
+                command.fail();
+            }
+            return;
+        }
         if self.shared.stop.load(Ordering::Acquire) {
             self.stop_when_released();
             return;
         }
         self.sync_portals();
         while let Ok(command) = self.commands.try_recv() {
+            if self.shared.available().is_err() {
+                command.fail();
+                continue;
+            }
             match command {
                 Command::Subscribe(sink, request, reply) => {
                     let result = if !request.valid(&self.shared) {
@@ -925,7 +1086,7 @@ impl TapState {
                     } else {
                         self.blinded = secure_input();
                         self.lock_keys = locks(CGEventSource::flags_state(SESSION));
-                        match self.shared.output.send(Delivery::Subscribe(
+                        match self.shared.queue(Delivery::Subscribe(
                             sink,
                             self.lock_keys,
                             self.blinded,
@@ -958,7 +1119,58 @@ impl TapState {
     }
 
     fn poll(&mut self) {
+        if self.shared.dead.load(Ordering::Acquire) {
+            self.failed_callback();
+            return;
+        }
+        // This timer runs every 50 ms, including while idle. Disabled taps are restored even
+        // without input; gate revocation does not wait for the next physical event.
+        if self.shared.capturing.load(Ordering::Acquire) && !self.shared.gate.is_open() {
+            let _ = self.shared.finish(EndReason::Lost, None);
+        }
+        if self
+            .tap
+            .as_ref()
+            .is_some_and(|tap| !CGEvent::tap_is_enabled(tap))
+        {
+            self.tap_disabled();
+        }
         self.sync_portals();
+        if self.last_geometry_poll.elapsed() >= Duration::from_secs(1) {
+            self.last_geometry_poll = Instant::now();
+            let refreshed: Vec<_> = self
+                .portal_config
+                .iter()
+                .filter_map(|portal| {
+                    Display::read(portal.portal.display)
+                        .ok()
+                        .map(|display| Portal { display, ..*portal })
+                })
+                .collect();
+            if refreshed.len() != self.portals.len()
+                || refreshed
+                    .iter()
+                    .zip(self.portals.iter())
+                    .any(|(new, old)| new.display != old.display)
+            {
+                self.release_edges(clock::now());
+                self.portals = Arc::new(refreshed);
+            }
+            if self.shared.capturing.load(Ordering::Acquire)
+                && let Some(display) = self.display
+            {
+                match Display::read(display.id) {
+                    Ok(current) if current == display => {}
+                    _ => {
+                        let _ = self.shared.finish(EndReason::Lost, None);
+                    }
+                }
+            }
+        }
+        if self.last_secure_poll.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.last_secure_poll = Instant::now();
         let blinded = secure_input();
         if blinded != self.blinded {
             self.blinded = blinded;
@@ -968,15 +1180,6 @@ impl TapState {
             if self.subscribed {
                 self.shared.event(0, CaptureEvent::KeyboardBlinded(blinded));
             }
-        }
-        if self.shared.capturing.load(Ordering::Acquire)
-            && (!self.shared.gate.is_open()
-                || self
-                    .tap
-                    .as_ref()
-                    .is_none_or(|tap| !CGEvent::tap_is_enabled(tap)))
-        {
-            let _ = self.shared.finish(EndReason::Lost, None);
         }
         let current = locks(CGEventSource::flags_state(SESSION));
         if current != self.lock_keys {
@@ -1016,18 +1219,35 @@ impl TapState {
         }
     }
 
+    fn failed_callback(&mut self) {
+        self.shared.fail();
+        while let Ok(command) = self.commands.try_recv() {
+            command.fail();
+        }
+        if let Some(run_loop) = CFRunLoop::current() {
+            run_loop.stop();
+        }
+    }
+
+    fn tap_disabled(&self) {
+        if let Some(tap) = &self.tap {
+            CGEvent::tap_enable(tap, true);
+        }
+        if self.shared.capturing.load(Ordering::Acquire) {
+            let _ = self.shared.finish(EndReason::Lost, None);
+        }
+    }
+
     /// Returns true only when the OS should receive this event.
     fn event(&mut self, kind: CGEventType, event: &CGEvent) -> bool {
+        if self.shared.dead.load(Ordering::Acquire) {
+            return true;
+        }
         if matches!(
             kind,
             CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
         ) {
-            if let Some(tap) = &self.tap {
-                CGEvent::tap_enable(tap, true);
-            }
-            if self.shared.capturing.load(Ordering::Acquire) {
-                let _ = self.shared.finish(EndReason::Lost, None);
-            }
+            self.tap_disabled();
             return true;
         }
         if self.shared.capturing.load(Ordering::Acquire) && !self.shared.gate.is_open() {
@@ -1105,7 +1325,7 @@ impl TapState {
                 }
                 self.pressed = pressed;
             }
-            return !capturing;
+            return !capturing || self.shared.dead.load(Ordering::Acquire);
         }
         if matches!(
             kind,
@@ -1161,7 +1381,7 @@ impl TapState {
                             .event(token, CaptureEvent::Key { usage, down, at });
                     }
                 }
-                return false;
+                return self.shared.dead.load(Ordering::Acquire);
             }
             if capturing {
                 if down {
@@ -1171,7 +1391,7 @@ impl TapState {
                     self.shared
                         .event(token, CaptureEvent::Key { usage, down, at });
                 }
-                return false;
+                return self.shared.dead.load(Ordering::Acquire);
             }
             return true;
         }
@@ -1213,7 +1433,7 @@ impl TapState {
                         );
                     }
                 }
-                return false;
+                return self.shared.dead.load(Ordering::Acquire);
             }
             if capturing {
                 if button_down {
@@ -1229,14 +1449,11 @@ impl TapState {
                         },
                     );
                 }
-                return false;
+                return self.shared.dead.load(Ordering::Acquire);
             }
             return true;
         }
-        if kind == CGEventType::ScrollWheel
-            && capturing
-            && let Some(display) = self.display
-        {
+        if kind == CGEventType::ScrollWheel && capturing {
             let continuous = integer(CGEventField::ScrollWheelEventIsContinuous) != 0;
             let (x, y) = if continuous {
                 (
@@ -1256,7 +1473,6 @@ impl TapState {
                         continuous,
                         x,
                         y,
-                        display.scale,
                         integer(CGEventField::ScrollWheelEventScrollPhase),
                         integer(CGEventField::ScrollWheelEventMomentumPhase),
                     ),
@@ -1264,35 +1480,121 @@ impl TapState {
                 },
             );
         }
-        !capturing
+        !capturing || self.shared.dead.load(Ordering::Acquire)
     }
 }
 
 unsafe extern "C-unwind" fn tap_callback(
     _proxy: CGEventTapProxy,
     kind: CGEventType,
-    event: NonNull<CGEvent>,
+    event: *mut CGEvent,
     info: *mut c_void,
 ) -> *mut CGEvent {
-    // SAFETY: the boxed context and borrowed event live through this callback; the source
-    // runs only on its owning thread, and callbacks never recursively run the run loop.
+    if info.is_null() {
+        return event;
+    }
+    // SAFETY: TapGuard owns this Box until after all callback sources are invalidated, even
+    // during unwinding. Callbacks run serially on this thread and never recurse into the loop.
     let state = unsafe { &mut *info.cast::<TapState>() };
-    // SAFETY: CoreGraphics supplies a valid event for the callback's duration.
-    if state.event(kind, unsafe { event.as_ref() }) {
-        event.as_ptr()
-    } else {
-        ptr::null_mut()
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if state.shared.dead.load(Ordering::Acquire) {
+            return event;
+        }
+        if matches!(
+            kind,
+            CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+        ) {
+            state.tap_disabled();
+            return event;
+        }
+        // SAFETY: non-NULL events are borrowed only for this callback; NULL is never dereferenced.
+        let Some(input) = (unsafe { event.as_ref() }) else {
+            return event;
+        };
+        if state.event(kind, input) {
+            event
+        } else {
+            ptr::null_mut()
+        }
+    }));
+    match result {
+        Ok(result) if !state.shared.dead.load(Ordering::Acquire) => result,
+        Ok(_) => event,
+        Err(_) => {
+            state.failed_callback();
+            event
+        }
     }
 }
 
 unsafe extern "C-unwind" fn command_callback(info: *mut c_void) {
-    // SAFETY: same boxed context lifetime and single-thread callback ownership as tap_callback.
-    unsafe { &mut *info.cast::<TapState>() }.commands();
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: TapGuard keeps the context alive through source invalidation, including unwinding.
+    let state = unsafe { &mut *info.cast::<TapState>() };
+    if catch_unwind(AssertUnwindSafe(|| state.commands())).is_err() {
+        state.failed_callback();
+    }
 }
 
 unsafe extern "C-unwind" fn timer_callback(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
-    // SAFETY: timer is removed/invalidated before its boxed, thread-owned context is dropped.
-    unsafe { &mut *info.cast::<TapState>() }.poll();
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: TapGuard invalidates the timer before freeing its single-thread-owned context.
+    let state = unsafe { &mut *info.cast::<TapState>() };
+    if catch_unwind(AssertUnwindSafe(|| state.poll())).is_err() {
+        state.failed_callback();
+    }
+}
+
+struct TapGuard {
+    state: *mut TapState,
+    run_loop: Option<CFRetained<CFRunLoop>>,
+    tap_source: Option<CFRetained<CFRunLoopSource>>,
+    command_source: Option<CFRetained<CFRunLoopSource>>,
+    timer: Option<CFRetained<CFRunLoopTimer>>,
+}
+
+impl Drop for TapGuard {
+    fn drop(&mut self) {
+        // SAFETY: unique ownership came from Box::into_raw; callbacks have returned before
+        // run_tap can exit/unwind. The allocation is freed only after every source is invalidated.
+        let state = unsafe { &mut *self.state };
+        if state.shared.stop.load(Ordering::Acquire) {
+            let _ = state.shared.finish(EndReason::Lost, None);
+        } else {
+            state.shared.fail();
+        }
+        if let Some(tap) = &state.tap {
+            CGEvent::tap_enable(tap, false);
+            tap.invalidate();
+        }
+        // SAFETY: immutable process-lifetime CoreFoundation mode constant.
+        let mode = unsafe { kCFRunLoopDefaultMode };
+        if let Some(timer) = &self.timer {
+            timer.invalidate();
+            if let Some(run_loop) = &self.run_loop {
+                run_loop.remove_timer(Some(timer), mode);
+            }
+        }
+        for source in [&self.command_source, &self.tap_source]
+            .into_iter()
+            .flatten()
+        {
+            source.invalidate();
+            if let Some(run_loop) = &self.run_loop {
+                run_loop.remove_source(Some(source), mode);
+            }
+        }
+        while let Ok(command) = state.commands.try_recv() {
+            command.fail();
+        }
+        // SAFETY: all native callbacks are now disabled/invalidated, including partial setup and
+        // unwinding exits; this is the only reconstruction of the Box::into_raw allocation.
+        drop(unsafe { Box::from_raw(self.state) });
+    }
 }
 
 fn run_tap(
@@ -1300,24 +1602,34 @@ fn run_tap(
     commands: Receiver<Command>,
     ready: Sender<Result<Arc<Wake>, PlatformError>>,
 ) {
-    let mut state = Box::new(TapState {
+    let state = Box::into_raw(Box::new(TapState {
         shared: shared.clone(),
         commands,
         tap: None,
+        portal_config: Arc::new(Vec::new()),
         portals: Arc::new(Vec::new()),
         pressed: HashSet::new(),
         subscribed: false,
         monitor: false,
         last_activity: None,
+        last_secure_poll: Instant::now(),
+        last_geometry_poll: Instant::now(),
         blinded: secure_input(),
         lock_keys: locks(CGEventSource::flags_state(SESSION)),
         display: None,
         local_keys: [false; 128],
         suppressed_keys: [0; 128],
         suppressed_buttons: [0; 256],
-    });
-    let info = ptr::from_mut(&mut *state).cast::<c_void>();
-    let setup = || -> Result<_, PlatformError> {
+    }));
+    let mut guard = TapGuard {
+        state,
+        run_loop: None,
+        tap_source: None,
+        command_source: None,
+        timer: None,
+    };
+    let info = state.cast::<c_void>();
+    let mut setup = || -> Result<_, PlatformError> {
         if shared.stop.load(Ordering::Acquire) {
             return Err(PlatformError::Timeout);
         }
@@ -1340,27 +1652,33 @@ fn run_tap(
         ]
         .iter()
         .fold(0u64, |mask, kind| mask | 1 << kind.0);
-        // SAFETY: callback only borrows the stable Box above; its port/source are invalidated
-        // before the box is dropped. This is the one public, suppressing session tap.
+        // SAFETY: public suppressing session tap, with a NULL-aware C callback. TapGuard owns
+        // the Box::into_raw context and invalidates the tap before freeing it on every exit.
         let tap = unsafe {
-            CGEvent::tap_create(
+            CGEventTapCreate(
                 CGEventTapLocation::SessionEventTap,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::Default,
                 mask,
-                Some(tap_callback),
+                tap_callback,
                 info,
             )
-        }
-        .ok_or_else(|| {
+        };
+        let tap = NonNull::new(tap).ok_or_else(|| {
             check_permissions()
                 .err()
                 .unwrap_or_else(|| PlatformError::Backend("CGEventTapCreate failed".into()))
         })?;
+        // SAFETY: CGEventTapCreate returns an owned +1 reference on success.
+        let tap = unsafe { CFRetained::from_raw(tap) };
+        // SAFETY: setup runs before callbacks are added to the loop; the guard owns this state.
+        unsafe { (*state).tap = Some(tap.clone()) };
         let run_loop = CFRunLoop::current()
             .ok_or_else(|| PlatformError::Backend("no capture run loop".into()))?;
+        guard.run_loop = Some(run_loop.clone());
         let tap_source = CFMachPort::new_run_loop_source(None, Some(&tap), 0)
             .ok_or_else(|| PlatformError::Backend("create tap run-loop source".into()))?;
+        guard.tap_source = Some(tap_source.clone());
         let mut context = CFRunLoopSourceContext {
             version: 0,
             info,
@@ -1376,6 +1694,7 @@ fn run_tap(
         // SAFETY: default allocator and version-zero context; callbacks borrow the same stable box.
         let command_source = unsafe { CFRunLoopSource::new(None, -1, &mut context) }
             .ok_or_else(|| PlatformError::Backend("create capture command source".into()))?;
+        guard.command_source = Some(command_source.clone());
         let mut context = CFRunLoopTimerContext {
             version: 0,
             info,
@@ -1387,8 +1706,8 @@ fn run_tap(
         let timer = unsafe {
             CFRunLoopTimer::new(
                 None,
-                CFAbsoluteTimeGetCurrent() + 0.25,
-                0.25,
+                CFAbsoluteTimeGetCurrent() + 0.05,
+                0.05,
                 0,
                 0,
                 Some(timer_callback),
@@ -1396,16 +1715,18 @@ fn run_tap(
             )
         }
         .ok_or_else(|| PlatformError::Backend("create Secure Input timer".into()))?;
-        Ok((tap, run_loop, tap_source, command_source, timer))
+        guard.timer = Some(timer.clone());
+        // SAFETY: the valid thread-owned timer accepts a nonnegative tolerance.
+        unsafe { timer.set_tolerance(0.0) };
+        Ok((run_loop, tap_source, command_source, timer))
     };
-    let (tap, run_loop, tap_source, command_source, timer) = match setup() {
+    let (run_loop, tap_source, command_source, timer) = match setup() {
         Ok(resources) => resources,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
-    state.tap = Some(tap);
     // SAFETY: immutable process-lifetime CoreFoundation run-loop mode constant.
     let mode = unsafe { kCFRunLoopDefaultMode };
     run_loop.add_source(Some(&tap_source), mode);
@@ -1418,23 +1739,219 @@ fn run_tap(
     if !shared.stop.load(Ordering::Acquire) && ready.send(Ok(wake)).is_ok() {
         CFRunLoop::run();
     }
-    let _ = shared.finish(EndReason::Lost, None);
-    timer.invalidate();
-    run_loop.remove_timer(Some(&timer), mode);
-    run_loop.remove_source(Some(&command_source), mode);
-    run_loop.remove_source(Some(&tap_source), mode);
-    command_source.invalidate();
-    tap_source.invalidate();
-    if let Some(tap) = &state.tap {
-        CGEvent::tap_enable(tap, false);
-        tap.invalidate();
-    }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use objc2_core_foundation::CGSize;
+
+    // Pure state fixtures: no native resources were acquired, so finish never calls Quartz.
+    fn shared_fixture() -> (Arc<Shared>, Receiver<Delivery>) {
+        let gate = IoGate::new();
+        gate.set_engine_permits(true);
+        gate.set_session_permits(true);
+        let (output, receiver) = mpsc::sync_channel(DELIVERY_LIMIT);
+        (
+            Arc::new(Shared {
+                gate,
+                output,
+                active: AtomicU64::new(0),
+                capturing: AtomicBool::new(false),
+                epoch: AtomicU64::new(0),
+                detached: AtomicBool::new(false),
+                hidden: AtomicBool::new(false),
+                stop: AtomicBool::new(false),
+                dead: AtomicBool::new(false),
+                time: AtomicU8::new(UNKNOWN_TIME),
+                portals: Mutex::new(Arc::new(Vec::new())),
+            }),
+            receiver,
+        )
+    }
+
+    #[test]
+    fn finish_active_state_machine() {
+        for phase in [PENDING, EFFECTIVE] {
+            let (shared, receiver) = shared_fixture();
+            shared.active.store(7 << 2 | phase, Ordering::Release);
+            shared.capturing.store(true, Ordering::Release);
+            let request = Request {
+                deadline: Instant::now() + CALL_BUDGET,
+                cancelled: AtomicBool::new(false),
+                epoch: 0,
+            };
+            // A late failed begin must not end another generation.
+            shared.finish_token(EndReason::Lost, 6).unwrap();
+            assert_eq!(shared.active.load(Ordering::Acquire), 7 << 2 | phase);
+            shared.finish(EndReason::Requested, None).unwrap();
+            assert_eq!(shared.active.load(Ordering::Acquire), 0);
+            assert!(!shared.capturing.load(Ordering::Acquire));
+            assert!(!request.valid(&shared));
+            if phase == EFFECTIVE {
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Ok(Delivery::End(7, EndReason::Requested))
+                ));
+            }
+            // Idle end ignores even an invalid warp, and repeated abort has no second Ended.
+            shared
+                .finish(
+                    EndReason::Requested,
+                    Some((DisplayId(0), PointDevice::new(f64::NAN, 0.0))),
+                )
+                .unwrap();
+            shared.finish(EndReason::Aborted, None).unwrap();
+            assert!(receiver.try_recv().is_err());
+        }
+        let (shared, receiver) = shared_fixture();
+        shared.active.store(8 << 2 | RECOVERING, Ordering::Release);
+        shared.capturing.store(true, Ordering::Release);
+        shared.finish(EndReason::Aborted, None).unwrap();
+        assert!(!shared.capturing.load(Ordering::Acquire));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Delivery::End(8, EndReason::Aborted))
+        ));
+        // The original recovery still owns this generation; abort never waits for it.
+        assert_eq!(shared.active.load(Ordering::Acquire), 8 << 2 | RECOVERING);
+    }
+
+    #[test]
+    fn failed_cursor_restore_is_retried() {
+        let flag = AtomicBool::new(true);
+        assert!(
+            restore_flag(&flag, || Err(PlatformError::Backend(
+                "synthetic failure".into()
+            )))
+            .is_err()
+        );
+        assert!(flag.load(Ordering::Acquire));
+        restore_flag(&flag, || Ok(())).unwrap();
+        assert!(!flag.load(Ordering::Acquire));
+        restore_flag(&flag, || panic!("successful restore must not repeat")).unwrap();
+    }
+
+    #[test]
+    fn delivery_exit_recovers_on_sink_panic_and_unwind() {
+        let (shared, receiver) = shared_fixture();
+        shared.active.store(1 << 2 | EFFECTIVE, Ordering::Release);
+        shared.capturing.store(true, Ordering::Release);
+        shared
+            .queue(Delivery::Subscribe(
+                Arc::new(|_| panic!("synthetic sink panic")),
+                LockKeys::default(),
+                false,
+            ))
+            .unwrap();
+        let worker_shared = shared.clone();
+        std::thread::spawn(move || deliver(worker_shared, receiver))
+            .join()
+            .unwrap();
+        assert!(shared.dead.load(Ordering::Acquire));
+        assert!(!shared.capturing.load(Ordering::Acquire));
+        assert_eq!(shared.active.load(Ordering::Acquire), 0);
+        assert!(shared.available().is_err());
+
+        let (shared, _receiver) = shared_fixture();
+        shared.active.store(2 << 2 | EFFECTIVE, Ordering::Release);
+        shared.capturing.store(true, Ordering::Release);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _guard = DeliveryGuard(shared.clone());
+                panic!("synthetic worker unwind");
+            }))
+            .is_err()
+        );
+        assert!(shared.dead.load(Ordering::Acquire));
+        assert!(!shared.capturing.load(Ordering::Acquire));
+        assert_eq!(shared.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn delivery_overflow_ends_and_drops_backlog() {
+        let (shared, receiver) = shared_fixture();
+        let (events, observed) = mpsc::channel();
+        let (started, activation) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        shared
+            .queue(Delivery::Subscribe(
+                Arc::new(move |event| {
+                    let is_start = matches!(event, CaptureEvent::Started { .. });
+                    events.send(event).unwrap();
+                    if is_start {
+                        started.send(()).unwrap();
+                        blocked
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }
+                }),
+                LockKeys::default(),
+                false,
+            ))
+            .unwrap();
+        shared.active.store(1 << 2 | PENDING, Ordering::Release);
+        shared.capturing.store(true, Ordering::Release);
+        let (reply, result) = mpsc::channel();
+        shared
+            .queue(Delivery::Activate {
+                token: 1,
+                id: CaptureId(1),
+                start: CaptureStart {
+                    held_keys: Vec::new(),
+                    lock_keys: LockKeys::default(),
+                },
+                request: Arc::new(Request {
+                    deadline: Instant::now() + Duration::from_secs(2),
+                    cancelled: AtomicBool::new(false),
+                    epoch: 0,
+                }),
+                reply,
+            })
+            .unwrap();
+        let worker_shared = shared.clone();
+        let worker = std::thread::spawn(move || deliver(worker_shared, receiver));
+        activation.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..DELIVERY_LIMIT {
+            shared
+                .queue(Delivery::Event(
+                    1,
+                    CaptureEvent::LockKeys(LockKeys::default()),
+                ))
+                .unwrap();
+        }
+        assert!(
+            shared
+                .queue(Delivery::Event(
+                    1,
+                    CaptureEvent::LockKeys(LockKeys::default())
+                ))
+                .is_err()
+        );
+        assert!(!shared.capturing.load(Ordering::Acquire));
+        assert_eq!(shared.active.load(Ordering::Acquire), 0);
+        assert!(shared.available().is_err());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(result.recv().unwrap().is_err());
+        let events: Vec<_> = observed.try_iter().collect();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[2],
+            CaptureEvent::Started { id: CaptureId(1) }
+        ));
+        assert!(matches!(
+            events[3],
+            CaptureEvent::Ended {
+                id: CaptureId(1),
+                reason: EndReason::Lost
+            }
+        ));
+    }
 
     #[test]
     fn portals_all_edges_at_scale_two() {
@@ -1473,18 +1990,29 @@ mod tests {
 
     #[test]
     fn flags_changed_modifier_down_up() {
-        for (keycodes, mask) in [
-            (&[0x38, 0x3c][..], CGEventFlags::MaskShift),
-            (&[0x3b, 0x3e][..], CGEventFlags::MaskControl),
-            (&[0x3a, 0x3d][..], CGEventFlags::MaskAlternate),
-            (&[0x37, 0x36][..], CGEventFlags::MaskCommand),
-            (&[0x3f][..], CGEventFlags::MaskSecondaryFn),
+        for (left, right, left_bit, right_bit, aggregate) in [
+            (0x38, 0x3c, 0x2, 0x4, CGEventFlags::MaskShift),
+            (0x3b, 0x3e, 0x1, 0x2000, CGEventFlags::MaskControl),
+            (0x3a, 0x3d, 0x20, 0x40, CGEventFlags::MaskAlternate),
+            (0x37, 0x36, 0x8, 0x10, CGEventFlags::MaskCommand),
         ] {
-            for &code in keycodes {
-                assert_eq!(modifier_down(code, mask), Some(true));
+            let both = aggregate | CGEventFlags::from_bits_retain(left_bit | right_bit);
+            for code in [left, right] {
+                assert_eq!(modifier_down(code, both), Some(true));
                 assert_eq!(modifier_down(code, CGEventFlags::empty()), Some(false));
             }
+            let right_only = aggregate | CGEventFlags::from_bits_retain(right_bit);
+            assert_eq!(modifier_down(left, right_only), Some(false));
+            assert_eq!(modifier_down(right, right_only), Some(true));
+            let left_only = aggregate | CGEventFlags::from_bits_retain(left_bit);
+            assert_eq!(modifier_down(left, left_only), Some(true));
+            assert_eq!(modifier_down(right, left_only), Some(false));
         }
+        assert_eq!(
+            modifier_down(0x3f, CGEventFlags::MaskSecondaryFn),
+            Some(true)
+        );
+        assert_eq!(modifier_down(0x3f, CGEventFlags::empty()), Some(false));
         assert_eq!(modifier_down(0x39, CGEventFlags::MaskAlphaShift), None);
         assert_eq!(modifier_down(0, CGEventFlags::MaskShift), None);
     }
@@ -1510,14 +2038,11 @@ mod tests {
 
     #[test]
     fn scroll_conversion() {
-        let discrete = scroll(false, 1.0, -2.0, 2.0, 0, 0);
-        assert_eq!((discrete.v120_x, discrete.v120_y), (120, -240));
+        let discrete = scroll(false, 1.0, -2.0, 0, 0);
+        assert_eq!((discrete.v120_x, discrete.v120_y), (-120, -240));
         assert_eq!(discrete.pixels, None);
         assert_eq!(discrete.phase, ScrollPhase::Discrete);
-        assert_eq!(
-            scroll(true, 0.0, 0.0, 2.0, 0, 0).phase,
-            ScrollPhase::Discrete
-        );
+        assert_eq!(scroll(true, 0.0, 0.0, 0, 0).phase, ScrollPhase::Discrete);
         for (phase, momentum, expected) in [
             (128, 0, ScrollPhase::MayBegin),
             (1, 0, ScrollPhase::Began),
@@ -1528,11 +2053,11 @@ mod tests {
             (0, 2, ScrollPhase::MomentumChanged),
             (0, 3, ScrollPhase::MomentumEnded),
         ] {
-            let converted = scroll(true, -3.0, 4.0, 2.0, phase, momentum);
-            assert_eq!(converted.pixels, Some(VectorLogical::new(-6.0, 8.0)));
+            let converted = scroll(true, -3.0, 4.0, phase, momentum);
+            assert_eq!(converted.pixels, Some(VectorLogical::new(3.0, 4.0)));
             assert_eq!((converted.v120_x, converted.v120_y), (0, 0));
             assert_eq!(converted.phase, expected);
-            assert_eq!(scroll(true, 0.0, 0.0, 2.0, phase, momentum).phase, expected);
+            assert_eq!(scroll(true, 0.0, 0.0, phase, momentum).phase, expected);
         }
     }
 

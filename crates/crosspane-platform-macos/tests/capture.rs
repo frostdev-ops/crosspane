@@ -10,7 +10,9 @@ use crosspane_platform::{
 };
 use crosspane_platform_macos::capture::MacCapture;
 use crosspane_types::id::DisplayId;
-use objc2_core_graphics::{CGDisplayBounds, CGDisplayPixelsWide, CGEvent, CGMainDisplayID};
+use objc2_core_graphics::{
+    CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGEvent, CGMainDisplayID,
+};
 
 // The lead opts in in an attended GUI session. Never enable this from ordinary acceptance runs.
 static LIVE_SERIAL: Mutex<()> = Mutex::new(());
@@ -35,7 +37,8 @@ fn subscribed(gate: Arc<IoGate>) -> (MacCapture, mpsc::Receiver<CaptureEvent>) {
     let mut capture = MacCapture::new(gate).expect("both TCC grants and GUI session required");
     let display = CGMainDisplayID();
     let bounds = CGDisplayBounds(display);
-    let scale = CGDisplayPixelsWide(display) as f64 / bounds.size.width;
+    let mode = CGDisplayCopyDisplayMode(display).unwrap();
+    let scale = CGDisplayMode::pixel_width(Some(&mode)) as f64 / bounds.size.width;
     capture
         .set_portals(&[CapturePortal {
             id: PortalId(1),
