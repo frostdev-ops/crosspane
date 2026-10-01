@@ -17,7 +17,7 @@ use crosspane_platform::{
     StreamId, WindowEvent,
 };
 use crosspane_protocol::link::{LinkEvent, PeerLink};
-use crosspane_protocol::msg::{Capability, ControlMessage, Placement, Refusal};
+use crosspane_protocol::msg::{Capability, ControlMessage, Placement, Refusal, RevocationNotice};
 use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::id::NodeId;
@@ -108,6 +108,8 @@ pub struct Agent {
     pairing: crate::pairing::Pairing,
     identity: Arc<crosspane_security::identity::DeviceIdentity>,
     port: u16,
+    /// Revocation notices this node issued, sent to every peer that connects (04 §4).
+    revocations: crate::revocations::Issued,
 }
 
 /// The E2 pieces the agent wires in (`media.rs`, the proxy host).
@@ -121,6 +123,7 @@ pub struct E2Wiring {
     pub crossing: bool,
     pub identity: Arc<crosspane_security::identity::DeviceIdentity>,
     pub port: u16,
+    pub revocations: crate::revocations::Issued,
 }
 
 const NOTICE_HISTORY: usize = 20;
@@ -255,6 +258,7 @@ impl Agent {
             pairing: crate::pairing::Pairing::default(),
             identity: e2.identity,
             port: e2.port,
+            revocations: e2.revocations,
         }
     }
 
@@ -375,6 +379,15 @@ impl Agent {
                         peer,
                         displays: hello.displays.clone(),
                     });
+                    // Revocations this node issued: the peer may have been offline then.
+                    if let Some(link) = self.links.get_mut(&peer) {
+                        for notice in self.revocations.notices() {
+                            if notice.revoked != peer {
+                                let _ =
+                                    link.send_control(&ControlMessage::Revocation(notice.clone()));
+                            }
+                        }
+                    }
                     // Tell the peer our view of the layout; it merges by version.
                     self.update_layout(false);
                     let explicit = self.explicit();
@@ -406,6 +419,11 @@ impl Agent {
                     if arrange::merge(&mut self.placements, &explicit) {
                         self.update_layout(false);
                     }
+                    return;
+                }
+                ControlMessage::Revocation(notice) => {
+                    let (peer, notice) = (*peer, notice.clone());
+                    self.on_revocation(peer, &notice);
                     return;
                 }
                 ControlMessage::Ping { .. } | ControlMessage::Pong { .. } => return,
@@ -1477,6 +1495,69 @@ impl Agent {
             .map(|(node, _)| *node)
     }
 
+    /// Revoke a lost or stolen device (04 §4): forget it here, refuse it until it pairs again,
+    /// and tell every other peer with a signed notice.
+    fn revoke(&mut self, node: NodeId) -> Result<String, String> {
+        let name = self.peer_label(node);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let notice =
+            crosspane_security::trust::TrustStore::issue_revocation(&self.identity, node, now_ms)
+                .map_err(|e| format!("could not sign the revocation: {e}"))?;
+        self.trust
+            .update(|t| Ok(t.revoke(node)))
+            .map_err(|e| format!("could not update the trust store: {e}"))?;
+        self.close_untrusted();
+        self.send_grants();
+        if let Err(e) = self.revocations.add(notice.clone()) {
+            tracing::warn!(error = %e, "could not save the revocation notice");
+        }
+        // The revoked node's link is closing; it isn't told.
+        let mut told = 0;
+        for (peer, link) in &mut self.links {
+            if *peer != node
+                && link
+                    .send_control(&ControlMessage::Revocation(notice.clone()))
+                    .is_ok()
+            {
+                told += 1;
+            }
+        }
+        tracing::info!(peer = %node.short(), told, "revoked");
+        self.notices.push_back(format!("revoked {name}"));
+        Ok(format!(
+            "revoked {name}; told {told} connected peer(s), the others when they next connect"
+        ))
+    }
+
+    /// A peer passed on a revocation notice: apply it if its issuer is trusted and it verifies.
+    fn on_revocation(&mut self, from: NodeId, notice: &RevocationNotice) {
+        use crosspane_security::trust::Revoked;
+        let own = self.node;
+        let result = self.trust.update(|t| {
+            t.apply_revocation(notice, own)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        });
+        match result {
+            Ok(Revoked::Applied { forgotten }) => {
+                let revoked = forgotten.map_or_else(|| notice.revoked.short(), |entry| entry.name);
+                let issuer = self.peer_label(notice.issuer);
+                tracing::info!(revoked = %notice.revoked.short(), issuer = %notice.issuer.short(), "revocation applied");
+                self.close_untrusted();
+                self.send_grants();
+                self.notices
+                    .push_back(format!("{revoked} was revoked by {issuer}"));
+            }
+            Ok(Revoked::Duplicate | Revoked::IgnoredSelf | Revoked::Stale) => {
+                tracing::debug!(revoked = %notice.revoked.short(), "revocation notice already handled");
+            }
+            Err(e) => {
+                tracing::warn!(peer = %from.short(), error = %e, "revocation notice rejected")
+            }
+        }
+    }
+
     fn on_paired(&mut self, paired: crate::pairing::Paired) {
         let peer = paired.peer;
         let now_ms = std::time::SystemTime::now()
@@ -1495,6 +1576,10 @@ impl Agent {
         {
             Ok(()) => {
                 tracing::info!(peer = %peer.node.short(), name = %peer.name, "paired");
+                // A fresh pairing supersedes this node's own revocation of that device.
+                if let Err(e) = self.revocations.remove(peer.node) {
+                    tracing::warn!(error = %e, "could not update the revocations file");
+                }
                 self.notices.push_back(format!("paired with {}", peer.name));
                 self.send_grants();
                 if let Some(addr) = paired.dial {
@@ -1632,6 +1717,13 @@ impl Agent {
                     }
                     Ok(None) => Response::err(format!("{peer} is not paired")),
                     Err(e) => Response::err(format!("could not update the trust store: {e}")),
+                },
+                None => Response::err(format!("no peer called {peer}")),
+            },
+            Request::Revoke { peer } => match self.find_peer(&peer) {
+                Some(node) => match self.revoke(node) {
+                    Ok(text) => Response::ok(json!(text)),
+                    Err(e) => Response::err(e),
                 },
                 None => Response::err(format!("no peer called {peer}")),
             },

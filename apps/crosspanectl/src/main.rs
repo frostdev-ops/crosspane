@@ -45,6 +45,9 @@ enum Command {
     },
     /// Unpair a peer (name or node-id prefix): its key is forgotten and the connection ends now.
     Forget { peer: String },
+    /// A lost or stolen device: forget it here and tell every other paired machine to forget it
+    /// too (a signed revocation notice). It can only come back through a fresh pairing.
+    Revoke { peer: String },
     /// Put a peer (name or node-id prefix) on a side of this machine.
     Layout { peer: String, side: Side },
     /// Place one display on the shared canvas: NODE (this machine's or a peer's name, or a
@@ -159,6 +162,7 @@ fn main() -> Result<()> {
         Command::Restart => json!({"cmd": "restart"}),
         Command::Diag { out } => return diag(out.clone()),
         Command::Forget { peer } => json!({"cmd": "forget", "peer": peer}),
+        Command::Revoke { peer } => json!({"cmd": "revoke", "peer": peer}),
         Command::Layout { peer, side } => {
             let side = format!("{side:?}").to_lowercase();
             json!({"cmd": "layout", "peer": peer, "side": side})
