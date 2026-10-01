@@ -6,6 +6,7 @@ use crate::config::EngineConfig;
 use crate::io::{Input, Output};
 
 /// The controller side of E1: crossing, capture, routing, heartbeats, release and panic.
+#[derive(Debug)]
 pub struct ControllerE1 {
     _private: (),
 }

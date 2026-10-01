@@ -22,6 +22,7 @@ use e1::controller::ControllerE1;
 use e1::target::TargetE1;
 
 /// One node's engine: the E1 controller and target roles side by side.
+#[derive(Debug)]
 pub struct Engine {
     controller: ControllerE1,
     target: TargetE1,

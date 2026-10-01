@@ -7,6 +7,7 @@ use crate::config::EngineConfig;
 use crate::io::{Input, Output};
 
 /// The target side of E1: accepting control, injecting through the lease ledger, local override.
+#[derive(Debug)]
 pub struct TargetE1 {
     _private: (),
 }
