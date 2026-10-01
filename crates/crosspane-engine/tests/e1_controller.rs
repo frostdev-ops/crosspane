@@ -2525,6 +2525,48 @@ fn incoming_control_cancels_pending_hud_and_push_without_outgoing_capture() {
 }
 
 #[test]
+fn refused_incoming_control_does_not_cancel_a_pending_crossing() {
+    // B may not control this node (no input grant): its StartControl is refused and must not
+    // pre-empt this node's own crossing to B.
+    let (mut engine, portal) = exclusive_engine_with(config());
+    engine.handle(Input::Grants(BTreeMap::new()), time(0));
+    let out = exclusive_step(
+        &mut engine,
+        Input::Capture(CaptureEvent::EdgePressed {
+            portal,
+            position: 0.5,
+            at: time(0),
+        }),
+        0,
+    );
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, Output::ShowOverlay { id, .. } if *id == HUD))
+    );
+    let out = exclusive_step(&mut engine, incoming_start(), 1);
+    assert!(out.iter().any(|o| matches!(
+        o,
+        Output::SendControl {
+            msg: ControlMessage::ControlRefused {
+                reason: Refusal::Permission,
+                ..
+            },
+            ..
+        }
+    )));
+    assert!(!out.contains(&Output::HideOverlay(HUD)));
+    assert_eq!(engine.controlled_by(), None);
+    let out = exclusive_step(&mut engine, Input::Overlay(OverlayEvent::Visible(HUD)), 2);
+    assert!(out.iter().any(|o| matches!(
+        o,
+        Output::SendControl {
+            msg: ControlMessage::StartControl { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
 fn incoming_control_cancels_sent_handshake_and_ends_late_acknowledgement() {
     let (mut engine, portal) = exclusive_engine_with(config());
     exclusive_step(
