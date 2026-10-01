@@ -221,6 +221,11 @@ impl TargetE1 {
         }
     }
 
+    /// True while another node controls this one (an E1 session is active here).
+    pub fn is_controlled(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub fn next_deadline(&self) -> Option<MonoTime> {
         let pause = self.active.and_then(|s| s.paused_until);
         let retry = if !self.recovery.is_empty() || !self.release_retry.is_empty() {

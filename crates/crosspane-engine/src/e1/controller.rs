@@ -399,6 +399,11 @@ impl ControllerE1 {
         }
     }
 
+    /// The capture portals this controller currently wants (empty while disarmed).
+    pub fn portals(&self) -> &[CapturePortal] {
+        &self.portals
+    }
+
     fn update_portals(&mut self, out: &mut Vec<Output>) {
         let portals = if self.armed {
             self.layout.as_ref().map_or_else(Vec::new, |layout| {

@@ -90,8 +90,14 @@ fn main() -> Result<()> {
 }
 
 fn load_identity(paths: &Paths, config: &Config, platform: Option<&platform::Platform>) -> Result<DeviceIdentity> {
-    let store = platform.and_then(|p| p.keystore.as_deref());
-    keys::load_or_create(store, &paths.key_file(), config.allow_file_keystore)
+    let store = platform
+        .and_then(|p| p.keystore.as_deref())
+        .filter(|_| !config.force_file_keystore);
+    keys::load_or_create(
+        store,
+        &paths.key_file(),
+        config.allow_file_keystore || config.force_file_keystore,
+    )
 }
 
 fn run() -> Result<()> {
@@ -111,9 +117,16 @@ fn run() -> Result<()> {
 
     // Crash recovery runs first (04 §8 invariant 2): Engine::new returns it as outputs.
     let journal = FileJournal::open(&paths.journal_file()).context("open input journal")?;
+    let e2_journal =
+        FileJournal::open(&paths.e2_journal_file()).context("open projection input journal")?;
     let mut engine_config = EngineConfig::new(node);
     engine_config.push_to_cross = std::time::Duration::from_millis(config.push_to_cross_ms.min(200));
-    let (engine, startup) = Engine::new(engine_config, Box::new(journal), platform::now())
+    let (engine, startup) = Engine::new(
+        engine_config,
+        Box::new(journal),
+        Box::new(e2_journal),
+        platform::now(),
+    )
         .context("start engine")?;
 
     let (tx, rx) = std::sync::mpsc::channel();

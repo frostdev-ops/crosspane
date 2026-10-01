@@ -45,6 +45,9 @@ enum Side {
 }
 
 fn socket_path() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CROSSPANE_RUNTIME_DIR") {
+        return Ok(PathBuf::from(dir).join("agent.sock"));
+    }
     if cfg!(target_os = "macos") {
         let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
         Ok(tmp.join("crosspane/agent.sock"))

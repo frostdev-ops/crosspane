@@ -124,6 +124,9 @@ impl Agent {
     }
 
     fn feed(&mut self, input: Input) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            log_input(&input);
+        }
         let outputs = self.engine.handle(input, platform::now());
         self.execute(outputs);
     }
@@ -132,6 +135,9 @@ impl Agent {
         match event {
             Event::Input(input) => self.feed(input),
             Event::LocalDisplays(displays) => {
+                if displays == self.local_displays {
+                    return;
+                }
                 self.local_displays = displays.clone();
                 self.feed(Input::LocalDisplays(displays.clone()));
                 self.broadcast(&ControlMessage::Displays(displays));
@@ -166,8 +172,11 @@ impl Agent {
                     self.feed(Input::PeerDisplays { peer, displays: hello.displays.clone() });
                     // Tell the peer our view of the layout; it merges by version.
                     self.update_layout(false);
-                    if let Some(link) = self.links.get_mut(&peer) {
-                        let _ = link.send_control(&ControlMessage::Layout(self.placements.clone()));
+                    let explicit = self.explicit();
+                    if !explicit.is_empty()
+                        && let Some(link) = self.links.get_mut(&peer)
+                    {
+                        let _ = link.send_control(&ControlMessage::Layout(explicit));
                     }
                     return;
                 }
@@ -179,8 +188,12 @@ impl Agent {
                     return;
                 }
                 ControlMessage::Layout(placements) => {
-                    if arrange::merge(&mut self.placements, placements) {
-                        self.feed(Input::Layout(self.placements.clone()));
+                    // Version 0 is the derived default every node computes for itself; only
+                    // explicit placements (version ≥ 1) travel.
+                    let explicit: Vec<Placement> =
+                        placements.iter().copied().filter(|p| p.version > 0).collect();
+                    if arrange::merge(&mut self.placements, &explicit) {
+                        self.update_layout(false);
                     }
                     return;
                 }
@@ -195,7 +208,7 @@ impl Agent {
                     info.rtt = None;
                 }
             }
-            LinkEvent::Input { .. } | LinkEvent::Motion { .. } => {}
+            _ => {}
         }
         self.feed(Input::Link(event));
     }
@@ -207,6 +220,9 @@ impl Agent {
     }
 
     fn execute_one(&mut self, output: Output) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            log_output(&output);
+        }
         match output {
             Output::SetPortals(portals) => {
                 if let Some(capture) = &mut self.platform.capture
@@ -392,10 +408,16 @@ impl Agent {
                 .filter(|(_, info)| !info.displays.is_empty())
                 .map(|(node, info)| (*node, info.displays.clone())),
         );
-        let mut changed = arrange::merge(&mut self.placements, &arrange::default_layout(&nodes));
-        if local_changed {
-            changed |= self.rearrange_local();
+        // Defaults (version 0) are derived from the current set of nodes every time, so a default
+        // computed while alone never conflicts with the joint one. Explicit placements (version ≥
+        // 1, from `crosspanectl layout`) win over defaults through `merge`.
+        let before_all = self.placements.clone();
+        self.placements.retain(|p| p.version > 0);
+        arrange::merge(&mut self.placements, &arrange::default_layout(&nodes));
+        if local_changed && self.placements.iter().any(|p| p.node == self.node && p.version > 0) {
+            self.rearrange_local();
         }
+        let mut changed = self.placements != before_all;
         // Drop placements for displays that no longer exist.
         let known: BTreeSet<_> = nodes
             .iter()
@@ -407,7 +429,7 @@ impl Agent {
         if changed {
             self.feed(Input::Layout(self.placements.clone()));
             if local_changed {
-                self.broadcast(&ControlMessage::Layout(self.placements.clone()));
+                self.broadcast(&ControlMessage::Layout(self.explicit()));
             }
         }
     }
@@ -456,9 +478,21 @@ impl Agent {
             .map(|((display, _), origin)| Placement { node: peer, display: display.id, origin, version })
             .collect();
         arrange::merge(&mut self.placements, &fresh);
+        // Pin this node's own displays explicitly too, so the relation survives reconnects.
+        let own: Vec<Placement> = self
+            .placements
+            .iter()
+            .filter(|p| p.node == self.node)
+            .map(|p| Placement { version: version.max(p.version), ..*p })
+            .collect();
+        arrange::merge(&mut self.placements, &own);
         self.feed(Input::Layout(self.placements.clone()));
-        self.broadcast(&ControlMessage::Layout(self.placements.clone()));
+        self.broadcast(&ControlMessage::Layout(self.explicit()));
         Ok(())
+    }
+
+    fn explicit(&self) -> Vec<Placement> {
+        self.placements.iter().copied().filter(|p| p.version > 0).collect()
     }
 
     fn find_peer(&self, query: &str) -> Option<NodeId> {
@@ -600,3 +634,37 @@ pub fn subscribe_platform(platform: &mut Platform, tx: &Sender<Event>) {
     }
 }
 
+
+/// Debug trace of engine inputs, without motion noise or key contents (04 §7: logs never
+/// record keys).
+fn log_input(input: &Input) {
+    match input {
+        Input::Tick => {}
+        Input::Capture(CaptureEvent::Motion { dx, dy, .. }) => tracing::trace!(dx, dy, "in: motion"),
+        Input::Capture(CaptureEvent::Key { .. }) => tracing::debug!("in: capture key"),
+        Input::Link(LinkEvent::Motion { msg, .. }) => tracing::trace!(pos = ?msg.position, "in: link motion"),
+        Input::Link(LinkEvent::Input { peer, msg }) => match msg {
+            crosspane_protocol::msg::InputMessage::Key { .. } => {
+                tracing::debug!(peer = %peer.short(), "in: link key")
+            }
+            other => tracing::debug!(peer = %peer.short(), msg = ?other, "in: link input"),
+        },
+        other => tracing::debug!(input = ?other, "in"),
+    }
+}
+
+fn log_output(output: &Output) {
+    match output {
+        Output::SendMotion { msg, .. } => tracing::trace!(pos = ?msg.position, "out: motion"),
+        Output::Inject { cmd: crosspane_engine::InjectCmd::MoveTo { position, .. }, .. } => {
+            tracing::trace!(?position, "out: move")
+        }
+        Output::Inject { id, cmd: crosspane_engine::InjectCmd::Key { down, .. } } => {
+            tracing::debug!(?id, down, "out: inject key")
+        }
+        Output::SendInput { peer, msg: crosspane_protocol::msg::InputMessage::Key { down, .. } } => {
+            tracing::debug!(peer = %peer.short(), down, "out: send key")
+        }
+        other => tracing::debug!(output = ?other, "out"),
+    }
+}

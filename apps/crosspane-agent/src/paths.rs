@@ -36,6 +36,11 @@ impl Paths {
                 runtime_dir: runtime.join("crosspane"),
             }
         };
+        // Several agents on one machine (integration tests) need their own control sockets.
+        let paths = match std::env::var_os("CROSSPANE_RUNTIME_DIR") {
+            Some(dir) => Paths { runtime_dir: PathBuf::from(dir), ..paths },
+            None => paths,
+        };
         for dir in [&paths.config_dir, &paths.state_dir, &paths.runtime_dir] {
             create_private_dir(dir)?;
         }
@@ -52,6 +57,10 @@ impl Paths {
 
     pub fn journal_file(&self) -> PathBuf {
         self.state_dir.join("input.journal")
+    }
+
+    pub fn e2_journal_file(&self) -> PathBuf {
+        self.state_dir.join("projection-input.journal")
     }
 
     pub fn control_socket(&self) -> PathBuf {
