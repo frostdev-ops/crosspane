@@ -161,7 +161,7 @@ fn live_textedit_park_and_restore() {
     };
     let result = cleanup
         .parking
-        .park(window, PixelSize::new(800, 600))
+        .park(window, PixelSize::new(800, 600), 2.0)
         .unwrap();
     assert_eq!(result.kind, ParkingKind::Mirror);
     assert_eq!(result.content.width(), 800);

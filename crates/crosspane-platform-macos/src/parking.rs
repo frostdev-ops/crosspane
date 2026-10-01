@@ -285,11 +285,21 @@ impl ParkingState {
 }
 
 impl WindowParking for MacMirrorParking {
-    fn park(&mut self, window: WindowId, size: PixelSize) -> Result<Parked, PlatformError> {
+    fn park(
+        &mut self,
+        window: WindowId,
+        size: PixelSize,
+        _scale: f64,
+    ) -> Result<Parked, PlatformError> {
         self.geometry_reply(Command::Park(window, size))
     }
 
-    fn resize(&mut self, window: WindowId, size: PixelSize) -> Result<Parked, PlatformError> {
+    fn resize(
+        &mut self,
+        window: WindowId,
+        size: PixelSize,
+        _scale: f64,
+    ) -> Result<Parked, PlatformError> {
         self.geometry_reply(Command::Resize(window, size))
     }
 
@@ -509,7 +519,11 @@ mod tests {
         let mut parking = MacMirrorParking::new(path.clone()).unwrap();
         parking.restore(WindowId(42)).unwrap();
         assert!(parking.recover().unwrap().is_empty());
-        assert!(parking.park(WindowId(42), PixelSize::new(0, 600)).is_err());
+        assert!(
+            parking
+                .park(WindowId(42), PixelSize::new(0, 600), 1.0)
+                .is_err()
+        );
         drop(parking);
         fs::write(&path, "crosspane-mirror-v1\n42 123 NaN 0 400 300\n").unwrap();
         assert!(read_journal(&path).is_err());
