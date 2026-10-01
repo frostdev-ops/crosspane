@@ -4,7 +4,8 @@
 use std::process::Command;
 use std::time::Instant;
 
-use crosspane_media::codec::{CodecError, VideoCodecs};
+use crosspane_media::codec::{CodecError, VideoCodecs, VideoDecoder};
+use crosspane_media::picture::{Nv12, YuvMatrix, nv12_to_bgra};
 use crosspane_platform_macos::video::VtCodecs;
 use crosspane_types::geom::PixelSize;
 
@@ -403,4 +404,243 @@ fn ffmpeg_annex_b_interop() {
         "frame 2 depends on missing frame 1: {result:?}"
     );
     missing_reference.decode(&units[0], &mut pixels).unwrap();
+}
+
+const PATCHES: [[u8; 4]; 12] = [
+    [0, 0, 255, 255],
+    [0, 255, 0, 255],
+    [255, 0, 0, 255],
+    [255, 255, 0, 255],
+    [255, 0, 255, 255],
+    [0, 255, 255, 255],
+    [255, 255, 255, 255],
+    [0, 0, 0, 255],
+    [128, 128, 128, 255],
+    [48, 150, 208, 255],
+    [160, 80, 32, 255],
+    [80, 176, 112, 255],
+];
+
+#[test]
+fn nv12_colour_round_trip_and_pool_resize() {
+    let codecs = VtCodecs::new();
+    let Some(mut encoder) =
+        available(codecs.encoder_with_fallback(PixelSize::new(256, 256), 20_000_000, 30, false))
+    else {
+        return;
+    };
+    let Some(mut decoder) = available(codecs.nv12_decoder()) else {
+        return;
+    };
+    let Some(mut bgra_decoder) = available(codecs.decoder()) else {
+        return;
+    };
+    let mut packet = Vec::new();
+    let mut picture = Nv12::default();
+    let mut converted = Vec::new();
+    let mut bgra = Vec::new();
+    for size in [PixelSize::new(256, 256), PixelSize::new(250, 142)] {
+        // Four columns of 64x64 blocks. At the smaller size, the final row/column is
+        // clipped; its centre is the centre of the visible part, away from chroma edges.
+        let mut pixels = vec![0; (size.width * size.height * 4) as usize];
+        for y in 0..size.height {
+            for x in 0..size.width {
+                let colour = PATCHES[((y / 64 * 4 + x / 64) % 12) as usize];
+                pixels[((y * size.width + x) * 4) as usize..][..4].copy_from_slice(&colour);
+            }
+        }
+        let mut maximum = [0u8; 3];
+        let mut agreement = [0u8; 3];
+        for frame in 0..3 {
+            let key = encoder
+                .encode(&pixels, size.width * 4, size, false, &mut packet)
+                .unwrap()
+                .key;
+            assert_eq!(key, frame == 0);
+            decoder.decode_nv12(&packet, &mut picture).unwrap();
+            picture.validate().unwrap();
+            assert_eq!(picture.size, size);
+            assert_eq!(picture.colour.matrix, YuvMatrix::Bt709);
+            nv12_to_bgra(&picture, size, &mut converted).unwrap();
+            assert_eq!(bgra_decoder.decode(&packet, &mut bgra).unwrap(), size);
+            for (index, colour) in PATCHES.iter().enumerate() {
+                let left = index as u32 % 4 * 64;
+                let top = index as u32 / 4 * 64;
+                let x = left + (size.width - left).min(64) / 2;
+                let y = top + (size.height - top).min(64) / 2;
+                let at = ((y * size.width + x) * 4) as usize;
+                for channel in 0..3 {
+                    maximum[channel] =
+                        maximum[channel].max(converted[at + channel].abs_diff(colour[channel]));
+                    agreement[channel] = agreement[channel]
+                        .max(converted[at + channel].abs_diff(bgra[at + channel]));
+                }
+            }
+        }
+        eprintln!(
+            "{size:?}: NV12 {:?}, strides Y={} UV={}, max source errors BGR={maximum:?}, BGRA agreement={agreement:?}",
+            picture.colour, picture.y_stride, picture.uv_stride
+        );
+        assert!(
+            maximum.iter().all(|&error| error <= 8),
+            "source errors: {maximum:?}"
+        );
+        assert!(
+            agreement.iter().all(|&error| error <= 4),
+            "BGRA agreement: {agreement:?}"
+        );
+    }
+}
+
+#[test]
+fn nv12_non_idr_failure_recovers_and_mixed_outputs_work() {
+    let codecs = VtCodecs::new();
+    let size = PixelSize::new(256, 256);
+    let Some(mut encoder) = available(codecs.encoder(size, 20_000_000, 30)) else {
+        return;
+    };
+    let Some(mut decoder) = available(codecs.nv12_decoder()) else {
+        return;
+    };
+    let (pixels, stride) = synthetic(size, 0);
+    let mut idr = Vec::new();
+    let mut packet = Vec::new();
+    assert!(
+        encoder
+            .encode(&pixels, stride, size, false, &mut idr)
+            .unwrap()
+            .key
+    );
+    assert!(
+        !encoder
+            .encode(&pixels, stride, size, false, &mut packet)
+            .unwrap()
+            .key
+    );
+    let mut picture = Nv12::default();
+    assert!(decoder.decode_nv12(&packet, &mut picture).is_err());
+    assert_eq!(picture, Nv12::default());
+    decoder.decode_nv12(&idr, &mut picture).unwrap();
+    let y = picture.y.as_ptr();
+    let uv = picture.uv.as_ptr();
+    let mut bgra = Vec::new();
+    decoder.decode(&packet, &mut bgra).unwrap();
+    encoder
+        .encode(&pixels, stride, size, false, &mut packet)
+        .unwrap();
+    decoder.decode_nv12(&packet, &mut picture).unwrap();
+    assert_eq!(picture.y.as_ptr(), y, "reuse Y allocation");
+    assert_eq!(picture.uv.as_ptr(), uv, "reuse UV allocation");
+    encoder
+        .encode(&pixels, stride, size, false, &mut packet)
+        .unwrap();
+    decoder.decode(&packet, &mut bgra).unwrap();
+    // An IDR switches back to native BGRA; the following NV12 request must preserve
+    // that session's references until another IDR permits rebuilding it.
+    encoder
+        .encode(&pixels, stride, size, true, &mut packet)
+        .unwrap();
+    decoder.decode(&packet, &mut bgra).unwrap();
+    encoder
+        .encode(&pixels, stride, size, false, &mut packet)
+        .unwrap();
+    decoder.decode_nv12(&packet, &mut picture).unwrap();
+    picture.validate().unwrap();
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Timeval {
+    seconds: std::ffi::c_long,
+    microseconds: std::ffi::c_int,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Rusage {
+    user: Timeval,
+    system: Timeval,
+    counters: [std::ffi::c_long; 14],
+}
+
+unsafe extern "C" {
+    fn getrusage(who: std::ffi::c_int, usage: *mut Rusage) -> std::ffi::c_int;
+}
+
+fn process_cpu_seconds() -> f64 {
+    let mut usage = Rusage::default();
+    // SAFETY: Darwin's public rusage layout, writable stack storage, RUSAGE_SELF=0.
+    assert_eq!(unsafe { getrusage(0, &mut usage) }, 0);
+    (usage.user.seconds + usage.system.seconds) as f64
+        + f64::from(usage.user.microseconds + usage.system.microseconds) / 1_000_000.0
+}
+
+#[test]
+#[ignore = "120-frame 1440p CPU comparison; run with --release --ignored --nocapture"]
+fn input_pool_cpu_timing() {
+    let size = PixelSize::new(2560, 1440);
+    let mut measurements = Vec::new();
+    for fallback in [true, false] {
+        let Some(mut encoder) =
+            available(VtCodecs::new().encoder_with_fallback(size, 20_000_000, 30, fallback))
+        else {
+            eprintln!(
+                "{}: CPU time/frame unavailable (VideoToolbox session creation failed)",
+                if fallback {
+                    "fallback CVPixelBufferCreate"
+                } else {
+                    "IOSurface compression pool"
+                }
+            );
+            continue;
+        };
+        let mut packet = Vec::new();
+        let (mut pixels, stride) = synthetic(size, 0);
+        encoder
+            .encode(&pixels, stride, size, false, &mut packet)
+            .unwrap();
+        let start = process_cpu_seconds();
+        let mut generation_cpu = 0.0;
+        for frame in 0..120u32 {
+            let generation_start = process_cpu_seconds();
+            // Move the colour through every pixel without allocating per frame.
+            for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                pixel.copy_from_slice(&[
+                    (index as u32 + frame) as u8,
+                    (index as u32 / 2560 + frame * 3) as u8,
+                    (index as u32 / 64 + frame * 5) as u8,
+                    255,
+                ]);
+            }
+            generation_cpu += process_cpu_seconds() - generation_start;
+            encoder
+                .encode(&pixels, stride, size, false, &mut packet)
+                .unwrap();
+        }
+        let milliseconds = (process_cpu_seconds() - start - generation_cpu) * 1000.0 / 120.0;
+        eprintln!(
+            "{}: {milliseconds:.3} ms process CPU/frame (user + system, content generation excluded)",
+            if fallback {
+                "fallback CVPixelBufferCreate"
+            } else {
+                "IOSurface compression pool"
+            }
+        );
+        measurements.push(milliseconds);
+    }
+    if measurements.len() != 2 {
+        eprintln!(
+            "Software-transfer inference unavailable; lead must run timing and sample on a Mac with VideoToolbox access."
+        );
+        return;
+    }
+    eprintln!(
+        "pool/fallback CPU ratio {:.3}; {}. Lead must verify with sample.",
+        measurements[1] / measurements[0],
+        if measurements[1] < measurements[0] * 0.7 {
+            "CPU reduction suggests software transfer avoided"
+        } else {
+            "no clear evidence that software transfer was avoided"
+        }
+    );
 }
