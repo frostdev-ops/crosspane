@@ -1,5 +1,5 @@
 [package]
-name = "crosspane-bench"
+name = "crosspane-testapp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

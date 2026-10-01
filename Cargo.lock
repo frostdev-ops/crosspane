@@ -16,13 +16,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crosspane-bench"
-version = "0.0.0"
-dependencies = [
- "crosspane-types",
-]
-
-[[package]]
 name = "crosspane-engine"
 version = "0.0.0"
 dependencies = [
@@ -92,6 +85,13 @@ name = "crosspane-security"
 version = "0.0.0"
 dependencies = [
  "crosspane-protocol",
+ "crosspane-types",
+]
+
+[[package]]
+name = "crosspane-testapp"
+version = "0.0.0"
+dependencies = [
  "crosspane-types",
 ]
 
