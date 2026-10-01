@@ -156,6 +156,20 @@ fn socket_path() -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
+    // `crosspanectl status | head` closes stdout early: end quietly instead of panicking.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if message.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
     let cli = Cli::parse();
     let request = match &cli.command {
         Command::Status => json!({"cmd": "status"}),
