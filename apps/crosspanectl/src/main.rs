@@ -634,8 +634,11 @@ fn print_status(s: &Value) {
         );
         let r = &p["received"];
         if r.is_object() {
+            let latency = r["latency_ms"]
+                .as_f64()
+                .map_or_else(String::new, |ms| format!(", latency {ms:.0} ms"));
             println!(
-                "    received {} frames, {:.1} MB, last {} ms ago",
+                "    received {} frames, {:.1} MB, last {} ms ago{latency}",
                 r["frames"],
                 r["bytes"].as_f64().unwrap_or(0.0) / 1e6,
                 r["last_ms_ago"]

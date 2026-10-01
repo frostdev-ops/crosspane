@@ -215,6 +215,7 @@ fn run() -> Result<()> {
         proxy_ids,
         events: tx.clone(),
         crossing: config.crossing,
+        latency_overlay: config.latency_overlay,
         identity,
         port: config.port,
         revocations: revocations::Issued::load(revocations::file_beside(&paths.trust_file())),
