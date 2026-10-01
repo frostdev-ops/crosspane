@@ -37,6 +37,7 @@ const A: NodeId = NodeId([1; 32]);
 const B: NodeId = NodeId([2; 32]);
 const C: NodeId = NodeId([3; 32]);
 const WINDOW: WindowId = WindowId(10);
+const WINDOW2: WindowId = WindowId(11);
 const DISPLAY: DisplayId = DisplayId(4);
 const KEY: HidUsage = HidUsage::keyboard(4);
 const BUTTON: MouseButton = MouseButton(1);
@@ -221,6 +222,7 @@ impl Fixture {
             0,
         );
         f.handle(Input::Windows(WindowEvent::Added(window(WINDOW))), 0);
+        f.handle(Input::Windows(WindowEvent::Focused(Some(WINDOW))), 0);
         f
     }
     fn handle(&mut self, input: Input, now: u64) -> Vec<Output> {
@@ -518,6 +520,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
         },
         8,
     );
+    f.handle(Input::Windows(WindowEvent::Focused(Some(WINDOW))), 9);
     f.handle(input(B, press(2, true)), 9);
     let out = f.handle(
         control(
@@ -672,6 +675,12 @@ fn twin_and_mirror_mapping_clamping_focus_and_sequences() {
         f.handle(Input::Windows(WindowEvent::Focused(Some(WindowId(99)))), 0);
         let out = f.handle(input(B, press(3, true)), 0);
         assert_eq!(out[0], Output::ActivateWindow { window: WINDOW });
+        assert!(commands(&out).is_empty());
+        assert!(!f.held().contains(&Held::Key(KEY)));
+        assert!(f.handle(input(B, press(3, false)), 0).is_empty());
+        assert!(f.handle(input(C, press(100, false)), 0).is_empty());
+        f.handle(Input::Windows(WindowEvent::Focused(Some(WINDOW))), 0);
+        let out = f.handle(input(B, press(4, true)), 0);
         assert_eq!(
             commands(&out),
             vec![InjectCmd::Key {
@@ -679,10 +688,7 @@ fn twin_and_mirror_mapping_clamping_focus_and_sequences() {
                 down: true
             }]
         );
-        assert!(f.handle(input(B, press(3, false)), 0).is_empty());
-        assert!(f.handle(input(C, press(100, false)), 0).is_empty());
-        f.handle(Input::Windows(WindowEvent::Focused(Some(WINDOW))), 0);
-        let out = f.handle(input(B, press(4, false)), 0);
+        let out = f.handle(input(B, press(5, false)), 0);
         assert_eq!(out.len(), 1);
         assert_eq!(commands(&out), vec![up()]);
         let out = f.handle(
@@ -690,7 +696,7 @@ fn twin_and_mirror_mapping_clamping_focus_and_sequences() {
                 B,
                 ProjInput::Scroll {
                     projection: ID,
-                    seq: 5,
+                    seq: 6,
                     position: PointDevice::new(8.0, 9.0),
                     delta: delta(),
                 },
@@ -830,6 +836,7 @@ fn shared_journal_keeps_other_projection_and_retries_journal_errors() {
         0,
     );
     f.handle(input(B, press(1, true)), 0);
+    f.handle(Input::Windows(WindowEvent::Focused(Some(second_window))), 0);
     f.handle(
         input(
             B,
@@ -913,14 +920,12 @@ fn crash_recovery_is_first_retries_and_has_independent_e1_ids() {
     let retry = f.handle(Input::Tick, 50);
     assert_eq!(
         commands(&retry),
-        vec![
-            up(),
-            InjectCmd::Button {
-                button: BUTTON,
-                down: false
-            }
-        ]
+        vec![InjectCmd::Recover {
+            keys: vec![KEY],
+            buttons: vec![BUTTON]
+        }]
     );
+    assert_ne!(injections(&out)[0].0, injections(&retry)[0].0);
     f.confirm(&retry, true, 50);
     assert!(f.held().is_empty());
     let mut e1_journal = MemoryJournal::default();
@@ -1316,12 +1321,16 @@ fn destination_tracks_held_drops_duplicates_and_focus_loss_sends_ups() {
 #[test]
 fn motion_slots_keep_latest_and_button_scroll_flush_preserves_order() {
     let mut f = Fixture::destination();
-    f.proxy(
+    let first = f.proxy(
         ProxyEvent::Motion {
             position: PointDevice::new(1.0, 2.0),
         },
         0,
     );
+    assert!(matches!(
+        inputs(&first).as_slice(),
+        [ProjInput::Motion { seq: 1, .. }]
+    ));
     f.proxy(
         ProxyEvent::Motion {
             position: PointDevice::new(5.0, 6.0),
@@ -1335,7 +1344,7 @@ fn motion_slots_keep_latest_and_button_scroll_flush_preserves_order() {
         inputs(&out),
         vec![ProjInput::Motion {
             projection: ID,
-            seq: 1,
+            seq: 2,
             position: PointDevice::new(5.0, 6.0)
         }]
     );
@@ -1357,8 +1366,8 @@ fn motion_slots_keep_latest_and_button_scroll_flush_preserves_order() {
     assert!(matches!(
         inputs(&out).as_slice(),
         [
-            ProjInput::Motion { seq: 2, .. },
-            ProjInput::Button { seq: 3, .. }
+            ProjInput::Motion { seq: 3, .. },
+            ProjInput::Button { seq: 4, .. }
         ]
     ));
     f.proxy(
@@ -1377,15 +1386,15 @@ fn motion_slots_keep_latest_and_button_scroll_flush_preserves_order() {
     assert!(matches!(
         inputs(&out).as_slice(),
         [
-            ProjInput::Motion { seq: 4, .. },
-            ProjInput::Scroll { seq: 5, .. }
+            ProjInput::Motion { seq: 5, .. },
+            ProjInput::Scroll { seq: 6, .. }
         ]
     ));
     let mut f = Fixture::destination();
     let mut sent = Vec::new();
     let mut now = MonoTime::ZERO;
     for n in 0..120 {
-        f.at(
+        let out = f.at(
             Input::Proxy {
                 key: key(A),
                 event: ProxyEvent::Motion {
@@ -1394,6 +1403,13 @@ fn motion_slots_keep_latest_and_button_scroll_flush_preserves_order() {
             },
             now,
         );
+        if inputs(&out)
+            .iter()
+            .any(|m| matches!(m, ProjInput::Motion { .. }))
+        {
+            sent.push(now);
+            continue;
+        }
         // Heartbeats may precede the motion slot. Deliver both timers without moving the
         // simulated clock backwards, and require every pending motion to reach a flush.
         for _ in 0..3 {
@@ -1693,10 +1709,808 @@ fn reciprocal_id_one_projections_end_independently_and_ignore_wrong_direction() 
     assert_eq!(b.e2.next_deadline(), None);
 }
 
+fn offered() -> Fixture {
+    let mut f = Fixture::ready(A, B);
+    f.handle(
+        Input::Command(Command::Project {
+            window: WINDOW,
+            to: B,
+        }),
+        0,
+    );
+    f
+}
+
+fn startup(stage: u8) -> Fixture {
+    let mut f = offered();
+    if stage >= 1 {
+        f.handle(control(B, accepted()), 10);
+    }
+    if stage >= 2 {
+        f.handle(
+            Input::Parked {
+                window: WINDOW,
+                result: Ok(parked(WINDOW, PlatformParking::Twin, size())),
+            },
+            20,
+        );
+    }
+    if stage >= 3 {
+        f.handle(
+            Input::CaptureStarted {
+                projection: ID,
+                result: Ok(StreamId(1)),
+            },
+            30,
+        );
+    }
+    f
+}
+
+#[test]
+fn late_parking_and_resize_results_always_restore_even_on_failure() {
+    for resize in [false, true] {
+        for ok in [false, true] {
+            let mut f = startup(if resize { 3 } else { 1 });
+            if resize {
+                f.handle(
+                    control(
+                        B,
+                        Message::Resize {
+                            projection: ID,
+                            size: PixelSize::new(800, 600),
+                            scale: 1.0,
+                        },
+                    ),
+                    40,
+                );
+            }
+            let ended = f.handle(Input::Command(Command::Return(key(A))), 50);
+            assert!(ended.contains(&Output::Restore { window: WINDOW }));
+            assert_eq!(f.e2.next_deadline(), Some(ms(5050)));
+            let result = if ok {
+                Ok(parked(WINDOW, PlatformParking::Twin, size()))
+            } else {
+                Err(Failure::Other)
+            };
+            assert_eq!(
+                f.handle(
+                    Input::Parked {
+                        window: WINDOW,
+                        result
+                    },
+                    60
+                ),
+                vec![Output::Restore { window: WINDOW }]
+            );
+            assert_eq!(f.e2.next_deadline(), None);
+            assert!(matches!(
+                messages(&f.handle(
+                    Input::Command(Command::Project {
+                        window: WINDOW,
+                        to: B
+                    }),
+                    61
+                ))
+                .as_slice(),
+                [Message::Start { .. }]
+            ));
+        }
+    }
+}
+
+#[test]
+fn unanswered_parking_expires_and_removed_windows_clear_pending_cleanup() {
+    for resize in [false, true] {
+        let mut f = startup(if resize { 3 } else { 1 });
+        if resize {
+            f.handle(
+                control(
+                    B,
+                    Message::Resize {
+                        projection: ID,
+                        size: size(),
+                        scale: 1.0,
+                    },
+                ),
+                40,
+            );
+        }
+        f.handle(Input::Command(Command::Return(key(A))), 50);
+        let busy = f.handle(
+            Input::Command(Command::Project {
+                window: WINDOW,
+                to: B,
+            }),
+            5049,
+        );
+        assert_eq!(
+            busy,
+            vec![Output::Notice(Notice::ProjectionRefused {
+                peer: B,
+                reason: Refusal::Busy
+            })]
+        );
+        assert!(f.handle(Input::Tick, 5049).is_empty());
+        assert_eq!(
+            f.handle(Input::Tick, 5050),
+            vec![Output::Restore { window: WINDOW }]
+        );
+        assert_eq!(f.e2.next_deadline(), None);
+        assert!(matches!(
+            messages(&f.handle(
+                Input::Command(Command::Project {
+                    window: WINDOW,
+                    to: B
+                }),
+                5051
+            ))
+            .as_slice(),
+            [Message::Start { .. }]
+        ));
+    }
+    for ended in [false, true] {
+        let mut f = startup(1);
+        if ended {
+            f.handle(Input::Command(Command::Return(key(A))), 50);
+        }
+        f.handle(Input::Windows(WindowEvent::Removed(WINDOW)), 60);
+        assert_eq!(f.e2.next_deadline(), None);
+        assert!(
+            f.handle(
+                Input::Parked {
+                    window: WINDOW,
+                    result: Err(Failure::Other)
+                },
+                70
+            )
+            .is_empty()
+        );
+        assert!(f.handle(Input::Tick, 10000).is_empty());
+        f.handle(Input::Windows(WindowEvent::Added(window(WINDOW))), 10000);
+        assert!(matches!(
+            messages(&f.handle(
+                Input::Command(Command::Project {
+                    window: WINDOW,
+                    to: B
+                }),
+                10000
+            ))
+            .as_slice(),
+            [Message::Start { .. }]
+        ));
+    }
+}
+
+#[test]
+fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
+    for stage in 0..3 {
+        for (wanted, scale, expected) in [
+            (PixelSize::new(800, 600), 2.0, true),
+            (size(), 1.5, true),
+            (size(), 2.0, false),
+        ] {
+            let mut f = startup(stage);
+            for (size, scale) in [(PixelSize::new(700, 500), 3.0), (wanted, scale)] {
+                assert!(
+                    f.handle(
+                        control(
+                            B,
+                            Message::Resize {
+                                projection: ID,
+                                size,
+                                scale
+                            }
+                        ),
+                        40
+                    )
+                    .is_empty()
+                );
+            }
+            if stage < 1 {
+                f.handle(control(B, accepted()), 50);
+            }
+            if stage < 2 {
+                f.handle(
+                    Input::Parked {
+                        window: WINDOW,
+                        result: Ok(parked(WINDOW, PlatformParking::Twin, size())),
+                    },
+                    60,
+                );
+            }
+            let out = f.handle(
+                Input::CaptureStarted {
+                    projection: ID,
+                    result: Ok(StreamId(1)),
+                },
+                70,
+            );
+            assert_eq!(
+                out,
+                if expected {
+                    vec![Output::ResizeParked {
+                        window: WINDOW,
+                        size: wanted,
+                        scale,
+                    }]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+    // Actual parking geometry, rather than the requested size, decides whether resizing is needed.
+    let mut f = startup(1);
+    f.handle(
+        control(
+            B,
+            Message::Resize {
+                projection: ID,
+                size: size(),
+                scale: 2.0,
+            },
+        ),
+        40,
+    );
+    f.handle(
+        Input::Parked {
+            window: WINDOW,
+            result: Ok(parked(
+                WINDOW,
+                PlatformParking::Twin,
+                PixelSize::new(639, 480),
+            )),
+        },
+        50,
+    );
+    assert_eq!(
+        f.handle(
+            Input::CaptureStarted {
+                projection: ID,
+                result: Ok(StreamId(1))
+            },
+            60
+        ),
+        vec![Output::ResizeParked {
+            window: WINDOW,
+            size: size(),
+            scale: 2.0
+        }]
+    );
+}
+
+#[test]
+fn source_rejects_invalid_sizes_without_parking_or_overwriting_valid_resize() {
+    for bad in [
+        PixelSize::new(0, 1),
+        PixelSize::new(1, 0),
+        PixelSize::new(16385, 1),
+        PixelSize::new(1, 16385),
+        PixelSize::new(u32::MAX, u32::MAX),
+    ] {
+        let mut f = offered();
+        let out = f.handle(
+            control(
+                B,
+                Message::Accepted {
+                    projection: ID,
+                    size: bad,
+                    scale: 1.0,
+                },
+            ),
+            1,
+        );
+        assert_eq!(
+            messages(&out),
+            vec![Message::End {
+                projection: ID,
+                reason: Reason::Failed
+            }]
+        );
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, Output::Park { .. } | Output::Restore { .. }))
+        );
+        assert_eq!(f.e2.next_deadline(), None);
+        for stage in 0..4 {
+            let mut f = startup(stage);
+            assert!(
+                f.handle(
+                    control(
+                        B,
+                        Message::Resize {
+                            projection: ID,
+                            size: bad,
+                            scale: 1.0
+                        }
+                    ),
+                    50
+                )
+                .is_empty()
+            );
+        }
+    }
+    for valid in [PixelSize::new(1, 1), PixelSize::new(16384, 16384)] {
+        let mut f = offered();
+        assert_eq!(
+            f.handle(
+                control(
+                    B,
+                    Message::Accepted {
+                        projection: ID,
+                        size: valid,
+                        scale: 1.0
+                    }
+                ),
+                1
+            ),
+            vec![Output::Park {
+                window: WINDOW,
+                size: valid,
+                scale: 1.0
+            }]
+        );
+    }
+    let mut f = startup(2);
+    f.handle(
+        control(
+            B,
+            Message::Resize {
+                projection: ID,
+                size: size(),
+                scale: 1.0,
+            },
+        ),
+        40,
+    );
+    f.handle(
+        control(
+            B,
+            Message::Resize {
+                projection: ID,
+                size: PixelSize::new(0, 0),
+                scale: 2.0,
+            },
+        ),
+        41,
+    );
+    assert_eq!(
+        f.handle(
+            Input::CaptureStarted {
+                projection: ID,
+                result: Ok(StreamId(1))
+            },
+            50
+        ),
+        vec![Output::ResizeParked {
+            window: WINDOW,
+            size: size(),
+            scale: 1.0
+        }]
+    );
+}
+
+#[test]
+fn source_focus_and_keyframe_controls_require_live_stage() {
+    for stage in 0..4 {
+        let mut f = startup(stage);
+        let focus = f.handle(
+            control(
+                B,
+                Message::Focus {
+                    projection: ID,
+                    focused: true,
+                },
+            ),
+            40,
+        );
+        let keyframe = f.handle(control(B, Message::KeyFrameRequest { projection: ID }), 40);
+        assert_eq!(
+            focus,
+            if stage == 3 {
+                vec![Output::ActivateWindow { window: WINDOW }]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(
+            keyframe,
+            if stage == 3 {
+                vec![Output::RequestKeyFrame { projection: ID }]
+            } else {
+                vec![]
+            }
+        );
+    }
+}
+
+#[test]
+fn startup_liveness_timeouts_fail_at_the_exact_deadline_and_clean_late_results() {
+    for stage in [1, 2] {
+        let mut f = startup(stage);
+        let deadline = ms(if stage == 1 { 10010 } else { 10020 });
+        assert_eq!(f.e2.next_deadline(), Some(deadline));
+        assert!(
+            f.at(Input::Tick, MonoTime::from_nanos(deadline.as_nanos() - 1))
+                .is_empty()
+        );
+        let out = f.at(Input::Tick, deadline);
+        assert_eq!(
+            messages(&out),
+            vec![Message::End {
+                projection: ID,
+                reason: Reason::Failed
+            }]
+        );
+        assert!(out.contains(&Output::Restore { window: WINDOW }));
+        if stage == 1 {
+            assert_eq!(f.e2.next_deadline(), Some(ms(15010)));
+            assert_eq!(
+                f.handle(
+                    Input::Parked {
+                        window: WINDOW,
+                        result: Err(Failure::Other)
+                    },
+                    10011
+                ),
+                vec![Output::Restore { window: WINDOW }]
+            );
+        } else {
+            assert_eq!(
+                f.handle(
+                    Input::CaptureStarted {
+                        projection: ID,
+                        result: Ok(StreamId(1))
+                    },
+                    10021
+                ),
+                vec![Output::StopCapture {
+                    stream: StreamId(1)
+                }]
+            );
+        }
+        assert_eq!(f.e2.next_deadline(), None);
+    }
+    let mut f = Fixture::ready(B, A);
+    f.handle(control(A, start()), 20);
+    assert_eq!(f.e2.next_deadline(), Some(ms(10020)));
+    assert!(f.handle(Input::Tick, 10019).is_empty());
+    let out = f.handle(Input::Tick, 10020);
+    assert_eq!(
+        messages(&out),
+        vec![Message::Close {
+            projection: ID,
+            reason: Reason::Failed
+        }]
+    );
+    assert!(out.contains(&Output::CloseProxy { key: key(A) }));
+    assert!(out.contains(&Output::Notice(Notice::ProjectionEnded {
+        key: key(A),
+        reason: Reason::Failed
+    })));
+    assert_eq!(f.e2.next_deadline(), None);
+    assert_eq!(
+        f.handle(
+            Input::ProxyOpened {
+                key: key(A),
+                result: Ok((size(), 1.0))
+            },
+            10021
+        ),
+        vec![Output::CloseProxy { key: key(A) }]
+    );
+}
+
+#[test]
+fn key_downs_wait_for_confirmed_focus_and_activation_is_throttled_but_ups_do_not_focus() {
+    let mut f = Fixture::source(PlatformParking::Twin);
+    f.handle(Input::Windows(WindowEvent::Focused(None)), 0);
+    assert_eq!(
+        f.handle(input(B, press(1, true)), 0),
+        vec![Output::ActivateWindow { window: WINDOW }]
+    );
+    assert!(f.held().is_empty());
+    assert_eq!(f.e2.next_deadline(), None);
+    for (seq, now) in [(2, 1), (3, 299)] {
+        assert!(f.handle(input(B, press(seq, true)), now).is_empty());
+        assert!(f.held().is_empty());
+    }
+    assert_eq!(
+        f.handle(input(B, press(4, true)), 300),
+        vec![Output::ActivateWindow { window: WINDOW }]
+    );
+    assert!(f.handle(input(B, press(5, false)), 301).is_empty());
+    assert!(f.handle(input(B, press(6, true)), 599).is_empty());
+    assert_eq!(
+        f.handle(input(B, press(7, true)), 600),
+        vec![Output::ActivateWindow { window: WINDOW }]
+    );
+    assert!(f.held().is_empty());
+    f.handle(Input::Windows(WindowEvent::Focused(Some(WINDOW))), 601);
+    assert_eq!(
+        commands(&f.handle(input(B, press(8, true)), 601)),
+        vec![InjectCmd::Key {
+            usage: KEY,
+            down: true
+        }]
+    );
+    f.handle(Input::Windows(WindowEvent::Focused(Some(WINDOW2))), 602);
+    let up = f.handle(input(B, press(9, false)), 602);
+    assert_eq!(commands(&up), vec![crate::up()]);
+    assert!(
+        !up.iter()
+            .any(|o| matches!(o, Output::ActivateWindow { .. }))
+    );
+    f.confirm(&up, true, 602);
+    assert!(f.held().is_empty());
+}
+
+#[test]
+fn outgoing_window_text_is_truncated_on_utf8_boundaries() {
+    let mut f = Fixture::ready(A, B);
+    let mut info = window(WINDOW);
+    info.title = "a".repeat(1023) + "é";
+    info.app_id = "b".repeat(1022) + "é" + "z";
+    f.handle(Input::Windows(WindowEvent::Changed(info)), 0);
+    let out = f.handle(
+        Input::Command(Command::Project {
+            window: WINDOW,
+            to: B,
+        }),
+        0,
+    );
+    let messages = messages(&out);
+    let Message::Start { window, .. } = &messages[0] else {
+        panic!("missing Start")
+    };
+    assert_eq!(window.title, "a".repeat(1023));
+    assert_eq!(window.app_id, "b".repeat(1022) + "é");
+    crosspane_protocol::wire::encode_control(
+        &ControlMessage::Projection(messages[0].clone()),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let mut info = crate::window(WINDOW);
+    info.title = "🦀".repeat(300);
+    let out = f.handle(Input::Windows(WindowEvent::Changed(info)), 1);
+    assert_eq!(
+        crate::messages(&out),
+        vec![Message::Title {
+            projection: ID,
+            title: "🦀".repeat(256)
+        }]
+    );
+}
+
+#[test]
+fn destination_caps_held_items_releases_excess_keys_and_ignores_invalid_buttons() {
+    let mut f = Fixture::destination();
+    for id in 4..36 {
+        let out = f.proxy(
+            ProxyEvent::Key {
+                usage: HidUsage::keyboard(id),
+                down: true,
+            },
+            0,
+        );
+        assert!(matches!(
+            inputs(&out).as_slice(),
+            [ProjInput::Key { down: true, .. }]
+        ));
+    }
+    for id in 36..40 {
+        let usage = HidUsage::keyboard(id);
+        assert!(
+            matches!(inputs(&f.proxy(ProxyEvent::Key { usage, down: true }, 0)).as_slice(), [ProjInput::Key { usage: sent, down: false, .. }] if *sent == usage)
+        );
+    }
+    for button in 1..=16 {
+        assert!(matches!(
+            inputs(&f.proxy(
+                ProxyEvent::Button {
+                    button: MouseButton(button),
+                    down: true,
+                    position: PointDevice::zero()
+                },
+                0
+            ))
+            .as_slice(),
+            [ProjInput::Button { down: true, .. }]
+        ));
+    }
+    let deadline = f.e2.next_deadline();
+    for button in (0..=u8::MAX).filter(|button| !(1..=16).contains(button)) {
+        for down in [true, false] {
+            assert!(
+                f.proxy(
+                    ProxyEvent::Button {
+                        button: MouseButton(button),
+                        down,
+                        position: PointDevice::new(900.0, 800.0),
+                    },
+                    1,
+                )
+                .is_empty()
+            );
+            assert_eq!(f.e2.next_deadline(), deadline);
+        }
+    }
+    let out = f.handle(Input::Tick, 50);
+    let held = inputs(&out);
+    assert!(
+        matches!(held.as_slice(), [ProjInput::Held { seq: 53, keys, buttons, .. }] if keys.len() == 32 && buttons.len() == 16 && buttons.iter().all(|b| (1..=16).contains(&b.0)))
+    );
+    for msg in held {
+        crosspane_protocol::wire::encode_input(&InputMessage::Proj(msg), &mut Vec::new()).unwrap();
+    }
+    let out = f.proxy(ProxyEvent::Focus(false), 51);
+    assert_eq!(inputs(&out).len(), 48);
+    assert!(inputs(&out).iter().all(|msg| matches!(
+        msg,
+        ProjInput::Key { down: false, .. } | ProjInput::Button { down: false, .. }
+    )));
+    assert!(inputs(&out).iter().all(|msg| match msg {
+        ProjInput::Button { position, .. } => *position == PointDevice::zero(),
+        _ => true,
+    }));
+}
+
+#[test]
+fn destination_cap_counts_pending_opens_per_peer_and_frees_ended_slots() {
+    let mut f = Fixture::ready(B, A);
+    f.handle(
+        Input::Grants(
+            [
+                (A, [Capability::WindowPresent].into()),
+                (C, [Capability::WindowPresent].into()),
+            ]
+            .into(),
+        ),
+        0,
+    );
+    for id in 1..=16 {
+        let key = ProjectionKey {
+            source: A,
+            projection: ProjectionId(id),
+        };
+        let out = f.handle(
+            control(
+                A,
+                Message::Start {
+                    projection: key.projection,
+                    window: WindowSummary {
+                        title: String::new(),
+                        app_id: String::new(),
+                    },
+                    size: size(),
+                },
+            ),
+            0,
+        );
+        assert!(matches!(out.as_slice(), [Output::OpenProxy { .. }]));
+        if id % 2 == 0 {
+            f.handle(
+                Input::ProxyOpened {
+                    key,
+                    result: Ok((size(), 1.0)),
+                },
+                0,
+            );
+        }
+    }
+    assert!(f.handle(control(A, start()), 0).is_empty());
+    let start17 = Message::Start {
+        projection: ProjectionId(17),
+        window: WindowSummary {
+            title: String::new(),
+            app_id: String::new(),
+        },
+        size: size(),
+    };
+    assert_eq!(
+        messages(&f.handle(control(A, start17.clone()), 0)),
+        vec![Message::Refused {
+            projection: ProjectionId(17),
+            reason: Refusal::Busy
+        }]
+    );
+    assert!(matches!(
+        f.handle(control(C, start17.clone()), 0).as_slice(),
+        [Output::OpenProxy { .. }]
+    ));
+    f.handle(
+        control(
+            A,
+            Message::End {
+                projection: ID,
+                reason: Reason::Returned,
+            },
+        ),
+        1,
+    );
+    assert!(matches!(
+        f.handle(control(A, start17), 1).as_slice(),
+        [Output::OpenProxy { .. }]
+    ));
+}
+
+#[test]
+fn pending_proxy_ignores_geometry_and_title_but_honours_close_and_lost() {
+    for (event, reason) in [
+        (ProxyEvent::CloseRequested, Reason::Returned),
+        (ProxyEvent::Lost, Reason::Failed),
+    ] {
+        let mut f = Fixture::ready(B, A);
+        f.handle(control(A, start()), 0);
+        assert!(
+            f.handle(
+                control(
+                    A,
+                    Message::Geometry {
+                        projection: ID,
+                        size: size(),
+                        parking: ParkingKind::Twin
+                    }
+                ),
+                0
+            )
+            .is_empty()
+        );
+        assert!(
+            f.handle(
+                control(
+                    A,
+                    Message::Title {
+                        projection: ID,
+                        title: "pending".into()
+                    }
+                ),
+                0
+            )
+            .is_empty()
+        );
+        let out = f.proxy(event, 1);
+        assert_eq!(
+            messages(&out),
+            vec![Message::Close {
+                projection: ID,
+                reason
+            }]
+        );
+        assert!(out.contains(&Output::CloseProxy { key: key(A) }));
+        assert_eq!(f.e2.next_deadline(), None);
+        assert_eq!(
+            f.handle(
+                Input::ProxyOpened {
+                    key: key(A),
+                    result: Ok((size(), 1.0))
+                },
+                2
+            ),
+            vec![Output::CloseProxy { key: key(A) }]
+        );
+    }
+    let mut f = Fixture::ready(B, A);
+    f.handle(control(A, start()), 0);
+    let out = f.handle(
+        Input::ProxyOpened {
+            key: key(A),
+            result: Err(Failure::Other),
+        },
+        1,
+    );
+    assert!(out.contains(&Output::Notice(Notice::ProjectionRefused {
+        peer: A,
+        reason: Refusal::InjectorFailed
+    })));
+}
+
 #[derive(Default)]
 struct Platform {
     held: BTreeSet<Held>,
     parked: BTreeSet<WindowId>,
+    ever_parked: BTreeSet<WindowId>,
     streams: BTreeSet<StreamId>,
     proxies: BTreeSet<ProjectionKey>,
     asleep: bool,
@@ -1714,12 +2528,17 @@ struct Simulation {
     now: MonoTime,
     failures: bool,
     delay: bool,
+    network: bool,
 }
 
 impl Simulation {
     fn new() -> Self {
+        let mut nodes = [Fixture::ready(A, B), Fixture::ready(B, A)];
+        for f in &mut nodes {
+            f.handle(Input::Windows(WindowEvent::Added(window(WINDOW2))), 0);
+        }
         Self {
-            nodes: [Fixture::ready(A, B), Fixture::ready(B, A)],
+            nodes,
             platform: std::array::from_fn(|_| Platform {
                 permitted: true,
                 fresh: true,
@@ -1731,6 +2550,7 @@ impl Simulation {
             now: ms(0),
             failures: false,
             delay: false,
+            network: true,
         }
     }
 
@@ -1776,7 +2596,7 @@ impl Simulation {
         for output in out {
             match output {
                 Output::SendControl { msg, .. } => {
-                    if self.platform.iter().all(|p| p.connected) {
+                    if self.network && self.platform.iter().all(|p| p.connected) {
                         self.queue.push_back((
                             1 - node,
                             Input::Link(LinkEvent::Control {
@@ -1787,7 +2607,7 @@ impl Simulation {
                     }
                 }
                 Output::SendInput { msg, .. } => {
-                    if self.platform.iter().all(|p| p.connected) {
+                    if self.network && self.platform.iter().all(|p| p.connected) {
                         self.queue.push_back((
                             1 - node,
                             Input::Link(LinkEvent::Input {
@@ -1801,6 +2621,7 @@ impl Simulation {
                     assert!(allowed, "parking while blocked");
                     // Model even partially failed parking as an obligation to restore.
                     self.platform[node].parked.insert(window);
+                    self.platform[node].ever_parked.insert(window);
                     let result = if self.failures {
                         Err(Failure::Other)
                     } else {
@@ -1817,7 +2638,14 @@ impl Simulation {
                     self.response(node, Input::Parked { window, result });
                 }
                 Output::Restore { window } => {
+                    assert!(
+                        self.platform[node].ever_parked.contains(&window),
+                        "Restore for a never-parked window"
+                    );
                     self.platform[node].parked.remove(&window);
+                }
+                Output::ActivateWindow { window } => {
+                    self.response(node, Input::Windows(WindowEvent::Focused(Some(window))));
                 }
                 Output::StartCapture { projection, .. } => {
                     assert!(allowed, "capture while blocked");
@@ -1975,14 +2803,18 @@ proptest! {
         events in prop::collection::vec((0u8..26, any::<u8>(), 0u16..400, any::<bool>(), any::<bool>()), 1..150)
     ) {
         let mut sim = Simulation::new();
-        // Every case starts both directions with id 1; random events can interrupt any startup
+        // Every case starts two windows in both directions; random events can interrupt startup
         // phase, delay responses, and fail platform operations independently of network delivery.
-        for node in 0..2 { sim.step(node, Input::Command(Command::Project { window: WINDOW, to: [B, A][node] })); }
+        for node in 0..2 {
+            for window in [WINDOW, WINDOW2] { sim.step(node, Input::Command(Command::Project { window, to: [B, A][node] })); }
+        }
         sim.drain(1_000);
         for node in 0..2 {
-            let proxy_key = key([B, A][node]);
+            for projection in [ID, ProjectionId(2)] {
+            let proxy_key = ProjectionKey { source: [B, A][node], projection };
             sim.step(node, Input::Proxy { key: proxy_key, event: ProxyEvent::Key { usage: KEY, down: true } });
             sim.step(node, Input::Proxy { key: proxy_key, event: ProxyEvent::Button { button: BUTTON, down: true, position: PointDevice::zero() } });
+            }
         }
         sim.drain(1_000);
         for (kind, arg, elapsed, failure, delay) in events {
@@ -1991,9 +2823,10 @@ proptest! {
             sim.delay = delay;
             let node = usize::from((arg >> 2) % 2);
             let proxy_key = ProjectionKey { source: [B, A][node], projection: ProjectionId(1 + u64::from(arg % 4)) };
+            let chosen_window = if arg & 1 == 0 { WINDOW } else { WINDOW2 };
             let usage = HidUsage::keyboard(4 + u16::from(arg % 4));
             let event = match kind {
-                0 => Input::Command(Command::Project { window: WINDOW, to: [B, A][node] }),
+                0 => Input::Command(Command::Project { window: chosen_window, to: [B, A][node] }),
                 1 => locked(),
                 2 => Input::Session(SessionEvent::State(OPEN)),
                 3 => Input::Session(SessionEvent::WillSleep),
@@ -2014,8 +2847,8 @@ proptest! {
                 19 => Input::Command(Command::Return(ProjectionKey { source: [A, B][node], projection: proxy_key.projection })),
                 20 => Input::MediaError { key: proxy_key },
                 21 => Input::Windows(WindowEvent::Focused(Some(WindowId(99)))),
-                22 => Input::Windows(WindowEvent::Removed(WINDOW)),
-                23 => Input::Windows(WindowEvent::Added(window(WINDOW))),
+                22 => Input::Windows(WindowEvent::Removed(chosen_window)),
+                23 => Input::Windows(WindowEvent::Added(window(chosen_window))),
                 24 if !sim.pending.is_empty() => {
                     let (target, input) = sim.pending.swap_remove(usize::from(arg) % sim.pending.len());
                     sim.step(target, input);
@@ -2032,4 +2865,50 @@ proptest! {
         }
         sim.finish();
     }
+
+    #[test]
+    fn lease_only_ticks_release_two_windows_per_node_without_network(
+        elapsed in prop::collection::vec(0u16..500, 1..30)
+    ) {
+        let mut sim = Simulation::new();
+        for node in 0..2 {
+            for window in [WINDOW, WINDOW2] {
+                sim.step(node, Input::Command(Command::Project { window, to: [B, A][node] }));
+            }
+        }
+        sim.drain(1_000);
+        for node in 0..2 {
+            for (projection, window) in [(ID, WINDOW), (ProjectionId(2), WINDOW2)] {
+                sim.step(node, Input::Windows(WindowEvent::Focused(Some(window))));
+                sim.step(node, input([B, A][node], ProjInput::Key {
+                    projection, seq: 1, usage: HidUsage::keyboard(4 + projection.0 as u16), down: true,
+                }));
+                sim.step(node, input([B, A][node], ProjInput::Button {
+                    projection, seq: 2, button: MouseButton(projection.0 as u8), down: true,
+                    position: PointDevice::zero(),
+                }));
+            }
+        }
+        sim.drain(1_000);
+        for node in 0..2 { assert_eq!(sim.platform[node].held.len(), 4); }
+        assert!(sim.queue.is_empty());
+        sim.network = false;
+        for duration in elapsed {
+            sim.now = sim.now.saturating_add(Duration::from_millis(u64::from(duration)));
+            for node in 0..2 { sim.step(node, Input::Tick); }
+            sim.drain(1_000); // Only platform InjectDone acknowledgements; network is disabled.
+        }
+        sim.now = sim.now.max(ms(301));
+        for node in 0..2 { sim.step(node, Input::Tick); }
+        sim.drain(1_000);
+        for node in 0..2 {
+            assert!(sim.platform[node].held.is_empty());
+            assert!(sim.nodes[node].held().is_empty());
+            assert_eq!(sim.platform[node].parked.len(), 2);
+            assert_eq!(sim.platform[node].streams.len(), 2);
+            assert_eq!(sim.platform[node].proxies.len(), 2);
+        }
+        sim.finish();
+    }
+
 }

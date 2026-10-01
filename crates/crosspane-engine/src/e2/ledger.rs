@@ -275,6 +275,17 @@ impl Ledgers {
     pub fn tick(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         let owners: Vec<_> = self.leases.keys().copied().collect();
         for owner in owners {
+            if owner == ProjectionId(0) {
+                if let Some(lease) = self.leases.get_mut(&owner)
+                    && lease.retry.is_some_and(|deadline| deadline <= now)
+                {
+                    let items: Vec<_> = lease.unconfirmed.keys().copied().collect();
+                    let (keys, buttons) = split(&items);
+                    lease.retry = now.checked_add(RETRY);
+                    self.submit_recovery(keys, buttons, out);
+                }
+                continue;
+            }
             if let Some(lease) = self.leases.get_mut(&owner) {
                 let mut actions = lease.ledger.on_tick(now);
                 if lease.retry.is_some_and(|deadline| deadline <= now) {
@@ -318,6 +329,7 @@ impl Ledgers {
         if ok && !journal_failed {
             for item in items {
                 lease.unconfirmed.remove(&item);
+                lease.generations.remove(&item);
             }
             if lease.unconfirmed.is_empty() {
                 lease.retry = None;
@@ -366,4 +378,43 @@ pub(super) fn split(
         }
     }
     (keys, buttons)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crosspane_input::journal::MemoryJournal;
+    use crosspane_types::hid::HidUsage;
+
+    #[test]
+    fn confirmed_releases_drop_generations_without_clearing_a_later_press() {
+        let mut out = Vec::new();
+        let mut ledgers = Ledgers::new(Box::new(MemoryJournal::default()), &mut out).unwrap();
+        let owner = ProjectionId(1);
+        let now = MonoTime::ZERO;
+        ledgers.open(owner).unwrap();
+        for usage in 4..104 {
+            let item = Held::Key(HidUsage::keyboard(usage));
+            assert!(ledgers.input(owner, item, true, now, &mut out));
+            assert!(ledgers.input(owner, item, false, now, &mut out));
+            let Some(Output::Inject { id, .. }) = out.last() else {
+                panic!("missing release")
+            };
+            let id = *id;
+            assert_eq!(ledgers.done(id, true, now), None);
+            assert!(ledgers.leases[&owner].generations.is_empty());
+            out.clear();
+        }
+        let item = Held::Key(HidUsage::keyboard(4));
+        assert!(ledgers.input(owner, item, true, now, &mut out));
+        assert!(ledgers.input(owner, item, false, now, &mut out));
+        let Some(Output::Inject { id, .. }) = out.last() else {
+            panic!("missing release")
+        };
+        let old = *id;
+        assert!(ledgers.input(owner, item, true, now, &mut out));
+        ledgers.done(old, true, now);
+        assert_eq!(ledgers.leases[&owner].generations.len(), 1);
+        assert_eq!(ledgers.leases[&owner].ledger.held(), vec![item]);
+    }
 }

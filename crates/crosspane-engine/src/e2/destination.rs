@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crosspane_input::Held;
 use crosspane_input::timing::{HEARTBEAT_HELD, HEARTBEAT_IDLE};
-use crosspane_protocol::msg::{Capability, InputMessage, Refusal};
+use crosspane_protocol::msg::{Capability, InputMessage, MAX_HELD_KEYS, Refusal};
 use crosspane_protocol::projection::{
     ProjInput, ProjectionEndReason as Reason, ProjectionMessage as Message,
 };
@@ -21,9 +21,12 @@ use crate::io::{Failure, Notice, Output, ProjectionKey, ProxyEvent};
 const MOTION_SLOT: Duration = Duration::from_nanos(8_333_334);
 const RESIZE_SLOT: Duration = Duration::from_millis(50);
 const KEYFRAME_SLOT: Duration = Duration::from_millis(200);
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const PEER_CAP: usize = 16;
 
 pub(super) struct Destination {
     open: bool,
+    open_due: Option<MonoTime>,
     seq: u32,
     held: BTreeSet<Held>,
     position: PointDevice,
@@ -144,10 +147,29 @@ impl E2 {
             if self.destinations.contains_key(&key) {
                 return;
             }
+            // Pending opens count too, so concurrent Start messages cannot bypass the cap.
+            if self
+                .destinations
+                .keys()
+                .filter(|key| key.source == peer)
+                .count()
+                >= PEER_CAP
+            {
+                send(
+                    peer,
+                    Message::Refused {
+                        projection,
+                        reason: Refusal::Busy,
+                    },
+                    out,
+                );
+                return;
+            }
             self.destinations.insert(
                 key,
                 Destination {
                     open: false,
+                    open_due: Some(now.saturating_add(OPEN_TIMEOUT)),
                     seq: 0,
                     held: BTreeSet::new(),
                     position: PointDevice::zero(),
@@ -170,16 +192,18 @@ impl E2 {
             });
             return;
         }
-        if !self.destinations.contains_key(&key) {
+        let Some(destination) = self.destinations.get(&key) else {
             return;
-        }
+        };
         match msg {
-            Message::Geometry { size, parking, .. } => out.push(Output::ProxyGeometry {
-                key,
-                size: *size,
-                parking: *parking,
-            }),
-            Message::Title { title, .. } => out.push(Output::ProxyTitle {
+            Message::Geometry { size, parking, .. } if destination.open => {
+                out.push(Output::ProxyGeometry {
+                    key,
+                    size: *size,
+                    parking: *parking,
+                })
+            }
+            Message::Title { title, .. } if destination.open => out.push(Output::ProxyTitle {
                 key,
                 title: title.clone(),
             }),
@@ -207,6 +231,7 @@ impl E2 {
         match result {
             Ok((size, scale)) => {
                 destination.open = true;
+                destination.open_due = None;
                 destination.last_heartbeat = now;
                 destination.heartbeat_due = now.checked_add(HEARTBEAT_IDLE);
                 send(
@@ -228,6 +253,10 @@ impl E2 {
                     },
                     out,
                 );
+                out.push(Output::Notice(Notice::ProjectionRefused {
+                    peer: key.source,
+                    reason: Refusal::InjectorFailed,
+                }));
                 // Close is idempotent, including a partially-created or failed proxy.
                 out.push(Output::CloseProxy { key });
                 self.destinations.remove(&key);
@@ -242,6 +271,17 @@ impl E2 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        match event {
+            ProxyEvent::CloseRequested => {
+                self.end_destination(key, Reason::Returned, false, false, out);
+                return;
+            }
+            ProxyEvent::Lost => {
+                self.end_destination(key, Reason::Failed, false, false, out);
+                return;
+            }
+            _ => {}
+        }
         if !self.permits_io() {
             return;
         }
@@ -297,6 +337,30 @@ impl E2 {
                 return;
             }
             ProxyEvent::Key { usage, down } => {
+                if *down
+                    && !destination.held.contains(&Held::Key(*usage))
+                    && destination
+                        .held
+                        .iter()
+                        .filter(|item| matches!(item, Held::Key(_)))
+                        .count()
+                        >= MAX_HELD_KEYS
+                {
+                    sent = destination.input(
+                        key,
+                        |seq| ProjInput::Key {
+                            projection: key.projection,
+                            seq,
+                            usage: *usage,
+                            down: false,
+                        },
+                        out,
+                    );
+                    if !sent {
+                        self.end_destination(key, Reason::Failed, false, false, out);
+                    }
+                    return;
+                }
                 if !transition(&mut destination.held, Held::Key(*usage), *down) {
                     return;
                 }
@@ -317,6 +381,10 @@ impl E2 {
                 down,
                 position,
             } => {
+                if !(1..=16).contains(&button.0) {
+                    // Unsupported buttons are never forwarded or held, so there is no up to send.
+                    return;
+                }
                 if !transition(&mut destination.held, Held::Button(*button), *down) {
                     return;
                 }
@@ -352,7 +420,9 @@ impl E2 {
             ProxyEvent::Motion { position } => {
                 destination.position = *position;
                 destination.motion = Some(*position);
-                if destination.motion_due.is_none() {
+                if destination.last_motion.is_none() {
+                    sent = destination.flush_motion(key, now, out);
+                } else if destination.motion_due.is_none() {
                     destination.motion_due = destination.last_motion.map_or_else(
                         || now.checked_add(MOTION_SLOT),
                         |last| {
@@ -416,6 +486,14 @@ impl E2 {
     pub(super) fn destination_tick(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         let keys: Vec<_> = self.destinations.keys().copied().collect();
         for key in keys {
+            if self
+                .destinations
+                .get(&key)
+                .is_some_and(|d| d.open_due.is_some_and(|deadline| deadline <= now))
+            {
+                self.end_destination(key, Reason::Failed, false, false, out);
+                continue;
+            }
             let Some(destination) = self.destinations.get_mut(&key).filter(|d| d.open) else {
                 continue;
             };
@@ -477,7 +555,7 @@ impl E2 {
     pub(super) fn destination_deadline(&self) -> Option<MonoTime> {
         self.destinations
             .values()
-            .flat_map(|d| [d.motion_due, d.resize_due, d.heartbeat_due])
+            .flat_map(|d| [d.open_due, d.motion_due, d.resize_due, d.heartbeat_due])
             .flatten()
             .min()
     }

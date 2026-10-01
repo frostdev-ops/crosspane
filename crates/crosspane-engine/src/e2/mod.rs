@@ -38,7 +38,7 @@ pub struct E2 {
     sources: BTreeMap<ProjectionId, Source>,
     destinations: BTreeMap<ProjectionKey, Destination>,
     // Don't reuse a window while its previous parking operation can still complete.
-    pending_parks: BTreeSet<WindowId>,
+    pending_parks: BTreeMap<WindowId, MonoTime>,
     ledgers: Ledgers,
 }
 
@@ -80,7 +80,7 @@ impl E2 {
                 next_projection: Some(1),
                 sources: BTreeMap::new(),
                 destinations: BTreeMap::new(),
-                pending_parks: BTreeSet::new(),
+                pending_parks: BTreeMap::new(),
                 ledgers,
             },
             out,
@@ -110,7 +110,7 @@ impl E2 {
                     .filter(|key| !self.granted(key.source, Capability::WindowPresent))
                     .collect();
                 for id in sources {
-                    self.end_source(id, Reason::Revoked, false, out);
+                    self.end_source(id, Reason::Revoked, false, now, out);
                 }
                 for key in destinations {
                     self.end_destination(key, Reason::Revoked, false, false, out);
@@ -130,7 +130,7 @@ impl E2 {
                     _ => {}
                 }
                 if !self.permits_io() {
-                    self.end_all(Reason::Locked, out);
+                    self.end_all(Reason::Locked, now, out);
                 }
             }
             Input::Windows(event) => match event {
@@ -150,8 +150,9 @@ impl E2 {
                         .map(|(&id, _)| id)
                         .collect();
                     for id in ids {
-                        self.end_source(id, Reason::WindowClosed, false, out);
+                        self.end_source(id, Reason::WindowClosed, false, now, out);
                     }
+                    self.pending_parks.remove(window);
                 }
                 WindowEvent::Focused(window) => self.focused = *window,
                 _ => {}
@@ -159,14 +160,14 @@ impl E2 {
             Input::Command(Command::Project { window, to }) => self.project(*window, *to, now, out),
             Input::Command(Command::Return(key)) => {
                 if key.source == self.node {
-                    self.end_source(key.projection, Reason::Returned, false, out);
+                    self.end_source(key.projection, Reason::Returned, false, now, out);
                 } else {
                     self.end_destination(*key, Reason::Returned, false, false, out);
                 }
             }
             Input::Command(Command::Panic) => {
                 self.panic = true;
-                self.end_all(Reason::Returned, out);
+                self.end_all(Reason::Returned, now, out);
             }
             Input::Command(Command::Rearm) => self.panic = false,
             Input::Link(LinkEvent::Closed { peer, .. }) => {
@@ -184,7 +185,7 @@ impl E2 {
                     .filter(|key| key.source == *peer)
                     .collect();
                 for id in sources {
-                    self.end_source(id, Reason::LinkLost, true, out);
+                    self.end_source(id, Reason::LinkLost, true, now, out);
                 }
                 for key in destinations {
                     self.end_destination(key, Reason::LinkLost, true, true, out);
@@ -205,7 +206,7 @@ impl E2 {
                     | Message::Resize { .. }
                     | Message::Focus { .. }
                     | Message::KeyFrameRequest { .. }
-                    | Message::Close { .. } => self.source_control(*peer, msg, out),
+                    | Message::Close { .. } => self.source_control(*peer, msg, now, out),
                     _ => {}
                 }
             }
@@ -213,17 +214,19 @@ impl E2 {
                 peer,
                 msg: InputMessage::Proj(msg),
             }) => self.source_input(*peer, msg, now, out),
-            Input::Parked { window, result } => self.parked(*window, *result, out),
+            Input::Parked { window, result } => self.parked(*window, *result, now, out),
             Input::CaptureStarted { projection, result } => {
-                self.capture_started(*projection, *result, out)
+                self.capture_started(*projection, *result, now, out)
             }
-            Input::CaptureEnded { stream, reason } => self.capture_ended(*stream, *reason, out),
+            Input::CaptureEnded { stream, reason } => {
+                self.capture_ended(*stream, *reason, now, out)
+            }
             Input::ProxyOpened { key, result } => self.proxy_opened(*key, *result, now, out),
             Input::Proxy { key, event } => self.proxy_event(*key, event, now, out),
             Input::MediaError { key } => self.media_error(*key, now, out),
             Input::InjectDone { id, ok } => {
                 if let Some(owner) = self.ledgers.done(*id, *ok, now) {
-                    self.end_source(owner, Reason::Failed, false, out);
+                    self.end_source(owner, Reason::Failed, false, now, out);
                 }
             }
             Input::Tick => {
@@ -256,11 +259,11 @@ impl E2 {
             .is_some_and(|grants| grants.contains(&capability))
     }
 
-    fn end_all(&mut self, reason: Reason, out: &mut Vec<Output>) {
+    fn end_all(&mut self, reason: Reason, now: MonoTime, out: &mut Vec<Output>) {
         let sources: Vec<_> = self.sources.keys().copied().collect();
         let destinations: Vec<_> = self.destinations.keys().copied().collect();
         for id in sources {
-            self.end_source(id, reason, false, out);
+            self.end_source(id, reason, false, now, out);
         }
         for key in destinations {
             self.end_destination(key, reason, false, false, out);

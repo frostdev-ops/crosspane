@@ -18,13 +18,15 @@ use crosspane_types::time::MonoTime;
 use super::{E2, send};
 use crate::io::{Failure, InjectCmd, Notice, Output, ProjectionKey};
 
-const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+const PARK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const FOCUS_GRACE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Offered(MonoTime),
-    Parking,
-    Capturing,
+    Parking(MonoTime),
+    Capturing(MonoTime),
     Live,
 }
 
@@ -37,6 +39,8 @@ pub(super) struct Source {
     resizing: bool,
     latest_resize: Option<(PixelSize, f64)>,
     last_seq: u32,
+    parked_scale: f64,
+    last_activation: Option<MonoTime>,
 }
 
 impl E2 {
@@ -54,7 +58,7 @@ impl E2 {
         } else if !self.windows.contains_key(&window)
             || !self.peers.contains(&peer)
             || self.sources.values().any(|s| s.window == window)
-            || self.pending_parks.contains(&window)
+            || self.pending_parks.contains_key(&window)
             || self.next_projection.is_none()
             || !self.ledgers.recovery_done()
         {
@@ -93,8 +97,8 @@ impl E2 {
             Message::Start {
                 projection,
                 window: WindowSummary {
-                    title: info.title.clone(),
-                    app_id: info.app_id.clone(),
+                    title: wire_text(&info.title),
+                    app_id: wire_text(&info.app_id),
                 },
                 size,
             },
@@ -105,17 +109,25 @@ impl E2 {
             Source {
                 peer,
                 window,
-                stage: Stage::Offered(now.saturating_add(OFFER_TIMEOUT)),
+                stage: Stage::Offered(now.saturating_add(START_TIMEOUT)),
                 parked: None,
                 stream: None,
                 resizing: false,
                 latest_resize: None,
                 last_seq: 0,
+                parked_scale: scale,
+                last_activation: None,
             },
         );
     }
 
-    pub(super) fn source_control(&mut self, peer: NodeId, msg: &Message, out: &mut Vec<Output>) {
+    pub(super) fn source_control(
+        &mut self,
+        peer: NodeId,
+        msg: &Message,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
         let projection = match msg {
             Message::Accepted { projection, .. }
             | Message::Refused { projection, .. }
@@ -130,7 +142,12 @@ impl E2 {
         };
         match msg {
             Message::Accepted { size, scale, .. } if matches!(source.stage, Stage::Offered(_)) => {
-                source.stage = Stage::Parking;
+                if !sane_size(*size) {
+                    self.end_source(projection, Reason::Failed, false, now, out);
+                    return;
+                }
+                source.stage = Stage::Parking(now.saturating_add(START_TIMEOUT));
+                source.parked_scale = *scale;
                 out.push(Output::Park {
                     window: source.window,
                     size: *size,
@@ -142,13 +159,14 @@ impl E2 {
                     peer,
                     reason: *reason,
                 }));
-                self.end_source(projection, Reason::Failed, true, out);
+                self.end_source(projection, Reason::Failed, true, now, out);
             }
-            Message::Resize { size, scale, .. } if source.stage == Stage::Live => {
-                if source.resizing {
+            Message::Resize { size, scale, .. } if sane_size(*size) => {
+                if source.stage != Stage::Live || source.resizing {
                     source.latest_resize = Some((*size, *scale));
                 } else {
                     source.resizing = true;
+                    source.parked_scale = *scale;
                     out.push(Output::ResizeParked {
                         window: source.window,
                         size: *size,
@@ -156,15 +174,15 @@ impl E2 {
                     });
                 }
             }
-            Message::Focus { focused: true, .. } => {
-                out.push(Output::ActivateWindow {
-                    window: source.window,
-                });
+            Message::Focus { focused: true, .. } if source.stage == Stage::Live => {
+                if source.activate(now, out) {
+                    self.focused = None;
+                }
             }
-            Message::KeyFrameRequest { .. } => {
+            Message::KeyFrameRequest { .. } if source.stage == Stage::Live => {
                 out.push(Output::RequestKeyFrame { projection });
             }
-            Message::Close { reason, .. } => self.end_source(projection, *reason, true, out),
+            Message::Close { reason, .. } => self.end_source(projection, *reason, true, now, out),
             _ => {}
         }
     }
@@ -173,33 +191,30 @@ impl E2 {
         &mut self,
         window: WindowId,
         result: Result<Parked, Failure>,
+        now: MonoTime,
         out: &mut Vec<Output>,
     ) {
-        if self.pending_parks.remove(&window) {
-            if result.is_ok() {
-                out.push(Output::Restore { window });
-            }
+        if self.pending_parks.remove(&window).is_some() {
+            out.push(Output::Restore { window });
             return;
         }
-        let Some((&projection, source)) = self
-            .sources
-            .iter_mut()
-            .find(|(_, s)| s.window == window && (s.stage == Stage::Parking || s.resizing))
-        else {
+        let Some((&projection, source)) = self.sources.iter_mut().find(|(_, s)| {
+            s.window == window && (matches!(s.stage, Stage::Parking(_)) || s.resizing)
+        }) else {
             return;
         };
-        let initial = source.stage == Stage::Parking;
+        let initial = matches!(source.stage, Stage::Parking(_));
         // This operation has answered, so ending it must not wait for another Parked result.
         source.resizing = false;
         if initial {
-            source.stage = Stage::Capturing;
+            source.stage = Stage::Capturing(now.saturating_add(START_TIMEOUT));
         }
         let Ok(parked) = result else {
-            self.end_source(projection, Reason::Failed, false, out);
+            self.end_source(projection, Reason::Failed, false, now, out);
             return;
         };
         let Some((size, parking)) = geometry(parked).filter(|_| parked.window == window) else {
-            self.end_source(projection, Reason::Failed, false, out);
+            self.end_source(projection, Reason::Failed, false, now, out);
             return;
         };
         source.parked = Some(parked);
@@ -251,14 +266,7 @@ impl E2 {
                 out,
             );
             source.resizing = false;
-            if let Some((size, scale)) = source.latest_resize.take() {
-                source.resizing = true;
-                out.push(Output::ResizeParked {
-                    window,
-                    size,
-                    scale,
-                });
-            }
+            source.resize_latest(out);
         }
     }
 
@@ -266,19 +274,21 @@ impl E2 {
         &mut self,
         projection: ProjectionId,
         result: Result<StreamId, Failure>,
+        now: MonoTime,
         out: &mut Vec<Output>,
     ) {
         if let Some(source) = self
             .sources
             .get_mut(&projection)
-            .filter(|s| s.stage == Stage::Capturing)
+            .filter(|s| matches!(s.stage, Stage::Capturing(_)))
         {
             match result {
                 Ok(stream) => {
                     source.stream = Some(stream);
                     source.stage = Stage::Live;
+                    source.resize_latest(out);
                 }
-                Err(_) => self.end_source(projection, Reason::Failed, false, out),
+                Err(_) => self.end_source(projection, Reason::Failed, false, now, out),
             }
         } else if let Ok(stream) = result
             && !self.sources.values().any(|s| s.stream == Some(stream))
@@ -292,6 +302,7 @@ impl E2 {
         &mut self,
         stream: StreamId,
         reason: StreamEndReason,
+        now: MonoTime,
         out: &mut Vec<Output>,
     ) {
         let reason = match reason {
@@ -302,7 +313,7 @@ impl E2 {
         };
         if let Some((&projection, _)) = self.sources.iter().find(|(_, s)| s.stream == Some(stream))
         {
-            self.end_source(projection, reason, false, out);
+            self.end_source(projection, reason, false, now, out);
         }
     }
 
@@ -364,10 +375,12 @@ impl E2 {
                 self.ledgers.inject(InjectCmd::Scroll(*delta), out);
             }
             ProjInput::Key { usage, down, .. } => {
-                if self.focused != Some(source.window) {
-                    out.push(Output::ActivateWindow {
-                        window: source.window,
-                    });
+                if *down && self.focused != Some(source.window) {
+                    if source.activate(now, out) {
+                        self.focused = None;
+                    }
+                    // Focus is confirmed only by WindowEvent::Focused, never by elapsed time.
+                    return;
                 }
                 item = Some((Held::Key(*usage), *down));
             }
@@ -385,7 +398,7 @@ impl E2 {
         if let Some((item, down)) = item
             && !self.ledgers.input(projection, item, down, now, out)
         {
-            self.end_source(projection, Reason::Failed, false, out);
+            self.end_source(projection, Reason::Failed, false, now, out);
         }
     }
 
@@ -394,6 +407,7 @@ impl E2 {
         projection: ProjectionId,
         reason: Reason,
         peer_ended: bool,
+        now: MonoTime,
         out: &mut Vec<Output>,
     ) {
         let Some(source) = self.sources.remove(&projection) else {
@@ -408,8 +422,9 @@ impl E2 {
                 window: source.window,
             });
         }
-        if source.stage == Stage::Parking || source.resizing {
-            self.pending_parks.insert(source.window);
+        if matches!(source.stage, Stage::Parking(_)) || source.resizing {
+            self.pending_parks
+                .insert(source.window, now.saturating_add(PARK_CLEANUP_TIMEOUT));
         }
         if !peer_ended {
             send(source.peer, Message::End { projection, reason }, out);
@@ -427,25 +442,35 @@ impl E2 {
         let expired: Vec<_> = self
             .sources
             .iter()
-            .filter(|(_, s)| matches!(s.stage, Stage::Offered(deadline) if deadline <= now))
-            .map(|(&id, s)| (id, s.peer))
+            .filter(|(_, s)| s.deadline().is_some_and(|deadline| deadline <= now))
+            .map(|(&id, s)| (id, s.peer, matches!(s.stage, Stage::Offered(_))))
             .collect();
-        for (id, peer) in expired {
-            out.push(Output::Notice(Notice::ProjectionRefused {
-                peer,
-                reason: Refusal::Busy,
-            }));
-            self.end_source(id, Reason::Failed, false, out);
+        for (id, peer, offered) in expired {
+            if offered {
+                out.push(Output::Notice(Notice::ProjectionRefused {
+                    peer,
+                    reason: Refusal::Busy,
+                }));
+            }
+            self.end_source(id, Reason::Failed, false, now, out);
+        }
+        let windows: Vec<_> = self
+            .pending_parks
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(&window, _)| window)
+            .collect();
+        for window in windows {
+            self.pending_parks.remove(&window);
+            out.push(Output::Restore { window });
         }
     }
 
     pub(super) fn source_deadline(&self) -> Option<MonoTime> {
         self.sources
             .values()
-            .filter_map(|s| match s.stage {
-                Stage::Offered(deadline) => Some(deadline),
-                _ => None,
-            })
+            .filter_map(Source::deadline)
+            .chain(self.pending_parks.values().copied())
             .min()
     }
 
@@ -461,7 +486,7 @@ impl E2 {
                         source.peer,
                         Message::Title {
                             projection,
-                            title: window.title.clone(),
+                            title: wire_text(&window.title),
                         },
                         out,
                     );
@@ -469,6 +494,61 @@ impl E2 {
             }
         }
     }
+}
+
+impl Source {
+    fn deadline(&self) -> Option<MonoTime> {
+        match self.stage {
+            Stage::Offered(deadline) | Stage::Parking(deadline) | Stage::Capturing(deadline) => {
+                Some(deadline)
+            }
+            Stage::Live => None,
+        }
+    }
+
+    fn activate(&mut self, now: MonoTime, out: &mut Vec<Output>) -> bool {
+        if self
+            .last_activation
+            .is_some_and(|last| now.saturating_duration_since(last) < FOCUS_GRACE)
+        {
+            return false;
+        }
+        self.last_activation = Some(now);
+        out.push(Output::ActivateWindow {
+            window: self.window,
+        });
+        true
+    }
+
+    fn resize_latest(&mut self, out: &mut Vec<Output>) {
+        if let Some((size, scale)) = self.latest_resize.take()
+            && (self
+                .parked
+                .and_then(geometry)
+                .is_none_or(|(actual, _)| actual != size)
+                || self.parked_scale != scale)
+        {
+            self.resizing = true;
+            self.parked_scale = scale;
+            out.push(Output::ResizeParked {
+                window: self.window,
+                size,
+                scale,
+            });
+        }
+    }
+}
+
+fn sane_size(size: PixelSize) -> bool {
+    (1..=16384).contains(&size.width) && (1..=16384).contains(&size.height)
+}
+
+fn wire_text(value: &str) -> String {
+    let mut end = value.len().min(1024);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn dimension(value: f64) -> u32 {
