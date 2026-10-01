@@ -246,8 +246,8 @@ impl VirtualDisplay {
                 let _: () = msg_send![&*descriptor, setMaxPixelsWide: MAX_PIXELS];
                 let _: () = msg_send![&*descriptor, setMaxPixelsHigh: MAX_PIXELS];
                 let _: () = msg_send![&*descriptor, setSizeInMillimeters: CGSize::new(logical.width * 25.4 / 110.0, logical.height * 25.4 / 110.0)];
-                let _: () = msg_send![&*descriptor, setProductID: 0xC001_u32];
-                let _: () = msg_send![&*descriptor, setVendorID: 0xF05D_u32];
+                let _: () = msg_send![&*descriptor, setProductID: crate::displays::TWIN_PRODUCT];
+                let _: () = msg_send![&*descriptor, setVendorID: crate::displays::TWIN_VENDOR];
                 let _: () = msg_send![&*descriptor, setSerialNum: serial];
             }
             // SAFETY: -initWithDescriptor:(CGVirtualDisplayDescriptor *) returns an owned display.

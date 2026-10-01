@@ -1,0 +1,22 @@
+# systemd user unit: runs the Crosspane agent with the graphical session.
+#   install -Dm644 packaging/linux/crosspane-agent.service ~/.config/systemd/user/crosspane-agent.service
+#   systemctl --user daemon-reload && systemctl --user enable --now crosspane-agent
+# Needs WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE in the user manager's environment (uwsm
+# and most session managers import them). Logs: journalctl --user -u crosspane-agent
+[Unit]
+Description=Crosspane agent (one keyboard and mouse, projected windows)
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/crosspane-agent run
+Environment=RUST_LOG=info
+# SIGTERM is a clean stop: injected input is released and parked windows are put back.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

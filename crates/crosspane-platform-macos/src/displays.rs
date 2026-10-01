@@ -21,9 +21,10 @@ use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSScreen;
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayBounds, CGDisplayChangeSummaryFlags, CGDisplayCopyDisplayMode,
-    CGDisplayMirrorsDisplay, CGDisplayMode, CGDisplayRegisterReconfigurationCallback,
-    CGDisplayRemoveReconfigurationCallback, CGDisplayRotation, CGDisplayScreenSize, CGError,
-    CGGetActiveDisplayList, kCGNullDirectDisplay,
+    CGDisplayMirrorsDisplay, CGDisplayMode, CGDisplayModelNumber,
+    CGDisplayRegisterReconfigurationCallback, CGDisplayRemoveReconfigurationCallback,
+    CGDisplayRotation, CGDisplayScreenSize, CGDisplayVendorNumber, CGError, CGGetActiveDisplayList,
+    kCGNullDirectDisplay,
 };
 use objc2_foundation::{NSNumber, NSString};
 
@@ -236,6 +237,11 @@ fn worker(
     }
 }
 
+/// The vendor and product numbers Crosspane's own twin displays (the opt-in virtual-display
+/// parking, D7) carry. They are left out of the display list: nobody may point at them.
+pub(crate) const TWIN_VENDOR: u32 = 0xF05D;
+pub(crate) const TWIN_PRODUCT: u32 = 0xC001;
+
 #[derive(Debug)]
 struct ScreenInfo {
     id: u32,
@@ -262,6 +268,9 @@ fn native_snapshot() -> Result<Vec<(u32, DisplayNumbers)>, PlatformError> {
     ids.truncate(count as usize);
     ids.into_iter()
         .filter(|&id| CGDisplayMirrorsDisplay(id) == kCGNullDirectDisplay)
+        .filter(|&id| {
+            CGDisplayVendorNumber(id) != TWIN_VENDOR || CGDisplayModelNumber(id) != TWIN_PRODUCT
+        })
         .map(|id| {
             let bounds = CGDisplayBounds(id);
             let physical = CGDisplayScreenSize(id);

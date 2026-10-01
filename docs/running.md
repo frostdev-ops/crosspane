@@ -54,13 +54,29 @@ mac_virtual_display = false   # Mac + private-vdisplay build only: hide projecte
 addr = "192.168.4.244:47811"
 ```
 
-## Start and stop
+## Install, start and stop
 
-- **Linux** (inside Hyprland): `crosspane-agent run`. For autostart on Omarchy, add
-  `o.launch_on_start("crosspane-agent run")` to `~/.config/hypr/autostart.lua`.
-- **Mac**: `open Crosspane.app --args run` (it has no Dock icon).
-- **Stop** with SIGTERM or Ctrl-C: the agent releases any injected input, puts every parked window
-  back and closes its connections. After a crash, the next start does the same from its journals.
+- **Linux:** `cargo install --locked --path apps/crosspane-agent --root ~/.local` (and the same
+  for `apps/crosspanectl`), then run it with the graphical session as a systemd user service:
+
+  ```sh
+  install -Dm644 packaging/linux/crosspane-agent.service ~/.config/systemd/user/crosspane-agent.service
+  systemctl --user daemon-reload && systemctl --user enable --now crosspane-agent
+  ```
+
+  Logs: `journalctl --user -u crosspane-agent`. Without systemd, run `crosspane-agent run`
+  inside the Hyprland session.
+- **Mac:** `scripts/macos/install-agent.sh` (add `--features private-vdisplay` for the D7
+  window hiding) builds, signs and installs `~/Applications/Crosspane.app`, starts it at login
+  (LaunchAgent `io.frostdev.crosspane.agent`) and puts `crosspanectl` in `~/.cargo/bin`. Logs:
+  `~/Library/Logs/Crosspane/agent.log`. Re-run it to upgrade.
+- **Stop** with SIGTERM (`systemctl --user stop crosspane-agent`, or `launchctl bootout
+  gui/$(id -u)/io.frostdev.crosspane.agent`): the agent releases any injected input, puts every
+  parked window back and closes its connections. After a crash, the next start does the same from
+  its journals.
+- **Restart** with `crosspanectl restart`. The agent also restarts by itself when macOS
+  permissions change, so new grants take effect; if a grant doesn't show up in
+  `crosspanectl status`, restart it.
 
 ## Pair two machines (once)
 
