@@ -33,8 +33,10 @@ pollster = "1.0.1"
 proptest = "1.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+thiserror = "2.0.21"
 wgpu = "30.0.1"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
+zeroize = "1.9.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

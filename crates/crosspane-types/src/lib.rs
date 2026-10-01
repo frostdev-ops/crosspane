@@ -8,4 +8,5 @@ pub mod display;
 pub mod geom;
 pub mod hid;
 pub mod id;
+pub mod input;
 pub mod time;
