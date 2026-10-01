@@ -106,9 +106,10 @@ async fn a_second_dial_by_a_healthy_peer_is_refused_quietly() {
     assert!(first.close_reason().is_none());
 }
 
-/// A peer that crashed and restarted dials again while its old connection is still held. The
-/// old connection has gone silent, so the new one replaces it, and the engine sees the restart:
-/// `Closed`, then a new `Hello`.
+/// A peer that crashed and restarted dials again while its old connection is still held. Until the
+/// old connection has been silent long enough to count as gone (1.5 s) the redial is refused; once
+/// it has, the new connection replaces it and the engine sees the restart: `Closed`, then a new
+/// `Hello`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_peer_replaces_its_silent_old_connection() {
     let ida = identity();
@@ -121,13 +122,36 @@ async fn a_restarted_peer_replaces_its_silent_old_connection() {
     let mut old_link = a.transport.link(r).unwrap();
     peer.crash().await;
 
-    // Silent for long enough to count as gone (1.5 s, sampled every 250 ms).
-    sleep(Duration::from_millis(2_000)).await;
-
+    // Redial until the node accepts, rather than guessing how long "silent" takes: a refusal
+    // closes the new connection with code 2 straight away and reports nothing.
     let raw = Raw::new();
-    let second = raw.connect(&idr, &ida, a.addr()).await;
-    let _control = open_stream(&second, 0x01, &hello_frame("restarted")).await;
-    a.expect_closed(r, LinkError::Closed).await;
+    let started = Instant::now();
+    let _control = loop {
+        let attempt = raw.connect(&idr, &ida, a.addr()).await;
+        let control = try_open_stream(&attempt, 0x01, &hello_frame("restarted")).await;
+        tokio::select! {
+            (code, _) = closed_by_peer(&attempt) => {
+                assert_eq!(code, 2, "refused with the wrong code");
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "the silent connection was never replaced"
+                );
+                sleep(Duration::from_millis(200)).await;
+            }
+            event = a.events.recv() => {
+                // Accepted: the engine hears the old link end, then the new one begin.
+                assert!(
+                    matches!(event, Some(LinkEvent::Closed { error: LinkError::Closed, .. })),
+                    "{event:?}"
+                );
+                break control.expect("an accepted connection takes a stream");
+            }
+        }
+    };
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "the old connection was replaced while it was still healthy"
+    );
     a.expect_hello(r, "restarted").await;
     assert_eq!(old_link.send_input(&key(1)), Err(LinkError::Closed));
     a.transport.link(r).unwrap().send_input(&key(1)).unwrap();

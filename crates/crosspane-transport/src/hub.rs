@@ -90,6 +90,24 @@ pub(crate) const CODE_OVERFLOW: u32 = 3;
 const UNTRUSTED_ALERTS: [u8; 9] = [42, 43, 44, 45, 46, 48, 49, 51, 116];
 const ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
 
+/// The one spelling of an address, so a peer is recognised whichever way it is written or reported:
+/// an IPv4 address on a dual-stack (IPv6) endpoint shows up IPv4-mapped (`::ffff:a.b.c.d`).
+pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(_) => addr,
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            // Keep the scope (needed for link-local addresses); drop the flow label.
+            None => SocketAddr::V6(std::net::SocketAddrV6::new(
+                *v6.ip(),
+                v6.port(),
+                0,
+                v6.scope_id(),
+            )),
+        },
+    }
+}
+
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -391,12 +409,9 @@ impl Inner {
 
     /// The peer behind an open connection (settled or not) whose remote address is `addr`.
     fn live_peer_at(&self, addr: SocketAddr) -> Option<NodeId> {
-        let canonical = |addr: SocketAddr| (addr.ip().to_canonical(), addr.port());
         lock(&self.peers)
             .iter()
-            .find(|(_, entry)| {
-                entry.live() && canonical(entry.conn.remote_address()) == canonical(addr)
-            })
+            .find(|(_, entry)| entry.live() && canonical(entry.conn.remote_address()) == addr)
             .map(|(peer, _)| *peer)
     }
 
@@ -405,6 +420,7 @@ impl Inner {
     /// (`Role::Server`) our own dial of that address is the competitor; for one we dialed it is not
     /// (it is that very dial), so only the peer's incoming handshake counts.
     pub(crate) fn competitor_in_flight(&self, remote: SocketAddr, role: Role) -> bool {
+        let remote = canonical(remote);
         (role == Role::Server && lock(&self.flights).contains_key(&remote))
             || lock(&self.incoming_open).contains_key(&remote)
             || lock(&self.retried)
@@ -444,7 +460,7 @@ impl Inner {
                     let mut retried = lock(&self.retried);
                     let now = Instant::now();
                     retried.retain(|_, at| now.duration_since(*at) < RETRY_COMES_BACK);
-                    retried.insert(incoming.remote_address(), now);
+                    retried.insert(canonical(incoming.remote_address()), now);
                 }
                 if incoming.retry().is_err() {
                     tracing::debug!("could not send a retry");
@@ -457,7 +473,8 @@ impl Inner {
                 continue;
             };
             let inner = self.clone();
-            let opened = OpenIncoming::new(&self.incoming_open, incoming.remote_address());
+            let opened =
+                OpenIncoming::new(&self.incoming_open, canonical(incoming.remote_address()));
             tokio::spawn(async move {
                 let handshake = timeout(HANDSHAKE_TIMEOUT, incoming).await;
                 // Past the TLS handshake the peer is authenticated and no longer counts.
@@ -482,6 +499,7 @@ impl Inner {
         self: &Arc<Self>,
         addr: SocketAddr,
     ) -> Result<NodeId, TransportError> {
+        let addr = canonical(addr);
         if self.shutting_down() {
             return Err(TransportError::Connect(
                 "the transport has shut down".into(),
@@ -944,6 +962,19 @@ mod tests {
         assert_eq!(decide(&declared, LOW), Decision::Supersede);
         // ...but not if the same node simply dialed again.
         assert_eq!(decide(&declared, HIGH), Decision::Replace);
+    }
+
+    #[test]
+    fn addresses_have_one_spelling_on_dual_stack_endpoints() {
+        let v4: SocketAddr = "127.0.0.1:47811".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:47811".parse().unwrap();
+        let v6: SocketAddr = "[::1]:47811".parse().unwrap();
+        assert_eq!(canonical(v4), v4);
+        assert_eq!(canonical(mapped), v4);
+        assert_eq!(canonical(v6), v6);
+        assert_ne!(canonical(v4), canonical(v6));
+        let link_local: SocketAddr = "[fe80::1%3]:47811".parse().unwrap();
+        assert_eq!(canonical(link_local), link_local);
     }
 
     #[test]

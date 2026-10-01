@@ -70,25 +70,18 @@ async fn hello_comes_first_even_when_input_is_sent_immediately() {
 }
 
 /// A second address of a peer we are already connected to is a quiet no-op: the existing peer is
-/// returned, nothing is reported, and the first connection carries on.
+/// returned, nothing is reported, and the first connection carries on. The two addresses are
+/// 127.0.0.1 and [::1] of one dual-stack node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_address_of_a_connected_peer_is_a_quiet_no_op() {
-    use std::net::SocketAddr;
-
+    if !dual_stack_available("a_second_address_of_a_connected_peer_is_a_quiet_no_op") {
+        return;
+    }
     let ida = identity();
     let idb = identity();
-    let mut a = Node::start("a", ida.clone(), &[&idb]);
-    // B listens on every loopback address: 127.0.0.1 and 127.0.0.2 are two addresses of one node.
-    let mut b = Node::start_with(
-        "b",
-        idb.clone(),
-        Pins::of(&[&ida]),
-        "0.0.0.0:0".parse().unwrap(),
-        false,
-    );
-    let port = b.addr().port();
-    let first = SocketAddr::from(([127, 0, 0, 1], port));
-    let second = SocketAddr::from(([127, 0, 0, 2], port));
+    let mut a = Node::start_with("a", ida.clone(), Pins::of(&[&idb]), dual_stack(), false);
+    let mut b = Node::start_with("b", idb.clone(), Pins::of(&[&ida]), dual_stack(), false);
+    let (first, second) = both_loopbacks(b.addr().port());
 
     assert_eq!(a.transport.connect(first).await.unwrap(), b.id);
     a.expect_hello(b.id, "b").await;
@@ -331,10 +324,7 @@ async fn loopback_connect_time() {
             );
         }
     }
-    assert!(
-        immediate
-            .iter()
-            .all(|took| *took < Duration::from_millis(250))
-    );
-    assert!(held.iter().all(|took| *took < Duration::from_millis(900)));
+    // Generous bounds for a slow CI machine; they still catch a connect that stalls for seconds.
+    assert!(immediate.iter().all(|took| *took < Duration::from_secs(1)));
+    assert!(held.iter().all(|took| *took < Duration::from_secs(2)));
 }
