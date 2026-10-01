@@ -40,6 +40,12 @@ pub trait PeerLink: Send {
     /// The current smoothed round-trip time, if measured.
     fn rtt(&self) -> Option<Duration>;
 
+    /// The peer's address on the path the connection uses now, if known (for link
+    /// classification, 03 §2).
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
     /// Close the connection. Further sends return [`LinkError::Closed`].
     fn close(&mut self, message: &str);
 }

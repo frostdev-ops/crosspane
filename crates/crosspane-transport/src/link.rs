@@ -329,6 +329,10 @@ impl PeerLink for QuicLink {
         self.cell.live().ok().map(|tx| tx.conn.rtt())
     }
 
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        self.cell.live().ok().map(|tx| tx.conn.remote_address())
+    }
+
     fn close(&mut self, message: &str) {
         let _ = self.cell.begin_close(message);
     }
