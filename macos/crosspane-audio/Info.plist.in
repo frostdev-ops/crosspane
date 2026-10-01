@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- CrosspaneAudio.driver (WP-3.4). Template: scripts/macos/build-audio-plugin.sh substitutes the
+     two @...@ values from src/crosspane_audio.h, so the bundle id and the factory UUID have one
+     source. Deliberately absent: every Mach service, network, IOKit user client, launch agent or
+     helper declaration, because the driver has no IPC. The build fails if one appears. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>CrosspaneAudio</string>
+	<key>CFBundleIdentifier</key>
+	<string>@CROSSPANE_AUDIO_BUNDLE_ID@</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>CrosspaneAudio</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFPlugInDynamicRegistration</key>
+	<string>NO</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>@CROSSPANE_AUDIO_FACTORY_UUID@</key>
+		<string>CrosspaneAudioFactory</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>@CROSSPANE_AUDIO_FACTORY_UUID@</string>
+		</array>
+	</dict>
+	<key>CFPlugInUnloadFunction</key>
+	<string>CrosspaneAudioUnload</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+</dict>
+</plist>

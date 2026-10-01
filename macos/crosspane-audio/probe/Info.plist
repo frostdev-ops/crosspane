@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded in audio-loopback-probe (-sectcreate __TEXT __info_plist) so macOS can attribute the
+     Microphone permission prompt that starting IO on the hidden loopback INPUT device may raise. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.frostdev.crosspane.audio.probe</string>
+	<key>CFBundleName</key>
+	<string>audio-loopback-probe</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>The Crosspane audio loopback probe reads the Crosspane virtual loopback device, which carries only synthetic test samples, to verify the driver. It never records a real microphone.</string>
+</dict>
+</plist>
