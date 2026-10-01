@@ -1,11 +1,19 @@
 //! Shared by window presentation and offscreen byte-for-byte tests.
 
+use std::cell::Cell;
+
 use crosspane_types::geom::{PixelRect, PixelSize};
 
 #[derive(Debug)]
 pub(super) struct Presenter {
     pipeline: wgpu::RenderPipeline,
     canvas: Option<Canvas>,
+    fallback: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+    last_uniform: Cell<Option<[u32; 8]>>,
+    accent: [u8; 3],
+    edge_px: u32,
+    srgb: bool,
     texture_format: wgpu::TextureFormat,
     pub(super) grey: f64,
 }
@@ -54,8 +62,50 @@ impl Presenter {
             multiview_mask: None,
             cache: None,
         });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("proxy edge"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let empty = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("proxy empty canvas"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let fallback = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("proxy empty canvas"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &empty.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
         Self {
             pipeline,
+            fallback,
+            uniform,
+            last_uniform: Cell::new(None),
+            accent: [0; 3],
+            edge_px: 0,
+            srgb: format.is_srgb(),
             canvas: None,
             texture_format: if format.is_srgb() {
                 wgpu::TextureFormat::Bgra8UnormSrgb
@@ -122,10 +172,16 @@ impl Presenter {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("proxy canvas"),
                 layout: &self.pipeline.get_bind_group_layout(0),
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.uniform.as_entire_binding(),
+                    },
+                ],
             });
             self.canvas = Some(Canvas {
                 texture,
@@ -175,7 +231,45 @@ impl Presenter {
         Ok(())
     }
 
-    pub(super) fn encode(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+    pub(super) fn set_edge(&mut self, accent: [u8; 3], edge_px: u32) {
+        self.accent = accent;
+        self.edge_px = edge_px;
+    }
+
+    pub(super) fn encode(
+        &self,
+        queue: &wgpu::Queue,
+        size: PixelSize,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+    ) {
+        // vec4<f32> colour followed by vec4<u32> (width, height, edge, canvas-present).
+        let mut data = [0_u32; 8];
+        for (slot, byte) in data[..3].iter_mut().zip(self.accent) {
+            let value = f32::from(byte) / 255.0;
+            let value = if self.srgb {
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            } else {
+                value
+            };
+            *slot = value.to_bits();
+        }
+        data[3] = 1.0_f32.to_bits();
+        data[4..].copy_from_slice(&[
+            size.width,
+            size.height,
+            self.edge_px,
+            u32::from(self.canvas.is_some()),
+        ]);
+        if self.last_uniform.get() != Some(data) {
+            let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_ne_bytes()).collect();
+            queue.write_buffer(&self.uniform, 0, &bytes);
+            self.last_uniform.set(Some(data));
+        }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("proxy presentation"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -197,11 +291,15 @@ impl Presenter {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        if let Some(canvas) = &self.canvas {
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &canvas.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(
+            0,
+            self.canvas
+                .as_ref()
+                .map_or(&self.fallback, |canvas| &canvas.bind_group),
+            &[],
+        );
+        pass.draw(0..3, 0..1);
     }
 }
 

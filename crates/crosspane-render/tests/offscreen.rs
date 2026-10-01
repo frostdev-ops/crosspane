@@ -240,7 +240,12 @@ fn readback(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("proxy offscreen presentation/readback"),
     });
-    presenter.encode(&mut encoder, &texture.create_view(&Default::default()));
+    presenter.encode(
+        queue,
+        size,
+        &mut encoder,
+        &texture.create_view(&Default::default()),
+    );
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -280,4 +285,56 @@ fn readback(
     drop(mapped);
     buffer.unmap();
     Ok(bytes)
+}
+
+#[test]
+fn edge_preserves_pattern_and_grey() -> Result<()> {
+    let Some((device, queue)) = device()? else {
+        return Ok(());
+    };
+    let canvas_size = PixelSize::new(37, 31);
+    let size = PixelSize::new(43, 39);
+    let bytes = pattern(canvas_size, 0);
+    let accent = [211, 45, 137];
+    for format in [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    ] {
+        let mut presenter = Presenter::new(&device, format);
+        presenter
+            .upload(&device, &queue, canvas_size, &bytes, &[full(canvas_size)])
+            .map_err(anyhow::Error::msg)?;
+        for edge in [2, 8] {
+            presenter.set_edge(accent, edge);
+            let actual = readback(&device, &queue, &presenter, format, size)?;
+            for y in 0..size.height {
+                for x in 0..size.width {
+                    let offset = (y * size.width + x) as usize * 4;
+                    let pixel = &actual[offset..offset + 4];
+                    if x < edge || y < edge || size.width - x <= edge || size.height - y <= edge {
+                        for (actual, expected) in
+                            pixel.iter().zip([accent[2], accent[1], accent[0], 255])
+                        {
+                            ensure!(
+                                actual.abs_diff(expected) <= 1,
+                                "{format:?} edge {edge}: accent mismatch ({x},{y})"
+                            );
+                        }
+                    } else if x < canvas_size.width && y < canvas_size.height {
+                        let source = (y * canvas_size.width + x) as usize * 4;
+                        ensure!(
+                            pixel == &bytes[source..source + 4],
+                            "{format:?} edge {edge}: interior mismatch ({x},{y})"
+                        );
+                    } else {
+                        ensure!(
+                            pixel == [32, 32, 32, 255],
+                            "{format:?} edge {edge}: grey mismatch ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
