@@ -1200,6 +1200,10 @@ impl VideoDecoder for Decoder {
         }
     }
 
+    fn decode_nv12(&mut self, data: &[u8], out: &mut Nv12) -> Result<(), CodecError> {
+        Decoder::decode_nv12(self, data, out)
+    }
+
     fn name(&self) -> &str {
         match &self.session {
             Some(session) => match session.hardware {
