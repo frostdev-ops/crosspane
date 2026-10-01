@@ -30,6 +30,21 @@ pub struct Platform {
     pub tray: Option<Box<dyn TrayHost>>,
     /// Network interfaces and their link class (WP-1.7/1.8, 03 §2).
     pub links: Option<Box<dyn crosspane_platform::LinkInfo>>,
+    /// The source side's GPU (GPU-v0): captured frames are hashed and converted to NV12 on it. On
+    /// Linux it's the compositor's GPU, which DMA-BUF capture allocates on.
+    pub gpu: Option<GpuDevice>,
+}
+
+/// A wgpu device for the source side's GPU work (docs/wp/GPU-v0.md, decision 3).
+#[derive(Clone, Debug)]
+pub struct GpuDevice {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+/// GPU frame paths are on unless `CROSSPANE_GPU=0` (for comparisons and as an escape hatch).
+fn gpu_enabled() -> bool {
+    std::env::var("CROSSPANE_GPU").as_deref() != Ok("0")
 }
 
 impl std::fmt::Debug for Platform {
@@ -45,6 +60,7 @@ impl std::fmt::Debug for Platform {
             .field("parking", &self.parking.is_some())
             .field("frames", &self.frames.is_some())
             .field("tray", &self.tray.is_some())
+            .field("gpu", &self.gpu.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -64,12 +80,22 @@ fn off_main<T: Send>(
     })
 }
 
-/// The video codecs for E2's motion path (WP-2.14), if this build and machine have them.
-pub fn video_codecs() -> Option<std::sync::Arc<dyn crosspane_media::codec::VideoCodecs>> {
+/// The video codecs for E2's motion path (WP-2.14), if this build and machine have them. With the
+/// source GPU, NVENC takes NV12 straight from GPU memory (WP-2.29).
+pub fn video_codecs(
+    gpu: Option<&GpuDevice>,
+) -> Option<std::sync::Arc<dyn crosspane_media::codec::VideoCodecs>> {
+    let _ = gpu;
     #[cfg(all(target_os = "linux", feature = "video"))]
     {
         match crosspane_platform_linux::video::FfmpegCodecs::new() {
-            Ok(c) => return Some(std::sync::Arc::new(c)),
+            Ok(c) => {
+                let c = match gpu {
+                    Some(gpu) => c.with_gpu(gpu.device.clone()),
+                    None => c,
+                };
+                return Some(std::sync::Arc::new(c));
+            }
             Err(e) => tracing::warn!(error = %e, "no video codecs: lossless tiles only"),
         }
     }
@@ -261,6 +287,20 @@ pub fn create(
         tracing::warn!("Hyprland cursor capture is on (CROSSPANE_HYPR_CURSORS=1)");
         frames.set_cursor_capture(true);
     }
+    // DMA-BUF capture on the compositor's GPU (WP-2.28): no readback inside Hyprland's commit.
+    let gpu = frames
+        .as_ref()
+        .filter(|_| gpu_enabled())
+        .and_then(|frames| match frames.enable_gpu(wgpu::Features::empty()) {
+            Ok((device, queue)) => {
+                tracing::info!("GPU frame capture on (DMA-BUF)");
+                Some(GpuDevice { device, queue })
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "GPU frame capture off: shared-memory capture");
+                None
+            }
+        });
     let (keys, pointer) = match optional("injection", inject::connect(gate.clone(), ipc)) {
         Some((k, p)) => (
             Some(Box::new(k) as Box<dyn KeyInjector>),
@@ -286,6 +326,7 @@ pub fn create(
         links: Some(Box::new(
             crosspane_platform_linux::link::SysfsLinkInfo::new(),
         )),
+        gpu,
         tray: optional("tray", crosspane_platform_linux::tray::SniTray::new())
             .map(|t| Box::new(t) as Box<dyn TrayHost>),
         gate,
@@ -375,6 +416,28 @@ pub fn create(
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
         tray: Some(Box::new(crosspane_platform_macos::tray::MacTray::new())),
         links: Some(Box::new(crosspane_platform_macos::link::MacLinkInfo::new())),
+        gpu: gpu_enabled().then(metal_device).flatten(),
         gate,
     })
+}
+
+/// A headless Metal device for hashing captured frames (WP-2.27b). The Mac has one GPU, which
+/// the renderer and VideoToolbox share.
+#[cfg(target_os = "macos")]
+fn metal_device() -> Option<GpuDevice> {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::METAL;
+    let adapter =
+        pollster::block_on(wgpu::Instance::new(desc).request_adapter(&Default::default()))
+            .map_err(|e| tracing::info!(error = %e, "no Metal adapter: CPU frame hashing"))
+            .ok()?;
+    let required_features = crosspane_render::source::SourceGpu::optional_features(&adapter);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("crosspane source"),
+        required_features,
+        ..Default::default()
+    }))
+    .map_err(|e| tracing::info!(error = %e, "no Metal device: CPU frame hashing"))
+    .ok()?;
+    Some(GpuDevice { device, queue })
 }

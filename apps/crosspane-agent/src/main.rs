@@ -262,15 +262,18 @@ fn run() -> Result<()> {
     // E2 video (WP-2.14): this node's encoder/decoder, if it has one and video isn't turned off.
     let video = media::VideoSetup {
         codecs: if config.video_mbps != Some(0) {
-            platform::video_codecs()
+            platform::video_codecs(platform.gpu.as_ref())
         } else {
             None
         },
+        gpu: platform.gpu.clone(),
     };
     // `cursor`: this node shows the source's cursor shapes on its proxies (WP-2.16).
     let mut features = vec!["e1".to_owned(), "cursor".to_owned()];
     if video.codecs.is_some() {
         features.push("h264".to_owned());
+        // Region video (WP-2.32): this node shows a video rectangle over its lossless canvas.
+        features.push("h264roi".to_owned());
     }
     let hello = Hello {
         minor: crosspane_protocol::PROTOCOL_MINOR,
@@ -298,7 +301,15 @@ fn run() -> Result<()> {
     // E2: the proxy window host owns the main thread (winit's rule on macOS); without a display
     // the node can still project its own windows, just not show others'.
     let host = match crosspane_render::proxy::ProxyHost::new() {
-        Ok(host) => Some(host),
+        #[allow(unused_mut)]
+        Ok(mut host) => {
+            // Decoded VideoToolbox pictures go to the GPU without a copy (WP-2.26).
+            #[cfg(target_os = "macos")]
+            host.0.set_importer(Arc::new(
+                crosspane_platform_macos::gpu_import::import_picture,
+            ));
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no proxy window host: this node can't show projected windows");
             None

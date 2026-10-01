@@ -270,6 +270,37 @@ impl TileEncoder {
         self.emit_tiles(scan, header, input, force_key, video, out)
     }
 
+    /// The tiles `emit_region(scan, …, video, force_key, …)` would read, as a row-major bitmap in
+    /// the `scan_external` layout: every tile for a key frame, otherwise the changed and stale
+    /// tiles outside `video`. A caller whose pixels are in device memory gathers exactly these
+    /// (WP-2.31). Doesn't change the encoder.
+    pub fn tiles_to_send(
+        &self,
+        scan: &TileScan,
+        video: Option<TileRect>,
+        force_key: bool,
+    ) -> Vec<u32> {
+        let size = scan.size;
+        let key = force_key || self.key_pending(size);
+        let tiles_x = size.width.div_ceil(TILE);
+        let total = scan.total as usize;
+        let mut bits = vec![0_u32; total.div_ceil(32)];
+        for index in 0..total {
+            let (tx, ty) = (index as u32 % tiles_x, index as u32 / tiles_x);
+            let changed = match &scan.kind {
+                ScanKind::Cpu(hashes) => self.hashes.get(index) != hashes.get(index),
+                ScanKind::External(bits) => bits[index / 32] & (1 << (index % 32)) != 0,
+            };
+            let stale = self.size == Some(size) && self.stale.get(index).copied().unwrap_or(false);
+            let send =
+                key || (!video.is_some_and(|rect| rect.contains(tx, ty)) && (changed || stale));
+            if send {
+                bits[index / 32] |= 1 << (index % 32);
+            }
+        }
+        bits
+    }
+
     /// Whether the next `emit`/`emit_from` of a capture of `size` will be a key frame even
     /// without `force_key` (requested, periodic, size change, or nothing committed yet).
     pub fn key_pending(&self, size: PixelSize) -> bool {

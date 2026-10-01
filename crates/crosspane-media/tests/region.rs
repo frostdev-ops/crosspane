@@ -735,3 +735,85 @@ fn external_packed_stale_refresh_errors_commit_and_keys() {
             .key
     );
 }
+
+fn packed_tile(pixels: &[u8], size: PixelSize, tx: u32, ty: u32) -> Vec<u8> {
+    let mut tile = Vec::new();
+    for y in ty * 64..((ty + 1) * 64).min(size.height) {
+        let x0 = tx * 64;
+        let x1 = ((tx + 1) * 64).min(size.width);
+        let row = (y * size.width) as usize * 4;
+        tile.extend_from_slice(&pixels[row + x0 as usize * 4..row + x1 as usize * 4]);
+    }
+    tile
+}
+
+/// `tiles_to_send` names exactly the tiles `emit_region` reads (WP-2.31 gathers only those):
+/// a source holding just those tiles always suffices, and the frame carries all of them.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn tiles_to_send_is_exactly_what_emit_region_reads() {
+    let size = PixelSize::new(450, 260);
+    let (nx, ny) = (size.width.div_ceil(64), size.height.div_ceil(64));
+    let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+    let mut encoder = TileEncoder::new();
+    let mut frame = vec![0_u8; (size.width * size.height * 4) as usize];
+    let mut committed = frame.clone();
+    let mut out = Vec::new();
+    for seq in 1..400_u64 {
+        for _ in 0..rng.random_range(0..6) {
+            let (tx, ty) = (rng.random_range(0..nx), rng.random_range(0..ny));
+            paint(&mut frame, size, tx, ty, rng.random::<u8>());
+        }
+        let video = rng.random_bool(0.5).then(|| {
+            let (x, y) = (rng.random_range(0..nx), rng.random_range(0..ny));
+            TileRect {
+                x,
+                y,
+                width: rng.random_range(1..=nx - x),
+                height: rng.random_range(1..=ny - y),
+            }
+        });
+        let force_key = rng.random_bool(0.05);
+        let scan = if rng.random_bool(0.5) {
+            encoder.scan(size, &frame, size.width * 4).unwrap()
+        } else {
+            let changed: Vec<(u32, u32)> = (0..ny)
+                .flat_map(|ty| (0..nx).map(move |tx| (tx, ty)))
+                .filter(|&(tx, ty)| {
+                    packed_tile(&frame, size, tx, ty) != packed_tile(&committed, size, tx, ty)
+                })
+                .collect();
+            encoder
+                .scan_external(size, &bitmap(size, &changed))
+                .unwrap()
+        };
+        let bits = encoder.tiles_to_send(&scan, video, force_key);
+        let source = Packed {
+            tiles: (0..ny)
+                .flat_map(|ty| (0..nx).map(move |tx| (tx, ty)))
+                .map(|(tx, ty)| {
+                    let i = (ty * nx + tx) as usize;
+                    if bits[i / 32] & (1 << (i % 32)) != 0 {
+                        packed_tile(&frame, size, tx, ty)
+                    } else {
+                        Vec::new() // wrong length: emit fails if it reads this tile
+                    }
+                })
+                .collect(),
+            nx,
+        };
+        let wanted: u32 = bits.iter().map(|w| w.count_ones()).sum();
+        let stats = encoder
+            .emit_region(
+                scan,
+                header(size, seq),
+                TilePixels::Packed(&source),
+                video,
+                force_key,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(stats.map_or(0, |s| s.tiles), wanted, "capture {seq}");
+        committed.clone_from(&frame);
+    }
+}

@@ -8,6 +8,13 @@
 //!     encoder and the peer advertised `h264`), and one lossless key frame follows when the motion
 //!     stops, so the destination is bit-exact again. Captures arrive only on damage, so the thread
 //!     also wakes on a timer to send that last key frame when frames simply stop.
+//!   - Region video (WP-2.32): when the peer advertised `h264roi`, only the moving rectangle of
+//!     the window goes as video and everything else stays lossless; its tiles are refreshed
+//!     losslessly as soon as motion leaves them.
+//!   - GPU paths (docs/wp/GPU-v0.md): a frame that is in GPU memory (DMA-BUF capture on Linux, an
+//!     SCK IOSurface on the Mac) is hashed on the source GPU. Linux gathers only the tiles that go
+//!     out and writes NV12 straight into NVENC's memory; the Mac reads changed tiles in place and
+//!     hands the captured buffer to VideoToolbox. Any GPU failure falls back to the CPU path.
 //!   - Cursor shapes (03 §4.6, WP-2.16) go as codec-2 frames numbered on their own, when the peer
 //!     advertised `cursor`; the last one is sent again with every key frame request.
 //! - **Destination:** media frames → a decoder thread → the proxy host. Frames are applied in
@@ -20,19 +27,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crosspane_engine::{Input, ProjectionKey};
-use crosspane_media::codec::{VideoCodecs, VideoDecoder, VideoEncoder};
-use crosspane_media::hybrid::{FramePlan, HybridConfig, HybridScheduler};
+use crosspane_media::codec::{EncodedVideo, VideoCodecs, VideoDecoder, VideoEncoder};
+use crosspane_media::hybrid::{
+    FramePlan, HybridConfig, HybridScheduler, RegionConfig, RegionPlan, RegionScheduler, TileRect,
+};
 use crosspane_media::picture::{Decoded, NativePicture, Nv12, nv12_to_bgra};
-use crosspane_media::tiles::{TileDecoder, TileEncoder};
+use crosspane_media::tiles::{EncodeStats, TileDecoder, TileEncoder, TilePixels, TileScan};
 use crosspane_media::wire::{
-    Codec, FrameHeader, MediaError, TILE, read_codec, read_cursor, read_header, read_video,
-    write_cursor, write_default_cursor, write_video,
+    Codec, FrameHeader, MediaError, TILE, VideoRegion, read_codec, read_cursor, read_header,
+    read_video_region, write_cursor, write_default_cursor, write_video, write_video_region,
 };
 use crosspane_platform::{CursorImage, Frame, StreamId};
 use crosspane_protocol::link::LinkError;
 use crosspane_render::proxy::{HostCommand, HostHandle};
+use crosspane_render::source::{FrameRegion, SourceGpu, TileChanges};
 use crosspane_transport::Transport;
-use crosspane_types::geom::PixelSize;
+use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
 use crosspane_types::id::{NodeId, ProjectionId};
 
 use crate::agent::Event;
@@ -150,6 +160,8 @@ pub enum SourceCmd {
         peer: NodeId,
         /// The peer can decode H.264 (it advertised `h264`).
         video: bool,
+        /// The peer shows region video (it advertised `h264roi`, WP-2.32).
+        region: bool,
         /// The peer shows cursor shapes (it advertised `cursor`).
         cursor: bool,
         /// Video bitrate for this stream (from the path's link class, 03 §7.4).
@@ -169,6 +181,13 @@ pub enum SourceCmd {
     RequestKey {
         projection: ProjectionId,
     },
+    /// The peer's features changed (a replacement connection): applies to every stream to it.
+    PeerFeatures {
+        peer: NodeId,
+        video: bool,
+        region: bool,
+        cursor: bool,
+    },
 }
 
 struct Encoding {
@@ -179,6 +198,11 @@ struct Encoding {
     scheduler: HybridScheduler,
     /// The peer can decode H.264.
     peer_video: bool,
+    /// The peer shows region video: only the moving rectangle goes as video (WP-2.32).
+    peer_region: bool,
+    regions: RegionScheduler,
+    /// GPU change detection and NV12 for frames on the GPU (GPU-v0); `None` once it failed.
+    gpu: Option<SourceGpu>,
     video: Option<Box<dyn VideoEncoder>>,
     /// The next video frame must be an IDR (a frame was dropped, or the receiver asked).
     video_key: bool,
@@ -210,6 +234,8 @@ const REFRESH_IDLE: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct VideoSetup {
     pub codecs: Option<Arc<dyn VideoCodecs>>,
+    /// The source GPU (GPU-v0): frames on it are hashed and converted there.
+    pub gpu: Option<crate::platform::GpuDevice>,
 }
 
 /// Start the encoder thread; capture sinks and the engine loop send it `SourceCmd`s.
@@ -249,6 +275,7 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                 projection,
                 peer,
                 video: peer_video,
+                region: peer_region,
                 cursor: peer_cursor,
                 bits_per_second,
             } => {
@@ -265,6 +292,9 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                         seq: 0,
                         scheduler: HybridScheduler::new(HybridConfig::default()),
                         peer_video,
+                        peer_region,
+                        regions: RegionScheduler::new(RegionConfig::default()),
+                        gpu: None,
                         video: None,
                         video_key: true,
                         last: None,
@@ -321,6 +351,30 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                     e.refresh_due = true;
                 }
             }
+            SourceCmd::PeerFeatures {
+                peer,
+                video,
+                region,
+                cursor,
+            } => {
+                for e in streams.values_mut().filter(|e| e.peer == peer) {
+                    let changed = e.peer_video != video || e.peer_region != region;
+                    e.peer_video = video;
+                    e.peer_region = region;
+                    if changed {
+                        // Start over in a known state: lossless key frame, fresh schedulers.
+                        e.scheduler = HybridScheduler::new(HybridConfig::default());
+                        e.regions = RegionScheduler::new(RegionConfig::default());
+                        e.encoder.request_key();
+                        e.video_key = true;
+                        e.refresh_due = true;
+                    }
+                    if cursor && !e.peer_cursor {
+                        e.cursor_dirty = e.cursor.is_some();
+                    }
+                    e.peer_cursor = cursor;
+                }
+            }
         };
         if let Some(first) = first {
             handle(first, &mut streams);
@@ -337,7 +391,7 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                 continue;
             };
             enc.refresh_due = false;
-            encode_frame(enc, &frame, now, video, transport, &mut out);
+            encode_frame(enc, &frame, now, false, video, transport, &mut out);
             enc.last_at = Instant::now();
             enc.last = Some(frame);
         }
@@ -364,6 +418,16 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
                 has_last = enc.last.is_some(),
                 "idle check"
             );
+            // Region video: re-plan the unchanged last frame; once the region ends its stale
+            // tiles go out losslessly (no key frame needed).
+            if enc.peer_region
+                && enc.regions.region().is_some()
+                && enc.last_at.elapsed() >= Duration::from_millis(200)
+                && let Some(frame) = enc.last.clone()
+            {
+                encode_frame(enc, &frame, now, true, video, transport, &mut out);
+                continue;
+            }
             if enc.scheduler.in_video()
                 && enc.last_at.elapsed() >= Duration::from_millis(200)
                 && let Some(frame) = enc.last.clone()
@@ -408,58 +472,281 @@ fn header(enc: &Encoding, frame: &Frame) -> FrameHeader {
     }
 }
 
-/// One captured frame: tile change detection always runs (it counts the changed tiles and keeps
-/// the tile hashes current), then the scheduler decides what goes out, and only tiles that go out
-/// are compressed.
+/// What the scheduler decided for one capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plan {
+    /// Lossless tiles; `key` makes it a tile key frame.
+    Tiles { key: bool },
+    /// Video of the whole window (`region: None`) or of a region of it, plus lossless tiles for
+    /// the changes outside the region; `key` asks for an IDR.
+    Video { region: Option<TileRect>, key: bool },
+}
+
+/// A frame's texture on the source GPU and the frame's top-left corner in it, when the frame is
+/// in GPU memory there (DMA-BUF capture on Linux, an SCK IOSurface on the Mac).
+fn frame_texture(frame: &Frame, video: &VideoSetup) -> Option<(wgpu::Texture, (u32, u32))> {
+    let native = frame.native()?;
+    let gpu = video.gpu.as_ref()?;
+    #[cfg(target_os = "linux")]
+    {
+        let _ = gpu;
+        crosspane_platform_linux::dmabuf::texture_of(native.as_ref())
+            .map(|(texture, origin)| (texture.clone(), origin))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crosspane_platform_macos::gpu_import::wrap_capture(&gpu.device, native.as_ref())
+    }
+}
+
+/// Device memory isn't readable by the CPU: tiles for the lossless codec are gathered on the GPU.
+/// The Mac's memory is unified, so it reads the changed tiles in place instead.
+const GATHER_ON_GPU: bool = cfg!(target_os = "linux");
+
+/// One captured frame: change detection always runs (on the GPU when the frame is there, else
+/// over its pixels), then the scheduler decides what goes out, and only tiles that go out are
+/// compressed. `idle` re-plans the last frame when captures stopped: no video is sent then.
 fn encode_frame(
     enc: &mut Encoding,
     frame: &Frame,
     now: Duration,
+    idle: bool,
     video: &VideoSetup,
     transport: &Transport,
     out: &mut Vec<u8>,
 ) {
     out.clear();
-    // Change detection only: LZ4 runs just for frames that go out as tiles.
-    let scan = match with_pixels(frame, |pixels, stride| {
-        enc.encoder.scan(frame.size, pixels, stride)
-    }) {
-        Ok(scan) => scan,
+    let texture = frame_texture(frame, video);
+    if texture.is_some()
+        && enc.gpu.is_none()
+        && let Some(gpu) = &video.gpu
+    {
+        enc.gpu = SourceGpu::new(gpu.device.clone(), gpu.queue.clone())
+            .map_err(|e| tracing::info!(error = %e, "GPU tile hashing unavailable"))
+            .ok();
+    }
+    let (scan, on_gpu) = match scan_frame(enc, frame, texture.as_ref()) {
+        Ok(scanned) => scanned,
         Err(e) => {
             tracing::warn!(error = %e, "encode failed");
             return;
         }
     };
-    let (changed, total) = (scan.changed(), scan.total());
     let available = enc.peer_video && video.codecs.is_some();
-    let plan = enc.scheduler.plan(changed, total, now, available);
-    tracing::trace!(changed, total, ?plan, "frame plan");
+    let plan = plan(enc, &scan, frame.size, now, available);
+    tracing::trace!(
+        changed = scan.changed(),
+        total = scan.total(),
+        ?plan,
+        "frame plan"
+    );
     match plan {
-        FramePlan::Tiles | FramePlan::TilesKey => {
-            let key = plan == FramePlan::TilesKey;
-            let header = header(enc, frame);
-            match with_pixels(frame, |pixels, stride| {
-                enc.encoder.emit(scan, header, pixels, stride, key, out)
-            }) {
-                Ok(Some(_)) => send(enc, out, transport),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(error = %e, "encode failed"),
-            }
+        Plan::Tiles { key } => {
+            emit_and_send(
+                enc,
+                frame,
+                texture.as_ref(),
+                scan,
+                on_gpu,
+                None,
+                key,
+                transport,
+                out,
+            );
         }
-        FramePlan::Video { key } => {
-            // The tile hashes follow the picture; the next tile frame is a key frame.
-            if let Err(e) = enc.encoder.commit(scan) {
-                tracing::warn!(error = %e, "tile commit failed");
+        Plan::Video { region, key } => {
+            match region {
+                // The tile hashes follow the picture; the next tile frame is a key frame.
+                None => match enc.encoder.commit(scan) {
+                    Ok(()) => gpu_committed(enc, on_gpu),
+                    Err(e) => tracing::warn!(error = %e, "tile commit failed"),
+                },
+                // The changes outside the region go losslessly first; the region's tiles become
+                // stale and are refreshed once motion leaves them.
+                Some(rect) => emit_and_send(
+                    enc,
+                    frame,
+                    texture.as_ref(),
+                    scan,
+                    on_gpu,
+                    Some(rect),
+                    false,
+                    transport,
+                    out,
+                ),
             }
-            if let Err(e) = send_video(enc, frame, key, video, transport, out) {
+            if idle {
+                return;
+            }
+            if let Err(e) = send_video(
+                enc,
+                frame,
+                texture.as_ref(),
+                region,
+                key,
+                video,
+                transport,
+                out,
+            ) {
                 tracing::info!(error = %e, "video failed: lossless tiles for a while");
                 enc.video = None;
                 enc.scheduler.video_failed(now);
+                enc.regions.video_failed(now);
                 enc.encoder.request_key();
                 send_tiles(enc, frame, true, transport, out);
             }
         }
     }
+}
+
+/// Change detection for one frame. The scan is on the GPU (`true`) when the frame is a texture
+/// there and the GPU works; a GPU failure falls back to the CPU for good.
+fn scan_frame(
+    enc: &mut Encoding,
+    frame: &Frame,
+    texture: Option<&(wgpu::Texture, (u32, u32))>,
+) -> Result<(TileScan, bool), String> {
+    if let (Some((texture, origin)), Some(gpu)) = (texture, enc.gpu.as_mut()) {
+        let region = FrameRegion {
+            texture,
+            origin: *origin,
+            size: frame.size,
+        };
+        match gpu.scan(region, None, false) {
+            Ok(changes) => {
+                let scan = enc
+                    .encoder
+                    .scan_external(frame.size, &changes.changed_bits)
+                    .map_err(|e| e.to_string())?;
+                return Ok((scan, true));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "GPU tile hashing failed: CPU from now on");
+                enc.gpu = None;
+            }
+        }
+    }
+    let scan = with_pixels(frame, |pixels, stride| {
+        enc.encoder.scan(frame.size, pixels, stride)
+    })?;
+    Ok((scan, false))
+}
+
+/// Keep the GPU's committed hashes in step with the tile encoder's after it consumed a scan: a
+/// GPU scan becomes the reference; after a CPU scan the GPU starts over (every tile changed).
+fn gpu_committed(enc: &mut Encoding, on_gpu: bool) {
+    if let Some(gpu) = enc.gpu.as_mut() {
+        if on_gpu {
+            gpu.commit();
+        } else {
+            gpu.reset();
+        }
+    }
+}
+
+fn plan(
+    enc: &mut Encoding,
+    scan: &TileScan,
+    size: PixelSize,
+    now: Duration,
+    available: bool,
+) -> Plan {
+    if enc.peer_region {
+        let (tiles_x, tiles_y) = (size.width.div_ceil(TILE), size.height.div_ceil(TILE));
+        match enc
+            .regions
+            .plan(tiles_x, tiles_y, &scan.changed_bits(), now, available)
+        {
+            RegionPlan::Tiles => Plan::Tiles { key: false },
+            RegionPlan::Video { region, key } => Plan::Video {
+                region: Some(region),
+                key,
+            },
+        }
+    } else {
+        match enc
+            .scheduler
+            .plan(scan.changed(), scan.total(), now, available)
+        {
+            FramePlan::Tiles => Plan::Tiles { key: false },
+            FramePlan::TilesKey => Plan::Tiles { key: true },
+            FramePlan::Video { key } => Plan::Video { region: None, key },
+        }
+    }
+}
+
+/// Encode the tiles a scan calls for (outside `video`, if given) and send them.
+#[allow(clippy::too_many_arguments)]
+fn emit_and_send(
+    enc: &mut Encoding,
+    frame: &Frame,
+    texture: Option<&(wgpu::Texture, (u32, u32))>,
+    scan: TileScan,
+    on_gpu: bool,
+    video: Option<TileRect>,
+    key: bool,
+    transport: &Transport,
+    out: &mut Vec<u8>,
+) {
+    match emit_tiles(enc, frame, texture, scan, video, key, out) {
+        Ok(stats) => {
+            gpu_committed(enc, on_gpu);
+            if stats.is_some() {
+                send(enc, out, transport);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "encode failed"),
+    }
+}
+
+fn emit_tiles(
+    enc: &mut Encoding,
+    frame: &Frame,
+    texture: Option<&(wgpu::Texture, (u32, u32))>,
+    scan: TileScan,
+    video: Option<TileRect>,
+    key: bool,
+    out: &mut Vec<u8>,
+) -> Result<Option<EncodeStats>, String> {
+    let header = header(enc, frame);
+    if GATHER_ON_GPU && let (Some((texture, origin)), Some(gpu)) = (texture, enc.gpu.as_mut()) {
+        let bits = enc.encoder.tiles_to_send(&scan, video, key);
+        let changes = TileChanges {
+            tiles_x: frame.size.width.div_ceil(TILE),
+            tiles_y: frame.size.height.div_ceil(TILE),
+            changed: bits.iter().map(|word| word.count_ones()).sum(),
+            changed_bits: bits,
+        };
+        let region = FrameRegion {
+            texture,
+            origin: *origin,
+            size: frame.size,
+        };
+        let failure = match gpu.gather(region, &changes, false) {
+            Ok(tiles) => {
+                return enc
+                    .encoder
+                    .emit_region(scan, header, TilePixels::Packed(&tiles), video, key, out)
+                    .map_err(|e| e.to_string());
+            }
+            Err(e) => e.to_string(),
+        };
+        // This frame is lost; the next one is scanned on the CPU, every tile changed.
+        enc.gpu = None;
+        return Err(format!(
+            "GPU tile gather failed, CPU from now on: {failure}"
+        ));
+    }
+    with_pixels(frame, |pixels, stride| {
+        enc.encoder.emit_region(
+            scan,
+            header,
+            TilePixels::Strided { pixels, stride },
+            video,
+            key,
+            out,
+        )
+    })
 }
 
 /// Re-encode `frame` as tiles (a key frame when the tile encoder has one pending) and send it.
@@ -475,41 +762,140 @@ fn send_tiles(
     match with_pixels(frame, |pixels, stride| {
         enc.encoder.encode(header, pixels, stride, key, out)
     }) {
-        Ok(Some(_)) => send(enc, out, transport),
-        Ok(None) => {}
+        Ok(stats) => {
+            // A CPU scan was committed: the GPU's hashes no longer describe the reference.
+            gpu_committed(enc, false);
+            if stats.is_some() {
+                send(enc, out, transport);
+            }
+        }
         Err(e) => tracing::warn!(error = %e, "encode failed"),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_video(
     enc: &mut Encoding,
     frame: &Frame,
+    texture: Option<&(wgpu::Texture, (u32, u32))>,
+    region: Option<TileRect>,
     key: bool,
     video: &VideoSetup,
     transport: &Transport,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
+    let area = region.map(|rect| rect.region(frame.size));
+    let (origin, size) = area.map_or(((0, 0), frame.size), |r| {
+        ((r.x, r.y), PixelSize::new(r.width, r.height))
+    });
     if enc.video.is_none() {
         let codecs = video.codecs.as_ref().ok_or("no video codecs")?;
         let encoder = codecs
-            .encoder(frame.size, enc.bits_per_second, 60)
+            .encoder(size, enc.bits_per_second, 60)
             .map_err(|e| e.to_string())?;
         tracing::info!(encoder = encoder.name(), "video on");
         enc.video = Some(encoder);
         enc.video_key = true;
     }
-    let encoder = enc.video.as_mut().ok_or("no encoder")?;
-    let mut access_unit = Vec::new();
     let force_key = key || enc.video_key;
-    let encoded = with_pixels(frame, |pixels, stride| {
-        encoder.encode(pixels, stride, frame.size, force_key, &mut access_unit)
-    })?;
+    let mut access_unit = Vec::new();
+    let encoder = enc.video.as_deref_mut().ok_or("no encoder")?;
+    let encoded = encode_picture(
+        encoder,
+        enc.gpu.as_mut(),
+        frame,
+        texture,
+        origin,
+        size,
+        force_key,
+        &mut access_unit,
+    )?;
     enc.video_key = false;
     let mut header = header(enc, frame);
     header.key = encoded.key;
-    write_video(header, &access_unit, out).map_err(|e| e.to_string())?;
+    match area {
+        Some(area) => write_video_region(header, area, &access_unit, out),
+        None => write_video(header, &access_unit, out),
+    }
+    .map_err(|e| e.to_string())?;
     send(enc, out, transport);
     Ok(())
+}
+
+/// One picture (`size` pixels at `origin` of the frame) through the encoder, from wherever the
+/// frame is: NV12 written by the GPU into NVENC's own memory (Linux), the captured buffer itself
+/// for VideoToolbox (Mac, whole frames), or CPU rows. A GPU path that fails falls back to rows.
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn encode_picture(
+    encoder: &mut dyn VideoEncoder,
+    gpu: Option<&mut SourceGpu>,
+    frame: &Frame,
+    texture: Option<&(wgpu::Texture, (u32, u32))>,
+    origin: (u32, u32),
+    size: PixelSize,
+    force_key: bool,
+    out: &mut Vec<u8>,
+) -> Result<EncodedVideo, String> {
+    #[cfg(all(target_os = "linux", feature = "video"))]
+    if let (Some((texture, at)), Some(gpu)) = (texture, gpu) {
+        let native = (|| -> Result<Option<EncodedVideo>, String> {
+            let Some(pool) = encoder.input_pool(size).map_err(|e| e.to_string())? else {
+                return Ok(None);
+            };
+            let input = pool.acquire().map_err(|e| e.to_string())?;
+            let Some((buffer, layout)) =
+                crosspane_platform_linux::video::nv12_buffer(input.as_ref())
+            else {
+                return Ok(None);
+            };
+            let region = FrameRegion {
+                texture,
+                origin: (at.0 + origin.0, at.1 + origin.1),
+                size,
+            };
+            let target = crosspane_render::source::Nv12Output {
+                target: crosspane_render::source::Nv12Target::Buffer {
+                    buffer,
+                    y_offset: layout.y_offset,
+                    y_pitch: layout.y_pitch,
+                    uv_offset: layout.uv_offset,
+                    uv_pitch: layout.uv_pitch,
+                },
+                colour: input.colour(),
+            };
+            gpu.write_nv12(region, target).map_err(|e| e.to_string())?;
+            encoder
+                .encode_native(input.as_ref(), size, force_key, out)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        })();
+        match native {
+            Ok(Some(encoded)) => return Ok(encoded),
+            Ok(None) => {}
+            Err(e) => tracing::debug!(error = %e, "GPU video input failed; encoding rows"),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if origin == (0, 0)
+        && size == frame.size
+        && let Some(native) = frame.native()
+        && let Some(input) = crosspane_platform_macos::frame_capture::capture_input(native)
+    {
+        match encoder.encode_native(input.as_ref(), size, force_key, out) {
+            Ok(encoded) => return Ok(encoded),
+            Err(e) => tracing::debug!(error = %e, "native video input failed; encoding rows"),
+        }
+    }
+    with_pixels(frame, |pixels, stride| {
+        let offset = origin.1 as usize * stride as usize + origin.0 as usize * 4;
+        encoder.encode(
+            pixels.get(offset..).unwrap_or_default(),
+            stride,
+            size,
+            force_key,
+            out,
+        )
+    })
 }
 
 /// Send the newest cursor shape; a refused one stays due and goes again on the next pass.
@@ -608,8 +994,11 @@ enum Showing {
     Nothing,
     /// The tile decoder's canvas.
     Canvas,
-    /// `picture`, cropped to this size.
-    Video(PixelSize),
+    /// The picture's top-left `rect.size()` at `rect` in content of `size`, over the canvas.
+    Video {
+        size: PixelSize,
+        rect: PixelRect,
+    },
 }
 
 impl Decoding {
@@ -621,7 +1010,7 @@ impl Decoding {
                 let (pixels, size) = self.decoder.canvas();
                 Some((size, Arc::from(pixels)))
             }
-            Showing::Video(size) => {
+            Showing::Video { size, rect } => {
                 let copy;
                 let picture = match &self.native {
                     Some(native) => {
@@ -632,8 +1021,22 @@ impl Decoding {
                     }
                     None => &*self.picture,
                 };
-                let mut pixels = Vec::new();
-                nv12_to_bgra(picture, size, &mut pixels).ok()?;
+                let area = PixelSize::new(rect.width() as u32, rect.height() as u32);
+                let mut video = Vec::new();
+                nv12_to_bgra(picture, area, &mut video).ok()?;
+                // The canvas under a region (as the proxy shows it); black where there's none.
+                let (canvas, canvas_size) = self.decoder.canvas();
+                let mut pixels = if canvas_size == size {
+                    canvas.to_vec()
+                } else {
+                    vec![0; size.width as usize * size.height as usize * 4]
+                };
+                let row = area.width as usize * 4;
+                for (y, source) in video.chunks_exact(row).enumerate() {
+                    let at =
+                        ((rect.min.y as usize + y) * size.width as usize + rect.min.x as usize) * 4;
+                    pixels.get_mut(at..at + row)?.copy_from_slice(source);
+                }
                 Some((size, Arc::from(pixels)))
             }
         }
@@ -758,9 +1161,8 @@ fn apply(
     video: &VideoSetup,
 ) {
     let result = match read_codec(data) {
-        Ok(Codec::H264) => {
-            apply_video(d, data, video).map(|(header, size)| (header, Some(size), None))
-        }
+        Ok(Codec::H264) => apply_video(d, data, video)
+            .map(|(header, size, rect)| (header, Some((size, rect)), None)),
         Ok(Codec::Tiles) => d
             .decoder
             .apply(data)
@@ -773,31 +1175,19 @@ fn apply(
         Ok((header, video_size, dirty)) => {
             d.last = seq.max(header.seq);
             ids.shown(key, data.len(), header.captured_ns);
-            let command = if let Some(size) = video_size {
-                d.showing = Showing::Video(size);
+            let command = if let Some((size, rect)) = video_size {
+                d.showing = Showing::Video { size, rect };
                 match &d.native {
                     Some(picture) => HostCommand::VideoNative {
                         id,
                         size,
-                        rect: crosspane_types::geom::PixelRect::new(
-                            crosspane_types::geom::euclid::point2(0, 0),
-                            crosspane_types::geom::euclid::point2(
-                                size.width as i32,
-                                size.height as i32,
-                            ),
-                        ),
+                        rect,
                         picture: Arc::clone(picture),
                     },
                     None => HostCommand::Video {
                         id,
                         size,
-                        rect: crosspane_types::geom::PixelRect::new(
-                            crosspane_types::geom::euclid::point2(0, 0),
-                            crosspane_types::geom::euclid::point2(
-                                size.width as i32,
-                                size.height as i32,
-                            ),
-                        ),
+                        rect,
                         picture: Arc::clone(&d.picture),
                     },
                 }
@@ -857,13 +1247,15 @@ fn apply_cursor(d: &mut Decoding, id: u64, data: &[u8], host: Option<&HostHandle
     }
 }
 
-/// Decode an H.264 frame into `d.picture`; returns its header and visible size.
+/// Decode an H.264 frame into `d.picture` (or keep it native); returns its header, the content
+/// size and where the picture goes in it (the whole content, or a region for region video).
 fn apply_video(
     d: &mut Decoding,
     data: &[u8],
     video: &VideoSetup,
-) -> Result<(FrameHeader, PixelSize), String> {
-    let (header, access_unit) = read_video(data).map_err(|e: MediaError| e.to_string())?;
+) -> Result<(FrameHeader, PixelSize, PixelRect), String> {
+    let (header, region, access_unit) =
+        read_video_region(data).map_err(|e: MediaError| e.to_string())?;
     if d.video.is_none() {
         let codecs = video
             .codecs
@@ -890,9 +1282,20 @@ fn apply_video(
             size
         }
     };
-    let (w, h) = (header.width, header.height);
-    if w == 0 || h == 0 || coded.width < w || coded.height < h {
-        return Err("decoded frame smaller than its header".into());
+    let size = PixelSize::new(header.width, header.height);
+    let area = region.unwrap_or(VideoRegion {
+        x: 0,
+        y: 0,
+        width: size.width,
+        height: size.height,
+    });
+    if area.width == 0 || area.height == 0 || coded.width < area.width || coded.height < area.height
+    {
+        return Err("decoded picture smaller than its region".into());
     }
-    Ok((header, PixelSize::new(w, h)))
+    let rect = PixelRect::new(
+        point2(area.x as i32, area.y as i32),
+        point2((area.x + area.width) as i32, (area.y + area.height) as i32),
+    );
+    Ok((header, size, rect))
 }
