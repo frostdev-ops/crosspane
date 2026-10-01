@@ -13,6 +13,7 @@ use winit::{
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoopProxy},
     keyboard::PhysicalKey,
+    monitor::MonitorHandle,
     window::{CursorIcon, CustomCursor, Window, WindowId},
 };
 
@@ -81,14 +82,20 @@ impl App {
             return Err("content size must be nonzero".into());
         }
         let instance = self.instance.as_ref().ok_or("event loop has not resumed")?;
-        let initial_scale = event_loop
+        let monitor = event_loop
             .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next());
+        let initial_scale = monitor
+            .as_ref()
             .map_or(1.0, |monitor| monitor.scale_factor());
         let attributes = Window::default_attributes()
             .with_title(title)
             .with_decorations(true)
             .with_resizable(true)
-            .with_inner_size(logical_size(size, initial_scale));
+            .with_inner_size(fit(
+                logical_size(size, initial_scale),
+                screen(monitor.as_ref()),
+            ));
         #[cfg(target_os = "linux")]
         let attributes = {
             use winit::platform::wayland::WindowAttributesExtWayland;
@@ -102,7 +109,10 @@ impl App {
         window.set_ime_allowed(false);
         let scale = window.scale_factor();
         if scale != initial_scale {
-            let _ = window.request_inner_size(logical_size(size, scale));
+            let _ = window.request_inner_size(fit(
+                logical_size(size, scale),
+                screen(window.current_monitor().as_ref()),
+            ));
         }
         let surface = instance
             .create_surface(window.clone())
@@ -207,9 +217,10 @@ impl App {
                     return;
                 }
                 if let Some(window) = self.windows.get_mut(&id) {
-                    let result = window
-                        .window
-                        .request_inner_size(logical_size(size, window.window.scale_factor()));
+                    let result = window.window.request_inner_size(fit(
+                        logical_size(size, window.window.scale_factor()),
+                        screen(window.window.current_monitor().as_ref()),
+                    ));
                     if let Some(actual) = result {
                         self.resized(id, actual, window_scale(&self.windows, id));
                     }
@@ -540,8 +551,56 @@ fn logical_size(size: PixelSize, scale: f64) -> LogicalSize<f64> {
         f64::from(size.height) / scale,
     )
 }
+/// A monitor's size in logical units.
+fn screen(monitor: Option<&MonitorHandle>) -> Option<LogicalSize<f64>> {
+    monitor.map(|monitor| monitor.size().to_logical(monitor.scale_factor()))
+}
+
+/// `size`, scaled down (keeping its shape) to fit comfortably on `screen`. Proxies start at the
+/// source window's size, and a window from an ultrawide monitor would otherwise open wider than a
+/// laptop's display.
+fn fit(size: LogicalSize<f64>, screen: Option<LogicalSize<f64>>) -> LogicalSize<f64> {
+    let Some(screen) = screen.filter(|s| s.width > 0.0 && s.height > 0.0) else {
+        return size;
+    };
+    let shrink = (screen.width * 0.9 / size.width)
+        .min(screen.height * 0.8 / size.height)
+        .min(1.0);
+    LogicalSize::new(
+        (size.width * shrink).floor().max(1.0),
+        (size.height * shrink).floor().max(1.0),
+    )
+}
+
 fn window_scale(windows: &HashMap<u64, ProxyWindow>, id: u64) -> f64 {
     windows
         .get(&id)
         .map_or(1.0, |window| window.window.scale_factor())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxies_fit_the_screen() {
+        let laptop = Some(LogicalSize::new(1512.0, 982.0));
+        // An ultrawide source window: scaled down, same shape.
+        let fitted = fit(LogicalSize::new(1716.0, 349.0), laptop);
+        assert_eq!(fitted, LogicalSize::new(1360.0, 276.0));
+        // Small enough already, or no screen known: unchanged.
+        assert_eq!(
+            fit(LogicalSize::new(320.0, 240.0), laptop),
+            LogicalSize::new(320.0, 240.0)
+        );
+        assert_eq!(
+            fit(LogicalSize::new(4000.0, 3000.0), None),
+            LogicalSize::new(4000.0, 3000.0)
+        );
+        // Too tall: limited by height.
+        assert_eq!(
+            fit(LogicalSize::new(500.0, 2000.0), laptop),
+            LogicalSize::new(196.0, 785.0)
+        );
+    }
 }
