@@ -62,8 +62,9 @@ machine whose keyboard you use. Changes to `config.toml` apply after `crosspanec
 
 ## Install, start and stop
 
-- **Linux:** `cargo install --locked --path apps/crosspane-agent --root ~/.local` (and the same
-  for `apps/crosspanectl`), then run it with the graphical session as a systemd user service:
+- **Linux:** `cargo install --locked --path apps/crosspane-agent --root ~/.local --features video`
+  (and the same, without the feature, for `apps/crosspanectl` and `apps/crosspane-ui`), then run
+  it with the graphical session as a systemd user service:
 
   ```sh
   install -Dm644 packaging/linux/crosspane-agent.service ~/.config/systemd/user/crosspane-agent.service
@@ -73,9 +74,11 @@ machine whose keyboard you use. Changes to `config.toml` apply after `crosspanec
   Logs: `journalctl --user -u crosspane-agent`. Without systemd, run `crosspane-agent run`
   inside the Hyprland session.
 - **Mac:** `scripts/macos/install-agent.sh` (add `--features private-vdisplay` for the D7
-  window hiding) builds, signs and installs `~/Applications/Crosspane.app`, starts it at login
-  (LaunchAgent `io.frostdev.crosspane.agent`) and puts `crosspanectl` in `~/.cargo/bin`. Logs:
-  `~/Library/Logs/Crosspane/agent.log`. Re-run it to upgrade.
+  window hiding) builds, signs and installs `~/Applications/Crosspane.app` (with the settings app
+  inside), starts it at login (LaunchAgent `io.frostdev.crosspane.agent`) and puts `crosspanectl`
+  in `~/.cargo/bin`. Logs: `~/Library/Logs/Crosspane/agent.log`. Re-run it to upgrade.
+- **Arch:** `packaging/arch/PKGBUILD` builds all three and installs the user unit and a
+  "Crosspane Settings" launcher entry.
 - **Stop** with SIGTERM (`systemctl --user stop crosspane-agent`, or `launchctl bootout
   gui/$(id -u)/io.frostdev.crosspane.agent`): the agent releases any injected input, puts every
   parked window back and closes its connections. After a crash, the next start does the same from
@@ -85,6 +88,10 @@ machine whose keyboard you use. Changes to `config.toml` apply after `crosspanec
   `crosspanectl status`, restart it.
 
 ## Pair two machines (once)
+
+The **Pairing** tab of the settings app does this with buttons: on A, **Open pairing window**;
+on B, **Scan**, then **Join** next to A's name and click the code A shows; on A, **Confirm**.
+From the command line:
 
 1. On machine A: `crosspanectl pair listen --allow-input`, then `crosspanectl pair status`. It
    shows a six-digit code.
@@ -105,12 +112,25 @@ window projection only. Both machines then show the peer in `crosspanectl status
 - **Machines**: per machine, its side and what it may do here (control, browse), plus
   **Pair a new machine…** and the pairing steps;
 - on the Mac, the missing permissions, each explained; clicking one opens its Settings pane;
+- **Settings…**, which opens the settings app;
 - **Stop everything (panic)**, **Restart** and **Quit**.
+
+**The settings app** (`crosspane-ui`, or **Settings…** in the tray) has four tabs:
+- **Machines**: each paired machine, whether it's connected, and what it may do here (control,
+  share, browse, present), plus **Forget…**;
+- **Layout**: every machine's displays to scale, in millimetres. Drag a machine to where its
+  screens are on your desk (it snaps to the others' edges) and **Apply**; the pointer crosses
+  where displays of different machines touch;
+- **Pairing**: pair a new machine, as above;
+- **Windows**: send this machine's windows to another one, show another machine's windows here,
+  and give projected windows back.
 
 Everything is also available from the command line:
 
 **One keyboard and mouse (E1).**
-- Set where the other machine is: `crosspanectl layout <peer> left|right|above|below`.
+- Set where the other machine is: drag it in the settings app's **Layout** tab, or
+  `crosspanectl layout <peer> left|right|above|below`, or place one display exactly with
+  `crosspanectl place <machine> <display id> <x mm> <y mm>`.
 - Push the pointer past that edge. A banner shows while input is routed to the other machine.
 - `crosspanectl release` takes input back at once. `crosspanectl panic` ends every session and
   disarms crossing until `crosspanectl rearm`.
@@ -126,10 +146,16 @@ Everything is also available from the command line:
     tray's **May browse and pull my windows**).
 - The window is used normally where it's shown; the app keeps running at home, hidden there.
 - `crosspanectl return <projection>` (or closing the projected window) gives the window back.
+- If the connection drops, projected windows wait for 20 s: the proxy keeps its last picture and
+  the window stays hidden at home, and both resume when the machines reconnect. Held keys and
+  buttons are released at once. After 20 s the window goes home.
 
 **Machines and permissions.**
 - `crosspanectl allow <peer> input|share|browse|present [--off]` grants or withdraws one thing.
 - `crosspanectl forget <peer>` unpairs a machine and ends its connection at once.
+- `crosspanectl revoke <peer>` is for a lost or stolen machine: it is forgotten here, and every
+  other paired machine is told to forget it too (now, or when it next connects). It can only come
+  back through a fresh pairing.
 - `crosspanectl restart` restarts the agent (the agent also restarts itself when macOS
   permissions change).
 
@@ -141,11 +167,13 @@ permissions and recent notices.
 - **Notifications** that your notification daemon shows on the output where a projected window is
   parked appear in that projected window (they're captured with it). Pinning the daemon to a real
   output (e.g. mako's `output=`) avoids it.
-- **Cursor shape:** over a projected window the cursor is the destination's own arrow; text and
-  resize cursors aren't synced yet.
+- **Cursor shape:** over a projected window the cursor takes the source app's shape (text beam,
+  hand, resize arrows) when the source can see it: on a Mac source (needs Screen Recording), and
+  on Hyprland for apps that draw their own cursor (GTK3, Firefox, Xwayland). Hyprland doesn't
+  hand out its own themed cursors (apps using the cursor-shape protocol, e.g. GTK4, Qt 6,
+  Chromium), so over those the cursor is the destination's default arrow.
 - **Picking windows:** a peer's windows must be allowed once (`crosspanectl allow <peer> browse` on
   that peer). Window titles from a Mac need Screen Recording there.
-- **Layout** is set by side (left/right/above/below), not by dragging displays in millimetres.
 - **Video:** H.264 needs a build with `--features video` (FFmpeg 9 on Linux; built in on the Mac);
   without it everything is lossless tiles, which is fine on a wired LAN but heavy for full-screen
   video over Wi-Fi.
