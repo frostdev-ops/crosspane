@@ -4,6 +4,7 @@ mod agent;
 mod config;
 mod ctl;
 mod keys;
+mod media;
 mod net;
 mod paths;
 mod platform;
@@ -103,7 +104,7 @@ fn load_identity(paths: &Paths, config: &Config, platform: Option<&platform::Pla
 fn run() -> Result<()> {
     let paths = Paths::new()?;
     let config = Config::load(&paths)?;
-    let mut platform = platform::create()?;
+    let mut platform = platform::create(&paths.state_dir)?;
     tracing::info!(backends = ?platform, "platform ready");
     let identity = Arc::new(load_identity(&paths, &config, Some(&platform))?);
     let node = identity.node();
@@ -144,47 +145,88 @@ fn run() -> Result<()> {
     for peer in &config.peers {
         net.dial(peer.addr);
     }
-    let agent = agent::Agent::new(node, config.name, engine, platform, net, trust, local_displays);
-    run_loop(agent, startup, rx, tx)
+
+    // E2: the proxy window host owns the main thread (winit's rule on macOS); without a display
+    // the node can still project its own windows, just not show others'.
+    let host = match crosspane_render::proxy::ProxyHost::new() {
+        Ok(host) => Some(host),
+        Err(e) => {
+            tracing::warn!(error = %e, "no proxy window host: this node can't show projected windows");
+            None
+        }
+    };
+    let proxy_ids = media::ProxyIds::default();
+    let e2 = agent::E2Wiring {
+        source_media: media::start_source(net.transport()),
+        dest_media: media::start_destination(
+            host.as_ref().map(|(_, handle)| handle.clone()),
+            proxy_ids.clone(),
+            tx.clone(),
+        ),
+        host: host.as_ref().map(|(_, handle)| handle.clone()),
+        proxy_ids,
+        events: tx.clone(),
+    };
+    let agent =
+        agent::Agent::new(node, config.name, engine, platform, net, trust, local_displays, e2);
+    run_loop(agent, startup, rx, tx, host.map(|(host, _)| host))
 }
 
-#[cfg(target_os = "macos")]
+/// Run the engine loop on its own thread and the proxy host (if any) on this, the main thread.
+/// Without a host on Linux, the engine loop runs here; on macOS the AppKit loop always owns the
+/// main thread.
 fn run_loop(
     agent: agent::Agent,
     startup: Vec<crosspane_engine::Output>,
     rx: std::sync::mpsc::Receiver<agent::Event>,
     tx: std::sync::mpsc::Sender<agent::Event>,
+    host: Option<crosspane_render::proxy::ProxyHost>,
 ) -> Result<()> {
-    // AppKit owns the main thread; the engine loop runs beside it.
-    std::thread::Builder::new()
-        .name("engine".into())
-        .spawn(move || {
-            agent.run(startup, &rx);
-            drop(tx);
-            std::process::exit(0);
-        })
-        .context("spawn engine thread")?;
-    crosspane_platform_macos::main_thread::run_app()?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn run_loop(
-    agent: agent::Agent,
-    startup: Vec<crosspane_engine::Output>,
-    rx: std::sync::mpsc::Receiver<agent::Event>,
-    tx: std::sync::mpsc::Sender<agent::Event>,
-) -> Result<()> {
-    // Keep a sender alive so the loop only ends on shutdown.
-    let _keep = tx;
-    agent.run(startup, &rx);
-    Ok(())
+    match host {
+        Some(host) => {
+            let host_tx = tx.clone();
+            std::thread::Builder::new()
+                .name("engine".into())
+                .spawn(move || {
+                    agent.run(startup, &rx);
+                    drop(tx);
+                    std::process::exit(0);
+                })
+                .context("spawn engine thread")?;
+            host.run(Box::new(move |event| {
+                let _ = host_tx.send(agent::Event::Host(event));
+            }))
+            .context("proxy host")?;
+            Ok(())
+        }
+        None => {
+            #[cfg(target_os = "macos")]
+            {
+                std::thread::Builder::new()
+                    .name("engine".into())
+                    .spawn(move || {
+                        agent.run(startup, &rx);
+                        drop(tx);
+                        std::process::exit(0);
+                    })
+                    .context("spawn engine thread")?;
+                crosspane_platform_macos::main_thread::run_app()?;
+                Ok(())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _keep = tx;
+                agent.run(startup, &rx);
+                Ok(())
+            }
+        }
+    }
 }
 
 fn identity() -> Result<()> {
     let paths = Paths::new()?;
     let config = Config::load(&paths)?;
-    let platform = platform::create().ok();
+    let platform = platform::create(&paths.state_dir).ok();
     let identity = load_identity(&paths, &config, platform.as_ref())?;
     println!("name: {}", config.name);
     println!("node: {}", identity.node());

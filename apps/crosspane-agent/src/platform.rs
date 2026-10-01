@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use crosspane_platform::{
-    Displays, GlobalHotkeys, InputCapture, IoGate, KeyInjector, KeyStore, OverlayHost,
-    Permissions, PlatformError, PointerInjector, SessionEvents,
+    Displays, FrameCapture, GlobalHotkeys, InputCapture, IoGate, KeyInjector, KeyStore,
+    OverlayHost, Permissions, PlatformError, PointerInjector, SessionEvents, WindowParking,
+    WindowSource,
 };
 use crosspane_types::time::MonoTime;
 
@@ -21,6 +22,10 @@ pub struct Platform {
     pub hotkeys: Option<Box<dyn GlobalHotkeys>>,
     pub keystore: Option<Box<dyn KeyStore>>,
     pub permissions: Box<dyn Permissions>,
+    // E2 (docs/wp/E2-v0.md)
+    pub windows: Option<Box<dyn WindowSource>>,
+    pub parking: Option<Box<dyn WindowParking>>,
+    pub frames: Option<Box<dyn FrameCapture>>,
 }
 
 impl std::fmt::Debug for Platform {
@@ -32,6 +37,9 @@ impl std::fmt::Debug for Platform {
             .field("overlay", &self.overlay.is_some())
             .field("hotkeys", &self.hotkeys.is_some())
             .field("keystore", &self.keystore.is_some())
+            .field("windows", &self.windows.is_some())
+            .field("parking", &self.parking.is_some())
+            .field("frames", &self.frames.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -62,11 +70,12 @@ pub fn now() -> MonoTime {
 }
 
 #[cfg(target_os = "linux")]
-pub fn create() -> anyhow::Result<Platform> {
+pub fn create(state_dir: &std::path::Path) -> anyhow::Result<Platform> {
     use anyhow::Context;
     use crosspane_platform_linux::hyprland::{
-        capture::HyprlandCapture, displays::HyprlandDisplays, hotkeys::HyprlandHotkeys, inject,
-        ipc::HyprIpc, overlay::HyprlandOverlay,
+        capture::HyprlandCapture, displays::HyprlandDisplays, frame_capture::HyprlandFrameCapture,
+        hotkeys::HyprlandHotkeys, inject, ipc::HyprIpc, overlay::HyprlandOverlay,
+        parking::HyprlandParking, windows::HyprlandWindows,
     };
     use crosspane_platform_linux::{
         logind::LogindSession, permissions::LinuxPermissions,
@@ -79,6 +88,23 @@ pub fn create() -> anyhow::Result<Platform> {
     let session = LogindSession::new(gate.clone(), Some(ipc.clone()))
         .context("logind session state (required: Crosspane fails closed without it)")?;
     let displays = HyprlandDisplays::new(ipc.clone()).context("Hyprland displays")?;
+    // No window is lost (04 §8 invariant 4): undo a previous run's parking before anything else.
+    let mut parking = optional(
+        "parking",
+        HyprlandParking::new(ipc.clone(), state_dir.join("parking.json")),
+    );
+    if let Some(parking) = &mut parking {
+        use crosspane_platform::WindowParking as _;
+        match parking.recover() {
+            Ok(restored) if !restored.is_empty() => {
+                tracing::warn!(count = restored.len(), "restored windows a previous run left parked")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "could not restore parked windows"),
+        }
+    }
+    let windows = optional("windows", HyprlandWindows::new(ipc.clone()));
+    let frames = optional("frame capture", HyprlandFrameCapture::new(gate.clone(), ipc.clone()));
     let (keys, pointer) = match optional("injection", inject::connect(gate.clone(), ipc)) {
         Some((k, p)) => (
             Some(Box::new(k) as Box<dyn KeyInjector>),
@@ -99,22 +125,35 @@ pub fn create() -> anyhow::Result<Platform> {
         keystore: optional("keystore", SecretServiceStore::new())
             .map(|k| Box::new(k) as Box<dyn KeyStore>),
         permissions: Box::new(LinuxPermissions),
+        windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
+        parking: parking.map(|p| Box::new(p) as Box<dyn WindowParking>),
+        frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
         gate,
     })
 }
 
 #[cfg(target_os = "macos")]
-pub fn create() -> anyhow::Result<Platform> {
+pub fn create(state_dir: &std::path::Path) -> anyhow::Result<Platform> {
     use anyhow::Context;
     use crosspane_platform_macos::{
-        capture::MacCapture, displays::MacDisplays, inject, keychain::MacKeychain,
-        overlay::MacOverlay, permissions::MacPermissions, session::MacSession,
+        capture::MacCapture, displays::MacDisplays, frame_capture::MacFrameCapture, inject,
+        keychain::MacKeychain, overlay::MacOverlay, parking::MacMirrorParking,
+        permissions::MacPermissions, session::MacSession, windows::MacWindows,
     };
 
     let gate = IoGate::new();
     let session = MacSession::new(gate.clone())
         .context("macOS session state (required: Crosspane fails closed without it)")?;
     let displays = MacDisplays::new().context("macOS displays")?;
+    let mut parking = optional("parking", MacMirrorParking::new(state_dir.join("parking.json")));
+    if let Some(parking) = &mut parking {
+        use crosspane_platform::WindowParking as _;
+        if let Err(e) = parking.recover() {
+            tracing::error!(error = %e, "could not restore parked windows");
+        }
+    }
+    let windows = optional("windows", MacWindows::new());
+    let frames = optional("frame capture", MacFrameCapture::new(gate.clone()));
     let (keys, pointer) = match optional("injection", inject::injectors(gate.clone())) {
         Some((k, p)) => (
             Some(Box::new(k) as Box<dyn KeyInjector>),
@@ -134,6 +173,9 @@ pub fn create() -> anyhow::Result<Platform> {
         hotkeys: None,
         keystore: Some(Box::new(MacKeychain::new())),
         permissions: Box::new(MacPermissions::new()),
+        windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
+        parking: parking.map(|p| Box::new(p) as Box<dyn WindowParking>),
+        frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),
         gate,
     })
 }

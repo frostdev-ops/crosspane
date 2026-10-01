@@ -62,6 +62,11 @@ impl Net {
         Ok(Net { runtime, transport: Arc::new(transport), dialing: Arc::default() })
     }
 
+    /// The transport, for the media encoder thread (`send_media` is synchronous).
+    pub fn transport(&self) -> Arc<Transport> {
+        self.transport.clone()
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.transport.local_addr()
     }

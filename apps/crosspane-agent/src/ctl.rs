@@ -29,6 +29,12 @@ pub enum Request {
     Layout { peer: String, side: Side },
     /// Dial a peer address now.
     Dial { addr: SocketAddr },
+    /// List this node's windows (E2).
+    Windows,
+    /// Project this node's `window` to `peer` (name or node-id prefix).
+    Project { window: u64, peer: String },
+    /// End projection `projection` of `source` (default: this node) and return the window.
+    Return { projection: u64, source: Option<String> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

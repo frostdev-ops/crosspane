@@ -4,11 +4,18 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crosspane_engine::{Engine, Failure, InjectCmd, Input, Notice, Output};
+use crosspane_engine::{
+    Command, Engine, Failure, InjectCmd, Input, Notice, Output, ProjectionKey, ProxyEvent,
+};
 use crosspane_input::arrange::{self, Side};
-use crosspane_platform::{CaptureEvent, OverlayEvent, PlatformError};
+use crosspane_platform::{
+    CaptureEvent, EventSink, FrameEvent, OverlayEvent, PlatformError, StreamId, WindowEvent,
+};
+use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
+use crosspane_types::id::{ProjectionId, WindowId};
 use crosspane_protocol::link::{LinkEvent, PeerLink};
 use crosspane_protocol::msg::{Capability, ControlMessage, Placement};
 use crosspane_types::display::DisplayInfo;
@@ -16,6 +23,7 @@ use crosspane_types::id::NodeId;
 use serde_json::{Value, json};
 
 use crate::ctl::{Request, Response};
+use crate::media::{DestCmd, ProxyIds, SourceCmd};
 use crate::net::Net;
 use crate::platform::{self, Platform};
 use crate::trust::SharedTrust;
@@ -27,6 +35,8 @@ pub enum Event {
     LocalDisplays(Vec<DisplayInfo>),
     Link(LinkEvent),
     Ctl(Request, Sender<Response>),
+    /// From the proxy window host (E2 destination).
+    Host(HostEvent),
 }
 
 /// What the loop knows about a peer.
@@ -55,6 +65,23 @@ pub struct Agent {
     notices: VecDeque<String>,
     last_trust_check: Instant,
     last_rtt_poll: Instant,
+    // E2 data plane and window host.
+    source_media: Sender<SourceCmd>,
+    dest_media: Sender<DestCmd>,
+    host: Option<HostHandle>,
+    proxy_ids: ProxyIds,
+    streams: HashMap<StreamId, ProjectionId>,
+    projections: BTreeMap<ProjectionKey, String>,
+    events: Sender<Event>,
+}
+
+/// The E2 pieces the agent wires in (`media.rs`, the proxy host).
+pub struct E2Wiring {
+    pub source_media: Sender<SourceCmd>,
+    pub dest_media: Sender<DestCmd>,
+    pub host: Option<HostHandle>,
+    pub proxy_ids: ProxyIds,
+    pub events: Sender<Event>,
 }
 
 const NOTICE_HISTORY: usize = 20;
@@ -69,6 +96,7 @@ impl Agent {
         net: Net,
         trust: SharedTrust,
         local_displays: Vec<DisplayInfo>,
+        e2: E2Wiring,
     ) -> Agent {
         Agent {
             node,
@@ -85,6 +113,13 @@ impl Agent {
             notices: VecDeque::new(),
             last_trust_check: Instant::now(),
             last_rtt_poll: Instant::now(),
+            source_media: e2.source_media,
+            dest_media: e2.dest_media,
+            host: e2.host,
+            proxy_ids: e2.proxy_ids,
+            streams: HashMap::new(),
+            projections: BTreeMap::new(),
+            events: e2.events,
         }
     }
 
@@ -148,10 +183,15 @@ impl Agent {
                 let response = self.on_ctl(request);
                 let _ = reply.send(response);
             }
+            Event::Host(event) => self.on_host(event),
         }
     }
 
     fn on_link(&mut self, event: LinkEvent) {
+        if let LinkEvent::Media { peer, data } = event {
+            let _ = self.dest_media.send(DestCmd::Media { peer, data });
+            return;
+        }
         match &event {
             LinkEvent::Control { peer, msg } => match msg {
                 ControlMessage::Hello(hello) => {
@@ -294,6 +334,107 @@ impl Agent {
             }
             Output::EngineGate(open) => self.platform.gate.set_engine_permits(open),
             Output::Notice(notice) => self.notice(&notice),
+            Output::Park { window, size, scale } => {
+                let result = match &mut self.platform.parking {
+                    Some(p) => p.park(window, size, scale).map_err(failure),
+                    None => Err(Failure::Other),
+                };
+                if let Err(f) = &result {
+                    tracing::warn!(failure = ?f, "parking failed");
+                }
+                self.pending.push_back(Input::Parked { window, result });
+            }
+            Output::ResizeParked { window, size, scale } => {
+                let result = match &mut self.platform.parking {
+                    Some(p) => p.resize(window, size, scale).map_err(failure),
+                    None => Err(Failure::Other),
+                };
+                self.pending.push_back(Input::Parked { window, result });
+            }
+            Output::Restore { window } => {
+                if let Some(p) = &mut self.platform.parking
+                    && let Err(e) = p.restore(window)
+                {
+                    tracing::error!(error = %e, "could not restore a parked window");
+                }
+            }
+            Output::ActivateWindow { window } => {
+                if let Some(w) = &mut self.platform.windows
+                    && let Err(e) = w.activate(window)
+                {
+                    tracing::debug!(error = %e, "activate failed");
+                }
+            }
+            Output::StartCapture { projection, peer, target, crop, max_fps } => {
+                let result = match &mut self.platform.frames {
+                    Some(frames) => {
+                        let media = self.source_media.clone();
+                        let events = self.events.clone();
+                        let sink: Arc<dyn EventSink<FrameEvent>> = Arc::new(move |ev: FrameEvent| match ev {
+                            FrameEvent::Frame { stream, frame } => {
+                                let _ = media.send(SourceCmd::Frame { stream, frame });
+                            }
+                            FrameEvent::Ended { stream, reason } => {
+                                let _ = events.send(Event::Input(Input::CaptureEnded { stream, reason }));
+                            }
+                            _ => {}
+                        });
+                        frames.start(target, crop, max_fps, sink).map_err(failure)
+                    }
+                    None => Err(Failure::Other),
+                };
+                if let Ok(stream) = result {
+                    self.streams.insert(stream, projection);
+                    let _ = self.source_media.send(SourceCmd::Start { stream, projection, peer });
+                }
+                self.pending.push_back(Input::CaptureStarted { projection, result });
+            }
+            Output::SetCaptureCrop { stream, crop } => {
+                if let Some(frames) = &mut self.platform.frames
+                    && let Err(e) = frames.set_crop(stream, crop)
+                {
+                    tracing::warn!(error = %e, "set_crop failed");
+                }
+            }
+            Output::StopCapture { stream } => {
+                self.streams.remove(&stream);
+                let _ = self.source_media.send(SourceCmd::Stop { stream });
+                if let Some(frames) = &mut self.platform.frames {
+                    let _ = frames.stop(stream);
+                }
+            }
+            Output::RequestKeyFrame { projection } => {
+                let _ = self.source_media.send(SourceCmd::RequestKey { projection });
+            }
+            Output::OpenProxy { key, title, app_id: _, size } => {
+                let id = self.proxy_ids.open(key);
+                let sent = self
+                    .host
+                    .as_ref()
+                    .is_some_and(|h| h.send(HostCommand::Open { id, title, size }).is_ok());
+                if !sent {
+                    self.proxy_ids.close(key);
+                    self.pending.push_back(Input::ProxyOpened { key, result: Err(Failure::Other) });
+                }
+            }
+            Output::ProxyGeometry { key, size, parking: _ } => {
+                if let (Some(h), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
+                    let _ = h.send(HostCommand::SetContentSize { id, size });
+                }
+            }
+            Output::ProxyTitle { key, title } => {
+                if let (Some(h), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
+                    let _ = h.send(HostCommand::SetTitle { id, title });
+                }
+            }
+            Output::CloseProxy { key } => {
+                if let Some(id) = self.proxy_ids.close(key)
+                    && let Some(h) = &self.host
+                {
+                    let _ = h.send(HostCommand::Close { id });
+                }
+                let _ = self.dest_media.send(DestCmd::Forget(key));
+            }
             other => tracing::debug!(output = ?other, "unhandled engine output"),
         }
     }
@@ -348,6 +489,22 @@ impl Agent {
             Notice::ControlEnded(p) => format!("control by {} ended", peer_name(self, p)),
             Notice::LocalOverride(p) => format!("local input overrode {}", peer_name(self, p)),
             Notice::Panic => "panic: everything stopped; re-arm to continue".to_owned(),
+            Notice::ProjectionStarted { key, peer, parking } => {
+                let text = format!(
+                    "projecting window {} to {} ({parking:?})",
+                    key.projection.0,
+                    peer_name(self, peer)
+                );
+                self.projections.insert(*key, text.clone());
+                text
+            }
+            Notice::ProjectionEnded { key, reason } => {
+                self.projections.remove(key);
+                format!("projection {} ended: {reason:?}", key.projection.0)
+            }
+            Notice::ProjectionRefused { peer, reason } => {
+                format!("{} refused the projection: {reason:?}", peer_name(self, peer))
+            }
             other => format!("{other:?}"),
         };
         tracing::info!(notice = %text);
@@ -505,6 +662,45 @@ impl Agent {
             .map(|(node, _)| *node)
     }
 
+    fn on_host(&mut self, event: HostEvent) {
+        let (id, input_of): (u64, Box<dyn FnOnce(ProjectionKey) -> Input>) = match event {
+            HostEvent::Opened { id, size, scale } => (
+                id,
+                Box::new(move |key| Input::ProxyOpened { key, result: Ok((size, scale)) }),
+            ),
+            HostEvent::OpenFailed { id, error } => {
+                tracing::warn!(%error, "proxy window failed to open");
+                (id, Box::new(|key| Input::ProxyOpened { key, result: Err(Failure::Other) }))
+            }
+            HostEvent::Resized { id, size, scale } => {
+                (id, Box::new(move |key| proxy(key, ProxyEvent::Resized { size, scale })))
+            }
+            HostEvent::Focus { id, focused } => {
+                (id, Box::new(move |key| proxy(key, ProxyEvent::Focus(focused))))
+            }
+            HostEvent::CloseRequested { id } => {
+                (id, Box::new(|key| proxy(key, ProxyEvent::CloseRequested)))
+            }
+            HostEvent::Lost { id } => (id, Box::new(|key| proxy(key, ProxyEvent::Lost))),
+            HostEvent::Key { id, usage, down } => {
+                (id, Box::new(move |key| proxy(key, ProxyEvent::Key { usage, down })))
+            }
+            HostEvent::Button { id, button, down, position } => (
+                id,
+                Box::new(move |key| proxy(key, ProxyEvent::Button { button, down, position })),
+            ),
+            HostEvent::Scroll { id, delta, position } => {
+                (id, Box::new(move |key| proxy(key, ProxyEvent::Scroll { delta, position })))
+            }
+            HostEvent::Motion { id, position } => {
+                (id, Box::new(move |key| proxy(key, ProxyEvent::Motion { position })))
+            }
+        };
+        if let Some(key) = self.proxy_ids.key(id) {
+            self.feed(input_of(key));
+        }
+    }
+
     fn on_ctl(&mut self, request: Request) -> Response {
         use crosspane_engine::Command;
         match request {
@@ -531,6 +727,43 @@ impl Agent {
             Request::Dial { addr } => {
                 self.net.dial(addr);
                 Response::ok(json!(format!("dialing {addr}")))
+            }
+            Request::Windows => match &self.platform.windows {
+                None => Response::err("no window source on this node"),
+                Some(w) => match w.windows() {
+                    Ok(list) => Response::ok(json!(list
+                        .iter()
+                        .map(|w| json!({
+                            "id": w.id.0,
+                            "app": w.app_id,
+                            "title": w.title,
+                            "display": w.display.map(|d| d.0),
+                            "size": [w.frame.size.width, w.frame.size.height],
+                        }))
+                        .collect::<Vec<_>>())),
+                    Err(e) => Response::err(format!("{e}")),
+                },
+            },
+            Request::Project { window, peer } => match self.find_peer(&peer) {
+                None => Response::err(format!("no connected peer matches {peer:?}")),
+                Some(to) => {
+                    self.feed(Input::Command(Command::Project { window: WindowId(window), to }));
+                    Response::ok(json!("projection offered"))
+                }
+            },
+            Request::Return { projection, source } => {
+                let source = match source {
+                    None => Some(self.node),
+                    Some(s) => self.find_peer(&s),
+                };
+                match source {
+                    None => Response::err("unknown source node"),
+                    Some(source) => {
+                        let key = ProjectionKey { source, projection: ProjectionId(projection) };
+                        self.feed(Input::Command(Command::Return(key)));
+                        Response::ok(json!("returning"))
+                    }
+                }
             }
         }
     }
@@ -559,6 +792,11 @@ impl Agent {
                 "version": p.version,
             })).collect::<Vec<_>>(),
             "notices": self.notices.iter().collect::<Vec<_>>(),
+            "projections": self.projections.iter().map(|(k, text)| json!({
+                "source": k.source.short(),
+                "projection": k.projection.0,
+                "text": text,
+            })).collect::<Vec<_>>(),
             "uptime_s": now.as_nanos() / 1_000_000_000,
         })
     }
@@ -624,6 +862,14 @@ pub fn subscribe_platform(platform: &mut Platform, tx: &Sender<Event>) {
             platform.overlay = None;
         }
     }
+    if let Some(windows) = &mut platform.windows {
+        let windows_tx = sink(tx);
+        if let Err(e) = windows.subscribe(std::sync::Arc::new(move |ev: WindowEvent| {
+            let _ = windows_tx.send(Event::Input(Input::Windows(ev)));
+        })) {
+            tracing::warn!(error = %e, "window events unavailable");
+        }
+    }
     if let Some(hotkeys) = &mut platform.hotkeys {
         let hotkey_tx = sink(tx);
         if let Err(e) = hotkeys.subscribe(std::sync::Arc::new(move |ev| {
@@ -667,4 +913,8 @@ fn log_output(output: &Output) {
         }
         other => tracing::debug!(output = ?other, "out"),
     }
+}
+
+fn proxy(key: ProjectionKey, event: ProxyEvent) -> Input {
+    Input::Proxy { key, event }
 }
