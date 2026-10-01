@@ -3,6 +3,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod audio;
 pub mod hyprland;
 pub mod link;
 pub mod logind;
