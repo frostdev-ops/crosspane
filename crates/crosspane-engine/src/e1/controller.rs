@@ -3,11 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use crosspane_input::Held;
 use crosspane_input::accel::Accelerator;
 use crosspane_input::layout::{Layout, Placed, PointerTracker, Step};
 use crosspane_input::lease::ControllerLease;
 use crosspane_input::router::Router;
+use crosspane_input::{Edge, Held};
 use crosspane_platform::{
     CaptureEvent, CaptureId, CapturePortal, HotkeyEvent, LockState, MotionKind, Overlay,
     OverlayAnchor, OverlayEvent, PortalId, Rgb8, SessionEvent, SessionState,
@@ -26,6 +26,7 @@ use crosspane_types::time::MonoTime;
 use crate::config::EngineConfig;
 use crate::io::{Command, HUD, Input, Notice, Output};
 
+const REENTRY_GUARD: Duration = Duration::from_millis(150);
 const HUD_TIMEOUT: Duration = Duration::from_millis(500);
 const START_TIMEOUT: Duration = Duration::from_secs(1);
 const END_TIMEOUT: Duration = Duration::from_millis(300);
@@ -162,6 +163,9 @@ pub struct ControllerE1 {
     capture_buttons: BTreeSet<MouseButton>,
     phase: Phase,
     push: Option<Push>,
+    // Portal IDs are regenerated on layout changes; guard the physical connection instead.
+    reentry: Option<(GlobalDisplayId, GlobalDisplayId, Edge, MonoTime)>,
+    cancelled: BTreeMap<NodeId, SessionId>,
     hotkey: Option<HotkeyHold>,
     next_session: Option<u64>,
     next_capture: Option<u64>,
@@ -190,6 +194,8 @@ impl ControllerE1 {
             capture_buttons: BTreeSet::new(),
             phase: Phase::Idle,
             push: None,
+            reentry: None,
+            cancelled: BTreeMap::new(),
             hotkey: None,
             next_session: Some(1),
             next_capture: Some(1),
@@ -412,6 +418,26 @@ impl ControllerE1 {
         self.session().map(|s| s.peer)
     }
 
+    /// An acknowledged outgoing session owns the controller role, including capture activation
+    /// and third-node handoffs that retain an existing capture.
+    pub(crate) fn started(&self) -> bool {
+        matches!(self.phase, Phase::Controlling(_))
+            || matches!(&self.phase, Phase::Crossing(c) if c.capture.is_some())
+    }
+
+    /// Yield an unacknowledged crossing before incoming target admission.
+    pub(crate) fn cancel_pending(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        self.push = None;
+        if matches!(self.phase, Phase::Crossing(_)) && !self.started() {
+            if let Some(session) = self.session() {
+                // Session IDs increase monotonically: one watermark per peer covers repeated
+                // cancellations without retaining an unbounded list of handshake tombstones.
+                self.cancelled.insert(session.peer, session.id);
+            }
+            self.return_home(EndReason::Released, None, false, true, now, out);
+        }
+    }
+
     /// False after a panic or release until re-armed: edges don't cross.
     pub fn armed(&self) -> bool {
         self.armed
@@ -562,6 +588,16 @@ impl ControllerE1 {
                 position,
                 at,
             } if matches!(self.phase, Phase::Idle) => {
+                if self.reentry.is_some_and(|(from, to, edge, until)| {
+                    now < until
+                        && self.layout.as_ref().is_some_and(|layout| {
+                            layout.portals().iter().any(|p| {
+                                p.id == *portal && p.from == from && p.to == to && p.edge == edge
+                            })
+                        })
+                }) {
+                    return;
+                }
                 if self.portal_entry(*portal, *position).is_none() {
                     self.push = None;
                     return;
@@ -775,6 +811,19 @@ impl ControllerE1 {
                         c.tracker = tracker;
                     }
                 } else if display.node == self.config.node {
+                    // Layout portals are directional: guard the local reverse of the portal
+                    // through which the remote pointer returned.
+                    self.reentry = layout
+                        .portals()
+                        .iter()
+                        .find(|p| p.id == portal)
+                        .and_then(|returned| {
+                            layout
+                                .portals()
+                                .iter()
+                                .find(|p| p.from == returned.to && p.to == returned.from)
+                        })
+                        .map(|p| (p.from, p.to, p.edge, now.saturating_add(REENTRY_GUARD)));
                     self.return_home(
                         EndReason::Released,
                         Some((display.display, position)),
@@ -821,6 +870,7 @@ impl ControllerE1 {
         if let LinkEvent::Closed { peer, .. } = event {
             self.peers.remove(peer);
             self.rtts.remove(peer);
+            self.cancelled.remove(peer);
             self.update_portals(out);
             if self.session().is_some_and(|s| s.peer == *peer)
                 || matches!(&self.phase, Phase::Crossing(c) if c.entry.0.node == *peer)
@@ -872,6 +922,20 @@ impl ControllerE1 {
                 } else {
                     self.return_home(EndReason::Released, None, false, true, now, out);
                 }
+            }
+            // A cancelled handshake can still be acknowledged after its EndControl was sent.
+            // There is no local session to capture; repeat the end for the cancelled identity.
+            LinkEvent::Control {
+                peer,
+                msg: ControlMessage::ControlStarted { session },
+            } if self.cancelled.get(peer).is_some_and(|last| session <= last) => {
+                out.push(Output::SendControl {
+                    peer: *peer,
+                    msg: ControlMessage::EndControl {
+                        session: *session,
+                        reason: EndReason::Released,
+                    },
+                })
             }
             LinkEvent::Control {
                 peer,

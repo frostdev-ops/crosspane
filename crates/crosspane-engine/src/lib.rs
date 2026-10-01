@@ -15,6 +15,8 @@ pub mod io;
 
 use crosspane_input::journal::{Journal, JournalError};
 use crosspane_platform::CaptureEvent;
+use crosspane_protocol::link::LinkEvent;
+use crosspane_protocol::msg::{ControlMessage, Refusal};
 use crosspane_types::id::NodeId;
 use crosspane_types::time::MonoTime;
 
@@ -73,6 +75,33 @@ impl Engine {
         // While another node controls this one, this node's own portals are inert: the injected
         // pointer enters at an edge, and crossing out from there would bounce control straight
         // back (found in the nested end-to-end test).
+        let incoming_start = if let Input::Link(LinkEvent::Control {
+            peer,
+            msg: ControlMessage::StartControl { session, .. },
+        }) = &input
+        {
+            Some((*peer, *session))
+        } else {
+            None
+        };
+        let refuse_start = incoming_start.is_some() && self.controller.started();
+        if let Some((peer, session)) = incoming_start {
+            if refuse_start {
+                out.push(Output::SendControl {
+                    peer,
+                    msg: ControlMessage::ControlRefused {
+                        session,
+                        reason: Refusal::Busy,
+                    },
+                });
+                out.push(Output::Notice(Notice::Refused {
+                    peer,
+                    reason: Refusal::Busy,
+                }));
+            } else {
+                self.controller.cancel_pending(now, &mut out);
+            }
+        }
         let was_controlled = self.target.is_controlled();
         let edge_event = matches!(
             &input,
@@ -81,7 +110,9 @@ impl Engine {
         if !(was_controlled && edge_event) {
             self.controller.handle(&input, now, &mut out);
         }
-        self.target.handle(&input, now, &mut out);
+        if !refuse_start {
+            self.target.handle(&input, now, &mut out);
+        }
         self.e2.handle(&input, now, &mut out);
         let controlled = self.target.is_controlled();
         if controlled {
