@@ -1289,13 +1289,7 @@ impl Worker {
                 self.state.end_all(StreamEndReason::Blocked);
                 return Ok(());
             }
-            let frame = Frame {
-                size,
-                stride: size.width * 4,
-                pixels,
-                damage,
-                at,
-            };
+            let frame = Frame::cpu(size, size.width * 4, pixels, damage, at);
             if stream.toplevel.is_some() {
                 // Captures stay outstanding; only delivery is throttled. Replacing a held
                 // frame must describe all changed pixels relative to the last delivered frame.

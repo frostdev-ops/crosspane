@@ -754,8 +754,8 @@ pub(super) fn copy_sample(
     } else {
         clock::now()
     };
-    Some(Frame {
-        size: PixelSize::new(
+    Some(Frame::cpu(
+        PixelSize::new(
             (region.max.x - region.min.x) as u32,
             (region.max.y - region.min.y) as u32,
         ),
@@ -763,7 +763,7 @@ pub(super) fn copy_sample(
         pixels,
         damage,
         at,
-    })
+    ))
 }
 
 fn key(string: &NSString) -> &objc2_core_foundation::CFType {
@@ -896,11 +896,9 @@ mod tests {
                     FrameEvent::Frame { stream, frame } => {
                         assert_eq!(stream, id);
                         if frame.size == expected {
-                            assert_eq!(frame.stride, expected.width * 4);
-                            assert_eq!(
-                                frame.pixels.len(),
-                                frame.stride as usize * expected.height as usize
-                            );
+                            let (pixels, stride) = frame.cpu_pixels().unwrap();
+                            assert_eq!(stride, expected.width * 4);
+                            assert_eq!(pixels.len(), stride as usize * expected.height as usize);
                             break;
                         }
                     }

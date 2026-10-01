@@ -2,7 +2,7 @@
 
 use std::{cell::Cell, sync::Arc};
 
-use crosspane_media::picture::Nv12;
+use crosspane_media::picture::{NativePicture, Nv12, YuvColour};
 
 use crosspane_types::geom::{PixelRect, PixelSize};
 
@@ -12,7 +12,9 @@ pub(super) struct Presenter {
     canvas: Option<Canvas>,
     video_pipeline: wgpu::RenderPipeline,
     video: Option<Video>,
-    pending_video: Option<(PixelSize, Arc<Nv12>)>,
+    pending_video: Option<(PixelSize, Picture)>,
+    /// Where a native picture is copied when it can't be imported.
+    native_copy: Nv12,
     video_visible: bool,
     #[cfg(test)]
     pub(super) video_uploads: usize,
@@ -40,7 +42,22 @@ struct Video {
     uv: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     size: PixelSize,
+    /// The planes are a native picture's own memory, not upload targets.
+    imported: bool,
 }
+
+#[derive(Debug)]
+enum Picture {
+    Cpu(Arc<Nv12>),
+    Native(Arc<dyn NativePicture>),
+}
+
+/// Imports a native picture's planes as `[R8Unorm luma, Rg8Unorm chroma]` textures on `device`.
+pub(crate) type Import<'a> = &'a (
+        dyn Fn(&wgpu::Device, &dyn NativePicture) -> Result<[wgpu::Texture; 2], String>
+            + Send
+            + Sync
+    );
 
 impl Presenter {
     pub(super) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -161,6 +178,7 @@ impl Presenter {
             video_uniform,
             video: None,
             pending_video: None,
+            native_copy: Nv12::default(),
             video_visible: false,
             #[cfg(test)]
             video_uploads: 0,
@@ -311,18 +329,153 @@ impl Presenter {
                 "video dimensions are zero, outside the picture or exceed GPU limits".into(),
             );
         }
-        self.pending_video = Some((size, picture));
+        self.pending_video = Some((size, Picture::Cpu(picture)));
         Ok(())
     }
 
-    pub(super) fn prepare_video(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// Like `set_video`, for a picture in native memory: `prepare_video` imports it without a copy
+    /// when it's given an importer that accepts it, and copies it otherwise.
+    pub(super) fn set_native_video(
+        &mut self,
+        device: &wgpu::Device,
+        size: PixelSize,
+        picture: Arc<dyn NativePicture>,
+    ) -> Result<(), String> {
+        let coded = picture.size();
+        let limit = device.limits().max_texture_dimension_2d;
+        if size.width == 0
+            || size.height == 0
+            || !coded.width.is_multiple_of(2)
+            || !coded.height.is_multiple_of(2)
+            || size.width > coded.width
+            || size.height > coded.height
+            || coded.width > limit
+            || coded.height > limit
+        {
+            return Err(
+                "video dimensions are zero, odd, outside the picture or exceed GPU limits".into(),
+            );
+        }
+        self.pending_video = Some((size, Picture::Native(picture)));
+        Ok(())
+    }
+
+    pub(super) fn prepare_video(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        import: Option<Import<'_>>,
+    ) {
         let Some((visible, picture)) = self.pending_video.take() else {
             return;
         };
+        let picture = match picture {
+            Picture::Cpu(picture) => picture,
+            Picture::Native(native) => {
+                if let Some(import) = import {
+                    match import(device, native.as_ref()) {
+                        Ok([y, uv]) => match self.show_imported(device, y, uv, native.size()) {
+                            Ok(()) => {
+                                self.write_video_uniform(queue, native.colour(), visible);
+                                return;
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "imported picture unusable; copying it");
+                            }
+                        },
+                        Err(error) => {
+                            tracing::debug!(%error, "picture import failed; copying it");
+                        }
+                    }
+                }
+                let mut copy = std::mem::take(&mut self.native_copy);
+                if let Err(error) = native.to_nv12(&mut copy).and_then(|()| copy.validate()) {
+                    tracing::warn!(%error, "native picture unreadable");
+                    self.native_copy = copy;
+                    return;
+                }
+                self.upload_video(device, queue, &copy, visible);
+                self.native_copy = copy;
+                return;
+            }
+        };
+        self.upload_video(device, queue, &picture, visible);
+    }
+
+    /// Show imported planes; they must be the formats and sizes the upload path would create.
+    fn show_imported(
+        &mut self,
+        device: &wgpu::Device,
+        y: wgpu::Texture,
+        uv: wgpu::Texture,
+        size: PixelSize,
+    ) -> Result<(), String> {
+        let extent = |texture: &wgpu::Texture| PixelSize::new(texture.width(), texture.height());
+        if y.format() != wgpu::TextureFormat::R8Unorm
+            || uv.format() != wgpu::TextureFormat::Rg8Unorm
+            || extent(&y) != size
+            || extent(&uv) != PixelSize::new(size.width / 2, size.height / 2)
+            || !y.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            || !uv.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING)
+        {
+            return Err("imported planes don't match the picture".into());
+        }
+        let bind_group = self.video_bind_group(device, &y, &uv);
+        self.video = Some(Video {
+            y,
+            uv,
+            bind_group,
+            size,
+            imported: true,
+        });
+        Ok(())
+    }
+
+    fn video_bind_group(
+        &self,
+        device: &wgpu::Device,
+        y: &wgpu::Texture,
+        uv: &wgpu::Texture,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("proxy NV12"),
+            layout: &self.video_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &y.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        &uv.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.video_uniform.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn upload_video(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        picture: &Nv12,
+        visible: PixelSize,
+    ) {
         if self
             .video
             .as_ref()
-            .is_none_or(|video| video.size != picture.size)
+            .is_none_or(|video| video.imported || video.size != picture.size)
         {
             let plane = |size: PixelSize, format| {
                 device.create_texture(&wgpu::TextureDescriptor {
@@ -345,37 +498,13 @@ impl Presenter {
                 PixelSize::new(picture.size.width / 2, picture.size.height / 2),
                 wgpu::TextureFormat::Rg8Unorm,
             );
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("proxy NV12"),
-                layout: &self.video_pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &y.create_view(&Default::default()),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.uniform.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(
-                            &uv.create_view(&Default::default()),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.video_uniform.as_entire_binding(),
-                    },
-                ],
-            });
+            let bind_group = self.video_bind_group(device, &y, &uv);
             self.video = Some(Video {
                 y,
                 uv,
                 bind_group,
                 size: picture.size,
+                imported: false,
             });
         }
         let Some(video) = &self.video else {
@@ -401,8 +530,16 @@ impl Presenter {
                 texture.size(),
             );
         }
+        self.write_video_uniform(queue, picture.colour, visible);
+        #[cfg(test)]
+        {
+            self.video_uploads += 1;
+        }
+    }
+
+    fn write_video_uniform(&mut self, queue: &wgpu::Queue, colour: YuvColour, visible: PixelSize) {
         // Four padded vec3<f32> values, followed by the visible dimensions.
-        let conversion = picture.colour.to_rgb();
+        let conversion = colour.to_rgb();
         let mut data = [0_u32; 20];
         for (slots, values) in data[..16]
             .as_chunks_mut::<4>()
@@ -419,10 +556,6 @@ impl Presenter {
         let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_ne_bytes()).collect();
         queue.write_buffer(&self.video_uniform, 0, &bytes);
         self.video_visible = true;
-        #[cfg(test)]
-        {
-            self.video_uploads += 1;
-        }
     }
 
     pub(super) fn set_edge(&mut self, accent: [u8; 3], edge_px: u32) {

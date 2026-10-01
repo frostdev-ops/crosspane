@@ -206,11 +206,9 @@ fn live_textedit_capture_resize_and_blocked_end() {
             {
                 assert_eq!(received, stream);
                 assert_eq!(frame.size, expected);
-                assert_eq!(frame.stride, frame.size.width * 4);
-                assert_eq!(
-                    frame.pixels.len(),
-                    frame.stride as usize * frame.size.height as usize
-                );
+                let (pixels, stride) = frame.to_cpu().unwrap();
+                assert_eq!(stride, frame.size.width * 4);
+                assert_eq!(pixels.len(), stride as usize * frame.size.height as usize);
                 assert!(frame.at <= clock::now());
                 frames += 1;
             }

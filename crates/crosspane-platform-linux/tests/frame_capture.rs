@@ -232,12 +232,12 @@ fn open_gate() -> Arc<IoGate> {
 }
 
 fn rgb(frame: &Frame, x: u32, y: u32) -> [u8; 3] {
-    let offset = (y * frame.stride + x * 4) as usize;
-    [
-        frame.pixels[offset + 2],
-        frame.pixels[offset + 1],
-        frame.pixels[offset],
-    ]
+    frame
+        .with_pixels(|pixels, stride| {
+            let offset = (y * stride + x * 4) as usize;
+            [pixels[offset + 2], pixels[offset + 1], pixels[offset]]
+        })
+        .unwrap()
 }
 
 fn frame_matching(
@@ -340,8 +340,9 @@ fn pixels_damage_crop_gate_and_stop() {
     // Parent tiling can resize a nest while this test runs. Sample the visible reference pattern,
     // and use the captured dimensions instead of comparing two asynchronous geometry snapshots.
     assert!(full.size.width >= 12 && full.size.height >= 12);
-    assert_eq!(full.stride, full.size.width * 4);
-    assert_eq!(full.pixels.len(), (full.stride * full.size.height) as usize);
+    let (pixels, stride) = full.cpu_pixels().unwrap();
+    assert_eq!(stride, full.size.width * 4);
+    assert_eq!(pixels.len(), (stride * full.size.height) as usize);
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     let now_ns = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
     assert!(full.at.as_nanos().abs_diff(now_ns) < 2_000_000_000);
@@ -366,8 +367,9 @@ fn pixels_damage_crop_gate_and_stop() {
             && (0..8)
                 .all(|y| (0..8).all(|x| rgb(frame, x, y) == fixture.reference_rgb(x + 1, y + 2)))
     });
-    assert_eq!(cropped.stride, 32);
-    assert_eq!(cropped.pixels.len(), 256);
+    let (pixels, stride) = cropped.cpu_pixels().unwrap();
+    assert_eq!(stride, 32);
+    assert_eq!(pixels.len(), 256);
     let second = capture
         .start(CaptureTarget::Display(display), None, 60, sink.clone())
         .unwrap();
@@ -780,7 +782,8 @@ fn window_pixels_resize_close_and_unknown_id() {
         }
     };
     let first = wait_frame(PixelSize::new(320, 240));
-    let pixels = first.pixels.as_chunks::<4>().0;
+    let (first_pixels, _) = first.to_cpu().unwrap();
+    let pixels = first_pixels.as_chunks::<4>().0;
     assert!(
         pixels.iter().any(|p| p != &pixels[0]),
         "window pixels are uniform"

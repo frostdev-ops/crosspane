@@ -10,6 +10,14 @@ publish.workspace = true
 [features]
 # The owner-approved private-API module (D7): CGVirtualDisplay twin-display parking. Off by default.
 private-vdisplay = []
+# Zero-copy GPU paths (GPU-v0): VideoToolbox and ScreenCaptureKit buffers as wgpu textures.
+gpu = [
+    "dep:wgpu",
+    "dep:objc2-metal",
+    "dep:objc2-io-surface",
+    "objc2-core-video/objc2-io-surface",
+    "objc2-core-video/objc2-metal",
+]
 
 [lints]
 workspace = true
@@ -21,6 +29,9 @@ crosspane-media.workspace = true
 crosspane-platform.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
+objc2-io-surface = { workspace = true, optional = true }
 block2.workspace = true
 dispatch2.workspace = true
 objc2.workspace = true
@@ -37,6 +48,9 @@ security-framework.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
 
 # AppKit needs the process's main thread, which libtest doesn't give tests (WP-1.24).
 [[test]]

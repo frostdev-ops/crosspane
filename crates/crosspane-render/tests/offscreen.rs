@@ -1,10 +1,18 @@
 use std::{
-    sync::{Arc, mpsc},
+    any::Any,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use crosspane_media::picture::{Nv12, YuvColour, YuvMatrix, nv12_to_bgra};
+use crosspane_media::{
+    codec::CodecError,
+    picture::{NativePicture, Nv12, YuvColour, YuvMatrix, nv12_to_bgra},
+};
 use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
 
 // Compile the private implementation, without adding a public testing API to the frozen host.
@@ -222,7 +230,18 @@ fn readback(
     format: wgpu::TextureFormat,
     size: PixelSize,
 ) -> Result<Vec<u8>> {
-    presenter.prepare_video(device, queue);
+    readback_importing(device, queue, presenter, format, size, None)
+}
+
+fn readback_importing(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    presenter: &mut Presenter,
+    format: wgpu::TextureFormat,
+    size: PixelSize,
+    import: Option<gpu::Import<'_>>,
+) -> Result<Vec<u8>> {
+    presenter.prepare_video(device, queue, import);
     let extent = wgpu::Extent3d {
         width: size.width,
         height: size.height,
@@ -566,5 +585,177 @@ fn superseded_pictures_never_reach_upload() -> Result<()> {
         &canvas,
         "invalid video leaves canvas unchanged",
     )?;
+    Ok(())
+}
+
+/// A picture "in native memory" for the tests: its CPU copy is the reference.
+#[derive(Debug)]
+struct FakeNative(Nv12);
+
+impl NativePicture for FakeNative {
+    fn size(&self) -> PixelSize {
+        self.0.size
+    }
+    fn colour(&self) -> YuvColour {
+        self.0.colour
+    }
+    fn to_nv12(&self, out: &mut Nv12) -> Result<(), CodecError> {
+        out.clone_from(&self.0);
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Uploads the fake picture's planes into new textures, as a platform importer would wrap them.
+fn fake_import(
+    queue: &wgpu::Queue,
+    device: &wgpu::Device,
+    picture: &dyn NativePicture,
+    half_height_chroma: u32,
+) -> Result<[wgpu::Texture; 2], String> {
+    let picture = &picture
+        .as_any()
+        .downcast_ref::<FakeNative>()
+        .ok_or("not a fake picture")?
+        .0;
+    let plane = |size: PixelSize, format, bytes: &[u8], stride: u32| {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imported plane"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: None,
+            },
+            texture.size(),
+        );
+        texture
+    };
+    let size = picture.size;
+    Ok([
+        plane(
+            size,
+            wgpu::TextureFormat::R8Unorm,
+            &picture.y,
+            picture.y_stride,
+        ),
+        plane(
+            PixelSize::new(size.width / 2, half_height_chroma),
+            wgpu::TextureFormat::Rg8Unorm,
+            &picture.uv,
+            picture.uv_stride,
+        ),
+    ])
+}
+
+#[test]
+fn native_pictures_import_or_copy() -> Result<()> {
+    let Some((device, queue)) = device()? else {
+        return Ok(());
+    };
+    let coded = PixelSize::new(64, 48);
+    let visible = PixelSize::new(61, 45);
+    let target = PixelSize::new(69, 53);
+    let imports = Arc::new(AtomicUsize::new(0));
+    let counted = {
+        let (imports, queue) = (imports.clone(), queue.clone());
+        move |device: &wgpu::Device, picture: &dyn NativePicture| {
+            imports.fetch_add(1, Ordering::Relaxed);
+            fake_import(&queue, device, picture, picture.size().height / 2)
+        }
+    };
+    let failing = |_: &wgpu::Device, _: &dyn NativePicture| -> Result<[wgpu::Texture; 2], String> {
+        Err("no import here".into())
+    };
+    // Planes of the wrong size must not be shown.
+    let wrong = {
+        let queue = queue.clone();
+        move |device: &wgpu::Device, picture: &dyn NativePicture| {
+            fake_import(&queue, device, picture, picture.size().height / 2 - 2)
+        }
+    };
+    for format in [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+    ] {
+        let mut presenter = Presenter::new(&device, format);
+        presenter.set_edge([211, 45, 137], 2);
+        let importers: [(Option<gpu::Import<'_>>, bool); 4] = [
+            (Some(&counted), true),
+            (Some(&failing), false),
+            (None, false),
+            (Some(&wrong), false),
+        ];
+        for (seed, (import, imported)) in (7..).zip(importers) {
+            let colour = YuvColour {
+                matrix: YuvMatrix::Bt601,
+                full_range: seed % 2 == 0,
+            };
+            let picture = random_picture(coded, 3, colour, seed);
+            let (imports_before, uploads_before) =
+                (imports.load(Ordering::Relaxed), presenter.video_uploads);
+            presenter
+                .set_native_video(&device, visible, Arc::new(FakeNative(picture.clone())))
+                .map_err(anyhow::Error::msg)?;
+            let actual =
+                readback_importing(&device, &queue, &mut presenter, format, target, import)?;
+            compare_video(&actual, &picture, visible, target, 2)?;
+            ensure!(
+                presenter.video_uploads == uploads_before + usize::from(!imported),
+                "{format:?} seed {seed}: copied {} times",
+                presenter.video_uploads - uploads_before
+            );
+            if imported {
+                ensure!(imports.load(Ordering::Relaxed) == imports_before + 1);
+            }
+            // A CPU picture after an imported one gets its own upload textures again.
+            let cpu = Arc::new(random_picture(coded, 0, colour, seed + 100));
+            presenter
+                .set_video(&device, visible, cpu.clone())
+                .map_err(anyhow::Error::msg)?;
+            let actual = readback(&device, &queue, &mut presenter, format, target)?;
+            compare_video(&actual, &cpu, visible, target, 2)?;
+        }
+        // Odd coded sizes and pictures smaller than the shown size are refused on arrival.
+        let odd = Nv12 {
+            size: PixelSize::new(63, 48),
+            ..random_picture(coded, 0, YuvColour::default(), 3)
+        };
+        ensure!(
+            presenter
+                .set_native_video(&device, visible, Arc::new(FakeNative(odd)))
+                .is_err()
+        );
+        ensure!(
+            presenter
+                .set_native_video(
+                    &device,
+                    PixelSize::new(65, 45),
+                    Arc::new(FakeNative(random_picture(
+                        coded,
+                        0,
+                        YuvColour::default(),
+                        4
+                    )))
+                )
+                .is_err()
+        );
+    }
     Ok(())
 }

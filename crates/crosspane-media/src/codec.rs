@@ -5,9 +5,13 @@
 //! (the capture and canvas format). Implementations live in the platform crates: VideoToolbox on
 //! macOS, FFmpeg (NVENC, NVDEC, software fallbacks) on Linux.
 
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+
 use crosspane_types::geom::PixelSize;
 
-use crate::picture::Nv12;
+use crate::picture::{Decoded, Nv12, YuvColour};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CodecError {
@@ -47,6 +51,50 @@ pub trait VideoEncoder: Send {
     fn set_bitrate(&mut self, bits_per_second: u32);
     /// The backend, for logs (e.g. `h264_nvenc`, `libx264`, `VideoToolbox`).
     fn name(&self) -> &str;
+
+    /// The pool this encoder takes native inputs from for frames of `size` (coded size: `size`
+    /// rounded up to even), rebuilt when the size changes. `None` when the backend only takes CPU
+    /// BGRA through [`VideoEncoder::encode`].
+    fn input_pool(
+        &mut self,
+        size: PixelSize,
+    ) -> Result<Option<Arc<dyn NativeInputPool>>, CodecError> {
+        let _ = size;
+        Ok(None)
+    }
+
+    /// Encode a buffer from [`VideoEncoder::input_pool`] that the caller has finished writing (its
+    /// GPU work is complete). `size` is the frame's real size inside the buffer's coded size, as
+    /// for [`VideoEncoder::encode`]; the rest is as there.
+    fn encode_native(
+        &mut self,
+        input: &dyn NativeInput,
+        size: PixelSize,
+        force_key: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<EncodedVideo, CodecError> {
+        let _ = (input, size, force_key, out);
+        Err(CodecError::BadInput("native input not supported"))
+    }
+}
+
+/// An encoder input buffer in the encoder's native memory (a VideoToolbox pool `CVPixelBuffer`, a
+/// CUDA-mapped NV12 buffer), NV12 of the pool's coded size. The GPU code that fills it and the
+/// encoder agree on the concrete type behind [`NativeInput::as_any`]. Dropping it returns the
+/// buffer to its pool.
+pub trait NativeInput: Send + Sync + fmt::Debug {
+    fn size(&self) -> PixelSize;
+    /// The colour description the encoder signals; the writer must produce exactly this.
+    fn colour(&self) -> YuvColour;
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Native input buffers of one coded size.
+pub trait NativeInputPool: Send + Sync + fmt::Debug {
+    /// A free buffer, or `Err(Failed)` when every buffer is in flight.
+    fn acquire(&self) -> Result<Arc<dyn NativeInput>, CodecError>;
+    fn size(&self) -> PixelSize;
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// A low-latency H.264 decoder for one projection.
@@ -62,6 +110,18 @@ pub trait VideoDecoder: Send {
     fn decode_nv12(&mut self, data: &[u8], out: &mut Nv12) -> Result<(), CodecError>;
     /// The backend, for logs.
     fn name(&self) -> &str;
+
+    /// Decode one access unit, leaving the picture in native memory when the backend can (no
+    /// copy). Otherwise it decodes into `reuse` with [`VideoDecoder::decode_nv12`] (reusing its
+    /// allocations when nothing else holds it) and returns it as [`Decoded::Nv12`].
+    fn decode_native(&mut self, data: &[u8], reuse: &mut Arc<Nv12>) -> Result<Decoded, CodecError> {
+        if Arc::get_mut(reuse).is_none() {
+            *reuse = Arc::default();
+        }
+        let picture = Arc::get_mut(reuse).ok_or(CodecError::Failed("picture in use".into()))?;
+        self.decode_nv12(data, picture)?;
+        Ok(Decoded::Nv12(Arc::clone(reuse)))
+    }
 }
 
 /// Creates encoders and decoders, one per projection.

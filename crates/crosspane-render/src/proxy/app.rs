@@ -19,7 +19,7 @@ use winit::{
 };
 
 use super::{
-    HostCommand, HostEvent, cursor,
+    HostCommand, HostEvent, PictureImporter, cursor,
     gpu::{Presenter, surface_format},
     input::{InputState, mouse_button, scroll},
 };
@@ -33,6 +33,7 @@ pub(super) struct App {
     windows: HashMap<u64, ProxyWindow>,
     ids: HashMap<WindowId, u64>,
     pending: VecDeque<HostCommand>,
+    importer: Option<PictureImporter>,
 }
 
 struct Gpu {
@@ -60,8 +61,10 @@ impl App {
     pub(super) fn new(
         proxy: EventLoopProxy<HostCommand>,
         events: Box<dyn FnMut(HostEvent)>,
+        importer: Option<PictureImporter>,
     ) -> Self {
         Self {
+            importer,
             proxy,
             events,
             instance: None,
@@ -275,6 +278,20 @@ impl App {
                     }
                 }
             }
+            HostCommand::VideoNative { id, size, picture } => {
+                if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
+                    match window
+                        .presenter
+                        .set_native_video(&gpu.device, size, picture)
+                    {
+                        Ok(()) => window.window.request_redraw(),
+                        Err(error) => {
+                            tracing::warn!(id, %error, "proxy frame rejected");
+                            self.remove(id, true);
+                        }
+                    }
+                }
+            }
             HostCommand::SetCursor {
                 id,
                 size,
@@ -462,7 +479,7 @@ impl ApplicationHandler<HostCommand> for App {
             WindowEvent::Destroyed => self.remove(id, true),
             WindowEvent::RedrawRequested => {
                 if let (Some(gpu), Some(instance)) = (&self.gpu, &self.instance)
-                    && let Err(error) = window.render(gpu, instance)
+                    && let Err(error) = window.render(gpu, instance, self.importer.as_deref())
                 {
                     tracing::warn!(id, %error, "proxy rendering failed");
                     self.remove(id, true);
@@ -547,7 +564,12 @@ impl ProxyWindow {
         Ok(())
     }
 
-    fn render(&mut self, gpu: &Gpu, instance: &wgpu::Instance) -> Result<(), String> {
+    fn render(
+        &mut self,
+        gpu: &Gpu,
+        instance: &wgpu::Instance,
+        import: Option<super::gpu::Import<'_>>,
+    ) -> Result<(), String> {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(());
         }
@@ -578,7 +600,8 @@ impl ProxyWindow {
                 return Err("surface validation failed".into());
             }
         };
-        self.presenter.prepare_video(&gpu.device, &gpu.queue);
+        self.presenter
+            .prepare_video(&gpu.device, &gpu.queue, import);
         self.consecutive_surface_losses = 0;
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = gpu

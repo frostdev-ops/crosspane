@@ -18,8 +18,15 @@ crosspane-platform.workspace = true
 
 [features]
 ffmpeg = ["dep:ffmpeg-next"]
+# Zero-copy GPU paths (GPU-v0): DMA-BUF capture into wgpu textures (Vulkan through ash).
+gpu = ["dep:wgpu", "dep:ash"]
+# NVENC from GPU memory: libcuda is loaded at run time, so builds need no CUDA toolkit.
+cuda = ["gpu", "ffmpeg", "dep:libloading"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { workspace = true, optional = true }
+ash = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
 pipewire.workspace = true
 rtrb.workspace = true
 font8x8.workspace = true
@@ -39,3 +46,6 @@ wayland-protocols-wlr.workspace = true
 xkbcommon.workspace = true
 zbus.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
