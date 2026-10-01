@@ -239,6 +239,16 @@ fn print_status(s: &Value) {
         }
     );
     println!("  backends: {}", s["backends"].as_str().unwrap_or("?"));
+    let missing: Vec<&str> = s["permissions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["state"].as_str() != Some("Granted"))
+        .filter_map(|p| p["permission"].as_str())
+        .collect();
+    if !missing.is_empty() {
+        println!("  permissions missing: {}", missing.join(", "));
+    }
     for d in s["displays"].as_array().into_iter().flatten() {
         println!(
             "  display {} {}  {}x{} @{} scale  {}x{} mm",

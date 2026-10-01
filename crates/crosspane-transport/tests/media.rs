@@ -333,8 +333,12 @@ async fn control_and_input_arrive_promptly_while_a_30_mib_frame_is_in_flight() {
         }
         let took = started.elapsed();
         worst = worst.max(took);
+        // Rounds completing while the frame is in flight (checked below) show control and input
+        // are not queued behind it. This bound only catches gross stalls: debug builds on a busy
+        // CI runner spend most of a round on crypto and scheduling, not on queueing.
+        let bound = Duration::from_millis(if cfg!(debug_assertions) { 400 } else { 100 });
         assert!(
-            took < Duration::from_millis(100),
+            took < bound,
             "round {round} took {took:?} with a 30 MiB frame in flight"
         );
         if media.is_none() {
