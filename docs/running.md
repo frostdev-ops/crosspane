@@ -31,6 +31,10 @@ Mac windows stay visible in place (M1 mirror).
 - **Input Monitoring**: capturing the keyboard and mouse (E1 controller).
 - **Screen & System Audio Recording**: capturing windows (E2 source).
 
+The agent asks macOS for whatever is missing when it starts (at most once a day), so the system's
+"Crosspane would like to…" dialogs appear by themselves; `crosspanectl request-permissions` asks
+again at any time.
+
 `Crosspane.app/Contents/MacOS/Crosspane permissions --request` asks for the last three;
 `crosspanectl status` lists what is still missing. Local Network is asked for the first time the
 agent connects.
