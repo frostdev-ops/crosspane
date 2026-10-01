@@ -48,8 +48,12 @@ jobs:
         run: cargo fmt --check
       - name: Check lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Install lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - name: Run tests
         run: cargo nextest run --workspace --locked --no-tests=pass
+        env:
+          CROSSPANE_REQUIRE_GPU: "1"
       - name: Build documentation
         run: cargo doc --workspace --no-deps --locked
         env:
@@ -90,6 +94,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
         run: cargo nextest run --workspace --locked --no-tests=pass
+        env:
+          CROSSPANE_REQUIRE_GPU: "1"
       - name: Build documentation
         run: cargo doc --workspace --no-deps --locked
         env:
@@ -130,6 +136,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
         run: cargo nextest run --workspace --locked --no-tests=pass
+        env:
+          CROSSPANE_REQUIRE_GPU: "1"
       - name: Build documentation
         run: cargo doc --workspace --no-deps --locked
         env:
