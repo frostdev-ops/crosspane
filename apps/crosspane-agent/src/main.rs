@@ -168,12 +168,11 @@ fn run() -> Result<()> {
 
     // E2 video (WP-2.14): this node's encoder/decoder, if it has one and video isn't turned off.
     let video = media::VideoSetup {
-        codecs: if config.video_mbps > 0 {
+        codecs: if config.video_mbps != Some(0) {
             platform::video_codecs()
         } else {
             None
         },
-        bits_per_second: config.video_mbps.saturating_mul(1_000_000),
     };
     // `cursor`: this node shows the source's cursor shapes on its proxies (WP-2.16).
     let mut features = vec!["e1".to_owned(), "cursor".to_owned()];
@@ -216,6 +215,7 @@ fn run() -> Result<()> {
         events: tx.clone(),
         crossing: config.crossing,
         latency_overlay: config.latency_overlay,
+        video_mbps: config.video_mbps,
         identity,
         port: config.port,
         revocations: revocations::Issued::load(revocations::file_beside(&paths.trust_file())),
