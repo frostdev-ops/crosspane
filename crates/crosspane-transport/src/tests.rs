@@ -100,26 +100,29 @@ async fn zero_rtt_is_never_available() {
 /// `Closed`, no second `Hello`, existing handles keep working, and exactly one connection is left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_competing_connection_takes_over_or_gives_way_silently() {
-    use std::net::SocketAddr;
-
     use crosspane_protocol::link::LinkEvent;
     use crosspane_protocol::msg::ControlMessage;
 
-    use crate::common::{Pins, identity};
+    use crate::common::{Pins, both_loopbacks, dual_stack, dual_stack_available, identity};
+
+    if !dual_stack_available("a_late_competing_connection_takes_over_or_gives_way_silently") {
+        return;
+    }
 
     let mut rounds = tokio::task::JoinSet::new();
     // Fresh random identities put the smaller NodeId on either side; several rounds cover both.
     for round in 0..8 {
         rounds.spawn(async move {
             let (ida, idb) = (identity(), identity());
-            let any = "0.0.0.0:0".parse().unwrap();
-            let mut a = Node::start_with("a", ida.clone(), Pins::of(&[&idb]), any, false);
-            let mut b = Node::start_with("b", idb.clone(), Pins::of(&[&ida]), any, false);
-            let at =
-                |node: &Node, last: u8| SocketAddr::from(([127, 0, 0, last], node.addr().port()));
+            // Dual-stack nodes: 127.0.0.1 and [::1] are two addresses of one node.
+            let mut a = Node::start_with("a", ida.clone(), Pins::of(&[&idb]), dual_stack(), false);
+            let mut b = Node::start_with("b", idb.clone(), Pins::of(&[&ida]), dual_stack(), false);
 
             // A dials B; both engines are told, and fetch their handles.
-            a.transport.connect(at(&b, 1)).await.unwrap();
+            a.transport
+                .connect(both_loopbacks(b.addr().port()).0)
+                .await
+                .unwrap();
             a.expect_hello(b.id, "b").await;
             b.expect_hello(a.id, "a").await;
             let mut a_link = a.transport.link(b.id).unwrap();
@@ -128,7 +131,10 @@ async fn a_late_competing_connection_takes_over_or_gives_way_silently() {
             // Then B dials A at another address of A: a competing connection in the opposite
             // direction.
             assert_eq!(
-                b.transport.connect(at(&a, 2)).await.unwrap(),
+                b.transport
+                    .connect(both_loopbacks(a.addr().port()).1)
+                    .await
+                    .unwrap(),
                 a.id,
                 "round {round}"
             );
@@ -205,5 +211,26 @@ async fn concurrent_connects_make_a_single_handshake() {
     assert_eq!(one.unwrap(), b.id);
     assert_eq!(two.unwrap(), b.id);
     assert_eq!(three.unwrap(), b.id);
+    assert_eq!(a.transport.inner.endpoint.stats().outgoing_handshakes, 1);
+}
+
+/// On a dual-stack endpoint an IPv4 peer is reported IPv4-mapped; the same peer written either way
+/// is one address, so asking again finds the connection instead of dialing a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_peer_written_two_ways_is_one_address() {
+    use crate::common::{Pins, dual_stack, dual_stack_available, identity};
+
+    if !dual_stack_available("one_peer_written_two_ways_is_one_address") {
+        return;
+    }
+    let (ida, idb) = (identity(), identity());
+    let a = Node::start_with("a", ida.clone(), Pins::of(&[&idb]), dual_stack(), false);
+    let b = Node::start_with("b", idb.clone(), Pins::of(&[&ida]), dual_stack(), false);
+    let port = b.addr().port();
+    let plain: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let mapped: std::net::SocketAddr = format!("[::ffff:127.0.0.1]:{port}").parse().unwrap();
+
+    assert_eq!(a.transport.connect(plain).await.unwrap(), b.id);
+    assert_eq!(a.transport.connect(mapped).await.unwrap(), b.id);
     assert_eq!(a.transport.inner.endpoint.stats().outgoing_handshakes, 1);
 }

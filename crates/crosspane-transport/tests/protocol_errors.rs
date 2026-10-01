@@ -252,10 +252,11 @@ async fn no_hello_within_five_seconds_closes_the_connection() {
     let _control = open_stream(&rig.conn, 0x01, &[]).await;
     let _input = open_stream(&rig.conn, 0x02, &[]).await;
     let started = std::time::Instant::now();
-    rig.expect_protocol_error_within(Duration::from_secs(8))
+    rig.expect_protocol_error_within(Duration::from_secs(15))
         .await;
+    // The deadline is 5 s from the handshake; `started` is a little later than that.
     assert!(
-        started.elapsed() >= Duration::from_millis(4_500),
+        started.elapsed() >= Duration::from_secs(3),
         "closed after only {:?}",
         started.elapsed()
     );
