@@ -473,6 +473,8 @@ impl AxWindow {
         // each element is additionally downcast before use.
         let values = unsafe { values.cast_unchecked::<CFType>() };
         let mut found = None;
+        // What each AX window looked like, for the error when none matches.
+        let mut seen = Vec::new();
         for value in values.iter() {
             let element = value
                 .downcast::<AXUIElement>()
@@ -483,6 +485,10 @@ impl AxWindow {
                 Err(PlatformError::NotFound) => continue,
                 Err(error) => return Err(error),
             };
+            seen.push(format!(
+                "({:.0},{:.0} {:.0}x{:.0})",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+            ));
             let matches = (frame.origin.x - raw.frame.origin.x).abs() <= 2.0
                 && (frame.origin.y - raw.frame.origin.y).abs() <= 2.0
                 && (frame.size.width - raw.frame.size.width).abs() <= 2.0
@@ -496,6 +502,7 @@ impl AxWindow {
                     .downcast::<CFString>()
                     .map_err(|_| PlatformError::Backend("AXTitle is not a string".into()))?;
                 if title.to_string() != raw.title {
+                    seen.push(format!("title {:?}", title.to_string()));
                     continue;
                 }
             }
@@ -504,8 +511,17 @@ impl AxWindow {
             }
             found = Some(window);
         }
-        found
-            .ok_or_else(|| PlatformError::Backend("Quartz window has no matching AX window".into()))
+        found.ok_or_else(|| {
+            PlatformError::Backend(format!(
+                "Quartz window ({:.0},{:.0} {:.0}x{:.0}) has no matching AX window among {} [{}]",
+                raw.frame.origin.x,
+                raw.frame.origin.y,
+                raw.frame.size.width,
+                raw.frame.size.height,
+                values.len(),
+                seen.join(" "),
+            ))
+        })
     }
 
     pub(crate) fn frame(&self) -> Result<RectLogical, PlatformError> {
