@@ -261,6 +261,128 @@ fn live_textedit_capture_resize_and_blocked_end() {
     drop(fixture);
 }
 
+#[test]
+fn live_display_native_buffers_sixty_seconds() {
+    use crosspane_platform::Frame;
+    use crosspane_platform_macos::frame_capture::held_capture_buffers;
+    use crosspane_types::id::DisplayId;
+    use objc2_core_graphics::CGMainDisplayID;
+    use std::collections::VecDeque;
+    use std::hash::{DefaultHasher, Hasher};
+    use std::sync::Mutex;
+
+    if std::env::var("CROSSPANE_MAC_LIVE").as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: 60 s display retention/CPU test requires CROSSPANE_MAC_LIVE=1 in the lead's GUI session"
+        );
+        return;
+    }
+    assert!(CGPreflightScreenCaptureAccess());
+    // Apple's public time.h defines CLOCK_PROCESS_CPUTIME_ID as 12.
+    unsafe extern "C" {
+        fn clock_gettime_nsec_np(clock: u32) -> u64;
+    }
+    let cpu_time = || {
+        // SAFETY: Public observation-only process clock, no pointers or mutable state.
+        unsafe { clock_gettime_nsec_np(12) }
+    };
+    let fixture = TextEditWindow(applescript("tell application \"TextEdit\"\nset d to make new document with properties {text:\"Crosspane native capture fixture\"}\nreturn id of first window whose document is d\nend tell").parse().unwrap());
+    let gate = IoGate::new();
+    gate.set_session_permits(true);
+    gate.set_engine_permits(true);
+    let mut capture = MacFrameCapture::new(gate).unwrap();
+    let held = Arc::new(Mutex::new(VecDeque::<Frame>::new()));
+    let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink_held = Arc::clone(&held);
+    let sink_received = Arc::clone(&received);
+    let stream = capture
+        .start(
+            CaptureTarget::Display(DisplayId(CGMainDisplayID())),
+            None,
+            30,
+            Arc::new(move |event| {
+                match event {
+                    FrameEvent::Frame { frame, .. } => {
+                        let mut held = sink_held.lock().unwrap();
+                        // The callback's incoming buffer plus the previous two is at most three.
+                        assert!(held_capture_buffers() <= 3);
+                        if held.len() == 2 {
+                            held.pop_front();
+                        }
+                        held.push_back(frame);
+                        sink_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    FrameEvent::Ended {
+                        reason: StreamEndReason::Requested,
+                        ..
+                    } => {}
+                    FrameEvent::Ended { reason, .. } => panic!("display stream ended: {reason:?}"),
+                    _ => {}
+                }
+            }),
+        )
+        .unwrap();
+    let start = Instant::now();
+    let mut frames = 0;
+    let mut totals = [0u64; 2];
+    let mut checksum = 0;
+    let mut last_count = 0;
+    let mut change = 0;
+    let mut last_arrival = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        change += 1;
+        applescript(&format!(
+            "tell application \"TextEdit\" to set text of document of window id {} to \"Crosspane native fixture {}\"",
+            fixture.0, change
+        ));
+        std::thread::sleep(Duration::from_millis(100));
+        let count = received.load(std::sync::atomic::Ordering::Relaxed);
+        if count != last_count {
+            last_count = count;
+            last_arrival = Instant::now();
+        }
+        assert!(
+            last_arrival.elapsed() < Duration::from_secs(3),
+            "SCK stalled with two buffers held"
+        );
+        let held = held.lock().unwrap();
+        if let Some(frame) = held.back() {
+            let hash_rows = |pixels: &[u8], stride: u32| {
+                let mut hash = DefaultHasher::new();
+                for row in pixels
+                    .chunks(stride as usize)
+                    .take(frame.size.height as usize)
+                {
+                    hash.write(&row[..frame.size.width as usize * 4]);
+                }
+                hash.finish()
+            };
+            let before = cpu_time();
+            let native_hash = frame.with_pixels(hash_rows).unwrap();
+            totals[0] += cpu_time() - before;
+            let before = cpu_time();
+            let (pixels, stride) = frame.to_cpu().unwrap();
+            let copied_hash = hash_rows(&pixels, stride);
+            totals[1] += cpu_time() - before;
+            assert_eq!(native_hash, copied_hash);
+            checksum ^= native_hash;
+            frames += 1;
+        }
+    }
+    assert!(frames >= 300, "only {frames} processed samples in 60 s");
+    assert!(last_count >= 300, "only {last_count} captures in 60 s");
+    eprintln!(
+        "display native: received={last_count}, measured={frames}, process CPU ns/frame read+hash={}, copy+hash={}, checksum={checksum}",
+        totals[0] / frames,
+        totals[1] / frames
+    );
+    capture.stop(stream).unwrap();
+    drop(capture);
+    held.lock().unwrap().clear();
+    assert_eq!(held_capture_buffers(), 0);
+    drop(fixture);
+}
+
 // Like private_vdisplay.rs, compile this file as a small driver: libtest owns main, but
 // the cursor watcher's AppKit calls require a running main-thread application loop.
 #[cfg(not(crosspane_cursor_driver))]

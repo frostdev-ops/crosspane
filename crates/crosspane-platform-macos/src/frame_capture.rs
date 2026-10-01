@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use crosspane_media::codec::NativeInput;
 use crosspane_platform::{
-    CaptureTarget, EventSink, FrameCapture, FrameEvent, IoGate, Permission, PermissionState,
-    PlatformError, StreamEndReason, StreamId,
+    CaptureTarget, EventSink, FrameCapture, FrameEvent, IoGate, NativeImage, Permission,
+    PermissionState, PlatformError, StreamEndReason, StreamId,
 };
 use crosspane_types::geom::{PixelRect, PixelSize};
 use objc2::MainThreadMarker;
@@ -23,6 +24,20 @@ use crate::permissions;
 const TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 const RESIZE_POLL: Duration = Duration::from_millis(250);
+
+/// A captured frame as encoder input: VideoToolbox converts SCK's IOSurface itself. `None` when
+/// `image` isn't a frame this crate captured.
+pub fn capture_input(image: &Arc<dyn NativeImage>) -> Option<Arc<dyn NativeInput>> {
+    image.as_any().downcast_ref::<native::SckImage>()?;
+    Some(Arc::new(native::CaptureInput(Arc::clone(image))))
+}
+
+/// How many captured buffers are alive now (all streams); for tests and diagnostics.
+pub fn held_capture_buffers() -> usize {
+    native::HELD_BUFFERS.load(Ordering::Relaxed)
+}
+
+pub(crate) use native::{CaptureInput, SckImage};
 
 struct Delivery {
     sink: Arc<dyn EventSink<FrameEvent>>,
@@ -97,11 +112,11 @@ impl Shared {
             delivery.full_damage = true;
             return;
         }
-        let Some(mut frame) = native::copy_sample(sample, delivery.scale, delivery.crop) else {
+        let Some(mut frame) = native::native_sample(sample, delivery.scale, delivery.crop) else {
             delivery.full_damage = true;
             return;
         };
-        // A close during the IOSurface copy must suppress the copied frame too.
+        // A close while retaining the IOSurface must suppress the frame too.
         if !self.permitted() {
             drop(deliveries);
             self.end_all(StreamEndReason::Blocked);
