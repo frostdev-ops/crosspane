@@ -13,9 +13,15 @@ pub struct Negotiated {
 
 /// Combine the local minor version and features with the peer's `Hello`.
 pub fn negotiate(local_minor: u32, local_features: &[String], remote: &Hello) -> Negotiated {
-    let _ = (local_minor, local_features, remote);
+    let mut features: Vec<_> = local_features
+        .iter()
+        .filter(|feature| remote.features.contains(feature))
+        .cloned()
+        .collect();
+    features.sort_unstable();
+    features.dedup();
     Negotiated {
-        minor: 0,
-        features: Vec::new(),
+        minor: local_minor.min(remote.minor),
+        features,
     }
 }

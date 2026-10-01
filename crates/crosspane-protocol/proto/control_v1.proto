@@ -1,0 +1,55 @@
+syntax = "proto3";
+package crosspane.control.v1;
+
+message ControlMessage {
+  oneof body {
+    Hello hello = 1;
+    Displays displays = 2;
+    Layout layout = 3;
+    StartControl start_control = 4;
+    ControlStarted control_started = 5;
+    ControlRefused control_refused = 6;
+    EndControl end_control = 7;
+    Grants grants = 8;
+    Revocation revocation = 9;
+    Ping ping = 10;
+    Pong pong = 11;
+    Goodbye goodbye = 12;
+  }
+}
+
+message Hello { uint32 minor = 1; string name = 2; repeated string features = 3; repeated Display displays = 4; }
+
+enum ColorSpace { COLOR_SPACE_SRGB = 0; COLOR_SPACE_DISPLAY_P3 = 1; COLOR_SPACE_BT709 = 2; }
+
+message Display {
+  uint32 id = 1; string name = 2;
+  double physical_w_mm = 3; double physical_h_mm = 4;
+  uint32 pixel_w = 5; uint32 pixel_h = 6;
+  double scale = 7; double logical_x = 8; double logical_y = 9;
+  uint32 refresh_millihz = 10; ColorSpace color_space = 11; bool hdr = 12;
+}
+message Displays { repeated Display displays = 1; }
+
+message Placement { bytes node = 1; uint32 display = 2; double origin_x_mm = 3; double origin_y_mm = 4; uint64 version = 5; }
+message Layout { repeated Placement placements = 1; }
+
+enum LockKey { LOCK_KEY_UNKNOWN = 0; LOCK_KEY_OFF = 1; LOCK_KEY_ON = 2; }
+message LockKeys { LockKey caps = 1; LockKey num = 2; LockKey scroll = 3; }
+
+message StartControl { uint64 session = 1; uint32 entry_display = 2; double entry_x = 3; double entry_y = 4; LockKeys lock_keys = 5; }
+message ControlStarted { uint64 session = 1; }
+
+enum Refusal { REFUSAL_UNSPECIFIED = 0; REFUSAL_PERMISSION = 1; REFUSAL_LOCKED = 2; REFUSAL_SECURE_INPUT = 3; REFUSAL_BUSY = 4; REFUSAL_INJECTOR_FAILED = 5; }
+message ControlRefused { uint64 session = 1; Refusal reason = 2; }
+
+enum EndReason { END_REASON_UNSPECIFIED = 0; END_REASON_RELEASED = 1; END_REASON_PANIC = 2; END_REASON_TARGET_LOCKED = 3; END_REASON_CONTROLLER_LOCKED = 4; END_REASON_LINK_LOST = 5; END_REASON_REVOKED = 6; }
+message EndControl { uint64 session = 1; EndReason reason = 2; }
+
+enum Capability { CAPABILITY_UNSPECIFIED = 0; CAPABILITY_INPUT_ACCEPT = 1; CAPABILITY_WINDOW_SHARE = 2; CAPABILITY_WINDOW_BROWSE = 3; CAPABILITY_WINDOW_PRESENT = 4; }
+message Grants { repeated Capability capabilities = 1; }
+
+message Revocation { bytes revoked = 1; bytes issuer = 2; uint64 issued_at_ms = 3; bytes signature = 4; }
+message Ping { uint64 t0 = 1; }
+message Pong { uint64 t0 = 1; uint64 t1 = 2; uint64 t2 = 3; }
+message Goodbye { string message = 1; }
