@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+exclude = ["spikes", "fuzz"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/frostdev-ops/crosspane"
+publish = false
+
+[workspace.dependencies]
+span-types = { path = "crates/span-types" }
+span-protocol = { path = "crates/span-protocol" }
+span-security = { path = "crates/span-security" }
+span-input = { path = "crates/span-input" }
+span-media = { path = "crates/span-media" }
+span-platform = { path = "crates/span-platform" }
+span-engine = { path = "crates/span-engine" }
+span-transport = { path = "crates/span-transport" }
+span-render = { path = "crates/span-render" }
+span-testkit = { path = "crates/span-testkit" }
+span-platform-linux = { path = "crates/span-platform-linux" }
+span-platform-macos = { path = "crates/span-platform-macos" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"

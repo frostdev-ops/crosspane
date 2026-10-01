@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      hosted_macos:
+        description: Also run on a GitHub-hosted macOS runner (billed minutes)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        # With no argument, rustup installs the toolchain (and components) named in rust-toolchain.toml.
+        run: rustup toolchain install
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check for preinstalled tools
+        id: tools
+        shell: bash
+        run: |
+          if command -v cargo-nextest >/dev/null && command -v cargo-deny >/dev/null; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install check tools
+        if: steps.tools.outputs.installed != 'true'
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest,cargo-deny
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo nextest run --workspace --locked --no-tests=pass
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check dependency policy
+        run: cargo deny check
+      - name: Check layering
+        run: scripts/check-layering.sh
+
+  macos:
+    if: vars.SPAN_MAC_RUNNER == 'true'
+    runs-on: [self-hosted, macOS, ARM64, span-mac]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        # With no argument, rustup installs the toolchain (and components) named in rust-toolchain.toml.
+        run: rustup toolchain install
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check for preinstalled tools
+        id: tools
+        shell: bash
+        run: |
+          if command -v cargo-nextest >/dev/null && command -v cargo-deny >/dev/null; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install check tools
+        if: steps.tools.outputs.installed != 'true'
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest,cargo-deny
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo nextest run --workspace --locked --no-tests=pass
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check dependency policy
+        run: cargo deny check
+      - name: Check layering
+        run: scripts/check-layering.sh
+
+  macos-hosted:
+    if: github.event_name == 'workflow_dispatch' && inputs.hosted_macos
+    runs-on: macos-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        # With no argument, rustup installs the toolchain (and components) named in rust-toolchain.toml.
+        run: rustup toolchain install
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check for preinstalled tools
+        id: tools
+        shell: bash
+        run: |
+          if command -v cargo-nextest >/dev/null && command -v cargo-deny >/dev/null; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install check tools
+        if: steps.tools.outputs.installed != 'true'
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest,cargo-deny
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo nextest run --workspace --locked --no-tests=pass
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check dependency policy
+        run: cargo deny check
+      - name: Check layering
+        run: scripts/check-layering.sh
