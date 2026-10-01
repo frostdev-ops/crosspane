@@ -402,6 +402,8 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
         },
         3,
     );
+    // Another window has focus on the source, so focusing the proxy activates this one.
+    f.handle(Input::Windows(WindowEvent::Focused(Some(WindowId(99)))), 3);
     assert_eq!(
         f.handle(
             control(
@@ -2140,9 +2142,58 @@ fn source_rejects_invalid_sizes_without_parking_or_overwriting_valid_resize() {
 }
 
 #[test]
+fn early_focus_activates_when_live_and_a_focused_window_is_left_alone() {
+    let focus = |focused| {
+        control(
+            B,
+            Message::Focus {
+                projection: ID,
+                focused,
+            },
+        )
+    };
+    // The proxy has focus before the capture is live: remembered, acted on when it is.
+    let mut f = startup(2);
+    f.handle(Input::Windows(WindowEvent::Focused(Some(WindowId(99)))), 35);
+    assert!(f.handle(focus(true), 36).is_empty());
+    let live = f.handle(
+        Input::CaptureStarted {
+            projection: ID,
+            result: Ok(StreamId(1)),
+        },
+        40,
+    );
+    assert!(live.contains(&Output::ActivateWindow { window: WINDOW }));
+    // Focus taken back before it went live: nothing to activate.
+    let mut f = startup(2);
+    f.handle(Input::Windows(WindowEvent::Focused(Some(WindowId(99)))), 35);
+    f.handle(focus(true), 36);
+    f.handle(focus(false), 37);
+    let live = f.handle(
+        Input::CaptureStarted {
+            projection: ID,
+            result: Ok(StreamId(1)),
+        },
+        40,
+    );
+    assert!(!live.contains(&Output::ActivateWindow { window: WINDOW }));
+    // The window is already focused (window sources report only changes): no activation, and
+    // keys go straight through instead of waiting for a confirmation that never comes.
+    let mut f = startup(3);
+    assert!(f.handle(focus(true), 40).is_empty());
+    let keys = f.handle(input(B, press(1, true)), 41);
+    assert!(
+        keys.iter().any(|o| matches!(o, Output::Inject { .. })),
+        "{keys:?}"
+    );
+    f.handle(input(B, press(2, false)), 42);
+}
+
+#[test]
 fn source_focus_and_keyframe_controls_require_live_stage() {
     for stage in 0..4 {
         let mut f = startup(stage);
+        f.handle(Input::Windows(WindowEvent::Focused(Some(WindowId(99)))), 35);
         let focus = f.handle(
             control(
                 B,
