@@ -1,4 +1,4 @@
-//! CPU output capture through ext-image-copy-capture-v1. Native objects belong to one thread.
+//! CPU output and window capture through ext-image-copy-capture-v1. Native objects belong to one thread.
 //!
 //! Hyprland 0.56.2 cannot capture compositor-drawn themed or cursor-shape-v1 cursors. In
 //! `src/managers/screenshare/CursorshareSession.cpp`, `render()` clears the cursor frame:
@@ -32,14 +32,19 @@ use crosspane_platform::{
     StreamEndReason, StreamId,
 };
 use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
-use crosspane_types::id::DisplayId;
+use crosspane_types::id::WindowId;
 use crosspane_types::time::MonoTime;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop};
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1::{self as handle_protocol, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self as list_protocol, ExtForeignToplevelListV1},
+};
 use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1,
     ext_image_capture_source_v1::ExtImageCaptureSourceV1,
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
 };
@@ -60,7 +65,7 @@ const CALL_TIMEOUT: Duration = Duration::from_millis(1800);
 const GATE_POLL: Duration = Duration::from_millis(10);
 const CURSOR_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_u64.div_ceil(30));
 
-/// Bounded command handle for all output capture streams on one Wayland connection.
+/// Bounded command handle for all output and window capture streams on one Wayland connection.
 #[derive(Debug)]
 pub struct HyprlandFrameCapture {
     commands: mpsc::Sender<Command>,
@@ -73,15 +78,24 @@ pub struct HyprlandFrameCapture {
 }
 
 struct Lookup {
-    display: DisplayId,
+    target: CaptureTarget,
     deadline: Instant,
-    reply: mpsc::Sender<Result<String, PlatformError>>,
+    reply: mpsc::Sender<Result<ResolvedTarget, PlatformError>>,
+}
+
+enum ResolvedTarget {
+    Output(String),
+    Window {
+        id: WindowId,
+        app_id: String,
+        title: String,
+    },
 }
 
 enum Request {
     Start {
         id: StreamId,
-        output: String,
+        target: ResolvedTarget,
         crop: Option<PixelRect>,
         max_fps: u32,
         sink: Arc<dyn EventSink<FrameEvent>>,
@@ -158,13 +172,46 @@ impl HyprlandFrameCapture {
                     let result = if Instant::now() >= lookup.deadline {
                         Err(PlatformError::Timeout)
                     } else {
-                        ipc.monitor_ids().and_then(|monitors| {
-                            monitors
-                                .into_iter()
-                                .find(|(_, id)| *id == lookup.display.0)
-                                .map(|(name, _)| name)
-                                .ok_or(PlatformError::NotFound)
-                        })
+                        match lookup.target {
+                            CaptureTarget::Display(display) => {
+                                ipc.monitor_ids().and_then(|monitors| {
+                                    monitors
+                                        .into_iter()
+                                        .find(|(_, id)| *id == display.0)
+                                        .map(|(name, _)| ResolvedTarget::Output(name))
+                                        .ok_or(PlatformError::NotFound)
+                                })
+                            }
+                            CaptureTarget::Window(id) => ipc.json("clients").and_then(|clients| {
+                                let client = clients
+                                    .as_array()
+                                    .and_then(|clients| {
+                                        clients.iter().find(|client| {
+                                            client["stableId"].as_str().and_then(parse_identifier)
+                                                == Some(id.0)
+                                                && client["mapped"].as_bool() == Some(true)
+                                        })
+                                    })
+                                    .ok_or(PlatformError::NotFound)?;
+                                let title = client["title"]
+                                    .as_str()
+                                    .ok_or_else(|| backend("missing client title"))?;
+                                let class = client["class"]
+                                    .as_str()
+                                    .ok_or_else(|| backend("missing client class"))?;
+                                let app_id = if class.is_empty() {
+                                    client["initialClass"].as_str().unwrap_or(class)
+                                } else {
+                                    class
+                                };
+                                Ok(ResolvedTarget::Window {
+                                    id,
+                                    app_id: app_id.into(),
+                                    title: title.into(),
+                                })
+                            }),
+                            _ => Err(PlatformError::Unsupported("capture target")),
+                        }
                     };
                     let _ = lookup.reply.send(result);
                 }
@@ -212,9 +259,6 @@ impl FrameCapture for HyprlandFrameCapture {
         max_fps: u32,
         sink: Arc<dyn EventSink<FrameEvent>>,
     ) -> Result<StreamId, PlatformError> {
-        let CaptureTarget::Display(display) = target else {
-            return Err(PlatformError::Unsupported("output capture only"));
-        };
         if !self.gate.is_open() {
             return Err(PlatformError::Locked);
         }
@@ -225,12 +269,12 @@ impl FrameCapture for HyprlandFrameCapture {
         let (reply, result) = mpsc::channel();
         self.lookups
             .send(Lookup {
-                display,
+                target,
                 deadline,
                 reply,
             })
             .map_err(|_| backend("monitor lookup unavailable"))?;
-        let output = receive(&result, deadline)??;
+        let target = receive(&result, deadline)??;
         let id = StreamId(self.next_id);
         self.next_id = self
             .next_id
@@ -239,7 +283,7 @@ impl FrameCapture for HyprlandFrameCapture {
         self.call(
             Request::Start {
                 id,
-                output,
+                target,
                 crop,
                 max_fps,
                 sink,
@@ -694,7 +738,8 @@ fn cursor_image(
 }
 
 struct Stream {
-    output: u32,
+    output: Option<u32>,
+    toplevel: Option<ExtForeignToplevelHandleV1>,
     source: ExtImageCaptureSourceV1,
     session: ExtImageCopyCaptureSessionV1,
     sink: Arc<dyn EventSink<FrameEvent>>,
@@ -705,6 +750,7 @@ struct Stream {
     reallocate: bool,
     buffer: Option<Buffer>,
     capture: Option<Capture>,
+    held: Option<Frame>,
     next_slot: Instant,
     interval: Duration,
     full_damage: bool,
@@ -738,12 +784,36 @@ struct Output {
     name: String,
 }
 
+#[derive(Default)]
+struct ToplevelProperties {
+    identifier: String,
+    app_id: String,
+    title: String,
+}
+
+struct Toplevel {
+    proxy: ExtForeignToplevelHandleV1,
+    current: Option<ToplevelProperties>,
+    pending: ToplevelProperties,
+}
+
+fn parse_identifier(value: &str) -> Option<u64> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(value, 16).ok()
+}
+
 struct State {
     gate: Arc<IoGate>,
     /// Whether new streams open a cursor session.
     cursors: Arc<AtomicBool>,
     manager: Option<ExtImageCopyCaptureManagerV1>,
     sources: Option<ExtOutputImageCaptureSourceManagerV1>,
+    toplevel_list: Option<ExtForeignToplevelListV1>,
+    window_sources: Option<ExtForeignToplevelImageCaptureSourceManagerV1>,
+    toplevels: Vec<Toplevel>,
     shm: Option<wl_shm::WlShm>,
     seat: Option<wl_seat::WlSeat>,
     seat_name: Option<u32>,
@@ -838,6 +908,29 @@ impl State {
     }
 }
 
+fn flush_window_request(connection: &Connection) -> Result<bool, PlatformError> {
+    match connection.flush() {
+        Ok(()) => Ok(true),
+        Err(wayland_client::backend::WaylandError::Io(error))
+            if error.kind() == ErrorKind::WouldBlock =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(backend(error)),
+    }
+}
+
+fn deliver_window(stream: &mut Stream, id: StreamId, gate: &IoGate) {
+    if stream.toplevel.is_some()
+        && gate.is_open()
+        && Instant::now() >= stream.next_slot
+        && let Some(frame) = stream.held.take()
+    {
+        emit(&stream.sink, FrameEvent::Frame { stream: id, frame });
+        stream.next_slot = Instant::now() + stream.interval;
+    }
+}
+
 fn emit(sink: &Arc<dyn EventSink<FrameEvent>>, event: FrameEvent) {
     if catch_unwind(AssertUnwindSafe(|| sink.send(event))).is_err() {
         tracing::warn!("frame event sink panicked");
@@ -870,6 +963,9 @@ impl Worker {
                 cursors,
                 manager: None,
                 sources: None,
+                toplevel_list: None,
+                window_sources: None,
+                toplevels: Vec::new(),
                 shm: None,
                 seat: None,
                 seat_name: None,
@@ -933,8 +1029,9 @@ impl Worker {
                 .values()
                 .flat_map(|stream| {
                     [
-                        (stream.capture.is_none() && stream.constraints.is_some())
-                            .then_some(stream.next_slot),
+                        ((stream.capture.is_none() && stream.constraints.is_some())
+                            || stream.held.is_some())
+                        .then_some(stream.next_slot),
                         stream.cursor.as_ref().and_then(CursorCapture::deadline),
                     ]
                     .into_iter()
@@ -955,12 +1052,12 @@ impl Worker {
             match command.request {
                 Request::Start {
                     id,
-                    output,
+                    target,
                     crop,
                     max_fps,
                     sink,
                 } => {
-                    let result = self.begin(id, &output, crop, max_fps, sink);
+                    let result = self.begin(id, &target, crop, max_fps, sink);
                     if result.is_ok() {
                         if let Some(stream) = self.state.streams.get_mut(&id) {
                             stream.pending = Some(PendingStart {
@@ -985,6 +1082,7 @@ impl Worker {
                         }) {
                             return Err(backend("crop must be nonempty and non-negative"));
                         }
+                        stream.held = None;
                         stream.crop = crop;
                         stream.full_damage = true;
                         Ok(())
@@ -1005,7 +1103,7 @@ impl Worker {
     fn begin(
         &mut self,
         id: StreamId,
-        name: &str,
+        target: &ResolvedTarget,
         crop: Option<PixelRect>,
         max_fps: u32,
         sink: Arc<dyn EventSink<FrameEvent>>,
@@ -1013,18 +1111,55 @@ impl Worker {
         if !self.state.gate.is_open() {
             return Err(PlatformError::Locked);
         }
-        let (&output, native) = self
-            .state
-            .outputs
-            .iter()
-            .find(|(_, output)| output.name == name)
-            .ok_or(PlatformError::NotFound)?;
-        let source = self
-            .state
-            .sources
-            .as_ref()
-            .ok_or(PlatformError::Unsupported("output capture source required"))?
-            .create_source(&native.proxy, &self.qh, ());
+        let (output, toplevel, source) = match target {
+            ResolvedTarget::Output(name) => {
+                let (&output, native) = self
+                    .state
+                    .outputs
+                    .iter()
+                    .find(|(_, output)| output.name == *name)
+                    .ok_or(PlatformError::NotFound)?;
+                let source = self
+                    .state
+                    .sources
+                    .as_ref()
+                    .ok_or(PlatformError::Unsupported("output capture source required"))?
+                    .create_source(&native.proxy, &self.qh, ());
+                (Some(output), None, source)
+            }
+            ResolvedTarget::Window { id, app_id, title } => {
+                let manager =
+                    self.state
+                        .window_sources
+                        .as_ref()
+                        .ok_or(PlatformError::Unsupported(
+                            "toplevel capture source required",
+                        ))?;
+                let direct = self.state.toplevels.iter().find(|toplevel| {
+                    toplevel
+                        .current
+                        .as_ref()
+                        .is_some_and(|p| parse_identifier(&p.identifier) == Some(id.0))
+                });
+                let native = if let Some(native) = direct {
+                    native
+                } else {
+                    let mut matches = self.state.toplevels.iter().filter(|toplevel| {
+                        toplevel
+                            .current
+                            .as_ref()
+                            .is_some_and(|p| p.app_id == *app_id && p.title == *title)
+                    });
+                    let native = matches.next().ok_or(PlatformError::NotFound)?;
+                    if matches.next().is_some() {
+                        return Err(PlatformError::NotFound);
+                    }
+                    native
+                };
+                let source = manager.create_source(&native.proxy, &self.qh, ());
+                (None, Some(native.proxy.clone()), source)
+            }
+        };
         let manager = self
             .state
             .manager
@@ -1035,6 +1170,7 @@ impl Worker {
             id,
             Stream {
                 output,
+                toplevel,
                 source,
                 session,
                 sink,
@@ -1045,6 +1181,7 @@ impl Worker {
                 reallocate: false,
                 buffer: None,
                 capture: None,
+                held: None,
                 next_slot: Instant::now(),
                 interval: Duration::from_nanos(1_000_000_000_u64.div_ceil(u64::from(max_fps))),
                 full_damage: true,
@@ -1063,7 +1200,7 @@ impl Worker {
         };
         // The output's constraints and first buffer must be ready before adding its cursor
         // session. An unavailable cursor path is attempted only once per stream.
-        if stream.pending.is_some() {
+        if stream.pending.is_some() || stream.toplevel.is_some() {
             return Ok(());
         }
         if !stream.cursor_started {
@@ -1152,22 +1289,36 @@ impl Worker {
                 self.state.end_all(StreamEndReason::Blocked);
                 return Ok(());
             }
-            emit(
-                &stream.sink,
-                FrameEvent::Frame {
-                    stream: id,
-                    frame: Frame {
-                        size,
-                        stride: size.width * 4,
-                        pixels,
-                        damage,
-                        at,
-                    },
-                },
-            );
-            stream.next_slot = Instant::now() + stream.interval;
+            let frame = Frame {
+                size,
+                stride: size.width * 4,
+                pixels,
+                damage,
+                at,
+            };
+            if stream.toplevel.is_some() {
+                // Captures stay outstanding; only delivery is throttled. Replacing a held
+                // frame must describe all changed pixels relative to the last delivered frame.
+                let mut frame = frame;
+                if stream.held.is_some() {
+                    frame.damage = Some(vec![PixelRect::new(
+                        point2(0, 0),
+                        point2(size.width as i32, size.height as i32),
+                    )]);
+                }
+                stream.held = Some(frame);
+            } else {
+                emit(&stream.sink, FrameEvent::Frame { stream: id, frame });
+                stream.next_slot = Instant::now() + stream.interval;
+            }
         }
-        if stream.capture.is_some() || Instant::now() < stream.next_slot {
+        if stream.capture.is_some()
+            || (stream.toplevel.is_none() && Instant::now() < stream.next_slot)
+        {
+            if stream.toplevel.is_some() && !flush_window_request(&self.connection)? {
+                return Ok(());
+            }
+            deliver_window(stream, id, &self.state.gate);
             return Ok(());
         }
         if stream.reallocate {
@@ -1209,6 +1360,14 @@ impl Worker {
                 ready: false,
                 constraints_revision: stream.constraints_revision,
             });
+        }
+        if stream.toplevel.is_some() {
+            // Put the replacement request on the wire before exposing ready to a caller
+            // which may immediately resize or update the source.
+            if !flush_window_request(&self.connection)? {
+                return Ok(());
+            }
+            deliver_window(stream, id, &self.state.gate);
         }
         Ok(())
     }
@@ -1291,6 +1450,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "ext_output_image_capture_source_manager_v1" => {
                     state.sources = Some(registry.bind(name, 1, qh, ()))
                 }
+                "ext_foreign_toplevel_list_v1" => {
+                    state.toplevel_list = Some(registry.bind(name, 1, qh, ()))
+                }
+                "ext_foreign_toplevel_image_capture_source_manager_v1" => {
+                    state.window_sources = Some(registry.bind(name, 1, qh, ()))
+                }
                 "wl_seat" if state.seat_name.is_none() => {
                     state.seat_name = Some(name);
                     state.seat = Some(registry.bind(name, version.min(9), qh, ()));
@@ -1318,7 +1483,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 let ids: Vec<_> = state
                     .streams
                     .iter()
-                    .filter_map(|(&id, stream)| (stream.output == name).then_some(id))
+                    .filter_map(|(&id, stream)| (stream.output == Some(name)).then_some(id))
                     .collect();
                 for id in ids {
                     state.end(id, StreamEndReason::TargetGone);
@@ -1331,6 +1496,89 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         }
     }
 }
+
+impl Dispatch<ExtForeignToplevelListV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtForeignToplevelListV1,
+        event: list_protocol::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        state.check_gate();
+        match event {
+            list_protocol::Event::Toplevel { toplevel } => state.toplevels.push(Toplevel {
+                proxy: toplevel,
+                current: None,
+                pending: ToplevelProperties::default(),
+            }),
+            list_protocol::Event::Finished => {
+                let ids: Vec<_> = state
+                    .streams
+                    .iter()
+                    .filter_map(|(&id, s)| s.toplevel.is_some().then_some(id))
+                    .collect();
+                for id in ids {
+                    state.end(id, StreamEndReason::TargetGone);
+                }
+                for toplevel in state.toplevels.drain(..) {
+                    toplevel.proxy.destroy();
+                }
+                proxy.destroy();
+                state.toplevel_list = None;
+            }
+            _ => (),
+        }
+    }
+    wayland_client::event_created_child!(State, ExtForeignToplevelListV1, [0 => (ExtForeignToplevelHandleV1, ())]);
+}
+
+impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtForeignToplevelHandleV1,
+        event: handle_protocol::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        state.check_gate();
+        if matches!(event, handle_protocol::Event::Closed) {
+            let ids: Vec<_> = state
+                .streams
+                .iter()
+                .filter_map(|(&id, s)| (s.toplevel.as_ref() == Some(proxy)).then_some(id))
+                .collect();
+            for id in ids {
+                state.end(id, StreamEndReason::TargetGone);
+            }
+            state.toplevels.retain(|t| &t.proxy != proxy);
+            proxy.destroy();
+            return;
+        }
+        let Some(toplevel) = state.toplevels.iter_mut().find(|t| &t.proxy == proxy) else {
+            return;
+        };
+        match event {
+            handle_protocol::Event::Identifier { identifier } => {
+                toplevel.pending.identifier = identifier
+            }
+            handle_protocol::Event::Title { title } => toplevel.pending.title = title,
+            handle_protocol::Event::AppId { app_id } => toplevel.pending.app_id = app_id,
+            handle_protocol::Event::Done => {
+                toplevel.current = Some(ToplevelProperties {
+                    identifier: toplevel.pending.identifier.clone(),
+                    app_id: toplevel.pending.app_id.clone(),
+                    title: toplevel.pending.title.clone(),
+                })
+            }
+            _ => (),
+        }
+    }
+}
+
+delegate_noop!(State: ignore ExtForeignToplevelImageCaptureSourceManagerV1);
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
     fn event(
@@ -1524,6 +1772,12 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, StreamId> for State {
                 format: WEnum::Value(format),
             } => stream.incoming.formats.push(format),
             session_protocol::Event::Done => {
+                if stream.toplevel.is_some() {
+                    stream.held = None;
+                    if let Some(capture) = stream.capture.take() {
+                        capture.proxy.destroy();
+                    }
+                }
                 stream.constraints = Some(std::mem::take(&mut stream.incoming));
                 stream.constraints_revision = stream.constraints_revision.wrapping_add(1);
                 stream.reallocate = true;
