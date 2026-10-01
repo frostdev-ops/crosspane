@@ -764,8 +764,14 @@ dependencies = [
 name = "crosspane-render"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "crosspane-media",
  "crosspane-types",
+ "pollster",
+ "thiserror 2.0.21",
+ "tracing",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
