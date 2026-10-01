@@ -12,6 +12,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod discovery;
 mod hub;
 mod link;
 mod media;

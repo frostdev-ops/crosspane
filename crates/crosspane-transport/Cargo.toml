@@ -14,6 +14,7 @@ workspace = true
 crosspane-types.workspace = true
 crosspane-protocol.workspace = true
 crosspane-security.workspace = true
+mdns-sd.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 tokio.workspace = true
