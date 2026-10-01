@@ -54,6 +54,9 @@ pub enum Revoked {
     IgnoredSelf,
     /// Already applied earlier.
     Duplicate,
+    /// Issued before the revoked node's current pairing (it was paired again since): ignored, so
+    /// an old notice can't undo a fresh pairing.
+    Stale,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -82,6 +85,14 @@ impl TrustStore {
 
     /// "Forget device" (04 §4). Returns the entry if it existed.
     pub fn forget(&mut self, node: NodeId) -> Option<PeerEntry> {
+        self.peers.remove(&node)
+    }
+
+    /// Revoke a lost or stolen device from this node (04 §4): forget it and refuse it until a
+    /// fresh pairing pins it again. The caller sends [`TrustStore::issue_revocation`]'s notice to
+    /// the other peers. Returns the entry if it was pinned.
+    pub fn revoke(&mut self, node: NodeId) -> Option<PeerEntry> {
+        self.revoked.insert(node);
         self.peers.remove(&node)
     }
 
@@ -176,6 +187,12 @@ impl TrustStore {
         }
         if self.is_revoked(notice.revoked) {
             return Ok(Revoked::Duplicate);
+        }
+        if self
+            .get(notice.revoked)
+            .is_some_and(|entry| entry.paired_at_ms > notice.issued_at_ms)
+        {
+            return Ok(Revoked::Stale);
         }
         let forgotten = self.forget(notice.revoked);
         self.revoked.insert(notice.revoked);

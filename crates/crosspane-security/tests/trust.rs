@@ -375,3 +375,49 @@ fn corrupt_json_is_rejected() {
     let empty = TrustStore::new();
     assert_eq!(TrustStore::from_json(&empty.to_json()), Ok(empty));
 }
+
+#[test]
+fn local_revoke_forgets_and_refuses_until_pinned_again() {
+    let c = DeviceIdentity::generate().unwrap();
+    let mut store = TrustStore::new();
+    store.pin(entry(&c)).unwrap();
+    assert!(store.revoke(c.node()).is_some());
+    assert!(store.is_revoked(c.node()));
+    assert_eq!(store.trusted(c.spki()), None);
+    assert!(!store.allows(c.node(), Capability::WindowShare));
+    // Revoking again (or an unknown node) returns nothing and stays revoked.
+    assert!(store.revoke(c.node()).is_none());
+    assert!(store.is_revoked(c.node()));
+    // It survives persistence.
+    let reloaded = TrustStore::from_json(&store.to_json()).unwrap();
+    assert!(reloaded.is_revoked(c.node()));
+    // A fresh pairing pins it again.
+    store.pin(entry(&c)).unwrap();
+    assert!(!store.is_revoked(c.node()));
+    assert_eq!(store.trusted(c.spki()), Some(c.node()));
+}
+
+#[test]
+fn a_notice_older_than_the_current_pairing_is_stale() {
+    let (a, b, c) = (
+        DeviceIdentity::generate().unwrap(),
+        DeviceIdentity::generate().unwrap(),
+        DeviceIdentity::generate().unwrap(),
+    );
+    let mut store = TrustStore::new();
+    store.pin(entry(&a)).unwrap();
+    // `entry` pairs at 42 ms: a notice from 41 ms predates it, one from 43 ms doesn't.
+    store.pin(entry(&c)).unwrap();
+    let old = TrustStore::issue_revocation(&a, c.node(), 41).unwrap();
+    assert!(matches!(
+        store.apply_revocation(&old, b.node()),
+        Ok(Revoked::Stale)
+    ));
+    assert_eq!(store.trusted(c.spki()), Some(c.node()));
+    let new = TrustStore::issue_revocation(&a, c.node(), 43).unwrap();
+    assert!(matches!(
+        store.apply_revocation(&new, b.node()),
+        Ok(Revoked::Applied { forgotten: Some(_) })
+    ));
+    assert_eq!(store.trusted(c.spki()), None);
+}

@@ -65,17 +65,23 @@ impl SharedTrust {
         }
     }
 
-    /// Change the store and save it.
+    /// Change the store and save it, all or nothing: the change applies in memory only once it
+    /// is on disk, so a failed save never leaves the two disagreeing (a restart would otherwise
+    /// undo a revocation the running agent already acted on).
     pub fn update<R>(&self, f: impl FnOnce(&mut TrustStore) -> Result<R>) -> Result<R> {
         let mut loaded = self
             .inner
             .write()
             .map_err(|_| anyhow::anyhow!("trust lock poisoned"))?;
-        let result = f(&mut loaded.store)?;
-        save(&self.path, &loaded.store)?;
-        loaded.modified = std::fs::metadata(&self.path)
-            .and_then(|m| m.modified())
-            .ok();
+        let mut next = loaded.store.clone();
+        let result = f(&mut next)?;
+        if next != loaded.store {
+            save(&self.path, &next)?;
+            loaded.store = next;
+            loaded.modified = std::fs::metadata(&self.path)
+                .and_then(|m| m.modified())
+                .ok();
+        }
         Ok(result)
     }
 }
@@ -101,4 +107,38 @@ fn read(path: &std::path::Path) -> Result<(TrustStore, Option<SystemTime>)> {
 
 fn save(path: &std::path::Path, store: &TrustStore) -> Result<()> {
     write_private(path, store.to_json().as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crosspane_security::identity::DeviceIdentity;
+    use crosspane_security::trust::{PeerEntry, default_grants};
+
+    #[test]
+    fn a_failed_save_changes_nothing_in_memory() {
+        // A path whose directory can't be created: every save fails.
+        let trust = SharedTrust::load(PathBuf::from("/proc/crosspane-test/trust.json")).unwrap();
+        let peer = DeviceIdentity::generate().unwrap();
+        let result = trust.update(|t| {
+            t.pin(PeerEntry {
+                node: peer.node(),
+                spki: peer.spki().to_vec(),
+                name: "x".into(),
+                granted: default_grants(),
+                paired_at_ms: 1,
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))
+        });
+        assert!(result.is_err());
+        assert!(trust.with(|t| t.get(peer.node()).is_none()));
+        // An update that changes nothing doesn't write (and so succeeds here).
+        assert!(
+            trust
+                .update(|t| Ok(t.forget(peer.node())))
+                .unwrap()
+                .is_none()
+        );
+    }
 }

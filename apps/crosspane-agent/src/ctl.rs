@@ -31,6 +31,11 @@ pub enum Request {
     Forget {
         peer: String,
     },
+    /// A lost or stolen device (04 §4): forget it, refuse it until it is paired again, and send
+    /// a signed revocation notice to every other paired peer (now, or when it next connects).
+    Revoke {
+        peer: String,
+    },
     /// List the windows `peer` lets this node pull (answered asynchronously).
     WindowsFrom {
         peer: String,

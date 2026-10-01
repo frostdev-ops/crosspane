@@ -9,6 +9,7 @@ mod net;
 mod pairing;
 mod paths;
 mod platform;
+mod revocations;
 mod tray;
 mod trust;
 // Twin-or-mirror parking is used only by macOS builds with `private-vdisplay`; its tests run
@@ -216,6 +217,7 @@ fn run() -> Result<()> {
         crossing: config.crossing,
         identity,
         port: config.port,
+        revocations: revocations::Issued::load(revocations::file_beside(&paths.trust_file())),
     };
     let mut agent = agent::Agent::new(
         node,
