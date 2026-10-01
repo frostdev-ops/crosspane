@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod accel;
+pub mod arrange;
 pub mod journal;
 pub mod layout;
 pub mod lease;

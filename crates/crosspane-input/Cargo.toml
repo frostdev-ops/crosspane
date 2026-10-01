@@ -14,6 +14,7 @@ workspace = true
 crosspane-types.workspace = true
 crosspane-platform.workspace = true
 crosspane-protocol.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

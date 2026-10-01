@@ -27,3 +27,9 @@ security-framework.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
+
+# AppKit needs the process's main thread, which libtest doesn't give tests (WP-1.24).
+[[test]]
+name = "overlay_gui"
+path = "tests/overlay_gui.rs"
+harness = false

@@ -683,6 +683,7 @@ dependencies = [
  "crosspane-protocol",
  "crosspane-types",
  "proptest",
+ "serde",
  "thiserror 2.0.21",
 ]
 
