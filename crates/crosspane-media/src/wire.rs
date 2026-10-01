@@ -13,6 +13,7 @@ pub const MAX_CURSOR: u32 = 256;
 const HOTSPOT_BYTES: usize = 8;
 /// Codec-2 flag: show the receiver's default cursor.
 const DEFAULT_CURSOR: u8 = 2;
+const VIDEO_REGION: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -116,12 +117,110 @@ pub fn read_video(data: &[u8]) -> Result<(FrameHeader, &[u8]), MediaError> {
         return Err(MediaError::BadCodec);
     }
     let (header, count) = parse_header(data)?;
+    if data[5] & VIDEO_REGION != 0 {
+        return Err(MediaError::BadReserved);
+    }
     let mut input = Reader::new(data.get(HEADER_BYTES..).ok_or(MediaError::Truncated)?);
     let access_unit = input.take(count as usize)?;
     if !input.remaining().is_empty() {
         return Err(MediaError::Trailing);
     }
     Ok((header, access_unit))
+}
+
+/// Where a region video picture goes in its frame (codec 1, flag bit 2; WP-2.32): the picture's
+/// top-left `width` × `height` pixels at (`x`, `y`) of the frame described by the header. Always
+/// tile-aligned: `x` and `y` are multiples of 64, and `x + width` is a multiple of 64 or the
+/// frame's width (likewise `y + height`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VideoRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn validate_region(header: FrameHeader, region: VideoRegion) -> Result<(), MediaError> {
+    tile_grid(header.width, header.height)?;
+    let right = region
+        .x
+        .checked_add(region.width)
+        .ok_or(MediaError::BadSize)?;
+    let bottom = region
+        .y
+        .checked_add(region.height)
+        .ok_or(MediaError::BadSize)?;
+    if region.width == 0
+        || region.height == 0
+        || right > header.width
+        || bottom > header.height
+        || !region.x.is_multiple_of(TILE)
+        || !region.y.is_multiple_of(TILE)
+        || (!right.is_multiple_of(TILE) && right != header.width)
+        || (!bottom.is_multiple_of(TILE) && bottom != header.height)
+    {
+        return Err(MediaError::BadSize);
+    }
+    Ok(())
+}
+
+/// `write_video` with a region: flag bit 2 set, and `x`, `y`, `width`, `height` (u32 LE each)
+/// before the access unit; the header's count is 16 + the access unit's length. `BadSize` for a
+/// region that's empty, outside the frame or not tile-aligned.
+pub fn write_video_region(
+    header: FrameHeader,
+    region: VideoRegion,
+    access_unit: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), MediaError> {
+    out.clear();
+    validate_region(header, region)?;
+    let count = access_unit
+        .len()
+        .checked_add(16)
+        .ok_or(MediaError::TooLarge)?;
+    let len = HEADER_BYTES
+        .checked_add(count)
+        .filter(|&len| len <= MAX_FRAME_BYTES)
+        .ok_or(MediaError::TooLarge)?;
+    out.try_reserve_exact(len)
+        .map_err(|_| MediaError::TooLarge)?;
+    write_codec_header(header, count as u32, Codec::H264, out);
+    out[5] |= VIDEO_REGION;
+    for value in [region.x, region.y, region.width, region.height] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(access_unit);
+    Ok(())
+}
+
+/// Parse a codec-1 frame with or without a region (validated as for `write_video_region`).
+/// `read_video` keeps rejecting region frames (`BadReserved`), so a caller can't miss the region.
+pub fn read_video_region(
+    data: &[u8],
+) -> Result<(FrameHeader, Option<VideoRegion>, &[u8]), MediaError> {
+    if read_codec(data)? != Codec::H264 {
+        return Err(MediaError::BadCodec);
+    }
+    let (header, count) = parse_header(data)?;
+    let mut frame = Reader::new(data.get(HEADER_BYTES..).ok_or(MediaError::Truncated)?);
+    let mut payload = Reader::new(frame.take(count as usize)?);
+    if !frame.remaining().is_empty() {
+        return Err(MediaError::Trailing);
+    }
+    let region = if data[5] & VIDEO_REGION != 0 {
+        let region = VideoRegion {
+            x: payload.u32()?,
+            y: payload.u32()?,
+            width: payload.u32()?,
+            height: payload.u32()?,
+        };
+        validate_region(header, region)?;
+        Some(region)
+    } else {
+        None
+    };
+    Ok((header, region, payload.remaining()))
 }
 
 /// Append a codec-2 frame: the CPF1 header for `header` (its `key` must be false) with a cursor
@@ -250,6 +349,8 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<(FrameHeader, u32), MediaError
     // Bit 0 is the key flag (tiles, video); codec 2 uses bit 1 alone (default cursor).
     let allowed = if codec == Codec::Cursor {
         DEFAULT_CURSOR
+    } else if codec == Codec::H264 {
+        1 | VIDEO_REGION
     } else {
         1
     };
