@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+if-addrs.workspace = true
 crosspane-types.workspace = true
 crosspane-media.workspace = true
 crosspane-platform.workspace = true
