@@ -119,6 +119,8 @@ pub struct Agent {
     /// Clock samples per peer, (round trip, offset) in ns, from the ping exchange.
     clocks: HashMap<NodeId, VecDeque<(u64, i64)>>,
     last_ping: Instant,
+    /// When each peer last answered a ping (only peers that answer pings are held to it).
+    last_pong: HashMap<NodeId, Instant>,
     pairing: crate::pairing::Pairing,
     identity: Arc<crosspane_security::identity::DeviceIdentity>,
     port: u16,
@@ -147,6 +149,8 @@ const HOUSEKEEPING: Duration = Duration::from_secs(1);
 /// Clock-offset pings to every peer (for frame latency).
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const CLOCK_SAMPLES: usize = 8;
+/// A peer that answers pings is considered gone after this long without an answer.
+const UNRESPONSIVE: Duration = Duration::from_secs(15);
 /// Above this smoothed RTT a "wired" path has a slower hop on the way (usually the peer's Wi-Fi).
 const WIRED_RTT: Duration = Duration::from_millis(3);
 const PERMISSION_CHECK: Duration = Duration::from_secs(2);
@@ -309,6 +313,7 @@ impl Agent {
             titles: HashMap::new(),
             clocks: HashMap::new(),
             last_ping: Instant::now(),
+            last_pong: HashMap::new(),
             pairing: crate::pairing::Pairing::default(),
             identity: e2.identity,
             port: e2.port,
@@ -516,6 +521,7 @@ impl Agent {
             LinkEvent::Closed { peer, error } => {
                 tracing::info!(peer = %peer.short(), ?error, "peer disconnected");
                 self.links.remove(peer);
+                self.last_pong.remove(peer);
                 if let Some(info) = self.peers.get_mut(peer) {
                     info.connected = false;
                     info.rtt = None;
@@ -1307,6 +1313,30 @@ impl Agent {
             .map_or_else(|| node.short(), |info| info.name.clone())
     }
 
+    /// QUIC declares a silent path dead only after its idle timeout, which grows with the probe
+    /// backoff (RFC 9000 §10.1: at least 3 PTOs), so a vanished peer (asleep, out of range) can
+    /// look connected for a minute or more. A peer that answers pings but hasn't for
+    /// `UNRESPONSIVE` has its link closed, which starts the E2 grace period (WP-2.15) promptly.
+    fn close_unresponsive(&mut self) {
+        let silent: Vec<NodeId> = self
+            .links
+            .keys()
+            .filter(|peer| {
+                self.last_pong
+                    .get(peer)
+                    .is_some_and(|at| at.elapsed() > UNRESPONSIVE)
+            })
+            .copied()
+            .collect();
+        for peer in silent {
+            tracing::info!(peer = %peer.short(), "peer stopped answering: closing the link");
+            self.last_pong.remove(&peer);
+            if let Some(link) = self.links.get_mut(&peer) {
+                link.close("unresponsive");
+            }
+        }
+    }
+
     /// The link class of each connected peer's current path (03 §2): the interface the OS routes
     /// the peer's address through.
     fn update_paths(&mut self) {
@@ -1365,6 +1395,7 @@ impl Agent {
     /// An NTP-style sample: the peer's clock minus ours is ((t1 - t0) + (t2 - t3)) / 2. The
     /// sample with the shortest round trip of the last few is the most trustworthy.
     fn on_pong(&mut self, peer: NodeId, t0: u64, t1: u64, t2: u64) {
+        self.last_pong.insert(peer, Instant::now());
         let t3 = platform::now().as_nanos();
         let (t0, t1, t2, t3) = (
             i128::from(t0),
@@ -1420,6 +1451,7 @@ impl Agent {
             let t0 = platform::now().as_nanos();
             self.broadcast(&ControlMessage::Ping { t0 });
             self.update_paths();
+            self.close_unresponsive();
         }
         if self.latency_overlay {
             self.latency_titles();
