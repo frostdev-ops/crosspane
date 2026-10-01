@@ -8,6 +8,7 @@
 
 #![deny(unsafe_code)]
 
+mod audio;
 pub mod config;
 pub mod e1;
 pub mod e2;
@@ -35,6 +36,7 @@ pub struct Engine {
     controller: ControllerE1,
     target: TargetE1,
     e2: E2,
+    audio: audio::Audio,
 }
 
 impl Engine {
@@ -58,6 +60,7 @@ impl Engine {
                 controller,
                 target,
                 e2,
+                audio: audio::Audio::new(config.node),
             },
             out,
         ))
@@ -116,6 +119,17 @@ impl Engine {
             self.target.handle(&input, now, &mut out);
         }
         self.e2.handle(&input, now, &mut out);
+        let audio_gates: Vec<_> = out
+            .iter()
+            .filter_map(|output| match output {
+                Output::EngineGate(permits) => Some(*permits),
+                _ => None,
+            })
+            .collect();
+        for permits in audio_gates {
+            self.audio.engine_gate(permits, &mut out);
+        }
+        self.audio.handle(&input, now, &mut out);
         let controlled = self.target.is_controlled();
         if controlled {
             out.retain(|o| !matches!(o, Output::SetPortals(_)));
@@ -149,6 +163,7 @@ impl Engine {
             self.controller.next_deadline(),
             self.target.next_deadline(),
             self.e2.next_deadline(),
+            self.audio.next_deadline(),
         ]
         .into_iter()
         .flatten()
