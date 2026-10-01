@@ -1,6 +1,8 @@
 //! Shared by window presentation and offscreen byte-for-byte tests.
 
-use std::cell::Cell;
+use std::{cell::Cell, sync::Arc};
+
+use crosspane_media::picture::Nv12;
 
 use crosspane_types::geom::{PixelRect, PixelSize};
 
@@ -8,6 +10,13 @@ use crosspane_types::geom::{PixelRect, PixelSize};
 pub(super) struct Presenter {
     pipeline: wgpu::RenderPipeline,
     canvas: Option<Canvas>,
+    video_pipeline: wgpu::RenderPipeline,
+    video: Option<Video>,
+    pending_video: Option<(PixelSize, Arc<Nv12>)>,
+    video_visible: bool,
+    #[cfg(test)]
+    pub(super) video_uploads: usize,
+    video_uniform: wgpu::Buffer,
     fallback: wgpu::BindGroup,
     uniform: wgpu::Buffer,
     last_uniform: Cell<Option<[u32; 8]>>,
@@ -21,6 +30,14 @@ pub(super) struct Presenter {
 #[derive(Debug)]
 struct Canvas {
     texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    size: PixelSize,
+}
+
+#[derive(Debug)]
+struct Video {
+    y: wgpu::Texture,
+    uv: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     size: PixelSize,
 }
@@ -62,6 +79,46 @@ impl Presenter {
             multiview_mask: None,
             cache: None,
         });
+        let video_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("proxy NV12 presentation"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../video.wgsl")
+                    .replace("GREY", &format!("{grey:.16}"))
+                    .replace("SRGB", if format.is_srgb() { "true" } else { "false" })
+                    .into(),
+            ),
+        });
+        let video_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("proxy NV12 presentation"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &video_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &video_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let video_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("proxy YUV conversion"),
+            size: 80,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("proxy edge"),
             size: 32,
@@ -100,6 +157,13 @@ impl Presenter {
         });
         Self {
             pipeline,
+            video_pipeline,
+            video_uniform,
+            video: None,
+            pending_video: None,
+            video_visible: false,
+            #[cfg(test)]
+            video_uploads: 0,
             fallback,
             uniform,
             last_uniform: Cell::new(None),
@@ -198,12 +262,6 @@ impl Presenter {
             if width == 0 || height == 0 {
                 continue;
             }
-            let damage_row_bytes = width as usize * 4;
-            let mut rows = Vec::with_capacity(damage_row_bytes * height as usize);
-            for y in rect.min.y..rect.max.y {
-                let start = y as usize * row_bytes + rect.min.x as usize * 4;
-                rows.extend_from_slice(&pixels[start..start + damage_row_bytes]);
-            }
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &canvas.texture,
@@ -215,10 +273,10 @@ impl Presenter {
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &rows,
+                pixels,
                 wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
+                    offset: (rect.min.y as usize * row_bytes + rect.min.x as usize * 4) as u64,
+                    bytes_per_row: Some(size.width * 4),
                     rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
@@ -228,7 +286,143 @@ impl Presenter {
                 },
             );
         }
+        self.pending_video = None;
+        self.video_visible = false;
         Ok(())
+    }
+
+    /// Validation happens on arrival, but only the newest pending picture reaches the GPU.
+    pub(super) fn set_video(
+        &mut self,
+        device: &wgpu::Device,
+        size: PixelSize,
+        picture: Arc<Nv12>,
+    ) -> Result<(), String> {
+        picture.validate().map_err(|error| error.to_string())?;
+        let limit = device.limits().max_texture_dimension_2d;
+        if size.width == 0
+            || size.height == 0
+            || size.width > picture.size.width
+            || size.height > picture.size.height
+            || picture.size.width > limit
+            || picture.size.height > limit
+        {
+            return Err(
+                "video dimensions are zero, outside the picture or exceed GPU limits".into(),
+            );
+        }
+        self.pending_video = Some((size, picture));
+        Ok(())
+    }
+
+    pub(super) fn prepare_video(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let Some((visible, picture)) = self.pending_video.take() else {
+            return;
+        };
+        if self
+            .video
+            .as_ref()
+            .is_none_or(|video| video.size != picture.size)
+        {
+            let plane = |size: PixelSize, format| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("proxy NV12 plane"),
+                    size: wgpu::Extent3d {
+                        width: size.width,
+                        height: size.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                })
+            };
+            let y = plane(picture.size, wgpu::TextureFormat::R8Unorm);
+            let uv = plane(
+                PixelSize::new(picture.size.width / 2, picture.size.height / 2),
+                wgpu::TextureFormat::Rg8Unorm,
+            );
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("proxy NV12"),
+                layout: &self.video_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &y.create_view(&Default::default()),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            &uv.create_view(&Default::default()),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.video_uniform.as_entire_binding(),
+                    },
+                ],
+            });
+            self.video = Some(Video {
+                y,
+                uv,
+                bind_group,
+                size: picture.size,
+            });
+        }
+        let Some(video) = &self.video else {
+            return;
+        };
+        for (texture, bytes, stride) in [
+            (&video.y, &picture.y, picture.y_stride),
+            (&video.uv, &picture.uv, picture.uv_stride),
+        ] {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: None,
+                },
+                texture.size(),
+            );
+        }
+        // Four padded vec3<f32> values, followed by the visible dimensions.
+        let conversion = picture.colour.to_rgb();
+        let mut data = [0_u32; 20];
+        for (slots, values) in data[..16]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(std::iter::once(conversion.offset).chain(conversion.rows))
+        {
+            for (slot, value) in slots.iter_mut().zip(values) {
+                *slot = value.to_bits();
+            }
+        }
+        data[16] = visible.width;
+        data[17] = visible.height;
+        let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_ne_bytes()).collect();
+        queue.write_buffer(&self.video_uniform, 0, &bytes);
+        self.video_visible = true;
+        #[cfg(test)]
+        {
+            self.video_uploads += 1;
+        }
     }
 
     pub(super) fn set_edge(&mut self, accent: [u8; 3], edge_px: u32) {
@@ -291,12 +485,22 @@ impl Presenter {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.pipeline);
+        let video = self.video.as_ref().filter(|_| self.video_visible);
+        pass.set_pipeline(if video.is_some() {
+            &self.video_pipeline
+        } else {
+            &self.pipeline
+        });
         pass.set_bind_group(
             0,
-            self.canvas
-                .as_ref()
-                .map_or(&self.fallback, |canvas| &canvas.bind_group),
+            video.map_or_else(
+                || {
+                    self.canvas
+                        .as_ref()
+                        .map_or(&self.fallback, |canvas| &canvas.bind_group)
+                },
+                |video| &video.bind_group,
+            ),
             &[],
         );
         pass.draw(0..3, 0..1);
