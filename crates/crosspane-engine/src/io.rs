@@ -120,6 +120,8 @@ pub enum Input {
 #[non_exhaustive]
 pub enum Output {
     SetPortals(Vec<CapturePortal>),
+    /// Turn `InputCapture::set_monitor_local_activity` on or off (local override on a target).
+    MonitorLocalActivity(bool),
     BeginCapture {
         id: CaptureId,
         portal: PortalId,
