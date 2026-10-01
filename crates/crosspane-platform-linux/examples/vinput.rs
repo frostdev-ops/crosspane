@@ -32,10 +32,25 @@ struct State {
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
-    fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<wl_output::WlOutput, ()> for State {
-    fn event(state: &mut Self, _: &wl_output::WlOutput, event: wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let wl_output::Event::Mode { width, height, .. } = event {
             state.size = Some((width as u32, height as u32));
         }
@@ -53,7 +68,11 @@ fn now_ms() -> u32 {
 }
 
 fn main() {
-    assert_eq!(std::env::var("CROSSPANE_NESTED_HYPR").as_deref(), Ok("1"), "nested compositors only");
+    assert_eq!(
+        std::env::var("CROSSPANE_NESTED_HYPR").as_deref(),
+        Ok("1"),
+        "nested compositors only"
+    );
     let conn = Connection::connect_to_env().unwrap();
     let (globals, mut queue) = registry_queue_init::<State>(&conn).unwrap();
     let qh = queue.handle();
@@ -64,10 +83,23 @@ fn main() {
     let vkm: ZwpVirtualKeyboardManagerV1 = globals.bind(&qh, 1..=1, ()).unwrap();
     let keyboard = vkm.create_virtual_keyboard(&seat, &qh, ());
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = xkb::Keymap::new_from_names(&context, "", "", "us", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS).unwrap();
-    let mut text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1).into_bytes();
+    let keymap = xkb::Keymap::new_from_names(
+        &context,
+        "",
+        "",
+        "us",
+        "",
+        None,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .unwrap();
+    let mut text = keymap
+        .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+        .into_bytes();
     text.push(0);
-    let mut file = std::fs::File::from(rustix::fs::memfd_create("vinput-keymap", rustix::fs::MemfdFlags::CLOEXEC).unwrap());
+    let mut file = std::fs::File::from(
+        rustix::fs::memfd_create("vinput-keymap", rustix::fs::MemfdFlags::CLOEXEC).unwrap(),
+    );
     file.write_all(&text).unwrap();
     keyboard.keymap(1, file.as_fd(), text.len() as u32);
     let mut state = State::default();
@@ -87,11 +119,17 @@ fn main() {
                 pointer.frame();
             }
             ["btn", s] => {
-                let state = if *s == "down" { wl_pointer::ButtonState::Pressed } else { wl_pointer::ButtonState::Released };
+                let state = if *s == "down" {
+                    wl_pointer::ButtonState::Pressed
+                } else {
+                    wl_pointer::ButtonState::Released
+                };
                 pointer.button(now_ms(), 0x110, state);
                 pointer.frame();
             }
-            ["key", code, s] => keyboard.key(now_ms(), code.parse().unwrap(), u32::from(*s == "down")),
+            ["key", code, s] => {
+                keyboard.key(now_ms(), code.parse().unwrap(), u32::from(*s == "down"))
+            }
             ["sleep", ms] => std::thread::sleep(Duration::from_millis(ms.parse().unwrap())),
             [] => {}
             other => eprintln!("unknown command {other:?}"),
