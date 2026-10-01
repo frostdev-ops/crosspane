@@ -25,6 +25,11 @@ crosspane-testkit = { path = "crates/crosspane-testkit" }
 crosspane-platform-linux = { path = "crates/crosspane-platform-linux" }
 crosspane-platform-macos = { path = "crates/crosspane-platform-macos" }
 
+# External crates (09 §2). Versions checked 2026-09-30.
+euclid = { version = "0.22.14", features = ["serde"] }
+proptest = "1.11.0"
+serde = { version = "1.0.229", features = ["derive"] }
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"

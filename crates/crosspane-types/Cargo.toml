@@ -9,3 +9,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+euclid.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
