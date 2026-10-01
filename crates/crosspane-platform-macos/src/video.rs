@@ -2,10 +2,12 @@
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use crosspane_media::codec::{CodecError, EncodedVideo, VideoCodecs, VideoDecoder, VideoEncoder};
-use crosspane_media::picture::{Nv12, YuvColour, YuvMatrix};
+#[cfg(feature = "gpu")]
+use crosspane_media::picture::NativePicture;
+use crosspane_media::picture::{Decoded, Nv12, YuvColour, YuvMatrix};
 use crosspane_types::geom::PixelSize;
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
@@ -27,8 +29,9 @@ use objc2_core_video::{
     kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferTransferFunction_sRGB,
     kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4,
     kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrixKey, kCVPixelBufferHeightKey,
-    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
-    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
+    kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelFormatType_32BGRA,
+    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
     kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
 };
 use objc2_video_toolbox::{
@@ -797,6 +800,49 @@ pub struct Decoder {
     last_reference: Option<u32>,
 }
 
+#[cfg(feature = "gpu")]
+#[derive(Debug)]
+pub(crate) struct VtPicture {
+    pub(crate) image: CFRetained<CVPixelBuffer>,
+    size: PixelSize,
+    colour: YuvColour,
+}
+
+// SAFETY: CoreVideo buffers are reference counted thread-safely; this immutable picture
+// never writes to the buffer, and VT cannot recycle it while its retain is held.
+#[cfg(feature = "gpu")]
+unsafe impl Send for VtPicture {}
+// SAFETY: The same immutable, thread-safe CoreVideo retain contract permits shared reads.
+#[cfg(feature = "gpu")]
+unsafe impl Sync for VtPicture {}
+
+#[cfg(feature = "gpu")]
+impl NativePicture for VtPicture {
+    fn size(&self) -> PixelSize {
+        self.size
+    }
+    fn colour(&self) -> YuvColour {
+        self.colour
+    }
+    fn to_nv12(&self, out: &mut Nv12) -> Result<(), CodecError> {
+        copy_nv12(&self.image, out)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl VtPicture {
+    pub(crate) fn retained(&self) -> Self {
+        Self {
+            image: self.image.clone(),
+            size: self.size,
+            colour: self.colour,
+        }
+    }
+}
+
 impl std::fmt::Debug for Decoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Decoder")
@@ -833,7 +879,7 @@ struct DecodeSession {
 }
 
 // SAFETY: VT and CoreMedia have no thread affinity. &mut Decoder serializes use; callbacks access
-// only the stable sender. The format is immutable, and all returned image bytes are copied.
+// only the stable sender. The format is immutable; returned buffers are retained and read-only.
 unsafe impl Send for DecodeSession {}
 
 impl Drop for DecodeSession {
@@ -922,8 +968,13 @@ impl DecodeSession {
                         &[
                             kCVPixelBufferPixelFormatTypeKey,
                             kCVPixelBufferIOSurfacePropertiesKey,
+                            kCVPixelBufferMetalCompatibilityKey,
                         ],
-                        &[formats.as_ref(), surface.as_ref()],
+                        &[
+                            formats.as_ref(),
+                            surface.as_ref(),
+                            CFBoolean::new(true).as_ref(),
+                        ],
                     )
                 },
             )
@@ -1204,6 +1255,48 @@ impl VideoDecoder for Decoder {
         Decoder::decode_nv12(self, data, out)
     }
 
+    fn decode_native(&mut self, data: &[u8], reuse: &mut Arc<Nv12>) -> Result<Decoded, CodecError> {
+        let image = self.decode_image(data, true)?;
+        #[cfg(feature = "gpu")]
+        {
+            let width = CVPixelBufferGetWidth(&image);
+            let height = CVPixelBufferGetHeight(&image);
+            let format = CVPixelBufferGetPixelFormatType(&image);
+            if (format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+                && width > 0
+                && height > 0
+                && width.is_multiple_of(2)
+                && height.is_multiple_of(2)
+                && CVPixelBufferGetPlaneCount(&image) == 2
+                && objc2_core_video::CVPixelBufferGetIOSurface(Some(&image)).is_some()
+            {
+                let colour = image_colour(&image);
+                return Ok(Decoded::Native(Arc::new(VtPicture {
+                    image,
+                    size: PixelSize::new(width as u32, height as u32),
+                    colour,
+                })));
+            }
+        }
+        // Reuse the last picture only if nothing else holds it (no clone of a shown picture).
+        if Arc::get_mut(reuse).is_none() {
+            *reuse = Arc::default();
+        }
+        let out = Arc::get_mut(reuse).ok_or_else(|| missing("unshared NV12 picture"))?;
+        let result = if CVPixelBufferGetPixelFormatType(&image) == kCVPixelFormatType_32BGRA {
+            transfer_image(&image, true).and_then(|image| copy_nv12(&image, out))
+        } else {
+            copy_nv12(&image, out)
+        };
+        if result.is_err() {
+            self.session = None;
+            self.last_reference = None;
+        }
+        result?;
+        Ok(Decoded::Nv12(Arc::clone(reuse)))
+    }
+
     fn name(&self) -> &str {
         match &self.session {
             Some(session) => match session.hardware {
@@ -1448,6 +1541,29 @@ fn transfer_image(
     }
 }
 
+fn image_colour(image: &CVPixelBuffer) -> YuvColour {
+    // SAFETY: Immutable public matrix constants; attachment lookup retains its CF value.
+    let matrix = unsafe {
+        image
+            .attachment(kCVImageBufferYCbCrMatrixKey, ptr::null_mut())
+            .and_then(|value| {
+                value.downcast_ref::<CFString>().map(|value| {
+                    if value == kCVImageBufferYCbCrMatrix_ITU_R_601_4 {
+                        YuvMatrix::Bt601
+                    } else {
+                        YuvMatrix::Bt709
+                    }
+                })
+            })
+            .unwrap_or(YuvMatrix::Bt709)
+    };
+    YuvColour {
+        matrix,
+        full_range: CVPixelBufferGetPixelFormatType(image)
+            == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    }
+}
+
 fn copy_nv12(image: &CVPixelBuffer, out: &mut Nv12) -> Result<(), CodecError> {
     let format = CVPixelBufferGetPixelFormatType(image);
     if (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -1465,21 +1581,6 @@ fn copy_nv12(image: &CVPixelBuffer, out: &mut Nv12) -> Result<(), CodecError> {
             "decoder output has odd dimensions".into(),
         ));
     }
-    // SAFETY: Immutable public matrix constants; attachment copy retains its CF value.
-    let matrix = unsafe {
-        image
-            .attachment(kCVImageBufferYCbCrMatrixKey, ptr::null_mut())
-            .and_then(|value| {
-                value.downcast_ref::<CFString>().map(|value| {
-                    if value == kCVImageBufferYCbCrMatrix_ITU_R_601_4 {
-                        YuvMatrix::Bt601
-                    } else {
-                        YuvMatrix::Bt709
-                    }
-                })
-            })
-            .unwrap_or(YuvMatrix::Bt709)
-    };
     let mut planes = [(ptr::null_mut::<u8>(), 0usize, 0usize); 2];
     status(
         // SAFETY: Live two-plane buffer, balanced read-only lock below.
@@ -1521,10 +1622,7 @@ fn copy_nv12(image: &CVPixelBuffer, out: &mut Nv12) -> Result<(), CodecError> {
         out.size = size;
         out.y_stride = planes[0].1 as u32;
         out.uv_stride = planes[1].1 as u32;
-        out.colour = YuvColour {
-            matrix,
-            full_range: format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-        };
+        out.colour = image_colour(image);
         Ok(())
     })();
     // SAFETY: Balances successful read-only lock; source slices no longer exist.
