@@ -466,6 +466,36 @@ impl SourceGpu {
             changed_bits,
         })
     }
+    /// Write `frame` as NV12 into `nv12` without hashing (region video, WP-2.31): same output as
+    /// `scan` with `nv12`. Waits for the GPU. Changes no hashes, so it never disturbs `commit`.
+    pub fn write_nv12(
+        &mut self,
+        frame: FrameRegion<'_>,
+        nv12: Nv12Output<'_>,
+    ) -> Result<(), SourceGpuError> {
+        catch_gpu(|| {
+            self.validate(frame)?;
+            self.validate_nv(frame.size, nv12)?;
+            let scope = ErrorScopes::new(&self.device);
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            self.encode_nv(&mut encoder, &view, frame, nv12)?;
+            let submission = self.queue.submit([encoder.finish()]);
+            let waited = self
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(Duration::from_secs(2)),
+                })
+                .map_err(|e| Gpu(e.to_string()));
+            // A failed submission makes the wait fail too; report the validation error first.
+            scope_result(scope)?;
+            waited.map(|_| ())
+        })
+    }
     /// Commit the most recent successful scan without GPU work.
     pub fn commit(&mut self) {
         if let Some(size) = self.scanned_size.take() {

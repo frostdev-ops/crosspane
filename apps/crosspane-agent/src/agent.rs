@@ -736,6 +736,7 @@ impl Agent {
                         projection,
                         peer,
                         video: has("h264"),
+                        region: has("h264roi"),
                         cursor: has("cursor"),
                         bits_per_second: self.video_bits(peer),
                     });
@@ -1414,6 +1415,24 @@ impl Agent {
 
     /// The video bitrate for streams to `peer`: the configured one, or one for its link class
     /// (03 §7.4).
+    /// A peer's Hello features changed (a replacement connection with a new feature set): the
+    /// encoder switches its streams to that peer over (video on or off, region video, cursor
+    /// shapes). Called where a refreshed Hello is applied.
+    #[allow(dead_code)] // The caller lands with peer feature refresh (WP-3.6 follow-up).
+    pub fn peer_features_changed(&mut self, peer: NodeId) {
+        let has = |feature: &str| {
+            self.peers
+                .get(&peer)
+                .is_some_and(|p| p.features.iter().any(|f| f == feature))
+        };
+        let _ = self.source_media.send(SourceCmd::PeerFeatures {
+            peer,
+            video: has("h264"),
+            region: has("h264roi"),
+            cursor: has("cursor"),
+        });
+    }
+
     fn video_bits(&self, peer: NodeId) -> u32 {
         let mbps = self
             .video_mbps

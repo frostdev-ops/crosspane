@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use anyhow::{Result, bail, ensure};
 use crosspane_media::{
     picture::{Nv12, YuvColour, YuvMatrix, nv12_to_bgra},
@@ -669,6 +670,98 @@ fn timing_report() -> Result<()> {
             "3440x1440 gather {}%: {:.3} ms",
             if all { 100 } else { 10 },
             start.elapsed().as_secs_f64() * 100.0
+        );
+    }
+    Ok(())
+}
+
+/// `write_nv12` (region video) writes what `scan` writes for the same region and leaves the
+/// hash state alone, so a later `commit` still commits the scan.
+#[test]
+fn write_nv12_matches_scan_and_keeps_hashes() -> Result<()> {
+    let Some(mut g) = gpu()? else { return Ok(()) };
+    let mut seed = 77;
+    let size = PixelSize::new(200, 130);
+    let bytes = random(size, &mut seed);
+    let t = upload(&g, size, &bytes);
+    let sub = FrameRegion {
+        texture: &t,
+        origin: (64, 64),
+        size: PixelSize::new(101, 65),
+    };
+    let (w, h) = (102u32, 66u32);
+    let pitch = 256u32;
+    let uv_offset = u64::from(pitch) * u64::from(h);
+    let make = |device: &wgpu::Device| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: uv_offset + u64::from(pitch) * u64::from(h / 2),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    };
+    let by_write = make(g.device());
+    let output = |buffer| Nv12Output {
+        target: Nv12Target::Buffer {
+            buffer,
+            y_offset: 0,
+            y_pitch: pitch,
+            uv_offset,
+            uv_pitch: pitch,
+        },
+        colour: YuvColour::default(),
+    };
+    // A scan of the whole frame, then its NV12 sub-region written separately, then commit.
+    let first = g.scan(region(&t), None, false).context("first scan")?;
+    ensure!(first.changed == first.tiles_x * first.tiles_y);
+    g.write_nv12(sub, output(&by_write)).context("write_nv12")?;
+    g.commit();
+    ensure!(
+        g.scan(region(&t), None, false)?.changed == 0,
+        "write_nv12 disturbed the scan being committed"
+    );
+    // The same region through a scan with NV12 (on a scratch SourceGpu, so hashes don't matter).
+    let Some(mut scratch) = gpu()? else {
+        return Ok(());
+    };
+    let t2 = upload(&scratch, size, &bytes);
+    let by_scan = make(scratch.device());
+    scratch
+        .scan(
+            FrameRegion {
+                texture: &t2,
+                ..sub
+            },
+            Some(output(&by_scan)),
+            false,
+        )
+        .context("scratch scan")?;
+    let copy = |gpu: &SourceGpu, b: &wgpu::Buffer| -> Result<Vec<u8>> {
+        let staging = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: b.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut e = gpu.device().create_command_encoder(&Default::default());
+        e.copy_buffer_to_buffer(b, 0, &staging, 0, b.size());
+        gpu.queue().submit([e.finish()]);
+        read_buffer(gpu, &staging)
+    };
+    let a = copy(&g, &by_write).context("copy a")?;
+    let b = copy(&scratch, &by_scan).context("copy b")?;
+    for row in 0..h {
+        let i = (row * pitch) as usize;
+        ensure!(
+            a[i..i + w as usize] == b[i..i + w as usize],
+            "luma row {row}"
+        );
+    }
+    for row in 0..h / 2 {
+        let i = uv_offset as usize + (row * pitch) as usize;
+        ensure!(
+            a[i..i + w as usize] == b[i..i + w as usize],
+            "chroma row {row}"
         );
     }
     Ok(())
