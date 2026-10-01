@@ -10,6 +10,7 @@ pub mod displays;
 pub mod frame_capture;
 pub mod inject;
 pub mod keychain;
+pub mod link;
 pub mod main_thread;
 pub mod overlay;
 pub mod parking;
