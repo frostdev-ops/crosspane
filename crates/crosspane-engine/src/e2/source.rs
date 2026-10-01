@@ -16,7 +16,7 @@ use crosspane_types::geom::{PixelSize, PointDevice, RectLogical};
 use crosspane_types::id::{NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
-use super::{E2, send};
+use super::{E2, GRACE, send};
 use crate::io::{Failure, InjectCmd, Notice, Output, ProjectionKey};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,6 +29,9 @@ enum Stage {
     Parking(MonoTime),
     Capturing(MonoTime),
     Live,
+    Suspended(MonoTime),
+    Resuming(MonoTime),
+    Restarting(MonoTime),
 }
 
 pub(super) struct Source {
@@ -37,7 +40,9 @@ pub(super) struct Source {
     stage: Stage,
     parked: Option<Parked>,
     stream: Option<StreamId>,
+    capture_pending: bool,
     resizing: bool,
+    resume_geometry: Option<(PixelSize, f64)>,
     latest_resize: Option<(PixelSize, f64)>,
     /// The size the destination last asked for (Accepted or Resize).
     wanted: Option<PixelSize>,
@@ -111,7 +116,9 @@ impl E2 {
                 stage: Stage::Offered(now.saturating_add(START_TIMEOUT)),
                 parked: None,
                 stream: None,
+                capture_pending: false,
                 resizing: false,
+                resume_geometry: None,
                 latest_resize: None,
                 wanted: None,
                 parked_frame: None,
@@ -143,6 +150,70 @@ impl E2 {
             size,
             scale,
         )
+    }
+
+    pub(super) fn suspend_source(
+        &mut self,
+        projection: ProjectionId,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let Some(source) = self.sources.get_mut(&projection) else {
+            return;
+        };
+        if matches!(source.stage, Stage::Offered(_)) {
+            self.end_source(projection, Reason::LinkLost, true, now, out);
+            return;
+        }
+        self.ledgers.retire(projection, out);
+        if let Some(stream) = source.stream.take() {
+            out.push(Output::StopCapture { stream });
+        }
+        // Keep bookkeeping for an operation already submitted, but discard queued resizes.
+        // A late Parked result updates the parked geometry without restoring or capturing.
+        source.resizing |= matches!(source.stage, Stage::Parking(_));
+        source.latest_resize = None;
+        source.resume_geometry = None;
+        source.stage = Stage::Suspended(now.saturating_add(GRACE));
+    }
+
+    pub(super) fn resume_sources(&mut self, peer: NodeId, now: MonoTime, out: &mut Vec<Output>) {
+        let ids: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|(_, s)| s.peer == peer && matches!(s.stage, Stage::Suspended(_)))
+            .map(|(&id, _)| id)
+            .collect();
+        for projection in ids {
+            let Some(source) = self.sources.get(&projection) else {
+                continue;
+            };
+            if source.deadline().is_some_and(|deadline| deadline <= now) {
+                self.end_source(projection, Reason::LinkLost, true, now, out);
+                continue;
+            }
+            let Some(info) = self.windows.get(&source.window) else {
+                self.end_source(projection, Reason::WindowClosed, true, now, out);
+                continue;
+            };
+            let (window, size, _) = self.window_details(info);
+            if self.ledgers.open(projection).is_err() {
+                self.end_source(projection, Reason::LinkLost, false, now, out);
+                continue;
+            }
+            if let Some(source) = self.sources.get_mut(&projection) {
+                source.stage = Stage::Resuming(now.saturating_add(START_TIMEOUT));
+            }
+            send(
+                peer,
+                Message::Start {
+                    projection,
+                    window,
+                    size,
+                },
+                out,
+            );
+        }
     }
 
     pub(super) fn source_control(
@@ -228,6 +299,21 @@ impl E2 {
             return;
         };
         match msg {
+            Message::Accepted { size, scale, .. } if matches!(source.stage, Stage::Resuming(_)) => {
+                if !sane_size(*size) {
+                    self.end_source(projection, Reason::LinkLost, false, now, out);
+                    return;
+                }
+                source.stage = Stage::Restarting(now.saturating_add(START_TIMEOUT));
+                source.wanted = Some(*size);
+                source.resume_geometry = Some((*size, *scale));
+                if !source.restart(projection, now, out) {
+                    self.end_source(projection, Reason::Failed, false, now, out);
+                }
+            }
+            Message::Refused { .. } if matches!(source.stage, Stage::Resuming(_)) => {
+                self.end_source(projection, Reason::LinkLost, true, now, out);
+            }
             Message::Accepted { size, scale, .. } if matches!(source.stage, Stage::Offered(_)) => {
                 if !sane_size(*size) {
                     self.end_source(projection, Reason::Failed, false, now, out);
@@ -257,7 +343,9 @@ impl E2 {
             {
                 // Nothing to do: the window is already parked at this size and scale.
             }
-            Message::Resize { size, scale, .. } if sane_size(*size) => {
+            Message::Resize { size, scale, .. }
+                if sane_size(*size) && !matches!(source.stage, Stage::Suspended(_)) =>
+            {
                 source.wanted = Some(*size);
                 if source.stage != Stage::Live || source.resizing {
                     source.latest_resize = Some((*size, *scale));
@@ -333,26 +421,7 @@ impl E2 {
         source.parked = Some(parked);
         source.parked_frame = frame;
         if initial {
-            let (target, crop) = match parking {
-                ParkingKind::Twin => (CaptureTarget::Display(parked.display), Some(parked.content)),
-                _ => (CaptureTarget::Window(window), None),
-            };
-            out.push(Output::StartCapture {
-                projection,
-                peer: source.peer,
-                target,
-                crop,
-                max_fps: 60,
-            });
-            send(
-                source.peer,
-                Message::Geometry {
-                    projection,
-                    size,
-                    parking,
-                },
-                out,
-            );
+            source.start_capture(projection, parked, size, parking, now, out);
             out.push(Output::Notice(Notice::ProjectionStarted {
                 key: ProjectionKey {
                     source: self.node,
@@ -361,7 +430,11 @@ impl E2 {
                 peer: source.peer,
                 parking,
             }));
-        } else {
+        } else if matches!(source.stage, Stage::Restarting(_)) {
+            if !source.restart(projection, now, out) {
+                self.end_source(projection, Reason::Failed, false, now, out);
+            }
+        } else if !matches!(source.stage, Stage::Suspended(_) | Stage::Resuming(_)) {
             if parking == ParkingKind::Twin
                 && let Some(stream) = source.stream
             {
@@ -394,8 +467,20 @@ impl E2 {
         if let Some(source) = self
             .sources
             .get_mut(&projection)
-            .filter(|s| matches!(s.stage, Stage::Capturing(_)))
+            .filter(|s| s.capture_pending)
         {
+            source.capture_pending = false;
+            if !matches!(source.stage, Stage::Capturing(_)) {
+                if let Ok(stream) = result {
+                    out.push(Output::StopCapture { stream });
+                }
+                if matches!(source.stage, Stage::Restarting(_))
+                    && !source.restart(projection, now, out)
+                {
+                    self.end_source(projection, Reason::Failed, false, now, out);
+                }
+                return;
+            }
             match result {
                 Ok(stream) => {
                     source.stream = Some(stream);
@@ -540,7 +625,10 @@ impl E2 {
             self.pending_parks
                 .insert(source.window, now.saturating_add(PARK_CLEANUP_TIMEOUT));
         }
-        if !peer_ended {
+        if !peer_ended
+            && !matches!(source.stage, Stage::Suspended(_))
+            && self.peers.contains(&source.peer)
+        {
             send(source.peer, Message::End { projection, reason }, out);
         }
         out.push(Output::Notice(Notice::ProjectionEnded {
@@ -557,16 +645,21 @@ impl E2 {
             .sources
             .iter()
             .filter(|(_, s)| s.deadline().is_some_and(|deadline| deadline <= now))
-            .map(|(&id, s)| (id, s.peer, matches!(s.stage, Stage::Offered(_))))
+            .map(|(&id, s)| (id, s.peer, s.stage))
             .collect();
-        for (id, peer, offered) in expired {
-            if offered {
+        for (id, peer, stage) in expired {
+            if matches!(stage, Stage::Offered(_)) {
                 out.push(Output::Notice(Notice::ProjectionRefused {
                     peer,
                     reason: Refusal::Busy,
                 }));
             }
-            self.end_source(id, Reason::Failed, false, now, out);
+            let reason = if matches!(stage, Stage::Suspended(_) | Stage::Resuming(_)) {
+                Reason::LinkLost
+            } else {
+                Reason::Failed
+            };
+            self.end_source(id, reason, matches!(stage, Stage::Suspended(_)), now, out);
         }
         let windows: Vec<_> = self
             .pending_parks
@@ -627,7 +720,7 @@ impl E2 {
             .is_some_and(|old| old.title != window.title)
         {
             for (&projection, source) in &self.sources {
-                if source.window == window.id {
+                if source.window == window.id && !matches!(source.stage, Stage::Suspended(_)) {
                     send(
                         source.peer,
                         Message::Title {
@@ -645,11 +738,75 @@ impl E2 {
 impl Source {
     fn deadline(&self) -> Option<MonoTime> {
         match self.stage {
-            Stage::Offered(deadline) | Stage::Parking(deadline) | Stage::Capturing(deadline) => {
-                Some(deadline)
-            }
+            Stage::Offered(deadline)
+            | Stage::Parking(deadline)
+            | Stage::Capturing(deadline)
+            | Stage::Suspended(deadline)
+            | Stage::Resuming(deadline)
+            | Stage::Restarting(deadline) => Some(deadline),
             Stage::Live => None,
         }
+    }
+
+    /// Serialize restart behind old platform operations: CaptureStarted has only a projection
+    /// id, so an old start must answer before another start is issued for that same id.
+    fn restart(&mut self, projection: ProjectionId, now: MonoTime, out: &mut Vec<Output>) -> bool {
+        if self.resizing || self.capture_pending {
+            return true;
+        }
+        let Some(parked) = self.parked else {
+            return false;
+        };
+        let Some((size, parking)) = geometry(parked) else {
+            return false;
+        };
+        if let Some((wanted, scale)) = self.resume_geometry.take()
+            && (size != wanted || self.parked_scale != scale)
+        {
+            self.resizing = true;
+            self.parked_scale = scale;
+            out.push(Output::ResizeParked {
+                window: self.window,
+                size: wanted,
+                scale,
+            });
+            return true;
+        }
+        self.start_capture(projection, parked, size, parking, now, out);
+        true
+    }
+
+    fn start_capture(
+        &mut self,
+        projection: ProjectionId,
+        parked: Parked,
+        size: PixelSize,
+        parking: ParkingKind,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let (target, crop) = match parking {
+            ParkingKind::Twin => (CaptureTarget::Display(parked.display), Some(parked.content)),
+            _ => (CaptureTarget::Window(self.window), None),
+        };
+        self.stage = Stage::Capturing(now.saturating_add(START_TIMEOUT));
+        self.capture_pending = true;
+        out.push(Output::StartCapture {
+            projection,
+            peer: self.peer,
+            target,
+            crop,
+            max_fps: 60,
+        });
+        send(
+            self.peer,
+            Message::Geometry {
+                projection,
+                size,
+                parking,
+            },
+            out,
+        );
     }
 
     fn activate(&mut self, now: MonoTime, out: &mut Vec<Output>) -> bool {

@@ -129,6 +129,12 @@ impl Ledgers {
     }
 
     pub fn open(&mut self, owner: ProjectionId) -> Result<(), JournalError> {
+        if let Some(lease) = self.leases.get_mut(&owner) {
+            // Resume the empty ledger without losing unconfirmed releases, retry deadlines or
+            // generations. Old InjectDone callbacks must never clear a new press's journal.
+            lease.retired = false;
+            return Ok(());
+        }
         let (ledger, _) = TargetLedger::open(Scoped {
             shared: self.shared.clone(),
             owner,

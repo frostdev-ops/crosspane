@@ -1031,7 +1031,12 @@ fn source_end_paths_release_stop_restore_and_ignore_unrelated_peers() {
             )
             .is_empty()
         );
-        let out = f.handle(event, 1);
+        let link_lost = matches!(event, Input::Link(LinkEvent::Closed { .. }));
+        let mut out = f.handle(event, 1);
+        if link_lost {
+            assert_eq!(out.len(), 2); // Immediate release and StopCapture, then grace.
+            out.extend(f.handle(Input::Tick, 20_001));
+        }
         assert_eq!(commands(&out), vec![up()]);
         assert_eq!(
             out[1],
@@ -1560,7 +1565,12 @@ fn destination_end_paths_send_ups_before_close_and_forget_timers() {
             },
             0,
         );
-        let out = f.handle(event, 1);
+        let link_lost = matches!(event, Input::Link(LinkEvent::Closed { .. }));
+        let mut out = f.handle(event, 1);
+        if link_lost {
+            assert!(out.is_empty());
+            out.extend(f.handle(Input::Tick, 20_001));
+        }
         assert_eq!(inputs(&out).len(), usize::from(ups));
         if ups {
             assert!(matches!(out[0], Output::SendInput { .. }));
@@ -3006,4 +3016,886 @@ fn focus_goes_back_to_the_previous_window_when_the_proxy_loses_focus() {
             .any(|o| matches!(o, Output::ActivateWindow { .. })),
         "{out:?}"
     );
+}
+
+#[test]
+fn grace_round_trip_keeps_parking_and_proxy_and_resumes_input() {
+    for kind in [PlatformParking::Twin, PlatformParking::Mirror] {
+        let mut source = Fixture::source(kind);
+        let mut destination = Fixture::destination();
+        for event in [
+            ProxyEvent::Key {
+                usage: KEY,
+                down: true,
+            },
+            ProxyEvent::Button {
+                button: BUTTON,
+                down: true,
+                position: PointDevice::zero(),
+            },
+        ] {
+            for msg in inputs(&destination.proxy(event, 10)) {
+                source.handle(input(B, msg), 10);
+            }
+        }
+        let dropped = source.handle(closed(B), 20);
+        assert_eq!(
+            commands(&dropped),
+            vec![
+                up(),
+                InjectCmd::Button {
+                    button: BUTTON,
+                    down: false
+                }
+            ]
+        );
+        assert_eq!(
+            dropped.last(),
+            Some(&Output::StopCapture {
+                stream: StreamId(1)
+            })
+        );
+        assert_eq!(dropped.len(), 3);
+        source.confirm(&dropped, true, 20);
+        assert!(source.held().is_empty());
+        assert!(destination.handle(closed(A), 20).is_empty());
+        assert_eq!(source.e2.next_deadline(), Some(ms(20_020)));
+        assert_eq!(destination.e2.next_deadline(), Some(ms(20_020)));
+        assert!(source.handle(input(B, press(99, true)), 21).is_empty());
+        assert!(
+            destination
+                .proxy(
+                    ProxyEvent::Key {
+                        usage: KEY,
+                        down: true
+                    },
+                    21
+                )
+                .is_empty()
+        );
+        assert!(
+            destination
+                .handle(Input::MediaError { key: key(A) }, 21)
+                .is_empty()
+        );
+        assert!(source.handle(Input::PeerUp { peer: C }, 22).is_empty());
+        assert!(source.handle(control(C, accepted()), 22).is_empty());
+
+        let mut info = window(WINDOW);
+        info.title = "updated while suspended".into();
+        info.frame.size = SizeLogical::new(420.0, 260.0);
+        assert!(
+            source
+                .handle(Input::Windows(WindowEvent::Changed(info)), 30)
+                .is_empty()
+        );
+        let resumed = source.handle(Input::PeerUp { peer: B }, 100);
+        assert_eq!(
+            messages(&resumed),
+            vec![Message::Start {
+                projection: ID,
+                window: WindowSummary {
+                    title: "updated while suspended".into(),
+                    app_id: "test".into()
+                },
+                size: PixelSize::new(420, 260),
+            }]
+        );
+        assert_eq!(resumed.len(), 1);
+        assert!(source.handle(Input::PeerUp { peer: B }, 101).is_empty());
+        assert!(
+            destination
+                .handle(Input::PeerUp { peer: A }, 100)
+                .is_empty()
+        );
+        let accepted_out = destination.handle(control(A, messages(&resumed)[0].clone()), 101);
+        assert_eq!(
+            accepted_out,
+            vec![Output::SendControl {
+                peer: A,
+                msg: ControlMessage::Projection(accepted()),
+            }]
+        );
+        let capture = source.handle(control(B, accepted()), 102);
+        let parking = if kind == PlatformParking::Twin {
+            ParkingKind::Twin
+        } else {
+            ParkingKind::Mirror
+        };
+        assert_eq!(
+            capture,
+            vec![
+                Output::StartCapture {
+                    projection: ID,
+                    peer: B,
+                    target: if kind == PlatformParking::Twin {
+                        CaptureTarget::Display(DISPLAY)
+                    } else {
+                        CaptureTarget::Window(WINDOW)
+                    },
+                    crop: if kind == PlatformParking::Twin {
+                        Some(parked(WINDOW, kind, size()).content)
+                    } else {
+                        None
+                    },
+                    max_fps: 60,
+                },
+                Output::SendControl {
+                    peer: B,
+                    msg: ControlMessage::Projection(Message::Geometry {
+                        projection: ID,
+                        size: size(),
+                        parking
+                    })
+                },
+            ]
+        );
+        source.handle(
+            Input::CaptureStarted {
+                projection: ID,
+                result: Ok(StreamId(2)),
+            },
+            103,
+        );
+        // The pre-drop held set was cleared: old physical ups are dropped, fresh downs flow.
+        assert!(
+            destination
+                .proxy(
+                    ProxyEvent::Key {
+                        usage: KEY,
+                        down: false
+                    },
+                    104
+                )
+                .is_empty()
+        );
+        for msg in inputs(&destination.proxy(
+            ProxyEvent::Key {
+                usage: KEY,
+                down: true,
+            },
+            105,
+        )) {
+            assert_eq!(
+                commands(&source.handle(input(B, msg), 105)),
+                vec![InjectCmd::Key {
+                    usage: KEY,
+                    down: true
+                }]
+            );
+        }
+        assert_eq!(source.held(), vec![Held::Key(KEY)]);
+    }
+}
+
+#[test]
+fn grace_expires_at_exact_deadline_with_the_original_link_lost_cleanup() {
+    let mut source = Fixture::source(PlatformParking::Twin);
+    let mut destination = Fixture::destination();
+    source.handle(input(B, press(1, true)), 50);
+    let dropped = source.handle(closed(B), 100);
+    source.confirm(&dropped, true, 100);
+    assert!(destination.handle(closed(A), 100).is_empty());
+    assert_eq!(source.e2.next_deadline(), Some(ms(20_100)));
+    assert_eq!(destination.e2.next_deadline(), Some(ms(20_100)));
+    assert!(source.handle(Input::Tick, 20_099).is_empty());
+    assert!(destination.handle(Input::Tick, 20_099).is_empty());
+    assert_eq!(
+        source.handle(Input::Tick, 20_100),
+        vec![
+            Output::Restore { window: WINDOW },
+            Output::Notice(Notice::ProjectionEnded {
+                key: key(A),
+                reason: Reason::LinkLost
+            }),
+        ]
+    );
+    assert_eq!(
+        destination.handle(Input::Tick, 20_100),
+        vec![
+            Output::CloseProxy { key: key(A) },
+            Output::Notice(Notice::ProjectionEnded {
+                key: key(A),
+                reason: Reason::LinkLost
+            }),
+        ]
+    );
+    assert_eq!(source.e2.next_deadline(), None);
+    assert_eq!(destination.e2.next_deadline(), None);
+    assert!(source.handle(Input::PeerUp { peer: B }, 20_101).is_empty());
+    assert!(source.handle(Input::Tick, 30_000).is_empty());
+    assert!(destination.handle(Input::Tick, 30_000).is_empty());
+}
+
+#[test]
+fn grace_only_applies_after_offered_and_all_later_startup_stages_suspend() {
+    let mut f = offered();
+    assert_eq!(
+        f.handle(closed(B), 100),
+        vec![Output::Notice(Notice::ProjectionEnded {
+            key: key(A),
+            reason: Reason::LinkLost,
+        })]
+    );
+    assert_eq!(f.e2.next_deadline(), None);
+    assert!(f.handle(Input::PeerUp { peer: B }, 101).is_empty());
+    for stage in 1..=3 {
+        let mut f = startup(stage);
+        let out = f.handle(closed(B), 100);
+        assert_eq!(
+            out,
+            if stage == 3 {
+                vec![Output::StopCapture {
+                    stream: StreamId(1),
+                }]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(f.e2.next_deadline(), Some(ms(20_100)));
+        let end = f.handle(Input::Tick, 20_100);
+        assert_eq!(
+            end,
+            vec![
+                Output::Restore { window: WINDOW },
+                Output::Notice(Notice::ProjectionEnded {
+                    key: key(A),
+                    reason: Reason::LinkLost
+                }),
+            ]
+        );
+        // Pending platform operations retain the existing bounded cleanup after ending.
+        if stage == 1 {
+            assert_eq!(f.e2.next_deadline(), Some(ms(25_100)));
+            assert_eq!(
+                f.handle(
+                    Input::Parked {
+                        window: WINDOW,
+                        result: Err(Failure::Other)
+                    },
+                    20_101
+                ),
+                vec![Output::Restore { window: WINDOW }]
+            );
+        }
+        if stage == 2 {
+            assert_eq!(
+                f.handle(
+                    Input::CaptureStarted {
+                        projection: ID,
+                        result: Ok(StreamId(9))
+                    },
+                    20_101
+                ),
+                vec![Output::StopCapture {
+                    stream: StreamId(9)
+                }]
+            );
+        }
+        assert_eq!(f.e2.next_deadline(), None);
+    }
+}
+
+#[test]
+fn grace_source_return_window_close_lock_sleep_panic_and_revocation_end_locally() {
+    for (event, reason) in [
+        (Input::Command(Command::Return(key(A))), Reason::Returned),
+        (
+            Input::Windows(WindowEvent::Removed(WINDOW)),
+            Reason::WindowClosed,
+        ),
+        (locked(), Reason::Locked),
+        (Input::Session(SessionEvent::WillSleep), Reason::Locked),
+        (Input::Command(Command::Panic), Reason::Returned),
+        (Input::Grants(Default::default()), Reason::Revoked),
+    ] {
+        let mut f = Fixture::source(PlatformParking::Twin);
+        f.handle(closed(B), 100);
+        assert_eq!(
+            f.handle(event, 101),
+            vec![
+                Output::Restore { window: WINDOW },
+                Output::Notice(Notice::ProjectionEnded {
+                    key: key(A),
+                    reason
+                }),
+            ]
+        );
+        assert_eq!(f.e2.next_deadline(), None);
+        assert!(f.handle(Input::PeerUp { peer: B }, 102).is_empty());
+    }
+}
+
+#[test]
+fn grace_destination_return_proxy_close_lock_sleep_panic_and_revocation_end_locally() {
+    for (event, reason) in [
+        (Input::Command(Command::Return(key(A))), Reason::Returned),
+        (
+            Input::Proxy {
+                key: key(A),
+                event: ProxyEvent::CloseRequested,
+            },
+            Reason::Returned,
+        ),
+        (
+            Input::Proxy {
+                key: key(A),
+                event: ProxyEvent::Lost,
+            },
+            Reason::Failed,
+        ),
+        (locked(), Reason::Locked),
+        (Input::Session(SessionEvent::WillSleep), Reason::Locked),
+        (Input::Command(Command::Panic), Reason::Returned),
+        (Input::Grants(Default::default()), Reason::Revoked),
+    ] {
+        let mut f = Fixture::destination();
+        f.proxy(
+            ProxyEvent::Key {
+                usage: KEY,
+                down: true,
+            },
+            50,
+        );
+        f.handle(closed(A), 100);
+        assert_eq!(
+            f.handle(event, 101),
+            vec![
+                Output::CloseProxy { key: key(A) },
+                Output::Notice(Notice::ProjectionEnded {
+                    key: key(A),
+                    reason
+                }),
+            ]
+        );
+        assert_eq!(f.e2.next_deadline(), None);
+    }
+}
+
+#[test]
+fn grace_drops_restart_the_deadline_in_suspension_and_during_resume() {
+    let mut source = Fixture::source(PlatformParking::Twin);
+    let mut destination = Fixture::destination();
+    source.handle(closed(B), 100);
+    destination.handle(closed(A), 100);
+    assert!(source.handle(closed(B), 10_000).is_empty());
+    assert!(destination.handle(closed(A), 10_000).is_empty());
+    assert_eq!(source.e2.next_deadline(), Some(ms(30_000)));
+    assert_eq!(destination.e2.next_deadline(), Some(ms(30_000)));
+    assert!(source.handle(Input::Tick, 20_100).is_empty());
+    assert!(destination.handle(Input::Tick, 20_100).is_empty());
+    assert_eq!(
+        messages(&source.handle(Input::PeerUp { peer: B }, 21_000)).len(),
+        1
+    );
+    assert_eq!(source.e2.next_deadline(), Some(ms(31_000)));
+    assert!(source.handle(closed(B), 22_000).is_empty());
+    destination.handle(closed(A), 22_000);
+    assert_eq!(source.e2.next_deadline(), Some(ms(42_000)));
+    assert_eq!(destination.e2.next_deadline(), Some(ms(42_000)));
+    for stream in 2..=3 {
+        let now = 23_000 + (stream - 2) * 1_000;
+        assert_eq!(
+            messages(&source.handle(Input::PeerUp { peer: B }, now)).len(),
+            1
+        );
+        assert_eq!(
+            messages(&destination.handle(control(A, start()), now)),
+            vec![accepted()]
+        );
+        assert!(matches!(
+            source.handle(control(B, accepted()), now)[0],
+            Output::StartCapture { .. }
+        ));
+        source.handle(
+            Input::CaptureStarted {
+                projection: ID,
+                result: Ok(StreamId(stream)),
+            },
+            now,
+        );
+        assert_eq!(
+            source.handle(closed(B), now + 10),
+            vec![Output::StopCapture {
+                stream: StreamId(stream)
+            }]
+        );
+        assert!(destination.handle(closed(A), now + 10).is_empty());
+    }
+    assert_eq!(source.e2.next_deadline(), Some(ms(44_010)));
+    assert_eq!(destination.e2.next_deadline(), Some(ms(44_010)));
+}
+
+#[test]
+fn grace_resume_resizes_changed_size_or_scale_before_capture() {
+    for kind in [PlatformParking::Twin, PlatformParking::Mirror] {
+        for (new_size, scale) in [(PixelSize::new(800, 600), 2.0), (size(), 1.5)] {
+            let mut f = Fixture::source(kind);
+            f.handle(closed(B), 100);
+            f.handle(Input::PeerUp { peer: B }, 200);
+            assert_eq!(
+                f.handle(
+                    control(
+                        B,
+                        Message::Accepted {
+                            projection: ID,
+                            size: new_size,
+                            scale
+                        }
+                    ),
+                    201
+                ),
+                vec![Output::ResizeParked {
+                    window: WINDOW,
+                    size: new_size,
+                    scale
+                }]
+            );
+            let out = f.handle(
+                Input::Parked {
+                    window: WINDOW,
+                    result: Ok(parked(WINDOW, kind, new_size)),
+                },
+                202,
+            );
+            assert!(matches!(out[0], Output::StartCapture { .. }));
+            assert_eq!(
+                messages(&out),
+                vec![Message::Geometry {
+                    projection: ID,
+                    size: new_size,
+                    parking: if kind == PlatformParking::Twin {
+                        ParkingKind::Twin
+                    } else {
+                        ParkingKind::Mirror
+                    },
+                }]
+            );
+            assert_eq!(out.len(), 2);
+            assert!(
+                f.handle(
+                    Input::CaptureStarted {
+                        projection: ID,
+                        result: Ok(StreamId(2))
+                    },
+                    203
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                commands(&f.handle(input(B, press(1, true)), 204)),
+                vec![InjectCmd::Key {
+                    usage: KEY,
+                    down: true
+                }]
+            );
+        }
+    }
+}
+
+#[test]
+fn grace_resume_refusal_or_offer_timeout_restores_with_link_lost() {
+    for refused in [false, true] {
+        let mut f = Fixture::source(PlatformParking::Twin);
+        f.handle(closed(B), 100);
+        f.handle(Input::PeerUp { peer: B }, 200);
+        let out = if refused {
+            f.handle(
+                control(
+                    B,
+                    Message::Refused {
+                        projection: ID,
+                        reason: Refusal::Busy,
+                    },
+                ),
+                201,
+            )
+        } else {
+            assert_eq!(f.e2.next_deadline(), Some(ms(10_200)));
+            assert!(f.handle(Input::Tick, 10_199).is_empty());
+            f.handle(Input::Tick, 10_200)
+        };
+        assert_eq!(out[0], Output::Restore { window: WINDOW });
+        assert_eq!(
+            out.last(),
+            Some(&Output::Notice(Notice::ProjectionEnded {
+                key: key(A),
+                reason: Reason::LinkLost
+            }))
+        );
+        assert_eq!(
+            messages(&out),
+            if refused {
+                vec![]
+            } else {
+                vec![Message::End {
+                    projection: ID,
+                    reason: Reason::LinkLost,
+                }]
+            }
+        );
+        assert_eq!(f.e2.next_deadline(), None);
+    }
+}
+
+#[test]
+fn grace_destination_accepts_the_latest_proxy_size_without_reopening() {
+    let mut f = Fixture::destination();
+    // A resize still in the 50 ms coalescing slot must also become the resume size.
+    f.proxy(
+        ProxyEvent::Resized {
+            size: PixelSize::new(700, 500),
+            scale: 1.5,
+        },
+        1,
+    );
+    f.proxy(
+        ProxyEvent::Resized {
+            size: PixelSize::new(710, 510),
+            scale: 1.5,
+        },
+        2,
+    );
+    f.handle(closed(A), 3);
+    let current = PixelSize::new(900, 700);
+    assert!(
+        f.proxy(
+            ProxyEvent::Resized {
+                size: current,
+                scale: 1.25
+            },
+            4
+        )
+        .is_empty()
+    );
+    for event in [
+        ProxyEvent::Focus(true),
+        ProxyEvent::Focus(false),
+        ProxyEvent::Key {
+            usage: KEY,
+            down: true,
+        },
+        ProxyEvent::Button {
+            button: BUTTON,
+            down: true,
+            position: PointDevice::zero(),
+        },
+        ProxyEvent::Motion {
+            position: PointDevice::zero(),
+        },
+        ProxyEvent::Scroll {
+            position: PointDevice::zero(),
+            delta: delta(),
+        },
+    ] {
+        assert!(f.proxy(event, 5).is_empty());
+    }
+    assert!(f.handle(Input::Tick, 100).is_empty());
+    let out = f.handle(control(A, start()), 200);
+    assert_eq!(
+        messages(&out),
+        vec![Message::Accepted {
+            projection: ID,
+            size: current,
+            scale: 1.25
+        }]
+    );
+    assert_eq!(out.len(), 1);
+    assert!(f.handle(control(A, start()), 201).is_empty());
+    let heartbeat_out = f.handle(Input::Tick, 450);
+    assert_eq!(inputs(&heartbeat_out).len(), 1);
+    assert!(
+        matches!(&inputs(&heartbeat_out)[0], ProjInput::Held { keys, buttons, .. } if keys.is_empty() && buttons.is_empty())
+    );
+    assert_eq!(
+        messages(&f.handle(Input::MediaError { key: key(A) }, 451)),
+        vec![Message::KeyFrameRequest { projection: ID }]
+    );
+}
+
+#[test]
+fn grace_pending_proxy_open_finishes_without_sending_on_the_closed_link() {
+    for opens_before_start in [false, true] {
+        let mut f = Fixture::ready(B, A);
+        f.handle(control(A, start()), 0);
+        f.handle(closed(A), 1);
+        if opens_before_start {
+            assert!(
+                f.handle(
+                    Input::ProxyOpened {
+                        key: key(A),
+                        result: Ok((size(), 2.0))
+                    },
+                    2
+                )
+                .is_empty()
+            );
+        }
+        let out = f.handle(control(A, start()), 3);
+        if opens_before_start {
+            assert_eq!(messages(&out), vec![accepted()]);
+        } else {
+            assert!(out.is_empty());
+            assert_eq!(f.e2.next_deadline(), Some(ms(10_003)));
+            assert_eq!(
+                messages(&f.handle(
+                    Input::ProxyOpened {
+                        key: key(A),
+                        result: Ok((size(), 2.0))
+                    },
+                    4
+                )),
+                vec![accepted()]
+            );
+        }
+    }
+}
+
+#[test]
+fn grace_resume_waits_for_old_parking_and_capture_results_and_drops_queued_resize() {
+    for stage in 1..=3 {
+        let mut f = startup(stage);
+        if stage == 3 {
+            f.handle(
+                control(
+                    B,
+                    Message::Resize {
+                        projection: ID,
+                        size: PixelSize::new(700, 500),
+                        scale: 2.0,
+                    },
+                ),
+                40,
+            );
+            f.handle(
+                control(
+                    B,
+                    Message::Resize {
+                        projection: ID,
+                        size: PixelSize::new(900, 700),
+                        scale: 2.0,
+                    },
+                ),
+                41,
+            );
+        }
+        f.handle(closed(B), 50);
+        f.handle(Input::PeerUp { peer: B }, 100);
+        assert!(f.handle(control(B, accepted()), 101).is_empty());
+        let out = if stage == 2 {
+            let out = f.handle(
+                Input::CaptureStarted {
+                    projection: ID,
+                    result: Ok(StreamId(99)),
+                },
+                102,
+            );
+            assert_eq!(
+                out[0],
+                Output::StopCapture {
+                    stream: StreamId(99)
+                }
+            );
+            out[1..].to_vec()
+        } else {
+            let out = f.handle(
+                Input::Parked {
+                    window: WINDOW,
+                    result: Ok(parked(
+                        WINDOW,
+                        PlatformParking::Twin,
+                        if stage == 3 {
+                            PixelSize::new(700, 500)
+                        } else {
+                            size()
+                        },
+                    )),
+                },
+                102,
+            );
+            if stage == 3 {
+                assert_eq!(
+                    out,
+                    vec![Output::ResizeParked {
+                        window: WINDOW,
+                        size: size(),
+                        scale: 2.0
+                    }]
+                );
+                f.handle(
+                    Input::Parked {
+                        window: WINDOW,
+                        result: Ok(parked(WINDOW, PlatformParking::Twin, size())),
+                    },
+                    103,
+                )
+            } else {
+                out
+            }
+        };
+        assert!(matches!(out[0], Output::StartCapture { .. }));
+        assert_eq!(out.len(), 2);
+        assert!(
+            f.handle(
+                Input::CaptureStarted {
+                    projection: ID,
+                    result: Ok(StreamId(2))
+                },
+                104
+            )
+            .is_empty()
+        );
+    }
+}
+
+#[test]
+fn grace_late_platform_results_while_suspended_keep_parking_and_stop_capture() {
+    for stage in 1..=2 {
+        let mut f = startup(stage);
+        f.handle(closed(B), 50);
+        let out = if stage == 1 {
+            f.handle(
+                Input::Parked {
+                    window: WINDOW,
+                    result: Ok(parked(WINDOW, PlatformParking::Twin, size())),
+                },
+                51,
+            )
+        } else {
+            f.handle(
+                Input::CaptureStarted {
+                    projection: ID,
+                    result: Ok(StreamId(99)),
+                },
+                51,
+            )
+        };
+        assert_eq!(
+            out,
+            if stage == 1 {
+                vec![]
+            } else {
+                vec![Output::StopCapture {
+                    stream: StreamId(99),
+                }]
+            }
+        );
+        assert_eq!(f.e2.next_deadline(), Some(ms(20_050)));
+        f.handle(Input::PeerUp { peer: B }, 100);
+        assert!(matches!(
+            f.handle(control(B, accepted()), 101)[0],
+            Output::StartCapture { .. }
+        ));
+    }
+}
+
+#[test]
+fn grace_resume_preserves_failed_release_retries_and_stale_completion_generations() {
+    let mut f = Fixture::source(PlatformParking::Twin);
+    f.handle(input(B, press(1, true)), 10);
+    f.handle(input(B, button(2, true, PointDevice::zero())), 10);
+    let dropped = f.handle(closed(B), 20);
+    let old = injections(&dropped)[0].0;
+    f.confirm(&dropped, false, 20);
+    f.handle(Input::PeerUp { peer: B }, 30);
+    assert_eq!(f.e2.next_deadline(), Some(ms(70)));
+    let retries = f.handle(Input::Tick, 70);
+    assert_eq!(
+        commands(&retries),
+        vec![
+            up(),
+            InjectCmd::Button {
+                button: BUTTON,
+                down: false
+            }
+        ]
+    );
+    f.handle(control(B, accepted()), 71);
+    f.handle(
+        Input::CaptureStarted {
+            projection: ID,
+            result: Ok(StreamId(2)),
+        },
+        72,
+    );
+    f.handle(input(B, press(3, true)), 73);
+    f.handle(Input::InjectDone { id: old, ok: true }, 74);
+    f.confirm(&retries, true, 74);
+    assert_eq!(f.held(), vec![Held::Key(KEY)]);
+    let release = f.handle(input(B, press(4, false)), 75);
+    assert_eq!(commands(&release), vec![up()]);
+    f.confirm(&release, true, 75);
+    assert!(f.held().is_empty());
+}
+
+#[test]
+fn grace_expired_projections_cannot_resume_without_a_tick() {
+    let mut source = Fixture::source(PlatformParking::Twin);
+    let mut destination = Fixture::destination();
+    source.handle(closed(B), 100);
+    destination.handle(closed(A), 100);
+    assert_eq!(
+        source.handle(Input::PeerUp { peer: B }, 20_100),
+        vec![
+            Output::Restore { window: WINDOW },
+            Output::Notice(Notice::ProjectionEnded {
+                key: key(A),
+                reason: Reason::LinkLost
+            }),
+        ]
+    );
+    assert_eq!(
+        destination.handle(control(A, start()), 20_100),
+        vec![
+            Output::CloseProxy { key: key(A) },
+            Output::Notice(Notice::ProjectionEnded {
+                key: key(A),
+                reason: Reason::LinkLost
+            }),
+        ]
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1_000, failure_persistence: None, ..ProptestConfig::default() })]
+
+    #[test]
+    fn grace_random_drop_releases_every_injected_key_and_button_immediately(
+        events in prop::collection::vec((any::<bool>(), any::<bool>()), 1..100),
+        drop_seed in any::<usize>(),
+    ) {
+        let mut f = Fixture::source(PlatformParking::Twin);
+        let mut injected = BTreeSet::new();
+        let drop_at = drop_seed % (events.len() + 1);
+        for (index, (is_key, down)) in events.into_iter().take(drop_at).enumerate() {
+            let seq = index as u32 + 1;
+            let msg = if is_key { press(seq, down) } else { button(seq, down, PointDevice::zero()) };
+            let out = f.handle(input(B, msg), index as u64);
+            for cmd in commands(&out) {
+                match cmd {
+                    InjectCmd::Key { usage, down } => transition_fake(&mut injected, Held::Key(usage), down),
+                    InjectCmd::Button { button, down } => transition_fake(&mut injected, Held::Button(button), down),
+                    _ => {},
+                }
+            }
+            f.confirm(&out, true, index as u64);
+        }
+        let held_at_drop = injected.clone();
+        let now = drop_at as u64 + 1;
+        let out = f.handle(closed(B), now);
+        prop_assert_eq!(commands(&out).len(), held_at_drop.len());
+        let releases: BTreeSet<_> = commands(&out).into_iter().map(|cmd| match cmd {
+            InjectCmd::Key { usage, down: false } => Held::Key(usage),
+            InjectCmd::Button { button, down: false } => Held::Button(button),
+            _ => panic!("drop emitted something other than a release"),
+        }).collect();
+        prop_assert_eq!(&releases, &held_at_drop);
+        for item in releases { injected.remove(&item); }
+        prop_assert!(injected.is_empty());
+        prop_assert_eq!(out.len(), commands(&out).len() + 1);
+        prop_assert_eq!(out.last(), Some(&Output::StopCapture { stream: StreamId(1) }));
+        f.confirm(&out, true, now);
+        prop_assert!(f.held().is_empty());
+        prop_assert_eq!(f.e2.next_deadline(), Some(ms(now + 20_000)));
+    }
 }

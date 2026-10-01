@@ -14,7 +14,7 @@ use crosspane_types::id::NodeId;
 use crosspane_types::time::MonoTime;
 
 use super::ledger::split;
-use super::{E2, send};
+use super::{E2, GRACE, send};
 use crate::io::{Command, Failure, Notice, Output, ProjectionKey, ProxyEvent};
 
 // Ceiling of 1 second / 120: rounding downward would exceed 120 Hz.
@@ -27,6 +27,9 @@ const PEER_CAP: usize = 16;
 pub(super) struct Destination {
     open: bool,
     open_due: Option<MonoTime>,
+    suspended: Option<MonoTime>,
+    /// Latest proxy geometry, including resizes not yet sent over the link.
+    current: Option<(PixelSize, f64)>,
     seq: u32,
     held: BTreeSet<Held>,
     position: PointDevice,
@@ -187,7 +190,33 @@ impl E2 {
                 send(peer, Message::Refused { projection, reason }, out);
                 return;
             }
-            if self.destinations.contains_key(&key) {
+            if let Some(destination) = self.destinations.get_mut(&key) {
+                if let Some(deadline) = destination.suspended {
+                    if deadline <= now {
+                        self.end_destination(key, Reason::LinkLost, true, true, out);
+                        return;
+                    }
+                    destination.suspended = None;
+                    if let Some((size, scale)) = destination.current.filter(|_| destination.open) {
+                        destination.last_sent = Some((size, scale));
+                        destination.last_heartbeat = now;
+                        destination.heartbeat_due = now.checked_add(HEARTBEAT_IDLE);
+                        send(
+                            peer,
+                            Message::Accepted {
+                                projection,
+                                size,
+                                scale,
+                            },
+                            out,
+                        );
+                        // A restarted stream's first frame is a key frame (E2-v0, decision 3).
+                        // MediaError requests another if that frame cannot be applied.
+                    } else {
+                        // The old OpenProxy is still in flight: wait for it, never open twice.
+                        destination.open_due = Some(now.saturating_add(OPEN_TIMEOUT));
+                    }
+                }
                 return;
             }
             // Pending opens count too, so concurrent Start messages cannot bypass the cap.
@@ -213,6 +242,8 @@ impl E2 {
                 Destination {
                     open: false,
                     open_due: Some(now.saturating_add(OPEN_TIMEOUT)),
+                    suspended: None,
+                    current: None,
                     seq: 0,
                     held: BTreeSet::new(),
                     position: PointDevice::zero(),
@@ -240,17 +271,21 @@ impl E2 {
             return;
         };
         match msg {
-            Message::Geometry { size, parking, .. } if destination.open => {
+            Message::Geometry { size, parking, .. }
+                if destination.open && destination.suspended.is_none() =>
+            {
                 out.push(Output::ProxyGeometry {
                     key,
                     size: *size,
                     parking: *parking,
                 })
             }
-            Message::Title { title, .. } if destination.open => out.push(Output::ProxyTitle {
-                key,
-                title: title.clone(),
-            }),
+            Message::Title { title, .. } if destination.open && destination.suspended.is_none() => {
+                out.push(Output::ProxyTitle {
+                    key,
+                    title: title.clone(),
+                })
+            }
             Message::End { reason, .. } => self.end_destination(key, *reason, true, false, out),
             _ => {}
         }
@@ -276,6 +311,10 @@ impl E2 {
             Ok((size, scale)) => {
                 destination.open = true;
                 destination.open_due = None;
+                destination.current = Some((size, scale));
+                if destination.suspended.is_some() {
+                    return;
+                }
                 destination.last_sent = Some((size, scale));
                 destination.last_heartbeat = now;
                 destination.heartbeat_due = now.checked_add(HEARTBEAT_IDLE);
@@ -290,14 +329,16 @@ impl E2 {
                 );
             }
             Err(_) => {
-                send(
-                    key.source,
-                    Message::Refused {
-                        projection: key.projection,
-                        reason: Refusal::InjectorFailed,
-                    },
-                    out,
-                );
+                if destination.suspended.is_none() {
+                    send(
+                        key.source,
+                        Message::Refused {
+                            projection: key.projection,
+                            reason: Refusal::InjectorFailed,
+                        },
+                        out,
+                    );
+                }
                 out.push(Output::Notice(Notice::ProjectionRefused {
                     peer: key.source,
                     reason: Refusal::InjectorFailed,
@@ -333,6 +374,12 @@ impl E2 {
         let Some(destination) = self.destinations.get_mut(&key).filter(|d| d.open) else {
             return;
         };
+        if let ProxyEvent::Resized { size, scale } = event {
+            destination.current = Some((*size, *scale));
+        }
+        if destination.suspended.is_some() {
+            return;
+        }
         let mut sent = true;
         match event {
             ProxyEvent::Resized { size, scale }
@@ -492,7 +539,10 @@ impl E2 {
     }
 
     pub(super) fn media_error(&mut self, key: ProjectionKey, now: MonoTime, out: &mut Vec<Output>) {
-        if let Some(destination) = self.destinations.get_mut(&key).filter(|d| d.open)
+        if let Some(destination) = self
+            .destinations
+            .get_mut(&key)
+            .filter(|d| d.open && d.suspended.is_none())
             && destination
                 .last_keyframe
                 .is_none_or(|last| now.saturating_duration_since(last) >= KEYFRAME_SLOT)
@@ -508,6 +558,22 @@ impl E2 {
         }
     }
 
+    pub(super) fn suspend_destination(&mut self, key: ProjectionKey, now: MonoTime) {
+        if let Some(destination) = self.destinations.get_mut(&key) {
+            destination.held.clear();
+            destination.suspended = Some(now.saturating_add(GRACE));
+            destination.open_due = None;
+            destination.motion = None;
+            destination.motion_due = None;
+            destination.last_motion = None;
+            destination.resize = None;
+            destination.resize_due = None;
+            destination.last_resize = None;
+            destination.heartbeat_due = None;
+            destination.last_keyframe = None;
+        }
+    }
+
     pub(super) fn end_destination(
         &mut self,
         key: ProjectionKey,
@@ -519,6 +585,7 @@ impl E2 {
         let Some(mut destination) = self.destinations.remove(&key) else {
             return;
         };
+        let link_closed = link_closed || destination.suspended.is_some();
         if !link_closed {
             destination.ups(key, out);
         }
@@ -539,6 +606,12 @@ impl E2 {
     pub(super) fn destination_tick(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         let keys: Vec<_> = self.destinations.keys().copied().collect();
         for key in keys {
+            if let Some(deadline) = self.destinations.get(&key).and_then(|d| d.suspended) {
+                if deadline <= now {
+                    self.end_destination(key, Reason::LinkLost, true, true, out);
+                }
+                continue;
+            }
             if self
                 .destinations
                 .get(&key)
@@ -611,7 +684,15 @@ impl E2 {
     pub(super) fn destination_deadline(&self) -> Option<MonoTime> {
         self.destinations
             .values()
-            .flat_map(|d| [d.open_due, d.motion_due, d.resize_due, d.heartbeat_due])
+            .flat_map(|d| {
+                [
+                    d.open_due,
+                    d.suspended,
+                    d.motion_due,
+                    d.resize_due,
+                    d.heartbeat_due,
+                ]
+            })
             .flatten()
             .min()
     }

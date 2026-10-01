@@ -7,6 +7,7 @@ mod source;
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use crosspane_input::journal::{Journal, JournalError};
 use crosspane_platform::{LockState, SessionEvent, SessionState, WindowEvent, WindowInfo};
@@ -21,6 +22,8 @@ use crate::io::{Command, Input, Output, ProjectionKey};
 use destination::Destination;
 use ledger::Ledgers;
 use source::Source;
+
+const GRACE: Duration = Duration::from_secs(20);
 
 /// Both E2 roles of one node.
 pub struct E2 {
@@ -96,6 +99,7 @@ impl E2 {
         match input {
             Input::PeerUp { peer } => {
                 self.peers.insert(*peer);
+                self.resume_sources(*peer, now, out);
             }
             Input::LocalDisplays(displays) => {
                 self.scales = displays.iter().map(|d| (d.id, d.geometry.scale)).collect();
@@ -195,10 +199,10 @@ impl E2 {
                     .filter(|key| key.source == *peer)
                     .collect();
                 for id in sources {
-                    self.end_source(id, Reason::LinkLost, true, now, out);
+                    self.suspend_source(id, now, out);
                 }
                 for key in destinations {
-                    self.end_destination(key, Reason::LinkLost, true, true, out);
+                    self.suspend_destination(key, now);
                 }
             }
             Input::Link(LinkEvent::Control {
