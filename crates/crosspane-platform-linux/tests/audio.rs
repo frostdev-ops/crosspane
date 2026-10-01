@@ -1,4 +1,5 @@
 //! All server/client operations in this test are restricted to the owned private null graph.
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use crosspane_platform::{
     AudioDeviceError, AudioEvent, AudioHost, AudioKind, IoGate, PlatformError,
