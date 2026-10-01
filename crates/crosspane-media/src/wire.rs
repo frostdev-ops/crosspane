@@ -62,9 +62,15 @@ pub enum Codec {
 
 /// The codec of a media frame, from its header alone.
 pub fn read_codec(data: &[u8]) -> Result<Codec, MediaError> {
-    // WP-2.14a implements this (and makes `read_header` accept codec 1).
-    let _ = data;
-    Ok(Codec::Tiles)
+    let mut input = Reader::new(data);
+    if input.u32()? != MAGIC {
+        return Err(MediaError::BadMagic);
+    }
+    if input.u8()? != 1 {
+        return Err(MediaError::BadVersion);
+    }
+    input.u8()?; // Flags are validated by the full header parser.
+    parse_codec(input.u8()?)
 }
 
 /// Append a codec-1 frame: the CPF1 header for `header` followed by `access_unit`. `out` is
@@ -75,17 +81,33 @@ pub fn write_video(
     access_unit: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<(), MediaError> {
-    // WP-2.14a implements this.
-    let _ = (header, access_unit, out);
-    Err(MediaError::BadCodec)
+    out.clear();
+    tile_grid(header.width, header.height)?;
+    let len = HEADER_BYTES
+        .checked_add(access_unit.len())
+        .filter(|&len| len <= MAX_FRAME_BYTES)
+        .ok_or(MediaError::TooLarge)?;
+    let count = u32::try_from(access_unit.len()).map_err(|_| MediaError::TooLarge)?;
+    out.try_reserve_exact(len)
+        .map_err(|_| MediaError::TooLarge)?;
+    write_codec_header(header, count, Codec::H264, out);
+    out.extend_from_slice(access_unit);
+    Ok(())
 }
 
 /// Parse a codec-1 frame: its header and access unit (borrowed from `data`). Every check the
 /// tile format applies to the header applies here too; the payload must be exactly `count` bytes.
 pub fn read_video(data: &[u8]) -> Result<(FrameHeader, &[u8]), MediaError> {
-    // WP-2.14a implements this.
-    let _ = data;
-    Err(MediaError::BadCodec)
+    if read_codec(data)? != Codec::H264 {
+        return Err(MediaError::BadCodec);
+    }
+    let (header, count) = parse_header(data)?;
+    let mut input = Reader::new(data.get(HEADER_BYTES..).ok_or(MediaError::Truncated)?);
+    let access_unit = input.take(count as usize)?;
+    if !input.remaining().is_empty() {
+        return Err(MediaError::Trailing);
+    }
+    Ok((header, access_unit))
 }
 
 /// Parse just the header (the receiver uses it to drop stale frames before decoding).
@@ -116,9 +138,7 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<(FrameHeader, u32), MediaError
     if flags & !1 != 0 {
         return Err(MediaError::BadReserved);
     }
-    if input.u8()? != 0 {
-        return Err(MediaError::BadCodec);
-    }
+    let codec = parse_codec(input.u8()?)?;
     if input.u8()? != 0 {
         return Err(MediaError::BadReserved);
     }
@@ -128,18 +148,22 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<(FrameHeader, u32), MediaError
     let width = input.u32()?;
     let height = input.u32()?;
     let (tiles_x, tiles_y) = tile_grid(width, height)?;
-    if u32::from(input.u16()?) != TILE {
-        return Err(MediaError::BadTile);
+    let tile_size = u32::from(input.u16()?);
+    match codec {
+        Codec::Tiles if tile_size != TILE => return Err(MediaError::BadTile),
+        // A tile header relabelled as video is still an unsupported codec/format pairing.
+        Codec::H264 if tile_size != 0 => return Err(MediaError::BadCodec),
+        _ => {}
     }
     if input.u16()? != 0 {
         return Err(MediaError::BadReserved);
     }
     let count = input.u32()?;
-    if count > tiles_x * tiles_y {
+    if codec == Codec::Tiles && count > tiles_x * tiles_y {
         return Err(MediaError::BadTile);
     }
     let key = flags & 1 != 0;
-    if key && count != tiles_x * tiles_y {
+    if codec == Codec::Tiles && key && count != tiles_x * tiles_y {
         return Err(MediaError::MissingTiles);
     }
     Ok((
@@ -156,14 +180,30 @@ pub(crate) fn parse_header(data: &[u8]) -> Result<(FrameHeader, u32), MediaError
 }
 
 pub(crate) fn write_header(header: FrameHeader, count: u32, out: &mut Vec<u8>) {
+    write_codec_header(header, count, Codec::Tiles, out);
+}
+
+fn parse_codec(byte: u8) -> Result<Codec, MediaError> {
+    match byte {
+        0 => Ok(Codec::Tiles),
+        1 => Ok(Codec::H264),
+        _ => Err(MediaError::BadCodec),
+    }
+}
+
+fn write_codec_header(header: FrameHeader, count: u32, codec: Codec, out: &mut Vec<u8>) {
+    let (codec_byte, tile_size) = match codec {
+        Codec::Tiles => (0, TILE as u16),
+        Codec::H264 => (1, 0),
+    };
     out.extend_from_slice(&MAGIC.to_le_bytes());
-    out.extend_from_slice(&[1, u8::from(header.key), 0, 0]);
+    out.extend_from_slice(&[1, u8::from(header.key), codec_byte, 0]);
     out.extend_from_slice(&header.projection.to_le_bytes());
     out.extend_from_slice(&header.seq.to_le_bytes());
     out.extend_from_slice(&header.captured_ns.to_le_bytes());
     out.extend_from_slice(&header.width.to_le_bytes());
     out.extend_from_slice(&header.height.to_le_bytes());
-    out.extend_from_slice(&(TILE as u16).to_le_bytes());
+    out.extend_from_slice(&tile_size.to_le_bytes());
     out.extend_from_slice(&0_u16.to_le_bytes());
     out.extend_from_slice(&count.to_le_bytes());
 }
