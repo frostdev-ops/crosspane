@@ -101,7 +101,12 @@ impl WindowSource for MacWindows {
                 "activation refused ({requested:?}); AXFrontmost: {error}"
             )));
         }
-        AxWindow::find(&raw, deadline)?.raise()
+        // Raising is best effort: activation routes the keys, and some apps (Safari) refuse part
+        // of it (AXMain: attribute unsupported).
+        if let Err(error) = AxWindow::find(&raw, deadline).and_then(|window| window.raise()) {
+            tracing::debug!(%error, "raising an activated window failed");
+        }
+        Ok(())
     }
 
     fn subscribe(&mut self, sink: Arc<dyn EventSink<WindowEvent>>) -> Result<(), PlatformError> {

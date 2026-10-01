@@ -2142,6 +2142,42 @@ fn source_rejects_invalid_sizes_without_parking_or_overwriting_valid_resize() {
 }
 
 #[test]
+fn keys_follow_focus_into_the_projected_apps_own_popups_only() {
+    let with = |id, pid, display| WindowInfo {
+        pid: Some(pid),
+        display: Some(display),
+        ..window(id)
+    };
+    for (focus, pid, display, injects) in [
+        // The app's own popup on the display the window is parked on (Safari's suggestions).
+        (WindowId(50), 7, DISPLAY, true),
+        // The same app's window elsewhere, and another app on the twin: keys stay back.
+        (WindowId(51), 7, DisplayId(99), false),
+        (WindowId(52), 8, DISPLAY, false),
+    ] {
+        let mut f = startup(3);
+        f.handle(
+            Input::Windows(WindowEvent::Changed(with(WINDOW, 7, DISPLAY))),
+            39,
+        );
+        f.handle(
+            Input::Windows(WindowEvent::Added(with(focus, pid, display))),
+            39,
+        );
+        f.handle(Input::Windows(WindowEvent::Focused(Some(focus))), 40);
+        let out = f.handle(input(B, press(1, true)), 41);
+        assert_eq!(
+            out.iter().any(|o| matches!(o, Output::Inject { .. })),
+            injects,
+            "{focus:?}: {out:?}"
+        );
+        if injects {
+            f.handle(input(B, press(2, false)), 42);
+        }
+    }
+}
+
+#[test]
 fn early_focus_activates_when_live_and_a_focused_window_is_left_alone() {
     let focus = |focused| {
         control(
