@@ -11,5 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-crosspane-types.workspace = true
-crosspane-protocol.workspace = true
+anyhow.workspace = true
+eframe.workspace = true
+serde.workspace = true
+serde_json.workspace = true
