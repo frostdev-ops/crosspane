@@ -26,9 +26,15 @@ crosspane-platform-linux = { path = "crates/crosspane-platform-linux" }
 crosspane-platform-macos = { path = "crates/crosspane-platform-macos" }
 
 # External crates (09 §2). Versions checked 2026-09-30.
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
 euclid = { version = "0.22.14", features = ["serde"] }
+pollster = "1.0.1"
 proptest = "1.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+wgpu = "30.0.1"
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

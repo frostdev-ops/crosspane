@@ -12,3 +12,10 @@ workspace = true
 
 [dependencies]
 crosspane-types.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+pollster.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true
+winit.workspace = true
