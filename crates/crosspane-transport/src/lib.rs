@@ -15,6 +15,7 @@
 mod hub;
 mod link;
 mod media;
+pub mod pairing;
 mod session;
 mod tls;
 
