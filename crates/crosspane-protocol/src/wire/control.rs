@@ -5,7 +5,7 @@ use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{
     DisplayGeometry, PixelSize, PointDevice, PointLogical, PointMm, SizeMm,
 };
-use crosspane_types::id::{DisplayId, NodeId, ProjectionId, SessionId};
+use crosspane_types::id::{DisplayId, NodeId, ProjectionId, SessionId, WindowId};
 use crosspane_types::input::LockKeys;
 use prost::Message;
 
@@ -13,7 +13,10 @@ use super::{Frame, KIND_CONTROL, MAX_CONTROL_PAYLOAD, WIRE_VERSION, WireError};
 use crate::msg::{
     Capability, ControlMessage, EndReason, Hello, Placement, Refusal, RevocationNotice,
 };
-use crate::projection::{ParkingKind, ProjectionEndReason, ProjectionMessage, WindowSummary};
+use crate::projection::{
+    BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjectionEndReason, ProjectionMessage,
+    WindowSummary,
+};
 
 const MAX_STRING: usize = 256;
 const MAX_PROJECTION_STRING: usize = 1024;
@@ -429,6 +432,27 @@ fn check_projection_scale(scale: f64) -> Result<(), WireError> {
     Ok(())
 }
 
+fn projection_refusal_to_pb(reason: Refusal) -> u32 {
+    match reason {
+        Refusal::Permission => 1,
+        Refusal::Locked => 2,
+        Refusal::SecureInput => 3,
+        Refusal::Busy => 4,
+        Refusal::InjectorFailed => 5,
+    }
+}
+
+fn projection_refusal_from_pb(reason: u32) -> Result<Refusal, WireError> {
+    match reason {
+        1 => Ok(Refusal::Permission),
+        2 => Ok(Refusal::Locked),
+        3 => Ok(Refusal::SecureInput),
+        4 => Ok(Refusal::Busy),
+        5 => Ok(Refusal::InjectorFailed),
+        _ => Err(WireError::BadValue("projection refusal")),
+    }
+}
+
 fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireError> {
     use pb::projection::Body;
 
@@ -461,19 +485,10 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 scale: *scale,
             })
         }
-        ProjectionMessage::Refused { projection, reason } => {
-            let reason = match reason {
-                Refusal::Permission => 1,
-                Refusal::Locked => 2,
-                Refusal::SecureInput => 3,
-                Refusal::Busy => 4,
-                Refusal::InjectorFailed => 5,
-            };
-            Body::Refused(pb::ProjectionRefused {
-                projection: projection.0,
-                reason,
-            })
-        }
+        ProjectionMessage::Refused { projection, reason } => Body::Refused(pb::ProjectionRefused {
+            projection: projection.0,
+            reason: projection_refusal_to_pb(*reason),
+        }),
         ProjectionMessage::Resize {
             projection,
             size,
@@ -550,12 +565,39 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 reason,
             })
         }
-        // WP-2.13 puts these on the wire.
-        ProjectionMessage::ListWindows { .. }
-        | ProjectionMessage::WindowList { .. }
-        | ProjectionMessage::Pull { .. }
-        | ProjectionMessage::BrowseRefused { .. } => {
-            return Err(WireError::BadValue("window browsing is not encodable yet"));
+        ProjectionMessage::ListWindows { request } => {
+            Body::ListWindows(pb::ProjectionListWindows { request: *request })
+        }
+        ProjectionMessage::WindowList { request, windows } => {
+            check_len(windows.len(), MAX_BROWSE_WINDOWS, "browse window count")?;
+            let windows = windows
+                .iter()
+                .map(|window| {
+                    check_projection_string(&window.summary.title)?;
+                    check_projection_string(&window.summary.app_id)?;
+                    Ok(pb::BrowsableWindow {
+                        window: window.window.0,
+                        title: window.summary.title.clone(),
+                        app_id: window.summary.app_id.clone(),
+                        width: window.size.width,
+                        height: window.size.height,
+                    })
+                })
+                .collect::<Result<_, WireError>>()?;
+            Body::WindowList(pb::ProjectionWindowList {
+                request: *request,
+                windows,
+            })
+        }
+        ProjectionMessage::Pull { request, window } => Body::Pull(pb::ProjectionPull {
+            request: *request,
+            window: window.0,
+        }),
+        ProjectionMessage::BrowseRefused { request, reason } => {
+            Body::BrowseRefused(pb::ProjectionBrowseRefused {
+                request: *request,
+                reason: projection_refusal_to_pb(*reason),
+            })
         }
     };
     Ok(pb::Projection { body: Some(body) })
@@ -585,20 +627,10 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
                 scale: accepted.scale,
             }
         }
-        Body::Refused(refused) => {
-            let reason = match refused.reason {
-                1 => Refusal::Permission,
-                2 => Refusal::Locked,
-                3 => Refusal::SecureInput,
-                4 => Refusal::Busy,
-                5 => Refusal::InjectorFailed,
-                _ => return Err(WireError::BadValue("projection refusal")),
-            };
-            ProjectionMessage::Refused {
-                projection: ProjectionId(refused.projection),
-                reason,
-            }
-        }
+        Body::Refused(refused) => ProjectionMessage::Refused {
+            projection: ProjectionId(refused.projection),
+            reason: projection_refusal_from_pb(refused.reason)?,
+        },
         Body::Resize(resize) => {
             check_projection_scale(resize.scale)?;
             ProjectionMessage::Resize {
@@ -663,6 +695,44 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
                 reason,
             }
         }
+        Body::ListWindows(list) => ProjectionMessage::ListWindows {
+            request: list.request,
+        },
+        Body::WindowList(list) => {
+            check_len(
+                list.windows.len(),
+                MAX_BROWSE_WINDOWS,
+                "browse window count",
+            )?;
+            let windows = list
+                .windows
+                .into_iter()
+                .map(|window| {
+                    check_projection_string(&window.title)?;
+                    check_projection_string(&window.app_id)?;
+                    Ok(BrowsableWindow {
+                        window: WindowId(window.window),
+                        summary: WindowSummary {
+                            title: window.title,
+                            app_id: window.app_id,
+                        },
+                        size: PixelSize::new(window.width, window.height),
+                    })
+                })
+                .collect::<Result<_, WireError>>()?;
+            ProjectionMessage::WindowList {
+                request: list.request,
+                windows,
+            }
+        }
+        Body::Pull(pull) => ProjectionMessage::Pull {
+            request: pull.request,
+            window: WindowId(pull.window),
+        },
+        Body::BrowseRefused(refused) => ProjectionMessage::BrowseRefused {
+            request: refused.request,
+            reason: projection_refusal_from_pb(refused.reason)?,
+        },
     })
 }
 
@@ -670,7 +740,10 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
 mod pb {
     #[derive(Clone, PartialEq, prost::Message)]
     pub struct Projection {
-        #[prost(oneof = "projection::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+        #[prost(
+            oneof = "projection::Body",
+            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+        )]
         pub body: Option<projection::Body>,
     }
 
@@ -697,6 +770,14 @@ mod pb {
             End(super::ProjectionEnd),
             #[prost(message, tag = "10")]
             Close(super::ProjectionClose),
+            #[prost(message, tag = "11")]
+            ListWindows(super::ProjectionListWindows),
+            #[prost(message, tag = "12")]
+            WindowList(super::ProjectionWindowList),
+            #[prost(message, tag = "13")]
+            Pull(super::ProjectionPull),
+            #[prost(message, tag = "14")]
+            BrowseRefused(super::ProjectionBrowseRefused),
         }
     }
 
@@ -792,6 +873,50 @@ mod pb {
     pub struct ProjectionClose {
         #[prost(uint64, tag = "1")]
         pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub reason: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionListWindows {
+        #[prost(uint32, tag = "1")]
+        pub request: u32,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct ProjectionWindowList {
+        #[prost(uint32, tag = "1")]
+        pub request: u32,
+        #[prost(message, repeated, tag = "2")]
+        pub windows: Vec<BrowsableWindow>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct BrowsableWindow {
+        #[prost(uint64, tag = "1")]
+        pub window: u64,
+        #[prost(string, tag = "2")]
+        pub title: String,
+        #[prost(string, tag = "3")]
+        pub app_id: String,
+        #[prost(uint32, tag = "4")]
+        pub width: u32,
+        #[prost(uint32, tag = "5")]
+        pub height: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionPull {
+        #[prost(uint32, tag = "1")]
+        pub request: u32,
+        #[prost(uint64, tag = "2")]
+        pub window: u64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionBrowseRefused {
+        #[prost(uint32, tag = "1")]
+        pub request: u32,
         #[prost(uint32, tag = "2")]
         pub reason: u32,
     }

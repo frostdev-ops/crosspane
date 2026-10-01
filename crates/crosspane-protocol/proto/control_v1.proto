@@ -68,6 +68,10 @@ message Projection {
     ProjectionKeyFrameRequest key_frame_request = 8;
     ProjectionEnd end = 9; // Source -> destination: close the proxy.
     ProjectionClose close = 10; // Destination -> source: restore the source window.
+    ProjectionListWindows list_windows = 11;
+    ProjectionWindowList window_list = 12;
+    ProjectionPull pull = 13;
+    ProjectionBrowseRefused browse_refused = 14;
   }
 }
 
@@ -132,4 +136,32 @@ message ProjectionEnd {
 message ProjectionClose {
   uint64 projection = 1;
   uint32 reason = 2;
+}
+
+message ProjectionListWindows {
+  uint32 request = 1;
+}
+
+// At most 256 windows; each title/app_id is capped at 1024 UTF-8 bytes.
+message ProjectionWindowList {
+  uint32 request = 1;
+  repeated BrowsableWindow windows = 2;
+}
+
+message BrowsableWindow {
+  uint64 window = 1;
+  string title = 2;
+  string app_id = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+}
+
+message ProjectionPull {
+  uint32 request = 1;
+  uint64 window = 2;
+}
+
+message ProjectionBrowseRefused {
+  uint32 request = 1;
+  uint32 reason = 2; // Same 1..5 codes as Refusal above.
 }

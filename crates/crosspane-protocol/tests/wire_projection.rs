@@ -2,7 +2,8 @@
 
 use crosspane_protocol::msg::{ControlMessage, InputMessage, MAX_HELD_KEYS, Refusal};
 use crosspane_protocol::projection::{
-    ParkingKind, ProjInput, ProjectionEndReason, ProjectionMessage, WindowSummary,
+    BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjInput, ProjectionEndReason,
+    ProjectionMessage, WindowSummary,
 };
 use crosspane_protocol::wire::{
     Frame, FrameDecoder, HEADER_LEN, KIND_CONTROL, KIND_PROJ_BUTTON, KIND_PROJ_HELD, KIND_PROJ_KEY,
@@ -11,7 +12,7 @@ use crosspane_protocol::wire::{
 };
 use crosspane_types::geom::{PixelSize, PointDevice, VectorLogical};
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::ProjectionId;
+use crosspane_types::id::{ProjectionId, WindowId};
 use crosspane_types::input::{ScrollDelta, ScrollPhase};
 use proptest::prelude::*;
 
@@ -41,6 +42,23 @@ fn size() -> impl Strategy<Value = PixelSize> {
 
 fn text() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..=256).prop_map(|chars| chars.into_iter().collect())
+}
+
+fn browsable_window() -> impl Strategy<Value = BrowsableWindow> {
+    (
+        any::<u64>(),
+        proptest::collection::vec(any::<char>(), 0..=32),
+        proptest::collection::vec(any::<char>(), 0..=32),
+        size(),
+    )
+        .prop_map(|(window, title, app_id, size)| BrowsableWindow {
+            window: WindowId(window),
+            summary: WindowSummary {
+                title: format!("窗口 — {}", title.into_iter().collect::<String>()),
+                app_id: app_id.into_iter().collect(),
+            },
+            size,
+        })
 }
 
 fn usage() -> impl Strategy<Value = HidUsage> {
@@ -216,6 +234,54 @@ proptest! {
         let fields = [projection, number(2, code)].concat();
         // Verify tag 10 and the reason codes independently of the codec's private pb types.
         prop_assert_eq!(control_frame(&message), projection_frame(10, &fields));
+        round_trip_control(message);
+    }
+
+    #[test]
+    fn round_trip_list_windows(request in any::<u32>()) {
+        let message = ProjectionMessage::ListWindows { request };
+        prop_assert_eq!(
+            decode_control(&projection_frame(11, &number(1, u64::from(request)))),
+            Ok(ControlMessage::Projection(message.clone()))
+        );
+        round_trip_control(message);
+    }
+
+    #[test]
+    fn round_trip_window_list(request in any::<u32>(),
+        windows in proptest::collection::vec(browsable_window(), MAX_BROWSE_WINDOWS)) {
+        // Every case includes the empty, single-window and full lists, with Unicode titles.
+        for count in [0, 1, MAX_BROWSE_WINDOWS] {
+            let windows = windows[..count].to_vec();
+            let mut fields = number(1, u64::from(request));
+            for window in &windows {
+                fields.extend(bytes_field(2, &browsable_window_bytes(window)));
+            }
+            let message = ProjectionMessage::WindowList { request, windows };
+            prop_assert_eq!(decode_control(&projection_frame(12, &fields)),
+                Ok(ControlMessage::Projection(message.clone())));
+            round_trip_control(message);
+        }
+    }
+
+    #[test]
+    fn round_trip_pull(request in any::<u32>(), window in any::<u64>()) {
+        let message = ProjectionMessage::Pull { request, window: WindowId(window) };
+        let fields = [number(1, u64::from(request)), number(2, window)].concat();
+        prop_assert_eq!(decode_control(&projection_frame(13, &fields)),
+            Ok(ControlMessage::Projection(message.clone())));
+        round_trip_control(message);
+    }
+
+    #[test]
+    fn round_trip_browse_refused(request in any::<u32>(),
+        (reason, code) in proptest::sample::select(vec![
+            (Refusal::Permission, 1u64), (Refusal::Locked, 2), (Refusal::SecureInput, 3),
+            (Refusal::Busy, 4), (Refusal::InjectorFailed, 5)])) {
+        let message = ProjectionMessage::BrowseRefused { request, reason };
+        let fields = [number(1, u64::from(request)), number(2, code)].concat();
+        prop_assert_eq!(decode_control(&projection_frame(14, &fields)),
+            Ok(ControlMessage::Projection(message.clone())));
         round_trip_control(message);
     }
 }
@@ -531,6 +597,113 @@ fn projection_frame(variant: u32, fields: &[u8]) -> Frame {
     }
 }
 
+fn browsable_window_bytes(window: &BrowsableWindow) -> Vec<u8> {
+    [
+        number(1, window.window.0),
+        bytes_field(2, window.summary.title.as_bytes()),
+        bytes_field(3, window.summary.app_id.as_bytes()),
+        number(4, u64::from(window.size.width)),
+        number(5, u64::from(window.size.height)),
+    ]
+    .concat()
+}
+
+#[test]
+fn rejects_too_many_browse_windows() {
+    // Even empty repeated messages count toward the cap.
+    assert_eq!(
+        decode_control(&projection_frame(
+            12,
+            &bytes_field(2, &[]).repeat(MAX_BROWSE_WINDOWS + 1)
+        )),
+        Err(WireError::BadValue("browse window count"))
+    );
+    assert_bad_control(ProjectionMessage::WindowList {
+        request: 0,
+        windows: vec![
+            BrowsableWindow {
+                window: WindowId(0),
+                summary: WindowSummary {
+                    title: String::new(),
+                    app_id: String::new(),
+                },
+                size: PixelSize::new(0, 0),
+            };
+            MAX_BROWSE_WINDOWS + 1
+        ],
+    });
+}
+
+#[test]
+fn rejects_overlong_browse_title_and_app_id_by_utf8_byte_length() {
+    for value in ["a".repeat(1025), "é".repeat(513)] {
+        for field in [2, 3] {
+            assert_eq!(
+                decode_control(&projection_frame(
+                    12,
+                    &bytes_field(2, &bytes_field(field, value.as_bytes()))
+                )),
+                Err(WireError::BadValue("projection string"))
+            );
+            let mut summary = WindowSummary {
+                title: String::new(),
+                app_id: String::new(),
+            };
+            if field == 2 {
+                summary.title = value.clone();
+            } else {
+                summary.app_id = value.clone();
+            }
+            assert_bad_control(ProjectionMessage::WindowList {
+                request: 1,
+                windows: vec![BrowsableWindow {
+                    window: WindowId(1),
+                    summary,
+                    size: PixelSize::new(0, 0),
+                }],
+            });
+        }
+    }
+    for value in ["a".repeat(1024), "é".repeat(512)] {
+        // Inclusive string limits and the full u32 size range are accepted.
+        round_trip_control(ProjectionMessage::WindowList {
+            request: u32::MAX,
+            windows: vec![
+                BrowsableWindow {
+                    window: WindowId(u64::MAX),
+                    summary: WindowSummary {
+                        title: value.clone(),
+                        app_id: value.clone(),
+                    },
+                    size: PixelSize::new(0, u32::MAX),
+                },
+                BrowsableWindow {
+                    window: WindowId(0),
+                    summary: WindowSummary {
+                        title: value.clone(),
+                        app_id: value,
+                    },
+                    size: PixelSize::new(u32::MAX, 0),
+                },
+            ],
+        });
+    }
+}
+
+#[test]
+fn rejects_unknown_browse_refusal_codes() {
+    for code in [0, 6, 255, u32::MAX] {
+        assert_eq!(
+            decode_control(&projection_frame(14, &number(2, u64::from(code)))),
+            Err(WireError::BadValue("projection refusal"))
+        );
+    }
+    assert_eq!(
+        decode_control(&projection_frame(14, &[])),
+        Err(WireError::BadValue("projection refusal"))
+    );
+}
+
 #[test]
 fn rejects_nonfinite_or_nonpositive_scale() {
     for scale in [
@@ -653,7 +826,7 @@ fn rejects_invalid_close_payloads() {
 
 #[test]
 fn unknown_projection_variant_is_unknown_control() {
-    for variant in [11, 99, 536_870_911] {
+    for variant in [15, 99, 536_870_911] {
         assert_eq!(
             decode_control(&projection_frame(variant, &[])),
             Err(WireError::UnknownControl)
