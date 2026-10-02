@@ -1,5 +1,4 @@
-use super::{Abort, Delivery, Socket, SocketGuard, backend, events};
-use crate::hyprland::ipc::HyprIpc;
+use super::{Abort, Delivery, Socket, SocketGuard, Source, backend, events, rejected, unmark};
 use crosspane_platform::{
     CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, Edge, EndReason, IoGate,
     MotionKind, PlatformError, PortalId,
@@ -17,7 +16,6 @@ use std::{
     fs::File,
     os::fd::AsFd,
     os::unix::{fs::FileExt, net::UnixStream},
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -63,6 +61,77 @@ use wayland_protocols_wlr::{
 use xkbcommon::xkb;
 use zeroize::Zeroizing;
 
+/// The bound on one monitor-cache refresh (two short IPC requests).
+const REFRESH_BOUND: Duration = Duration::from_millis(20);
+/// Time a refresh leaves of the caller's budget for the strips' own roundtrip and the reply.
+const REFRESH_RESERVE: Duration = Duration::from_millis(10);
+/// Time `set_portals` keeps back from the caller's deadline, so that a slow compositor makes the
+/// worker report its own rejection (previous set and capture intact) before the caller's receive
+/// timeout fires and aborts everything.
+const REPLY_RESERVE: Duration = Duration::from_millis(5);
+/// How soon the idle path tries again after a failed refresh.
+const REFRESH_RETRY: Duration = Duration::from_millis(250);
+/// How many [`Cause`]s a connection remembers.
+const CAUSES_KEPT: usize = 32;
+
+/// How [`Client::set_portals`] treats a stale monitor cache.
+#[derive(Clone, Copy)]
+pub(super) enum Refresh {
+    /// Refresh it first; a refresh that misses its bound rejects the set.
+    Required,
+    /// Rebuilding the previous set on a new connection: try to refresh, but go on with the cached
+    /// list if that fails (as before WP-2.43d), so a tight budget never costs the rebuild.
+    BestEffort,
+    /// The caller just refreshed (or tried to): use the cache as it is.
+    Done,
+    /// Nested tests only: refresh with this bound whether or not the cache is stale, and sit on
+    /// the freshly read list for `stall` before publishing it (a refresh that parses late).
+    Forced { bound: Duration, stall: Duration },
+}
+
+/// Why the backend itself ended a capture. The compositor's doing (it unlocked the pointer, took
+/// a focus away) and the backend's own decision (it removed the strip, the output went) are
+/// different things; the nested tests read this log (`HyprlandCapture::end_causes_for_test`) to
+/// tell them apart. Every `State::finish` names one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cause {
+    /// `set_portals` replaced or removed the captured strip's portal (backend decision).
+    StripReplaced,
+    /// The output holding the captured strip was removed (backend decision, §3.6.3).
+    OutputRemoved,
+    /// Another capture-critical global (seat, constraints, layer shell...) went away.
+    GlobalRemoved,
+    /// The compositor closed the captured strip's layer surface.
+    StripClosed,
+    /// The compositor sent `wl_pointer.leave` for the captured strip.
+    PointerLeft,
+    /// The compositor sent `wl_keyboard.leave` for the captured strip.
+    KeyboardLeft,
+    /// The compositor unlocked the pointer (`zwp_locked_pointer_v1.unlocked`). Hyprland 0.56.2
+    /// does this whenever it relocates the cursor, e.g. when any output is removed.
+    Unlocked,
+    /// The compositor deactivated the shortcuts inhibitor.
+    InhibitorInactive,
+    /// The seat lost the pointer or keyboard capability.
+    SeatLost,
+    /// The keymap was unusable.
+    KeymapUnusable,
+    /// The I/O gate closed.
+    GateClosed,
+    /// The connection went away or was aborted.
+    Disconnected,
+    /// `begin` failed after the capture was partly set up.
+    ActivationFailed,
+}
+
+/// An acknowledgement held back for a controlled time (nested tests, `PortalsTestHooks`).
+enum Deferred {
+    /// A layer-surface configure: its size becomes known to the preparation only now.
+    Size(u64, (u32, u32)),
+    /// A `wl_display.sync` callback: the roundtrip completes only now.
+    Sync(u64),
+}
+
 pub(super) struct Client {
     _socket: SocketGuard,
     conn: Connection,
@@ -71,6 +140,8 @@ pub(super) struct Client {
     state: State,
     globals: Globals,
     sync: u64,
+    /// The compositor this connection was made to, for its IPC too.
+    source: Source,
 }
 struct Globals {
     compositor: wl_compositor::WlCompositor,
@@ -101,6 +172,16 @@ struct Output {
 }
 struct Strip {
     portal: CapturePortal,
+    /// The output (and the monitor name it had) this strip was created on; a strip is kept across
+    /// a replacement only while the portal's display still resolves to the same monitor at the
+    /// same scale.
+    output: wl_output::WlOutput,
+    monitor: String,
+    /// The monitor's size in device pixels when the strip was made. Hyprland does not always move
+    /// an edge-anchored layer surface when its output is resized afterwards (a nested output
+    /// resized by its parent window leaves a right-edge strip behind), so a strip that is not
+    /// being captured on is replaced once its output's size is no longer this.
+    monitor_size: (u32, u32),
     scale: f64,
     offset: f64,
     surface: wl_surface::WlSurface,
@@ -118,6 +199,18 @@ impl Strip {
             b.destroy();
         }
     }
+}
+/// One requested portal, validated and resolved to its output (`Client::set_portals`).
+struct Plan {
+    portal: CapturePortal,
+    output: wl_output::WlOutput,
+    monitor: String,
+    monitor_size: (u32, u32),
+    scale: f64,
+    offset: f64,
+    length: u32,
+    /// The existing strip that stays for this portal, if any.
+    keep: Option<u64>,
 }
 struct Capture {
     id: CaptureId,
@@ -143,6 +236,16 @@ struct State {
     outputs: Vec<Output>,
     monitors: Vec<Monitor>,
     monitors_dirty: bool,
+    /// The idle path does not retry a failed refresh before this.
+    refresh_after: Instant,
+    /// Counts what a rejection must not hide: a started capture ended, or a mapped strip was
+    /// destroyed or closed. `set_portals` compares it before and after its dispatching steps.
+    lost: u64,
+    /// Why the backend ended captures, oldest first (at most [`CAUSES_KEPT`]).
+    causes: Vec<Cause>,
+    /// Nested tests only: how long configure and sync acknowledgements are held back.
+    ack_delay: Duration,
+    deferred: Vec<(Instant, Deferred)>,
     strips: BTreeMap<u64, Strip>,
     portals: BTreeMap<PortalId, u64>,
     next_strip: u64,
@@ -207,17 +310,8 @@ fn timestamp(nanos: u64) -> MonoTime {
         MonoTime::from_nanos(nanos)
     }
 }
-fn connect(deadline: Instant) -> Result<UnixStream, PlatformError> {
-    let name =
-        std::env::var_os("WAYLAND_DISPLAY").ok_or(PlatformError::Unsupported("not on Wayland"))?;
-    let mut path = PathBuf::from(name);
-    if !path.is_absolute() {
-        path = PathBuf::from(
-            std::env::var_os("XDG_RUNTIME_DIR")
-                .ok_or(PlatformError::Unsupported("no Wayland runtime directory"))?,
-        )
-        .join(path);
-    }
+fn connect(deadline: Instant, source: &Source) -> Result<UnixStream, PlatformError> {
+    let path = source.socket_path()?;
     let fd = rustix::net::socket_with(
         rustix::net::AddressFamily::UNIX,
         rustix::net::SocketType::STREAM,
@@ -248,9 +342,10 @@ impl Client {
         delivery: mpsc::Sender<Delivery>,
         deadline: Instant,
         monitors: Option<Vec<Monitor>>,
+        source: &Source,
     ) -> Result<Self, PlatformError> {
         let epoch = abort.epoch.load(Ordering::Acquire);
-        let stream = connect(deadline)?;
+        let stream = connect(deadline, source)?;
         let socket = Arc::new(Socket {
             stream: stream.try_clone().map_err(backend)?,
             lost: AtomicBool::new(false),
@@ -283,6 +378,11 @@ impl Client {
             outputs: Vec::new(),
             monitors: Vec::new(),
             monitors_dirty: true,
+            refresh_after: Instant::now(),
+            lost: 0,
+            causes: Vec::new(),
+            ack_delay: Duration::ZERO,
+            deferred: Vec::new(),
             strips: BTreeMap::new(),
             portals: BTreeMap::new(),
             next_strip: 0,
@@ -353,6 +453,7 @@ impl Client {
             state,
             globals,
             sync: 1,
+            source: source.clone(),
         };
         client.roundtrip(deadline)?;
         if let Some(monitors) = monitors {
@@ -365,9 +466,16 @@ impl Client {
     pub(super) fn monitor_cache(&self) -> Vec<Monitor> {
         self.state.monitors.clone()
     }
+    /// Refresh a stale monitor cache from the idle path, also while a capture is active (WP-2.43d).
+    /// The request is bounded at [`REFRESH_BOUND`]; after a failure the next try waits
+    /// [`REFRESH_RETRY`], so a broken IPC socket can't keep the capture thread from dispatching.
     pub(super) fn refresh_monitors(&mut self) {
-        if self.state.monitors_dirty && self.state.capture.is_none() {
-            let _ = self.monitors(Instant::now() + Duration::from_millis(20));
+        if self.state.monitors_dirty && Instant::now() >= self.state.refresh_after {
+            let started = Instant::now();
+            if self.monitors(started + REFRESH_BOUND).is_err() {
+                self.state.refresh_after = Instant::now() + REFRESH_RETRY;
+            }
+            tracing::trace!(elapsed = ?started.elapsed(), "monitor cache refreshed on the idle path");
         }
     }
     pub(super) fn inject_worker_error(&mut self) {
@@ -383,10 +491,40 @@ impl Client {
             return Err(error);
         }
         pump(&self.conn, &mut self.queue, &mut self.state, timeout)?;
+        self.state.release_deferred(false);
         self.state.check_epoch()?;
         if let Some(error) = self.state.error.take() {
             return Err(error);
         }
+        Ok(())
+    }
+    /// Nested tests only: hold configure and sync acknowledgements back for `delay` (zero: off),
+    /// so a test can see that `set_portals` is still waiting for them. Turning it off releases
+    /// whatever is still held.
+    pub(super) fn set_ack_delay(&mut self, delay: Duration) {
+        self.state.ack_delay = delay;
+        if delay.is_zero() {
+            self.state.release_deferred(true);
+        }
+    }
+    /// Why this connection ended captures, oldest first (nested tests).
+    pub(super) fn end_causes(&self) -> Vec<String> {
+        self.state.causes.iter().map(|c| format!("{c:?}")).collect()
+    }
+    /// Nested tests: run the backend's handling of the removal of the output named `name` without
+    /// removing it from the compositor. The compositor's own reaction (Hyprland 0.56.2 ends any
+    /// capture when any output goes) is then out of the picture, and what is left is the
+    /// backend's decision, exactly as `GlobalRemove` makes it.
+    pub(super) fn simulate_output_removal(&mut self, name: &str) -> Result<(), PlatformError> {
+        let proxy = self
+            .state
+            .outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| o.proxy.clone())
+            .ok_or(PlatformError::NotFound)?;
+        self.state.output_removed(&proxy);
+        let _ = self.conn.flush();
         Ok(())
     }
     fn wait(
@@ -428,27 +566,42 @@ impl Client {
         }
         Ok(())
     }
+    /// Refresh the monitor cache: read the list, and publish it only if that was still in time.
     fn monitors(&mut self, deadline: Instant) -> Result<(), PlatformError> {
+        self.refresh_cache(deadline, Duration::ZERO)
+    }
+    /// [`Self::monitors`], sitting on the list that was read for `stall` before publishing it
+    /// (nested tests: a refresh that parses late).
+    fn refresh_cache(&mut self, deadline: Instant, stall: Duration) -> Result<(), PlatformError> {
+        let list = self.read_monitors(deadline)?;
+        if !stall.is_zero() {
+            std::thread::sleep(stall);
+        }
+        self.state.check_epoch()?;
+        publish_monitors(
+            &mut self.state.monitors,
+            &mut self.state.monitors_dirty,
+            list,
+            deadline,
+            Instant::now(),
+        )
+    }
+    /// Read the monitor list from Hyprland's IPC. Touches no state.
+    fn read_monitors(&self, deadline: Instant) -> Result<Vec<Monitor>, PlatformError> {
         self.state.check_deadline(deadline)?;
-        let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-            .map_err(|_| PlatformError::Unsupported("not under Hyprland"))?;
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-            .ok_or(PlatformError::Unsupported("no runtime directory"))?;
         // Each IPC call has its own short-lived, bounded connection. No product hyprctl calls.
-        let ipc = HyprIpc::new(
-            &signature,
-            &PathBuf::from(runtime),
+        // The compositor is the one this connection was made to (`Source`).
+        let ipc = self.source.ipc(
             deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(8)),
-        );
+        )?;
         let ids = ipc.monitor_ids()?;
         let json = ipc.json("monitors")?;
         let list = json
             .as_array()
             .ok_or_else(|| backend("invalid monitor list"))?;
-        self.state.monitors = list
-            .iter()
+        list.iter()
             .map(|m| {
                 let name = m["name"]
                     .as_str()
@@ -481,59 +634,239 @@ impl Client {
                     scale,
                 })
             })
-            .collect::<Result<_, PlatformError>>()?;
-        self.state.monitors_dirty = false;
-        self.state.check_deadline(deadline)
+            .collect::<Result<_, PlatformError>>()
     }
+    /// A rejection claims that the previous set and any capture are intact. That holds only if the
+    /// backend was not aborted and nothing was lost while the command dispatched events: no started
+    /// capture ended and no mapped strip was destroyed or closed (`State::lost` is still `since`).
+    /// Otherwise the error is returned unmarked: whether anything survived is unknown.
+    fn settle(&self, error: PlatformError, since: u64) -> PlatformError {
+        if self.state.check_epoch().is_ok() && self.state.lost == since {
+            error
+        } else {
+            unmark(error)
+        }
+    }
+    /// A failure before anything live was touched: a rejection, subject to [`Self::settle`].
+    fn reject(&self, error: PlatformError, since: u64) -> PlatformError {
+        self.settle(rejected(error), since)
+    }
+    /// [`Self::reject`] for an error from waiting on the compositor: only a missed deadline or a
+    /// strip the compositor closed is a rejection. A failed connection is not: it ends the capture.
+    fn reject_if_waiting(&self, error: PlatformError, since: u64) -> PlatformError {
+        match error {
+            PlatformError::Timeout | PlatformError::NotFound => self.reject(error, since),
+            other => self.settle(other, since),
+        }
+    }
+    /// Step 1 of [`Self::set_portals`]: bring the monitor cache up to date (if it is stale) and make
+    /// sure every output a requested portal names has been announced on this connection.
+    fn refresh_topology(
+        &mut self,
+        portals: &[CapturePortal],
+        deadline: Instant,
+        work_deadline: Instant,
+        refresh: Refresh,
+        since: u64,
+    ) -> Result<(), PlatformError> {
+        let stall = match refresh {
+            Refresh::Forced { stall, .. } => {
+                self.state.monitors_dirty = true;
+                stall
+            }
+            _ => Duration::ZERO,
+        };
+        if self.state.monitors_dirty && !matches!(refresh, Refresh::Done) {
+            let bound = match refresh {
+                Refresh::Forced { bound, .. } => bound,
+                _ => REFRESH_BOUND,
+            };
+            let until = (Instant::now() + bound)
+                .min(deadline.checked_sub(REFRESH_RESERVE).unwrap_or(deadline));
+            let started = Instant::now();
+            let refreshed = self.refresh_cache(until, stall);
+            tracing::debug!(
+                elapsed = ?started.elapsed(),
+                ok = refreshed.is_ok(),
+                "monitor refresh for set_portals"
+            );
+            if let Err(error) = refreshed
+                && (!matches!(refresh, Refresh::BestEffort) || self.state.check_epoch().is_err())
+            {
+                return Err(self.reject(error, since));
+            }
+        }
+        // An output created since the connection is announced on the Wayland connection too; the
+        // IPC list may be ahead of what this thread has dispatched.
+        if portals.iter().any(|p| {
+            self.state
+                .monitors
+                .iter()
+                .find(|m| m.id == p.display)
+                .is_some_and(|m| !self.state.outputs.iter().any(|o| o.name == m.name))
+        }) {
+            self.roundtrip(work_deadline)
+                .map_err(|e| self.reject_if_waiting(e, since))?;
+        }
+        Ok(())
+    }
+    /// Whether `portal` can be placed on the outputs as they are now.
+    fn placeable(&self, portal: &CapturePortal) -> bool {
+        let Some(m) = self.state.monitors.iter().find(|m| m.id == portal.display) else {
+            return false;
+        };
+        let extent = if matches!(portal.edge, Edge::Left | Edge::Right) {
+            m.height
+        } else {
+            m.width
+        };
+        portal.to <= f64::from(extent) && self.state.outputs.iter().any(|o| o.name == m.name)
+    }
+    /// Rebuild the previous portal set on a new connection. Portals whose output has gone since
+    /// (it was removed, then the connection was lost) are left out instead of failing the whole
+    /// set, so that one removed output can't keep every other strip from coming back. Returns the
+    /// portals that are installed now.
+    pub(super) fn rebuild_portals(
+        &mut self,
+        portals: &[CapturePortal],
+        deadline: Instant,
+    ) -> Result<Vec<CapturePortal>, PlatformError> {
+        let since = self.state.lost;
+        let Some(work_deadline) = deadline
+            .checked_sub(REPLY_RESERVE)
+            .filter(|d| *d > Instant::now())
+        else {
+            return Err(backend("no time left to rebuild the strips"));
+        };
+        self.refresh_topology(portals, deadline, work_deadline, Refresh::BestEffort, since)?;
+        let placeable: Vec<CapturePortal> = portals
+            .iter()
+            .filter(|p| self.placeable(p))
+            .copied()
+            .collect();
+        if placeable.len() != portals.len() {
+            tracing::debug!(
+                dropped = portals.len() - placeable.len(),
+                "rebuilding capture strips without the outputs that are gone"
+            );
+        }
+        self.set_portals(&placeable, deadline, Refresh::Done)?;
+        Ok(placeable)
+    }
+    /// Replace the strips (WP-2.43d; `capture.rs` module docs). `Ok` only once every requested
+    /// strip is mapped with its buffer attached; failure leaves the previous set installed.
+    ///
+    /// 1. A stale monitor cache is refreshed first, also while a capture is active. If the refresh
+    ///    misses its bound the cache and the previous set stay in force (a rejection).
+    /// 2. The *whole* replacement is validated before any surface request is issued.
+    /// 3. A portal equal to an existing strip's `(id, display, edge, from, to)` keeps that strip
+    ///    (same layer surface, tag, edge state, any capture on it) while its display still
+    ///    resolves to the same monitor at the same scale. An identical set is a no-op.
+    /// 4. Strips for the other portals are created and prepared (configured, buffer allocated,
+    ///    attached, committed, one roundtrip) before anything live changes.
+    /// 5. Only then are a capture whose strip went away ended `Lost` and the absent strips
+    ///    destroyed.
+    ///
+    /// Everything up to step 5 is reported as a rejection ([`rejected`]), but only while the
+    /// guarantee behind a rejection still holds ([`Self::settle`]): an event dispatched meanwhile
+    /// may have ended the capture or destroyed an installed strip.
     pub(super) fn set_portals(
         &mut self,
         portals: &[CapturePortal],
         deadline: Instant,
+        refresh: Refresh,
     ) -> Result<(), PlatformError> {
-        // Monitor IDs and scale are cached at connection time and refreshed on output changes
-        // while idle. Portal replacement never spends its command budget on synchronous IPC.
+        let since = self.state.lost;
         self.state.check_deadline(deadline)?;
+        // The worker must answer before the caller's deadline, or the caller aborts everything. A
+        // reserve that is already gone is not made up from the caller's time: reject at once.
+        let Some(work_deadline) = deadline
+            .checked_sub(REPLY_RESERVE)
+            .filter(|d| *d > Instant::now())
+        else {
+            return Err(self.reject(backend("no time left to prepare the strips"), since));
+        };
+        // 1. Topology.
+        self.refresh_topology(portals, deadline, work_deadline, refresh, since)?;
+        // 2. Validate the whole replacement; 3. decide which strips stay.
         let mut ids = BTreeSet::new();
-        // Validate the *whole* replacement before issuing any surface requests.
-        let plans = portals
-            .iter()
-            .map(|p| {
-                if !ids.insert(p.id)
-                    || !p.from.is_finite()
-                    || !p.to.is_finite()
-                    || p.from < 0.0
-                    || p.from >= p.to
-                {
-                    return Err(backend("invalid capture portal"));
-                }
-                let m = self
-                    .state
-                    .monitors
-                    .iter()
-                    .find(|m| m.id == p.display)
-                    .ok_or(PlatformError::NotFound)?;
-                let vertical = matches!(p.edge, Edge::Left | Edge::Right);
-                if p.to > f64::from(if vertical { m.height } else { m.width }) {
-                    return Err(backend("portal outside output"));
-                }
-                let output = self
-                    .state
-                    .outputs
-                    .iter()
-                    .find(|o| o.name == m.name)
-                    .ok_or(PlatformError::NotFound)?
-                    .proxy
-                    .clone();
-                let start = (p.from / m.scale).floor();
-                let length = (p.to / m.scale).ceil() - start;
-                if length > f64::from(i32::MAX / 4) || start > f64::from(i32::MAX) {
-                    return Err(backend("portal too large"));
-                }
-                Ok((*p, output, m.scale, start, length as u32))
-            })
-            .collect::<Result<Vec<_>, PlatformError>>()?;
+        let mut plans = Vec::with_capacity(portals.len());
+        for p in portals {
+            if !ids.insert(p.id)
+                || !p.from.is_finite()
+                || !p.to.is_finite()
+                || p.from < 0.0
+                || p.from >= p.to
+            {
+                return Err(self.reject(backend("invalid capture portal"), since));
+            }
+            let Some(m) = self.state.monitors.iter().find(|m| m.id == p.display) else {
+                return Err(self.reject(backend("capture portal on an unknown display"), since));
+            };
+            let vertical = matches!(p.edge, Edge::Left | Edge::Right);
+            if p.to > f64::from(if vertical { m.height } else { m.width }) {
+                return Err(self.reject(backend("portal outside output"), since));
+            }
+            let Some(output) = self
+                .state
+                .outputs
+                .iter()
+                .find(|o| o.name == m.name)
+                .map(|o| o.proxy.clone())
+            else {
+                return Err(self.reject(backend("no wl_output for the portal's display"), since));
+            };
+            let start = (p.from / m.scale).floor();
+            let length = (p.to / m.scale).ceil() - start;
+            if length > f64::from(i32::MAX / 4) || start > f64::from(i32::MAX) {
+                return Err(self.reject(backend("portal too large"), since));
+            }
+            let monitor_size = (m.width, m.height);
+            let keep = self.state.portals.get(&p.id).copied().filter(|tag| {
+                let capturing = self.state.capture.as_ref().is_some_and(|c| c.strip == *tag);
+                self.state.strips.get(tag).is_some_and(|s| {
+                    s.portal == *p
+                        && s.mapped
+                        && !s.closed
+                        && s.buffer.is_some()
+                        && s.output == output
+                        && s.monitor == m.name
+                        && s.scale == m.scale
+                        && (capturing || s.monitor_size == monitor_size)
+                })
+            });
+            plans.push(Plan {
+                portal: *p,
+                output,
+                monitor: m.name.clone(),
+                monitor_size,
+                scale: m.scale,
+                offset: start,
+                length: length as u32,
+                keep,
+            });
+        }
+        if plans.iter().all(|p| p.keep.is_some()) && self.state.portals.len() == plans.len() {
+            return Ok(()); // Identical set: no requests, no roundtrip.
+        }
+        // 4. Create and prepare the new strips.
         let mut candidates = Vec::new();
-        for (portal, output, scale, offset, length) in plans {
+        let mut tags = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if let Some(tag) = plan.keep {
+                tags.push((plan.portal.id, tag));
+                continue;
+            }
+            let Plan {
+                portal,
+                output,
+                monitor,
+                monitor_size,
+                scale,
+                offset,
+                length,
+                ..
+            } = plan;
             self.state.next_strip += 1;
             let tag = self.state.next_strip;
             let surface = self.globals.compositor.create_surface(&self.qh, tag);
@@ -562,6 +895,9 @@ impl Client {
                 tag,
                 Strip {
                     portal,
+                    output,
+                    monitor,
+                    monitor_size,
                     scale,
                     offset,
                     surface,
@@ -573,13 +909,17 @@ impl Client {
                 },
             );
             candidates.push(tag);
+            tags.push((portal.id, tag));
         }
         let prepare = (|| {
-            self.wait(deadline, |s| {
+            if candidates.is_empty() {
+                return Ok(()); // Only removals: nothing to wait for.
+            }
+            self.wait(work_deadline, |s| {
                 candidates.iter().all(|tag| {
                     s.strips
                         .get(tag)
-                        .is_some_and(|p| p.size.is_some() || p.closed)
+                        .is_none_or(|p| p.size.is_some() || p.closed)
                 })
             })?;
             // Allocate every buffer before mapping anything. Failed replacements leave old strips.
@@ -593,57 +933,87 @@ impl Client {
                     return Err(PlatformError::NotFound);
                 }
                 let (w, h) = p.size.ok_or(PlatformError::NotFound)?;
-                p.buffer = Some(buffer(&self.globals.shm, &self.qh, w, h)?);
+                p.buffer = Some(buffer(&self.globals.shm, &self.qh, w, h).map_err(rejected)?);
             }
-            self.state.check_deadline(deadline)?;
+            self.state.check_deadline(work_deadline)?;
             for tag in &candidates {
                 if let Some(p) = self.state.strips.get(tag) {
                     p.surface.attach(p.buffer.as_ref(), 0, 0);
                     p.surface.commit();
                 }
             }
-            self.roundtrip(deadline)
+            self.roundtrip(work_deadline)
         })();
-        if let Err(error) = prepare {
+        // The pump inside the preparation may have closed a strip (its output went away, or the
+        // compositor refused it): every strip of the new set must still be alive and mapped.
+        let alive = prepare.and_then(|()| {
+            let healthy = tags.iter().all(|(_, tag)| {
+                self.state
+                    .strips
+                    .get(tag)
+                    .is_some_and(|s| !s.closed && (s.mapped || candidates.contains(tag)))
+            });
+            if healthy {
+                Ok(())
+            } else {
+                Err(PlatformError::NotFound)
+            }
+        });
+        if let Err(error) = alive {
             for tag in candidates {
                 if let Some(strip) = self.state.strips.remove(&tag) {
                     strip.destroy();
                 }
             }
             let _ = self.conn.flush();
-            return Err(error);
+            return Err(self.reject_if_waiting(error, since));
         }
+        // 5. Apply. From here the previous set is being replaced.
+        let new_tags: BTreeSet<u64> = tags.iter().map(|(_, tag)| *tag).collect();
         if let Some(c) = self.state.capture.as_ref()
-            && !candidates.contains(&c.strip)
+            && !new_tags.contains(&c.strip)
         {
-            self.state.finish(EndReason::Lost);
+            self.state.finish(EndReason::Lost, Cause::StripReplaced);
         }
-        let new_entered = self.state.entered.filter(|tag| candidates.contains(tag));
-        if let Some(tag) = self.state.entered.filter(|tag| !candidates.contains(tag))
-            && let Some(p) = self.state.strips.get(&tag)
-        {
-            self.state.pressing = None;
-            self.state.emit(CaptureEvent::EdgeReleased {
-                portal: p.portal.id,
-                at: now(),
-            });
+        if let Some(tag) = self.state.entered.filter(|tag| !new_tags.contains(tag)) {
+            if let Some(p) = self.state.strips.get(&tag) {
+                let portal = p.portal.id;
+                self.state.pressing = None;
+                self.state
+                    .emit(CaptureEvent::EdgeReleased { portal, at: now() });
+            }
+            self.state.entered = None;
         }
-        let old = std::mem::take(&mut self.state.portals);
-        for (_, tag) in old {
+        let stale: Vec<u64> = self
+            .state
+            .strips
+            .keys()
+            .copied()
+            .filter(|tag| !new_tags.contains(tag))
+            .collect();
+        for tag in stale {
             if let Some(strip) = self.state.strips.remove(&tag) {
                 strip.destroy();
             }
         }
-        for tag in candidates {
-            if let Some(strip) = self.state.strips.get_mut(&tag) {
+        self.state.portals = tags.into_iter().collect();
+        for tag in &candidates {
+            if let Some(strip) = self.state.strips.get_mut(tag) {
                 strip.mapped = true;
-                self.state.portals.insert(strip.portal.id, tag);
             }
         }
-        self.state.entered = new_entered;
-        if let Some(tag) = new_entered {
+        // A kept strip keeps its entered/pressing state. The pointer may have entered a new strip
+        // while it was being prepared, before it counted as mapped: report that press now.
+        if let Some(tag) = self.state.entered.filter(|tag| candidates.contains(tag)) {
             let (x, y) = self.state.pointer_position;
             self.state.pressed(tag, x, y, now());
+        }
+        if self
+            .state
+            .pressing
+            .is_some_and(|id| self.state.portals.get(&id).copied() != self.state.entered)
+        {
+            self.state.pressing = None;
         }
         self.conn.flush().map_err(backend)?;
         Ok(())
@@ -752,7 +1122,7 @@ impl Client {
             })
         })();
         if activate.is_err() {
-            self.state.finish(EndReason::Lost);
+            self.state.finish(EndReason::Lost, Cause::ActivationFailed);
             // Destroy partial objects, invalidate their generation, and prove the requests were
             // processed in the rollback reserve. If the compositor cannot respond, independent
             // connection shutdown also cancels any buffered requests that could activate later.
@@ -864,6 +1234,7 @@ impl Client {
             } else {
                 EndReason::Aborted
             },
+            Cause::Disconnected,
         );
         // Even a healthy socket must close on a dispatch/keymap error: merely dropping the
         // Connection leaves delivery's descriptor alive and the compositor's grabs in force.
@@ -875,6 +1246,47 @@ impl Drop for Client {
     fn drop(&mut self) {
         self.disconnected();
     }
+}
+/// What the removal of an output does to the strips and the capture (§3.6.3), decided on the
+/// strips' outputs alone so that it can be tested without a compositor.
+#[derive(Debug, PartialEq, Eq)]
+struct RemovalEffect {
+    /// The backend ends the capture: its own strip is on the removed output.
+    ends_capture: bool,
+    /// The strips (by tag) on the removed output, destroyed in every case.
+    destroys: Vec<u64>,
+}
+fn removal_effect<O: PartialEq>(
+    capture_strip: Option<u64>,
+    strips: &[(u64, O)],
+    removed: &O,
+) -> RemovalEffect {
+    RemovalEffect {
+        ends_capture: capture_strip
+            .is_some_and(|tag| strips.iter().any(|(t, out)| *t == tag && out == removed)),
+        destroys: strips
+            .iter()
+            .filter(|(_, out)| out == removed)
+            .map(|(tag, _)| *tag)
+            .collect(),
+    }
+}
+/// Publish a freshly read monitor list (§3.6.2), but only if that is still in time: a refresh that
+/// missed its deadline leaves the cache *and* the stale flag exactly as they were, so the idle
+/// path retries and `set_portals` can report the rejection with the previous state in force.
+fn publish_monitors(
+    cache: &mut Vec<Monitor>,
+    dirty: &mut bool,
+    list: Vec<Monitor>,
+    deadline: Instant,
+    now: Instant,
+) -> Result<(), PlatformError> {
+    if now >= deadline {
+        return Err(PlatformError::Timeout);
+    }
+    *cache = list;
+    *dirty = false;
+    Ok(())
 }
 fn buffer(
     shm: &wl_shm::WlShm,
@@ -960,7 +1372,7 @@ impl State {
     }
     fn check_gate(&mut self) {
         if !self.gate.is_open() && self.capture.is_some() {
-            self.finish(EndReason::Lost);
+            self.finish(EndReason::Lost, Cause::GateClosed);
         }
     }
     fn emit(&mut self, event: CaptureEvent) {
@@ -1023,11 +1435,80 @@ impl State {
         }
         self.scroll = AxisFrame::default();
         self.scrolling = (false, false);
+        if c.started {
+            self.lost += 1;
+        }
         c.started.then_some((c.id, c.generation))
     }
-    fn finish(&mut self, reason: EndReason) {
+    /// End the capture, if one exists, with `Ended { reason }`, and log why (`cause`).
+    fn finish(&mut self, reason: EndReason, cause: Cause) {
+        if self.capture.is_some() {
+            if self.causes.len() == CAUSES_KEPT {
+                self.causes.remove(0);
+            }
+            self.causes.push(cause);
+        }
         if let Some((id, generation)) = self.release() {
             self.emit_generation(generation, CaptureEvent::Ended { id, reason });
+        }
+    }
+    /// Make held-back acknowledgements that are due (all of them with `all`) take effect (nested
+    /// tests only; `deferred` is empty otherwise).
+    fn release_deferred(&mut self, all: bool) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.deferred)
+            .into_iter()
+            .partition(|(at, _)| all || *at <= now);
+        self.deferred = later;
+        for (_, ack) in due {
+            match ack {
+                Deferred::Size(tag, size) => {
+                    if let Some(strip) = self.strips.get_mut(&tag) {
+                        strip.size = Some(size);
+                    }
+                }
+                Deferred::Sync(token) => self.sync_done = self.sync_done.max(token),
+            }
+        }
+    }
+    /// A `wl_output` global went away (WP-2.43d, §3.6.3). The capture ends `Lost` only if its own
+    /// strip is on that output (the backend's decision, [`removal_effect`]); the strips on it are
+    /// destroyed in every case.
+    ///
+    /// **Hyprland 0.56.2 ends an active capture on the removal of *any* output** by itself: it
+    /// relocates the cursor and drops the pointer lock, and `Unlocked` ends the capture `Lost`
+    /// (cause [`Cause::Unlocked`], never [`Cause::OutputRemoved`]). That is an OS fact; the backend
+    /// reports `Lost`, never reacquires the lock to hide it, and must not end a capture for an
+    /// unrelated output's removal on its own.
+    fn output_removed(&mut self, output: &wl_output::WlOutput) {
+        let strips: Vec<(u64, wl_output::WlOutput)> = self
+            .strips
+            .iter()
+            .map(|(tag, strip)| (*tag, strip.output.clone()))
+            .collect();
+        let effect = removal_effect(self.capture.as_ref().map(|c| c.strip), &strips, output);
+        if effect.ends_capture {
+            self.finish(EndReason::Lost, Cause::OutputRemoved);
+        }
+        for tag in effect.destroys {
+            if self.entered == Some(tag) {
+                if let Some(strip) = self.strips.get(&tag).filter(|strip| strip.mapped) {
+                    let portal = strip.portal.id;
+                    self.pressing = None;
+                    self.emit(CaptureEvent::EdgeReleased { portal, at: now() });
+                }
+                self.entered = None;
+            }
+            if let Some(strip) = self.strips.remove(&tag) {
+                if strip.mapped {
+                    self.lost += 1;
+                }
+                strip.destroy();
+            }
+            self.portals.retain(|_, t| *t != tag);
         }
     }
     fn pressed(&mut self, tag: u64, x: f64, y: f64, at: MonoTime) {
@@ -1144,8 +1625,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 s.advertised.push((name, interface, version));
             }
             wl_registry::Event::GlobalRemove { name } => {
-                if s.outputs.iter().any(|o| o.global == name) {
-                    s.finish(EndReason::Lost);
+                if let Some(removed) = s
+                    .outputs
+                    .iter()
+                    .find(|o| o.global == name)
+                    .map(|o| o.proxy.clone())
+                {
+                    s.output_removed(&removed);
                     s.outputs.retain(|o| o.global != name);
                     s.monitors_dirty = true;
                 }
@@ -1160,7 +1646,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                                 | "zwlr_layer_shell_v1"
                         )
                 }) {
-                    s.finish(EndReason::Lost);
+                    s.finish(EndReason::Lost, Cause::GlobalRemoved);
                 }
                 s.advertised.retain(|(n, _, _)| *n != name);
             }
@@ -1228,16 +1714,24 @@ impl Dispatch<ZwlrLayerSurfaceV1, u64> for State {
                 height,
             } => {
                 layer.ack_configure(serial);
-                if let Some(p) = s.strips.get_mut(tag) {
+                if !s.ack_delay.is_zero() {
+                    // Nested tests: the preparation learns of the configure only later.
+                    let due = Instant::now() + s.ack_delay;
+                    s.deferred
+                        .push((due, Deferred::Size(*tag, (width, height))));
+                } else if let Some(p) = s.strips.get_mut(tag) {
                     p.size = Some((width, height));
                 }
             }
             zwlr_layer_surface_v1::Event::Closed => {
                 if let Some(p) = s.strips.get_mut(tag) {
                     p.closed = true;
+                    if p.mapped {
+                        s.lost += 1;
+                    }
                 }
                 if s.capture.as_ref().is_some_and(|c| c.strip == *tag) {
-                    s.finish(EndReason::Lost);
+                    s.finish(EndReason::Lost, Cause::StripClosed);
                 }
                 if s.entered == Some(*tag) {
                     if let Some(p) = s.strips.get(tag) {
@@ -1292,7 +1786,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             wl_pointer::Event::Leave { surface, .. } => {
                 if let Some(tag) = surface.data::<u64>().copied() {
                     if s.capture.as_ref().is_some_and(|c| c.strip == tag) {
-                        s.finish(EndReason::Lost);
+                        s.finish(EndReason::Lost, Cause::PointerLeft);
                     }
                     if s.entered == Some(tag) {
                         if let Some(p) = s.strips.get(&tag)
@@ -1433,7 +1927,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 })();
                 let Ok(text) = read else {
                     s.error = Some(backend("invalid keyboard keymap"));
-                    s.finish(EndReason::Lost);
+                    s.finish(EndReason::Lost, Cause::KeymapUnusable);
                     return;
                 };
                 let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
@@ -1446,12 +1940,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     s.xkb = Some(xkb::State::new(&keymap));
                 } else {
                     s.error = Some(backend("keyboard keymap unavailable"));
-                    s.finish(EndReason::Lost);
+                    s.finish(EndReason::Lost, Cause::KeymapUnusable);
                 }
             }
             wl_keyboard::Event::Keymap { .. } => {
                 s.error = Some(PlatformError::Unsupported("keyboard keymap format"));
-                s.finish(EndReason::Lost);
+                s.finish(EndReason::Lost, Cause::KeymapUnusable);
             }
             wl_keyboard::Event::Enter { surface, keys, .. } => {
                 s.keyboard_surface = Some(surface.clone());
@@ -1482,7 +1976,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     .as_ref()
                     .is_some_and(|c| s.strips.get(&c.strip).is_some_and(|p| p.surface == surface))
                 {
-                    s.finish(EndReason::Lost);
+                    s.finish(EndReason::Lost, Cause::KeyboardLeft);
                 }
             }
             wl_keyboard::Event::Key {
@@ -1553,7 +2047,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         } = event
             && !caps.contains(wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard)
         {
-            s.finish(EndReason::Lost);
+            s.finish(EndReason::Lost, Cause::SeatLost);
         }
     }
 }
@@ -1572,7 +2066,9 @@ impl Dispatch<ZwpLockedPointerV1, u64> for State {
         {
             match event {
                 zwp_locked_pointer_v1::Event::Locked => c.locked = true,
-                zwp_locked_pointer_v1::Event::Unlocked => s.finish(EndReason::Lost),
+                zwp_locked_pointer_v1::Event::Unlocked => {
+                    s.finish(EndReason::Lost, Cause::Unlocked)
+                }
                 _ => (),
             }
         }
@@ -1593,7 +2089,9 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, u64> for State {
         {
             match event {
                 zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => c.inhibited = true,
-                zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => s.finish(EndReason::Lost),
+                zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => {
+                    s.finish(EndReason::Lost, Cause::InhibitorInactive)
+                }
                 _ => (),
             }
         }
@@ -1642,7 +2140,13 @@ impl Dispatch<wl_callback::WlCallback, u64> for State {
         _: &QueueHandle<Self>,
     ) {
         s.check_gate();
-        s.sync_done = s.sync_done.max(*token);
+        if s.ack_delay.is_zero() {
+            s.sync_done = s.sync_done.max(*token);
+        } else {
+            // Nested tests: the roundtrip completes only after the held-back time.
+            let due = Instant::now() + s.ack_delay;
+            s.deferred.push((due, Deferred::Sync(*token)));
+        }
     }
 }
 delegate_noop!(State: ignore wl_compositor::WlCompositor);
@@ -1669,3 +2173,95 @@ delegate_noop!(State: ignore WpCursorShapeManagerV1);
 delegate_noop!(State: ignore WpCursorShapeDeviceV1);
 delegate_noop!(State: ignore ZwlrVirtualPointerManagerV1);
 delegate_noop!(State: ignore ZwlrVirtualPointerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(id: u32) -> Monitor {
+        Monitor {
+            id: DisplayId(id),
+            name: format!("M{id}"),
+            width: 100,
+            height: 100,
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn removing_another_output_never_ends_the_capture() {
+        // Output 1 holds the capture's strip (tag 10) and another strip (tag 11); output 2 holds
+        // tag 20. Whatever the order or number of strips, the removal of output 2 destroys its
+        // strips and leaves the capture alone: the backend must not end a capture for an
+        // unrelated output's removal.
+        let strips = [(10u64, 1u32), (20, 2), (11, 1), (21, 2)];
+        assert_eq!(
+            removal_effect(Some(10), &strips, &2),
+            RemovalEffect {
+                ends_capture: false,
+                destroys: vec![20, 21]
+            }
+        );
+        assert!(!removal_effect(Some(11), &strips, &2).ends_capture);
+        // The capture's own output going away is the backend's decision to end it.
+        assert_eq!(
+            removal_effect(Some(10), &strips, &1),
+            RemovalEffect {
+                ends_capture: true,
+                destroys: vec![10, 11]
+            }
+        );
+        assert!(removal_effect(Some(20), &strips, &2).ends_capture);
+        // Without a capture nothing ends; an output without strips changes nothing.
+        assert!(!removal_effect(None, &strips, &1).ends_capture);
+        assert_eq!(
+            removal_effect(Some(10), &strips, &3),
+            RemovalEffect {
+                ends_capture: false,
+                destroys: vec![]
+            }
+        );
+        // A capture strip that is no longer listed is not on any output.
+        assert!(!removal_effect(Some(99), &strips, &1).ends_capture);
+    }
+
+    #[test]
+    fn a_late_refresh_publishes_nothing() {
+        let (start, deadline) = (Instant::now(), Instant::now() + Duration::from_millis(20));
+        let mut cache = vec![monitor(1)];
+        let mut dirty = true;
+        // Read, parsed late: after the deadline the cache and the stale flag stay as they were.
+        let late = deadline + Duration::from_millis(1);
+        assert!(matches!(
+            publish_monitors(
+                &mut cache,
+                &mut dirty,
+                vec![monitor(1), monitor(2)],
+                deadline,
+                late
+            ),
+            Err(PlatformError::Timeout)
+        ));
+        assert_eq!(cache.len(), 1);
+        assert!(
+            dirty,
+            "a refresh that timed out must leave the retry pending"
+        );
+        // In time: published, and the flag cleared.
+        publish_monitors(
+            &mut cache,
+            &mut dirty,
+            vec![monitor(1), monitor(2)],
+            deadline,
+            start,
+        )
+        .unwrap();
+        assert_eq!(cache.len(), 2);
+        assert!(!dirty);
+        // Exactly at the deadline is late too.
+        let mut dirty = true;
+        assert!(publish_monitors(&mut cache, &mut dirty, vec![], deadline, deadline).is_err());
+        assert_eq!(cache.len(), 2);
+        assert!(dirty);
+    }
+}
