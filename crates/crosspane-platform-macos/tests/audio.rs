@@ -1878,7 +1878,9 @@ fn a_disabled_output_stream_is_not_an_error() {
 
 #[test]
 fn playback_cycles_above_the_ceiling_or_with_partial_frames_are_refused() {
-    for frames_bytes in [4097usize * 8, 12] {
+    // A physical output's ceiling is 16384 frames per buffer (WP-3.7b; the 4096-frame ceiling is the
+    // virtual devices' and is tested on the forwarder above).
+    for frames_bytes in [16385usize * 8, 12] {
         let mut rig = Rig::subscribed();
         let _handle = rig.host.open_playback(stereo()).unwrap();
         let callback = rig.hal.callback(BUILTIN).unwrap();

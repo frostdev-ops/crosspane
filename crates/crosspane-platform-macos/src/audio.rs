@@ -81,12 +81,26 @@
 //! # Physical playback
 //!
 //! `open_playback` supports only the default output, and only when it is not a Crosspane device
-//! and its client-facing format is exactly 48 kHz float32 stereo, one stream, interleaved or
-//! planar. Otherwise `Unsupported`, with no IOProc created and nothing changed. Default-device
+//! and its client-facing format is float32 stereo, one stream, interleaved or planar, at a rate
+//! `crosspane_media::audio::Resampler` can reach from 48 kHz: the device's nominal rate and its
+//! stream's rate must be the same whole number of hertz (44.1, 88.2, 96, 176.4 and 192 kHz among
+//! others; 48 kHz is the identity). Otherwise `Unsupported`, with no IOProc created and nothing
+//! changed. The stream stays 48 kHz end to end (Opus, jitter buffer, the 50 ms ring); the IOProc
+//! resamples it to the device's own rate, so the host never changes a hardware rate. Each cycle it
+//! reads at most the input frames the resampler needs for the cycle's frame count, makes them
+//! finite, commits to the ring exactly the frames the resampler consumed, and fills what the ring
+//! could not supply with silence; the resampler keeps its state across an underrun, so the stream
+//! continues when data returns. At 48 kHz the output is a bit-exact copy. A physical cycle may
+//! carry up to 16384 frames per buffer (the 4096-frame limit above is the virtual devices'), which
+//! the IOProc renders in chunks of its 8192-frame scratch; a larger buffer is a bad cycle, zeroed
+//! (up to a bounded size, never past the reported one) before the handle fails. The resampler and
+//! its scratch are allocated at open, so the IOProc allocates nothing. The output can exceed full
+//! scale by the filter's overshoot; it is not clipped, as the 48 kHz path never was. Default-device
 //! changes, device loss, nominal-rate or stream-format changes close the handle with
-//! `DeviceError::Unavailable`; the caller reopens deliberately. Physical `open_capture` is always
-//! `Unsupported`: it never reads a device, a default input, a permission state, and no microphone
-//! is ever opened by this module.
+//! `DeviceError::Unavailable`; the caller reopens deliberately and the reopen picks up the new
+//! rate (there is no live rate switching). Physical `open_capture` is always `Unsupported`: it
+//! never reads a device, a default input, a permission state, and no microphone is ever opened by
+//! this module.
 //!
 //! # Lifetimes and retirement
 //!
@@ -105,9 +119,11 @@
 //!
 //! # Known limits and unverified assumptions
 //!
-//! - Physical playback needs the default output to already run at 48 kHz float32 stereo; the host
-//!   never changes a hardware rate, so a device running at 44.1 kHz (the dev Mac's built-in
-//!   speakers do whenever the last client opened them at 44.1) is `Unsupported`. No resampler.
+//! - Physical playback needs the default output to be float32 stereo with its nominal rate equal
+//!   to its stream rate; the host never changes a hardware rate, it resamples to whatever the
+//!   device runs at (the dev Mac's built-in speakers run at 44.1 kHz). A device that lists a
+//!   different stream rate than its nominal rate, or a rate the resampler cannot reach, is
+//!   `Unsupported`.
 //! - The devices are required to report virtual transport (`virt`), as the P9 spike's driver does;
 //!   WP-3.4's property table must agree.
 //! - Whether starting IO on the hidden loopback *input* needs Microphone permission, what the OS
@@ -132,7 +148,8 @@
 //! PCM, no change when a second application starts, `VirtualActive{Speaker, false}` when the last
 //! stops, a `DeviceError` (never silent success) if macOS denies the loopback input, and no
 //! microphone IO anywhere. The tone probe plays one quiet second on the default output when that is
-//! 48 kHz float32 stereo and prints why not otherwise. Neither changes any default device.
+//! float32 stereo at a supported rate and prints why not otherwise. Neither changes any default
+//! device.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1129,7 +1146,7 @@ impl Worker {
             .map_err(hal_error)?
             .ok_or(PlatformError::NotFound)?;
         let info = self.hal.device_info(device).map_err(hal_error)?;
-        let layout = devices::playback_layout(&info)
+        let (layout, rate) = devices::playback_layout(&info)
             .map_err(|reject| PlatformError::Unsupported(reject.reason()))?;
         if self
             .binding
@@ -1180,12 +1197,21 @@ impl Worker {
         }
 
         let (producer, consumer) = speaker_ring();
-        let render = Arc::new(PlaybackRender::new(
+        // Resamples the 48 kHz ring to the device's rate in the IOProc (the identity at 48 kHz).
+        // `playback_layout` already vetted the rate, so a failure here is not expected.
+        let render = match PlaybackRender::new(
             consumer,
             self.gate.clone(),
             layout,
+            rate,
             self.shutdown.clone(),
-        ));
+        ) {
+            Ok(render) => Arc::new(render),
+            Err(_) => {
+                self.release_listeners(&notifier, listeners);
+                return Err(PlatformError::Unsupported(devices::Reject::Rate.reason()));
+            }
+        };
         let io = match self.hal.start_io(device, render.clone()) {
             Ok(io) => io,
             Err(error) => {
@@ -1323,4 +1349,171 @@ impl Drop for PlaybackStop {
 #[doc(hidden)]
 pub fn sdk_abi_report() -> Vec<(&'static str, u64)> {
     ffi::abi_report()
+}
+
+#[cfg(test)]
+mod playback_rate_tests {
+    //! `open_playback` on a physical output at its own rate (WP-3.7b), against a one-device stub
+    //! HAL: the host is given the rate and the layout, and what the IOProc plays is the resampler's
+    //! own output. (The full fake HAL and the 48 kHz behaviour live in `tests/audio.rs`.)
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Mutex;
+
+    use crosspane_media::audio::Resampler;
+
+    use super::hal::{
+        CLASS_AUDIO_DEVICE, DeviceInfo, IoBuffer, StreamFormat, StreamId, StreamInfo,
+    };
+    use super::*;
+
+    const OUTPUT: DeviceId = DeviceId(100);
+
+    /// One physical default output; records the callback `start_io` was given.
+    struct StubHal {
+        info: DeviceInfo,
+        callback: Mutex<Option<Arc<dyn IoCallback>>>,
+    }
+
+    #[derive(Debug)]
+    struct StubSession;
+
+    impl IoSession for StubSession {
+        fn stop(&mut self) -> Result<(), HalError> {
+            Ok(())
+        }
+    }
+
+    impl Hal for StubHal {
+        fn translate_uid(&self, _uid: &str) -> Result<Option<DeviceId>, HalError> {
+            Ok(None)
+        }
+
+        fn device_info(&self, _device: DeviceId) -> Result<DeviceInfo, HalError> {
+            Ok(self.info.clone())
+        }
+
+        fn is_alive(&self, _device: DeviceId) -> Result<bool, HalError> {
+            Ok(true)
+        }
+
+        fn is_running_somewhere(&self, _device: DeviceId) -> Result<bool, HalError> {
+            Ok(false)
+        }
+
+        fn default_output_device(&self) -> Result<Option<DeviceId>, HalError> {
+            Ok(Some(OUTPUT))
+        }
+
+        fn add_listener(
+            &self,
+            _target: ListenTarget,
+            _notifier: Arc<Notifier>,
+        ) -> Result<ListenerId, HalError> {
+            Ok(ListenerId(1))
+        }
+
+        fn remove_listener(&self, _listener: ListenerId) -> Result<(), HalError> {
+            Ok(())
+        }
+
+        fn flush_listeners(&self, _timeout: Duration) -> bool {
+            true
+        }
+
+        fn start_io(
+            &self,
+            _device: DeviceId,
+            callback: Arc<dyn IoCallback>,
+        ) -> Result<Box<dyn IoSession>, HalError> {
+            *self.callback.lock().unwrap() = Some(callback);
+            Ok(Box::new(StubSession))
+        }
+    }
+
+    fn output(rate: u32, interleaved: bool) -> DeviceInfo {
+        DeviceInfo {
+            uid: "BuiltInSpeakerDevice".to_string(),
+            class_id: CLASS_AUDIO_DEVICE,
+            transport: 0x626c_746e,
+            alive: true,
+            hidden: false,
+            nominal_rate: f64::from(rate),
+            input_streams: vec![],
+            output_streams: vec![StreamInfo {
+                id: StreamId(2001),
+                format: StreamFormat {
+                    sample_rate: f64::from(rate),
+                    ..StreamFormat::float32(2, interleaved)
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn playback_runs_at_the_outputs_own_rate_in_either_layout() {
+        for rate in [44_100, 48_000, 88_200, 96_000, 176_400, 192_000] {
+            for interleaved in [true, false] {
+                let hal = Arc::new(StubHal {
+                    info: output(rate, interleaved),
+                    callback: Mutex::new(None),
+                });
+                let gate = IoGate::new();
+                gate.set_session_permits(true);
+                gate.set_engine_permits(true);
+                let mut host = CoreAudioHost::with_hal(gate, hal.clone()).unwrap();
+                let mut handle = host.open_playback(AudioKind::Speaker.format()).unwrap();
+                let callback = hal.callback.lock().unwrap().clone().unwrap();
+
+                // A 1 kHz tone in the 48 kHz ring: left at 0.5, right inverted.
+                let input: Vec<f32> = (0..1000)
+                    .flat_map(|n| {
+                        let t = f64::from(n) / 48_000.0;
+                        let value = (0.5 * (std::f64::consts::TAU * 1000.0 * t).sin()) as f32;
+                        [value, -value]
+                    })
+                    .collect();
+                for sample in &input {
+                    handle.pcm.push(*sample).unwrap();
+                }
+                let frames = 480;
+                let mut expected = vec![0.0; frames * 2];
+                let done = Resampler::new(48_000, rate, 2)
+                    .unwrap()
+                    .process(&input, &mut expected);
+                assert_eq!(done.produced, frames, "{rate} Hz");
+
+                let bytes = (frames * 8) as u32;
+                let played: Vec<f32> = if interleaved {
+                    let mut out = vec![7.0f32; frames * 2];
+                    let list = [IoBuffer {
+                        channels: 2,
+                        byte_size: bytes,
+                        data: out.as_mut_ptr().cast(),
+                    }];
+                    // SAFETY: `out` is live, writable and exactly `byte_size` bytes for the call.
+                    unsafe { callback.process(&[], &list) };
+                    out
+                } else {
+                    let mut left = vec![7.0f32; frames];
+                    let mut right = vec![7.0f32; frames];
+                    let list = [left.as_mut_ptr(), right.as_mut_ptr()].map(|data| IoBuffer {
+                        channels: 1,
+                        byte_size: bytes / 2,
+                        data: data.cast(),
+                    });
+                    // SAFETY: two live, separate, writable vectors of exactly `byte_size` bytes.
+                    unsafe { callback.process(&[], &list) };
+                    left.iter()
+                        .zip(&right)
+                        .flat_map(|(l, r)| [*l, *r])
+                        .collect()
+                };
+                assert_eq!(played, expected, "{rate} Hz interleaved={interleaved}");
+                let stats = callback.control().stats();
+                assert_eq!((stats.frames_moved, stats.frames_dropped), (480, 0));
+            }
+        }
+    }
 }
