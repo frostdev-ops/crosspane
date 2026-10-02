@@ -5,6 +5,7 @@ pub mod demo;
 pub mod gui;
 pub mod motion;
 mod screens;
+pub mod tutorial_flow;
 pub mod view;
 
 pub use motion::{reduced_motion, transition_fraction};
