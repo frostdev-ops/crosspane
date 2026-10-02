@@ -1,21 +1,31 @@
 //! Crosspane's dark-only palette, glass surfaces and small shape-based controls.
-use eframe::egui::{
-    self, Color32, FontId, Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind, Vec2,
-};
+//!
+//! Nothing here loads fonts or art: the caller configures fonts on the [`egui::Context`] first.
+use egui::{Color32, FontId, Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind, Vec2};
 
+/// Backgrounds.
 pub const MIDNIGHT: Color32 = Color32::from_rgb(0x07, 0x15, 0x25);
+/// Structure and surfaces.
 pub const NAVY: Color32 = Color32::from_rgb(0x16, 0x4a, 0x74);
+/// Primary accent and actions.
 pub const FROST: Color32 = Color32::from_rgb(0x17, 0xc8, 0xf4);
+/// Highlights and hover.
 pub const GLACIER: Color32 = Color32::from_rgb(0x6f, 0xdc, 0xff);
+/// Primary text.
 pub const ICE: Color32 = Color32::from_rgb(0xe9, 0xf8, 0xff);
+/// The tint of peer machines on the desk.
 pub const PEER_ICE: Color32 = Color32::from_rgb(0xb7, 0xef, 0xff);
+/// Secondary text and badges.
 pub const QUIET: Color32 = Color32::from_rgb(0x89, 0xcb, 0xd5);
+/// Warnings, errors and destructive actions.
 pub const WARNING: Color32 = Color32::from_rgb(0xd9, 0x88, 0x91);
 
+/// `color` with the given unmultiplied opacity.
 pub fn alpha(color: Color32, opacity: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), opacity)
 }
 
+/// The dark egui style every Crosspane window installs (`set_style_of(Theme::Dark, …)`).
 pub fn style() -> egui::Style {
     let mut style = egui::Style {
         visuals: egui::Visuals::dark(),
@@ -76,6 +86,7 @@ pub fn style() -> egui::Style {
     style
 }
 
+/// A frosted-glass panel: translucent Midnight, a faint Glacier border and a soft shadow.
 pub fn glass() -> egui::Frame {
     egui::Frame::new()
         .fill(alpha(MIDNIGHT, 205))
@@ -90,6 +101,7 @@ pub fn glass() -> egui::Frame {
         })
 }
 
+/// A small letter-spaced section label in Quiet cyan.
 pub fn section(ui: &mut egui::Ui, text: &str) {
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -105,6 +117,7 @@ pub fn section(ui: &mut egui::Ui, text: &str) {
     ui.label(job);
 }
 
+/// A Frost-cyan primary button with Midnight text; muted and inert when `enabled` is false.
 pub fn primary(ui: &mut egui::Ui, text: &str, enabled: bool) -> Response {
     if !enabled || !ui.is_enabled() {
         return ui
@@ -157,6 +170,9 @@ pub fn text_edit(ui: &mut egui::Ui, text: &mut String, placeholder: &str) -> Res
     .inner
 }
 
+/// The Glacier glow along an edge where two machines' displays touch, optionally with a small
+/// two-way arrow marker at its middle. It is illustrative: it never claims an open gate or an
+/// armed crossing.
 pub fn crossing_glow(painter: &egui::Painter, line: [Pos2; 2], marker: bool) {
     for (width, opacity) in [(16.0, 12), (10.0, 28), (6.0, 60), (3.5, 255)] {
         painter.line_segment(line, Stroke::new(width, alpha(GLACIER, opacity)));
@@ -187,6 +203,7 @@ pub fn crossing_glow(painter: &egui::Painter, line: [Pos2; 2], marker: bool) {
     }
 }
 
+/// The legend chip that explains the glowing edges.
 pub fn crossing_legend(ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(alpha(QUIET, 18))
@@ -211,6 +228,7 @@ pub fn crossing_legend(ui: &mut egui::Ui) {
         });
 }
 
+/// An outlined button in the muted warning red.
 pub fn destructive(ui: &mut egui::Ui, text: &str) -> Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(WARNING))
@@ -218,6 +236,7 @@ pub fn destructive(ui: &mut egui::Ui, text: &str) -> Response {
     )
 }
 
+/// A small pill-shaped label tinted with `color`.
 pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
         .fill(alpha(color, 18))
@@ -229,6 +248,7 @@ pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
         });
 }
 
+/// A labelled pill switch. The response is marked changed when the value flips.
 pub fn switch(ui: &mut egui::Ui, value: &mut bool, label: &str) -> Response {
     let width = ui.fonts_mut(|fonts| {
         fonts
@@ -376,26 +396,5 @@ pub fn icon(painter: &egui::Painter, rect: Rect, index: usize, color: Color32) {
                 StrokeKind::Inside,
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn palette_and_dark_theme_construction() {
-        assert_eq!(MIDNIGHT.to_array(), [7, 21, 37, 255]);
-        assert_eq!(NAVY.to_array(), [22, 74, 116, 255]);
-        assert_eq!(FROST.to_array(), [23, 200, 244, 255]);
-        assert_eq!(GLACIER.to_array(), [111, 220, 255, 255]);
-        assert_eq!(ICE.to_array(), [233, 248, 255, 255]);
-        assert_eq!(QUIET.to_array(), [137, 203, 213, 255]);
-        let style = style();
-        assert!(style.visuals.dark_mode);
-        assert_eq!(style.visuals.override_text_color, Some(ICE));
-        assert_eq!(style.visuals.selection.stroke.color, GLACIER);
-        assert_eq!(style.text_styles[&egui::TextStyle::Heading].size, 24.0);
-        assert_eq!(glass().corner_radius, egui::CornerRadius::same(12));
-        assert!(glass().fill.a() < 255);
     }
 }

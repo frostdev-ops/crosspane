@@ -2,13 +2,11 @@
 
 mod app;
 mod art;
-mod crossings;
 mod ctl;
 mod demo;
 mod fonts;
 mod layout;
 mod model;
-mod theme;
 
 fn main() {
     if let Err(error) = run() {
@@ -41,8 +39,8 @@ fn run() -> anyhow::Result<()> {
             cc.egui_ctx.set_fonts(fonts);
             cc.egui_ctx.set_theme(eframe::egui::Theme::Dark);
             cc.egui_ctx
-                .set_style_of(eframe::egui::Theme::Dark, theme::style());
-            let art = art::Art::load(&cc.egui_ctx);
+                .set_style_of(eframe::egui::Theme::Dark, crosspane_ui_kit::theme::style());
+            let art = art::load(&cc.egui_ctx);
             Ok(Box::new(app::Settings::new(worker, art, screenshot)))
         }),
     )

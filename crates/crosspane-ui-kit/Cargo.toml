@@ -12,3 +12,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+egui.workspace = true
+png.workspace = true

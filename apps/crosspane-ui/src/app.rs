@@ -3,14 +3,17 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, FontId, Pos2, RichText, Sense, Stroke, StrokeKind};
+use crosspane_ui_kit::art::Art;
+use crosspane_ui_kit::layout::{DisplayRect, LayoutAction, LayoutView, LayoutWidget};
+use crosspane_ui_kit::theme;
+use eframe::egui::{self, Color32, FontId, RichText, Sense};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::ctl::{Failure, Request, Target, Worker};
-use crate::layout::{Editor, Fit};
+use crate::demo::Demo;
+use crate::layout::{from_status, place_request};
 use crate::model::{Display, Offer, PairStatus, Status, Window, short_id};
-use crate::{art::Art, crossings::crossings, demo::Demo, theme};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -18,12 +21,6 @@ enum Tab {
     Layout,
     Pairing,
     Windows,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CanvasDrag {
-    fit: Fit,
-    pointer_start: Pos2,
 }
 
 pub struct Settings {
@@ -44,8 +41,9 @@ pub struct Settings {
     pairing_started: bool,
     message: Option<String>,
     forget: Option<String>,
-    editor: Editor,
-    canvas_drag: Option<CanvasDrag>,
+    desk: LayoutWidget,
+    /// The layout in the latest status, which the desk follows and Revert restores.
+    confirmed: Vec<DisplayRect>,
     place_message: Option<String>,
     place_accepted: bool,
     listen_allow_input: bool,
@@ -92,8 +90,8 @@ impl Settings {
             pairing_started: false,
             message: None,
             forget: None,
-            editor: Editor::default(),
-            canvas_drag: None,
+            desk: LayoutWidget::default(),
+            confirmed: Vec::new(),
             place_message: None,
             place_accepted: false,
             listen_allow_input: false,
@@ -174,8 +172,7 @@ impl Settings {
                 Err(Failure::Unavailable) => {
                     // Retry only status until the socket answers again.
                     self.reachable = false;
-                    self.editor.stop_drag();
-                    self.canvas_drag = None;
+                    self.desk.cancel_drag();
                     self.status_sent = Some(Instant::now());
                     self.windows_need_refresh = true;
                 }
@@ -218,11 +215,12 @@ impl Settings {
         match target {
             Target::Status => {
                 self.status = decode(value)?;
+                self.confirmed = from_status(&self.status);
                 if self.place_accepted {
-                    self.editor.revert(&self.status);
+                    self.desk.revert(&self.confirmed);
                     self.place_accepted = false;
                 } else {
-                    self.editor.follow(&self.status);
+                    self.desk.follow(&self.confirmed);
                 }
             }
             Target::PairStatus => {
@@ -452,307 +450,30 @@ impl Settings {
 
     fn layout(&mut self, ui: &mut egui::Ui) {
         let busy = self.pending.contains(&Target::Place) || self.place_accepted;
-        let overlaps = self.editor.overlaps();
-        ui.horizontal(|ui| {
-            if theme::primary(
-                ui,
-                "Apply",
-                self.editor.edited() && overlaps.is_empty() && !busy && !self.editor.dragging(),
-            )
-            .clicked()
-            {
-                self.place_message = Some("Applying…".into());
-                self.send(Target::Place, self.editor.place_request());
-            }
-            if ui
-                .add_enabled(self.editor.edited() && !busy, egui::Button::new("Revert"))
-                .clicked()
-            {
-                self.editor.revert(&self.status);
-                self.canvas_drag = None;
-                self.place_message = None;
-            }
-            if !overlaps.is_empty() {
-                ui.colored_label(theme::WARNING, "Displays overlap.");
-            }
-        });
-        if let Some(message) = &self.place_message {
-            ui.label(message);
-        }
-        ui.label(RichText::new("Drag a machine to where it sits on your desk; the pointer crosses where screens touch").color(theme::QUIET));
-        ui.horizontal_wrapped(|ui| {
-            theme::chip(ui, "●  This machine", theme::FROST);
-            theme::chip(ui, "●  Peers", theme::PEER_ICE);
-            theme::crossing_legend(ui);
-        });
-        let (canvas, _) = ui.allocate_exact_size(
-            ui.available_size().max(egui::vec2(1.0, 1.0)),
-            Sense::hover(),
-        );
-        let painter = ui.painter_at(canvas);
-        theme::gradient(
-            &painter,
-            canvas,
-            12.0,
-            theme::alpha(theme::NAVY, 100),
-            theme::alpha(theme::MIDNIGHT, 225),
-        );
-        painter.rect_stroke(
-            canvas,
-            12.0,
-            Stroke::new(1.0, theme::alpha(theme::GLACIER, 45)),
-            StrokeKind::Inside,
-        );
-        // A quiet desk grid establishes scale without competing with the display labels.
-        let grid = canvas.shrink(12.0);
-        for x in (0..(grid.width() / 32.0) as usize).map(|i| grid.left() + i as f32 * 32.0) {
-            for y in (0..(grid.height() / 32.0) as usize).map(|i| grid.top() + i as f32 * 32.0) {
-                painter.circle_filled(egui::pos2(x, y), 0.7, theme::alpha(theme::QUIET, 30));
-            }
-        }
-        if !self.editor.displays.iter().any(|display| display.visible()) {
-            painter.text(
-                canvas.center(),
-                egui::Align2::CENTER_CENTER,
-                "No placed displays with a known size.",
-                FontId::proportional(16.0),
-                ui.visuals().text_color(),
-            );
-            return;
-        }
-        let fit = self
-            .canvas_drag
-            .map_or_else(|| Fit::new(&self.editor.displays, canvas), |drag| drag.fit);
-        let mut start = None;
-        let mut dragging_node = None;
-        for display in self
-            .editor
-            .displays
-            .iter()
-            .filter(|display| display.visible())
-        {
-            let response = ui.interact(
-                fit.rect(display),
-                ui.id().with((&display.node, display.display)),
-                if busy { Sense::hover() } else { Sense::drag() },
-            );
-            if response.dragged() {
-                dragging_node = Some(display.node.clone());
-            }
-            if response.drag_started() {
-                start = ui
-                    .input(|input| input.pointer.press_origin())
-                    .map(|pointer_start| (display.node.clone(), CanvasDrag { fit, pointer_start }));
-            }
-            response.on_hover_text(format!(
-                "{} / {}\n{:.0} × {:.0} mm at ({:.0}, {:.0}) mm",
-                display.machine,
-                display.name,
-                display.size[0],
-                display.size[1],
-                display.origin[0],
-                display.origin[1]
-            ));
-        }
-        if let Some((node, drag)) = start {
-            self.editor.start_drag(&node);
-            self.canvas_drag = Some(drag);
-        }
-        if let Some(drag) = self.canvas_drag {
-            if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
-                let now = drag.fit.to_mm(pointer);
-                let initial = drag.fit.to_mm(drag.pointer_start);
-                // Snap threshold is eight physical screen pixels, accounting for HiDPI.
-                self.editor.drag_by(
-                    [now[0] - initial[0], now[1] - initial[1]],
-                    drag.fit.scale * f64::from(ui.ctx().pixels_per_point()),
-                );
-            }
-            if !ui.input(|input| input.pointer.primary_down()) {
-                self.editor.stop_drag();
-                self.canvas_drag = None;
-            }
-        }
-        let overlaps = self.editor.overlaps();
         let own = short_id(&self.status.node);
-        for (index, display) in self.editor.displays.iter().enumerate() {
-            if !display.visible() {
-                continue;
+        let peer_order: Vec<String> = self
+            .status
+            .peers
+            .iter()
+            .map(|peer| short_id(&peer.node))
+            .collect();
+        let action = self.desk.show(
+            ui,
+            LayoutView {
+                confirmed: &self.confirmed,
+                local_node: &own,
+                peer_order: &peer_order,
+                busy,
+                feedback: self.place_message.as_deref(),
+            },
+        );
+        match action {
+            Some(LayoutAction::Apply(intents)) => {
+                self.place_message = Some("Applying…".into());
+                self.send(Target::Place, place_request(intents));
             }
-            let rect = fit.rect(display);
-            let accent = if display.node == own {
-                theme::FROST
-            } else {
-                let peer_index = self
-                    .status
-                    .peers
-                    .iter()
-                    .position(|peer| short_id(&peer.node) == display.node)
-                    .unwrap_or(0);
-                if peer_index % 2 == 0 {
-                    theme::PEER_ICE
-                } else {
-                    theme::QUIET
-                }
-            };
-            painter.add(
-                egui::epaint::Shadow {
-                    offset: [0, 4],
-                    blur: 12,
-                    spread: 0,
-                    color: Color32::from_black_alpha(90),
-                }
-                .as_shape(rect, 9),
-            );
-            theme::gradient(
-                &painter,
-                rect,
-                9.0,
-                if display.node == own {
-                    Color32::from_rgb(20, 64, 96)
-                } else {
-                    theme::alpha(theme::NAVY, 95)
-                },
-                if display.node == own {
-                    Color32::from_rgb(9, 31, 51)
-                } else {
-                    theme::alpha(theme::MIDNIGHT, 170)
-                },
-            );
-            painter.rect_stroke(
-                rect,
-                9.0,
-                Stroke::new(
-                    if overlaps.contains(&index) { 2.0 } else { 1.0 },
-                    if overlaps.contains(&index) {
-                        theme::WARNING
-                    } else {
-                        theme::alpha(accent, 240)
-                    },
-                ),
-                StrokeKind::Inside,
-            );
-            let top = [
-                rect.left_top() + egui::vec2(10.0, 2.0),
-                rect.right_top() + egui::vec2(-10.0, 2.0),
-            ];
-            for (width, opacity) in [(7.0, 18), (4.0, 35), (2.0, 180)] {
-                painter.line_segment(top, Stroke::new(width, theme::alpha(accent, opacity)));
-            }
-            let displays = if display.node == own {
-                &self.status.displays
-            } else {
-                self.status
-                    .peers
-                    .iter()
-                    .find(|peer| short_id(&peer.node) == display.node)
-                    .map_or(&self.status.displays, |peer| &peer.displays)
-            };
-            let resolution = displays
-                .iter()
-                .find(|screen| screen.id == display.display)
-                .map_or_else(
-                    || display.name.clone(),
-                    |screen| format!("{} × {}", screen.pixels[0], screen.pixels[1]),
-                );
-            let text_painter = painter.with_clip_rect(rect.shrink(3.0).intersect(canvas));
-            display_machine_chip(&text_painter, rect, &display.machine, accent);
-            let name = if display.name.is_empty() {
-                format!("Display {}", display.display)
-            } else {
-                display.name.clone()
-            };
-            let detail = format!("{resolution} · {}", display.machine);
-            for (text, fraction, size, color) in [
-                (
-                    name,
-                    0.52,
-                    (rect.height() * 0.18).clamp(8.0, 15.0),
-                    theme::ICE,
-                ),
-                (
-                    detail,
-                    0.78,
-                    (rect.height() * 0.16).clamp(8.0, 11.0),
-                    theme::QUIET,
-                ),
-            ] {
-                let width = (rect.width() - 12.0).max(1.0);
-                let font = fitted_font(ui, &text, width, size);
-                let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
-                job.wrap.max_width = width;
-                job.wrap.max_rows = 1;
-                job.wrap.break_anywhere = true;
-                let label = text_painter.layout_job(job);
-                let center = egui::pos2(rect.center().x, rect.top() + rect.height() * fraction);
-                text_painter.galley(center - label.size() / 2.0, label, color);
-            }
-        }
-        for crossing in crossings(&self.editor.displays) {
-            if crossing
-                .displays
-                .iter()
-                .any(|index| overlaps.contains(index))
-            {
-                continue;
-            }
-            let line = [fit.to_screen(crossing.start), fit.to_screen(crossing.end)];
-            theme::crossing_glow(&painter, line, true);
-        }
-        if self.editor.dragging() {
-            // Show only actual alignments, after the editor's existing snap and rounding.
-            for (i, a) in self
-                .editor
-                .displays
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| d.visible() && dragging_node.as_deref() == Some(&d.node))
-            {
-                for b in self
-                    .editor
-                    .displays
-                    .iter()
-                    .skip(i + 1)
-                    .filter(|b| b.visible() && b.node != a.node)
-                {
-                    for axis in 0..2 {
-                        for ae in [
-                            a.origin[axis],
-                            a.origin[axis] + a.size[axis] / 2.0,
-                            a.origin[axis] + a.size[axis],
-                        ] {
-                            for be in [
-                                b.origin[axis],
-                                b.origin[axis] + b.size[axis] / 2.0,
-                                b.origin[axis] + b.size[axis],
-                            ] {
-                                if (ae - be).abs() <= 1.0 {
-                                    let p = fit.to_screen(if axis == 0 {
-                                        [ae, 0.0]
-                                    } else {
-                                        [0.0, ae]
-                                    });
-                                    let line = if axis == 0 {
-                                        [
-                                            egui::pos2(p.x, canvas.top() + 8.0),
-                                            egui::pos2(p.x, canvas.bottom() - 8.0),
-                                        ]
-                                    } else {
-                                        [
-                                            egui::pos2(canvas.left() + 8.0, p.y),
-                                            egui::pos2(canvas.right() - 8.0, p.y),
-                                        ]
-                                    };
-                                    painter.line_segment(
-                                        line,
-                                        Stroke::new(1.0, theme::alpha(theme::FROST, 100)),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            Some(LayoutAction::Revert) => self.place_message = None,
+            None => {}
         }
     }
 
@@ -1077,8 +798,7 @@ impl Settings {
         for (index, (tab, name)) in tabs.into_iter().enumerate() {
             if navigation(ui, index, name, self.tab == tab).clicked() && self.tab != tab {
                 if self.tab == Tab::Layout {
-                    self.editor.stop_drag();
-                    self.canvas_drag = None;
+                    self.desk.cancel_drag();
                 }
                 self.tab = tab;
                 if tab == Tab::Windows {
@@ -1246,45 +966,6 @@ impl eframe::App for Settings {
     }
 }
 
-fn fitted_font(ui: &egui::Ui, text: &str, width: f32, desired: f32) -> FontId {
-    let measured = ui.fonts_mut(|fonts| {
-        fonts
-            .layout_no_wrap(text.into(), FontId::proportional(desired), theme::ICE)
-            .size()
-            .x
-    });
-    FontId::proportional((desired * (width / measured.max(1.0)).min(1.0)).max(8.0))
-}
-
-fn display_machine_chip(
-    painter: &egui::Painter,
-    display: egui::Rect,
-    machine: &str,
-    accent: Color32,
-) {
-    let font_size = (display.height() * 0.13).clamp(7.0, 9.0);
-    let font = FontId::proportional(font_size);
-    let label = painter.layout_no_wrap(machine.into(), font, accent);
-    let size = egui::vec2(
-        (label.size().x + 12.0).min((display.width() - 16.0).max(1.0)),
-        label.size().y + 4.0,
-    );
-    let rect = egui::Rect::from_min_size(display.min + egui::vec2(8.0, 5.0), size);
-    painter.rect_filled(rect, 5.0, theme::alpha(accent, 18));
-    painter.rect_stroke(
-        rect,
-        5.0,
-        Stroke::new(1.0, theme::alpha(accent, 70)),
-        StrokeKind::Inside,
-    );
-    painter
-        .with_clip_rect(
-            rect.shrink2(egui::vec2(4.0, 0.0))
-                .intersect(painter.clip_rect()),
-        )
-        .galley(rect.min + egui::vec2(6.0, 2.0), label, accent);
-}
-
 /// Paint a glass surface at its fixed bounds, then create a bounded vertical content UI.
 /// Keeping the frame's bounds independent of child measurements preserves the outer margin.
 fn glass_column(parent: &mut egui::Ui, id: &str, rect: egui::Rect, frame: egui::Frame) -> egui::Ui {
@@ -1440,6 +1121,7 @@ fn window_label(window: &Window) -> String {
 mod tests {
     use super::*;
     use eframe::App;
+    use eframe::egui::Pos2;
 
     // Inspect the real egui output without a native window, renderer, compositor or socket.
     // This catches inherited layouts and offscreen content that the model tests cannot detect.
@@ -1469,7 +1151,7 @@ mod tests {
                 ctx.set_fonts(crate::fonts::load().expect("system font"));
                 ctx.set_theme(egui::Theme::Dark);
                 ctx.set_style_of(egui::Theme::Dark, theme::style());
-                let mut app = Settings::new(None, Art::load(&ctx), None);
+                let mut app = Settings::new(None, crate::art::load(&ctx), None);
                 app.tab = tab;
                 let mut frame = eframe::Frame::_new_kittest();
                 let mut input_center = None;

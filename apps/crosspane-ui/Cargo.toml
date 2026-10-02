@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+crosspane-ui-kit.workspace = true
 eframe.workspace = true
 png.workspace = true
 serde.workspace = true
