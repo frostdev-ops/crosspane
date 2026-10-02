@@ -13,6 +13,26 @@ use crate::paths::write_private;
 /// The key store entry name.
 const KEY_NAME: &str = "device-key";
 
+/// Where the device identity came from (`status.result.installer.keystore`, WP-4.5): decided here,
+/// where the load picks between the OS key store and the key file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeySource {
+    /// Loaded from, or created in, the OS key store.
+    OsStore,
+    /// The 0600 key file supplied it: the OS key store was forced off, unavailable, or refused it.
+    File,
+}
+
+impl KeySource {
+    /// The spelling `status` uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeySource::OsStore => "os_store",
+            KeySource::File => "file",
+        }
+    }
+}
+
 /// How often `run` retries the load while the OS key store is locked.
 const UNLOCK_POLL: Duration = Duration::from_secs(2);
 /// How often a log line says the wait goes on.
@@ -28,7 +48,7 @@ pub fn load_or_create(
     allow_file_fallback: bool,
 ) -> Result<DeviceIdentity> {
     match attempt(store, key_file, allow_file_fallback, false)? {
-        Attempt::Loaded(identity) => Ok(identity),
+        Attempt::Loaded(identity, _) => Ok(identity),
         Attempt::Locked => bail!("the OS key store is locked; unlock it and restart Crosspane"),
     }
 }
@@ -36,8 +56,8 @@ pub fn load_or_create(
 /// What [`load_or_create_waiting`] ended with.
 #[derive(Debug)]
 pub enum Startup {
-    /// The identity, loaded (or created) once the key store allowed it.
-    Identity(DeviceIdentity),
+    /// The identity, loaded (or created) once the key store allowed it, and where it came from.
+    Identity(DeviceIdentity, KeySource),
     /// A stop request (SIGTERM or SIGINT) arrived while the key store was still locked.
     Stopped,
 }
@@ -65,14 +85,14 @@ pub fn load_or_create_waiting(
     let mut waiting: Option<Waiting> = None;
     loop {
         match attempt(store, key_file, allow_file_fallback, true)? {
-            Attempt::Loaded(identity) => {
+            Attempt::Loaded(identity, source) => {
                 if let Some(waiting) = waiting {
                     tracing::info!(
                         waited_s = waiting.waited(pacer.now()).as_secs(),
                         "the OS key store unlocked"
                     );
                 }
-                return Ok(Startup::Identity(identity));
+                return Ok(Startup::Identity(identity, source));
             }
             Attempt::Locked => {}
         }
@@ -124,7 +144,7 @@ impl Waiting {
 
 /// One try of the load.
 enum Attempt {
-    Loaded(DeviceIdentity),
+    Loaded(DeviceIdentity, KeySource),
     /// The OS key store is locked, and the caller asked to wait for it.
     Locked,
 }
@@ -139,7 +159,7 @@ fn attempt(
         match store.load(KEY_NAME) {
             Ok(Some(pkcs8)) => {
                 return DeviceIdentity::from_pkcs8(&pkcs8)
-                    .map(Attempt::Loaded)
+                    .map(|identity| Attempt::Loaded(identity, KeySource::OsStore))
                     .context("stored device key is invalid");
             }
             Ok(None) => {
@@ -147,7 +167,7 @@ fn attempt(
                 match store.store(KEY_NAME, identity.pkcs8()) {
                     Ok(()) => {
                         tracing::info!(node = %identity.node().short(), "created device key in the OS key store");
-                        return Ok(Attempt::Loaded(identity));
+                        return Ok(Attempt::Loaded(identity, KeySource::OsStore));
                     }
                     Err(e) if allow_file_fallback => {
                         tracing::warn!(error = %e, "OS key store refused the device key; using the file fallback");
@@ -169,7 +189,7 @@ fn attempt(
     } else if !allow_file_fallback {
         bail!("no OS key store on this platform and the file fallback is disabled");
     }
-    load_or_create_file(key_file).map(Attempt::Loaded)
+    load_or_create_file(key_file).map(|identity| Attempt::Loaded(identity, KeySource::File))
 }
 
 /// The production [`Pacer`]: it sleeps on SIGTERM and SIGINT, which end the sleep with "stop".
@@ -482,12 +502,13 @@ mod tests {
         );
         let file = key_file("three-locks");
         let mut pacer = FakePacer::new(None);
-        let Startup::Identity(identity) =
+        let Startup::Identity(identity, source) =
             load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap()
         else {
             panic!("expected the identity");
         };
         assert_eq!(identity.node(), existing.node());
+        assert_eq!(source, KeySource::OsStore);
         // Three locked loads, three pauses of 2 s each, then the fourth load worked.
         assert_eq!(store.loads(), 4);
         assert_eq!(pacer.pauses, vec![UNLOCK_POLL; 3]);
@@ -544,12 +565,14 @@ mod tests {
         let store = FakeStore::new(&locked, Reply::Key(pkcs8_of(&existing)));
         let file = key_file("long-wait");
         let mut pacer = FakePacer::new(None);
-        let Startup::Identity(identity) =
+        let Startup::Identity(identity, source) =
             load_or_create_waiting(Some(&store), &file, true, &mut pacer).unwrap()
         else {
             panic!("expected the identity");
         };
         assert_eq!(identity.node(), existing.node());
+        // A lock was waited out, never a reason to fall back: the key store supplied it.
+        assert_eq!(source, KeySource::OsStore);
         assert_eq!(pacer.now(), Duration::from_secs(400));
         assert!(!file.exists());
         cleanup(&file);
@@ -576,11 +599,12 @@ mod tests {
         let store = FakeStore::new(&[], Reply::Broken);
         let file = key_file("other-error-fallback");
         let mut pacer = FakePacer::new(None);
-        let Startup::Identity(identity) =
+        let Startup::Identity(identity, source) =
             load_or_create_waiting(Some(&store), &file, true, &mut pacer).unwrap()
         else {
             panic!("expected the identity");
         };
+        assert_eq!(source, KeySource::File);
         assert!(pacer.pauses.is_empty());
         assert!(file.exists());
         assert_eq!(std::fs::read(&file).unwrap(), pkcs8_of(&identity));
@@ -592,11 +616,12 @@ mod tests {
         let store = FakeStore::new(&[], Reply::Missing);
         let file = key_file("first-run");
         let mut pacer = FakePacer::new(None);
-        let Startup::Identity(identity) =
+        let Startup::Identity(identity, source) =
             load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap()
         else {
             panic!("expected the identity");
         };
+        assert_eq!(source, KeySource::OsStore);
         assert!(pacer.pauses.is_empty());
         assert_eq!(store.loads(), 1);
         assert_eq!(
@@ -612,17 +637,45 @@ mod tests {
         let store = FakeStore::new(&[Reply::Locked, Reply::Locked], Reply::Missing);
         let file = key_file("first-run-after-lock");
         let mut pacer = FakePacer::new(None);
-        let Startup::Identity(identity) =
+        let Startup::Identity(identity, source) =
             load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap()
         else {
             panic!("expected the identity");
         };
+        assert_eq!(source, KeySource::OsStore);
         assert_eq!(pacer.pauses.len(), 2);
         assert_eq!(
             store.stored(),
             vec![(KEY_NAME.to_owned(), pkcs8_of(&identity))]
         );
         cleanup(&file);
+    }
+
+    #[test]
+    fn without_an_os_store_the_file_supplies_the_identity_and_says_so() {
+        let file = key_file("no-store-file");
+        let mut pacer = FakePacer::new(None);
+        let Startup::Identity(first, source) =
+            load_or_create_waiting(None, &file, true, &mut pacer).unwrap()
+        else {
+            panic!("expected the identity");
+        };
+        assert_eq!(source, KeySource::File);
+        // The same file on the next start.
+        let Startup::Identity(second, source) =
+            load_or_create_waiting(None, &file, true, &mut pacer).unwrap()
+        else {
+            panic!("expected the identity");
+        };
+        assert_eq!(source, KeySource::File);
+        assert_eq!(first.node(), second.node());
+        cleanup(&file);
+    }
+
+    #[test]
+    fn the_source_has_the_spellings_status_uses() {
+        assert_eq!(KeySource::OsStore.as_str(), "os_store");
+        assert_eq!(KeySource::File.as_str(), "file");
     }
 
     #[test]

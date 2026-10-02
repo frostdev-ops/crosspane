@@ -499,6 +499,17 @@ pub enum Output {
     },
 }
 
+/// Why this node's controller session was ended by `release()` (WP-4.5): the release chord, or a
+/// release command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReleaseCause {
+    /// The release chord: seen in the captured stream (including while a home exit was being
+    /// activated) or reported by the platform's hotkey.
+    Chord,
+    /// `Command::ReleaseControl` (`crosspanectl release`, the tray's "Take input back").
+    Command,
+}
+
 /// Something to tell the user (tray notification, HUD text).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -544,5 +555,13 @@ pub enum Notice {
     HomeFailed {
         key: ProjectionKey,
         reason: HomeFailure,
+    },
+    /// WP-4.5: this node, as controller, ended its session with `peer` by a release (`cause`).
+    /// Emitted exactly once per ended controller session, and only if a session was active (a
+    /// release with none emits nothing). Not for display: the other ways a session ends have
+    /// their own notices (or none).
+    ControlReleased {
+        peer: NodeId,
+        cause: ReleaseCause,
     },
 }

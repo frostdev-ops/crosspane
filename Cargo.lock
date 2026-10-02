@@ -823,6 +823,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wgpu",
+ "xxhash-rust",
  "zeroize",
 ]
 

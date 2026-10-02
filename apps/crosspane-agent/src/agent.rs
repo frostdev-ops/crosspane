@@ -480,6 +480,10 @@ pub struct Agent {
     /// The display each of this node's projections is captured from (the twin output on
     /// Hyprland), to name the projected window in notices.
     capture_display: BTreeMap<ProjectionId, DisplayId>,
+    /// What the agent learned about its own process at startup (WP-4.5).
+    startup: installer::StartupFacts,
+    /// What the agent counts and remembers for `status.result.installer` (WP-4.5).
+    tracker: installer::Tracker,
     /// Every input fed to the engine, in order (tests only).
     #[cfg(test)]
     fed: Vec<Input>,
@@ -506,6 +510,9 @@ pub struct E2Wiring {
 }
 
 const NOTICE_HISTORY: usize = 20;
+/// How long after the "controlled from" indicator is hidden the overlay host may still deliver
+/// transitions of it (WP-4.5 `e1_hud_shows` attribution).
+const INDICATOR_SETTLE: Duration = Duration::from_secs(1);
 const HOUSEKEEPING: Duration = Duration::from_secs(1);
 /// Clock-offset pings to every peer (for frame latency).
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -705,6 +712,8 @@ impl Agent {
             placement_dirty: false,
             capture_motion_seen: false,
             capture_display: BTreeMap::new(),
+            startup: installer::StartupFacts::unknown(node),
+            tracker: installer::Tracker::new(),
             #[cfg(test)]
             fed: Vec::new(),
             #[cfg(test)]
@@ -712,6 +721,11 @@ impl Agent {
             #[cfg(test)]
             emitted: Vec::new(),
         }
+    }
+
+    /// What this process learned about itself before the loop started: `status` reports it.
+    pub fn set_startup(&mut self, facts: StartupFacts) {
+        self.startup = facts;
     }
 
     /// Carry out `outputs` (crash recovery from `Engine::new` first), then run until the channel
@@ -728,6 +742,8 @@ impl Agent {
         self.feed(Input::AudioMicrophoneSupport { available: false });
         self.send_grants();
         self.update_layout(false);
+        // The first look at the backends: later differences advance `epochs.backends`.
+        self.backends_now();
         loop {
             self.settle();
             let now = platform::now();
@@ -777,10 +793,23 @@ impl Agent {
         let now = platform::now();
         #[cfg(test)]
         let now = self.test_now.unwrap_or(now);
+        let from_controller = installer::e1_input_peer(&input);
+        // The sessions that are established, not a handshake still waiting for its answer.
+        let before = (
+            self.engine.control_established(),
+            self.engine.controlled_by(),
+        );
         let outputs = self.engine.handle(input, now);
+        let after = (
+            self.engine.control_established(),
+            self.engine.controlled_by(),
+        );
+        self.tracker
+            .handled(before, after, from_controller, &outputs);
         #[cfg(test)]
         self.emitted.extend(outputs.iter().cloned());
         self.execute(outputs);
+        self.tracker.executed();
         self.flush_placements();
     }
 
@@ -824,7 +853,26 @@ impl Agent {
                 self.placement
                     .opened(*key, title.as_deref().unwrap_or_default());
                 self.placement_dirty = true;
+                if key.source != self.node {
+                    self.tracker.proxy_opened(*key);
+                }
             }
+            // The overlay host's outcome for a "controlled from" show.
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(id))
+                if *id == crosspane_engine::io::TARGET_INDICATOR =>
+            {
+                self.tracker.indicator_answer(true);
+            }
+            Input::Overlay(crosspane_platform::OverlayEvent::Unavailable(id))
+                if *id == crosspane_engine::io::TARGET_INDICATOR =>
+            {
+                self.tracker.indicator_answer(false);
+            }
+            // The projection's capture is running: it is live (and counts) from here.
+            Input::CaptureStarted {
+                projection,
+                result: Ok(_),
+            } => self.tracker.capture_started(self.node, *projection),
             _ => {}
         }
     }
@@ -881,7 +929,10 @@ impl Agent {
                 self.local_displays = displays.clone();
                 self.feed(Input::LocalDisplays(displays.clone()));
                 self.broadcast(&ControlMessage::Displays(displays));
-                self.update_layout(true);
+                // One advance for a local display change, whether or not it moved a placement.
+                if !self.update_layout(true) {
+                    self.tracker.layout_changed();
+                }
             }
             Event::Link(event) => self.on_link(event),
             Event::Ctl(request @ (Request::WindowsFrom { .. } | Request::Pull { .. }), reply) => {
@@ -964,8 +1015,11 @@ impl Agent {
                         .collect();
                     if arrange::merge(&mut self.placements, &explicit) {
                         // `update_layout` only feeds the engine when its own defaults change, so
-                        // the merged layout goes to the engine here.
-                        self.update_layout(false);
+                        // the merged layout goes to the engine here. One advance for the
+                        // received layout, however many placements it moved.
+                        if !self.update_layout(false) {
+                            self.tracker.layout_changed();
+                        }
                         self.feed(Input::Layout(self.placements.clone()));
                     }
                     return;
@@ -1047,6 +1101,7 @@ impl Agent {
         if self.cache_hello(peer, hello).is_none() {
             return;
         }
+        self.tracker.link_established(peer);
         tracing::info!(peer = %peer.short(), name = %self.peer_label(peer), "peer connected");
         self.feed(Input::PeerUp { peer });
         // After `PeerUp`: the engine ignores audio availability for a peer that isn't up.
@@ -1103,6 +1158,8 @@ impl Agent {
         let Some(displays_changed) = self.cache_hello(peer, hello) else {
             return;
         };
+        // A new connection was established, though the logical link never went down.
+        self.tracker.link_established(peer);
         tracing::info!(peer = %peer.short(), name = %self.peer_label(peer), "peer connection replaced");
         if let Some(audio) = &self.audio {
             audio.cancel_peer(peer);
@@ -1231,11 +1288,20 @@ impl Agent {
                     Some(host) => host.show(id, &overlay),
                     None => Err(PlatformError::Unsupported("no overlay backend")),
                 };
-                if let Err(e) = shown {
-                    tracing::warn!(error = %e, "overlay unavailable");
+                match shown {
+                    // Accepted: an outcome is owed, for the peer controlling this node now.
+                    Ok(()) if id == crosspane_engine::io::TARGET_INDICATOR => {
+                        self.tracker
+                            .indicator_shown(self.engine.controlled_by(), Instant::now());
+                    }
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!(error = %e, "overlay unavailable"),
                 }
             }
             Output::HideOverlay(id) => {
+                if id == crosspane_engine::io::TARGET_INDICATOR {
+                    self.tracker.indicator_hidden(Instant::now());
+                }
                 if let Some(host) = &mut self.platform.overlay
                     && let Err(e) = host.hide(id)
                 {
@@ -1243,7 +1309,11 @@ impl Agent {
                 }
             }
             Output::Inject { id, cmd } => {
+                let key_or_button = matches!(cmd, InjectCmd::Key { .. } | InjectCmd::Button { .. });
                 let ok = self.inject(cmd);
+                if key_or_button {
+                    self.tracker.injected(id, ok);
+                }
                 self.pending.push_back(Input::InjectDone { id, ok });
             }
             Output::SendInput { peer, msg } => {
@@ -1261,13 +1331,17 @@ impl Agent {
                     let _ = link.send_control(&msg);
                 }
             }
-            Output::EngineGate(open) => self.platform.gate.set_engine_permits(open),
+            Output::EngineGate(open) => {
+                self.tracker.engine_permits = open;
+                self.platform.gate.set_engine_permits(open);
+            }
             Output::Notice(notice) => self.notice(&notice),
             Output::Park {
                 window,
                 size,
                 scale,
             } => {
+                self.tracker.parking_started(window);
                 let result = match &mut self.platform.parking {
                     Some(p) => p.park(window, size, scale).map_err(|error| {
                         tracing::warn!(%error, "parking failed");
@@ -1292,11 +1366,14 @@ impl Agent {
                 self.pending.push_back(Input::Parked { window, result });
             }
             Output::Restore { window } => {
-                if let Some(p) = &mut self.platform.parking
-                    && let Err(e) = p.restore(window)
-                {
-                    tracing::error!(error = %e, "could not restore a parked window");
-                }
+                // Without a parking backend nothing was parked here, and nothing was restored.
+                let restored = match &mut self.platform.parking {
+                    Some(p) => p.restore(window).inspect_err(
+                        |e| tracing::error!(error = %e, "could not restore a parked window"),
+                    ),
+                    None => Err(PlatformError::Unsupported("no parking backend")),
+                };
+                self.tracker.restored(window, restored.is_ok());
             }
             Output::ActivateWindow { window } => {
                 if let Some(w) = &mut self.platform.windows
@@ -1491,11 +1568,18 @@ impl Agent {
                 self.titles.remove(&key);
                 self.placement.closed(key);
                 self.placement_dirty = true;
-                if let Some(id) = self.proxy_ids.close(key)
-                    && let Some(h) = &self.host
-                {
-                    let _ = h.send(HostCommand::Close { id });
-                }
+                let id = self.proxy_ids.close(key);
+                // Whether the host was handed its `Close` (it doesn't say when the proxy is gone).
+                let queued = match (id, &self.host) {
+                    (Some(id), Some(h)) => h.send(HostCommand::Close { id }).is_ok(),
+                    _ => false,
+                };
+                #[cfg(test)]
+                let queued = self
+                    .tracker
+                    .close_seam
+                    .map_or(queued, |seam| id.is_some_and(seam));
+                self.tracker.proxy_closed(queued);
                 let _ = self.dest_media.send(DestCmd::Forget(key));
             }
             // Audio (D8): the worker carries these out off this loop and reports back through
@@ -1533,6 +1617,7 @@ impl Agent {
 
     /// Hand one audio output of the engine to the worker.
     fn audio_output(&mut self, output: Output) {
+        self.tracker.audio_output(&output);
         let Some(audio) = &self.audio else {
             // The engine only asks when audio is negotiated, which needs this node's worker. If
             // it asks anyway, fail what it is waiting for rather than leave it hanging.
@@ -1607,6 +1692,12 @@ impl Agent {
     }
 
     fn notice(&mut self, notice: &Notice) {
+        // Counted, not shown: how a controller session was released says nothing the user needs
+        // (the end notices above are unchanged).
+        if let Notice::ControlReleased { peer, cause } = notice {
+            self.tracker.released(*peer, *cause);
+            return;
+        }
         let peer_name = |agent: &Agent, peer: &NodeId| {
             agent
                 .peers
@@ -1625,6 +1716,8 @@ impl Agent {
             Notice::LocalOverride(p) => format!("local input overrode {}", peer_name(self, p)),
             Notice::Panic => "panic: everything stopped; re-arm to continue".to_owned(),
             Notice::ProjectionStarted { key, peer, parking } => {
+                // Parked: counted once the capture starts.
+                self.tracker.projection_parked(*key, *peer, *parking);
                 let text = format!(
                     "projecting window {} to {} ({parking:?})",
                     key.projection.0,
@@ -1634,6 +1727,7 @@ impl Agent {
                 text
             }
             Notice::ProjectionEnded { key, reason } => {
+                self.tracker.projection_ended(self.node, *key, *reason);
                 self.projections.remove(key);
                 format!("projection {} ended: {reason:?}", key.projection.0)
             }
@@ -1955,10 +2049,14 @@ impl Agent {
                 return;
             }
             TrayAction::OpenApp => {
-                if let Err(e) = open_settings_app() {
-                    tracing::warn!(error = %e, "could not open the settings app");
-                    self.notices
-                        .push_back(format!("could not open the settings app: {e}"));
+                match (self.tracker.spawn_settings)() {
+                    // Only a spawn that worked counts (WP-4.5).
+                    Ok(()) => self.tracker.settings_opened += 1,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not open the settings app");
+                        self.notices
+                            .push_back(format!("could not open the settings app: {e}"));
+                    }
                 }
                 return;
             }
@@ -1991,7 +2089,12 @@ impl Agent {
             }),
         ) {
             Ok(d) => self.discovery = Some(d),
-            Err(e) => tracing::warn!(error = %e, "no discovery: using configured addresses only"),
+            Err(e) => {
+                tracing::warn!(error = %e, "no discovery: using configured addresses only");
+                // `Discovery::start` doesn't say which step failed: the daemon as a whole didn't
+                // start.
+                self.tracker.discovery_error = Some("daemon_failed");
+            }
         }
     }
 
@@ -2275,6 +2378,9 @@ impl Agent {
     fn housekeeping(&mut self) {
         self.home_housekeeping();
         self.discovery_housekeeping();
+        // Known limit (WP-4.5): a backend that flips and flips back within one tick is missed.
+        // Backends rarely flip back without a restart, and a restart is a new instance.
+        self.backends_now();
         if self.last_ping.elapsed() >= PING_INTERVAL {
             self.last_ping = Instant::now();
             let t0 = platform::now().as_nanos();
@@ -2307,6 +2413,7 @@ impl Agent {
             match self.trust.refresh() {
                 Ok(true) => {
                     tracing::info!("trust store changed");
+                    self.tracker.grants_changed();
                     self.close_untrusted();
                     self.send_grants();
                 }
@@ -2367,7 +2474,10 @@ impl Agent {
 
     /// Fill in default placements for any node that has none (version 0, computed identically on
     /// every peer), re-arrange this node's own displays after a local change, and tell the engine.
-    fn update_layout(&mut self, local_changed: bool) {
+    ///
+    /// Returns whether the placements changed. When they did, the layout epoch has advanced by one
+    /// (WP-4.5): a caller whose own trigger counts anyway adds one only if this didn't.
+    fn update_layout(&mut self, local_changed: bool) -> bool {
         let mut nodes = vec![(self.node, self.local_displays.clone())];
         nodes.extend(
             self.peers
@@ -2400,11 +2510,13 @@ impl Agent {
             .retain(|p| known.contains(&(p.node, p.display)));
         changed |= self.placements.len() != before;
         if changed {
+            self.tracker.layout_changed();
             self.feed(Input::Layout(self.placements.clone()));
             if local_changed {
                 self.broadcast(&ControlMessage::Layout(self.explicit()));
             }
         }
+        changed
     }
 
     /// Re-place this node's displays from the OS arrangement, keeping the node's top-left corner
@@ -2492,6 +2604,7 @@ impl Agent {
             })
             .collect();
         arrange::merge(&mut self.placements, &own);
+        self.tracker.layout_changed();
         self.feed(Input::Layout(self.placements.clone()));
         self.broadcast(&ControlMessage::Layout(self.explicit()));
         Ok(())
@@ -2577,6 +2690,7 @@ impl Agent {
             }
         }
         self.placements = next;
+        self.tracker.layout_changed();
         // Explicit side choices from the tray no longer describe the layout.
         self.tray.sides.clear();
         self.feed(Input::Layout(self.placements.clone()));
@@ -2638,6 +2752,7 @@ impl Agent {
         self.trust
             .update(|t| Ok(t.revoke(node)))
             .map_err(|e| format!("could not update the trust store: {e}"))?;
+        self.tracker.grants_changed();
         self.close_untrusted();
         self.send_grants();
         // The revoked node's link is closing; it isn't told.
@@ -2682,6 +2797,7 @@ impl Agent {
                 let revoked = forgotten.map_or_else(|| notice.revoked.short(), |entry| entry.name);
                 let issuer = self.peer_label(notice.issuer);
                 tracing::info!(revoked = %notice.revoked.short(), issuer = %notice.issuer.short(), "revocation applied");
+                self.tracker.grants_changed();
                 self.close_untrusted();
                 self.send_grants();
                 self.notices
@@ -2723,6 +2839,7 @@ impl Agent {
                     tracing::warn!(error = %e, "could not update the revocations file");
                 }
                 self.notices.push_back(format!("paired with {}", peer.name));
+                self.tracker.grants_changed();
                 self.send_grants();
                 if let Some(addr) = paired.dial {
                     self.net.dial(addr);
@@ -2861,10 +2978,15 @@ impl Agent {
                 };
                 match self.find_peer(&peer) {
                     Some(node) => match self.trust.update(|t| {
+                        let before = t.clone();
                         t.set_grant(node, capability, allow)
-                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        Ok(*t != before)
                     }) {
-                        Ok(()) => {
+                        Ok(changed) => {
+                            if changed {
+                                self.tracker.grants_changed();
+                            }
                             self.send_grants();
                             let mut text = format!(
                                 "{} {capability:?} for {peer}",
@@ -2886,6 +3008,7 @@ impl Agent {
             Request::Forget { peer } => match self.find_trusted(&peer).ok() {
                 Some(node) => match self.trust.update(|t| Ok(t.forget(node))) {
                     Ok(Some(entry)) => {
+                        self.tracker.grants_changed();
                         self.close_untrusted();
                         self.send_grants();
                         Response::ok(json!(format!("forgot {}", entry.name)))
@@ -3179,6 +3302,8 @@ impl Agent {
                 })
             }).collect::<Vec<_>>(),
             "uptime_s": now.as_nanos() / 1_000_000_000,
+            // The typed local facts the installer reads (WP-4.5).
+            "installer": self.installer_status(),
         })
     }
 }
@@ -3894,6 +4019,905 @@ fn node_accent(node: NodeId) -> [u8; 3] {
     rgb.map(|value| ((value + 0.175) * 255.0).round() as u8)
 }
 
+/// `status.result.installer`, schema version 1 (WP-4.5): the typed local facts the installer reads
+/// to decide whether Crosspane works on this machine, without parsing prose.
+///
+/// Everything here is observed by the agent from what the engine emits and what the backends
+/// report, and counted for this instance only (a restart is a new instance with a new id). Nothing
+/// in it names a key, a typed character, a sample, a window title or a peer address.
+mod installer {
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crosspane_engine::io::{InjectId, ReleaseCause};
+    use crosspane_platform::LockState;
+    use crosspane_protocol::msg::InputMessage;
+    use crosspane_protocol::projection::{ParkingKind, ProjectionEndReason};
+
+    use super::*;
+    use crate::config::Config;
+    use crate::keys::KeySource;
+    use crate::paths::Paths;
+
+    /// `installer.schema_version`.
+    const SCHEMA_VERSION: u32 = 1;
+
+    /// What the agent learned about its own process at startup.
+    #[derive(Clone, Debug)]
+    pub struct StartupFacts {
+        instance_id: u64,
+        pid: u32,
+        uid: u32,
+        exe: String,
+        runtime_dir: String,
+        started_unix_ms: u64,
+        config_revision: String,
+        /// Where the identity came from, and whether the config forced the key file.
+        pub(super) key_source: KeySource,
+        pub(super) force_file_keystore: bool,
+    }
+
+    impl StartupFacts {
+        /// The facts of this process: its id, the files it runs from and with, and where its
+        /// identity came from. `config` is the one loaded from `paths`, and `config_revision` the
+        /// digest of the exact bytes it was parsed from (`Config::load_revision`).
+        pub fn collect(
+            node: NodeId,
+            paths: &Paths,
+            key_source: KeySource,
+            config: &Config,
+            config_revision: String,
+        ) -> StartupFacts {
+            StartupFacts::with(
+                node,
+                &paths.runtime_dir,
+                config_revision,
+                key_source,
+                config.force_file_keystore,
+            )
+        }
+
+        /// Facts for an agent nobody has given any (tests, and the instant before `main` does).
+        pub fn unknown(node: NodeId) -> StartupFacts {
+            StartupFacts::with(
+                node,
+                Path::new(""),
+                crate::config::revision_of(None),
+                KeySource::File,
+                false,
+            )
+        }
+
+        fn with(
+            node: NodeId,
+            runtime_dir: &Path,
+            config_revision: String,
+            key_source: KeySource,
+            force_file_keystore: bool,
+        ) -> StartupFacts {
+            let started = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let pid = std::process::id();
+            StartupFacts {
+                instance_id: instance_id(node, pid, started.as_nanos()),
+                pid,
+                uid: rustix::process::geteuid().as_raw(),
+                exe: std::env::current_exe()
+                    .map(|exe| exe.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                runtime_dir: runtime_dir.to_string_lossy().into_owned(),
+                started_unix_ms: u64::try_from(started.as_millis()).unwrap_or(u64::MAX),
+                config_revision,
+                key_source,
+                force_file_keystore,
+            }
+        }
+    }
+
+    /// The id of one run of the agent: `xxh3_64` over the node id, the PID (little-endian) and the
+    /// start time in nanoseconds since the Unix epoch (little-endian, 128 bits). Computed once; it
+    /// never changes within a process.
+    fn instance_id(node: NodeId, pid: u32, start_ns: u128) -> u64 {
+        let mut bytes = Vec::with_capacity(32 + 4 + 16);
+        bytes.extend_from_slice(&node.0);
+        bytes.extend_from_slice(&pid.to_le_bytes());
+        bytes.extend_from_slice(&start_ns.to_le_bytes());
+        xxhash_rust::xxh3::xxh3_64(&bytes)
+    }
+
+    /// The E1 sessions this node has established right now: as the controller (the peer has
+    /// acknowledged and the capture is live, `Engine::control_established`) and as the target.
+    pub type Sessions = (Option<NodeId>, Option<NodeId>);
+
+    /// The peer, if any, whose key or button messages this input carries as E1 input: a controller
+    /// driving this node as its target. (A projection's input is E2's, and is never counted here.)
+    pub fn e1_input_peer(input: &Input) -> Option<NodeId> {
+        match input {
+            Input::Link(LinkEvent::Input { peer, msg })
+                if !matches!(msg, InputMessage::Proj(_)) =>
+            {
+                Some(*peer)
+            }
+            _ => None,
+        }
+    }
+
+    /// What one input did to one E1 role's session: the peer whose session ended and the peer
+    /// whose session started. `announced` is the peer a new session was announced to (or admitted
+    /// from) during this input: it tells an end followed by a start with the same peer, which
+    /// looks like no change in `before` and `after`.
+    fn session_edges(
+        before: Option<NodeId>,
+        after: Option<NodeId>,
+        announced: Option<NodeId>,
+    ) -> (Option<NodeId>, Option<NodeId>) {
+        let ended = before.filter(|b| after != Some(*b) || announced == Some(*b));
+        let started = after.filter(|a| before != Some(*a) || announced == Some(*a));
+        (ended, started)
+    }
+
+    /// The monotonic per-peer counters (never reset within an instance). The values that don't
+    /// live here: `e2_frames_presented` comes from the proxy stats (`media.rs`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct PeerCounters {
+        pub e1_controller_started: u64,
+        pub e1_controller_ended: u64,
+        pub e1_target_started: u64,
+        pub e1_target_ended: u64,
+        pub e1_injections_ok: u64,
+        pub e1_hud_shows: u64,
+        pub e1_chord_releases: u64,
+        pub e1_command_releases: u64,
+        pub e2_source_started: u64,
+        pub e2_source_returned: u64,
+        pub e2_dest_started: u64,
+        pub e2_dest_returned: u64,
+        pub e2_returns_failed: u64,
+    }
+
+    /// One backend as `status` lists it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Backend {
+        pub name: &'static str,
+        /// `ready`, `missing`, `blocked` or `failed`.
+        pub state: &'static str,
+        /// `None` when ready, else `not_supported`, `permission`, `construction_failed`,
+        /// `worker_exited`, `disabled` or `unknown`.
+        pub reason: Option<&'static str>,
+    }
+
+    fn up(name: &'static str) -> Backend {
+        Backend {
+            name,
+            state: "ready",
+            reason: None,
+        }
+    }
+
+    fn down(name: &'static str, state: &'static str, reason: &'static str) -> Backend {
+        Backend {
+            name,
+            state,
+            reason: Some(reason),
+        }
+    }
+
+    /// The backend list as last computed, and how many times it has differed from the one before.
+    #[derive(Debug, Default)]
+    struct BackendsSeen {
+        last: Option<Vec<Backend>>,
+        epoch: u64,
+    }
+
+    /// Everything the agent counts and remembers for `status.result.installer`.
+    pub struct Tracker {
+        pub counters: BTreeMap<NodeId, PeerCounters>,
+        /// Per peer: how many connections have been established this instance (monotonic, and
+        /// kept when the peer is forgotten, so that a re-pairing doesn't start over).
+        link_generation: BTreeMap<NodeId, u64>,
+        /// Tray "Settings…" actions whose process spawn succeeded.
+        pub settings_opened: u64,
+        /// How a Settings spawn is attempted (a seam: tests don't start a process).
+        pub spawn_settings: fn() -> std::io::Result<()>,
+        grants_epoch: u64,
+        layout_epoch: u64,
+        /// Set through `&self` (`status` is a read), hence the cell.
+        backends: RefCell<BackendsSeen>,
+        /// Live projections of this node's windows (capture started), with the peer each goes to.
+        sources: BTreeMap<ProjectionKey, NodeId>,
+        /// Projections of this node's windows that are parked but whose capture hasn't started:
+        /// what `ProjectionStarted` said, kept until the matching `CaptureStarted` succeeds.
+        pending_sources: BTreeMap<ProjectionKey, (NodeId, ParkingKind)>,
+        /// How the latest projection of this node's window to each peer is parked (`twin` or
+        /// `mirror`). Never reset, and absent until the first projection to that peer.
+        last_parking: BTreeMap<NodeId, &'static str>,
+        /// Open proxies of other nodes' windows.
+        proxies: BTreeSet<ProjectionKey>,
+        /// What the last `Restore` of this input's outputs came to (true: restored).
+        last_restore: Option<bool>,
+        /// Whether the last `CloseProxy` of this input's outputs was queued to the proxy host.
+        last_close: Option<bool>,
+        /// Tests only: stands in for sending the host its `Close` (there is no window host).
+        #[cfg(test)]
+        pub close_seam: Option<fn(u64) -> bool>,
+        /// The controller session this node had established before the input being handled.
+        established_before: Option<NodeId>,
+        /// Windows this instance parked and has not restored since: its journal entries still
+        /// unresolved. Entries an earlier run left behind are `startup_recovery`'s.
+        parked: BTreeSet<WindowId>,
+        /// Key and button injections that answer a controller's own message, with that peer.
+        e1_injects: BTreeMap<InjectId, NodeId>,
+        /// "Controlled from" shows the overlay host accepted and hasn't answered, the peer of
+        /// the latest, and whether more than one has been outstanding (an answer then can't be
+        /// told from another's: the overlay events carry only the shared indicator id).
+        indicator_pending: u32,
+        indicator_peer: Option<NodeId>,
+        indicator_ambiguous: bool,
+        /// When the indicator was last hidden. The host may still have transitions of that
+        /// earlier indicator queued (a `Visible` again after a move), carrying the same id, so a
+        /// show accepted within `INDICATOR_SETTLE` of it is answered ambiguously too.
+        pub(super) indicator_hidden_at: Option<Instant>,
+        /// Speaker sessions the engine has started and not stopped, either direction.
+        audio_sessions: BTreeSet<AudioKey>,
+        /// The engine's side of the I/O gate: closed from a panic until the re-arm.
+        pub engine_permits: bool,
+        pub audio_off: bool,
+        pub gpu_off: bool,
+        pub discovery_off: bool,
+        /// Why discovery isn't running, if it failed to start.
+        pub discovery_error: Option<&'static str>,
+    }
+
+    impl Tracker {
+        pub fn new() -> Tracker {
+            let off = |var: &str| std::env::var(var).as_deref() == Ok("0");
+            Tracker {
+                counters: BTreeMap::new(),
+                link_generation: BTreeMap::new(),
+                settings_opened: 0,
+                spawn_settings: open_settings_app,
+                grants_epoch: 0,
+                layout_epoch: 0,
+                backends: RefCell::new(BackendsSeen::default()),
+                sources: BTreeMap::new(),
+                pending_sources: BTreeMap::new(),
+                last_parking: BTreeMap::new(),
+                proxies: BTreeSet::new(),
+                last_restore: None,
+                last_close: None,
+                #[cfg(test)]
+                close_seam: None,
+                established_before: None,
+                parked: BTreeSet::new(),
+                e1_injects: BTreeMap::new(),
+                indicator_pending: 0,
+                indicator_peer: None,
+                indicator_ambiguous: false,
+                indicator_hidden_at: None,
+                audio_sessions: BTreeSet::new(),
+                engine_permits: true,
+                // The same switches the backends read (`platform.rs`, `start_discovery`).
+                audio_off: off("CROSSPANE_AUDIO"),
+                gpu_off: off("CROSSPANE_GPU"),
+                discovery_off: discovery_switched_off(
+                    std::env::var("CROSSPANE_DISCOVERY").ok().as_deref(),
+                ),
+                discovery_error: None,
+            }
+        }
+
+        fn counter(&mut self, peer: NodeId) -> &mut PeerCounters {
+            self.counters.entry(peer).or_default()
+        }
+
+        /// Trust or grants changed (an allow, a pairing, a forget, a revocation, a reload).
+        pub fn grants_changed(&mut self) {
+            self.grants_epoch = self.grants_epoch.saturating_add(1);
+        }
+
+        /// The placements or a display set changed.
+        pub fn layout_changed(&mut self) {
+            self.layout_epoch = self.layout_epoch.saturating_add(1);
+        }
+
+        /// A connection with `peer` was established.
+        pub fn link_established(&mut self, peer: NodeId) {
+            let generation = self.link_generation.entry(peer).or_insert(0);
+            *generation = generation.saturating_add(1);
+        }
+
+        /// The engine handled one input: count the E1 sessions it established and ended (a
+        /// handshake that is refused, times out or is released was never established, and counts
+        /// nothing), and note which of its injections answer a controller's own key and button
+        /// messages.
+        pub fn handled(
+            &mut self,
+            before: Sessions,
+            after: Sessions,
+            from_controller: Option<NodeId>,
+            outputs: &[Output],
+        ) {
+            // Restores and closes of an earlier input have nothing to do with the ends in this
+            // one's.
+            self.last_restore = None;
+            self.last_close = None;
+            self.established_before = before.0;
+            // An established controller session starts and ends in different inputs even with
+            // the same peer again (the new one is acknowledged later), so no announcement helps.
+            let (ended, started) = session_edges(before.0, after.0, None);
+            if let Some(peer) = ended {
+                self.counter(peer).e1_controller_ended += 1;
+            }
+            if let Some(peer) = started {
+                self.counter(peer).e1_controller_started += 1;
+            }
+            let admitted = outputs.iter().find_map(|output| match output {
+                Output::Notice(Notice::ControlledBy(peer)) => Some(*peer),
+                _ => None,
+            });
+            let (ended, started) = session_edges(before.1, after.1, admitted);
+            if let Some(peer) = ended {
+                self.counter(peer).e1_target_ended += 1;
+            }
+            if let Some(peer) = started {
+                self.counter(peer).e1_target_started += 1;
+            }
+            if let Some(peer) = from_controller {
+                for output in outputs {
+                    if let Output::Inject {
+                        id,
+                        cmd: InjectCmd::Key { .. } | InjectCmd::Button { .. },
+                    } = output
+                    {
+                        self.e1_injects.insert(*id, peer);
+                    }
+                }
+            }
+        }
+
+        /// The outputs of that input are carried out.
+        pub fn executed(&mut self) {
+            self.e1_injects.clear();
+        }
+
+        /// A key or button injection was carried out; counted for the controller whose message
+        /// it answers, and only if the injector reported success.
+        pub fn injected(&mut self, id: InjectId, ok: bool) {
+            if let Some(peer) = self.e1_injects.remove(&id)
+                && ok
+            {
+                self.counter(peer).e1_injections_ok += 1;
+            }
+        }
+
+        /// The overlay host accepted a "controlled from" show, while `peer` controlled this node.
+        /// A second one before the first is answered, or one soon after the indicator was
+        /// hidden, makes the next answer ambiguous: the events carry only the shared indicator
+        /// id, so an answer may be an earlier indicator's, and nobody is credited for it.
+        pub fn indicator_shown(&mut self, peer: Option<NodeId>, now: Instant) {
+            let settling = self
+                .indicator_hidden_at
+                .is_some_and(|hidden| now.saturating_duration_since(hidden) < INDICATOR_SETTLE);
+            if self.indicator_pending > 0 || settling {
+                self.indicator_ambiguous = true;
+            }
+            self.indicator_pending = self.indicator_pending.saturating_add(1);
+            self.indicator_peer = peer;
+        }
+
+        /// The overlay host answered for the indicator: on screen (`visible`) or not. Credited
+        /// to the peer of the show only when that show was the one outstanding; an answer with
+        /// none outstanding (the host says `Visible` again after a move) counts nothing.
+        pub fn indicator_answer(&mut self, visible: bool) {
+            let sole = self.indicator_pending == 1 && !self.indicator_ambiguous;
+            if visible
+                && sole
+                && let Some(peer) = self.indicator_peer
+            {
+                self.counter(peer).e1_hud_shows += 1;
+            }
+            self.indicator_pending = self.indicator_pending.saturating_sub(1);
+            if self.indicator_pending == 0 {
+                self.indicator_ambiguous = false;
+            }
+        }
+
+        /// The indicator was hidden: transitions of it may still be on their way.
+        pub fn indicator_hidden(&mut self, now: Instant) {
+            self.indicator_hidden_at = Some(now);
+        }
+
+        /// The engine ended a controller session by a release. Only a session this node had
+        /// established is counted: releasing a handshake that was never answered isn't.
+        pub fn released(&mut self, peer: NodeId, cause: ReleaseCause) {
+            if self.established_before != Some(peer) {
+                return;
+            }
+            match cause {
+                ReleaseCause::Chord => self.counter(peer).e1_chord_releases += 1,
+                ReleaseCause::Command => self.counter(peer).e1_command_releases += 1,
+            }
+        }
+
+        /// A window of this node was parked for a projection to `peer` (`ProjectionStarted`),
+        /// as `parking`. Nothing counts yet: the projection is live when its capture starts.
+        pub fn projection_parked(
+            &mut self,
+            key: ProjectionKey,
+            peer: NodeId,
+            parking: ParkingKind,
+        ) {
+            self.pending_sources.insert(key, (peer, parking));
+        }
+
+        /// The capture of this node's projection `projection` started: it is live now, so its
+        /// start and its parking kind count. (A projection that ends first, or whose capture
+        /// fails, never gets here: its pending facts are dropped when it ends.)
+        pub fn capture_started(&mut self, local: NodeId, projection: ProjectionId) {
+            let key = ProjectionKey {
+                source: local,
+                projection,
+            };
+            let Some((peer, parking)) = self.pending_sources.remove(&key) else {
+                return;
+            };
+            if self.sources.insert(key, peer).is_none() {
+                self.counter(peer).e2_source_started += 1;
+            }
+            // The Mac's virtual-display parking reports `Twin` too. A kind this agent doesn't
+            // know leaves the last one standing.
+            let kind = match parking {
+                ParkingKind::Twin => Some("twin"),
+                ParkingKind::Mirror => Some("mirror"),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                self.last_parking.insert(peer, kind);
+            }
+        }
+
+        /// A `CloseProxy` was carried out; `queued` says whether the proxy host was sent its
+        /// `Close` (the host doesn't acknowledge it).
+        pub fn proxy_closed(&mut self, queued: bool) {
+            self.last_close = Some(queued);
+        }
+
+        /// A proxy of `key`'s window opened on this node.
+        pub fn proxy_opened(&mut self, key: ProjectionKey) {
+            if self.proxies.insert(key) {
+                self.counter(key.source).e2_dest_started += 1;
+            }
+        }
+
+        /// A projection ended. A projection that never went live isn't counted at all.
+        ///
+        /// As the source: the window is back (the `Restore` just before the notice worked) and
+        /// that is a return, or it isn't and that is a failed return. When the window itself went
+        /// away (`WindowClosed`) nothing was returned and nothing failed: a restore of a window
+        /// that no longer exists succeeds without putting anything back.
+        ///
+        /// As the destination: a `Returned` end counts as returned when the proxy host was
+        /// queued its `Close` just before the notice, and as a failed return when it wasn't.
+        /// "Queued" is all that is known: the host doesn't say when the proxy is gone.
+        pub fn projection_ended(
+            &mut self,
+            local: NodeId,
+            key: ProjectionKey,
+            reason: ProjectionEndReason,
+        ) {
+            if key.source == local {
+                self.pending_sources.remove(&key);
+                let restored = self.last_restore.take() == Some(true);
+                if let Some(peer) = self.sources.remove(&key) {
+                    match reason {
+                        ProjectionEndReason::WindowClosed => {}
+                        _ if restored => self.counter(peer).e2_source_returned += 1,
+                        _ => self.counter(peer).e2_returns_failed += 1,
+                    }
+                }
+            } else if self.proxies.remove(&key) && reason == ProjectionEndReason::Returned {
+                if self.last_close.take() == Some(true) {
+                    self.counter(key.source).e2_dest_returned += 1;
+                } else {
+                    self.counter(key.source).e2_returns_failed += 1;
+                }
+            }
+        }
+
+        /// This node is about to park `window`: its journal entry exists from now on.
+        pub fn parking_started(&mut self, window: WindowId) {
+            self.parked.insert(window);
+        }
+
+        /// A `Restore` of `window` was carried out; `restored` says whether the window is back.
+        pub fn restored(&mut self, window: WindowId, restored: bool) {
+            self.last_restore = Some(restored);
+            if restored {
+                self.parked.remove(&window);
+            }
+        }
+
+        /// Keep the speaker sessions the engine has started.
+        pub fn audio_output(&mut self, output: &Output) {
+            match output {
+                Output::StartAudioStream {
+                    key,
+                    kind: AudioKind::Speaker,
+                    ..
+                } => {
+                    self.audio_sessions.insert(*key);
+                }
+                Output::StopAudioStream { key } => {
+                    self.audio_sessions.remove(key);
+                }
+                Output::RemoveAudioPeer { peer } => self.audio_sessions.retain(|k| k.peer != *peer),
+                _ => {}
+            }
+        }
+
+        fn audio_peers(&self) -> BTreeSet<NodeId> {
+            self.audio_sessions.iter().map(|key| key.peer).collect()
+        }
+
+        /// `recovery_pending`: this instance's parked-but-not-restored windows, that is the
+        /// parking-journal entries it created and has not resolved (a restore that failed leaves
+        /// its entry). Entries a previous run left behind are not counted here: whether the
+        /// startup recovery cleared them is `startup_recovery`'s.
+        fn recovery_pending(&self) -> u32 {
+            u32::try_from(self.parked.len()).unwrap_or(u32::MAX)
+        }
+    }
+
+    /// The tokens `status` uses for the permissions the installer cares about; `None` for any other.
+    fn permission_token(permission: Permission) -> Option<&'static str> {
+        match permission {
+            Permission::ScreenRecording => Some("screen_recording"),
+            Permission::Accessibility => Some("accessibility"),
+            Permission::InputMonitoring => Some("input_monitoring"),
+            Permission::Microphone => Some("microphone"),
+            _ => None,
+        }
+    }
+
+    fn state_token(state: PermissionState) -> &'static str {
+        match state {
+            PermissionState::Granted => "granted",
+            PermissionState::NotGranted => "not_granted",
+            PermissionState::Unknown => "unknown",
+        }
+    }
+
+    impl Agent {
+        /// The backends as they are now, in the order `status` lists them, and the epoch: how many
+        /// times the list has differed from the one before it. The list is computed here, on each
+        /// status request and on the housekeeping tick.
+        pub(super) fn backends_now(&self) -> (Vec<Backend>, u64) {
+            let now = self.backends();
+            let mut seen = self.tracker.backends.borrow_mut();
+            if seen.last.as_ref().is_some_and(|last| *last != now) {
+                seen.epoch = seen.epoch.saturating_add(1);
+            }
+            seen.last = Some(now.clone());
+            (now, seen.epoch)
+        }
+
+        /// What each backend is. `None` can't say why a backend is absent, so the reason is what
+        /// this OS makes likely: a backend it builds that isn't there failed to construct; one
+        /// it never builds is not supported; a permission this OS requires and hasn't been given
+        /// blocks every backend that needs it. (The I/O gate is reported in `gate`, not here.)
+        fn backends(&self) -> Vec<Backend> {
+            let p = &self.platform;
+            let t = &self.tracker;
+            let missing: Vec<Permission> = p
+                .permissions
+                .required()
+                .into_iter()
+                .filter(|&permission| p.permissions.state(permission) != PermissionState::Granted)
+                .collect();
+            let blocked = |needs: &[Permission]| needs.iter().any(|n| missing.contains(n));
+            // A backend this OS builds.
+            let built = |name, present: bool, needs: &[Permission]| {
+                if blocked(needs) {
+                    down(name, "blocked", "permission")
+                } else if present {
+                    up(name)
+                } else {
+                    down(name, "failed", "construction_failed")
+                }
+            };
+            // A backend only some OSes or compositors have.
+            let optional = |name, present: bool| {
+                if present {
+                    up(name)
+                } else {
+                    down(name, "missing", "not_supported")
+                }
+            };
+            // Where the identity came from: the OS key store, or the file.
+            let keystore = match (self.startup.key_source, self.startup.force_file_keystore) {
+                (KeySource::OsStore, _) => up("keystore"),
+                (KeySource::File, true) => down("keystore", "missing", "disabled"),
+                (KeySource::File, false) if p.keystore.is_none() => {
+                    down("keystore", "failed", "construction_failed")
+                }
+                (KeySource::File, false) => down("keystore", "failed", "unknown"),
+            };
+            let home = match (&p.home, self.home.fence) {
+                (None, _) => down("home", "missing", "not_supported"),
+                // A leftover release bind can't be confirmed gone: the home seat isn't usable.
+                (Some(_), true) => down("home", "failed", "unknown"),
+                (Some(_), false) => up("home"),
+            };
+            let gpu = match (p.gpu.is_some(), t.gpu_off) {
+                (true, _) => up("gpu"),
+                (false, true) => down("gpu", "missing", "disabled"),
+                (false, false) => down("gpu", "missing", "not_supported"),
+            };
+            let audio = if t.audio_off {
+                down("audio", "missing", "disabled")
+            } else {
+                built("audio", self.audio.is_some(), &[Permission::Microphone])
+            };
+            let discovery = match (self.discovery.is_some(), t.discovery_off, t.discovery_error) {
+                (true, _, _) => up("discovery"),
+                (false, true, _) => down("discovery", "missing", "disabled"),
+                (false, false, Some(_)) => down("discovery", "failed", "construction_failed"),
+                // Not started yet.
+                (false, false, None) => down("discovery", "failed", "unknown"),
+            };
+            use Permission::{Accessibility, InputMonitoring, ScreenRecording};
+            vec![
+                built(
+                    "capture",
+                    p.capture.is_some(),
+                    &[InputMonitoring, Accessibility],
+                ),
+                built("keys", p.keys.is_some(), &[Accessibility]),
+                built("pointer", p.pointer.is_some(), &[Accessibility]),
+                built("overlay", p.overlay.is_some(), &[]),
+                optional("hotkeys", p.hotkeys.is_some()),
+                keystore,
+                built("windows", p.windows.is_some(), &[Accessibility]),
+                built("parking", p.parking.is_some(), &[Accessibility]),
+                built("frames", p.frames.is_some(), &[ScreenRecording]),
+                built("tray", p.tray.is_some(), &[]),
+                built("links", p.links.is_some(), &[]),
+                gpu,
+                home,
+                audio,
+                discovery,
+            ]
+        }
+
+        /// `result.installer`, the whole of it (the frozen schema of WP-4.5).
+        pub(super) fn installer_status(&self) -> Value {
+            let t = &self.tracker;
+            let (backends, backends_epoch) = self.backends_now();
+            let session = self.platform.session.state();
+            let mut trusted: Vec<(NodeId, String, BTreeSet<Capability>)> =
+                self.trust.with(|trust| {
+                    trust
+                        .peers()
+                        .iter()
+                        .map(|e| (e.node, e.name.clone(), e.granted.clone()))
+                        .collect()
+                });
+            trusted.sort_by_key(|(node, _, _)| *node);
+            let peers: Vec<Value> = trusted
+                .into_iter()
+                .map(|(node, name, granted)| {
+                    let info = self.peers.get(&node);
+                    let grants: BTreeSet<&str> = granted
+                        .iter()
+                        .filter_map(|c| crate::ctl::capability_name(*c))
+                        .collect();
+                    let c = t.counters.get(&node).copied().unwrap_or_default();
+                    json!({
+                        "node": node.to_string(),
+                        "name": name,
+                        "connected": info.is_some_and(|i| i.connected),
+                        "link_generation": t.link_generation.get(&node),
+                        "features": info.map(|i| i.features.clone()).unwrap_or_default(),
+                        "grants_given": grants,
+                        "last_source_parking": t.last_parking.get(&node),
+                        "counters": {
+                            "e1_controller_started": c.e1_controller_started,
+                            "e1_controller_ended": c.e1_controller_ended,
+                            "e1_target_started": c.e1_target_started,
+                            "e1_target_ended": c.e1_target_ended,
+                            "e1_injections_ok": c.e1_injections_ok,
+                            "e1_hud_shows": c.e1_hud_shows,
+                            "e1_chord_releases": c.e1_chord_releases,
+                            "e1_command_releases": c.e1_command_releases,
+                            "e2_source_started": c.e2_source_started,
+                            "e2_source_returned": c.e2_source_returned,
+                            "e2_dest_started": c.e2_dest_started,
+                            "e2_dest_returned": c.e2_dest_returned,
+                            // Null until the renderer reports (WP-4.5a), never 0.
+                            "e2_frames_presented": self.proxy_ids.presented_from(node),
+                            "e2_returns_failed": c.e2_returns_failed,
+                        },
+                    })
+                })
+                .collect();
+            let permissions: Vec<Value> = self
+                .platform
+                .permissions
+                .required()
+                .into_iter()
+                .filter_map(|permission| {
+                    let name = permission_token(permission)?;
+                    let state = state_token(self.platform.permissions.state(permission));
+                    Some(json!({ "name": name, "state": state }))
+                })
+                .collect();
+            let stats = self
+                .audio
+                .as_ref()
+                .map(|audio| audio.stats())
+                .unwrap_or_default();
+            let mut features: Vec<&str> = Vec::new();
+            if cfg!(feature = "private-vdisplay") {
+                features.push("private-vdisplay");
+            }
+            if cfg!(feature = "video") {
+                features.push("video");
+            }
+            let lock = match session.lock {
+                LockState::Unlocked => "unlocked",
+                LockState::Locked => "locked",
+                LockState::Unknown => "unknown",
+            };
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "build": { "version": env!("CARGO_PKG_VERSION"), "features": features },
+                "instance": {
+                    "id": self.startup.instance_id,
+                    "pid": self.startup.pid,
+                    "uid": self.startup.uid,
+                    "exe": self.startup.exe,
+                    "runtime_dir": self.startup.runtime_dir,
+                    "started_unix_ms": self.startup.started_unix_ms,
+                },
+                "config_revision": self.startup.config_revision,
+                "node": self.node.to_string(),
+                "recovery_pending": t.recovery_pending(),
+                "startup_recovery": self.platform.startup_recovery.as_str(),
+                "gate": {
+                    "open": self.platform.gate.is_open(),
+                    "session": lock,
+                    "active": session.active,
+                    "armed": self.engine.armed(),
+                    "panic": !t.engine_permits,
+                },
+                "epochs": {
+                    "gate": self.platform.gate.epoch(),
+                    "grants": t.grants_epoch,
+                    "layout": t.layout_epoch,
+                    "backends": backends_epoch,
+                },
+                "backends": backends
+                    .iter()
+                    .map(|b| json!({ "name": b.name, "state": b.state, "reason": b.reason }))
+                    .collect::<Vec<_>>(),
+                "keystore": self.startup.key_source.as_str(),
+                "permissions": permissions,
+                "discovery": {
+                    "enabled": !t.discovery_off,
+                    "running": self.discovery.is_some(),
+                    "candidates": u32::try_from(self.candidates.len()).unwrap_or(u32::MAX),
+                    "error": t.discovery_error,
+                },
+                "tray": { "created": self.platform.tray.is_some() },
+                "audio": {
+                    "enabled": self.audio.is_some(),
+                    "active_peers": t.audio_peers().iter().map(NodeId::to_string).collect::<Vec<_>>(),
+                    "frames_sent": stats.sent,
+                    "frames_played": stats.played,
+                },
+                "settings_opened": t.settings_opened,
+                "peers": peers,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crosspane_types::hid::HidUsage;
+
+        use super::*;
+
+        const A: NodeId = NodeId([1; 32]);
+        const B: NodeId = NodeId([2; 32]);
+
+        #[test]
+        fn the_startup_facts_keep_the_revision_they_are_given_and_never_read_the_file_again() {
+            let nowhere = std::path::PathBuf::from("/nonexistent/crosspane-test");
+            let paths = Paths {
+                config_dir: nowhere.clone(),
+                state_dir: nowhere.clone(),
+                runtime_dir: nowhere,
+            };
+            let facts = StartupFacts::collect(
+                A,
+                &paths,
+                KeySource::OsStore,
+                &Config::default(),
+                "0123456789abcdef".to_owned(),
+            );
+            assert_eq!(facts.config_revision, "0123456789abcdef");
+            assert_eq!(facts.key_source, KeySource::OsStore);
+            // An agent nobody told anything has the zero revision: "no file".
+            assert_eq!(StartupFacts::unknown(A).config_revision, "0000000000000000");
+        }
+
+        #[test]
+        fn the_instance_id_depends_on_the_node_the_pid_and_the_start_time() {
+            let id = instance_id(A, 4242, 1_790_950_000_000_000_000);
+            assert_eq!(id, instance_id(A, 4242, 1_790_950_000_000_000_000));
+            assert_ne!(id, instance_id(B, 4242, 1_790_950_000_000_000_000));
+            assert_ne!(id, instance_id(A, 4243, 1_790_950_000_000_000_000));
+            assert_ne!(id, instance_id(A, 4242, 1_790_950_000_000_000_001));
+        }
+
+        #[test]
+        fn a_session_that_ends_and_starts_with_the_same_peer_is_both() {
+            // (before, after, announced) → (ended, started)
+            let cases = [
+                ((None, Some(A), None), (None, Some(A))),
+                ((Some(A), None, None), (Some(A), None)),
+                // Nothing changed: no end, no start.
+                ((Some(A), Some(A), None), (None, None)),
+                ((None, None, None), (None, None)),
+                // The same peer again: a new session announced while one was running.
+                ((Some(A), Some(A), Some(A)), (Some(A), Some(A))),
+                // Another peer replaces it.
+                ((Some(A), Some(B), Some(B)), (Some(A), Some(B))),
+                // Announced and gone again within the input: nothing was established.
+                ((None, None, Some(A)), (None, None)),
+            ];
+            for ((before, after, announced), expected) in cases {
+                assert_eq!(
+                    session_edges(before, after, announced),
+                    expected,
+                    "{before:?} -> {after:?}, announced {announced:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn only_a_controllers_own_messages_are_e1_input() {
+            use crosspane_protocol::projection::ProjInput;
+            let key = HidUsage::keyboard(4);
+            let e1 = |msg| Input::Link(LinkEvent::Input { peer: A, msg });
+            let session = crosspane_types::id::SessionId(1);
+            assert_eq!(
+                e1_input_peer(&e1(InputMessage::Key {
+                    session,
+                    seq: 1,
+                    usage: key,
+                    down: true
+                })),
+                Some(A)
+            );
+            assert_eq!(
+                e1_input_peer(&e1(InputMessage::Proj(ProjInput::Key {
+                    projection: ProjectionId(1),
+                    seq: 1,
+                    usage: key,
+                    down: true
+                }))),
+                None
+            );
+            assert_eq!(e1_input_peer(&Input::Tick), None);
+        }
+    }
+}
+
+pub use installer::StartupFacts;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4221,6 +5245,7 @@ mod audio_tests {
             links: None,
             gpu: None,
             home: None,
+            startup_recovery: crate::platform::StartupRecovery::None,
         };
         let e2 = E2Wiring {
             source_media: source_tx,
@@ -7750,5 +8775,1936 @@ mod home_tests {
                 ..
             }
         )));
+    }
+
+    // ---- status.result.installer (WP-4.5) ----
+
+    use crosspane_engine::io::ReleaseCause;
+
+    /// `result.installer`, as `crosspanectl status` shows it.
+    fn status_installer(h: &Home) -> Value {
+        h.rig.agent.status()["installer"].clone()
+    }
+
+    /// The paired peer's counters that aren't zero or unreported.
+    fn nonzero(h: &Home) -> Value {
+        let counters = status_installer(h)["peers"][0]["counters"].clone();
+        Value::Object(
+            counters
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v.as_u64().is_some_and(|n| n > 0))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+    }
+
+    fn epoch(h: &Home, which: &str) -> u64 {
+        status_installer(h)["epochs"][which].as_u64().unwrap()
+    }
+
+    /// The status with this run's own ids replaced, so two runs can be compared.
+    fn anonymous(h: &Home) -> Value {
+        let mut status = status_installer(h);
+        status["instance"] = json!("<instance>");
+        let text = status
+            .to_string()
+            .replace(&h.rig.local.to_string(), "<local>")
+            .replace(&h.rig.peer.to_string(), "<peer>");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// An injector that refuses every key.
+    struct FailingKeys;
+
+    impl KeyInjector for FailingKeys {
+        fn key(&mut self, _usage: HidUsage, _down: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Backend(
+                "fixture: the injector refuses".into(),
+            ))
+        }
+
+        fn lock_keys(&self) -> Result<LockKeys, PlatformError> {
+            Ok(LockKeys::default())
+        }
+
+        fn set_lock_keys(&mut self, _wanted: LockKeys) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn recover_keys(&mut self, _keys: &[HidUsage]) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    /// Parking that parks as `kind`, and whose `restore` fails when told to.
+    struct Parking {
+        kind: crosspane_platform::ParkingKind,
+        restore_fails: bool,
+    }
+
+    impl crosspane_platform::WindowParking for Parking {
+        fn park(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            let mut parked =
+                crosspane_platform::WindowParking::park(&mut FakeParking, window, size, scale)?;
+            parked.kind = self.kind;
+            Ok(parked)
+        }
+        fn resize(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            self.park(window, size, scale)
+        }
+        fn geometry(&self, _window: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn restore(&mut self, _window: WindowId) -> Result<(), PlatformError> {
+            if self.restore_fails {
+                Err(PlatformError::Backend(
+                    "fixture: the window won't come back".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The Mac's four permissions, each granted or not (what is in the list is granted).
+    struct MacLike(Arc<Mutex<Vec<Permission>>>);
+
+    impl crosspane_platform::Permissions for MacLike {
+        fn required(&self) -> Vec<Permission> {
+            vec![
+                Permission::ScreenRecording,
+                Permission::Accessibility,
+                Permission::InputMonitoring,
+                Permission::Microphone,
+            ]
+        }
+
+        fn state(&self, permission: Permission) -> PermissionState {
+            if self.0.lock().unwrap().contains(&permission) {
+                PermissionState::Granted
+            } else {
+                PermissionState::NotGranted
+            }
+        }
+
+        fn request(&mut self, _permission: Permission) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn subscribe(
+            &mut self,
+            _sink: Arc<dyn EventSink<(Permission, PermissionState)>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    /// A session whose state the test sets.
+    struct VarSession(Arc<Mutex<crosspane_platform::SessionState>>);
+
+    impl crosspane_platform::SessionEvents for VarSession {
+        fn state(&self) -> crosspane_platform::SessionState {
+            *self.0.lock().unwrap()
+        }
+
+        fn subscribe(
+            &mut self,
+            _sink: Arc<dyn EventSink<crosspane_platform::SessionEvent>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    struct FakeTray;
+
+    impl crosspane_platform::TrayHost for FakeTray {
+        fn subscribe(
+            &mut self,
+            _sink: Arc<dyn EventSink<crosspane_platform::TrayEvent>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn set(&mut self, _menu: &crosspane_platform::TrayMenu) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    /// An audio worker that reports the counters it is given.
+    struct StatsPlane(WorkerStats);
+
+    impl AudioPlane for StatsPlane {
+        fn submit(&self, _output: Output) {}
+        fn packet(&self, _peer: NodeId, _packet: AudioPacket) {}
+        fn cancel_peer(&self, _peer: NodeId) {}
+        fn stats(&self) -> WorkerStats {
+            self.0
+        }
+        fn shutdown(self: Box<Self>) {}
+    }
+
+    /// An overlay host that accepts every show (the outcome events are the test's to send).
+    struct AcceptingOverlay;
+
+    impl OverlayHost for AcceptingOverlay {
+        fn subscribe(
+            &mut self,
+            _sink: Arc<dyn EventSink<crosspane_platform::OverlayEvent>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn show(&mut self, _id: OverlayId, _overlay: &Overlay) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn hide(&mut self, _id: OverlayId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    /// The start of an E1 session to this node from `peer` (any node the engine grants input).
+    fn start_control(
+        h: &mut Home,
+        peer: NodeId,
+        session: crosspane_types::id::SessionId,
+    ) -> Vec<Output> {
+        step(
+            h,
+            control_input(
+                peer,
+                ControlMessage::StartControl {
+                    session,
+                    entry_display: DisplayId(1),
+                    entry: PointDevice::new(1.0, 1.0),
+                    lock_keys: LockKeys::default(),
+                },
+            ),
+        )
+    }
+
+    /// This node controlled by the paired peer (E1 target), as session 77.
+    fn controlled() -> (Home, crosspane_types::id::SessionId) {
+        let mut h = bare_scenario();
+        h.rig.agent.platform.overlay = Some(Box::new(AcceptingOverlay));
+        let (peer, session) = (h.rig.peer, crosspane_types::id::SessionId(77));
+        let out = start_control(&mut h, peer, session);
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::Notice(Notice::ControlledBy(p)) if *p == peer)),
+            "{out:?}"
+        );
+        (h, session)
+    }
+
+    /// The controller's message for one key (or button) change.
+    fn from_controller(h: &mut Home, session: crosspane_types::id::SessionId, msg: InputMessageOf) {
+        let peer = h.rig.peer;
+        step(
+            h,
+            Input::Link(LinkEvent::Input {
+                peer,
+                msg: msg(session),
+            }),
+        );
+    }
+
+    type InputMessageOf =
+        Box<dyn FnOnce(crosspane_types::id::SessionId) -> crosspane_protocol::msg::InputMessage>;
+
+    fn key_msg(usage: u16, down: bool, seq: u32) -> InputMessageOf {
+        Box::new(move |session| crosspane_protocol::msg::InputMessage::Key {
+            session,
+            seq,
+            usage: HidUsage::keyboard(usage),
+            down,
+        })
+    }
+
+    fn button_msg(down: bool, seq: u32) -> InputMessageOf {
+        Box::new(
+            move |session| crosspane_protocol::msg::InputMessage::Button {
+                session,
+                seq,
+                button: MouseButton::PRIMARY,
+                down,
+            },
+        )
+    }
+
+    /// This node projects its window 10 to the paired peer, who accepts: projection `id` goes live.
+    fn project(h: &mut Home, id: u64) {
+        let peer = h.rig.peer;
+        step(
+            h,
+            Input::Command(Command::Project {
+                window: WindowId(10),
+                to: peer,
+            }),
+        );
+        step(
+            h,
+            projection_input(
+                peer,
+                ProjectionMessage::Accepted {
+                    projection: ProjectionId(id),
+                    size: PixelSize::new(400, 300),
+                    scale: 1.0,
+                },
+            ),
+        );
+    }
+
+    /// Return this node's own projection `id`.
+    fn give_back(h: &mut Home, id: u64) {
+        let key = ProjectionKey {
+            source: h.rig.local,
+            projection: ProjectionId(id),
+        };
+        step(h, Input::Command(Command::Return(key)));
+    }
+
+    #[test]
+    fn the_installer_status_has_the_frozen_shape() {
+        let mut h = home();
+        // What the environment would otherwise decide.
+        h.rig.agent.tracker.audio_off = false;
+        h.rig.agent.tracker.gpu_off = false;
+        h.rig.agent.tracker.discovery_off = false;
+        // The legacy status keeps every field it had; `installer` is the one addition.
+        let status = h.rig.agent.status();
+        for field in [
+            "node",
+            "name",
+            "listening",
+            "gate_open",
+            "armed",
+            "controlling",
+            "controlled_by",
+            "session",
+            "backends",
+            "permissions",
+            "displays",
+            "peers",
+            "audio",
+            "home",
+            "layout",
+            "notices",
+            "projections",
+            "uptime_s",
+        ] {
+            assert!(status.get(field).is_some(), "{field}");
+        }
+        assert!(
+            status["backends"].is_string(),
+            "the legacy `backends` is still one line of text"
+        );
+        let instance = status_installer(&h)["instance"].clone();
+        let mut names: Vec<_> = instance.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["exe", "id", "pid", "runtime_dir", "started_unix_ms", "uid"]
+        );
+        assert_eq!(instance["pid"], json!(std::process::id()));
+        assert_eq!(instance["uid"], json!(rustix::process::geteuid().as_raw()));
+        assert!(instance["id"].is_u64());
+        assert!(instance["started_unix_ms"].as_u64().unwrap() > 1_700_000_000_000);
+        assert!(instance["exe"].is_string() && instance["runtime_dir"].is_string());
+        let features: Vec<&str> = [
+            ("private-vdisplay", cfg!(feature = "private-vdisplay")),
+            ("video", cfg!(feature = "video")),
+        ]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| name)
+        .collect();
+        let zeros = json!({
+            "e1_controller_started": 0, "e1_controller_ended": 0,
+            "e1_target_started": 0, "e1_target_ended": 0,
+            "e1_injections_ok": 0, "e1_hud_shows": 0,
+            "e1_chord_releases": 0, "e1_command_releases": 0,
+            "e2_source_started": 0, "e2_source_returned": 0,
+            "e2_dest_started": 0, "e2_dest_returned": 0,
+            "e2_frames_presented": null,
+            "e2_returns_failed": 0,
+        });
+        let missing = |name: &str, reason: &str| json!({ "name": name, "state": "missing", "reason": reason });
+        let failed =
+            |name: &str, reason: &str| json!({ "name": name, "state": "failed", "reason": reason });
+        let ready = |name: &str| json!({ "name": name, "state": "ready", "reason": null });
+        assert_eq!(
+            anonymous(&h),
+            json!({
+                "schema_version": 1,
+                "build": { "version": env!("CARGO_PKG_VERSION"), "features": features },
+                "instance": "<instance>",
+                "config_revision": "0000000000000000",
+                "node": "<local>",
+                "recovery_pending": 0,
+                "startup_recovery": "none",
+                "gate": {
+                    "open": true, "session": "unlocked", "active": true,
+                    "armed": true, "panic": false
+                },
+                "epochs": { "gate": 2, "grants": 0, "layout": 0, "backends": 0 },
+                "backends": [
+                    ready("capture"),
+                    ready("keys"),
+                    ready("pointer"),
+                    failed("overlay", "construction_failed"),
+                    missing("hotkeys", "not_supported"),
+                    failed("keystore", "construction_failed"),
+                    failed("windows", "construction_failed"),
+                    failed("parking", "construction_failed"),
+                    failed("frames", "construction_failed"),
+                    failed("tray", "construction_failed"),
+                    failed("links", "construction_failed"),
+                    missing("gpu", "not_supported"),
+                    ready("home"),
+                    failed("audio", "construction_failed"),
+                    failed("discovery", "unknown"),
+                ],
+                "keystore": "file",
+                "permissions": [],
+                "discovery": { "enabled": true, "running": false, "candidates": 0, "error": null },
+                "tray": { "created": false },
+                "audio": { "enabled": false, "active_peers": [], "frames_sent": 0, "frames_played": 0 },
+                "settings_opened": 0,
+                "peers": [{
+                    "node": "<peer>",
+                    "name": "peer-name",
+                    "connected": false,
+                    "link_generation": null,
+                    "features": [],
+                    "grants_given": ["present", "share"],
+                    "last_source_parking": null,
+                    "counters": zeros,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn backend_states_and_reasons_are_the_bounded_vocabulary_in_the_frozen_order() {
+        let granted = Arc::new(Mutex::new(Vec::new()));
+        let mut h = home();
+        h.rig.agent.platform.permissions = Box::new(MacLike(granted.clone()));
+        h.rig.agent.platform.tray = Some(Box::new(FakeTray));
+        let listed = |h: &Home| -> Vec<(String, String, Option<String>)> {
+            status_installer(h)["backends"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    (
+                        b["name"].as_str().unwrap().to_owned(),
+                        b["state"].as_str().unwrap().to_owned(),
+                        b["reason"].as_str().map(str::to_owned),
+                    )
+                })
+                .collect()
+        };
+        let by_name = |list: &[(String, String, Option<String>)], name: &str| {
+            let (_, state, reason) = list.iter().find(|(n, _, _)| n == name).unwrap().clone();
+            (state, reason)
+        };
+        let list = listed(&h);
+        let names: Vec<&str> = list.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "capture",
+                "keys",
+                "pointer",
+                "overlay",
+                "hotkeys",
+                "keystore",
+                "windows",
+                "parking",
+                "frames",
+                "tray",
+                "links",
+                "gpu",
+                "home",
+                "audio",
+                "discovery"
+            ]
+        );
+        for (name, state, reason) in &list {
+            assert!(
+                ["ready", "missing", "blocked", "failed"].contains(&state.as_str()),
+                "{name}"
+            );
+            match reason {
+                None => assert_eq!(state, "ready", "{name}: only a ready backend has no reason"),
+                Some(reason) => {
+                    assert_ne!(state, "ready", "{name}");
+                    assert!(
+                        [
+                            "not_supported",
+                            "permission",
+                            "construction_failed",
+                            "worker_exited",
+                            "disabled",
+                            "unknown"
+                        ]
+                        .contains(&reason.as_str()),
+                        "{name}: {reason}"
+                    );
+                }
+            }
+        }
+        // Nothing the Mac needs is granted: what needs a permission is blocked on it, whether or
+        // not the backend exists; what needs none is as it was.
+        let blocked = || (String::from("blocked"), Some(String::from("permission")));
+        for name in [
+            "capture", "keys", "pointer", "windows", "parking", "frames", "audio",
+        ] {
+            assert_eq!(by_name(&list, name), blocked(), "{name}");
+        }
+        assert_eq!(by_name(&list, "tray"), ("ready".into(), None));
+        assert_eq!(by_name(&list, "home"), ("ready".into(), None));
+        // Granting is a change of the list, so the epoch moves (once, however often it is read).
+        let before = epoch(&h, "backends");
+        granted.lock().unwrap().extend([
+            Permission::InputMonitoring,
+            Permission::Accessibility,
+            Permission::ScreenRecording,
+            Permission::Microphone,
+        ]);
+        h.rig.agent.housekeeping();
+        let list = listed(&h);
+        assert_eq!(epoch(&h, "backends"), before + 1);
+        assert_eq!(epoch(&h, "backends"), before + 1);
+        assert_eq!(by_name(&list, "capture"), ("ready".into(), None));
+        // Built, but not there: failed. Not granted by anyone: not the reason.
+        assert_eq!(
+            by_name(&list, "frames"),
+            ("failed".into(), Some("construction_failed".into()))
+        );
+        assert_eq!(
+            by_name(&list, "audio"),
+            ("failed".into(), Some("construction_failed".into()))
+        );
+        // The permissions the Mac reports, by their frozen tokens.
+        assert_eq!(
+            status_installer(&h)["permissions"],
+            json!([
+                { "name": "screen_recording", "state": "granted" },
+                { "name": "accessibility", "state": "granted" },
+                { "name": "input_monitoring", "state": "granted" },
+                { "name": "microphone", "state": "granted" },
+            ])
+        );
+        granted
+            .lock()
+            .unwrap()
+            .retain(|p| *p != Permission::Microphone);
+        assert_eq!(
+            status_installer(&h)["permissions"][3],
+            json!({ "name": "microphone", "state": "not_granted" })
+        );
+    }
+
+    #[test]
+    fn what_is_switched_off_or_unavailable_says_why() {
+        let mut h = home();
+        let state = |h: &Home, name: &str| -> (String, Value) {
+            let list = status_installer(h)["backends"].clone();
+            let b = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["name"] == name)
+                .unwrap()
+                .clone();
+            (b["state"].as_str().unwrap().to_owned(), b["reason"].clone())
+        };
+        let t = &mut h.rig.agent.tracker;
+        (t.audio_off, t.gpu_off, t.discovery_off) = (true, true, true);
+        for name in ["audio", "gpu", "discovery"] {
+            assert_eq!(
+                state(&h, name),
+                ("missing".into(), json!("disabled")),
+                "{name}"
+            );
+        }
+        assert_eq!(status_installer(&h)["discovery"]["enabled"], json!(false));
+        let t = &mut h.rig.agent.tracker;
+        (t.audio_off, t.gpu_off, t.discovery_off) = (false, false, false);
+        // Discovery that tried and could not start.
+        h.rig.agent.tracker.discovery_error = Some("daemon_failed");
+        assert_eq!(
+            state(&h, "discovery"),
+            ("failed".into(), json!("construction_failed"))
+        );
+        let discovery = status_installer(&h)["discovery"].clone();
+        assert_eq!(
+            discovery,
+            json!({ "enabled": true, "running": false, "candidates": 0, "error": "daemon_failed" })
+        );
+        // The key file standing in for the OS store: forced by config, or not.
+        let source = |h: &mut Home, file: bool, forced: bool| {
+            h.rig.agent.startup.key_source = if file {
+                crate::keys::KeySource::File
+            } else {
+                crate::keys::KeySource::OsStore
+            };
+            h.rig.agent.startup.force_file_keystore = forced;
+        };
+        source(&mut h, false, false);
+        assert_eq!(state(&h, "keystore"), ("ready".into(), Value::Null));
+        assert_eq!(status_installer(&h)["keystore"], json!("os_store"));
+        source(&mut h, true, true);
+        assert_eq!(state(&h, "keystore"), ("missing".into(), json!("disabled")));
+        assert_eq!(status_installer(&h)["keystore"], json!("file"));
+        source(&mut h, true, false);
+        assert_eq!(
+            state(&h, "keystore"),
+            ("failed".into(), json!("construction_failed"))
+        );
+        // A leftover release bind that can't be confirmed gone: the home seat is not usable.
+        h.rig.agent.home.fence = true;
+        assert_eq!(state(&h, "home"), ("failed".into(), json!("unknown")));
+        // A tray that exists.
+        h.rig.agent.platform.tray = Some(Box::new(FakeTray));
+        assert_eq!(status_installer(&h)["tray"], json!({ "created": true }));
+        assert_eq!(state(&h, "tray"), ("ready".into(), Value::Null));
+    }
+
+    #[test]
+    fn the_gate_section_follows_the_session_a_panic_and_a_re_arm() {
+        let mut h = bare_scenario();
+        let gate = |h: &Home| status_installer(h)["gate"].clone();
+        assert_eq!(
+            gate(&h),
+            json!({ "open": true, "session": "unlocked", "active": true, "armed": true, "panic": false })
+        );
+        let seen = epoch(&h, "gate");
+        step(&mut h, Input::Command(Command::Panic));
+        assert_eq!(
+            gate(&h),
+            json!({ "open": false, "session": "unlocked", "active": true, "armed": false, "panic": true })
+        );
+        step(&mut h, Input::Command(Command::Rearm));
+        assert_eq!(
+            gate(&h),
+            json!({ "open": true, "session": "unlocked", "active": true, "armed": true, "panic": false })
+        );
+        // The gate is open before and after, but it was shut in between: the epoch says so.
+        assert_eq!(epoch(&h, "gate"), seen + 2);
+        // The session's own report: locked, unknown, or inactive.
+        let session = Arc::new(Mutex::new(crosspane_platform::SessionState {
+            lock: crosspane_platform::LockState::Locked,
+            active: None,
+        }));
+        h.rig.agent.platform.session = Box::new(VarSession(session.clone()));
+        assert_eq!(gate(&h)["session"], json!("locked"));
+        assert_eq!(gate(&h)["active"], Value::Null);
+        *session.lock().unwrap() = crosspane_platform::SessionState {
+            lock: crosspane_platform::LockState::Unknown,
+            active: Some(false),
+        };
+        assert_eq!(gate(&h)["session"], json!("unknown"));
+        assert_eq!(gate(&h)["active"], json!(false));
+    }
+
+    #[test]
+    fn controller_sessions_are_counted_and_the_way_each_was_released_is_named() {
+        let mut h = bare_scenario();
+        assert_eq!(nonzero(&h), json!({}));
+        // 1. The release command.
+        cross_scenario(&mut h);
+        assert_eq!(nonzero(&h), json!({ "e1_controller_started": 1 }));
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        let after_command = json!({
+            "e1_controller_started": 1, "e1_controller_ended": 1, "e1_command_releases": 1
+        });
+        assert_eq!(nonzero(&h), after_command);
+        // A release with no session ends nothing, and says nothing.
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert_eq!(nonzero(&h), after_command);
+        // 2. The chord, as the capture reports it (a release disarms crossing: re-arm to cross).
+        step(&mut h, Input::Command(Command::Rearm));
+        cross_scenario(&mut h);
+        for usage in [0xE0, 0xE1, 0xE2, 0x29] {
+            captured_key(&mut h, usage, true);
+        }
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        for usage in [0x29, 0xE2, 0xE1, 0xE0] {
+            captured_key(&mut h, usage, false);
+        }
+        assert_eq!(
+            nonzero(&h),
+            json!({
+                "e1_controller_started": 2, "e1_controller_ended": 2,
+                "e1_command_releases": 1, "e1_chord_releases": 1
+            })
+        );
+        // 3. The platform's own report of the chord.
+        step(&mut h, Input::Command(Command::Rearm));
+        cross_scenario(&mut h);
+        let at = h.rig.agent.test_now.unwrap();
+        step(
+            &mut h,
+            Input::Hotkey(crosspane_platform::HotkeyEvent::Pressed { at }),
+        );
+        step(
+            &mut h,
+            Input::Hotkey(crosspane_platform::HotkeyEvent::Released { at }),
+        );
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        assert_eq!(
+            nonzero(&h),
+            json!({
+                "e1_controller_started": 3, "e1_controller_ended": 3,
+                "e1_command_releases": 1, "e1_chord_releases": 2
+            })
+        );
+        // 4. An end that is no release: the end counter moves, neither release counter does.
+        step(&mut h, Input::Command(Command::Rearm));
+        cross_scenario(&mut h);
+        let peer = h.rig.peer;
+        h.rig.agent.on_link(LinkEvent::Closed {
+            peer,
+            error: crosspane_protocol::link::LinkError::Closed,
+        });
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        assert_eq!(
+            nonzero(&h),
+            json!({
+                "e1_controller_started": 4, "e1_controller_ended": 4,
+                "e1_command_releases": 1, "e1_chord_releases": 2
+            })
+        );
+        // The legacy fields agree: nothing is left controlling. And the release notice is
+        // counted, not shown: the notice history has no line for it.
+        assert_eq!(h.rig.agent.status()["controlling"], Value::Null);
+        assert!(
+            !h.rig
+                .agent
+                .notices
+                .iter()
+                .any(|line| line.contains("ControlReleased")),
+            "{:?}",
+            h.rig.agent.notices
+        );
+    }
+
+    /// A crossing to the paired peer whose `StartControl` is out and unanswered: the session id.
+    fn handshake(h: &mut Home) -> crosspane_types::id::SessionId {
+        let portal = h
+            .rig
+            .agent
+            .emitted
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Output::SetPortals(ps) => {
+                    ps.iter().find(|p| p.display == DisplayId(1)).map(|p| p.id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let at = h.rig.agent.test_now.unwrap();
+        step(
+            h,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal,
+                position: 0.5,
+                at,
+            }),
+        );
+        let out = step(
+            h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::HUD,
+            )),
+        );
+        let session = out
+            .iter()
+            .find_map(|o| match o {
+                Output::SendControl {
+                    msg: ControlMessage::StartControl { session, .. },
+                    ..
+                } => Some(*session),
+                _ => None,
+            })
+            .unwrap();
+        // The legacy `controlling` already names the peer; the session isn't established yet.
+        assert_eq!(h.rig.agent.engine.controlling(), Some(h.rig.peer));
+        assert_eq!(h.rig.agent.engine.control_established(), None);
+        session
+    }
+
+    #[test]
+    fn a_controller_handshake_that_is_never_established_counts_nothing() {
+        let peer = |h: &Home| h.rig.peer;
+        // The target refuses it.
+        let mut h = bare_scenario();
+        let session = handshake(&mut h);
+        let p = peer(&h);
+        step(
+            &mut h,
+            control_input(
+                p,
+                ControlMessage::ControlRefused {
+                    session,
+                    reason: Refusal::Busy,
+                },
+            ),
+        );
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        assert_eq!(nonzero(&h), json!({}));
+        // It is never answered.
+        let mut h = bare_scenario();
+        handshake(&mut h);
+        tick(&mut h, 1_500);
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        assert_eq!(nonzero(&h), json!({}));
+        // It is released: by the command, and by the chord (as the platform reports it).
+        let mut h = bare_scenario();
+        handshake(&mut h);
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        assert_eq!(nonzero(&h), json!({}));
+        let mut h = bare_scenario();
+        handshake(&mut h);
+        let at = h.rig.agent.test_now.unwrap();
+        step(
+            &mut h,
+            Input::Hotkey(crosspane_platform::HotkeyEvent::Pressed { at }),
+        );
+        step(
+            &mut h,
+            Input::Hotkey(crosspane_platform::HotkeyEvent::Released { at }),
+        );
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        assert_eq!(nonzero(&h), json!({}));
+        // A session that is established afterwards counts, once.
+        step(&mut h, Input::Command(Command::Rearm));
+        cross_scenario(&mut h);
+        assert_eq!(nonzero(&h), json!({ "e1_controller_started": 1 }));
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert_eq!(
+            nonzero(&h),
+            json!({
+                "e1_controller_started": 1, "e1_controller_ended": 1, "e1_command_releases": 1
+            })
+        );
+    }
+
+    /// Both release paths that buffer the chord during a home exit's capture activation: each ends
+    /// the session once, as a chord release, and nothing later adds a second.
+    fn chord_events() -> Vec<CaptureEvent> {
+        [0xE0, 0xE1, 0xE2, 0x29]
+            .into_iter()
+            .map(|usage| CaptureEvent::Key {
+                usage: HidUsage::keyboard(usage),
+                down: true,
+                at: at(),
+            })
+            .collect()
+    }
+
+    fn controller_releases(h: &Home) -> Vec<(NodeId, ReleaseCause)> {
+        h.rig
+            .agent
+            .emitted
+            .iter()
+            .filter_map(|o| match o {
+                Output::Notice(Notice::ControlReleased { peer, cause }) => Some((*peer, *cause)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// After the release: the rest of the chord's keys come in, and the platform's own pair.
+    fn late_chord_and_hotkey(h: &mut Home) {
+        for usage in [0xE0, 0xE1, 0xE2, 0x29] {
+            captured_key(h, usage, true);
+        }
+        let at = h.rig.agent.test_now.unwrap();
+        step(
+            h,
+            Input::Hotkey(crosspane_platform::HotkeyEvent::Pressed { at }),
+        );
+        step(
+            h,
+            Input::Hotkey(crosspane_platform::HotkeyEvent::Released { at }),
+        );
+        for usage in [0x29, 0xE2, 0xE1, 0xE0] {
+            captured_key(h, usage, false);
+        }
+    }
+
+    #[test]
+    fn a_chord_buffered_while_a_home_exit_activates_is_one_chord_release() {
+        // `exit_activated`: the exit capture's snapshot has the modifiers held, and the chord's
+        // key arrives during the activation (buffered, then reconciled when it is effective).
+        let mut h = home_scenario();
+        h.capture.lock().unwrap().start = Some(CaptureStart {
+            held_keys: [0xE0, 0xE1, 0xE2]
+                .into_iter()
+                .map(HidUsage::keyboard)
+                .collect(),
+            lock_keys: LockKeys::default(),
+        });
+        h.capture.lock().unwrap().during_begin = vec![CaptureEvent::Key {
+            usage: HidUsage::keyboard(0x29),
+            down: true,
+            at: at(),
+        }];
+        exit_home(&mut h);
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        let peer = h.rig.peer;
+        assert_eq!(controller_releases(&h), [(peer, ReleaseCause::Chord)]);
+        late_chord_and_hotkey(&mut h);
+        assert_eq!(controller_releases(&h), [(peer, ReleaseCause::Chord)]);
+        assert_eq!(
+            nonzero(&h),
+            json!({
+                "e1_controller_started": 1, "e1_controller_ended": 1, "e1_chord_releases": 1,
+                "e2_source_started": 1
+            })
+        );
+        assert!(h.held.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_chord_buffered_until_a_home_exit_is_cancelled_is_one_chord_release() {
+        // `cancel_exit`: the chord arrived during the activation, and the activation never
+        // finished before its deadline, so the buffered keys are what the cancel finds.
+        let mut h = home_scenario();
+        h.capture.lock().unwrap().during_begin = chord_events();
+        let edge_at = h.rig.agent.test_now.unwrap();
+        step(
+            &mut h,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal: PortalId((1 << 30) + 1),
+                position: 0.5,
+                at: edge_at,
+            }),
+        );
+        h.rig
+            .agent
+            .feed(Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::HUD,
+            )));
+        // The exit capture's events are the engine's to see; its answer is held back.
+        let mut answer = None;
+        while let Ok(event) = h.rig.events.try_recv() {
+            if matches!(event, Event::Input(Input::CaptureBegun { .. })) {
+                answer = Some(event);
+            } else {
+                h.rig.agent.on_event(event);
+            }
+        }
+        let answer = answer.expect("the capture was begun");
+        let peer = h.rig.peer;
+        assert_eq!(h.rig.agent.engine.controlling(), Some(peer));
+        assert!(controller_releases(&h).is_empty());
+        tick(&mut h, 1_500);
+        assert_eq!(h.rig.agent.engine.controlling(), None);
+        assert_eq!(controller_releases(&h), [(peer, ReleaseCause::Chord)]);
+        // The late answer of that capture, the rest of the chord and the platform's pair.
+        h.rig.agent.on_event(answer);
+        process_events(&mut h);
+        late_chord_and_hotkey(&mut h);
+        assert_eq!(controller_releases(&h), [(peer, ReleaseCause::Chord)]);
+        assert_eq!(
+            nonzero(&h),
+            json!({
+                "e1_controller_started": 1, "e1_controller_ended": 1, "e1_chord_releases": 1,
+                "e2_source_started": 1
+            })
+        );
+        assert!(h.held.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn target_sessions_count_the_injections_that_worked_and_the_indicator_that_showed() {
+        let (mut h, session) = controlled();
+        assert_eq!(nonzero(&h), json!({ "e1_target_started": 1 }));
+        let injections = |h: &Home| {
+            h.injected
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|what| what.starts_with("key") || what.starts_with("button"))
+                .count() as u64
+        };
+        // A key's press and release, and a button's: four key and button events.
+        from_controller(&mut h, session, key_msg(4, true, 1));
+        from_controller(&mut h, session, key_msg(4, false, 2));
+        from_controller(&mut h, session, button_msg(true, 3));
+        from_controller(&mut h, session, button_msg(false, 4));
+        assert_eq!(injections(&h), 4);
+        assert_eq!(nonzero(&h)["e1_injections_ok"], json!(4));
+        // Pointer motion is not a key or button event.
+        let peer = h.rig.peer;
+        step(
+            &mut h,
+            Input::Link(LinkEvent::Motion {
+                peer,
+                msg: crosspane_protocol::msg::PointerMessage {
+                    session,
+                    seq: 1,
+                    display: DisplayId(1),
+                    position: PointDevice::new(5.0, 5.0),
+                },
+            }),
+        );
+        assert!(h.injected.lock().unwrap().contains(&"move"));
+        assert_eq!(nonzero(&h)["e1_injections_ok"], json!(4));
+        // Attempts that the injector refuses are not counted.
+        h.rig.agent.platform.keys = Some(Box::new(FailingKeys));
+        from_controller(&mut h, session, key_msg(5, true, 5));
+        from_controller(&mut h, session, key_msg(5, false, 6));
+        assert_eq!(nonzero(&h)["e1_injections_ok"], json!(4));
+        h.rig.agent.platform.keys = Some(Box::new(FakeKeys(h.injected.clone(), h.held.clone())));
+        // The indicator counts when the overlay host confirms it is on screen, not before.
+        assert!(nonzero(&h).get("e1_hud_shows").is_none());
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::TARGET_INDICATOR,
+            )),
+        );
+        assert_eq!(nonzero(&h)["e1_hud_shows"], json!(1));
+        // The host says `Visible` again after moving the overlay: no show is outstanding, so it
+        // counts nothing.
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::TARGET_INDICATOR,
+            )),
+        );
+        assert_eq!(nonzero(&h)["e1_hud_shows"], json!(1));
+        // The capture HUD of a controller is not this counter.
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::HUD,
+            )),
+        );
+        assert_eq!(nonzero(&h)["e1_hud_shows"], json!(1));
+        // The controller ends the session; everything it pressed is released.
+        step(
+            &mut h,
+            control_input(
+                peer,
+                ControlMessage::EndControl {
+                    session,
+                    reason: crosspane_protocol::msg::EndReason::Released,
+                },
+            ),
+        );
+        assert_eq!(h.rig.agent.engine.controlled_by(), None);
+        assert!(h.held.lock().unwrap().is_empty());
+        assert_eq!(
+            nonzero(&h),
+            json!({
+                "e1_target_started": 1, "e1_target_ended": 1,
+                "e1_injections_ok": 4, "e1_hud_shows": 1
+            })
+        );
+    }
+
+    #[test]
+    fn an_indicator_the_host_cannot_show_or_was_never_asked_for_counts_nothing() {
+        // The host says it can't put it on screen; a `Visible` that follows belongs to no show.
+        let (mut h, _) = controlled();
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Unavailable(
+                crosspane_engine::io::TARGET_INDICATOR,
+            )),
+        );
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::TARGET_INDICATOR,
+            )),
+        );
+        assert_eq!(nonzero(&h), json!({ "e1_target_started": 1 }));
+        // A show the host refuses outright owes no outcome, so a stray one is nobody's.
+        let mut h = bare_scenario();
+        h.rig.agent.platform.overlay = Some(Box::new(RefusingOverlay(Arc::default())));
+        let (peer, session) = (h.rig.peer, crosspane_types::id::SessionId(77));
+        start_control(&mut h, peer, session);
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::TARGET_INDICATOR,
+            )),
+        );
+        assert_eq!(nonzero(&h), json!({ "e1_target_started": 1 }));
+    }
+
+    #[test]
+    fn an_indicator_answer_that_could_belong_to_either_of_two_peers_credits_nobody() {
+        // Peer P controls and its indicator is shown; P ends and peer Q starts, whose indicator
+        // is shown too, all before the host answers for P's. The overlay events carry only the
+        // shared indicator id, so neither answer can be told apart: nobody is credited.
+        let (mut h, session) = controlled();
+        let p = h.rig.peer;
+        let q = NodeId([3; 32]);
+        step(
+            &mut h,
+            Input::Grants(
+                [
+                    (q, [Capability::InputAccept].into()),
+                    (
+                        p,
+                        [
+                            Capability::WindowShare,
+                            Capability::WindowPresent,
+                            Capability::InputAccept,
+                        ]
+                        .into(),
+                    ),
+                ]
+                .into(),
+            ),
+        );
+        step(
+            &mut h,
+            control_input(
+                p,
+                ControlMessage::EndControl {
+                    session,
+                    reason: crosspane_protocol::msg::EndReason::Released,
+                },
+            ),
+        );
+        let out = start_control(&mut h, q, crosspane_types::id::SessionId(78));
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::Notice(Notice::ControlledBy(who)) if *who == q)),
+            "{out:?}"
+        );
+        for _ in 0..2 {
+            step(
+                &mut h,
+                Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                    crosspane_engine::io::TARGET_INDICATOR,
+                )),
+            );
+        }
+        let shows = |h: &Home, who: NodeId| {
+            h.rig
+                .agent
+                .tracker
+                .counters
+                .get(&who)
+                .map_or(0, |c| c.e1_hud_shows)
+        };
+        assert_eq!((shows(&h, p), shows(&h, q)), (0, 0));
+        // Once the host has caught up, the next show and its answer are attributed again.
+        step(
+            &mut h,
+            control_input(
+                q,
+                ControlMessage::EndControl {
+                    session: crosspane_types::id::SessionId(78),
+                    reason: crosspane_protocol::msg::EndReason::Released,
+                },
+            ),
+        );
+        settled(&mut h);
+        start_control(&mut h, p, crosspane_types::id::SessionId(79));
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::TARGET_INDICATOR,
+            )),
+        );
+        assert_eq!((shows(&h, p), shows(&h, q)), (1, 0));
+    }
+
+    /// The indicator was hidden longer ago than the host may still deliver its transitions.
+    fn settled(h: &mut Home) {
+        let hidden = h.rig.agent.tracker.indicator_hidden_at.as_mut();
+        *hidden.expect("the indicator was hidden") -= INDICATOR_SETTLE;
+    }
+
+    #[test]
+    fn a_late_transition_of_an_earlier_indicator_credits_nobody() {
+        // P's indicator is confirmed and credited. P ends and Q starts, and Q's show is accepted
+        // before a transition the host reported for P's indicator (on screen again after a
+        // move) arrives. That `Visible` is P's, not an answer to Q's show; Q's own answer then
+        // says it could not be shown. Neither may credit Q.
+        let (mut h, session) = controlled();
+        let p = h.rig.peer;
+        let q = NodeId([3; 32]);
+        step(
+            &mut h,
+            Input::Grants(
+                [
+                    (q, [Capability::InputAccept].into()),
+                    (
+                        p,
+                        [
+                            Capability::WindowShare,
+                            Capability::WindowPresent,
+                            Capability::InputAccept,
+                        ]
+                        .into(),
+                    ),
+                ]
+                .into(),
+            ),
+        );
+        let indicator = |visible: bool| {
+            let id = crosspane_engine::io::TARGET_INDICATOR;
+            Input::Overlay(if visible {
+                crosspane_platform::OverlayEvent::Visible(id)
+            } else {
+                crosspane_platform::OverlayEvent::Unavailable(id)
+            })
+        };
+        step(&mut h, indicator(true));
+        step(
+            &mut h,
+            control_input(
+                p,
+                ControlMessage::EndControl {
+                    session,
+                    reason: crosspane_protocol::msg::EndReason::Released,
+                },
+            ),
+        );
+        start_control(&mut h, q, crosspane_types::id::SessionId(78));
+        step(&mut h, indicator(true));
+        step(&mut h, indicator(false));
+        let shows = |h: &Home, who: NodeId| {
+            h.rig
+                .agent
+                .tracker
+                .counters
+                .get(&who)
+                .map_or(0, |c| c.e1_hud_shows)
+        };
+        assert_eq!((shows(&h, p), shows(&h, q)), (1, 0));
+    }
+
+    #[test]
+    fn a_projections_input_is_not_an_e1_injection() {
+        // The peer's keys into a window this node projects go through the same injectors, but
+        // they are E2's: no E1 counter moves.
+        let mut h = projected_scenario();
+        step(
+            &mut h,
+            Input::Windows(WindowEvent::Focused(Some(WindowId(10)))),
+        );
+        for (seq, down) in [(1, true), (2, false)] {
+            proj_key(&mut h, seq, down);
+        }
+        assert!(
+            h.injected
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|what| what.starts_with("key")),
+            "the window got its keys: {:?}",
+            h.injected.lock().unwrap()
+        );
+        assert!(
+            nonzero(&h).get("e1_injections_ok").is_none(),
+            "{}",
+            nonzero(&h)
+        );
+    }
+
+    #[test]
+    fn the_status_does_not_depend_on_what_was_typed() {
+        // Two runs that type different keys (and a different number of them, ending in the same
+        // count) are indistinguishable in the status: nothing about a key is in it.
+        let run = |usages: &[u16]| {
+            let (mut h, session) = controlled();
+            let mut seq = 0;
+            for usage in usages {
+                for down in [true, false] {
+                    seq += 1;
+                    from_controller(&mut h, session, key_msg(*usage, down, seq));
+                }
+            }
+            h.injected.lock().unwrap().clear();
+            let text = anonymous(&h);
+            // And no field or value names one: the usages, as numbers or in words.
+            let flat = text.to_string();
+            for usage in usages {
+                assert!(
+                    !flat.contains(&format!("\"usage\":{usage}")) && !flat.contains("usage"),
+                    "{flat}"
+                );
+            }
+            for word in [
+                "typed",
+                "scancode",
+                "keycode",
+                "character",
+                "title",
+                "pcm",
+                "samples",
+            ] {
+                assert!(!flat.contains(word), "{word} in {flat}");
+            }
+            text
+        };
+        assert_eq!(run(&[4, 5, 6]), run(&[0x1A, 0x1B, 0x2C]));
+    }
+
+    #[test]
+    fn an_e2_source_projection_counts_started_and_returned_and_keeps_its_journal_count() {
+        let mut h = projected_scenario();
+        assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+        // The window is parked: its journal entry is unresolved until it is restored.
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(1));
+        give_back(&mut h, 1);
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_source_started": 1, "e2_source_returned": 1 })
+        );
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(0));
+        // An offer the peer refuses never went live: nothing is counted for it.
+        let peer = h.rig.peer;
+        step(
+            &mut h,
+            Input::Command(Command::Project {
+                window: WindowId(10),
+                to: peer,
+            }),
+        );
+        step(
+            &mut h,
+            projection_input(
+                peer,
+                ProjectionMessage::Refused {
+                    projection: ProjectionId(2),
+                    reason: Refusal::Permission,
+                },
+            ),
+        );
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_source_started": 1, "e2_source_returned": 1 })
+        );
+    }
+
+    #[test]
+    fn startup_recovery_reports_what_the_platform_kept_and_is_apart_from_recovery_pending() {
+        use crate::platform::StartupRecovery;
+        let mut h = home();
+        for (kept, shown) in [
+            (StartupRecovery::Restored(2), "restored"),
+            (StartupRecovery::NothingParked, "nothing_parked"),
+            (StartupRecovery::Failed, "failed"),
+            (StartupRecovery::None, "none"),
+        ] {
+            h.rig.agent.platform.startup_recovery = kept;
+            let status = status_installer(&h);
+            assert_eq!(status["startup_recovery"], json!(shown), "{kept:?}");
+            // This instance parked nothing, whatever the startup found.
+            assert_eq!(status["recovery_pending"], json!(0), "{kept:?}");
+        }
+        // `recovery_pending` is this instance's own parked-but-not-restored windows (a failed
+        // startup recovery is `startup_recovery`'s to say): one while a projection holds its
+        // window, none after the return, and `startup_recovery` is not touched by either.
+        let mut h = projected_scenario();
+        h.rig.agent.platform.startup_recovery = StartupRecovery::Failed;
+        let shown = status_installer(&h);
+        assert_eq!(shown["recovery_pending"], json!(1));
+        assert_eq!(shown["startup_recovery"], json!("failed"));
+        give_back(&mut h, 1);
+        let shown = status_installer(&h);
+        assert_eq!(shown["recovery_pending"], json!(0));
+        assert_eq!(shown["startup_recovery"], json!("failed"));
+    }
+
+    /// Frame capture that refuses to start.
+    struct FailingFrames;
+
+    impl crosspane_platform::FrameCapture for FailingFrames {
+        fn start(
+            &mut self,
+            _target: CaptureTarget,
+            _crop: Option<crosspane_types::geom::PixelRect>,
+            _max_fps: u32,
+            _sink: Arc<dyn EventSink<FrameEvent>>,
+        ) -> Result<StreamId, PlatformError> {
+            Err(PlatformError::Backend("fixture: no capture".into()))
+        }
+        fn set_crop(
+            &mut self,
+            _stream: StreamId,
+            _crop: Option<crosspane_types::geom::PixelRect>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn stop(&mut self, _stream: StreamId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_projection_whose_capture_fails_or_is_cancelled_never_started() {
+        // The capture refuses to start: the window was parked and is put back, and none of
+        // start, return or parking is counted.
+        let mut h = bare_scenario();
+        h.rig.agent.platform.frames = Some(Box::new(FailingFrames));
+        project(&mut h, 1);
+        assert!(
+            h.rig
+                .agent
+                .notices
+                .iter()
+                .any(|n| n.contains("projection 1 ended")),
+            "{:?}",
+            h.rig.agent.notices
+        );
+        assert_eq!(nonzero(&h), json!({}));
+        let shown = status_installer(&h);
+        assert_eq!(shown["peers"][0]["last_source_parking"], Value::Null);
+        assert_eq!(shown["recovery_pending"], json!(0));
+        // The capture would start, but the projection is returned first: the answer that comes
+        // late finds nothing to start.
+        let mut h = bare_scenario();
+        let peer = h.rig.peer;
+        step(
+            &mut h,
+            Input::Command(Command::Project {
+                window: WindowId(10),
+                to: peer,
+            }),
+        );
+        h.rig.agent.feed(projection_input(
+            peer,
+            ProjectionMessage::Accepted {
+                projection: ProjectionId(1),
+                size: PixelSize::new(400, 300),
+                scale: 1.0,
+            },
+        ));
+        // The window's parking result is the engine's to see; that starts the capture, whose
+        // answer is queued behind it.
+        let at = h
+            .rig
+            .agent
+            .pending
+            .iter()
+            .position(|input| matches!(input, Input::Parked { .. }))
+            .expect("the window was parked");
+        let parked = h.rig.agent.pending.remove(at).unwrap();
+        h.rig.agent.feed(parked);
+        assert!(
+            h.rig
+                .agent
+                .pending
+                .iter()
+                .any(|input| matches!(input, Input::CaptureStarted { result: Ok(_), .. })),
+            "{:?}",
+            h.rig.agent.pending
+        );
+        give_back(&mut h, 1);
+        h.rig.agent.settle();
+        assert_eq!(nonzero(&h), json!({}));
+        let shown = status_installer(&h);
+        assert_eq!(shown["peers"][0]["last_source_parking"], Value::Null);
+        assert_eq!(shown["recovery_pending"], json!(0));
+    }
+
+    #[test]
+    fn a_window_that_is_destroyed_while_projected_is_neither_returned_nor_a_failed_return() {
+        let mut h = projected_scenario();
+        assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+        step(&mut h, Input::Windows(WindowEvent::Removed(WindowId(10))));
+        assert!(
+            h.rig
+                .agent
+                .notices
+                .iter()
+                .any(|n| n.contains("projection 1 ended: WindowClosed")),
+            "{:?}",
+            h.rig.agent.notices
+        );
+        // Its restore "worked" (there was nothing to restore), and nothing came back.
+        assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(0));
+    }
+
+    #[test]
+    fn a_return_whose_window_does_not_come_back_is_a_failed_return() {
+        let mut h = projected_scenario();
+        h.rig.agent.platform.parking = Some(Box::new(Parking {
+            kind: crosspane_platform::ParkingKind::Twin,
+            restore_fails: true,
+        }));
+        give_back(&mut h, 1);
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_source_started": 1, "e2_returns_failed": 1 })
+        );
+        // The journal entry is still there: the window is not restored.
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(1));
+    }
+
+    #[test]
+    fn last_source_parking_follows_the_kind_of_the_latest_projection_to_the_peer() {
+        let mut h = bare_scenario();
+        let parking = |h: &Home| status_installer(h)["peers"][0]["last_source_parking"].clone();
+        assert_eq!(parking(&h), Value::Null);
+        // The default fixture parks on a twin (the Mac's virtual display reports the same).
+        project(&mut h, 1);
+        assert_eq!(parking(&h), json!("twin"));
+        give_back(&mut h, 1);
+        // Never reset: the return doesn't clear it.
+        assert_eq!(parking(&h), json!("twin"));
+        h.rig.agent.platform.parking = Some(Box::new(Parking {
+            kind: crosspane_platform::ParkingKind::Mirror,
+            restore_fails: false,
+        }));
+        project(&mut h, 2);
+        assert_eq!(parking(&h), json!("mirror"));
+        assert_eq!(nonzero(&h)["e2_source_started"], json!(2));
+        give_back(&mut h, 2);
+        assert_eq!(parking(&h), json!("mirror"));
+    }
+
+    #[test]
+    fn an_e2_destination_proxy_counts_opened_and_returned_but_not_other_ends() {
+        let mut h = bare_scenario();
+        let peer = h.rig.peer;
+        let key = |n: u64| ProjectionKey {
+            source: peer,
+            projection: ProjectionId(n),
+        };
+        // The peer offers a window. There is no proxy host in this fixture, so the agent's own
+        // answer to the engine is a failure: drop that and give the host's `Opened` ourselves.
+        let offered = |h: &mut Home, n: u64| {
+            h.rig.agent.feed(projection_input(
+                peer,
+                ProjectionMessage::Start {
+                    projection: ProjectionId(n),
+                    window: crosspane_protocol::projection::WindowSummary {
+                        title: "t".into(),
+                        app_id: "a".into(),
+                    },
+                    size: PixelSize::new(400, 300),
+                },
+            ));
+            h.rig.agent.pending.clear();
+        };
+        let opened = |h: &mut Home, n: u64| {
+            // The host's window for it (there is no host here: the id it would have).
+            h.rig.agent.proxy_ids.open(key(n));
+            h.rig.agent.feed(Input::ProxyOpened {
+                key: key(n),
+                result: Ok((PixelSize::new(400, 300), 1.0)),
+            });
+        };
+        // The host takes the `Close` it is sent (WP-4.5: "returned" is "close queued").
+        h.rig.agent.tracker.close_seam = Some(|_| true);
+        offered(&mut h, 5);
+        opened(&mut h, 5);
+        assert_eq!(nonzero(&h), json!({ "e2_dest_started": 1 }));
+        h.rig.agent.feed(Input::Command(Command::Return(key(5))));
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_dest_started": 1, "e2_dest_returned": 1 })
+        );
+        // The source ends one (its window closed): the proxy closes, but not because of a return.
+        offered(&mut h, 6);
+        opened(&mut h, 6);
+        h.rig.agent.feed(projection_input(
+            peer,
+            ProjectionMessage::End {
+                projection: ProjectionId(6),
+                reason: crosspane_protocol::projection::ProjectionEndReason::WindowClosed,
+            },
+        ));
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_dest_started": 2, "e2_dest_returned": 1 })
+        );
+        // A proxy that never opened never counts, whatever ends it.
+        offered(&mut h, 7);
+        h.rig.agent.feed(Input::ProxyOpened {
+            key: key(7),
+            result: Err(Failure::Other),
+        });
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_dest_started": 2, "e2_dest_returned": 1 })
+        );
+    }
+
+    #[test]
+    fn a_destination_return_whose_close_was_not_queued_is_a_failed_return() {
+        let mut h = bare_scenario();
+        let peer = h.rig.peer;
+        let key = ProjectionKey {
+            source: peer,
+            projection: ProjectionId(5),
+        };
+        h.rig.agent.feed(projection_input(
+            peer,
+            ProjectionMessage::Start {
+                projection: ProjectionId(5),
+                window: crosspane_protocol::projection::WindowSummary {
+                    title: "t".into(),
+                    app_id: "a".into(),
+                },
+                size: PixelSize::new(400, 300),
+            },
+        ));
+        h.rig.agent.pending.clear();
+        h.rig.agent.proxy_ids.open(key);
+        h.rig.agent.feed(Input::ProxyOpened {
+            key,
+            result: Ok((PixelSize::new(400, 300), 1.0)),
+        });
+        assert_eq!(nonzero(&h), json!({ "e2_dest_started": 1 }));
+        // The host has exited: sending it the `Close` fails. The return happened (the engine
+        // ended the projection) but isn't counted as one; it is the return error.
+        h.rig.agent.tracker.close_seam = Some(|_| false);
+        h.rig.agent.feed(Input::Command(Command::Return(key)));
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_dest_started": 1, "e2_returns_failed": 1 })
+        );
+        // Without a window host at all (the production state when none started) it is the same:
+        // no `Close` can be queued.
+        h.rig.agent.tracker.close_seam = None;
+        let again = ProjectionKey {
+            projection: ProjectionId(6),
+            ..key
+        };
+        h.rig.agent.feed(projection_input(
+            peer,
+            ProjectionMessage::Start {
+                projection: ProjectionId(6),
+                window: crosspane_protocol::projection::WindowSummary {
+                    title: "t".into(),
+                    app_id: "a".into(),
+                },
+                size: PixelSize::new(400, 300),
+            },
+        ));
+        h.rig.agent.pending.clear();
+        h.rig.agent.proxy_ids.open(again);
+        h.rig.agent.feed(Input::ProxyOpened {
+            key: again,
+            result: Ok((PixelSize::new(400, 300), 1.0)),
+        });
+        h.rig.agent.feed(Input::Command(Command::Return(again)));
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_dest_started": 2, "e2_returns_failed": 2 })
+        );
+    }
+
+    #[test]
+    fn frames_presented_is_null_until_the_renderer_reports_and_then_a_number() {
+        let h = bare_scenario();
+        let presented =
+            |h: &Home| status_installer(h)["peers"][0]["counters"]["e2_frames_presented"].clone();
+        assert_eq!(presented(&h), Value::Null);
+        let key = ProjectionKey {
+            source: h.rig.peer,
+            projection: ProjectionId(1),
+        };
+        h.rig.agent.proxy_ids.open(key);
+        // The decoder showing frames is not the renderer presenting them.
+        assert_eq!(presented(&h), Value::Null);
+        h.rig.agent.proxy_ids.presented(key);
+        h.rig.agent.proxy_ids.presented(key);
+        assert_eq!(presented(&h), json!(2));
+        h.rig.agent.proxy_ids.close(key);
+        assert_eq!(presented(&h), json!(2));
+    }
+
+    #[test]
+    fn the_grants_epoch_advances_on_real_trust_changes_only() {
+        let mut h = bare_scenario();
+        let allow = |h: &mut Home, capability: &str, allow: bool| {
+            h.rig.agent.on_ctl(Request::Allow {
+                peer: "peer-name".into(),
+                capability: capability.into(),
+                allow,
+            })
+        };
+        let start = epoch(&h, "grants");
+        // The peer is allowed input already (the fixture's doing): allowing it again changes
+        // nothing.
+        assert!(allow(&mut h, "input", true).ok);
+        assert_eq!(epoch(&h, "grants"), start);
+        assert!(allow(&mut h, "input", false).ok);
+        assert_eq!(epoch(&h, "grants"), start + 1);
+        assert!(allow(&mut h, "input", false).ok);
+        assert_eq!(epoch(&h, "grants"), start + 1);
+        assert!(allow(&mut h, "input", true).ok);
+        assert_eq!(epoch(&h, "grants"), start + 2);
+        // A request that is refused changes nothing.
+        assert!(!allow(&mut h, "sound", true).ok);
+        assert_eq!(epoch(&h, "grants"), start + 2);
+        assert_eq!(
+            status_installer(&h)["peers"][0]["grants_given"],
+            json!(["input", "present", "share"])
+        );
+        // A change of the trust file under the running agent (a reload).
+        let peer = h.rig.peer;
+        h.rig
+            .agent
+            .trust
+            .update(|t| {
+                t.set_grant(peer, Capability::WindowBrowse, true)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .unwrap();
+        h.rig.agent.last_trust_check = Instant::now() - Duration::from_secs(10);
+        h.rig.agent.housekeeping();
+        assert_eq!(
+            epoch(&h, "grants"),
+            start + 2,
+            "its own change was counted when made"
+        );
+        // Forgetting the peer.
+        let forgotten = h.rig.agent.on_ctl(Request::Forget {
+            peer: "peer-name".into(),
+        });
+        assert!(forgotten.ok, "{forgotten:?}");
+        assert_eq!(epoch(&h, "grants"), start + 3);
+        assert_eq!(status_installer(&h)["peers"], json!([]));
+    }
+
+    #[test]
+    fn the_layout_epoch_advances_on_accepted_places_and_display_changes() {
+        let mut h = bare_scenario();
+        let start = epoch(&h, "layout");
+        let local = display(1, 1.0, (0.0, 0.0), (1000, 1000));
+        h.rig
+            .agent
+            .on_event(Event::LocalDisplays(vec![local.clone()]));
+        // A local display change is one advance, though it also moved placements (the first
+        // display is placed by default).
+        let after_display = epoch(&h, "layout");
+        assert_eq!(after_display, start + 1);
+        // The same display set again is no change.
+        h.rig
+            .agent
+            .on_event(Event::LocalDisplays(vec![local.clone()]));
+        assert_eq!(epoch(&h, "layout"), after_display);
+        // A change that moves no placement (the display's name) is one advance too.
+        let renamed = DisplayInfo {
+            name: "renamed".into(),
+            ..local.clone()
+        };
+        h.rig.agent.on_event(Event::LocalDisplays(vec![renamed]));
+        let after_rename = epoch(&h, "layout");
+        assert_eq!(after_rename, after_display + 1);
+        h.rig.agent.on_event(Event::LocalDisplays(vec![local]));
+        assert_eq!(epoch(&h, "layout"), after_rename + 1);
+        let after_display = epoch(&h, "layout");
+        let place = |h: &mut Home, x: f64| {
+            h.rig.agent.on_ctl(Request::Place {
+                placements: vec![crate::ctl::PlaceEntry {
+                    node: "local".into(),
+                    display: 1,
+                    origin_mm: [x, 0.0],
+                }],
+            })
+        };
+        // Clear of the peer's display, which the fixture puts at 100 mm.
+        let accepted = place(&mut h, -500.0);
+        assert!(accepted.ok, "{accepted:?}");
+        let after_place = epoch(&h, "layout");
+        assert_eq!(after_place, after_display + 1);
+        // A place that is refused changes nothing.
+        assert!(!place(&mut h, f64::NAN).ok);
+        assert_eq!(epoch(&h, "layout"), after_place);
+        // A peer's layout that changes the placements.
+        let peer = h.rig.peer;
+        let theirs = Placement {
+            node: h.rig.local,
+            display: DisplayId(1),
+            origin: crosspane_types::geom::PointMm::new(50.0, 0.0),
+            version: 1_000,
+        };
+        h.rig.agent.on_link(LinkEvent::Control {
+            peer,
+            msg: ControlMessage::Layout(vec![theirs]),
+        });
+        let after_received = epoch(&h, "layout");
+        assert_eq!(after_received, after_place + 1);
+        // The same layout again changes nothing.
+        h.rig.agent.on_link(LinkEvent::Control {
+            peer,
+            msg: ControlMessage::Layout(vec![theirs]),
+        });
+        assert_eq!(epoch(&h, "layout"), after_received);
+        // A peer's display set that changes the placements is one advance; the same set again,
+        // none.
+        let displays = vec![
+            display(1, 1.0, (0.0, 0.0), (1000, 1000)),
+            display(2, 1.0, (0.0, 0.0), (500, 500)),
+        ];
+        let announce = |h: &mut Home| {
+            h.rig.agent.on_link(LinkEvent::Control {
+                peer,
+                msg: ControlMessage::Displays(displays.clone()),
+            });
+        };
+        announce(&mut h);
+        let after_displays = epoch(&h, "layout");
+        assert_eq!(after_displays, after_received + 1);
+        announce(&mut h);
+        assert_eq!(epoch(&h, "layout"), after_displays);
+    }
+
+    #[test]
+    fn link_generation_is_null_until_the_first_connection_and_counts_each_one() {
+        let mut h = home();
+        let peer = h.rig.peer;
+        let generation = |h: &Home| status_installer(h)["peers"][0]["link_generation"].clone();
+        let hello = || Hello {
+            minor: crosspane_protocol::PROTOCOL_MINOR,
+            name: "peer-announced".into(),
+            features: vec!["e1".into(), "audio".into()],
+            displays: Vec::new(),
+        };
+        assert_eq!(generation(&h), Value::Null);
+        h.rig.agent.on_link(LinkEvent::Control {
+            peer,
+            msg: ControlMessage::Hello(hello()),
+        });
+        assert_eq!(generation(&h), json!(1));
+        let shown = status_installer(&h)["peers"][0].clone();
+        assert_eq!(shown["connected"], json!(true));
+        assert_eq!(shown["features"], json!(["e1", "audio"]));
+        h.rig.agent.on_link(LinkEvent::Closed {
+            peer,
+            error: crosspane_protocol::link::LinkError::Closed,
+        });
+        assert_eq!(generation(&h), json!(1));
+        assert_eq!(status_installer(&h)["peers"][0]["connected"], json!(false));
+        // A reconnect bumps it, and so does a connection that replaces a running one.
+        h.rig.agent.on_link(LinkEvent::Control {
+            peer,
+            msg: ControlMessage::Hello(hello()),
+        });
+        assert_eq!(generation(&h), json!(2));
+        h.rig.agent.on_link(LinkEvent::HelloRefresh {
+            peer,
+            hello: hello(),
+        });
+        assert_eq!(generation(&h), json!(3));
+    }
+
+    #[test]
+    fn settings_opened_counts_only_spawns_that_worked() {
+        let mut h = home();
+        let opened = |h: &Home| status_installer(h)["settings_opened"].clone();
+        h.rig.agent.tracker.spawn_settings = || Ok(());
+        h.rig.agent.tray_action(TrayAction::OpenApp);
+        assert_eq!(opened(&h), json!(1));
+        h.rig.agent.tracker.spawn_settings =
+            || Err(std::io::Error::other("fixture: no such program"));
+        h.rig.agent.tray_action(TrayAction::OpenApp);
+        assert_eq!(opened(&h), json!(1));
+        assert!(
+            h.rig
+                .agent
+                .notices
+                .back()
+                .is_some_and(|n| n.contains("could not open the settings app"))
+        );
+        h.rig.agent.tracker.spawn_settings = || Ok(());
+        h.rig.agent.tray_action(TrayAction::OpenApp);
+        assert_eq!(opened(&h), json!(2));
+    }
+
+    #[test]
+    fn audio_peers_are_those_with_a_live_speaker_session_either_way_and_the_counters_pass_through()
+    {
+        let mut h = home();
+        h.rig.agent.audio = Some(Box::new(StatsPlane(WorkerStats {
+            sent: 7,
+            played: 9,
+            congested: 100,
+            ..WorkerStats::default()
+        })));
+        let audio = |h: &Home| status_installer(h)["audio"].clone();
+        assert_eq!(
+            audio(&h),
+            json!({ "enabled": true, "active_peers": [], "frames_sent": 7, "frames_played": 9 })
+        );
+        let (a, b) = (NodeId([1; 32]), h.rig.peer);
+        let session = |peer, stream, kind, endpoint| {
+            (
+                AudioKey {
+                    peer,
+                    stream: crosspane_types::audio::AudioStreamId(stream),
+                    generation: u64::from(stream),
+                },
+                kind,
+                endpoint,
+            )
+        };
+        use crosspane_engine::io::AudioEndpoint::{
+            LocalPlayback, VirtualMicrophone, VirtualSpeaker,
+        };
+        // One session plays here, one is this node's virtual speaker playing there; a microphone
+        // session is no speaker session.
+        let sessions = [
+            session(b, 1, AudioKind::Speaker, LocalPlayback),
+            session(a, 2, AudioKind::Speaker, VirtualSpeaker),
+            session(a, 3, AudioKind::Microphone, VirtualMicrophone),
+        ];
+        for (key, kind, endpoint) in sessions {
+            h.rig.agent.execute(vec![Output::StartAudioStream {
+                key,
+                kind,
+                endpoint,
+            }]);
+        }
+        let mut both = [a, b];
+        both.sort();
+        assert_eq!(
+            audio(&h)["active_peers"],
+            json!(both.iter().map(NodeId::to_string).collect::<Vec<_>>())
+        );
+        // The engine stops one: only the other peer is left.
+        h.rig
+            .agent
+            .execute(vec![Output::StopAudioStream { key: sessions[1].0 }]);
+        assert_eq!(audio(&h)["active_peers"], json!([b.to_string()]));
+        // A peer going away takes its sessions with it.
+        h.rig
+            .agent
+            .execute(vec![Output::RemoveAudioPeer { peer: b }]);
+        assert_eq!(audio(&h)["active_peers"], json!([]));
     }
 }

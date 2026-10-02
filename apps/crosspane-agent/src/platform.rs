@@ -40,6 +40,54 @@ pub trait HomeSeat: Send {
     fn watch_reload(&mut self, reload: Box<dyn Fn() + Send>) -> Result<(), PlatformError>;
 }
 
+/// What the startup recovery of parked windows came to (WP-4.5). `create` runs every parking
+/// backend's `recover()` before anything else (04 §8 invariant 4) and keeps the outcome here, for
+/// `status.result.installer.startup_recovery`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupRecovery {
+    /// Every backend recovered, and this many windows were put back.
+    Restored(usize),
+    /// Every backend recovered, and nothing had been left parked.
+    NothingParked,
+    /// At least one backend could not recover: journal entries may remain.
+    Failed,
+    /// There is no parking backend, so nothing was recovered.
+    None,
+}
+
+impl StartupRecovery {
+    /// Combine what each parking backend's `recover()` came to: `Ok(n)` windows restored, or
+    /// `Err(())` for a failure. No backend at all is `None`; any failure is `Failed`, whatever the
+    /// others did.
+    pub fn combine(outcomes: &[Result<usize, ()>]) -> StartupRecovery {
+        if outcomes.is_empty() {
+            return StartupRecovery::None;
+        }
+        let mut restored = 0usize;
+        for outcome in outcomes {
+            match outcome {
+                Ok(count) => restored = restored.saturating_add(*count),
+                Err(()) => return StartupRecovery::Failed,
+            }
+        }
+        if restored > 0 {
+            StartupRecovery::Restored(restored)
+        } else {
+            StartupRecovery::NothingParked
+        }
+    }
+
+    /// The spelling `status` uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartupRecovery::Restored(_) => "restored",
+            StartupRecovery::NothingParked => "nothing_parked",
+            StartupRecovery::Failed => "failed",
+            StartupRecovery::None => "none",
+        }
+    }
+}
+
 pub struct Platform {
     pub gate: Arc<IoGate>,
     pub session: Box<dyn SessionEvents>,
@@ -65,6 +113,8 @@ pub struct Platform {
     /// Home on the twin (WP-2.43): the release bind and the pointer read-back. `None` off
     /// Hyprland, and on Hyprland when the bind can't be spelled (the agent logs why).
     pub home: Option<Box<dyn HomeSeat>>,
+    /// What the startup recovery of parked windows came to (WP-4.5).
+    pub startup_recovery: StartupRecovery,
 }
 
 /// A wgpu device for the source side's GPU work (docs/wp/GPU-v0.md, decision 3).
@@ -441,6 +491,7 @@ pub fn create(
         "mirror parking",
         HyprlandMirrorParking::new(ipc.clone(), state_dir.join("mirror.json"), MIRROR_BORDER),
     );
+    let mut recoveries = Vec::new();
     for backend in [
         twin.as_mut().map(|p| p as &mut dyn WindowParking),
         mirror.as_mut().map(|p| p as &mut dyn WindowParking),
@@ -449,16 +500,22 @@ pub fn create(
     .flatten()
     {
         match backend.recover() {
-            Ok(restored) if !restored.is_empty() => {
-                tracing::warn!(
-                    count = restored.len(),
-                    "restored windows a previous run left parked"
-                )
+            Ok(restored) => {
+                if !restored.is_empty() {
+                    tracing::warn!(
+                        count = restored.len(),
+                        "restored windows a previous run left parked"
+                    );
+                }
+                recoveries.push(Ok(restored.len()));
             }
-            Ok(_) => {}
-            Err(e) => tracing::error!(error = %e, "could not restore parked windows"),
+            Err(e) => {
+                tracing::error!(error = %e, "could not restore parked windows");
+                recoveries.push(Err(()));
+            }
         }
     }
+    let startup_recovery = StartupRecovery::combine(&recoveries);
     let parking: Option<Box<dyn WindowParking>> = match (twin, mirror) {
         (Some(twin), Some(mirror)) => Some(Box::new(crate::twin::TwinOrMirror::new(
             Box::new(twin),
@@ -509,6 +566,7 @@ pub fn create(
     };
     Ok(Platform {
         home,
+        startup_recovery,
         session: Box::new(session),
         displays: Box::new(displays),
         capture: optional("capture", HyprlandCapture::new(gate.clone()))
@@ -557,6 +615,8 @@ pub fn create(
         MacMirrorParking::new(state_dir.join("parking.json")),
     )
     .map(|p| Box::new(p) as Box<dyn WindowParking>);
+    // What each journal's recovery came to, for `StartupRecovery` (WP-4.5).
+    let mut recoveries: Vec<Result<usize, ()>> = Vec::new();
     #[cfg(feature = "private-vdisplay")]
     {
         use crosspane_platform_macos::private_vdisplay::MacTwinParking;
@@ -573,8 +633,12 @@ pub fn create(
                 )));
             }
             (Some(mut twin), mirror) => {
-                if let Err(e) = off_main(|| twin.recover()) {
-                    tracing::error!(error = %e, "could not restore windows parked on virtual displays");
+                match off_main(|| twin.recover()) {
+                    Ok(restored) => recoveries.push(Ok(restored.len())),
+                    Err(e) => {
+                        tracing::error!(error = %e, "could not restore windows parked on virtual displays");
+                        recoveries.push(Err(()));
+                    }
                 }
                 parking = mirror;
             }
@@ -587,9 +651,16 @@ pub fn create(
             "mac_virtual_display needs a build with the private-vdisplay feature; mirroring (M1)"
         );
     }
-    if let Some(Err(e)) = parking.as_mut().map(|p| off_main(|| p.recover())) {
-        tracing::error!(error = %e, "could not restore parked windows");
+    if let Some(p) = parking.as_mut() {
+        match off_main(|| p.recover()) {
+            Ok(restored) => recoveries.push(Ok(restored.len())),
+            Err(e) => {
+                tracing::error!(error = %e, "could not restore parked windows");
+                recoveries.push(Err(()));
+            }
+        }
     }
+    let startup_recovery = StartupRecovery::combine(&recoveries);
     let windows = optional("windows", MacWindows::new());
     let frames = optional("frame capture", MacFrameCapture::new(gate.clone()));
     let (keys, pointer) = match optional("injection", inject::injectors(gate.clone())) {
@@ -600,6 +671,7 @@ pub fn create(
         None => (None, None),
     };
     Ok(Platform {
+        startup_recovery,
         session: Box::new(session),
         displays: Box::new(displays),
         capture: optional("capture", MacCapture::new(gate.clone()))
@@ -728,5 +800,43 @@ mod tests {
         assert!(is_executable(&file));
         assert!(!is_executable(&dir), "a directory is not a program");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod startup_recovery_tests {
+    use super::StartupRecovery as R;
+
+    #[test]
+    fn no_parking_backend_is_none() {
+        assert_eq!(R::combine(&[]), R::None);
+    }
+
+    #[test]
+    fn backends_that_recovered_with_nothing_parked_say_so() {
+        assert_eq!(R::combine(&[Ok(0)]), R::NothingParked);
+        assert_eq!(R::combine(&[Ok(0), Ok(0)]), R::NothingParked);
+    }
+
+    #[test]
+    fn windows_put_back_are_counted_across_backends() {
+        assert_eq!(R::combine(&[Ok(2)]), R::Restored(2));
+        assert_eq!(R::combine(&[Ok(0), Ok(3)]), R::Restored(3));
+        assert_eq!(R::combine(&[Ok(1), Ok(2)]), R::Restored(3));
+    }
+
+    #[test]
+    fn one_failed_recovery_is_a_failure_whatever_the_others_did() {
+        assert_eq!(R::combine(&[Err(())]), R::Failed);
+        assert_eq!(R::combine(&[Ok(5), Err(())]), R::Failed);
+        assert_eq!(R::combine(&[Err(()), Ok(0)]), R::Failed);
+    }
+
+    #[test]
+    fn each_variant_has_its_frozen_spelling() {
+        assert_eq!(R::Restored(1).as_str(), "restored");
+        assert_eq!(R::NothingParked.as_str(), "nothing_parked");
+        assert_eq!(R::Failed.as_str(), "failed");
+        assert_eq!(R::None.as_str(), "none");
     }
 }

@@ -187,6 +187,13 @@ impl Engine {
         self.controller.target()
     }
 
+    /// The node this node's keyboard and mouse drive once the session is established (WP-4.5):
+    /// the peer has acknowledged it and the capture is live. [`Engine::controlling`] also names the
+    /// peer of a handshake that has not been answered yet, which this does not.
+    pub fn control_established(&self) -> Option<NodeId> {
+        self.controller.established()
+    }
+
     /// The node driving this one (E1 target), if any.
     pub fn controlled_by(&self) -> Option<NodeId> {
         self.target.controller()

@@ -28,7 +28,7 @@ use crate::config::EngineConfig;
 use crate::e2::{Placement as Proxy, TwinHome};
 use crate::io::{
     Command, Failure, HUD, HomeFailure, HomeOp, Input, Notice, Output, PortalsFailure,
-    ProjectionKey, Warp,
+    ProjectionKey, ReleaseCause, Warp,
 };
 
 const REENTRY_GUARD: Duration = Duration::from_millis(150);
@@ -573,7 +573,7 @@ impl ControllerE1 {
             Input::Link(event) => self.link_event(event, now, out),
             Input::Hotkey(event) => self.hotkey_event(*event, now, out),
             Input::Command(Command::ReleaseControl) if !matches!(self.phase, Phase::Idle) => {
-                self.release(now, out);
+                self.release(ReleaseCause::Command, now, out);
             }
             Input::Command(Command::Panic) => self.panic(now, out),
             Input::Command(Command::Rearm) => self.arm(now, out),
@@ -776,6 +776,16 @@ impl ControllerE1 {
     /// The node this controller drives (or is crossing to), if any.
     pub fn target(&self) -> Option<NodeId> {
         self.session().map(|s| s.peer)
+    }
+
+    /// The node whose session this controller has established (WP-4.5): the peer acknowledged it
+    /// and the capture is live (`Phase::Controlling`). Unlike [`ControllerE1::target`], not the
+    /// peer of a handshake still waiting for its answer.
+    pub fn established(&self) -> Option<NodeId> {
+        match &self.phase {
+            Phase::Controlling(c) => Some(c.session.peer),
+            _ => None,
+        }
     }
 
     /// An acknowledged outgoing session owns the controller role, including capture activation
@@ -1679,9 +1689,16 @@ impl ControllerE1 {
         self.update_portals(now, out);
     }
 
-    fn release(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+    fn release(&mut self, cause: ReleaseCause, now: MonoTime, out: &mut Vec<Output>) {
+        // WP-4.5: the session this release ends, if there is one. `return_home` ends every session
+        // it finds (and does nothing in `Idle` or `Returning`), so a session here is exactly one
+        // ended controller session; a release with none says nothing.
+        let ended = self.session().map(|s| s.peer);
         // Explicit release disarms crossing (04 §6); an ordinary pointer crossing home does not.
         self.return_home(EndReason::Released, None, false, true, now, out);
+        if let Some(peer) = ended {
+            out.push(Output::Notice(Notice::ControlReleased { peer, cause }));
+        }
         self.disarm(now, out);
     }
 
@@ -1706,7 +1723,7 @@ impl ControllerE1 {
                     rearm,
                 });
                 if self.armed {
-                    self.release(now, out);
+                    self.release(ReleaseCause::Chord, now, out);
                 }
             }
             HotkeyEvent::Released { .. } => {
@@ -3016,7 +3033,7 @@ impl ControllerE1 {
             // The authoritative hotkey pair may arrive after this captured chord.
             // Suppress that pair for re-arm purposes without comparing timestamps.
             self.chord_press_outstanding = true;
-            self.release(now, out);
+            self.release(ReleaseCause::Chord, now, out);
         } else if mode == InputMode::Routing {
             self.route(Held::Key(usage), down, now, out);
         }
@@ -3276,7 +3293,7 @@ impl ControllerE1 {
         if self.reconcile_chord(Some(&start.held_keys)) {
             // The release chord was pressed while the exit was activating: end everything.
             self.chord_press_outstanding = true;
-            self.release(now, out);
+            self.release(ReleaseCause::Chord, now, out);
             return;
         }
         // Checked on arrival, not only on `Tick`, as a crossing's is.
@@ -3463,7 +3480,7 @@ impl ControllerE1 {
         // (and a chord already completed ends everything).
         if self.reconcile_chord(None) {
             self.chord_press_outstanding = true;
-            self.release(now, out);
+            self.release(ReleaseCause::Chord, now, out);
             return;
         }
         out.push(Output::EndCapture { warp_to: None });
@@ -3668,5 +3685,293 @@ mod tests {
     fn teardown_backoff_doubles_to_the_cap() {
         let steps: Vec<_> = (0..9).map(|attempt| backoff(attempt).as_millis()).collect();
         assert_eq!(steps, [100, 200, 400, 800, 1600, 2000, 2000, 2000, 2000]);
+    }
+}
+
+#[cfg(test)]
+mod release_cause_tests {
+    //! WP-4.5: `Notice::ControlReleased` names the way a controller session was released (the
+    //! chord, or the command), once per ended session, and says nothing for a release with no
+    //! session or for any other way a session ends.
+
+    #![allow(clippy::unwrap_used)]
+
+    use crosspane_platform::{
+        CaptureEvent, CaptureId, CaptureStart, HotkeyEvent, LockState, OverlayEvent, PortalId,
+        SessionEvent, SessionState,
+    };
+    use crosspane_protocol::msg::{ControlMessage, EndReason as WireEnd, Placement};
+    use crosspane_types::color::ColorSpace;
+    use crosspane_types::geom::{PixelSize, PointLogical, PointMm, SizeMm};
+
+    use super::*;
+
+    const A: NodeId = NodeId([1; 32]);
+    const B: NodeId = NodeId([2; 32]);
+
+    fn ms(n: u64) -> MonoTime {
+        MonoTime::from_nanos(n * 1_000_000)
+    }
+
+    fn display() -> DisplayInfo {
+        DisplayInfo {
+            id: DisplayId(1),
+            name: "test".into(),
+            geometry: DisplayGeometry {
+                physical_size: SizeMm::new(100.0, 100.0),
+                pixel_size: PixelSize::new(1000, 1000),
+                scale: 1.0,
+                logical_origin: PointLogical::zero(),
+            },
+            refresh_millihz: 60_000,
+            color_space: ColorSpace::Srgb,
+            hdr: false,
+        }
+    }
+
+    /// A controller on node A with peer B to its right, up, and the session permitted.
+    struct Rig {
+        controller: ControllerE1,
+        portal: PortalId,
+        now: MonoTime,
+        chord: Vec<HidUsage>,
+    }
+
+    impl Rig {
+        fn new() -> Rig {
+            let mut config = EngineConfig::new(A);
+            config.accel.base_mm_per_unit = 0.1;
+            config.accel.max_gain = 1.0;
+            let mut chord = config.release_chord.modifiers.clone();
+            chord.push(config.release_chord.key);
+            let mut controller = ControllerE1::new(&config, ms(0));
+            let mut setup = Vec::new();
+            let mut placements = Vec::new();
+            let mut placed = Vec::new();
+            for (index, node) in [A, B].into_iter().enumerate() {
+                let info = display();
+                let origin = PointMm::new(index as f64 * 100.0, 0.0);
+                placements.push(Placement {
+                    node,
+                    display: info.id,
+                    origin,
+                    version: 1,
+                });
+                placed.push(Placed {
+                    id: GlobalDisplayId {
+                        node,
+                        display: info.id,
+                    },
+                    geometry: info.geometry,
+                    origin,
+                });
+                let input = if node == A {
+                    Input::LocalDisplays(vec![info])
+                } else {
+                    Input::PeerDisplays {
+                        peer: node,
+                        displays: vec![info],
+                    }
+                };
+                controller.handle(&input, ms(0), &mut setup);
+            }
+            let layout = Layout::new(placed, config.layout).unwrap();
+            let portal = layout
+                .portals()
+                .iter()
+                .find(|p| p.from.node == A && p.to.node == B)
+                .unwrap()
+                .id;
+            controller.handle(&Input::Layout(placements), ms(0), &mut setup);
+            controller.handle(
+                &Input::Session(SessionEvent::State(SessionState {
+                    lock: LockState::Unlocked,
+                    active: Some(true),
+                })),
+                ms(0),
+                &mut setup,
+            );
+            controller.handle(&Input::PeerUp { peer: B }, ms(0), &mut setup);
+            Rig {
+                controller,
+                portal,
+                now: ms(0),
+                chord,
+            }
+        }
+
+        fn send(&mut self, input: Input) -> Vec<Output> {
+            let mut out = Vec::new();
+            self.controller.handle(&input, self.now, &mut out);
+            out
+        }
+
+        /// The pointer pushes B's edge and the HUD is up: crossing, no session yet.
+        fn crossing(&mut self) {
+            let out = self.send(Input::Capture(CaptureEvent::EdgePressed {
+                portal: self.portal,
+                position: 0.5,
+                at: self.now,
+            }));
+            assert!(
+                out.iter()
+                    .any(|o| matches!(o, Output::ShowOverlay { id, .. } if *id == HUD))
+            );
+            assert_eq!(self.controller.target(), None);
+        }
+
+        /// A full crossing: B acknowledges and the capture is live.
+        fn controlling(&mut self) -> SessionId {
+            self.crossing();
+            let out = self.send(Input::Overlay(OverlayEvent::Visible(HUD)));
+            let session = out
+                .iter()
+                .find_map(|o| match o {
+                    Output::SendControl {
+                        msg: ControlMessage::StartControl { session, .. },
+                        ..
+                    } => Some(*session),
+                    _ => None,
+                })
+                .unwrap();
+            let out = self.send(Input::Link(LinkEvent::Control {
+                peer: B,
+                msg: ControlMessage::ControlStarted { session },
+            }));
+            let capture: CaptureId = out
+                .iter()
+                .find_map(|o| match o {
+                    Output::BeginCapture { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .unwrap();
+            self.send(Input::Capture(CaptureEvent::Started { id: capture }));
+            self.send(Input::CaptureBegun {
+                id: capture,
+                result: Ok(CaptureStart {
+                    held_keys: Vec::new(),
+                    lock_keys: LockKeys::default(),
+                }),
+            });
+            assert_eq!(self.controller.target(), Some(B));
+            session
+        }
+
+        fn press_chord(&mut self) -> Vec<Output> {
+            let mut out = Vec::new();
+            for usage in self.chord.clone() {
+                out.extend(self.send(Input::Capture(CaptureEvent::Key {
+                    usage,
+                    down: true,
+                    at: self.now,
+                })));
+            }
+            out
+        }
+    }
+
+    fn released(out: &[Output]) -> Vec<(NodeId, ReleaseCause)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Notice(Notice::ControlReleased { peer, cause }) => Some((*peer, *cause)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_release_command_says_command_once() {
+        let mut rig = Rig::new();
+        rig.controlling();
+        let out = rig.send(Input::Command(Command::ReleaseControl));
+        assert_eq!(released(&out), [(B, ReleaseCause::Command)]);
+        assert_eq!(rig.controller.target(), None);
+        // The session is over: a second release has none to end.
+        let again = rig.send(Input::Command(Command::ReleaseControl));
+        assert!(released(&again).is_empty());
+    }
+
+    #[test]
+    fn the_captured_chord_says_chord_once() {
+        let mut rig = Rig::new();
+        rig.controlling();
+        let out = rig.press_chord();
+        assert_eq!(released(&out), [(B, ReleaseCause::Chord)]);
+        assert_eq!(rig.controller.target(), None);
+        // The platform's own report of the same chord arrives after it: nothing left to release
+        // (and crossing is disarmed), so there is no second notice.
+        let pair = rig.send(Input::Hotkey(HotkeyEvent::Pressed { at: rig.now }));
+        assert!(released(&pair).is_empty());
+    }
+
+    #[test]
+    fn the_hotkey_says_chord() {
+        let mut rig = Rig::new();
+        rig.controlling();
+        let out = rig.send(Input::Hotkey(HotkeyEvent::Pressed { at: rig.now }));
+        assert_eq!(released(&out), [(B, ReleaseCause::Chord)]);
+        assert_eq!(rig.controller.target(), None);
+    }
+
+    #[test]
+    fn a_release_while_crossing_with_a_session_still_counts_once() {
+        // The handshake was sent (a session exists) but B hasn't acknowledged yet.
+        let mut rig = Rig::new();
+        rig.crossing();
+        let out = rig.send(Input::Overlay(OverlayEvent::Visible(HUD)));
+        assert!(out.iter().any(|o| matches!(
+            o,
+            Output::SendControl {
+                msg: ControlMessage::StartControl { .. },
+                ..
+            }
+        )));
+        assert_eq!(rig.controller.target(), Some(B));
+        let out = rig.send(Input::Command(Command::ReleaseControl));
+        assert_eq!(released(&out), [(B, ReleaseCause::Command)]);
+    }
+
+    #[test]
+    fn a_release_with_no_session_says_nothing() {
+        // Idle: the hotkey releases (and disarms) but there is nothing to end.
+        let mut rig = Rig::new();
+        let out = rig.send(Input::Hotkey(HotkeyEvent::Pressed { at: rig.now }));
+        assert!(released(&out).is_empty());
+        // Crossing, HUD not yet acknowledged: no session has started either.
+        let mut rig = Rig::new();
+        rig.crossing();
+        let out = rig.send(Input::Command(Command::ReleaseControl));
+        assert!(released(&out).is_empty());
+        assert_eq!(rig.controller.target(), None);
+    }
+
+    #[test]
+    fn the_other_ways_a_session_ends_are_not_releases() {
+        // The target ends it.
+        let mut rig = Rig::new();
+        let session = rig.controlling();
+        let out = rig.send(Input::Link(LinkEvent::Control {
+            peer: B,
+            msg: ControlMessage::EndControl {
+                session,
+                reason: WireEnd::Released,
+            },
+        }));
+        assert!(released(&out).is_empty());
+        assert_eq!(rig.controller.target(), None);
+        // The link drops.
+        let mut rig = Rig::new();
+        rig.controlling();
+        let out = rig.send(Input::Link(LinkEvent::Closed {
+            peer: B,
+            error: crosspane_protocol::link::LinkError::Closed,
+        }));
+        assert!(released(&out).is_empty());
+        // Panic.
+        let mut rig = Rig::new();
+        rig.controlling();
+        let out = rig.send(Input::Command(Command::Panic));
+        assert!(released(&out).is_empty());
+        assert_eq!(rig.controller.target(), None);
     }
 }

@@ -83,15 +83,35 @@ fn default_name() -> String {
         .unwrap_or_else(|| "crosspane".to_owned())
 }
 
+/// The revision of a config file (`status.result.installer.config_revision`, WP-4.5): 16 lowercase
+/// hex digits, `xxh3_64` of its bytes; all zeros for no file at all (the only zero).
+pub fn revision_of(bytes: Option<&[u8]>) -> String {
+    format!("{:016x}", bytes.map_or(0, xxhash_rust::xxh3::xxh3_64))
+}
+
 impl Config {
     pub fn load(paths: &Paths) -> Result<Config> {
+        Config::load_revision(paths).map(|(config, _)| config)
+    }
+
+    /// [`Config::load`], and the revision of the exact bytes the config was parsed from: what this
+    /// run is configured with, whatever happens to the file afterwards. No file is loaded as the
+    /// defaults (which are then saved) and has the zero revision; a file that can't be read is an
+    /// error, never the zero revision.
+    pub fn load_revision(paths: &Paths) -> Result<(Config, String)> {
         let file = paths.config_file();
-        match std::fs::read_to_string(&file) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", file.display())),
+        match std::fs::read(&file) {
+            Ok(bytes) => {
+                let text = std::str::from_utf8(&bytes)
+                    .with_context(|| format!("read {}: not valid UTF-8", file.display()))?;
+                let config =
+                    toml::from_str(text).with_context(|| format!("parse {}", file.display()))?;
+                Ok((config, revision_of(Some(&bytes))))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = Config::default();
                 config.save(paths)?;
-                Ok(config)
+                Ok((config, revision_of(None)))
             }
             Err(e) => Err(e).with_context(|| format!("read {}", file.display())),
         }
@@ -100,5 +120,107 @@ impl Config {
     pub fn save(&self, paths: &Paths) -> Result<()> {
         let text = toml::to_string_pretty(self).context("serialise config")?;
         write_private(&paths.config_file(), text.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Paths in a scratch directory of their own, removed afterwards.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Scratch {
+            let dir = std::env::temp_dir()
+                .join(format!("crosspane-config-{}-{test}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        fn paths(&self) -> Paths {
+            Paths {
+                config_dir: self.0.clone(),
+                state_dir: self.0.clone(),
+                runtime_dir: self.0.clone(),
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_revision_is_sixteen_hex_digits_of_the_bytes_and_zeros_only_for_no_file() {
+        assert_eq!(revision_of(None), "0000000000000000");
+        // The known `xxh3_64` of no bytes at all: an empty file is a file, not "no file".
+        assert_eq!(revision_of(Some(b"")), "2d06800538d394c2");
+        let one = revision_of(Some(b"name = \"desk\"\n"));
+        assert_eq!(one.len(), 16);
+        assert!(
+            one.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        );
+        assert_eq!(revision_of(Some(b"name = \"desk\"\n")), one);
+        assert_ne!(revision_of(Some(b"name = \"desktop\"\n")), one);
+    }
+
+    #[test]
+    fn the_revision_is_that_of_the_bytes_loaded_even_if_the_file_is_replaced_afterwards() {
+        let scratch = Scratch::new("replaced");
+        let paths = scratch.paths();
+        let loaded = b"name = \"loaded\"\nport = 47811\n";
+        std::fs::write(paths.config_file(), loaded).unwrap();
+        let (config, revision) = Config::load_revision(&paths).unwrap();
+        assert_eq!(config.name, "loaded");
+        assert_eq!(revision, revision_of(Some(loaded)));
+        // Someone edits the file while the agent waits for its key store (or just runs): the
+        // revision it keeps still describes what it loaded.
+        let edited = b"name = \"edited\"\nport = 47811\n";
+        std::fs::write(paths.config_file(), edited).unwrap();
+        assert_eq!(revision, revision_of(Some(loaded)));
+        assert_ne!(revision, revision_of(Some(edited)));
+        // The next start loads, and reports, the edited file.
+        let (config, next) = Config::load_revision(&paths).unwrap();
+        assert_eq!(config.name, "edited");
+        assert_eq!(next, revision_of(Some(edited)));
+    }
+
+    #[test]
+    fn no_file_loads_the_defaults_with_the_zero_revision_and_saves_them() {
+        let scratch = Scratch::new("missing");
+        let paths = scratch.paths();
+        assert!(!paths.config_file().exists());
+        let (config, revision) = Config::load_revision(&paths).unwrap();
+        assert_eq!(config.port, Config::default().port);
+        assert_eq!(revision, "0000000000000000");
+        // The defaults are saved for the next start, and `load` still works as before.
+        assert!(paths.config_file().exists());
+        assert_eq!(Config::load(&paths).unwrap().port, config.port);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_an_error_never_the_zero_revision() {
+        let scratch = Scratch::new("unreadable");
+        let paths = scratch.paths();
+        // A directory where the file should be: reading it fails, which is not "no file".
+        std::fs::create_dir(paths.config_file()).unwrap();
+        let error = Config::load_revision(&paths).unwrap_err();
+        assert!(format!("{error:#}").contains("read"), "{error:#}");
+        assert!(Config::load(&paths).is_err());
+        // Bytes that aren't text, and text that isn't a config, are errors too.
+        std::fs::remove_dir(paths.config_file()).unwrap();
+        std::fs::write(paths.config_file(), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(Config::load_revision(&paths).is_err());
+        std::fs::write(paths.config_file(), b"not = [valid").unwrap();
+        assert!(Config::load_revision(&paths).is_err());
     }
 }

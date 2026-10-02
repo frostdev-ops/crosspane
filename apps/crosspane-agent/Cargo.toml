@@ -32,6 +32,9 @@ wgpu.workspace = true
 pollster.workspace = true
 rtrb.workspace = true
 zeroize.workspace = true
+xxhash-rust.workspace = true
+# `process` (the effective uid for `status`) is a workspace feature, so it is the same on both OSes.
+rustix.workspace = true
 
 [features]
 # The owner-approved private-API module (D7): hide projected Mac windows on a CGVirtualDisplay twin.
@@ -42,7 +45,6 @@ video = ["crosspane-platform-linux/ffmpeg", "crosspane-platform-linux/cuda"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 crosspane-platform-linux = { workspace = true, features = ["gpu"] }
-rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crosspane-platform-macos = { workspace = true, features = ["gpu"] }

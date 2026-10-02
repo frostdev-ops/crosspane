@@ -1,7 +1,7 @@
 //! Session state and the I/O gate (04 §7).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::{EventSink, PlatformError};
 
@@ -70,6 +70,8 @@ pub trait SessionEvents: Send {
 pub struct IoGate {
     /// Bit 0: the session permits I/O. Bit 1: the engine permits I/O.
     flags: AtomicU8,
+    /// How many times either bit actually changed value (see [`IoGate::epoch`]).
+    epoch: AtomicU64,
 }
 
 impl IoGate {
@@ -97,11 +99,25 @@ impl IoGate {
         self.set(Self::ENGINE, permits);
     }
 
+    /// A counter that starts at 0 and goes up by one every time either side's flag actually
+    /// changes value (a redundant `set` doesn't count). It never goes down, so a poller that sees
+    /// the same value twice knows the gate did not change in between, even if it was closed and
+    /// opened again (a lock then an unlock, a panic then a re-arm) between its two looks.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
     fn set(&self, bit: u8, on: bool) {
-        if on {
-            self.flags.fetch_or(bit, Ordering::AcqRel);
+        let before = if on {
+            self.flags.fetch_or(bit, Ordering::AcqRel)
         } else {
-            self.flags.fetch_and(!bit, Ordering::AcqRel);
+            self.flags.fetch_and(!bit, Ordering::AcqRel)
+        };
+        // Both calls return the flags as they were: the bit changed exactly when it was not
+        // already at the requested value. Counted after the change, so a reader that sees the new
+        // epoch also sees the new flags.
+        if (before & bit != 0) != on {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -120,6 +136,65 @@ mod tests {
         assert!(gate.is_open());
         gate.set_session_permits(false);
         assert!(!gate.is_open());
+    }
+
+    #[test]
+    fn the_epoch_starts_at_zero_and_counts_only_real_changes() {
+        let gate = IoGate::new();
+        assert_eq!(gate.epoch(), 0);
+        // Closing a side that is already closed is nothing.
+        gate.set_session_permits(false);
+        gate.set_engine_permits(false);
+        assert_eq!(gate.epoch(), 0);
+        gate.set_session_permits(true);
+        assert_eq!(gate.epoch(), 1);
+        // Redundant sets, on either side.
+        gate.set_session_permits(true);
+        assert_eq!(gate.epoch(), 1);
+        gate.set_engine_permits(true);
+        assert_eq!(gate.epoch(), 2);
+        gate.set_engine_permits(true);
+        assert_eq!(gate.epoch(), 2);
+    }
+
+    #[test]
+    fn a_close_then_open_between_two_looks_still_advances_the_epoch() {
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        assert!(gate.is_open());
+        let seen = gate.epoch();
+        // The session locks and unlocks again: a poller that only reads `is_open` sees an open gate
+        // both times, the epoch says it was not the same gate in between.
+        gate.set_session_permits(false);
+        gate.set_session_permits(true);
+        assert!(gate.is_open());
+        assert_eq!(gate.epoch(), seen + 2);
+        // Likewise a panic then a re-arm (the engine side).
+        let seen = gate.epoch();
+        gate.set_engine_permits(false);
+        assert!(!gate.is_open());
+        gate.set_engine_permits(true);
+        assert!(gate.is_open());
+        assert_eq!(gate.epoch(), seen + 2);
+    }
+
+    #[test]
+    fn the_two_sides_have_separate_flags_but_one_epoch() {
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let seen = gate.epoch();
+        // Closing the engine side leaves the session's alone.
+        gate.set_engine_permits(false);
+        assert_eq!(gate.epoch(), seen + 1);
+        // Opening the session side again is redundant: it was never closed.
+        gate.set_session_permits(true);
+        assert_eq!(gate.epoch(), seen + 1);
+        // The epoch never goes down.
+        gate.set_engine_permits(true);
+        gate.set_session_permits(false);
+        assert!(gate.epoch() > seen + 1);
     }
 
     #[test]

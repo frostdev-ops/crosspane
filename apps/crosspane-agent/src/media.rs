@@ -62,6 +62,13 @@ struct ProxyMap {
     stats: HashMap<ProjectionKey, FrameStats>,
     /// Each peer's clock minus this node's (ns), from the agent's ping exchange.
     offsets: HashMap<NodeId, i64>,
+    /// Frames the renderer reported presented, per source peer, for projections that have since
+    /// closed: a closed projection's own counter goes with its stats, the peer's total doesn't
+    /// (WP-4.5).
+    presented_closed: HashMap<NodeId, u64>,
+    /// Whether the renderer has ever reported a presented frame. Until it does, "no frames" is
+    /// not known to be zero, only unreported (WP-4.5: the value stays `null`, never 0).
+    presented_reported: bool,
 }
 
 /// What the decoder has shown for one projection (for `crosspanectl status`).
@@ -72,6 +79,8 @@ pub struct FrameStats {
     pub last: Option<Instant>,
     /// Capture-to-decoded time, smoothed, once the peer's clock offset is known.
     pub latency_ms: Option<f64>,
+    /// Frames the renderer submitted for presentation (WP-4.5; the call site is WP-4.5a's).
+    pub presented: u64,
 }
 
 impl ProxyIds {
@@ -93,8 +102,43 @@ impl ProxyIds {
         let mut map = self.inner.lock().ok()?;
         let id = map.by_key.remove(&key)?;
         map.by_id.remove(&id);
-        map.stats.remove(&key);
+        // What this projection presented stays in its peer's total.
+        if let Some(stats) = map.stats.remove(&key)
+            && stats.presented > 0
+        {
+            *map.presented_closed.entry(key.source).or_default() += stats.presented;
+        }
         Some(id)
+    }
+
+    /// The renderer submitted one frame of `key` for presentation (WP-4.5a calls this where it
+    /// does; until it does, [`ProxyIds::presented_from`] says `None`). Counts per projection;
+    /// a frame of a projection that has closed isn't counted, as with the decoder's own stats.
+    #[allow(dead_code)]
+    pub fn presented(&self, key: ProjectionKey) {
+        if let Ok(mut map) = self.inner.lock()
+            && map.by_key.contains_key(&key)
+        {
+            map.presented_reported = true;
+            map.stats.entry(key).or_default().presented += 1;
+        }
+    }
+
+    /// Frames of projections from `source` that the renderer reported presented, in this
+    /// instance: the sum over its open projections and the ones that have closed. `None` while the
+    /// renderer has reported nothing at all (unknown, which is not the same as 0).
+    pub fn presented_from(&self, source: NodeId) -> Option<u64> {
+        let map = self.inner.lock().ok()?;
+        if !map.presented_reported {
+            return None;
+        }
+        let open: u64 = map
+            .stats
+            .iter()
+            .filter(|(key, _)| key.source == source)
+            .map(|(_, stats)| stats.presented)
+            .sum();
+        Some(map.presented_closed.get(&source).copied().unwrap_or(0) + open)
     }
 
     fn shown(&self, key: ProjectionKey, bytes: usize, captured_ns: u64) {
@@ -1298,4 +1342,67 @@ fn apply_video(
         point2((area.x + area.width) as i32, (area.y + area.height) as i32),
     );
     Ok((header, size, rect))
+}
+
+#[cfg(test)]
+mod presented_tests {
+    //! The `presented` hook (WP-4.5): a per-projection counter summed per source peer, `None`
+    //! until the renderer has reported at all, and monotonic across a projection's close.
+
+    use super::*;
+
+    fn key(source: u8, projection: u64) -> ProjectionKey {
+        ProjectionKey {
+            source: NodeId([source; 32]),
+            projection: ProjectionId(projection),
+        }
+    }
+
+    #[test]
+    fn nothing_is_known_until_the_renderer_reports() {
+        let ids = ProxyIds::default();
+        ids.open(key(1, 1));
+        assert_eq!(ids.presented_from(NodeId([1; 32])), None);
+        // A frame the decoder showed is not a presented frame.
+        ids.shown(key(1, 1), 10, 0);
+        assert_eq!(ids.presented_from(NodeId([1; 32])), None);
+        ids.presented(key(1, 1));
+        assert_eq!(ids.presented_from(NodeId([1; 32])), Some(1));
+        // Once the renderer has reported, a peer it hasn't shown anything of has 0.
+        assert_eq!(ids.presented_from(NodeId([2; 32])), Some(0));
+    }
+
+    #[test]
+    fn counts_are_summed_per_source_peer_over_its_projections() {
+        let ids = ProxyIds::default();
+        for k in [key(1, 1), key(1, 2), key(2, 1)] {
+            ids.open(k);
+        }
+        for _ in 0..3 {
+            ids.presented(key(1, 1));
+        }
+        ids.presented(key(1, 2));
+        ids.presented(key(2, 1));
+        assert_eq!(ids.presented_from(NodeId([1; 32])), Some(4));
+        assert_eq!(ids.presented_from(NodeId([2; 32])), Some(1));
+    }
+
+    #[test]
+    fn closing_a_projection_never_lowers_its_peers_total() {
+        let ids = ProxyIds::default();
+        ids.open(key(1, 1));
+        ids.presented(key(1, 1));
+        ids.presented(key(1, 1));
+        assert_eq!(ids.presented_from(NodeId([1; 32])), Some(2));
+        ids.close(key(1, 1));
+        assert_eq!(ids.presented_from(NodeId([1; 32])), Some(2));
+        // A later projection from the same peer adds to it.
+        ids.open(key(1, 2));
+        ids.presented(key(1, 2));
+        assert_eq!(ids.presented_from(NodeId([1; 32])), Some(3));
+        // A frame of a projection that is gone isn't counted.
+        ids.close(key(1, 2));
+        ids.presented(key(1, 2));
+        assert_eq!(ids.presented_from(NodeId([1; 32])), Some(3));
+    }
 }

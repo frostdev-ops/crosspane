@@ -155,12 +155,13 @@ fn load_identity(
 /// The device identity for `run`: a locked key store is waited out (the login keyring is often
 /// still locked when the agent starts at login), until it unlocks or SIGTERM or SIGINT asks the
 /// agent to stop. `None` means "stop requested while waiting": nothing was started yet, and the
-/// caller returns, so the process exits with status 0.
+/// caller returns, so the process exits with status 0. Otherwise the identity and where it came
+/// from (for `status`).
 fn load_identity_waiting(
     paths: &Paths,
     config: &Config,
     store: Option<&dyn crosspane_platform::KeyStore>,
-) -> Result<Option<DeviceIdentity>> {
+) -> Result<Option<(DeviceIdentity, keys::KeySource)>> {
     let (store, allow_file) = keystore_policy(config, store);
     let startup = keys::load_or_create_waiting(
         store,
@@ -169,7 +170,7 @@ fn load_identity_waiting(
         &mut keys::SignalPacer::new(),
     )?;
     Ok(match startup {
-        keys::Startup::Identity(identity) => Some(identity),
+        keys::Startup::Identity(identity, source) => Some((identity, source)),
         keys::Startup::Stopped => None,
     })
 }
@@ -229,7 +230,8 @@ fn request_permissions_daily(state_dir: &std::path::Path, platform: &mut platfor
 
 fn run() -> Result<()> {
     let paths = Paths::new()?;
-    let config = Config::load(&paths)?;
+    // The revision is of the very bytes this run is configured from (WP-4.5).
+    let (config, config_revision) = Config::load_revision(&paths)?;
     // One agent per user, settled before anything touches the session: creating the platform
     // recovers parked windows, which would un-hide a running agent's projections. The lock is
     // held for the life of the process (close-on-exec, so a restart in place takes it again).
@@ -251,12 +253,16 @@ fn run() -> Result<()> {
     request_permissions_daily(&paths.state_dir, &mut platform);
     // `_lock` stays held while the key store is waited for, so a second agent still refuses to
     // start.
-    let Some(identity) = load_identity_waiting(&paths, &config, platform.keystore.as_deref())?
+    let Some((identity, key_source)) =
+        load_identity_waiting(&paths, &config, platform.keystore.as_deref())?
     else {
         return Ok(());
     };
     let identity = Arc::new(identity);
     let node = identity.node();
+    // This run's id and the facts `status` reports about it (WP-4.5), fixed from here on.
+    let startup_facts =
+        agent::StartupFacts::collect(node, &paths, key_source, &config, config_revision);
     tracing::info!(node = %node, name = %config.name, "identity");
     let trust = trust::SharedTrust::load(paths.trust_file())?;
 
@@ -392,6 +398,7 @@ fn run() -> Result<()> {
         features,
         audio.map(|worker| Box::new(worker) as Box<dyn agent::AudioPlane>),
     );
+    agent.set_startup(startup_facts);
     agent.start_discovery();
     run_loop(agent, startup, rx, tx, host.map(|(host, _)| host))
 }
