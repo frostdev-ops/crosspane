@@ -148,6 +148,7 @@ const HYPRLAND_PLACEMENT: bool = cfg!(target_os = "linux");
 
 /// How often the home bind is verified while it is wanted (also at once on a config reload).
 const BIND_CHECK: Duration = Duration::from_secs(1);
+const HOME_WATCHDOG: Duration = Duration::from_millis(500);
 /// How often a startup removal that failed is tried again (amendment A1).
 const FENCE_RETRY: Duration = Duration::from_secs(2);
 /// How far, in device pixels per axis, the pointer read back after a warp may be from the point it
@@ -331,8 +332,8 @@ struct HomeNow {
 struct HomeAgent {
     /// Set by `Notice::Home { entered: true }`, cleared when home is left or fails.
     now: Option<HomeNow>,
-    /// The engine's install request in force: set when an install is verified, cleared when the
-    /// engine asks for the removal (or the bind is given up on). While set the bind is verified
+    /// The engine's install request in force: retained across failures until physical safety or
+    /// a clean capture-protected removal is verified. While set the bind is verified
     /// on every config reload and every [`BIND_CHECK`].
     wanted: Option<HomeOp>,
     /// What the agent last verified: `Some(true)` present, `Some(false)` absent, `None` unknown
@@ -353,6 +354,24 @@ struct HomeAgent {
     reload: bool,
     /// The latest failed injection and when, for the `Drain` notice.
     inject_error: Option<(Instant, String)>,
+    /// The parking backend's candidate twin displays. A fresh physical snapshot must still
+    /// exclude an ID before rescue: restore can remove the output before its journal save fails.
+    twins: BTreeMap<WindowId, DisplayId>,
+    /// Physical IDs verified through command IPC. Subscription snapshots can become empty
+    /// when their event connection is lost, even while command IPC and rescue still work.
+    physical: BTreeSet<DisplayId>,
+    /// Entering or home, from the bind transaction through its removal request.
+    active: bool,
+    /// A twin warp without a resumed E1 capture needs physical fallback verification.
+    pointer_unsafe: bool,
+    /// Capture lifecycle events distinguish a clean E1 resumption from an abandoned entry.
+    capture: Option<crosspane_platform::CaptureId>,
+    /// A1 removal deferred until the cursor is verified safe; keep its original correlation.
+    removal: Option<HomeOp>,
+    fallback: Option<(DisplayId, PointDevice)>,
+    /// One warning per continuous episode on a twin outside home.
+    rescue_reported: bool,
+    watchdog_next: Instant,
 }
 
 impl HomeAgent {
@@ -368,6 +387,15 @@ impl HomeAgent {
             last_check: Instant::now(),
             reload: false,
             inject_error: None,
+            twins: BTreeMap::new(),
+            physical: BTreeSet::new(),
+            active: false,
+            pointer_unsafe: false,
+            capture: None,
+            removal: None,
+            fallback: None,
+            rescue_reported: false,
+            watchdog_next: Instant::now(),
         }
     }
 
@@ -760,13 +788,7 @@ impl Agent {
         loop {
             self.settle();
             let now = platform::now();
-            let timeout = self
-                .engine
-                .next_deadline()
-                .map_or(HOUSEKEEPING, |deadline| {
-                    Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
-                })
-                .min(HOUSEKEEPING);
+            let timeout = self.receive_timeout(now, Instant::now());
             match events.recv_timeout(timeout) {
                 Ok(Event::Shutdown) => {
                     return Stopped {
@@ -804,6 +826,27 @@ impl Agent {
                     restart: true,
                 };
             }
+        }
+    }
+
+    /// The receive loop must wake for the watchdog even without engine deadlines or input.
+    /// Suspend its deadline while exempt; an expired deadline must never spin that loop.
+    fn receive_timeout(
+        &self,
+        now: crosspane_types::time::MonoTime,
+        clock_now: Instant,
+    ) -> Duration {
+        let timeout = self
+            .engine
+            .next_deadline()
+            .map_or(HOUSEKEEPING, |deadline| {
+                Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+            })
+            .min(HOUSEKEEPING);
+        if self.home_watchdog_needed() {
+            timeout.min(self.home.watchdog_next.saturating_duration_since(clock_now))
+        } else {
+            timeout
         }
     }
 
@@ -847,6 +890,13 @@ impl Agent {
     /// What the agent itself needs to learn from an input before the engine sees it.
     fn observe(&mut self, input: &Input) {
         match input {
+            Input::Capture(CaptureEvent::Started { id }) => self.home.capture = Some(*id),
+            Input::Capture(CaptureEvent::Ended { id, .. })
+            | Input::CaptureBegun { id, result: Err(_) }
+                if self.home.capture == Some(*id) =>
+            {
+                self.home.capture = None;
+            }
             Input::Capture(CaptureEvent::Motion { .. }) => self.capture_motion_seen = true,
             Input::Link(LinkEvent::Input {
                 peer,
@@ -1278,6 +1328,7 @@ impl Agent {
                 }
             }
             Output::EndCapture { warp_to } => {
+                self.home.capture = None;
                 if let Some(capture) = &mut self.platform.capture
                     && let Err(e) = capture.end(warp_to)
                 {
@@ -1289,6 +1340,17 @@ impl Agent {
             // warp while the gate is closed and still returns `Ok`), so the answer is built from a
             // read-back of the pointer and then the gate (amendments A3 and B2).
             Output::ReleaseAndWarp { op, warp_to } => {
+                self.home.capture = None;
+                let twin = self
+                    .home
+                    .twins
+                    .values()
+                    .any(|display| *display == warp_to.0);
+                if twin {
+                    self.home.pointer_unsafe = true;
+                } else if self.physical_display(warp_to.0) {
+                    self.home.fallback = Some(warp_to);
+                }
                 let ended = match &mut self.platform.capture {
                     Some(capture) => capture.end(Some(warp_to)).map_err(failure),
                     None => Err(Failure::Other),
@@ -1300,6 +1362,13 @@ impl Agent {
                         Err(f)
                     }
                 };
+                if !twin && matches!(result, Ok(Warp::Done)) && self.physical_display(warp_to.0) {
+                    self.home.pointer_unsafe = false;
+                    self.home.rescue_reported = false;
+                }
+                if !twin {
+                    self.home_confirm_physical();
+                }
                 self.pending
                     .push_back(Input::CaptureReleased { op, result });
             }
@@ -1373,6 +1442,7 @@ impl Agent {
                     }),
                     None => Err(Failure::Other),
                 };
+                self.home_parked(window, &result);
                 self.pending.push_back(Input::Parked { window, result });
             }
             Output::ResizeParked {
@@ -1387,6 +1457,7 @@ impl Agent {
                     }),
                     None => Err(Failure::Other),
                 };
+                self.home_parked(window, &result);
                 self.pending.push_back(Input::Parked { window, result });
             }
             Output::Restore { window } => {
@@ -1398,6 +1469,9 @@ impl Agent {
                     None => Err(PlatformError::Unsupported("no parking backend")),
                 };
                 self.tracker.restored(window, restored.is_ok());
+                if restored.is_ok() {
+                    self.home.twins.remove(&window);
+                }
             }
             Output::ActivateWindow { window } => {
                 if let Some(w) = &mut self.platform.windows
@@ -3259,6 +3333,9 @@ impl Agent {
         } else {
             crate::lifecycle::Parking::None
         };
+        // A panic's first restore may fail while the final journal recovery succeeds. Only a
+        // fresh physical read-back after that recovery permits the remaining bind cleanup.
+        self.home_shutdown();
         self.net.shutdown();
         // Last: peers already heard of the close, and the worker's stop is bounded (2.5 s) but
         // can be slower than the rest of this.
@@ -3394,9 +3471,9 @@ impl Agent {
     /// read-back (amendment B2): a closed gate is `Skipped` whatever the coordinates say, even
     /// when the gate closed between the warp and the read-back and the engine hasn't heard of the
     /// lock yet. `Done` needs an open gate and a pointer on `warp_to`'s display within
-    /// [`WARP_TOLERANCE`] of its point; a read-back that can't be made (or no Hyprland to read
-    /// from) is an error, never `Done`. `Skipped` and an error both make the engine retry the
-    /// warp once the node is unlocked and idle.
+    /// [`WARP_TOLERANCE`] of its rounded device-pixel point. Hyprland 0.56.2 floors cursorpos
+    /// in logical pixels, so scale 2 can report two device pixels below the rounded warp target.
+    /// A read-back that can't be made (or no Hyprland to read from) is an error, never `Done`.
     fn warp_result(&self, warp_to: (DisplayId, PointDevice)) -> Result<Warp, Failure> {
         let seen = self.platform.home.as_ref().map(|seat| seat.cursor());
         if !self.platform.gate.is_open() {
@@ -3406,8 +3483,8 @@ impl Agent {
             Some(Ok((on, at))) => {
                 let (want_display, want) = warp_to;
                 if on == want_display
-                    && (at.x - want.x).abs() <= WARP_TOLERANCE
-                    && (at.y - want.y).abs() <= WARP_TOLERANCE
+                    && (at.x.round() - want.x.round()).abs() <= WARP_TOLERANCE
+                    && (at.y.round() - want.y.round()).abs() <= WARP_TOLERANCE
                 {
                     Ok(Warp::Done)
                 } else {
@@ -3431,11 +3508,16 @@ impl Agent {
     /// `Output::HomeBind`: install (verified) or remove (verified absent) the release bind, and
     /// answer with `Input::HomeBindSet`.
     fn home_bind(&mut self, op: HomeOp, install: bool) {
+        self.home.active = install;
+        self.home.removal = (!install).then_some(op);
         let result = if install {
             self.home_install(op)
         } else {
             self.home_remove()
         };
+        if !install && result.is_ok() {
+            self.home.removal = None;
+        }
         self.pending.push_back(Input::HomeBindSet {
             op,
             install,
@@ -3478,7 +3560,17 @@ impl Agent {
     /// Remove the bind, never a foreign one (amendment A2, B5: that is the module's rule). `Err`
     /// keeps the engine's teardown fence up; it retries with backoff.
     fn home_remove(&mut self) -> Result<(), Failure> {
-        self.home.wanted = None;
+        // The engine's A1 teardown keeps the seat arbitrated while this answer is an error.
+        // Keep verifying/reinstalling our bind until a fallback has read back on a physical
+        // display. A2 still belongs entirely to HomeSeat::remove; no foreign bind is touched.
+        if self.home.pointer_unsafe && !self.home_capture_active() {
+            return Err(Failure::Other);
+        }
+        // A clean twin-strip exit may remove the bind while E1 owns escape, but it is not
+        // physical safety. Keep that obligation across a failed removal and capture ending.
+        if !self.home.pointer_unsafe {
+            self.home.wanted = None;
+        }
         let Some(seat) = &self.platform.home else {
             // Nothing could have been installed here.
             return Ok(());
@@ -3486,6 +3578,7 @@ impl Agent {
         let keys = seat.keys();
         match seat.remove() {
             Ok(()) => {
+                self.home.wanted = None;
                 self.home.present = Some(false);
                 // Rollback precedes HomeFailed in the engine's output list. Keep the install
                 // error until the next install so that notice can still explain the failure.
@@ -3539,6 +3632,7 @@ impl Agent {
     /// The periodic part: the startup fence's retry, and the bind's verification while it is
     /// wanted (on a config reload at once, else every [`BIND_CHECK`]).
     fn home_housekeeping(&mut self) {
+        self.home_watchdog();
         if self.home.fence && self.home.last_fence_try.elapsed() >= FENCE_RETRY {
             self.home.last_fence_try = Instant::now();
             self.home_fence_retry();
@@ -3550,6 +3644,170 @@ impl Agent {
             self.home.last_check = Instant::now();
             self.home_verify();
         }
+    }
+
+    fn home_parked(
+        &mut self,
+        window: WindowId,
+        result: &Result<crosspane_platform::Parked, Failure>,
+    ) {
+        if let Ok(parked) = result {
+            if parked.kind == crosspane_platform::ParkingKind::Twin {
+                self.home.twins.insert(window, parked.display);
+            } else {
+                self.home.twins.remove(&window);
+            }
+        }
+    }
+
+    fn physical_display(&self, display: DisplayId) -> bool {
+        (self.local_displays.iter().any(|d| d.id == display)
+            || self.home.physical.contains(&display))
+            && !self.home.twins.values().any(|twin| *twin == display)
+    }
+
+    fn home_capture_active(&self) -> bool {
+        self.home.capture.is_some() && self.engine.controlling().is_some()
+    }
+
+    /// A fallback may have moved the cursor even if end/warp confirmation failed or a lock
+    /// arrived afterwards. Bind removal needs verified physical safety, not a successful `end`.
+    fn home_confirm_physical(&mut self) {
+        self.home_confirm_physical_in(None);
+    }
+
+    /// A rescue already queried physical Displays: its single confirmation must use that exact
+    /// snapshot rather than subscription data, which can be stale or empty independently.
+    fn home_confirm_physical_in(&mut self, physical: Option<&[DisplayInfo]>) {
+        if self.home.pointer_unsafe
+            && self.platform.home.as_ref().is_some_and(|seat| {
+                seat.cursor().is_ok_and(|(on, _)| {
+                    physical.map_or_else(
+                        || self.physical_display(on),
+                        |snapshot| snapshot.iter().any(|display| display.id == on),
+                    )
+                })
+            })
+        {
+            self.home.pointer_unsafe = false;
+            self.home.rescue_reported = false;
+        }
+        self.home_finish_removal();
+    }
+
+    fn home_watchdog_needed(&self) -> bool {
+        self.platform.gate.is_open()
+            && !self.home.active
+            && !self.home_capture_active()
+            && (!self.home.twins.is_empty()
+                || self.home.pointer_unsafe
+                || self.home.removal.is_some())
+            && self.platform.home.is_some()
+    }
+
+    /// Shared by the post-warp read-back and a periodic read that already established safety.
+    fn home_finish_removal(&mut self) {
+        if !self.home.pointer_unsafe
+            && let Some(op) = self.home.removal
+        {
+            let result = self.home_remove();
+            if result.is_ok() {
+                self.home.removal = None;
+            }
+            self.pending.push_back(Input::HomeBindSet {
+                op,
+                install: false,
+                result,
+            });
+        }
+    }
+
+    fn home_fallback(&self, physical: &[DisplayInfo]) -> Option<(DisplayId, PointDevice)> {
+        self.home
+            .fallback
+            .filter(|(display, _)| physical.iter().any(|d| d.id == *display))
+            .or_else(|| {
+                // DisplayInfo has no primary flag: the first physical display is the stable,
+                // conservative default until the engine gives us its explicit fallback.
+                physical.first().map(|d| {
+                    let size = d.geometry.pixel_size;
+                    (
+                        d.id,
+                        PointDevice::new(f64::from(size.width) / 2.0, f64::from(size.height) / 2.0),
+                    )
+                })
+            })
+    }
+
+    /// The invariant backstop, independent of the engine's stranded retry budget. Event-driven
+    /// housekeeping shares this deadline: at most one classification read per 500 ms, plus one
+    /// fresh physical confirmation only when a rescue is attempted. Exempt states do no IPC.
+    fn home_watchdog(&mut self) {
+        if !self.home_watchdog_needed() || Instant::now() < self.home.watchdog_next {
+            return;
+        }
+        self.home.watchdog_next = Instant::now() + HOME_WATCHDOG;
+        let Some(Ok((on, _))) = self.platform.home.as_ref().map(|seat| seat.cursor()) else {
+            return;
+        };
+        // The read can race a lock notification: ask the shared gate again after IPC.
+        if !self.platform.gate.is_open() {
+            return;
+        }
+        if self.physical_display(on) {
+            self.home.rescue_reported = false;
+            self.home.pointer_unsafe = false;
+            self.home_finish_removal();
+            return;
+        }
+        let twin = self.home.twins.values().any(|twin| *twin == on);
+        if !twin && !self.home.pointer_unsafe && self.home.removal.is_none() {
+            return;
+        }
+        // Displays excludes CROSSPANE-* by name. Revalidate a rescue candidate against
+        // the current physical snapshot, so a hotplugged physical output reusing a cached ID
+        // can never be mistaken for the removed twin (even when journal cleanup failed). An
+        // outstanding cleanup also needs this lookup when subscription data cannot classify
+        // the cursor, including after restoring the last twin.
+        let Ok(physical) = self.platform.displays.displays() else {
+            return;
+        };
+        self.home.physical = physical.iter().map(|display| display.id).collect();
+        self.home
+            .twins
+            .retain(|_, twin| !physical.iter().any(|d| d.id == *twin));
+        if physical.iter().any(|d| d.id == on) {
+            self.home.pointer_unsafe = false;
+            self.home.rescue_reported = false;
+            self.home_finish_removal();
+            return;
+        }
+        if !twin {
+            return;
+        }
+        if !self.platform.gate.is_open() {
+            return;
+        }
+        self.home.pointer_unsafe = true;
+        if !std::mem::replace(&mut self.home.rescue_reported, true) {
+            tracing::warn!(
+                twin_display = on.0,
+                "the pointer is on a twin outside home; returning it to a physical display"
+            );
+        }
+        let Some(fallback) = self.home_fallback(&physical) else {
+            return;
+        };
+        if !self.platform.gate.is_open() {
+            return;
+        }
+        let Some(capture) = &mut self.platform.capture else {
+            return;
+        };
+        if let Err(error) = capture.end(Some(fallback)) {
+            tracing::debug!(%error, "the watchdog fallback could not be completed");
+        }
+        self.home_confirm_physical_in(Some(&physical));
     }
 
     fn home_fence_retry(&mut self) {
@@ -3597,7 +3855,9 @@ impl Agent {
                 tracing::warn!(error = %e, "the home bind was lost and could not be installed again");
                 self.home.present = None;
                 self.home.error = Some(e.to_string());
-                self.home.wanted = None;
+                if !self.home.pointer_unsafe {
+                    self.home.wanted = None;
+                }
                 self.pending.push_back(Input::HomeBindSet {
                     op,
                     install: true,
@@ -3609,6 +3869,10 @@ impl Agent {
 
     /// At stop: make sure the bind is gone, whatever became of the engine's own removal.
     fn home_shutdown(&mut self) {
+        self.home_confirm_physical();
+        if self.home.pointer_unsafe {
+            return;
+        }
         self.home.wanted = None;
         if let Some(seat) = &self.platform.home {
             match seat.remove() {
@@ -3640,6 +3904,7 @@ impl Agent {
             .checked_sub(TRAY_UPDATE)
             .unwrap_or_else(Instant::now);
         if entered {
+            self.home.active = true;
             let title = self.home_title(key);
             let peer =
                 controlling.map_or_else(|| "the other machine".to_owned(), |p| self.peer_label(p));
@@ -3653,6 +3918,7 @@ impl Agent {
                 "Input is home in {title}; {peer} stays connected; press {keys} or push past the window's edges to return"
             );
         }
+        self.home.active = false;
         let was = self.home.now.take_if(|home| home.key == key);
         match controlling {
             Some(peer) => format!("Input returned to {}", self.peer_label(peer)),
@@ -3673,6 +3939,7 @@ impl Agent {
 
     /// `Notice::HomeFailed`: one line per reason, with the agent's own detail where it has one.
     fn home_failed_notice(&mut self, key: ProjectionKey, reason: HomeFailure) -> String {
+        self.home.active = false;
         self.home.now.take_if(|home| home.key == key);
         self.tray.last_update = Instant::now()
             .checked_sub(TRAY_UPDATE)
@@ -3705,7 +3972,11 @@ impl Agent {
                 "the keyboard and pointer could not be released from the capture in time".to_owned()
             }
             HomeFailure::Warp => {
-                "the pointer could not be moved into the window (is the screen locked?)".to_owned()
+                if self.platform.gate.is_open() {
+                    "could not confirm the pointer position".to_owned()
+                } else {
+                    "could not confirm the pointer position (the input gate is closed)".to_owned()
+                }
             }
             HomeFailure::Focus => "the window did not take focus in time".to_owned(),
             HomeFailure::Guard => {
@@ -6017,6 +6288,11 @@ mod home_tests {
         installs: u32,
         removes: u32,
         checks: u32,
+        cursor_reads: u32,
+        display_reads: u32,
+        physical: Vec<DisplayInfo>,
+        restores: u32,
+        recoveries: u32,
         /// What the read-back sees; `None`: the read-back fails.
         cursor: Option<(DisplayId, PointDevice)>,
         /// Runs once, during the read-back (a lock arriving in the middle of a warp).
@@ -6082,7 +6358,11 @@ mod home_tests {
         }
 
         fn cursor(&self) -> Result<(DisplayId, PointDevice), PlatformError> {
-            let during = self.0.lock().unwrap().during_cursor.take();
+            let during = {
+                let mut c = self.0.lock().unwrap();
+                c.cursor_reads += 1;
+                c.during_cursor.take()
+            };
             if let Some(f) = during {
                 f();
             }
@@ -6095,6 +6375,21 @@ mod home_tests {
 
         fn watch_reload(&mut self, reload: Box<dyn Fn() + Send>) -> Result<(), PlatformError> {
             self.0.lock().unwrap().reload = Some(reload);
+            Ok(())
+        }
+    }
+
+    struct HomeDisplays(Shared);
+    impl crosspane_platform::Displays for HomeDisplays {
+        fn displays(&self) -> Result<Vec<DisplayInfo>, PlatformError> {
+            let mut c = self.0.lock().unwrap();
+            c.display_reads += 1;
+            Ok(c.physical.clone())
+        }
+        fn subscribe(
+            &mut self,
+            _sink: Arc<dyn EventSink<Vec<DisplayInfo>>>,
+        ) -> Result<(), PlatformError> {
             Ok(())
         }
     }
@@ -6551,6 +6846,43 @@ mod home_tests {
         check_shutdown_journals(false);
     }
 
+    /// Models an undo that removes the twin but cannot persist its journal, followed by a
+    /// successful final journal recovery that returns the cursor to a physical output.
+    struct RestoreFailureParking(Shared);
+    impl crosspane_platform::WindowParking for RestoreFailureParking {
+        fn park(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            crosspane_platform::WindowParking::park(&mut FakeParking, window, size, scale)
+        }
+        fn resize(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            self.park(window, size, scale)
+        }
+        fn geometry(&self, _window: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn restore(&mut self, _window: WindowId) -> Result<(), PlatformError> {
+            self.0.lock().unwrap().restores += 1;
+            Err(PlatformError::Backend(
+                "journal save after undo failed".into(),
+            ))
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            let mut c = self.0.lock().unwrap();
+            c.recoveries += 1;
+            c.cursor = Some((DisplayId(1), PointDevice::new(500.0, 500.0)));
+            Ok(vec![WindowId(10)])
+        }
+    }
+
     struct FakeFrames;
     impl crosspane_platform::FrameCapture for FakeFrames {
         fn start(
@@ -6595,6 +6927,7 @@ mod home_tests {
         let held = Arc::new(Mutex::new(BTreeSet::new()));
         let platform = &mut rig.agent.platform;
         platform.home = Some(Box::new(FakeHome(compositor.clone())));
+        platform.displays = Box::new(HomeDisplays(compositor.clone()));
         platform.capture = Some(Box::new(FakeCapture(capture.clone())));
         platform.keys = Some(Box::new(FakeKeys(injected.clone(), held.clone())));
         platform.pointer = Some(Box::new(FakePointer(injected.clone())));
@@ -6856,6 +7189,8 @@ mod home_tests {
         process_events(&mut h);
         let mut d = display(1, 1.0, (0.0, 0.0), (1000, 1000));
         d.geometry.physical_size = SizeMm::new(100.0, 100.0);
+        h.rig.agent.local_displays = vec![d.clone()];
+        h.compositor.lock().unwrap().physical = vec![d.clone()];
         let peer = h.rig.peer;
         h.rig
             .agent
@@ -7200,7 +7535,7 @@ mod home_tests {
             out.iter().any(|o| matches!(
                 o,
                 Output::Notice(Notice::HomeFailed {
-                    reason: HomeFailure::Release,
+                    reason: HomeFailure::Warp,
                     ..
                 })
             )),
@@ -7769,6 +8104,667 @@ mod home_tests {
         // The right place on the wrong display is not there.
         h.compositor.lock().unwrap().cursor = Some((DisplayId(1), TARGET.1));
         assert_eq!(warp(&mut h, TARGET), Ok(Warp::Skipped));
+    }
+
+    #[test]
+    fn the_logged_home_warp_is_within_two_integer_device_pixels() {
+        let mut h = home();
+        let to = (
+            DisplayId(3),
+            PointDevice::new(1202.5749006681976, 56.2041219764659),
+        );
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(3), PointDevice::new(1202.0, 54.0)));
+        assert_eq!(warp(&mut h, to), Ok(Warp::Done));
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(3), PointDevice::new(1202.0, 53.0)));
+        assert_eq!(warp(&mut h, to), Ok(Warp::Skipped));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_logged_twin_readback_converts_floored_layout_pixels_to_device_pixels() {
+        use crosspane_platform_linux::hyprland::{cursor_position, ipc::HyprIpc};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir =
+            std::env::temp_dir().join(format!("crosspane-home-cursor-{}", std::process::id()));
+        let socket_dir = dir.join("hypr/test");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let server = UnixListener::bind(socket_dir.join(".socket.sock")).unwrap();
+        let thread = std::thread::spawn(move || {
+            for (request, reply) in [
+                ("j/cursorpos", json!({"x": 1049177, "y": 27})),
+                (
+                    "j/monitors",
+                    json!([{"id": 3, "name": "CROSSPANE-a", "x": 1048576,
+                    "y": 0, "width": 1710, "height": 1200, "scale": 2, "transform": 0,
+                    "reserved": [0, 30, 0, 0]}]),
+                ),
+            ] {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut buf = [0; 128];
+                let n = stream.read(&mut buf).unwrap();
+                assert_eq!(std::str::from_utf8(&buf[..n]).unwrap(), request);
+                stream.write_all(reply.to_string().as_bytes()).unwrap();
+            }
+        });
+        let ipc = HyprIpc::new("test", &dir, Duration::from_secs(1));
+        assert_eq!(
+            cursor_position(&ipc).unwrap(),
+            (DisplayId(3), PointDevice::new(1202.0, 54.0))
+        );
+        thread.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_watchdog_rescues_a_twin_pointer_without_capture_and_uses_the_last_fallback() {
+        let mut h = projected_scenario();
+        let fallback = (DisplayId(1), PointDevice::new(123.0, 456.0));
+        h.rig.agent.home.fallback = Some(fallback);
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        let before = h.capture.lock().unwrap().ends.len();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.capture.lock().unwrap().ends[before..], [Some(fallback)]);
+        assert_eq!(h.compositor.lock().unwrap().cursor, Some(fallback));
+        assert!(h.capture.lock().unwrap().active.is_none());
+        assert!(!h.rig.agent.home.rescue_reported);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.capture.lock().unwrap().ends.len(), before + 1);
+        assert!(!h.rig.agent.home.rescue_reported);
+    }
+
+    #[test]
+    fn the_watchdog_uses_the_physical_display_center_without_an_engine_fallback() {
+        let mut h = projected_scenario();
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(
+            h.compositor.lock().unwrap().cursor,
+            Some((DisplayId(1), PointDevice::new(500.0, 500.0)))
+        );
+    }
+
+    #[test]
+    fn the_watchdog_leaves_active_home_and_entering_alone() {
+        let mut h = home_scenario();
+        let before = h.capture.lock().unwrap().ends.len();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.capture.lock().unwrap().ends.len(), before);
+        assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(7));
+        // Before focus commits, the bind transaction still marks a legitimate entry.
+        let mut h = aimed_scenario();
+        trigger(&mut h);
+        assert!(h.rig.agent.home.now.is_none());
+        assert!(h.rig.agent.home.active);
+        let before = h.capture.lock().unwrap().ends.len();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.capture.lock().unwrap().ends.len(), before);
+    }
+
+    #[test]
+    fn a_clean_home_exit_keeps_capture_until_session_end_then_the_watchdog_rescues_once() {
+        use crosspane_protocol::msg::EndReason;
+        use std::io::Write;
+
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for cause in 0..3 {
+            let logs = Arc::new(Mutex::new(Vec::new()));
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || LogWriter(writer.clone()))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let mut h = home_scenario();
+                exit_home(&mut h);
+                assert!(!h.compositor.lock().unwrap().ours);
+                assert!(h.rig.agent.home_capture_active());
+                assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(7));
+                let before = h.capture.lock().unwrap().ends.len();
+                h.rig.agent.home_housekeeping();
+                assert_eq!(h.capture.lock().unwrap().ends.len(), before);
+                assert!(!h.rig.agent.home.rescue_reported);
+                // Make the ordinary return warp unconfirmed, leaving the cursor on the twin.
+                h.capture.lock().unwrap().warp_cursor = None;
+                let session = h
+                    .rig
+                    .agent
+                    .emitted
+                    .iter()
+                    .find_map(|o| match o {
+                        Output::SendControl {
+                            msg: ControlMessage::StartControl { session, .. },
+                            ..
+                        } => Some(*session),
+                        _ => None,
+                    })
+                    .unwrap();
+                let ended = match cause {
+                    0 => Input::Command(Command::ReleaseControl),
+                    1 => control_input(
+                        h.rig.peer,
+                        ControlMessage::EndControl {
+                            session,
+                            reason: EndReason::Released,
+                        },
+                    ),
+                    _ => Input::Link(LinkEvent::Closed {
+                        peer: h.rig.peer,
+                        error: crosspane_protocol::link::LinkError::Closed,
+                    }),
+                };
+                step(&mut h, ended);
+                assert!(!h.rig.agent.home_capture_active());
+                assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(7));
+                h.capture.lock().unwrap().warp_cursor = Some(h.compositor.clone());
+                let before = h.capture.lock().unwrap().ends.len();
+                h.rig.agent.home_housekeeping();
+                assert_eq!(h.capture.lock().unwrap().ends.len(), before + 1);
+                assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+                h.rig.agent.home_housekeeping();
+                assert_eq!(h.capture.lock().unwrap().ends.len(), before + 1);
+            });
+            let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                text.matches("the pointer is on a twin outside home")
+                    .count(),
+                1,
+                "cause {cause}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_entry_keeps_its_bind_until_the_watchdog_confirms_a_physical_fallback() {
+        let mut h = aimed_scenario();
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        h.capture.lock().unwrap().warp_cursor = None;
+        let out = trigger(&mut h);
+        assert!(out.iter().any(|o| matches!(
+            o,
+            Output::Notice(Notice::HomeFailed {
+                reason: HomeFailure::Warp,
+                ..
+            })
+        )));
+        assert!(h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.wanted.is_some());
+        assert!(h.rig.agent.home.pointer_unsafe);
+        assert!(!h.rig.agent.home_capture_active());
+        assert_eq!(h.compositor.lock().unwrap().cursor, Some(TARGET));
+        h.capture.lock().unwrap().warp_cursor = Some(h.compositor.clone());
+        h.rig.agent.home_housekeeping();
+        process_events(&mut h);
+        h.rig.agent.settle();
+        assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.wanted.is_none());
+    }
+
+    #[test]
+    fn a_failed_clean_exit_removal_requires_fresh_safety_after_capture_ends() {
+        let mut h = home_scenario();
+        h.compositor.lock().unwrap().remove_error = Some("temporary removal failure".into());
+        exit_home(&mut h);
+        assert!(h.rig.agent.home_capture_active());
+        assert!(h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.removal.is_some());
+        assert!(h.rig.agent.home.pointer_unsafe);
+        h.capture.lock().unwrap().warp_cursor = None;
+        h.compositor.lock().unwrap().remove_error = None;
+        let reads = h.compositor.lock().unwrap().cursor_reads;
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert!(!h.rig.agent.home_capture_active());
+        assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(7));
+        assert!(h.compositor.lock().unwrap().cursor_reads > reads);
+        assert!(h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.removal.is_some());
+        // A failed fallback must not convert the old capture exemption into physical safety.
+        h.rig.agent.home_confirm_physical();
+        assert!(h.compositor.lock().unwrap().ours);
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(1), PointDevice::zero()));
+        h.rig.agent.home_confirm_physical();
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.removal.is_none());
+    }
+
+    #[test]
+    fn a_transient_reinstall_failure_keeps_the_unsafe_bind_obligation_and_foreign_ownership() {
+        for foreign in [false, true] {
+            let mut h = home_scenario();
+            h.capture.lock().unwrap().warp_cursor = None;
+            step(&mut h, Input::Command(Command::ReleaseControl));
+            let wanted = h.rig.agent.home.wanted;
+            assert!(wanted.is_some());
+            {
+                let mut c = h.compositor.lock().unwrap();
+                c.ours = false;
+                c.foreign = foreign;
+                if !foreign {
+                    c.install_error = Some("transient reinstall failure".into());
+                }
+            }
+            h.rig.agent.home.reload = true;
+            h.rig.agent.home_housekeeping();
+            h.rig.agent.settle();
+            assert_eq!(h.rig.agent.home.wanted, wanted);
+            assert!(!h.compositor.lock().unwrap().ours);
+            assert_eq!(h.compositor.lock().unwrap().foreign, foreign);
+            {
+                let mut c = h.compositor.lock().unwrap();
+                // The owner removes the collision; Crosspane has never removed it.
+                c.foreign = false;
+                c.install_error = None;
+            }
+            h.rig.agent.home.last_check = Instant::now() - BIND_CHECK;
+            h.rig.agent.home_housekeeping();
+            assert!(h.compositor.lock().unwrap().ours);
+            assert_eq!(h.rig.agent.home.wanted, wanted);
+            assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(7));
+        }
+    }
+
+    #[test]
+    fn shutdown_rechecks_physical_safety_after_final_parking_recovery() {
+        let mut h = home_scenario();
+        h.capture.lock().unwrap().warp_cursor = None;
+        h.rig.agent.platform.parking = Some(Box::new(RestoreFailureParking(h.compositor.clone())));
+        h.rig.agent.shutdown();
+        let c = h.compositor.lock().unwrap();
+        assert!(c.restores > 0);
+        assert_eq!(c.recoveries, 1);
+        assert_eq!(c.cursor.unwrap().0, DisplayId(1));
+        assert!(!c.ours);
+        assert!(!h.rig.agent.home.pointer_unsafe);
+        assert!(h.rig.agent.home.wanted.is_none());
+    }
+
+    #[test]
+    fn a_physical_output_reusing_a_partially_restored_twin_id_is_not_rescued_and_is_pruned() {
+        let mut h = projected_scenario();
+        h.rig.agent.platform.parking = Some(Box::new(RestoreFailureParking(h.compositor.clone())));
+        h.rig.agent.execute(vec![Output::Restore {
+            window: WindowId(10),
+        }]);
+        assert_eq!(h.compositor.lock().unwrap().restores, 1);
+        assert_eq!(
+            h.rig.agent.home.twins.get(&WindowId(10)),
+            Some(&DisplayId(7))
+        );
+        {
+            let mut c = h.compositor.lock().unwrap();
+            c.physical.push(display(7, 1.0, (0.0, 0.0), (1000, 1000)));
+            c.cursor = Some(TARGET);
+        }
+        let ends = h.capture.lock().unwrap().ends.len();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.capture.lock().unwrap().ends.len(), ends);
+        assert_eq!(h.compositor.lock().unwrap().cursor, Some(TARGET));
+        assert!(h.rig.agent.home.twins.is_empty());
+        assert!(!h.rig.agent.home.rescue_reported);
+    }
+
+    #[test]
+    fn watchdog_event_bursts_read_once_per_interval_and_rescue_reads_exactly_twice() {
+        let mut h = projected_scenario();
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(1), PointDevice::zero()));
+        let reads = h.compositor.lock().unwrap().cursor_reads;
+        let displays = h.compositor.lock().unwrap().display_reads;
+        for _ in 0..1000 {
+            h.rig.agent.home_housekeeping();
+        }
+        assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, 1);
+        assert_eq!(h.compositor.lock().unwrap().display_reads, displays);
+        h.rig.agent.home.watchdog_next = Instant::now();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, 2);
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        h.rig.agent.home.watchdog_next = Instant::now();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, 4);
+        assert_eq!(h.compositor.lock().unwrap().display_reads - displays, 1);
+        assert!(!h.rig.agent.home.rescue_reported);
+        assert!(!h.rig.agent.home.pointer_unsafe);
+    }
+
+    #[test]
+    fn every_watchdog_exemption_precedes_all_cursor_and_display_ipc() {
+        let mut home = home_scenario();
+        let mut entering = aimed_scenario();
+        trigger(&mut entering);
+        let mut captured = home_scenario();
+        exit_home(&mut captured);
+        let mut locked = projected_scenario();
+        locked.gate.set_session_permits(false);
+        for h in [&mut home, &mut entering, &mut captured, &mut locked] {
+            let reads = h.compositor.lock().unwrap().cursor_reads;
+            let displays = h.compositor.lock().unwrap().display_reads;
+            h.rig.agent.home.watchdog_next = Instant::now();
+            for _ in 0..1000 {
+                h.rig.agent.home_housekeeping();
+            }
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads, reads);
+            assert_eq!(h.compositor.lock().unwrap().display_reads, displays);
+        }
+    }
+
+    #[test]
+    fn the_receive_timeout_wakes_for_the_watchdog_and_suspends_it_while_exempt() {
+        let mut h = projected_scenario();
+        // Use the exact timeout function the receive loop calls. No earlier engine deadline
+        // should shorten this watchdog deadline in the idle projection fixture.
+        let engine_now = MonoTime::from_nanos(0);
+        let clock_now = Instant::now();
+        h.rig.agent.home.watchdog_next = clock_now + HOME_WATCHDOG;
+        assert_eq!(
+            h.rig.agent.receive_timeout(engine_now, clock_now),
+            HOME_WATCHDOG
+        );
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(engine_now, clock_now + HOME_WATCHDOG),
+            Duration::ZERO
+        );
+        // An expired watchdog is suspended in every exempt state, so it cannot busy-loop.
+        h.rig.agent.home.watchdog_next = clock_now;
+        h.rig.agent.home.active = true;
+        assert_eq!(
+            h.rig.agent.receive_timeout(engine_now, clock_now),
+            HOUSEKEEPING
+        );
+        h.rig.agent.home.active = false;
+        h.gate.set_session_permits(false);
+        assert_eq!(
+            h.rig.agent.receive_timeout(engine_now, clock_now),
+            HOUSEKEEPING
+        );
+        h.gate.set_session_permits(true);
+        h.rig.agent.home.twins.clear();
+        assert_eq!(
+            h.rig.agent.receive_timeout(engine_now, clock_now),
+            HOUSEKEEPING
+        );
+        h.rig.agent.home.pointer_unsafe = true;
+        assert_eq!(
+            h.rig.agent.receive_timeout(engine_now, clock_now),
+            Duration::ZERO
+        );
+        h.rig.agent.home.pointer_unsafe = false;
+        h.rig.agent.home.removal = Some(HomeOp(900));
+        assert_eq!(
+            h.rig.agent.receive_timeout(engine_now, clock_now),
+            Duration::ZERO
+        );
+        h.rig.agent.platform.home = None;
+        assert_eq!(
+            h.rig.agent.receive_timeout(engine_now, clock_now),
+            HOUSEKEEPING
+        );
+
+        let mut h = home_scenario();
+        exit_home(&mut h);
+        assert!(h.rig.agent.home_capture_active());
+        h.rig.agent.home.watchdog_next = clock_now + HOUSEKEEPING;
+        let engine_timeout = h.rig.agent.receive_timeout(engine_now, clock_now);
+        assert!(!engine_timeout.is_zero());
+        h.rig.agent.home.watchdog_next = clock_now;
+        assert_eq!(
+            h.rig.agent.receive_timeout(engine_now, clock_now),
+            engine_timeout,
+            "the live capture suspends the expired watchdog while keeping earlier engine deadlines"
+        );
+    }
+
+    #[test]
+    fn rescue_uses_current_physical_displays_when_subscription_data_is_empty_or_stale() {
+        for empty in [true, false] {
+            let mut h = aimed_scenario();
+            h.compositor.lock().unwrap().cursor = Some(TARGET);
+            h.capture.lock().unwrap().warp_cursor = None;
+            trigger(&mut h);
+            assert!(h.rig.agent.home.pointer_unsafe);
+            assert!(h.compositor.lock().unwrap().ours);
+            start_request(&mut h, Refusal::Busy);
+            h.rig.agent.local_displays = if empty {
+                Vec::new()
+            } else {
+                vec![display(99, 1.0, (0.0, 0.0), (1000, 1000))]
+            };
+            h.compositor.lock().unwrap().physical = vec![display(2, 1.0, (0.0, 0.0), (800, 600))];
+            h.capture.lock().unwrap().warp_cursor = Some(h.compositor.clone());
+            let reads = h.compositor.lock().unwrap().cursor_reads;
+            h.rig.agent.home.watchdog_next = Instant::now();
+            h.rig.agent.home_housekeeping();
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, 2);
+            assert_eq!(
+                h.compositor.lock().unwrap().cursor,
+                Some((DisplayId(2), PointDevice::new(400.0, 300.0)))
+            );
+            assert!(!h.rig.agent.home.pointer_unsafe);
+            assert!(!h.rig.agent.home.rescue_reported);
+            assert!(!h.compositor.lock().unwrap().ours);
+            assert!(h.rig.agent.home.removal.is_none());
+            assert!(h.rig.agent.home.wanted.is_none());
+            assert!(h.rig.agent.home.physical.contains(&DisplayId(2)));
+            h.rig.agent.settle();
+            // The same verified physical ID remains classifiable on subsequent ticks, even
+            // though the event subscription still has no usable snapshot.
+            let displays = h.compositor.lock().unwrap().display_reads;
+            let reads = h.compositor.lock().unwrap().cursor_reads;
+            h.rig.agent.home.watchdog_next = Instant::now();
+            h.rig.agent.home_housekeeping();
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, 1);
+            assert_eq!(h.compositor.lock().unwrap().display_reads, displays);
+            let out = step(
+                &mut h,
+                control_input(
+                    NodeId([3; 32]),
+                    ControlMessage::StartControl {
+                        session: crosspane_types::id::SessionId(78),
+                        entry_display: DisplayId(1),
+                        entry: PointDevice::new(1.0, 1.0),
+                        lock_keys: LockKeys::default(),
+                    },
+                ),
+            );
+            assert!(
+                out.iter().any(|output| matches!(
+                    output,
+                    Output::SendControl {
+                        msg: ControlMessage::ControlStarted { .. },
+                        ..
+                    }
+                )),
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_retries_and_last_twin_restore_still_confirm_safety_and_lift_the_fence() {
+        let mut h = aimed_scenario();
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        h.capture.lock().unwrap().warp_cursor = None;
+        trigger(&mut h);
+        for _ in 0..12 {
+            tick(&mut h, 1001);
+        }
+        assert!(
+            tick(&mut h, 5000)
+                .iter()
+                .all(|output| !matches!(output, Output::ReleaseAndWarp { .. })),
+            "the engine's stranded retry budget must be exhausted"
+        );
+        assert!(h.rig.agent.home.pointer_unsafe);
+        assert!(h.compositor.lock().unwrap().ours);
+        start_request(&mut h, Refusal::Busy);
+        let local = h.rig.local;
+        let out = step(
+            &mut h,
+            Input::Command(Command::Return(ProjectionKey {
+                source: local,
+                projection: ProjectionId(1),
+            })),
+        );
+        assert!(out.iter().any(|output| matches!(
+            output,
+            Output::Restore {
+                window: WindowId(10)
+            }
+        )));
+        assert!(h.rig.agent.home.twins.is_empty());
+        // The owner's recovery/restore moved the pointer. Keep the subscription empty too:
+        // the outstanding obligation needs a current physical lookup, with just one cursor read.
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(1), PointDevice::zero()));
+        h.rig.agent.local_displays.clear();
+        let reads = h.compositor.lock().unwrap().cursor_reads;
+        h.rig.agent.home.watchdog_next = Instant::now();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, 1);
+        assert!(!h.rig.agent.home.pointer_unsafe);
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.removal.is_none());
+        assert!(h.rig.agent.home.wanted.is_none());
+        h.rig.agent.settle();
+        let peer = NodeId([3; 32]);
+        let out = step(
+            &mut h,
+            control_input(
+                peer,
+                ControlMessage::StartControl {
+                    session: crosspane_types::id::SessionId(78),
+                    entry_display: DisplayId(1),
+                    entry: PointDevice::new(1.0, 1.0),
+                    lock_keys: LockKeys::default(),
+                },
+            ),
+        );
+        assert!(
+            out.iter().any(|output| matches!(
+                output,
+                Output::SendControl {
+                    msg: ControlMessage::ControlStarted { .. },
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        assert_eq!(h.rig.agent.engine.controlled_by(), Some(peer));
+    }
+
+    #[test]
+    fn two_twin_incidents_each_warn_without_an_intervening_physical_poll() {
+        use std::io::Write;
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || Writer(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut h = projected_scenario();
+            for _ in 0..2 {
+                h.compositor.lock().unwrap().cursor = Some(TARGET);
+                h.rig.agent.home.watchdog_next = Instant::now();
+                h.rig.agent.home_housekeeping();
+                assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+                assert!(!h.rig.agent.home.rescue_reported);
+            }
+        });
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("the pointer is on a twin outside home")
+                .count(),
+            2,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_never_warps_while_locked_or_when_the_gate_closes_during_readback() {
+        let mut h = projected_scenario();
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        h.gate.set_session_permits(false);
+        let before = h.capture.lock().unwrap().ends.len();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.capture.lock().unwrap().ends.len(), before);
+        h.gate.set_session_permits(true);
+        let gate = h.gate.clone();
+        h.compositor.lock().unwrap().during_cursor =
+            Some(Box::new(move || gate.set_session_permits(false)));
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.capture.lock().unwrap().ends.len(), before);
+        assert_eq!(h.compositor.lock().unwrap().cursor, Some(TARGET));
+    }
+
+    #[test]
+    fn the_bind_stays_verified_until_a_fallback_reads_back_on_a_physical_display() {
+        let mut h = home_scenario();
+        let fallback = (DisplayId(1), PointDevice::new(500.0, 500.0));
+        h.capture.lock().unwrap().warp_cursor = None;
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert!(h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.wanted.is_some());
+        assert!(h.rig.agent.home.pointer_unsafe);
+        // The retained shortcut is still checked and restored after a compositor reload.
+        h.compositor.lock().unwrap().ours = false;
+        h.rig.agent.home.reload = true;
+        h.rig.agent.home_housekeeping();
+        assert!(h.compositor.lock().unwrap().ours);
+        assert_eq!(bind(&mut h, 99, false), Err(Failure::Other));
+        h.capture.lock().unwrap().warp_cursor = Some(h.compositor.clone());
+        h.rig.agent.home.watchdog_next = Instant::now();
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().cursor, Some(fallback));
+        assert!(!h.rig.agent.home.pointer_unsafe);
+        tick(&mut h, 1000);
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.wanted.is_none());
+    }
+
+    #[test]
+    fn a_failed_entry_notice_names_the_confirmation_failure_and_the_actual_gate() {
+        let mut h = home();
+        let key = key(&h);
+        h.rig.agent.notice(&Notice::HomeFailed {
+            key,
+            reason: HomeFailure::Warp,
+        });
+        assert!(last_notice(&h).contains("could not confirm the pointer position"));
+        assert!(!last_notice(&h).contains("locked"));
+        assert!(!last_notice(&h).contains("gate is closed"));
+        h.gate.set_session_permits(false);
+        h.rig.agent.notice(&Notice::HomeFailed {
+            key,
+            reason: HomeFailure::Warp,
+        });
+        assert!(last_notice(&h).contains("the input gate is closed"));
     }
 
     #[test]

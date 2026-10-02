@@ -2084,7 +2084,7 @@ fn entry_aborts_on_release_err() {
     let out = h.released(op, Err(Failure::Other));
     // Abort after release, a capture may exist: the session ends, the pointer goes to the
     // fallback point, the bind is removed.
-    assert!(home_failed(&out, HomeFailure::Release), "{out:?}");
+    assert!(home_failed(&out, HomeFailure::Warp), "{out:?}");
     let removal = bind(&out, false).expect("the bind is removed");
     assert_eq!(warps(&out).len(), 1);
     assert_eq!(warps(&out)[0].1, FALLBACK);
@@ -2126,13 +2126,12 @@ fn entry_aborts_on_release_err() {
 }
 
 #[test]
-fn entry_aborts_on_warp_skipped() {
+fn entry_aborts_on_warp_skipped_with_an_open_gate_and_immediately_retries_the_fallback() {
     let mut h = H::aimed();
     let op = h.reach_releasing();
     h.advance(1);
     let out = h.released(op, Ok(Warp::Skipped));
-    // The capture is gone but the pointer was not moved: no `Returning`, the session ends, and
-    // the fallback warp is retried until it is done.
+    // A skipped warp can have moved the pointer: recover immediately with the gate open.
     assert!(home_failed(&out, HomeFailure::Warp), "{out:?}");
     assert_eq!(end_controls(&out).len(), 1);
     let leave = warp(&out).expect("the fallback warp");
@@ -2144,7 +2143,7 @@ fn entry_aborts_on_warp_skipped() {
         !has_end_capture(&out) && warps(&out).is_empty(),
         "no Returning: {out:?}"
     );
-    // The gate is still closed: the warp is skipped again, and retried every second.
+    // Confirmation still fails: retry every second while the gate remains open.
     h.released(leave.0, Ok(Warp::Skipped));
     let t = h.now_ms();
     assert!(warps(&h.tick(t + STRANDED_RETRY - 1)).is_empty());

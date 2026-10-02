@@ -1583,6 +1583,13 @@ impl ControllerE1 {
         self.activation_overflow = false;
         self.committed_exit = None;
         let failure = self.failure.take();
+        // A failed entry owns its fallback through `stranded`, including the first attempt.
+        // A skipped warp can already have moved the pointer: it never proves a closed gate.
+        let entry_stranded = home.is_some_and(|h| {
+            matches!(h.state, HomeState::Entering(Entering::Releasing { .. }))
+                && failure == Some(HomeFailure::Warp)
+                && self.stranded.is_some()
+        });
         // The point a capture that began on a twin strip, or an ended home, returns the pointer
         // to when no crossing point is given (§2.7).
         let fallback = home
@@ -1654,13 +1661,15 @@ impl ControllerE1 {
         let point = warp_to.or(fallback).filter(|_| warps);
         if live {
             match point {
-                Some(point) => {
+                Some(point) if !entry_stranded => {
                     self.release_and_warp(WarpPurpose::Leave, point, out);
                 }
+                Some(_) => out.push(Output::EndCapture { warp_to: None }),
                 None => out.push(Output::EndCapture { warp_to }),
             }
         } else if let Some(point) = point
             && (home.is_some() || capture.is_some())
+            && !entry_stranded
         {
             // Nothing to end, but the pointer may be on the invisible twin: a plain warp.
             self.release_and_warp(WarpPurpose::Leave, point, out);
@@ -2754,6 +2763,8 @@ impl ControllerE1 {
             WarpPurpose::Retry => {
                 if matches!(result, Ok(Warp::Done)) {
                     self.stranded = None;
+                } else if let Some(stranded) = &mut self.stranded {
+                    stranded.next = now.saturating_add(STRANDED_RETRY);
                 }
             }
             // The pointer was meant to stay on the twin; a warp that failed or was skipped leaves
@@ -2797,20 +2808,27 @@ impl ControllerE1 {
                     }));
                 }
             }
-            Ok(Warp::Skipped) => {
-                // The capture is gone but the pointer was not moved (the gate closed): nothing to
-                // wait for, and the fallback warp is retried once the gate reopens.
+            Ok(Warp::Skipped) | Err(_) => {
+                // The pointer may already be on the twin, even with an open gate. Account for
+                // recovery before leaving; keep a possibly-live capture fenced on an error.
                 self.stranded = Some(Stranded {
                     target: home.fallback,
                     next: now.saturating_add(STRANDED_RETRY),
                     attempts: 0,
                 });
-                if let Phase::Controlling(c) = &mut self.phase
+                if matches!(result, Ok(Warp::Skipped))
+                    && let Phase::Controlling(c) = &mut self.phase
                     && let Some(home) = &mut c.home
                 {
                     home.ended_seen = true;
                 }
                 self.leave_home(Some(HomeFailure::Warp), now, out);
+                if self.permits_io() && !self.gate_closed {
+                    if let Some(stranded) = &mut self.stranded {
+                        stranded.attempts = 1;
+                    }
+                    self.release_and_warp(WarpPurpose::Retry, home.fallback, out);
+                }
             }
             // An error, or an answer after the deadline: a capture may still exist.
             _ => self.leave_home(Some(HomeFailure::Release), now, out),
@@ -3699,6 +3717,136 @@ mod tests {
     fn teardown_backoff_doubles_to_the_cap() {
         let steps: Vec<_> = (0..9).map(|attempt| backoff(attempt).as_millis()).collect();
         assert_eq!(steps, [100, 200, 400, 800, 1600, 2000, 2000, 2000, 2000]);
+    }
+}
+
+#[cfg(test)]
+mod entry_recovery_tests {
+    use super::*;
+    use crosspane_input::layout::Placed;
+    use crosspane_types::geom::{PixelSize, PointLogical, PointMm, SizeMm};
+
+    const FALLBACK: (DisplayId, PointDevice) = (DisplayId(1), PointDevice::new(500.0, 500.0));
+
+    fn releasing() -> ControllerE1 {
+        let node = NodeId([1; 32]);
+        let peer = NodeId([2; 32]);
+        let config = EngineConfig::new(node);
+        let mut controller = ControllerE1::new(&config, MonoTime::ZERO);
+        controller.state = SessionState {
+            lock: LockState::Unlocked,
+            active: Some(true),
+        };
+        let host = GlobalDisplayId {
+            node: peer,
+            display: DisplayId(1),
+        };
+        let layout = Layout::new(
+            vec![Placed {
+                id: host,
+                geometry: DisplayGeometry {
+                    physical_size: SizeMm::new(100.0, 100.0),
+                    pixel_size: PixelSize::new(1000, 1000),
+                    scale: 1.0,
+                    logical_origin: PointLogical::zero(),
+                },
+                origin: PointMm::zero(),
+            }],
+            config.layout,
+        )
+        .unwrap();
+        controller.phase = Phase::Controlling(Control {
+            session: Session {
+                peer,
+                id: SessionId(1),
+                input_seq: 1,
+                motion_seq: 1,
+                lease: ControllerLease::new(MonoTime::ZERO),
+            },
+            capture: Capture {
+                id: CaptureId(1),
+                started: true,
+            },
+            tracker: PointerTracker::new(&layout, host, PointDevice::zero()).unwrap(),
+            hud_display: DisplayId(1),
+            home: Some(Home {
+                op: HomeOp(1),
+                peer,
+                projection: ProjectionId(1),
+                window: WindowId(1),
+                ended: CaptureId(1),
+                ended_seen: false,
+                fallback: FALLBACK,
+                bind: true,
+                display: DisplayId(1),
+                generation: 1,
+                strips_gen: 1,
+                state: HomeState::Entering(Entering::Releasing {
+                    deadline: MonoTime::from_nanos(1_000_000_000),
+                }),
+            }),
+            from_twin: false,
+            last_motion: None,
+        });
+        controller
+    }
+
+    #[test]
+    fn skipped_entry_with_an_open_gate_emits_an_immediate_stranded_retry() {
+        let mut controller = releasing();
+        let mut out = Vec::new();
+        controller.entry_released(HomeOp(1), &Ok(Warp::Skipped), MonoTime::ZERO, &mut out);
+        assert!(
+            out.iter().any(
+                |o| matches!(o, Output::ReleaseAndWarp { warp_to, .. } if *warp_to == FALLBACK)
+            )
+        );
+        assert!(
+            controller
+                .warps
+                .iter()
+                .any(|w| w.purpose == WarpPurpose::Retry && w.target == FALLBACK)
+        );
+        assert_eq!(controller.stranded.unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn skipped_entry_with_a_closed_gate_waits_for_unlock_without_spending_a_retry() {
+        let mut controller = releasing();
+        controller.state.lock = LockState::Locked;
+        let mut out = Vec::new();
+        controller.entry_released(HomeOp(1), &Ok(Warp::Skipped), MonoTime::ZERO, &mut out);
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, Output::ReleaseAndWarp { .. }))
+        );
+        assert_eq!(controller.stranded.unwrap().attempts, 0);
+        controller.state.lock = LockState::Unlocked;
+        controller.stranded_retry(MonoTime::from_nanos(2_000_000_000), &mut out);
+        assert!(
+            out.iter().any(
+                |o| matches!(o, Output::ReleaseAndWarp { warp_to, .. } if *warp_to == FALLBACK)
+            )
+        );
+    }
+
+    #[test]
+    fn entry_error_with_an_open_gate_retries_immediately_even_if_capture_may_be_live() {
+        let mut controller = releasing();
+        let mut out = Vec::new();
+        controller.entry_released(HomeOp(1), &Err(Failure::Other), MonoTime::ZERO, &mut out);
+        assert!(matches!(controller.phase, Phase::Returning { .. }));
+        assert!(
+            out.iter().any(
+                |o| matches!(o, Output::ReleaseAndWarp { warp_to, .. } if *warp_to == FALLBACK)
+            )
+        );
+        assert!(
+            controller
+                .warps
+                .iter()
+                .any(|w| w.purpose == WarpPurpose::Retry)
+        );
     }
 }
 

@@ -27,6 +27,9 @@
 #      live checklist (see the report and docs/running.md);
 #   5. the home bind round trip through the `home_bind` example (binds before and after), and the
 #      stop path: SIGTERM removes our bind and never the owner's.
+#   6. WP-2.43g: after E1 releases, place A's pointer on the known Wayland twin stand-in;
+#      the housekeeping watchdog returns it to a physical output and warns once. This does
+#      not force a failed home entry: physical entry still needs the lead's live check.
 # If the twin can't be made (P2 failed) the script checks the Mirror case instead (no home, no
 # `HomeFailed`, proxy motion received, E1 unchanged) and says so: twin coverage is then live-only
 # and is NOT reported as passed. Unknown or absent parking fails the run.
@@ -223,8 +226,10 @@ nest b hyprctl dispatch "hl.dsp.window.float({ window = \"address:$proxy\", acti
 nest b hyprctl dispatch "hl.dsp.window.resize({ window = \"address:$proxy\", x = $pw, y = $ph, relative = false })" >/dev/null
 nest b hyprctl dispatch "hl.dsp.window.move({ window = \"address:$proxy\", x = $px, y = $py, relative = false })" >/dev/null
 if [ "$parking" = Twin ]; then
-  # The source follows the proxy's size: the twin output becomes ${pw}x${ph}.
-  twin_fits() { nest a hyprctl -j monitors | jq -e --arg output "$twin_output" --argjson w "$pw" --argjson h "$ph" '.[] | select(.name == $output and .width == $w and .height == $h)' >/dev/null; }
+  # The source follows the proxy's size: the twin output becomes about ${pw}x${ph}. The proxy's
+  # placed size is B's rounding of the requested one (300x85 for a 300x84 request in a 1912x254
+  # display), so allow a pixel either way.
+  twin_fits() { nest a hyprctl -j monitors | jq -e --arg output "$twin_output" --argjson w "$pw" --argjson h "$ph" '.[] | select(.name == $output and (.width - $w | fabs) <= 1 and (.height - $h | fabs) <= 1)' >/dev/null; }
   wait_for 20 twin_fits \
     || fail "A's twin output never took the proxy's size ${pw}x${ph} in a ${bw}x${bh} display: $(nest a hyprctl -j monitors | jq -c '[.[] | {name, width, height}]')"
   echo "ok: the twin output follows B's floating proxy (${pw}x${ph} in ${bw}x${bh})"
@@ -354,6 +359,30 @@ ctl a release >/dev/null 2>&1 || true
 sleep 0.5
 echo "status after (A): $(status_json a | jq -c .home)"
 
+if [ "$parking" = Twin ]; then
+  status_json a | jq -e '.controlling == null and .home.projection == null and .installer.gate.open' >/dev/null \
+    || fail "A is not idle, out of home and unlocked for the watchdog regression"
+  read -r tx ty < <(nest a hyprctl -j monitors | jq -r --arg output "$twin_output" \
+    '.[] | select(.name == $output) | "\((.x + .width / .scale / 2) | floor) \((.y + .height / .scale / 2) | floor)"')
+  rescue_message='the pointer is on a twin outside home; returning it to a physical display'
+  warnings_before=$(grep -cF "$rescue_message" "$(clean a)" || true)
+  nest a hyprctl dispatch "hl.dsp.cursor.move({ x = $tx, y = $ty })" >/dev/null
+  cursor_is_physical() {
+    local cursor monitors
+    cursor=$(nest a hyprctl -j cursorpos) && monitors=$(nest a hyprctl -j monitors) || return 1
+    jq -en --argjson c "$cursor" --argjson monitors "$monitors" '
+      $monitors | any(.[]; (.name | startswith("CROSSPANE-") | not) and
+        $c.x >= .x and $c.x < (.x + .width / .scale) and
+        $c.y >= .y and $c.y < (.y + .height / .scale))' >/dev/null
+  }
+  wait_for 3 cursor_is_physical || fail "the watchdog left A's pointer on the twin"
+  sleep 1.2
+  warnings_after=$(grep -cF "$rescue_message" "$(clean a)" || true)
+  [ "$warnings_after" -eq $((warnings_before + 1)) ] || fail "the watchdog did not warn exactly once"
+  [ "$(bind_count a "$home_desc")" = 0 ] || fail "the watchdog installed a home bind without entry"
+  echo "ok: an idle pointer on the Wayland twin stand-in was rescued to a physical output with one warning"
+fi
+
 nest a "$bin/examples/home_bind" install --command true >/dev/null
 [ "$(bind_count a "$home_desc")" = 1 ] || fail "could not stage a bind of ours before the stop"
 stop_agent() { # stop_agent N: SIGTERM and wait
@@ -373,7 +402,7 @@ stop_agent b
 echo "ok: stopping the agent left the owner's binding alone"
 
 if [ "$parking" = Twin ]; then
-  echo "PASS: start-up and stop cleanup, twin parking, current twin strips, placement, proxy motion without observed local capture motion and no home (entry and exit are live-only)"
+  echo "PASS: start-up and stop cleanup, twin parking, current twin strips, placement, proxy motion without observed local capture motion and no home, idle twin watchdog rescue (entry and exit are live-only)"
 else
   echo "PASS (Mirror case only): twin coverage NOT exercised; the twin cases are live-only"
 fi
