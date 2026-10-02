@@ -32,6 +32,7 @@ use crosspane_platform::{
 use crosspane_protocol::link::{LinkError, LinkEvent};
 use crosspane_protocol::msg::{
     Capability, ControlMessage, EndReason, InputMessage, Placement, PointerMessage, Refusal,
+    TargetStatus,
 };
 use crosspane_protocol::projection::{ProjInput, ProjectionMessage as Message};
 use crosspane_types::color::ColorSpace;
@@ -3586,6 +3587,7 @@ enum Cause {
     PeerLost,
     LeaseLost,
     EndControlFromPeer,
+    LocalOverride,
     Panic,
     Lock,
     ReleaseCommand,
@@ -3677,6 +3679,13 @@ fn apply(h: &mut H, cause: Cause, op: HomeOp) -> Vec<Output> {
                 },
             ))
         }
+        Cause::LocalOverride => h.feed(Input::Link(LinkEvent::Input {
+            peer: B,
+            msg: InputMessage::Status {
+                session: h.session.unwrap(),
+                status: TargetStatus::LocalOverride,
+            },
+        })),
         Cause::Panic => h.feed(Input::Command(Command::Panic)),
         Cause::Lock => h.feed(locked()),
         Cause::ReleaseCommand => h.feed(Input::Command(Command::ReleaseControl)),
@@ -3717,6 +3726,7 @@ fn check_leave(cause: Cause, at: At, ended: bool) {
         cause,
         Cause::PlacementLost
             | Cause::EndControlFromPeer
+            | Cause::LocalOverride
             | Cause::ReleaseCommand
             | Cause::BindLost
             | Cause::LeaseLost
@@ -3760,6 +3770,18 @@ fn check_leave(cause: Cause, at: At, ended: bool) {
 
     // The session ended; nothing is held anywhere (quiet, below).
     assert_eq!(h.engine.controlling(), None, "{tag}: {out:?}");
+    if cause == Cause::LocalOverride {
+        assert!(
+            has_notice(&out, &Notice::LocalOverride(B)),
+            "{tag}: {out:?}"
+        );
+        assert!(
+            !notices(&out)
+                .iter()
+                .any(|n| matches!(n, Notice::ControlReleased { .. })),
+            "{tag}: {out:?}"
+        );
+    }
     let expected_end = match cause {
         Cause::PeerLost | Cause::EndControlFromPeer => None,
         Cause::LeaseLost => Some(EndReason::LinkLost),
@@ -3924,6 +3946,11 @@ fn home_lease_lost() {
 #[test]
 fn home_end_control_from_peer() {
     check_all(Cause::EndControlFromPeer);
+}
+
+#[test]
+fn home_local_override_ends_through_bind_removal_fence() {
+    check_all(Cause::LocalOverride);
 }
 
 #[test]
@@ -5995,6 +6022,151 @@ fn stranded_pointer_waits_for_the_rearm_after_a_panic() {
 
 fn ids_of(portals: &[CapturePortal]) -> Vec<PortalId> {
     portals.iter().map(|p| p.id).collect()
+}
+
+/// A controls B while the backend still has A's original A -> B strip installed. A replacement
+/// A -> C set has been offered but not answered; it reuses the original strip's id.
+fn local_override_with_pending_replacement() -> (H, Vec<CapturePortal>) {
+    let mut h = H::bare();
+    h.feed(Input::PeerDisplays {
+        peer: C,
+        displays: vec![display(1)],
+    });
+    h.feed(Input::PeerUp { peer: C });
+    h.cross();
+    h.auto_portals = false;
+    h.advance(1);
+    let out = h.feed(Input::Layout(vec![
+        Placement {
+            node: A,
+            display: LOCAL,
+            origin: PointMm::zero(),
+            version: 2,
+        },
+        Placement {
+            node: B,
+            display: REMOTE,
+            origin: PointMm::new(200.0, 0.0),
+            version: 2,
+        },
+        Placement {
+            node: C,
+            display: LOCAL,
+            origin: PointMm::new(100.0, 0.0),
+            version: 2,
+        },
+    ]));
+    let replacement = set_portals(&out).pop().expect("A -> C replacement");
+    assert_eq!(ids_of(&replacement), vec![h.layout_portal]);
+    assert_eq!(h.engine.control_established(), Some(B));
+    (h, replacement)
+}
+
+fn local_override_and_end_capture(h: &mut H) -> u64 {
+    h.advance(1);
+    let overridden_at = h.now_ms();
+    let out = h.feed(Input::Link(LinkEvent::Input {
+        peer: B,
+        msg: InputMessage::Status {
+            session: h.session.unwrap(),
+            status: TargetStatus::LocalOverride,
+        },
+    }));
+    assert!(has_notice(&out, &Notice::LocalOverride(B)), "{out:?}");
+    assert!(has_end_capture(&out), "{out:?}");
+    assert_eq!(h.engine.controlling(), None);
+    h.advance(1);
+    h.ended(h.capture.unwrap(), CaptureEnd::Requested);
+    overridden_at
+}
+
+#[test]
+fn local_override_guard_survives_rejected_replacement_and_display_refresh() {
+    let (mut h, replacement) = local_override_with_pending_replacement();
+    h.portals_set(ids_of(&replacement), Err(PortalsFailure::Rejected));
+    let overridden_at = local_override_and_end_capture(&mut h);
+    // Refreshing unchanged display data still calls update_portals. Its offered layout has
+    // A -> C, while the backend's confirmed A -> B connection remains installed.
+    h.advance(1);
+    h.feed(Input::PeerDisplays {
+        peer: B,
+        displays: vec![display(1)],
+    });
+    for at in [overridden_at + 4, overridden_at + REENTRY_GUARD - 1] {
+        let out = h.at(
+            at,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal: h.layout_portal,
+                position: 0.5,
+                at: ms(at),
+            }),
+        );
+        assert!(
+            !has_hud_show(&out) && start_control_to(&out).is_none(),
+            "{out:?}"
+        );
+        assert_eq!(h.engine.controlling(), None);
+    }
+    let at = overridden_at + REENTRY_GUARD;
+    let out = h.at(
+        at,
+        Input::Capture(CaptureEvent::EdgePressed {
+            portal: h.layout_portal,
+            position: 0.5,
+            at: ms(at),
+        }),
+    );
+    assert!(has_hud_show(&out), "{out:?}");
+    let out = h.visible();
+    assert_eq!(
+        start_control_to(&out),
+        Some(B),
+        "the rejected set did not replace B: {out:?}"
+    );
+    h.feed(Input::Command(Command::ReleaseControl));
+    h.quiet();
+}
+
+#[test]
+fn local_override_guard_covers_pending_replacement_success_without_extending_deadline() {
+    let (mut h, replacement) = local_override_with_pending_replacement();
+    let overridden_at = local_override_and_end_capture(&mut h);
+    h.advance(1);
+    h.portals_set(ids_of(&replacement), Ok(()));
+    // The formerly installed id now leads to C: a connection that did not exist at override.
+    for at in [overridden_at + 4, overridden_at + REENTRY_GUARD - 1] {
+        let out = h.at(
+            at,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal: h.layout_portal,
+                position: 0.5,
+                at: ms(at),
+            }),
+        );
+        assert!(
+            !has_hud_show(&out) && start_control_to(&out).is_none(),
+            "{out:?}"
+        );
+        assert_eq!(h.engine.controlling(), None);
+    }
+    let at = overridden_at + REENTRY_GUARD;
+    let out = h.at(
+        at,
+        Input::Capture(CaptureEvent::EdgePressed {
+            portal: h.layout_portal,
+            position: 0.5,
+            at: ms(at),
+        }),
+    );
+    assert!(has_hud_show(&out), "{out:?}");
+    let out = h.visible();
+    assert_eq!(
+        start_control_to(&out),
+        Some(C),
+        "the confirmed replacement leads to C: {out:?}"
+    );
+    h.feed(Input::Command(Command::ReleaseControl));
+    h.quiet();
 }
 
 #[test]

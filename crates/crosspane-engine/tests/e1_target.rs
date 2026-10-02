@@ -795,84 +795,72 @@ fn revocation_ends_session_but_unrelated_grants_do_not() {
 }
 
 #[test]
-fn local_override_releases_pauses_extends_and_resumes() {
+fn local_override_releases_ends_and_never_resumes() {
     let mut f = Fixture::active();
     f.handle(key(1, KEY, true), 0);
     f.handle(button(2, true), 0);
     let out = f.handle(activity(), 10);
     assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
-    assert_eq!(
-        &out[1..],
-        [
-            status(TargetStatus::LocalOverride),
-            Output::Notice(Notice::LocalOverride(PEER))
-        ]
-    );
-    assert_eq!(f.target.next_deadline(), Some(ms(1010)));
+    let mut expected = vec![status(TargetStatus::LocalOverride)];
+    expected.extend(ended(None, Notice::ControlEnded(PEER)));
+    assert_eq!(&out[1..], expected);
+    assert!(!f.target.is_controlled());
+    assert_eq!(f.target.controller(), None);
+    assert_eq!(f.target.next_deadline(), None);
+    // Journal records stay until the release is confirmed, exactly as on controller release.
+    assert_eq!(f.held(), vec![Held::Key(KEY), Held::Button(BUTTON)]);
     f.confirm(&out, true, 10);
-    for (input, seq) in [
-        (key(3, KEY2, true), 3),
-        (button(4, true), 4),
-        (key(5, KEY, false), 5),
-        (button(6, false), 6),
-        (
-            message(InputMessage::Scroll {
-                session: SESSION,
-                seq: 7,
-                delta: scroll(),
-            }),
-            7,
-        ),
-    ] {
-        assert_eq!(f.handle(input, 20), vec![ack(seq)]);
-    }
-    assert!(f.held().is_empty());
-    assert!(f.handle(motion(100), 20).is_empty());
-    let locks_out = f.handle(
+    for input in [
+        key(3, KEY2, true),
+        button(4, true),
+        key(5, KEY, false),
+        button(6, false),
+        message(InputMessage::Scroll {
+            session: SESSION,
+            seq: 7,
+            delta: scroll(),
+        }),
         message(InputMessage::LockKeys {
             session: SESSION,
             seq: 8,
             keys: locks(),
         }),
-        20,
-    );
-    assert_eq!(commands(&locks_out), vec![InjectCmd::LockKeys(locks())]);
-    assert_eq!(locks_out.last(), Some(&ack(8)));
-    assert_eq!(
-        f.handle(heartbeat(9, vec![KEY2], vec![BUTTON]), 20),
-        vec![ack(9)]
-    );
+        heartbeat(9, vec![KEY2], vec![BUTTON]),
+        motion(100),
+        end(PEER, SESSION),
+    ] {
+        assert!(f.handle(input, 20).is_empty());
+    }
+    assert!(f.held().is_empty());
     assert!(f.handle(activity(), 500).is_empty());
-    assert_eq!(f.target.next_deadline(), Some(ms(1500)));
     assert!(f.handle(Input::Tick, 1010).is_empty());
-    assert_eq!(
-        f.handle(Input::Tick, 1500),
-        vec![status(TargetStatus::Resumed)]
-    );
+    assert!(f.handle(Input::Tick, 1500).is_empty());
     assert_eq!(f.target.next_deadline(), None);
-    assert_eq!(
-        commands(&f.handle(key(10, KEY2, true), 1500)),
-        vec![InjectCmd::Key {
-            usage: KEY2,
-            down: true
-        }]
-    );
-    assert_eq!(f.handle(motion(1), 1500).len(), 1);
+    assert!(f.handle(key(10, KEY2, true), 1500).is_empty());
+    assert!(f.handle(motion(101), 1500).is_empty());
 }
 
 #[test]
-fn local_override_without_held_items_still_releases_and_reports_once() {
+fn local_override_without_held_items_still_releases_and_ends_once() {
     let mut f = Fixture::active();
     let out = f.handle(activity(), 0);
     assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
-    assert_eq!(
-        &out[1..],
-        [
-            status(TargetStatus::LocalOverride),
-            Output::Notice(Notice::LocalOverride(PEER))
-        ]
-    );
+    let mut expected = vec![status(TargetStatus::LocalOverride)];
+    expected.extend(ended(None, Notice::ControlEnded(PEER)));
+    assert_eq!(&out[1..], expected);
+    assert!(!f.target.is_controlled());
     assert!(f.handle(activity(), 1).is_empty());
+}
+
+#[test]
+fn local_activity_without_a_session_does_nothing() {
+    let mut f = Fixture::new();
+    assert!(f.handle(activity(), 0).is_empty());
+    f.ready();
+    assert!(f.handle(activity(), 1).is_empty());
+    assert!(!f.target.is_controlled());
+    assert!(f.held().is_empty());
+    assert_eq!(f.target.next_deadline(), None);
 }
 
 #[test]
@@ -1079,19 +1067,18 @@ fn release_journal_failure_ends_session_and_retries_until_recorded() {
 }
 
 #[test]
-fn deadline_is_minimum_of_lease_pause_and_retry() {
+fn local_override_clears_lease_deadline_and_keeps_release_retry() {
     let mut f = Fixture::active();
     f.handle(key(1, KEY, true), 10);
     assert_eq!(f.target.next_deadline(), Some(after_ms(310)));
     let out = f.handle(activity(), 20);
-    assert_eq!(f.target.next_deadline(), Some(ms(1020)));
+    assert_eq!(f.target.next_deadline(), None);
     f.confirm(&out, false, 20);
     assert_eq!(f.target.next_deadline(), Some(ms(70)));
     let retry = f.handle(Input::Tick, 70);
     f.confirm(&retry, true, 70);
-    assert_eq!(f.target.next_deadline(), Some(ms(1020)));
-    f.handle(Input::Tick, 1020);
     assert_eq!(f.target.next_deadline(), None);
+    assert!(f.handle(Input::Tick, 1020).is_empty());
 }
 
 #[test]
@@ -1218,23 +1205,15 @@ fn persistent_record_up_failure_cannot_form_a_completion_feedback_loop() {
 }
 
 #[test]
-fn key_after_local_override_timeout_resumes_without_a_tick() {
+fn key_after_old_local_override_timeout_cannot_resume_without_a_new_session() {
     let mut f = Fixture::active();
-    let paused = f.handle(activity(), 0);
-    f.confirm(&paused, true, 0);
+    let ended = f.handle(activity(), 0);
+    f.confirm(&ended, true, 0);
     let out = f.handle(key(1, KEY, true), 1_001);
-    assert_eq!(out.first(), Some(&status(TargetStatus::Resumed)));
-    assert_eq!(
-        commands(&out),
-        vec![InjectCmd::Key {
-            usage: KEY,
-            down: true
-        }]
-    );
-    assert_eq!(out.last(), Some(&ack(1)));
-    assert_eq!(f.held(), vec![Held::Key(KEY)]);
-    assert_eq!(f.target.next_deadline(), Some(after_ms(1_301)));
-    assert_eq!(f.handle(key(2, KEY, true), 1_002), vec![ack(2)]);
+    assert!(out.is_empty());
+    assert!(f.held().is_empty());
+    assert_eq!(f.target.next_deadline(), None);
+    assert!(f.handle(key(2, KEY, true), 1_002).is_empty());
 }
 
 #[test]

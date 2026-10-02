@@ -1713,7 +1713,9 @@ impl Agent {
             }
             Notice::ControlledBy(p) => format!("controlled by {}", peer_name(self, p)),
             Notice::ControlEnded(p) => format!("control by {} ended", peer_name(self, p)),
-            Notice::LocalOverride(p) => format!("local input overrode {}", peer_name(self, p)),
+            Notice::LocalOverride(p) => {
+                format!("{} was used locally: control returned", peer_name(self, p))
+            }
             Notice::Panic => "panic: everything stopped; re-arm to continue".to_owned(),
             Notice::ProjectionStarted { key, peer, parking } => {
                 // Parked: counted once the capture starts.

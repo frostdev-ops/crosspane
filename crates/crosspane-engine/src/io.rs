@@ -529,6 +529,7 @@ pub enum Notice {
     },
     ControlledBy(NodeId),
     ControlEnded(NodeId),
+    /// The target was used locally; its controller ended the session and returned control home.
     LocalOverride(NodeId),
     Panic,
     /// E2.

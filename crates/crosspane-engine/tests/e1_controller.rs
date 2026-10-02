@@ -1368,19 +1368,384 @@ fn ack_loss_returns_home_and_equality_reschedules_without_a_busy_loop() {
 }
 
 #[test]
-fn status_override_keeps_control_and_refusal_returns() {
+fn status_override_returns_home_releases_held_and_uses_distinct_notice() {
     let mut f = Fixture::new(config(), 2);
-    let (session, _) = f.controlling(vec![]);
-    assert_eq!(
-        f.send(discrete(
+    let (session, capture) = f.controlling(vec![]);
+    f.send(key(KEY, true, f.now));
+    f.send(button(true, f.now));
+    let out = f.feed(
+        10,
+        discrete(
             B,
             InputMessage::Status {
                 session,
-                status: TargetStatus::LocalOverride
+                status: TargetStatus::LocalOverride,
+            },
+        ),
+    );
+    assert_returns(&out);
+    assert_eq!(out.first(), Some(&Output::Notice(Notice::LocalOverride(B))));
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Output::Notice(Notice::ControlReleased { .. })))
+    );
+    let released: BTreeSet<_> = transitions(&out)
+        .into_iter()
+        .map(|(peer, s, _, held, down)| {
+            assert_eq!((peer, s, down), (B, session, false));
+            held
+        })
+        .collect();
+    assert_eq!(
+        released,
+        BTreeSet::from([Held::Key(KEY), Held::Button(MouseButton::PRIMARY)])
+    );
+    assert_end(&out, B, session, EndReason::Released);
+    assert_eq!(f.engine.established(), None);
+    assert!(f.raw(11, 10.0).is_empty());
+    assert_eq!(f.ended(12, capture), vec![Output::HideOverlay(HUD)]);
+    for input in [
+        discrete(
+            B,
+            InputMessage::Status {
+                session,
+                status: TargetStatus::LocalOverride,
+            },
+        ),
+        discrete(
+            B,
+            InputMessage::Status {
+                session,
+                status: TargetStatus::Resumed,
+            },
+        ),
+        control(
+            B,
+            ControlMessage::EndControl {
+                session,
+                reason: EndReason::Released,
+            },
+        ),
+    ] {
+        assert!(f.send(input).is_empty());
+    }
+    assert!(f.feed(1010, Input::Tick).is_empty());
+}
+
+#[test]
+fn local_override_guards_every_outgoing_portal_for_150_ms_then_allows_crossing() {
+    for destination in [B, C] {
+        let mut f = Fixture::new(config(), 3);
+        let positions = [
+            (A, PointMm::zero()),
+            (B, PointMm::new(100.0, 0.0)),
+            (C, PointMm::new(0.0, 100.0)),
+        ];
+        f.layout = Layout::new(
+            positions
+                .iter()
+                .map(|(node, origin)| Placed {
+                    id: GlobalDisplayId {
+                        node: *node,
+                        display: DisplayId(1),
+                    },
+                    geometry: display(1).geometry,
+                    origin: *origin,
+                })
+                .collect(),
+            config().layout,
+        )
+        .unwrap();
+        let to_b = f
+            .layout
+            .portals()
+            .iter()
+            .find(|p| p.from.node == A && p.to.node == B)
+            .unwrap()
+            .id;
+        let tested = f
+            .layout
+            .portals()
+            .iter()
+            .find(|p| p.from.node == A && p.to.node == destination)
+            .unwrap()
+            .id;
+        f.portal = to_b;
+        f.send(Input::Layout(
+            positions
+                .into_iter()
+                .map(|(node, origin)| Placement {
+                    node,
+                    display: DisplayId(1),
+                    origin,
+                    version: 2,
+                })
+                .collect(),
+        ));
+        f.up(C);
+        let (session, capture) = f.controlling(vec![]);
+        assert_eq!(f.engine.portals().len(), 2);
+        f.feed(
+            10,
+            discrete(
+                B,
+                InputMessage::Status {
+                    session,
+                    status: TargetStatus::LocalOverride,
+                },
+            ),
+        );
+        f.ended(11, capture);
+        // Even a release arriving within the guard cannot re-arm a portal early.
+        assert!(
+            f.feed(
+                12,
+                Input::Capture(CaptureEvent::EdgeReleased {
+                    portal: tested,
+                    at: time(12)
+                })
+            )
+            .is_empty()
+        );
+        for at in [13, 159] {
+            assert!(
+                f.feed(
+                    at,
+                    Input::Capture(CaptureEvent::EdgePressed {
+                        portal: tested,
+                        position: 0.5,
+                        at: time(at)
+                    })
+                )
+                .is_empty()
+            );
+        }
+        assert!(f.engine.armed());
+        let out = f.feed(
+            160,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal: tested,
+                position: 0.5,
+                at: time(160),
+            }),
+        );
+        assert!(shows_hud(&out));
+        let out = f.send(Input::Overlay(OverlayEvent::Visible(HUD)));
+        assert_eq!(start(&out).0, destination);
+    }
+}
+
+#[test]
+fn target_local_activity_hands_over_between_real_engines_with_every_down_released() {
+    use crosspane_engine::{Engine, InjectCmd};
+    use crosspane_input::journal::MemoryJournal;
+
+    fn deliver(from: NodeId, to: &mut Engine, out: &[Output], now: MonoTime) -> Vec<Output> {
+        let mut replies = Vec::new();
+        for output in out {
+            let event = match output {
+                Output::SendControl { msg, .. } => LinkEvent::Control {
+                    peer: from,
+                    msg: msg.clone(),
+                },
+                Output::SendInput { msg, .. } => LinkEvent::Input {
+                    peer: from,
+                    msg: msg.clone(),
+                },
+                Output::SendMotion { msg, .. } => LinkEvent::Motion {
+                    peer: from,
+                    msg: *msg,
+                },
+                _ => continue,
+            };
+            replies.extend(to.handle(Input::Link(event), now));
+        }
+        replies
+    }
+
+    fn inject(
+        engine: &mut Engine,
+        out: &[Output],
+        now: MonoTime,
+        held: &mut BTreeSet<Held>,
+        counts: &mut BTreeMap<Held, (u32, u32)>,
+    ) {
+        for output in out {
+            let Output::Inject { id, cmd } = output else {
+                continue;
+            };
+            let transition = match cmd {
+                InjectCmd::Key { usage, down } => Some((Held::Key(*usage), *down)),
+                InjectCmd::Button { button, down } => Some((Held::Button(*button), *down)),
+                InjectCmd::ReleaseAll => {
+                    for item in std::mem::take(held) {
+                        counts.entry(item).or_default().1 += 1;
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some((item, down)) = transition {
+                if down {
+                    assert!(held.insert(item), "duplicate down: {item:?}");
+                    counts.entry(item).or_default().0 += 1;
+                } else {
+                    assert!(held.remove(&item), "unpaired up: {item:?}");
+                    counts.entry(item).or_default().1 += 1;
+                }
+            }
+            assert!(
+                engine
+                    .handle(Input::InjectDone { id: *id, ok: true }, now)
+                    .is_empty()
+            );
+        }
+    }
+
+    let (mut controller, portal) = exclusive_engine_with(config());
+    let (mut target, _) = Engine::new(
+        EngineConfig::new(B),
+        Box::new(MemoryJournal::default()),
+        Box::new(MemoryJournal::default()),
+        time(0),
+    )
+    .unwrap();
+    for input in [
+        Input::LocalDisplays(vec![display(1)]),
+        Input::PeerUp { peer: A },
+        Input::Session(SessionEvent::State(PERMITTED)),
+        Input::Grants([(A, [crosspane_protocol::msg::Capability::InputAccept].into())].into()),
+    ] {
+        target.handle(input, time(0));
+    }
+    let mut held = BTreeSet::new();
+    let mut counts = BTreeMap::new();
+    let hud = controller.handle(edge_pressed(portal, time(0)), time(0));
+    assert!(shows_hud(&hud));
+    let start_out = controller.handle(Input::Overlay(OverlayEvent::Visible(HUD)), time(0));
+    let session = start(&start_out).1;
+    let accepted = deliver(A, &mut target, &start_out, time(0));
+    inject(&mut target, &accepted, time(0), &mut held, &mut counts);
+    let capture_out = deliver(B, &mut controller, &accepted, time(0));
+    let capture = capture_out
+        .iter()
+        .find_map(|o| match o {
+            Output::BeginCapture {
+                id, portal: from, ..
+            } => {
+                assert_eq!(*from, portal);
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    controller.handle(
+        Input::Capture(CaptureEvent::Started { id: capture }),
+        time(0),
+    );
+    controller.handle(
+        Input::CaptureBegun {
+            id: capture,
+            result: Ok(CaptureStart {
+                held_keys: vec![],
+                lock_keys: LockKeys::default(),
+            }),
+        },
+        time(0),
+    );
+    assert_eq!(controller.control_established(), Some(B));
+    assert_eq!(target.controlled_by(), Some(A));
+    for input in [
+        key(KEY, true, time(1)),
+        key(OTHER_KEY, true, time(1)),
+        button(true, time(1)),
+    ] {
+        let out = controller.handle(input, time(1));
+        let injected = deliver(A, &mut target, &out, time(1));
+        inject(&mut target, &injected, time(1), &mut held, &mut counts);
+        deliver(B, &mut controller, &injected, time(1));
+    }
+    assert_eq!(held.len(), 3);
+    let override_out = target.handle(
+        Input::Capture(CaptureEvent::LocalActivity { at: time(10) }),
+        time(10),
+    );
+    assert_eq!(target.controlled_by(), None);
+    assert!(override_out.contains(&Output::Notice(Notice::ControlEnded(A))));
+    assert!(
+        !override_out
+            .iter()
+            .any(|o| matches!(o, Output::Notice(Notice::LocalOverride(_))))
+    );
+    assert!(
+        override_out.iter().all(|o| !matches!(
+            o,
+            Output::Inject {
+                cmd: InjectCmd::MoveTo { .. },
+                ..
             }
         )),
-        vec![Output::Notice(Notice::LocalOverride(B))]
+        "the target keeps its physical pointer"
     );
+    inject(&mut target, &override_out, time(10), &mut held, &mut counts);
+    assert!(held.is_empty());
+    assert_eq!(
+        counts,
+        BTreeMap::from([
+            (Held::Key(KEY), (1, 1)),
+            (Held::Key(OTHER_KEY), (1, 1)),
+            (Held::Button(MouseButton::PRIMARY), (1, 1)),
+        ])
+    );
+    let returned = deliver(B, &mut controller, &override_out, time(10));
+    assert_eq!(controller.controlling(), None);
+    assert_eq!(controller.control_established(), None);
+    assert_returns(&returned);
+    assert!(returned.contains(&Output::Notice(Notice::LocalOverride(B))));
+    assert!(
+        !returned
+            .iter()
+            .any(|o| matches!(o, Output::Notice(Notice::ControlReleased { .. })))
+    );
+    assert_end(&returned, B, session, EndReason::Released);
+    // The native pointer remained parked at the capture's departing portal throughout.
+    assert!(
+        !returned
+            .iter()
+            .any(|o| matches!(o, Output::ReleaseAndWarp { .. }))
+    );
+    assert!(deliver(A, &mut target, &returned, time(10)).is_empty());
+    assert_eq!(
+        controller.handle(
+            Input::Capture(CaptureEvent::Ended {
+                id: capture,
+                reason: CaptureEnd::Requested,
+            }),
+            time(11)
+        ),
+        vec![Output::HideOverlay(HUD)]
+    );
+    assert!(
+        controller
+            .handle(edge_pressed(portal, time(12)), time(12))
+            .is_empty()
+    );
+    assert!(target.handle(Input::Tick, time(1011)).is_empty());
+    assert!(controller.handle(Input::Tick, time(1011)).is_empty());
+    assert!(
+        target
+            .handle(
+                Input::Capture(CaptureEvent::LocalActivity { at: time(1012) }),
+                time(1012)
+            )
+            .is_empty()
+    );
+}
+
+#[test]
+fn status_resumed_keeps_control_and_refusal_returns() {
+    let mut f = Fixture::new(config(), 2);
+    let (session, _) = f.controlling(vec![]);
     assert_eq!(motions(&f.raw(1, 1.0)).len(), 1);
     assert!(
         f.send(discrete(

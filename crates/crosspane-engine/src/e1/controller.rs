@@ -368,6 +368,8 @@ pub struct ControllerE1 {
     push: Option<Push>,
     // Portal IDs are regenerated on layout changes; guard the physical connection instead.
     reentry: Option<(GlobalDisplayId, GlobalDisplayId, Edge, MonoTime)>,
+    // Local handover guards every outgoing crossing, across offered/confirmed mapping changes.
+    local_override_until: Option<MonoTime>,
     // Restored portals that ignore `EdgePressed` until their first `EdgeReleased` (not the same
     // as `armed`, which is the user's crossing switch).
     disarmed: Vec<Disarmed>,
@@ -484,6 +486,7 @@ impl ControllerE1 {
             phase: Phase::Idle,
             push: None,
             reentry: None,
+            local_override_until: None,
             disarmed: Vec::new(),
             cancelled: BTreeMap::new(),
             hotkey: None,
@@ -1087,6 +1090,9 @@ impl ControllerE1 {
                 position,
                 at,
             } if matches!(self.phase, Phase::Idle) => {
+                if self.local_override_until.is_some_and(|until| now < until) {
+                    return;
+                }
                 if self.is_disarmed(*portal, now) {
                     // Restored under a stationary pointer after a target session: no push, no
                     // HUD, no handshake until the pointer leaves the strip (or the fallback).
@@ -1480,7 +1486,15 @@ impl ControllerE1 {
             {
                 match status {
                     TargetStatus::LocalOverride => {
-                        out.push(Output::Notice(Notice::LocalOverride(*peer)))
+                        // Ordinary capture leaves the pointer at its frozen departure point;
+                        // home/twin captures retain return_home's fallback and teardown rules.
+                        // Its exact departure portal is not retained. This controller-wide
+                        // 150 ms guard is the lead-approved substitute for WP-1.39's tracker
+                        // hysteresis here: portal refreshes, replacement answers and queued
+                        // releases cannot expose an unguarded connection before the deadline.
+                        self.local_override_until = Some(now.saturating_add(REENTRY_GUARD));
+                        out.push(Output::Notice(Notice::LocalOverride(*peer)));
+                        self.return_home(EndReason::Released, None, false, true, now, out);
                     }
                     TargetStatus::Refused(reason) => {
                         out.push(Output::Notice(Notice::Refused {

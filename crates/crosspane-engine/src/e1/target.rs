@@ -27,7 +27,6 @@ struct ActiveSession {
     controller: NodeId,
     session: SessionId,
     last_motion_seq: u32,
-    paused_until: Option<MonoTime>,
 }
 
 #[derive(Debug)]
@@ -47,7 +46,6 @@ pub struct TargetE1 {
     pending: BTreeMap<InjectId, Pending>,
     next_id: u64,
     now: MonoTime,
-    local_override_pause: Duration,
     recovery: Vec<Held>,
     recovery_failed: bool,
     // A completion for an earlier release must never clear a later press's journal record.
@@ -74,7 +72,7 @@ impl TargetE1 {
     /// Opens the journal; the returned outputs release whatever a crashed previous process left
     /// held (04 §8 invariant 2).
     pub fn new(
-        config: &EngineConfig,
+        _config: &EngineConfig,
         journal: Box<dyn Journal>,
         now: MonoTime,
     ) -> Result<(TargetE1, Vec<Output>), JournalError> {
@@ -92,7 +90,6 @@ impl TargetE1 {
             pending: BTreeMap::new(),
             next_id: 1,
             now,
-            local_override_pause: config.local_override_pause,
             recovery,
             recovery_failed: false,
             generations: BTreeMap::new(),
@@ -107,7 +104,6 @@ impl TargetE1 {
     /// Handle one input (every input is offered to both roles), appending outputs.
     pub fn handle(&mut self, input: &Input, now: MonoTime, out: &mut Vec<Output>) {
         self.now = now;
-        self.resume_if_due(out);
         match input {
             Input::Session(event) => {
                 match event {
@@ -168,7 +164,6 @@ impl TargetE1 {
                         controller: *peer,
                         session: *session,
                         last_motion_seq: 0,
-                        paused_until: None,
                     });
                     self.inject(
                         InjectCmd::MoveTo {
@@ -251,13 +246,12 @@ impl TargetE1 {
     }
 
     pub fn next_deadline(&self) -> Option<MonoTime> {
-        let pause = self.active.and_then(|s| s.paused_until);
         let retry = if !self.recovery.is_empty() || !self.release_retry.is_empty() {
             Some(self.now.saturating_add(RETRY_INTERVAL))
         } else {
             None
         };
-        [self.ledger.next_deadline(), pause, retry]
+        [self.ledger.next_deadline(), retry]
             .into_iter()
             .flatten()
             .min()
@@ -276,10 +270,6 @@ impl TargetE1 {
     fn matches(&self, peer: NodeId, session: SessionId) -> bool {
         self.active
             .is_some_and(|s| s.controller == peer && s.session == session)
-    }
-
-    fn paused(&self) -> bool {
-        self.active.is_some_and(|s| s.paused_until.is_some())
     }
 
     fn inject(&mut self, cmd: InjectCmd, pending: Option<Pending>, out: &mut Vec<Output>) {
@@ -399,7 +389,7 @@ impl TargetE1 {
             InputMessage::Button { button, down, .. } => {
                 self.key_or_button(Held::Button(*button), *down, out);
             }
-            InputMessage::Scroll { delta, .. } if !self.paused() => {
+            InputMessage::Scroll { delta, .. } => {
                 self.inject(InjectCmd::Scroll(*delta), None, out);
             }
             InputMessage::LockKeys { keys, .. } => {
@@ -429,7 +419,7 @@ impl TargetE1 {
     }
 
     fn key_or_button(&mut self, item: Held, down: bool, out: &mut Vec<Output>) {
-        if down && (self.paused() || !self.permits_io()) {
+        if down && !self.permits_io() {
             return;
         }
         match self.ledger.on_input(item, down, self.now) {
@@ -440,7 +430,7 @@ impl TargetE1 {
     }
 
     fn motion(&mut self, peer: NodeId, msg: &PointerMessage, out: &mut Vec<Output>) {
-        if !self.matches(peer, msg.session) || self.paused() || !self.permits_io() {
+        if !self.matches(peer, msg.session) || !self.permits_io() {
             return;
         }
         if let Some(active) = &mut self.active {
@@ -463,42 +453,23 @@ impl TargetE1 {
         let Some(active) = self.active else {
             return;
         };
-        if active.paused_until.is_none() {
-            self.release_all(true, out);
-            out.push(Output::SendInput {
-                peer: active.controller,
-                msg: InputMessage::Status {
-                    session: active.session,
-                    status: TargetStatus::LocalOverride,
-                },
-            });
-            out.push(Output::Notice(Notice::LocalOverride(active.controller)));
-        }
-        if let Some(active) = &mut self.active {
-            active.paused_until = Some(self.now.saturating_add(self.local_override_pause));
-        }
-    }
-
-    fn resume_if_due(&mut self, out: &mut Vec<Output>) {
-        if let Some(active) = &mut self.active
-            && active.paused_until.is_some_and(|until| until <= self.now)
-        {
-            active.paused_until = None;
-            out.push(Output::SendInput {
-                peer: active.controller,
-                msg: InputMessage::Status {
-                    session: active.session,
-                    status: TargetStatus::Resumed,
-                },
-            });
-        }
+        self.release_all(true, out);
+        out.push(Output::SendInput {
+            peer: active.controller,
+            msg: InputMessage::Status {
+                session: active.session,
+                status: TargetStatus::LocalOverride,
+            },
+        });
+        // The status ends control on the controller. Sending an EndControl on its separate
+        // stream as well could arrive first and hide the handover's distinct notice.
+        self.end_session(None, None, out);
     }
 
     fn tick(&mut self, out: &mut Vec<Output>) {
         for action in self.ledger.on_tick(self.now) {
             self.action(action, out);
         }
-        self.resume_if_due(out);
         if self.recovery_failed {
             self.recover(out);
         }
