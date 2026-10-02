@@ -858,12 +858,14 @@ name = "crosspane-installer"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "clap",
  "crosspane-installer-core",
  "crosspane-types",
  "crosspane-ui-kit",
  "eframe",
  "png",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

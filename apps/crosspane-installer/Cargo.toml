@@ -17,8 +17,12 @@ crosspane-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+aws-lc-rs.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crosspane-ui-kit.workspace = true
 eframe.workspace = true
 png.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
