@@ -110,6 +110,11 @@ done
 /usr/bin/plutil -insert NSLocalNetworkUsageDescription -string \
     'Crosspane connects to your other computers on the local network to share the keyboard, mouse and windows.' \
     "$plist"
+# Crosspane's audio reads the speakers loopback, which macOS counts as microphone input (AUDIO-v0
+# §4.2). No physical microphone is ever opened in v0.
+/usr/bin/plutil -insert NSMicrophoneUsageDescription -string \
+    'Crosspane passes sound that apps play to "Crosspane speakers" on to your other computer.' \
+    "$plist"
 if [[ $ui_element == true ]]; then
     /usr/bin/plutil -insert LSUIElement -bool true "$plist"
 fi

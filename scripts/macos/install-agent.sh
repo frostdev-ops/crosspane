@@ -16,7 +16,8 @@ export OPUS_LIB_DIR=${OPUS_LIB_DIR:-$(brew --prefix opus)}
 cargo build --release --locked -p crosspane-agent "$@"
 cargo build --release --locked -p crosspanectl -p crosspane-ui
 scripts/macos/bundle.sh --bin target/release/crosspane-agent --id "$label" --name Crosspane \
-    --out target/macos-bundles --ui-element --extra target/release/crosspane-ui >/dev/null
+    --out target/macos-bundles --ui-element --extra target/release/crosspane-ui \
+    --entitlements packaging/macos/crosspane-agent.entitlements >/dev/null
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/Crosspane" "$HOME/.cargo/bin"
 plist=$HOME/Library/LaunchAgents/$label.plist
 domain=gui/$(id -u)
