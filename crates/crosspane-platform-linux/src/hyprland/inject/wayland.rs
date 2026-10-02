@@ -31,7 +31,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 use xkbcommon::xkb;
 
 use super::config::{Config, Refresh, Rmlvo, Update, Watcher, snapshot_is_current};
-use super::{Action, CALL_BUDGET, Command, backend};
+use super::{Action, CALL_BUDGET, Command, InjectedPosition, backend};
 
 const TICK: Duration = Duration::from_millis(10);
 
@@ -167,6 +167,7 @@ pub(super) struct Source {
     pointers_open: bool,
     retired: bool,
     gate: Arc<IoGate>,
+    injected: Arc<InjectedPosition>,
     keyboard: Option<ZwpVirtualKeyboardV1>,
     xkb: xkb::State,
     pointers: BTreeMap<DisplayId, Pointer>,
@@ -190,6 +191,7 @@ impl Source {
     pub fn new(
         gate: Arc<IoGate>,
         config: Config,
+        injected: Arc<InjectedPosition>,
         deadline: Instant,
     ) -> Result<Self, PlatformError> {
         let connection = connect_display(deadline)?;
@@ -219,6 +221,7 @@ impl Source {
             pointers_open: true,
             retired: false,
             gate,
+            injected,
             keyboard: None,
             xkb,
             pointers: BTreeMap::new(),
@@ -633,13 +636,17 @@ impl Source {
             ));
         }
         self.allowed(deadline)?;
-        pointer.proxy.motion_absolute(
-            time_ms(),
-            (position.x * 256.0).round() as u32,
-            (position.y * 256.0).round() as u32,
-            width,
-            height,
+        let x = (position.x * 256.0).round() as u32;
+        let y = (position.y * 256.0).round() as u32;
+        // Publish before submission so a monitor reading the resulting cursor cannot mistake
+        // injected motion for local activity. Invalid, paused, or gated requests never get here.
+        self.injected.record(
+            display,
+            PointDevice::new(f64::from(x) / 256.0, f64::from(y) / 256.0),
         );
+        pointer
+            .proxy
+            .motion_absolute(time_ms(), x, y, width, height);
         pointer.proxy.frame();
         self.active = Some(display);
         Ok(())

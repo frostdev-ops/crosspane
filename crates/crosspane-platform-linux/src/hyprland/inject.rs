@@ -11,13 +11,25 @@
 //! configuration change seen since the read began, resumes it. A closed `IoGate` is independent:
 //! both must be clear to inject. A lost Wayland connection, a lost configuration watcher, or
 //! both handles being dropped, still ends the worker, whose drop releases whatever is held.
+//!
+//! **Where the pointer was put (WP-1.43).** The injection worker records the absolute position of
+//! every submitted `move_to` and when it was made, in an `InjectedPosition` that lives as long as
+//! either the worker or a local-activity monitor holds it. Hyprland offers no per-device input stream
+//! to clients, so [`HyprlandCapture`](super::capture::HyprlandCapture) tells the owner's own
+//! mouse from injected motion by comparing the cursor with this record. The injector and the
+//! capture backend are built separately, from the same [`IoGate`]; that gate is what links them
+//! (`injected_position_for`), so neither constructor changes. `move_to` is the only injection
+//! that moves the pointer (no relative motion exists on this backend, and buttons and scrolling
+//! leave the pointer where it is). The worker records the fixed-point position immediately before
+//! submitting motion to Wayland. Rejected or unqueued requests leave the record alone; a request
+//! submitted before a later timeout is still recorded because it may have moved the pointer.
 
 mod config;
 mod wayland;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{IoGate, KeyInjector, PlatformError, PointerInjector};
@@ -50,6 +62,80 @@ struct Handle {
     locks: config::LockReader,
     key_alive: Arc<AtomicBool>,
     pointer_alive: Arc<AtomicBool>,
+}
+
+/// One absolute pointer injection: where, on which display (device pixels from its top-left, the
+/// same units as [`cursor_position`](super::cursor::cursor_position)) and when.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Injection {
+    pub(super) display: DisplayId,
+    pub(super) position: PointDevice,
+    pub(super) at: Instant,
+    /// Distinguishes new submissions even at an identical point and clock timestamp.
+    pub(super) revision: u64,
+}
+
+/// The last position the pointer injector put the pointer at (module docs, WP-1.43). A short
+/// mutex: the injector writes it once per motion and the monitor reads it ten times a second.
+#[derive(Debug, Default)]
+pub(super) struct InjectedPosition {
+    last: Mutex<Option<Injection>>,
+}
+
+impl InjectedPosition {
+    /// Record an injection at `display`, `position` made now.
+    pub(super) fn record(&self, display: DisplayId, position: PointDevice) {
+        self.record_at(display, position, Instant::now());
+    }
+
+    pub(super) fn record_at(&self, display: DisplayId, position: PointDevice, at: Instant) {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let revision = last.map_or(0, |previous| previous.revision).wrapping_add(1);
+        *last = Some(Injection {
+            display,
+            position,
+            at,
+            revision,
+        });
+    }
+
+    /// The most recent injection, if the pointer was ever moved.
+    pub(super) fn last(&self) -> Option<Injection> {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Which [`InjectedPosition`] belongs to which [`IoGate`]. The weak gate keeps its allocation, so
+/// an address can't be reused while it is listed; entries whose gate or record is gone are
+/// dropped on every registration.
+type Links = Vec<(Weak<IoGate>, Weak<InjectedPosition>)>;
+static LINKS: Mutex<Links> = Mutex::new(Vec::new());
+
+fn linked(links: &Links, gate: &Arc<IoGate>) -> Option<Arc<InjectedPosition>> {
+    links
+        .iter()
+        .find(|(g, _)| std::ptr::eq(g.as_ptr(), Arc::as_ptr(gate)))
+        .and_then(|(_, injected)| injected.upgrade())
+}
+
+/// The record that the injector built with `gate` writes, made on first use: injectors on one
+/// gate share one record.
+pub(super) fn register(gate: &Arc<IoGate>) -> Arc<InjectedPosition> {
+    let mut links = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
+    links.retain(|(g, p)| g.strong_count() > 0 && p.strong_count() > 0);
+    if let Some(existing) = linked(&links, gate) {
+        return existing;
+    }
+    let fresh = Arc::new(InjectedPosition::default());
+    links.push((Arc::downgrade(gate), Arc::downgrade(&fresh)));
+    fresh
+}
+
+/// The record of the live pointer injector built with `gate`, if there is one. How the capture
+/// backend finds what the injector did without either constructor taking the other.
+pub(super) fn injected_position_for(gate: &Arc<IoGate>) -> Option<Arc<InjectedPosition>> {
+    let links = LINKS.lock().unwrap_or_else(PoisonError::into_inner);
+    linked(&links, gate)
 }
 
 enum Action {
@@ -107,6 +193,7 @@ pub fn connect(
     ipc: HyprIpc,
 ) -> Result<(HyprlandKeyInjector, HyprlandPointerInjector), PlatformError> {
     let deadline = Instant::now() + CONNECT_BUDGET;
+    let injected = register(&gate);
     let (commands, rx) = mpsc::sync_channel(32);
     let (ready, initialized) = mpsc::sync_channel(1);
     let key_alive = Arc::new(AtomicBool::new(true));
@@ -120,7 +207,7 @@ pub fn connect(
             let result = (|| {
                 let config = config::read(&worker_ipc, None, deadline)?;
                 let previous = config.keyboard_addresses.clone();
-                let source = wayland::Source::new(gate, config, deadline)?;
+                let source = wayland::Source::new(gate, config, injected, deadline)?;
                 let name = config::own_keyboard_name(&worker_ipc, &previous)?;
                 let watcher =
                     config::Watcher::new(worker_ipc, name.clone(), source.config_epoch())?;

@@ -6,13 +6,14 @@
 //! amendment B2).
 //!
 //! Two short-lived IPC requests, each bounded by the [`HyprIpc`] timeout: `cursorpos`, then
-//! `monitors`. Hyprland reports the cursor in layout (logical) coordinates, rounded to whole
+//! `monitors`. Hyprland reports the cursor in layout (logical) coordinates, floored to whole
 //! pixels, and each monitor's layout origin, panel size, scale and transform; the position on the
 //! monitor under the cursor is `(cursor - origin) * scale`. Every monitor is considered,
 //! including Crosspane's own twin outputs (`CROSSPANE-*`), which `Displays` leaves out.
 //!
-//! The reading is only as exact as Hyprland's rounding: up to half a layout pixel, which is half
-//! a scale factor in device pixels (one device pixel at scale 2).
+//! IPC also rounds scale to two decimals. `CursorProjection` keeps the geometry needed to
+//! compare injections with possible readings until a settled reading provides a baseline. That
+//! initial envelope is capped at eight device pixels per axis to preserve override sensitivity.
 
 use crosspane_platform::PlatformError;
 use crosspane_types::{geom::PointDevice, id::DisplayId};
@@ -31,12 +32,27 @@ const EDGE_SLACK: f64 = 1.0;
 /// `NotFound`: the pointer is on no monitor. `Timeout` or `Backend`: the IPC failed or answered
 /// something unusable.
 pub fn cursor_position(ipc: &HyprIpc) -> Result<(DisplayId, PointDevice), PlatformError> {
+    cursor_sample(ipc).map(|sample| (sample.display, sample.position))
+}
+
+/// The public reading plus the unreconstructed layout position and all monitor projections.
+/// Monitoring needs the injected display's geometry even if rounded IPC geometry attributes a
+/// cursor near an edge to its neighbour.
+pub(super) struct CursorSample {
+    pub(super) display: DisplayId,
+    pub(super) position: PointDevice,
+    pub(super) layout: (f64, f64),
+    pub(super) projections: Vec<CursorProjection>,
+}
+
+pub(super) fn cursor_sample(ipc: &HyprIpc) -> Result<CursorSample, PlatformError> {
     // The cursor first: the layout can only be as new as, or newer than, the position.
     let cursor = ipc.json("cursorpos")?;
     let monitors = ipc.json("monitors")?;
-    locate(&cursor, &monitors)
+    locate_sample(&cursor, &monitors)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Monitor {
     id: u32,
     x: f64,
@@ -45,6 +61,66 @@ struct Monitor {
     width: f64,
     height: f64,
     scale: f64,
+}
+
+/// Hyprland 0.56: absolute motion maps onto `round(panel_size / true_scale)` layout pixels;
+/// cursorpos floors the resulting global point, and monitor IPC serializes scale to two
+/// decimals and origin as integers. This projection accounts for those reductions without
+/// guessing precise scale, with a capped initial envelope until a settled baseline is available.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct CursorProjection(Monitor);
+
+impl CursorProjection {
+    const CAP: f64 = 8.0;
+    pub(super) fn display(&self) -> DisplayId {
+        DisplayId(self.0.id)
+    }
+
+    /// Distance outside the injection's possible reported positions, capped to eight device
+    /// pixels per axis about its nominal floored projection. Extreme scale-rounding errors can
+    /// exceed that cap; rounded IPC cannot guarantee both arbitrary-scale injection suppression
+    /// and a bounded override threshold before a baseline exists.
+    pub(super) fn injection_distance(&self, injected: PointDevice, layout: (f64, f64)) -> f64 {
+        let m = self.0;
+        let axis = |point: f64, observed: f64, origin: f64, extent: f64| {
+            // `{:.2f}` loses at most half of 0.01. next_up/down include floating-point
+            // representation error at the interval endpoints.
+            let scale_low = (m.scale - 0.005).next_down().max(f64::MIN_POSITIVE);
+            let scale_high = (m.scale + 0.005).next_up();
+            let fraction = point / extent;
+            let nominal = (origin + (extent / m.scale).round() * fraction).floor();
+            // Monitor origins are cast to int in IPC. Their true values differ by less than
+            // one layout pixel; include both signs (also valid for negative origins).
+            let low = (origin - 1.0 + (extent / scale_high).round() * fraction)
+                .next_down()
+                .floor()
+                .max(nominal - Self::CAP / m.scale);
+            let high = (origin + 1.0 + (extent / scale_low).round() * fraction)
+                .next_up()
+                .floor()
+                .min(nominal + Self::CAP / m.scale);
+            // Compare the retained IPC layout point before the public device reconstruction's
+            // edge clamp. Thus that clamp cannot hide or introduce a difference at either edge.
+            (low - observed).max(observed - high).max(0.0) * m.scale
+        };
+        axis(injected.x, layout.0, m.x, m.width).hypot(axis(injected.y, layout.1, m.y, m.height))
+    }
+
+    /// The complete pre-baseline tolerance, including the normal divergence threshold, cannot
+    /// conceal a movement beyond the cap along either axis.
+    pub(super) fn outside_injection_cap(&self, injected: PointDevice, layout: (f64, f64)) -> bool {
+        let m = self.0;
+        let outside = |point: f64, observed: f64, origin: f64, extent: f64| {
+            let fraction = point / extent;
+            let nominal = (origin + (extent / m.scale).round() * fraction).floor();
+            (observed - nominal).abs() * m.scale > Self::CAP
+        };
+        outside(injected.x, layout.0, m.x, m.width) || outside(injected.y, layout.1, m.y, m.height)
+    }
+
+    pub(super) fn observation_distance(&self, before: (f64, f64), now: (f64, f64)) -> f64 {
+        (before.0 - now.0).hypot(before.1 - now.1) * self.0.scale
+    }
 }
 
 impl Monitor {
@@ -95,7 +171,15 @@ impl Monitor {
 }
 
 /// The pure part of [`cursor_position`], for the unit tests.
+#[cfg(test)]
 fn locate(cursor: &Value, monitors: &Value) -> Result<(DisplayId, PointDevice), PlatformError> {
+    locate_sample(cursor, monitors).map(|sample| (sample.display, sample.position))
+}
+
+pub(super) fn locate_sample(
+    cursor: &Value,
+    monitors: &Value,
+) -> Result<CursorSample, PlatformError> {
     let coordinate = |key: &str| {
         cursor
             .get(key)
@@ -108,8 +192,10 @@ fn locate(cursor: &Value, monitors: &Value) -> Result<(DisplayId, PointDevice), 
         .as_array()
         .ok_or_else(|| PlatformError::Backend("hyprland monitors: not a list".into()))?;
     let mut best: Option<(f64, Monitor)> = None;
+    let mut projections = Vec::with_capacity(list.len());
     for m in list {
         let m = Monitor::parse(m)?;
+        projections.push(CursorProjection(m));
         let distance = m.distance(x, y);
         // The nearest monitor wins; a point inside one (half-open) beats one that merely touches it.
         if best.as_ref().is_none_or(|(d, _)| distance < *d) {
@@ -123,10 +209,12 @@ fn locate(cursor: &Value, monitors: &Value) -> Result<(DisplayId, PointDevice), 
     let device = |layout: f64, origin: f64, extent: f64| {
         ((layout - origin) * m.scale).clamp(0.0, extent - 1.0)
     };
-    Ok((
-        DisplayId(m.id),
-        PointDevice::new(device(x, m.x, m.width), device(y, m.y, m.height)),
-    ))
+    Ok(CursorSample {
+        display: DisplayId(m.id),
+        position: PointDevice::new(device(x, m.x, m.width), device(y, m.y, m.height)),
+        layout: (x, y),
+        projections,
+    })
 }
 
 #[cfg(test)]
@@ -146,6 +234,117 @@ mod tests {
 
     fn at(x: i64, y: i64) -> Result<(DisplayId, PointDevice), PlatformError> {
         locate(&json!({"x": x, "y": y}), &monitors())
+    }
+
+    #[test]
+    fn injection_projection_bounds_fractional_scale_and_edge_readings() {
+        for scale in [4.0 / 3.0, 1.5, 1.25, 0.5, 3.0, 4.25, 16.0] {
+            let reported: f64 = format!("{scale:.2}").parse().unwrap();
+            for (width, height) in [(1920.0, 1080.0), (1080.0, 1920.0), (511.0, 333.0)] {
+                let projection = CursorProjection(Monitor {
+                    id: 0,
+                    x: -950.0,
+                    y: 600.0,
+                    width,
+                    height,
+                    scale: reported,
+                });
+                for point in [
+                    PointDevice::new(0.0, 0.0),
+                    PointDevice::new(width - 1.0 / 256.0, height - 1.0 / 256.0),
+                    PointDevice::new(width * 0.78125, height * 0.46296296296),
+                ] {
+                    let layout = (
+                        (-950.0 + (width / scale).round() * point.x / width).floor(),
+                        (600.0 + (height / scale).round() * point.y / height).floor(),
+                    );
+                    assert_eq!(
+                        projection.injection_distance(point, layout),
+                        0.0,
+                        "scale {scale}, extent {width}x{height}, point {point:?}, reading {layout:?}"
+                    );
+                    assert!(
+                        projection.injection_distance(point, (layout.0 + 100.0, layout.1 + 100.0))
+                            > 3.0,
+                        "real divergence disappeared at scale {scale}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn injection_projection_cap_applies_throughout_two_decimal_scale_buckets() {
+        // The implementation derives its envelope from a positive scale interval, rather than
+        // recognizing particular scales. Probe rounding endpoints throughout and beyond the
+        // usual scale range, negative/fractional origins and fixed-point edges.
+        for cents in (1..=6400).step_by(7) {
+            for offset in [-0.004999999, 0.0, 0.004999999] {
+                let scale = f64::from(cents) / 100.0 + offset;
+                let reported: f64 = format!("{scale:.2}").parse().unwrap();
+                for origin in [-950.9_f64, -0.9, 0.9, 1048576.9] {
+                    let projection = CursorProjection(Monitor {
+                        id: 0,
+                        x: origin.trunc(),
+                        y: origin.trunc(),
+                        width: 3840.0,
+                        height: 2160.0,
+                        scale: reported,
+                    });
+                    for point in [
+                        PointDevice::new(0.0, 0.0),
+                        PointDevice::new(1500.0, 500.0),
+                        PointDevice::new(3839.99609375, 2159.99609375),
+                    ] {
+                        let layout = (
+                            (origin + (3840.0 / scale).round() * point.x / 3840.0).floor(),
+                            (origin + (2160.0 / scale).round() * point.y / 2160.0).floor(),
+                        );
+                        let distance = projection.injection_distance(point, layout);
+                        if projection.outside_injection_cap(point, layout) {
+                            assert!(distance > 0.0, "uncertainty exceeded cap at scale {scale}");
+                        } else {
+                            assert_eq!(
+                                distance, 0.0,
+                                "scale {scale}, origin {origin}, point {point:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn injection_projection_caps_each_axis_at_eight_device_pixels() {
+        let projection = CursorProjection(Monitor {
+            id: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 7680.0,
+            height: 4320.0,
+            scale: 0.25,
+        });
+        let point = PointDevice::new(7000.0, 2000.0);
+        for layout in [
+            (28032.0, 8000.0),
+            (27968.0, 8000.0),
+            (28000.0, 8032.0),
+            (28000.0, 7968.0),
+        ] {
+            assert_eq!(projection.injection_distance(point, layout), 0.0);
+            assert!(!projection.outside_injection_cap(point, layout));
+        }
+        for layout in [
+            (28033.0, 8000.0),
+            (27967.0, 8000.0),
+            (28000.0, 8033.0),
+            (28000.0, 7967.0),
+            (28400.0, 8000.0),
+        ] {
+            assert!(projection.injection_distance(point, layout) > 0.0);
+            assert!(projection.outside_injection_cap(point, layout));
+        }
     }
 
     #[test]

@@ -27,10 +27,24 @@
 //! message starts with [`PORTALS_REJECTED`] and leaves the previous set and any capture intact;
 //! everything else (the caller's bare [`PlatformError::Timeout`], a worker that is gone, an abort,
 //! a lost connection) leaves their fate unknown.
+//!
+//! **Local activity (WP-1.43, [`InputCapture::set_monitor_local_activity`]).** Hyprland gives
+//! clients no per-device input stream, so while monitoring is on a thread of its own (it uses no
+//! Wayland connection and none of the capture machinery above) reads the pointer over the
+//! compositor's IPC every 100 ms and reports [`CaptureEvent::LocalActivity`] when the pointer is
+//! somewhere the pointer injector did not put it: the injector records every absolute position it
+//! injects ([`super::inject`]), and the monitor reports when the pointer has moved since its
+//! previous reading, is more than 3 device pixels (or a display) away from the last injected
+//! position, and the last injection is older than 150 ms, at most once per 500 ms. Injected motion
+//! therefore never counts, so the device already driving a session cannot take it back. It stops
+//! on `false`, on drop and when the compositor goes away, and never reads while monitoring is off.
+//! **Keyboard-only local input is not detected**: best effort, pointer only. See the
+//! `local_activity` module below for the exact rules.
 mod events;
 mod wayland;
 use wayland::Refresh;
 
+use super::inject::injected_position_for;
 use super::ipc::HyprIpc;
 use crosspane_platform::{
     CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, EndReason, EventSink,
@@ -188,22 +202,30 @@ impl Source {
             }
         }
     }
-    /// Hyprland's IPC for the same compositor.
-    fn ipc(&self, timeout: Duration) -> Result<HyprIpc, PlatformError> {
+    /// The runtime directory and instance signature of the same compositor.
+    fn instance(&self) -> Result<(PathBuf, String), PlatformError> {
         match self {
             Source::Environment => {
                 let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
                     .map_err(|_| PlatformError::Unsupported("not under Hyprland"))?;
                 let runtime = std::env::var_os("XDG_RUNTIME_DIR")
                     .ok_or(PlatformError::Unsupported("no runtime directory"))?;
-                Ok(HyprIpc::new(&signature, &PathBuf::from(runtime), timeout))
+                Ok((PathBuf::from(runtime), signature))
             }
-            Source::Pinned(endpoint) => Ok(HyprIpc::new(
-                &endpoint.signature,
-                &endpoint.runtime_dir,
-                timeout,
-            )),
+            Source::Pinned(endpoint) => {
+                Ok((endpoint.runtime_dir.clone(), endpoint.signature.clone()))
+            }
         }
+    }
+    /// Hyprland's IPC for the same compositor.
+    fn ipc(&self, timeout: Duration) -> Result<HyprIpc, PlatformError> {
+        let (runtime, signature) = self.instance()?;
+        Ok(HyprIpc::new(&signature, &runtime, timeout))
+    }
+    /// The instance's `hyprland.lock`, whose first line is the compositor's process id.
+    fn lock_path(&self) -> Result<PathBuf, PlatformError> {
+        let (runtime, signature) = self.instance()?;
+        Ok(runtime.join("hypr").join(signature).join("hyprland.lock"))
     }
 }
 
@@ -388,6 +410,17 @@ pub struct HyprlandCapture {
     /// The verified nest endpoint this backend is connected to, if it was built for a nested test
     /// ([`Self::new_for_nest_test`]). `None` for every production backend: the test hooks refuse it.
     nest: Option<Endpoint>,
+    /// Local-activity monitoring (WP-1.43): the gate that links this backend to the pointer
+    /// injector, the compositor to poll, the subscriber to report to, and the running monitor.
+    /// The monitor is stopped and joined when the handle drops (after `drop` has aborted the
+    /// capture, so it never delays that).
+    gate: Arc<IoGate>,
+    source: Source,
+    sink: Option<Arc<dyn EventSink<CaptureEvent>>>,
+    activity_delivery: mpsc::Sender<Delivery>,
+    monitor: Option<local_activity::Monitor>,
+    #[cfg(test)]
+    monitor_source: Option<local_activity::SourceFactory>,
 }
 impl fmt::Debug for HyprlandCapture {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -447,6 +480,10 @@ pub(super) enum Delivery {
         locks: LockKeys,
         ready: mpsc::Sender<()>,
     },
+    LocalActivity {
+        at: crosspane_types::time::MonoTime,
+        generation: Arc<local_activity::Generation>,
+    },
 }
 /// Controlled interference with one `set_portals`, for the nested-compositor tests
 /// ([`HyprlandCapture::set_portals_for_test`]). Everything is off by default.
@@ -488,6 +525,19 @@ struct Command {
     reply: mpsc::Sender<Result<Reply, PlatformError>>,
 }
 impl HyprlandCapture {
+    fn local_activity_source(&mut self) -> Result<local_activity::CursorSource, PlatformError> {
+        #[cfg(test)]
+        if let Some(factory) = &mut self.monitor_source {
+            return Ok(factory());
+        }
+        let ipc = self.source.ipc(local_activity::IPC_TIMEOUT)?;
+        let lock = self.source.lock_path()?;
+        Ok(local_activity::CursorSource {
+            reader: local_activity::cursor_reader(ipc),
+            alive: local_activity::compositor_alive(lock),
+            clock: Arc::new(local_activity::SystemClock::default()),
+        })
+    }
     /// Connect to `$WAYLAND_DISPLAY`; strips are created per portal on `set_portals`. The test
     /// hooks refuse a backend made here, whatever the environment says.
     pub fn new(gate: Arc<IoGate>) -> Result<Self, PlatformError> {
@@ -529,6 +579,8 @@ impl HyprlandCapture {
         let (commands, requests) = mpsc::channel();
         let (ready, initialized) = mpsc::channel();
         let control = abort.clone();
+        let (monitor_gate, monitor_source) = (gate.clone(), source.clone());
+        let activity_delivery = delivery.clone();
         std::thread::Builder::new()
             .name("hypr-capture".into())
             .spawn(move || worker(requests, delivery, gate, control, ready, source))
@@ -537,6 +589,13 @@ impl HyprlandCapture {
             commands,
             abort,
             nest,
+            gate: monitor_gate,
+            source: monitor_source,
+            sink: None,
+            activity_delivery,
+            monitor: None,
+            #[cfg(test)]
+            monitor_source: None,
         };
         initialized
             .recv_timeout(Duration::from_secs(2))
@@ -649,7 +708,10 @@ impl InputCapture for HyprlandCapture {
         .map(|_| ())
     }
     fn subscribe(&mut self, sink: Arc<dyn EventSink<CaptureEvent>>) -> Result<(), PlatformError> {
-        self.call(Operation::Subscribe(sink)).map(|_| ())
+        self.call(Operation::Subscribe(sink.clone()))?;
+        // The local-activity monitor reports to the same subscriber.
+        self.sink = Some(sink);
+        Ok(())
     }
     fn begin(&mut self, id: CaptureId, portal: PortalId) -> Result<CaptureStart, PlatformError> {
         match self.call(Operation::Begin(id, portal))? {
@@ -663,15 +725,54 @@ impl InputCapture for HyprlandCapture {
     fn abort_handle(&self) -> Arc<dyn CaptureAbort> {
         self.abort.clone()
     }
-    fn set_monitor_local_activity(&mut self, _: bool) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported(
-            "Wayland local activity monitoring",
-        ))
+    /// Module docs, WP-1.43. `false` stops and joins the monitor (within about 50 ms: a reading
+    /// is two IPC requests of 20 ms at most) and is always `Ok`; `true` starts it, or leaves a
+    /// running one alone. Needs a subscriber, and a pointer injector built with the same gate:
+    /// without one the monitor could not tell injected motion from the owner's, so it refuses
+    /// ([`PlatformError::Unsupported`]) instead of ever reporting injected motion as local.
+    fn set_monitor_local_activity(&mut self, on: bool) -> Result<(), PlatformError> {
+        if !on {
+            if let Some(mut monitor) = self.monitor.take() {
+                monitor.stop();
+            }
+            return Ok(());
+        }
+        if self
+            .monitor
+            .as_ref()
+            .is_some_and(local_activity::Monitor::is_running)
+        {
+            return Ok(());
+        }
+        // One that stopped by itself (its compositor went away) is replaced.
+        if let Some(mut finished) = self.monitor.take() {
+            finished.stop();
+        }
+        if self.sink.is_none() {
+            return Err(backend("local activity monitoring needs a subscriber"));
+        }
+        let injected = injected_position_for(&self.gate).ok_or(PlatformError::Unsupported(
+            "Hyprland local activity monitoring needs the pointer injector",
+        ))?;
+        let source = self.local_activity_source()?;
+        // The same delivery thread sends every subscription event. The monitor never calls the
+        // subscriber concurrently with Wayland dispatch or the independent abort path.
+        let delivery = self.activity_delivery.clone();
+        let report: local_activity::Report = Box::new(move |generation, at| {
+            let _ = delivery.send(Delivery::LocalActivity { at, generation });
+        });
+        self.monitor = Some(local_activity::Monitor::start_source(
+            source, injected, report,
+        )?);
+        Ok(())
     }
 }
 impl Drop for HyprlandCapture {
     fn drop(&mut self) {
         self.abort.abort();
+        if let Some(mut monitor) = self.monitor.take() {
+            monitor.stop();
+        }
         let (reply, _) = mpsc::channel();
         let _ = self.commands.send(Command {
             operation: Operation::Stop,
@@ -986,6 +1087,9 @@ fn deliver(events: mpsc::Receiver<Delivery>, wake: UnixDatagram, abort: Arc<Abor
                     sink = Some(new);
                     let _ = ready.send(());
                 }
+                Delivery::LocalActivity { at, generation } => {
+                    generation.deliver(at, &sink);
+                }
             }
         }
         let mut packet = [0; events::SIZE];
@@ -1079,6 +1183,1626 @@ pub(super) fn backend(error: impl fmt::Display) -> PlatformError {
     PlatformError::Backend(format!("Hyprland capture: {error}"))
 }
 
+/// Local pointer activity on a target, found by **cursor divergence** (WP-1.43).
+///
+/// Hyprland exposes no per-device input stream to clients, so the owner's own mouse is told from
+/// injected motion by where the pointer is. While monitoring is on, a thread reads the pointer
+/// ([`cursor_position`](super::super::cursor::cursor_position): two short-lived IPC requests) and
+/// compares it with what the pointer injector recorded ([`InjectedPosition`]). It reports
+/// [`CaptureEvent::LocalActivity`] ([`is_local_activity`]) when **all** of these hold:
+///
+/// - the pointer **moved since the previous successful reading**, or a move beyond the cap is
+///   pending from settling (the first reading only sets a baseline; stale divergence reports once);
+/// - it is **more than 3 device pixels** from the last injected position (Euclidean, on the same
+///   display), or on **another display**, or the injector never moved it;
+/// - the **last injection is older than 150 ms**, so injected motion still in flight settles
+///   first;
+/// - nothing was reported in the last **500 ms**.
+///
+/// Hyprland floors cursor coordinates and serializes output scale to two decimals. Before a
+/// baseline exists, the comparison projects the injection onto possible IPC coordinates, capped
+/// at eight device pixels per axis; anything beyond that cap counts as divergence. The first
+/// settled reading inside this envelope becomes the baseline for that injection and geometry.
+/// Subsequent readings compare with it using the normal three-device-pixel threshold, so rounding
+/// uncertainty does not permanently conceal local movement. Any new injection, output geometry
+/// change or monitor restart clears the baseline.
+///
+/// An IPC failure is logged at debug level, skipped, and never reports. The compositor's pid and
+/// process start time are pinned when monitoring starts; the thread ends if that instance goes
+/// away or restarts. It stops on `false` and on drop, and nothing polls while monitoring is off.
+/// Each queued report carries a monitor generation: stopping invalidates it and synchronizes with
+/// delivery, so an old target session cannot report into a later one.
+///
+/// Limits, best effort by design: **only the pointer is watched**, so keyboard-only local input is
+/// not detected (04 §6, the Wayland note); anything else that moves the pointer without the
+/// injector (a compositor warp, another client's warp) also counts as local; and the owner's mouse
+/// is not noticed while the controller injects faster than every 150 ms. Local motion before the
+/// first settled baseline can become that baseline if it remains inside the capped envelope;
+/// later movement is detected. Conversely, injection rounding beyond the eight-pixel cap can
+/// appear local before a baseline exists: rounded IPC cannot resolve that ambiguity.
+/// IPC cannot distinguish compositor warps from physical movement, so a warp can end a
+/// remote-control session with a safe return in the rare locked-pointer application case.
+mod local_activity {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, PoisonError};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use crosspane_platform::{CaptureEvent, EventSink, PlatformError};
+    use crosspane_types::{geom::PointDevice, id::DisplayId, time::MonoTime};
+
+    use super::backend;
+    use crate::hyprland::cursor::{CursorProjection, CursorSample, cursor_sample};
+    use crate::hyprland::inject::{InjectedPosition, Injection};
+    use crate::hyprland::ipc::HyprIpc;
+
+    /// How often the pointer is read while monitoring is on.
+    pub(super) const INTERVAL: Duration = Duration::from_millis(100);
+    /// The bound on each of the two requests of one reading. Together they bound how long
+    /// stopping the monitor can wait for a reading in progress.
+    pub(super) const IPC_TIMEOUT: Duration = Duration::from_millis(20);
+    /// The pointer must be farther than this (device pixels) from the injected position.
+    const DIVERGENCE: f64 = 3.0;
+    /// An injection this recent may not have been applied yet.
+    const SETTLE: Duration = Duration::from_millis(150);
+    /// At most one report in this time.
+    const REPORT_INTERVAL: Duration = Duration::from_millis(500);
+    /// What `/proc/<pid>/comm` says of the compositor (the agent's own compositor watch asks the
+    /// same).
+    const COMPOSITOR: &str = "Hyprland";
+
+    /// The pointer on a display, in that display's device pixels from its top-left: what the
+    /// injector was asked for, or what the compositor reports.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) struct Reading {
+        pub(super) display: DisplayId,
+        pub(super) position: PointDevice,
+        layout: Option<(f64, f64)>,
+        projection: Option<CursorProjection>,
+    }
+
+    impl From<Injection> for Reading {
+        fn from(injection: Injection) -> Reading {
+            Reading {
+                display: injection.display,
+                position: injection.position,
+                layout: None,
+                projection: None,
+            }
+        }
+    }
+
+    /// How long ago things happened, as of the reading being judged; `None`: never.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Timings {
+        pub(super) since_injection: Option<Duration>,
+        pub(super) since_report: Option<Duration>,
+    }
+
+    /// Whether a reading is local activity (module docs). Pure: `injected` is the last injected
+    /// position or its settled baseline (`None`: never injected), `observed` this reading and
+    /// `previous` the last good one before it (`None`: this is the first, which only sets the
+    /// baseline).
+    pub(super) fn is_local_activity(
+        injected: Option<Reading>,
+        observed: Reading,
+        previous: Option<Reading>,
+        timings: Timings,
+    ) -> bool {
+        activity_with_movement(injected, observed, moved_since(previous, observed), timings)
+    }
+
+    fn activity_with_movement(
+        injected: Option<Reading>,
+        observed: Reading,
+        moved: bool,
+        timings: Timings,
+    ) -> bool {
+        let diverged = injected.is_none_or(|put| {
+            if let (Some(projection), Some(layout)) = (put.projection, observed.layout) {
+                if let Some(baseline) = put.layout {
+                    put.display != observed.display
+                        || projection.observation_distance(baseline, layout) > DIVERGENCE
+                } else {
+                    let distance = projection.injection_distance(put.position, layout);
+                    // Rounded geometry can attribute an injected edge point to its neighbour.
+                    // Possible injected motion inside the capped envelope does not count.
+                    distance > 0.0
+                        && (put.display != observed.display
+                            || distance > DIVERGENCE
+                            || projection.outside_injection_cap(put.position, layout))
+                }
+            } else {
+                put.display != observed.display
+                    || (put.position.x - observed.position.x)
+                        .hypot(put.position.y - observed.position.y)
+                        > DIVERGENCE
+            }
+        });
+        let settled = timings.since_injection.is_none_or(|age| age > SETTLE);
+        let spaced = timings
+            .since_report
+            .is_none_or(|age| age >= REPORT_INTERVAL);
+        moved && diverged && settled && spaced
+    }
+
+    fn moved_since(previous: Option<Reading>, observed: Reading) -> bool {
+        previous.is_some_and(|before| match (before.layout, observed.layout) {
+            (Some(before), Some(now)) => before != now,
+            _ => before.display != observed.display || before.position != observed.position,
+        })
+    }
+
+    /// Reads the pointer; an `Err` is skipped (module docs).
+    #[derive(Clone)]
+    pub(super) struct Observation {
+        reading: Reading,
+        projections: Vec<CursorProjection>,
+    }
+    impl From<Reading> for Observation {
+        fn from(reading: Reading) -> Self {
+            Self {
+                reading,
+                projections: Vec::new(),
+            }
+        }
+    }
+    impl From<CursorSample> for Observation {
+        fn from(sample: CursorSample) -> Self {
+            Self {
+                reading: Reading {
+                    display: sample.display,
+                    position: sample.position,
+                    layout: Some(sample.layout),
+                    projection: None,
+                },
+                projections: sample.projections,
+            }
+        }
+    }
+    pub(super) type Reader = Box<dyn FnMut() -> Result<Observation, PlatformError> + Send>;
+    /// Whether the original compositor is still running; asked before every reading.
+    pub(super) type Alive = Box<dyn Fn() -> bool + Send>;
+
+    /// The compositor's pointer over `ipc` (whose timeout bounds each request).
+    pub(super) fn cursor_reader(ipc: HyprIpc) -> Reader {
+        Box::new(move || cursor_sample(&ipc).map(Observation::from))
+    }
+
+    /// Virtual time and waits let tests exercise the real enable path and production cadence.
+    pub(super) trait Clock: Send + Sync {
+        fn now(&self) -> Instant;
+        fn wait(&self, stopped: &AtomicBool, duration: Duration) -> bool;
+        fn wake(&self);
+    }
+    #[derive(Default)]
+    pub(super) struct SystemClock {
+        wait: Mutex<()>,
+        ready: Condvar,
+    }
+    impl Clock for SystemClock {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn wait(&self, stopped: &AtomicBool, duration: Duration) -> bool {
+            let lock = self.wait.lock().unwrap_or_else(PoisonError::into_inner);
+            let _waited = self
+                .ready
+                .wait_timeout_while(lock, duration, |_| !stopped.load(Ordering::Acquire))
+                .unwrap_or_else(PoisonError::into_inner);
+            !stopped.load(Ordering::Acquire)
+        }
+        fn wake(&self) {
+            let _lock = self.wait.lock().unwrap_or_else(PoisonError::into_inner);
+            self.ready.notify_all();
+        }
+    }
+    pub(super) struct CursorSource {
+        pub(super) reader: Reader,
+        pub(super) alive: Alive,
+        pub(super) clock: Arc<dyn Clock>,
+    }
+    #[cfg(test)]
+    pub(super) type SourceFactory = Box<dyn FnMut() -> CursorSource + Send>;
+
+    /// An allocation identifies one monitor generation. Delivery and invalidation share a short
+    /// lock: off cannot return while a send for that generation is in progress. EventSink's
+    /// frozen contract requires send to be nonblocking.
+    pub(in crate::hyprland) struct Generation(Mutex<bool>);
+    impl Generation {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(true)))
+        }
+        fn invalidate(&self) {
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        }
+        pub(super) fn deliver(
+            &self,
+            at: MonoTime,
+            sink: &Option<Arc<dyn EventSink<CaptureEvent>>>,
+        ) {
+            let live = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if *live && let Some(sink) = sink {
+                sink.send(CaptureEvent::LocalActivity { at });
+            }
+        }
+    }
+    struct InvalidateOnExit(Arc<Generation>);
+    impl Drop for InvalidateOnExit {
+        fn drop(&mut self) {
+            self.0.invalidate();
+        }
+    }
+    pub(super) type Report = Box<dyn Fn(Arc<Generation>, MonoTime) + Send>;
+
+    /// Whether the Hyprland process named by `lock` still runs.
+    pub(super) fn compositor_alive(lock: PathBuf) -> Alive {
+        let original = compositor_process(&lock, Path::new("/proc"));
+        Box::new(move || {
+            original.is_some() && compositor_process(&lock, Path::new("/proc")) == original
+        })
+    }
+
+    /// The first line of `lock` is the compositor's pid; `proc_root/<pid>/comm` says what that
+    /// process is. Pin its process start time too, so a reused pid cannot keep an old monitor
+    /// running. Missing or unreadable files mean the instance is gone.
+    fn compositor_process(lock: &Path, proc_root: &Path) -> Option<(String, String)> {
+        let text = std::fs::read_to_string(lock).ok()?;
+        let pid = text
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))?;
+        let process = proc_root.join(pid);
+        if std::fs::read_to_string(process.join("comm")).ok()?.trim() != COMPOSITOR {
+            return None;
+        }
+        let stat = std::fs::read_to_string(process.join("stat")).ok()?;
+        // After the closing parenthesis, field 3 (state) starts the suffix; start time is field 22.
+        let started = stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?;
+        Some((pid.to_owned(), started.to_owned()))
+    }
+
+    /// The node's monotonic clock, which stamps every capture event.
+    fn mono_now() -> MonoTime {
+        let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        MonoTime::from_nanos(
+            (t.tv_sec.max(0) as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(t.tv_nsec.max(0) as u64),
+        )
+    }
+
+    /// A running monitor thread. Stopped, and joined, by [`Monitor::stop`] and on drop.
+    pub(super) struct Monitor {
+        stop: Arc<AtomicBool>,
+        clock: Arc<dyn Clock>,
+        generation: Arc<Generation>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl std::fmt::Debug for Monitor {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Monitor")
+                .field("running", &self.is_running())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Monitor {
+        /// Start the production 100 ms cadence, reading immediately. Reports carry this run's
+        /// generation into the capture delivery queue.
+        pub(super) fn start_source(
+            source: CursorSource,
+            injected: Arc<InjectedPosition>,
+            report: Report,
+        ) -> Result<Monitor, PlatformError> {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let clock = source.clock.clone();
+            let generation = Generation::new();
+            let active = generation.clone();
+            let thread = std::thread::Builder::new()
+                .name("hypr-local-activity".into())
+                .spawn(move || {
+                    let _invalidate = InvalidateOnExit(active.clone());
+                    run(source, &injected, &*report, &active, &stopped);
+                })
+                .map_err(backend)?;
+            Ok(Monitor {
+                stop,
+                clock,
+                generation,
+                thread: Some(thread),
+            })
+        }
+
+        /// False once the thread has ended, by `stop` or on its own (its compositor went away).
+        pub(super) fn is_running(&self) -> bool {
+            self.thread.as_ref().is_some_and(|t| !t.is_finished())
+        }
+
+        /// Stop the thread and wait for it: it ends at its next wait, or when the reading in
+        /// progress does (two requests of [`IPC_TIMEOUT`] at most). Idempotent.
+        pub(super) fn stop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.clock.wake();
+            self.generation.invalidate();
+            if let Some(thread) = self.thread.take()
+                && thread.join().is_err()
+            {
+                tracing::warn!("the Hyprland local-activity monitor panicked");
+            }
+        }
+    }
+
+    impl Drop for Monitor {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    fn run(
+        mut source: CursorSource,
+        injected: &InjectedPosition,
+        report: &dyn Fn(Arc<Generation>, MonoTime),
+        generation: &Arc<Generation>,
+        stopped: &AtomicBool,
+    ) {
+        let mut previous: Option<Reading> = None;
+        let mut reported: Option<Instant> = None;
+        let mut baseline: Option<Reading> = None;
+        let mut baseline_injection: Option<Injection> = None;
+        let mut geometry: Vec<CursorProjection> = Vec::new();
+        // A divergent move suppressed during settling remains evidence of movement even if the
+        // cursor holds still until the first settled poll.
+        let mut pending = false;
+        loop {
+            if stopped.load(Ordering::Acquire) {
+                return;
+            }
+            let poll_started = source.clock.now();
+            if !(source.alive)() {
+                tracing::debug!("the Hyprland instance is gone: local-activity monitor ends");
+                return;
+            }
+            match (source.reader)() {
+                Ok(sample) => {
+                    let observed = sample.reading;
+                    let at = source.clock.now();
+                    // Read after the pointer, so that every injection the reading can reflect is
+                    // recorded already (the injector records before it moves the pointer).
+                    let injection = injected.last();
+                    if injection != baseline_injection || sample.projections != geometry {
+                        baseline = None;
+                        pending = false;
+                        baseline_injection = injection;
+                        geometry.clone_from(&sample.projections);
+                    }
+                    let timings = Timings {
+                        since_injection: injection.map(|i| at.saturating_duration_since(i.at)),
+                        since_report: reported.map(|r| at.saturating_duration_since(r)),
+                    };
+                    let expected = injection.map(|injection| {
+                        let mut expected = Reading::from(injection);
+                        expected.projection = sample
+                            .projections
+                            .iter()
+                            .copied()
+                            .find(|projection| projection.display() == injection.display);
+                        expected
+                    });
+                    // No geometry for a formerly injected display means the output disappeared.
+                    // Skip rather than compare a lossy reconstruction against exact coordinates.
+                    let known = observed.layout.is_none()
+                        || expected.is_none()
+                        || expected.is_some_and(|put| put.projection.is_some());
+                    let outside_cap = expected.is_some_and(|put| {
+                        put.projection
+                            .zip(observed.layout)
+                            .is_some_and(|(projection, layout)| {
+                                projection.outside_injection_cap(put.position, layout)
+                            })
+                    });
+                    if timings.since_injection.is_some_and(|age| age <= SETTLE)
+                        && outside_cap
+                        && moved_since(previous, observed)
+                    {
+                        pending = true;
+                    }
+                    if baseline.is_none()
+                        && timings.since_injection.is_some_and(|age| age > SETTLE)
+                        && let Some(put) = expected
+                        && let Some(projection) = put.projection
+                        && let Some(layout) = observed.layout
+                        && projection.injection_distance(put.position, layout) == 0.0
+                    {
+                        let mut settled = observed;
+                        settled.projection = Some(projection);
+                        baseline = Some(settled);
+                    }
+                    let activity = known
+                        && if pending && outside_cap {
+                            activity_with_movement(baseline.or(expected), observed, true, timings)
+                        } else {
+                            is_local_activity(baseline.or(expected), observed, previous, timings)
+                        };
+                    previous = Some(observed);
+                    if activity {
+                        // Nothing is reported once a stop is pending.
+                        if stopped.load(Ordering::Acquire) {
+                            return;
+                        }
+                        pending = false;
+                        reported = Some(at);
+                        report(generation.clone(), mono_now());
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "Hyprland pointer reading failed; skipped");
+                }
+            }
+            let remaining =
+                INTERVAL.saturating_sub(source.clock.now().saturating_duration_since(poll_started));
+            if !source.clock.wait(stopped, remaining) {
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crosspane_platform::InputCapture;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        const OLD: Duration = Duration::from_secs(1);
+
+        fn at(display: u32, x: f64, y: f64) -> Reading {
+            Reading {
+                display: DisplayId(display),
+                position: PointDevice::new(x, y),
+                layout: None,
+                projection: None,
+            }
+        }
+
+        /// A reading judged with the injection `age` old and the last report `since` ago.
+        fn judge(
+            injected: Option<Reading>,
+            observed: Reading,
+            previous: Option<Reading>,
+            age: Option<Duration>,
+            since: Option<Duration>,
+        ) -> bool {
+            is_local_activity(
+                injected,
+                observed,
+                previous,
+                Timings {
+                    since_injection: age,
+                    since_report: since,
+                },
+            )
+        }
+
+        #[test]
+        fn injected_and_matching_gives_no_report() {
+            let put = at(0, 500.0, 300.0);
+            // The pointer arrived (it moved) exactly where the injector put it.
+            assert!(!judge(
+                Some(put),
+                put,
+                Some(at(0, 100.0, 100.0)),
+                Some(OLD),
+                None
+            ));
+            // Within the tolerance of the compositor's whole-pixel coordinates.
+            assert!(!judge(
+                Some(put),
+                at(0, 502.0, 301.5),
+                Some(at(0, 100.0, 100.0)),
+                Some(OLD),
+                None
+            ));
+            // Exactly three device pixels is not "more than" three.
+            assert!(!judge(
+                Some(put),
+                at(0, 503.0, 300.0),
+                Some(at(0, 100.0, 100.0)),
+                Some(OLD),
+                None
+            ));
+        }
+
+        #[test]
+        fn a_divergence_over_three_pixels_after_the_injection_settled_is_reported() {
+            let put = at(0, 500.0, 300.0);
+            let before = Some(at(0, 500.0, 300.0));
+            // A pixel past three, along either axis and diagonally (3 px hypot is 4.24).
+            for observed in [
+                at(0, 503.01, 300.0),
+                at(0, 500.0, 296.9),
+                at(0, 503.0, 303.0),
+                at(0, 900.0, 700.0),
+            ] {
+                assert!(
+                    judge(Some(put), observed, before, Some(OLD), None),
+                    "{observed:?}"
+                );
+            }
+            // Never injected: any movement is the owner's.
+            assert!(judge(None, at(0, 10.0, 10.0), before, None, None));
+        }
+
+        #[test]
+        fn a_divergence_during_an_injection_in_flight_is_not_reported() {
+            let put = at(0, 500.0, 300.0);
+            let far = at(0, 900.0, 700.0);
+            let before = Some(at(0, 500.0, 300.0));
+            for age in [0, 40, 100, 150] {
+                assert!(
+                    !judge(
+                        Some(put),
+                        far,
+                        before,
+                        Some(Duration::from_millis(age)),
+                        None
+                    ),
+                    "{age} ms"
+                );
+            }
+            // Older than 150 ms: settled.
+            assert!(judge(
+                Some(put),
+                far,
+                before,
+                Some(Duration::from_millis(151)),
+                None
+            ));
+        }
+
+        #[test]
+        fn a_stale_divergence_is_reported_once() {
+            let put = at(0, 500.0, 300.0);
+            let there = at(0, 900.0, 700.0);
+            // The reading in which the pointer arrives there is the one report...
+            assert!(judge(Some(put), there, Some(put), Some(OLD), None));
+            // ...and while it stays there, no later reading repeats it, however long it takes.
+            for since in [0, 500, 5_000, 60_000] {
+                assert!(
+                    !judge(
+                        Some(put),
+                        there,
+                        Some(there),
+                        Some(OLD),
+                        Some(Duration::from_millis(since))
+                    ),
+                    "{since} ms"
+                );
+            }
+            // The first reading is only a baseline, however far it is from the injection.
+            assert!(!judge(Some(put), there, None, Some(OLD), None));
+        }
+
+        #[test]
+        fn at_most_one_report_per_500_ms() {
+            let put = at(0, 500.0, 300.0);
+            let (there, further) = (at(0, 900.0, 700.0), at(0, 910.0, 710.0));
+            for since in [0, 100, 499] {
+                assert!(
+                    !judge(
+                        Some(put),
+                        further,
+                        Some(there),
+                        Some(OLD),
+                        Some(Duration::from_millis(since))
+                    ),
+                    "{since} ms"
+                );
+            }
+            for since in [500, 501, 10_000] {
+                assert!(
+                    judge(
+                        Some(put),
+                        further,
+                        Some(there),
+                        Some(OLD),
+                        Some(Duration::from_millis(since))
+                    ),
+                    "{since} ms"
+                );
+            }
+        }
+
+        #[test]
+        fn another_display_is_a_divergence() {
+            let put = at(0, 500.0, 300.0);
+            // The same device pixels, on another display: the owner moved the pointer across.
+            assert!(judge(
+                Some(put),
+                at(1, 500.0, 300.0),
+                Some(at(0, 500.0, 300.0)),
+                Some(OLD),
+                None
+            ));
+            // Not while an injection onto that display settles.
+            assert!(!judge(
+                Some(put),
+                at(1, 500.0, 300.0),
+                Some(at(0, 500.0, 300.0)),
+                Some(Duration::from_millis(20)),
+                None
+            ));
+        }
+
+        #[test]
+        fn instance_liveness_pins_the_lock_process_and_start_time() {
+            let dir =
+                std::env::temp_dir().join(format!("cp-local-activity-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("proc/4242")).unwrap();
+            let lock = dir.join("hyprland.lock");
+            let proc_root = dir.join("proc");
+            // No lock: the instance directory is gone.
+            assert!(compositor_process(&lock, &proc_root).is_none());
+            std::fs::write(&lock, "4242\nwayland-9\n").unwrap();
+            // A pid with no process.
+            assert!(compositor_process(&lock, &proc_root).is_none());
+            // A process that is not Hyprland (the pid was reused).
+            std::fs::write(proc_root.join("4242/comm"), "bash\n").unwrap();
+            assert!(compositor_process(&lock, &proc_root).is_none());
+            std::fs::write(proc_root.join("4242/comm"), "Hyprland\n").unwrap();
+            assert!(
+                compositor_process(&lock, &proc_root).is_none(),
+                "missing stat"
+            );
+            let stat = |started| format!("4242 (Hyprland) S {} {started} 0\n", "0 ".repeat(18));
+            std::fs::write(proc_root.join("4242/stat"), stat(100)).unwrap();
+            let original = compositor_process(&lock, &proc_root);
+            assert_eq!(original, Some(("4242".into(), "100".into())));
+            // Another Hyprland with a reused pid is a different instance.
+            std::fs::write(proc_root.join("4242/stat"), stat(200)).unwrap();
+            assert_ne!(compositor_process(&lock, &proc_root), original);
+            // A lock that does not name a pid (including one that tries to leave the root).
+            for garbage in ["", "\n", "x\n", "../4242\n", "-1\n"] {
+                std::fs::write(&lock, garbage).unwrap();
+                assert!(
+                    compositor_process(&lock, &proc_root).is_none(),
+                    "{garbage:?}"
+                );
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// Collects what the monitor reports.
+        #[derive(Clone, Default)]
+        struct Reports(Arc<Mutex<Vec<CaptureEvent>>>);
+        impl Reports {
+            fn sink(&self) -> Arc<dyn EventSink<CaptureEvent>> {
+                let events = self.0.clone();
+                Arc::new(move |event: CaptureEvent| events.lock().unwrap().push(event))
+            }
+            fn count(&self) -> usize {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| matches!(e, CaptureEvent::LocalActivity { .. }))
+                    .count()
+            }
+        }
+
+        /// A controllable monotonic clock. Each wait announces the production delay and blocks
+        /// until the test advances it or shutdown wakes it; no test waits for wall-clock cadence.
+        struct FakeClock {
+            state: Mutex<(Instant, usize)>,
+            ready: Condvar,
+            waited: mpsc::Sender<Duration>,
+            wake_notice: Mutex<Option<mpsc::Sender<()>>>,
+        }
+        impl FakeClock {
+            fn new() -> (Arc<Self>, mpsc::Receiver<Duration>) {
+                let (waited, waits) = mpsc::channel();
+                (
+                    Arc::new(Self {
+                        state: Mutex::new((Instant::now(), 0)),
+                        ready: Condvar::new(),
+                        waited,
+                        wake_notice: Mutex::new(None),
+                    }),
+                    waits,
+                )
+            }
+            fn advance(&self, duration: Duration) {
+                self.state.lock().unwrap().0 += duration;
+            }
+            fn step(&self) {
+                self.state.lock().unwrap().1 += 1;
+                self.ready.notify_all();
+            }
+        }
+        impl Clock for FakeClock {
+            fn now(&self) -> Instant {
+                self.state.lock().unwrap().0
+            }
+            fn wait(&self, stopped: &AtomicBool, duration: Duration) -> bool {
+                self.waited.send(duration).unwrap();
+                let mut state = self.state.lock().unwrap();
+                while state.1 == 0 && !stopped.load(Ordering::Acquire) {
+                    state = self.ready.wait(state).unwrap();
+                }
+                if stopped.load(Ordering::Acquire) {
+                    return false;
+                }
+                state.1 -= 1;
+                state.0 += duration;
+                true
+            }
+            fn wake(&self) {
+                let _state = self.state.lock().unwrap();
+                if let Some(notice) = self.wake_notice.lock().unwrap().as_ref() {
+                    let _ = notice.send(());
+                }
+                self.ready.notify_all();
+            }
+        }
+
+        struct Harness {
+            capture: super::super::HyprlandCapture,
+            // Keep the detached worker's receiver and shared injection allocation alive.
+            _commands: mpsc::Receiver<super::super::Command>,
+            injected: Arc<InjectedPosition>,
+            clock: Arc<FakeClock>,
+            waits: mpsc::Receiver<Duration>,
+            queued: mpsc::Receiver<super::super::Delivery>,
+            reports: Reports,
+            calls: Arc<AtomicUsize>,
+            starts: Arc<Mutex<Vec<Instant>>>,
+            alive: Arc<AtomicBool>,
+        }
+        impl Harness {
+            fn new(script: Vec<Option<Observation>>, read_cost: Duration) -> Self {
+                let (mut capture, commands) = super::super::tests::detached(None);
+                let injected = crate::hyprland::inject::register(&capture.gate);
+                let (clock, waits) = FakeClock::new();
+                let clock_source = clock.clone();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let called = calls.clone();
+                let starts = Arc::new(Mutex::new(Vec::new()));
+                let started = starts.clone();
+                let alive = Arc::new(AtomicBool::new(true));
+                let live = alive.clone();
+                // Factory, rather than an installed monitor, exercises the actual false->true
+                // branch, shared-record lookup, queue wiring and production cadence.
+                capture.monitor_source = Some(Box::new(move || {
+                    let script = script.clone();
+                    let clock = clock_source.clone();
+                    let reader_clock = clock.clone();
+                    let calls = called.clone();
+                    let starts = started.clone();
+                    let alive = live.clone();
+                    let mut n = 0;
+                    CursorSource {
+                        reader: Box::new(move || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            starts.lock().unwrap().push(reader_clock.now());
+                            reader_clock.advance(read_cost);
+                            let sample = script.get(n).or(script.last()).cloned().flatten();
+                            n += 1;
+                            sample.ok_or_else(|| match n % 3 {
+                                0 => PlatformError::Timeout,
+                                1 => PlatformError::NotFound,
+                                _ => PlatformError::Backend("bad json".into()),
+                            })
+                        }),
+                        alive: Box::new(move || alive.load(Ordering::Acquire)),
+                        clock,
+                    }
+                }));
+                let (delivery, queued) = mpsc::channel();
+                capture.activity_delivery = delivery;
+                let reports = Reports::default();
+                capture.sink = Some(reports.sink());
+                Self {
+                    capture,
+                    _commands: commands,
+                    injected,
+                    clock,
+                    waits,
+                    queued,
+                    reports,
+                    calls,
+                    starts,
+                    alive,
+                }
+            }
+            fn readings(script: Vec<Option<Reading>>, cost: Duration) -> Self {
+                Self::new(
+                    script
+                        .into_iter()
+                        .map(|r| r.map(Observation::from))
+                        .collect(),
+                    cost,
+                )
+            }
+            fn quiet(&self, position: Reading) {
+                self.injected.record_at(
+                    position.display,
+                    position.position,
+                    self.clock.now() - OLD,
+                );
+            }
+            fn enable(&mut self) {
+                self.capture.set_monitor_local_activity(true).unwrap();
+            }
+            fn waited(&self) -> Duration {
+                self.waits.recv_timeout(Duration::from_secs(2)).unwrap()
+            }
+            fn step(&self) -> Duration {
+                self.clock.step();
+                self.waited()
+            }
+            fn drain(&self) {
+                while let Ok(delivery) = self.queued.try_recv() {
+                    match delivery {
+                        super::super::Delivery::LocalActivity { at, generation } => {
+                            generation.deliver(at, &self.capture.sink)
+                        }
+                        _ => panic!("unexpected non-activity delivery"),
+                    }
+                }
+            }
+            fn off(&mut self) {
+                self.capture.set_monitor_local_activity(false).unwrap();
+            }
+        }
+
+        #[test]
+        fn the_thread_reports_a_pointer_the_injector_did_not_put_there_once() {
+            let mut h = Harness::readings(
+                vec![
+                    Some(at(0, 500.0, 300.0)),
+                    Some(at(0, 500.0, 300.0)),
+                    Some(at(0, 700.0, 300.0)),
+                    Some(at(0, 710.0, 300.0)),
+                    Some(at(0, 720.0, 300.0)),
+                ],
+                Duration::ZERO,
+            );
+            h.quiet(at(0, 500.0, 300.0));
+            h.enable();
+            assert_eq!(h.waited(), INTERVAL);
+            for _ in 0..15 {
+                assert_eq!(h.step(), INTERVAL);
+                h.drain();
+            }
+            assert_eq!(h.reports.count(), 1);
+            h.off();
+            h.drain();
+            assert_eq!(h.reports.count(), 1);
+        }
+
+        #[test]
+        fn injected_motion_is_never_reported() {
+            let mut h = Harness::readings(
+                (0..32)
+                    .map(|n| Some(at(0, n as f64 * 10.0, 50.0)))
+                    .collect(),
+                Duration::ZERO,
+            );
+            h.quiet(at(0, 0.0, 50.0));
+            h.enable();
+            h.waited();
+            for n in 1..32 {
+                h.injected.record_at(
+                    DisplayId(0),
+                    PointDevice::new(n as f64 * 10.0, 50.0),
+                    h.clock.now(),
+                );
+                h.step();
+                h.drain();
+            }
+            h.off();
+            assert_eq!(h.reports.count(), 0);
+        }
+
+        #[test]
+        fn a_failed_reading_is_skipped_and_never_reports() {
+            let mut h = Harness::readings(
+                vec![
+                    Some(at(0, 500.0, 300.0)),
+                    None,
+                    None,
+                    None,
+                    Some(at(0, 500.0, 300.0)),
+                ],
+                Duration::ZERO,
+            );
+            h.quiet(at(0, 500.0, 300.0));
+            h.enable();
+            h.waited();
+            for _ in 0..12 {
+                h.step();
+                h.drain();
+            }
+            h.off();
+            assert_eq!(h.reports.count(), 0);
+        }
+
+        fn compositor_observation(scale: f64, point: PointDevice) -> Observation {
+            compositor_observation_on(scale, point, (1920.0, 1080.0))
+        }
+
+        fn compositor_observation_on(
+            scale: f64,
+            point: PointDevice,
+            extent: (f64, f64),
+        ) -> Observation {
+            use serde_json::json;
+            let reported: f64 = format!("{scale:.2}").parse().unwrap();
+            let (width, height) = extent;
+            let monitors = json!([{"id":0,"width":width as u32,"height":height as u32,"x":0,"y":0,
+                "scale":reported,"transform":0}]);
+            let raw = json!({
+                "x": ((width / scale).round() * point.x / width).floor(),
+                "y": ((height / scale).round() * point.y / height).floor(),
+            });
+            crate::hyprland::cursor::locate_sample(&raw, &monitors)
+                .unwrap()
+                .into()
+        }
+
+        #[test]
+        fn fractional_scale_injection_after_a_skipped_poll_is_never_local_activity() {
+            for scale in [4.0 / 3.0, 1.5, 1.25, 4.25, 16.0] {
+                for point in [
+                    PointDevice::new(1500.0, 500.0),
+                    PointDevice::new(0.0, 0.0),
+                    PointDevice::new(1919.99609375, 1079.99609375),
+                ] {
+                    let baseline = compositor_observation(scale, PointDevice::new(100.0, 100.0));
+                    let arrived = compositor_observation(scale, point);
+                    if scale == 4.0 / 3.0 && point.x == 1500.0 {
+                        assert_eq!(arrived.reading.position, PointDevice::new(1496.25, 498.75));
+                        assert!(
+                            (arrived.reading.position.x - point.x)
+                                .hypot(arrived.reading.position.y - point.y)
+                                > DIVERGENCE
+                        );
+                    }
+                    let mut h =
+                        Harness::new(vec![Some(baseline), None, Some(arrived)], Duration::ZERO);
+                    h.enable();
+                    h.waited();
+                    h.injected.record_at(DisplayId(0), point, h.clock.now());
+                    h.step(); // Failed 100 ms poll; successful poll is older than settle time.
+                    h.step();
+                    h.drain();
+                    assert_eq!(h.reports.count(), 0, "scale {scale}, injection {point:?}");
+                    h.off();
+                }
+            }
+        }
+
+        #[test]
+        fn settled_baseline_detects_a_hundred_device_pixels_at_quarter_scale_on_a_large_display() {
+            let point = PointDevice::new(7000.0, 2000.0);
+            let arrived = compositor_observation_on(0.25, point, (7680.0, 4320.0));
+            let local =
+                compositor_observation_on(0.25, PointDevice::new(7100.0, 2000.0), (7680.0, 4320.0));
+            assert_eq!(arrived.reading.layout, Some((28000.0, 8000.0)));
+            assert_eq!(local.reading.layout, Some((28400.0, 8000.0)));
+            let mut h = Harness::new(
+                vec![Some(arrived.clone()), None, Some(arrived), Some(local)],
+                Duration::ZERO,
+            );
+            h.enable();
+            h.waited();
+            h.injected.record_at(DisplayId(0), point, h.clock.now());
+            h.step(); // 100 ms: failed reading.
+            h.step(); // 200 ms: settled baseline.
+            h.drain();
+            assert_eq!(h.reports.count(), 0);
+            h.step();
+            h.drain();
+            assert_eq!(
+                h.reports.count(),
+                1,
+                "100 device pixels disappeared in scale uncertainty"
+            );
+            for _ in 0..10 {
+                h.step();
+                h.drain();
+            }
+            assert_eq!(h.reports.count(), 1, "stale divergence repeated");
+            h.off();
+        }
+
+        #[test]
+        fn settled_baseline_at_two_and_three_decimal_scales_reports_later_local_motion() {
+            for scale in [1.33, 1.333, 4.0 / 3.0] {
+                let point = PointDevice::new(1500.0, 500.0);
+                let arrived = compositor_observation(scale, point);
+                let local = compositor_observation(scale, PointDevice::new(1506.0, 500.0));
+                let projection = arrived.projections[0];
+                assert!(
+                    projection.observation_distance(
+                        arrived.reading.layout.unwrap(),
+                        local.reading.layout.unwrap()
+                    ) >= 4.0
+                );
+                let mut h = Harness::new(
+                    vec![
+                        Some(compositor_observation(
+                            scale,
+                            PointDevice::new(100.0, 100.0),
+                        )),
+                        None,
+                        Some(arrived.clone()),
+                        Some(arrived),
+                        Some(local),
+                    ],
+                    Duration::ZERO,
+                );
+                h.enable();
+                h.waited();
+                h.injected.record_at(DisplayId(0), point, h.clock.now());
+                for _ in 0..3 {
+                    h.step();
+                    h.drain();
+                    assert_eq!(h.reports.count(), 0, "injected-only at scale {scale}");
+                }
+                h.step();
+                h.drain();
+                assert_eq!(
+                    h.reports.count(),
+                    1,
+                    "local motion after baseline at scale {scale}"
+                );
+                h.off();
+            }
+        }
+
+        #[test]
+        fn local_motion_inside_the_first_settled_envelope_becomes_baseline_then_next_motion_reports()
+         {
+            let point = PointDevice::new(7000.0, 2000.0);
+            let sample =
+                |x| compositor_observation_on(0.25, PointDevice::new(x, 2000.0), (7680.0, 4320.0));
+            let mut h = Harness::new(
+                vec![
+                    Some(sample(7000.0)),
+                    Some(sample(7000.0)),
+                    Some(sample(7002.0)),
+                    Some(sample(7006.0)),
+                ],
+                Duration::ZERO,
+            );
+            h.enable();
+            h.waited();
+            h.injected.record_at(DisplayId(0), point, h.clock.now());
+            h.step(); // In flight: no settled baseline.
+            h.step();
+            h.drain(); // First settled position includes two local device pixels.
+            assert_eq!(
+                h.reports.count(),
+                0,
+                "ambiguous pre-baseline motion must establish the baseline"
+            );
+            h.step();
+            h.drain();
+            assert_eq!(
+                h.reports.count(),
+                1,
+                "next four device pixels must be detected"
+            );
+            h.off();
+        }
+
+        #[test]
+        fn a_new_injection_even_at_the_same_point_and_timestamp_clears_the_settled_baseline() {
+            let point = PointDevice::new(7000.0, 2000.0);
+            let sample =
+                |x| compositor_observation_on(0.25, PointDevice::new(x, 2000.0), (7680.0, 4320.0));
+            let mut h = Harness::new(
+                vec![
+                    Some(sample(7000.0)),
+                    Some(sample(7002.0)),
+                    Some(sample(7007.0)),
+                    Some(sample(7011.0)),
+                ],
+                Duration::ZERO,
+            );
+            h.quiet(at(0, point.x, point.y));
+            h.enable();
+            h.waited(); // Establish the first settled baseline.
+            h.step();
+            h.drain();
+            assert_eq!(h.reports.count(), 0);
+            let old = h.injected.last().unwrap();
+            h.injected.record_at(old.display, old.position, old.at);
+            h.step();
+            h.drain(); // New baseline at +7, rather than reporting relative to old one.
+            assert_eq!(
+                h.reports.count(),
+                0,
+                "new injection did not clear old baseline"
+            );
+            h.step();
+            h.drain();
+            assert_eq!(
+                h.reports.count(),
+                1,
+                "next motion from fresh baseline was missed"
+            );
+            h.off();
+        }
+
+        #[test]
+        fn output_geometry_change_clears_the_settled_baseline() {
+            let point = PointDevice::new(1500.0, 500.0);
+            let mut h = Harness::new(
+                vec![
+                    Some(compositor_observation(1.333, point)),
+                    Some(compositor_observation(1.25, point)),
+                    Some(compositor_observation(
+                        1.25,
+                        PointDevice::new(1506.0, 500.0),
+                    )),
+                ],
+                Duration::ZERO,
+            );
+            h.quiet(at(0, point.x, point.y));
+            h.enable();
+            h.waited();
+            h.step();
+            h.drain();
+            assert_eq!(
+                h.reports.count(),
+                0,
+                "geometry change was compared with an obsolete baseline"
+            );
+            h.step();
+            h.drain();
+            assert_eq!(h.reports.count(), 1);
+            h.off();
+        }
+
+        #[test]
+        fn pre_baseline_local_motion_beyond_eight_device_pixels_reports_without_extra_slack() {
+            let point = PointDevice::new(7000.0, 2000.0);
+            let sample =
+                |x| compositor_observation_on(0.25, PointDevice::new(x, 2000.0), (7680.0, 4320.0));
+            let mut h = Harness::new(
+                vec![
+                    Some(sample(7000.0)),
+                    Some(sample(7009.0)),
+                    Some(sample(7009.0)),
+                ],
+                Duration::ZERO,
+            );
+            h.enable();
+            h.waited();
+            h.injected.record_at(DisplayId(0), point, h.clock.now());
+            h.step();
+            h.drain();
+            assert_eq!(h.reports.count(), 0, "reported before injection settled");
+            h.step();
+            h.drain();
+            assert_eq!(
+                h.reports.count(),
+                1,
+                "8-pixel cap acquired another 3 pixels of slack"
+            );
+            for _ in 0..10 {
+                h.step();
+                h.drain();
+                assert_eq!(
+                    h.reports.count(),
+                    1,
+                    "pending settling move reported repeatedly"
+                );
+            }
+            h.off();
+        }
+
+        #[test]
+        fn pending_settling_divergence_is_cleared_on_new_injection_and_geometry_change() {
+            for new_injection in [true, false] {
+                let point = PointDevice::new(7000.0, 2000.0);
+                let first = compositor_observation_on(0.25, point, (7680.0, 4320.0));
+                let local = compositor_observation_on(
+                    0.25,
+                    PointDevice::new(7009.0, 2000.0),
+                    (7680.0, 4320.0),
+                );
+                let after_reset = if new_injection {
+                    local.clone()
+                } else {
+                    compositor_observation_on(
+                        0.25,
+                        PointDevice::new(7009.0, 2000.0),
+                        (8000.0, 4320.0),
+                    )
+                };
+                let mut h = Harness::new(
+                    vec![Some(first), Some(local), Some(after_reset)],
+                    Duration::ZERO,
+                );
+                h.enable();
+                h.waited();
+                h.injected.record_at(DisplayId(0), point, h.clock.now());
+                h.step(); // +9px physical movement at 100ms: pending, not yet reported.
+                h.drain();
+                assert_eq!(h.reports.count(), 0);
+                if new_injection {
+                    h.injected.record_at(DisplayId(0), point, h.clock.now());
+                }
+                for _ in 0..10 {
+                    h.step();
+                    h.drain();
+                }
+                assert_eq!(
+                    h.reports.count(),
+                    0,
+                    "pending movement survived reset; injection={new_injection}"
+                );
+                h.off();
+            }
+        }
+
+        #[test]
+        fn the_lifecycle_polls_only_while_on_and_joins_at_the_production_cadence() {
+            let mut h = Harness::readings(vec![Some(at(0, 1.0, 1.0))], Duration::from_millis(30));
+            h.quiet(at(0, 1.0, 1.0));
+            assert_eq!(h.calls.load(Ordering::SeqCst), 0, "polled while off");
+            h.off();
+            assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+            h.enable();
+            assert_eq!(h.waited(), Duration::from_millis(70));
+            h.enable(); // Already on: no new source, baseline or thread.
+            for _ in 0..3 {
+                assert_eq!(h.step(), Duration::from_millis(70));
+            }
+            assert_eq!(h.calls.load(Ordering::SeqCst), 4);
+            for starts in h.starts.lock().unwrap().windows(2) {
+                assert_eq!(
+                    starts[1].duration_since(starts[0]),
+                    Duration::from_millis(100)
+                );
+            }
+            h.off();
+            h.off();
+            assert!(h.capture.monitor.is_none());
+            h.clock.advance(Duration::from_secs(10));
+            assert_eq!(h.calls.load(Ordering::SeqCst), 4, "polled while off");
+            h.enable();
+            assert_eq!(h.waited(), Duration::from_millis(70));
+            assert_eq!(h.step(), Duration::from_millis(70));
+            assert_eq!(h.calls.load(Ordering::SeqCst), 6);
+            drop(h.capture);
+            h.clock.advance(Duration::from_secs(10));
+            assert_eq!(h.calls.load(Ordering::SeqCst), 6, "polled after drop");
+        }
+
+        #[test]
+        fn queued_activity_is_invalidated_on_off_reenable_drop_and_restart() {
+            let mut h = Harness::readings(
+                vec![Some(at(0, 0.0, 0.0)), Some(at(0, 20.0, 0.0))],
+                Duration::ZERO,
+            );
+            h.quiet(at(0, 0.0, 0.0));
+            h.enable();
+            h.waited();
+            h.step(); // Queue activity without delivering it.
+            let stale = h.queued.try_recv().unwrap();
+            h.off();
+            h.enable();
+            h.waited();
+            if let super::super::Delivery::LocalActivity { at, generation } = stale {
+                generation.deliver(at, &h.capture.sink);
+            } else {
+                panic!("unexpected delivery");
+            }
+            assert_eq!(h.reports.count(), 0, "old session delivered after reenable");
+            h.step();
+            h.drain();
+            assert_eq!(h.reports.count(), 1, "fresh generation did not deliver");
+            h.off();
+            h.enable();
+            h.waited();
+            h.step();
+            // Simulate compositor restart. Join the worker without an off call, exercising its
+            // exit guard; the pending generation must be invalid before a new target begins.
+            h.alive.store(false, Ordering::Release);
+            h.clock.step();
+            h.capture
+                .monitor
+                .as_mut()
+                .unwrap()
+                .thread
+                .take()
+                .unwrap()
+                .join()
+                .unwrap();
+            h.drain();
+            assert_eq!(
+                h.reports.count(),
+                1,
+                "restarted compositor's queue delivered"
+            );
+            h.alive.store(true, Ordering::Release);
+            h.enable();
+            h.waited();
+            h.step();
+            let sink = h.capture.sink.clone();
+            drop(h.capture);
+            while let Ok(super::super::Delivery::LocalActivity { at, generation }) =
+                h.queued.try_recv()
+            {
+                generation.deliver(at, &sink);
+            }
+            assert_eq!(h.reports.count(), 1, "queued activity delivered after drop");
+        }
+
+        #[test]
+        fn invalidation_waits_for_an_in_progress_delivery() {
+            let generation = Generation::new();
+            let (entered, started) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let released = Mutex::new(released);
+            // A deliberately stalled fixture lets the test exercise synchronization with a send
+            // already in progress. Production EventSink is required to be nonblocking.
+            let sink: Arc<dyn EventSink<CaptureEvent>> = Arc::new(move |_| {
+                entered.send(()).unwrap();
+                released.lock().unwrap().recv().unwrap();
+            });
+            let delivering = generation.clone();
+            let sender = std::thread::spawn(move || {
+                delivering.deliver(MonoTime::from_nanos(1), &Some(sink))
+            });
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                generation.0.try_lock().is_err(),
+                "delivery did not hold the invalidation lock"
+            );
+            let invalidating = generation.clone();
+            let stopped = std::thread::spawn(move || invalidating.invalidate());
+            release.send(()).unwrap();
+            sender.join().unwrap();
+            stopped.join().unwrap();
+            assert!(!*generation.0.lock().unwrap());
+        }
+
+        #[test]
+        fn a_stop_during_a_reading_waits_for_it_and_reports_nothing() {
+            let mut h = Harness::readings(vec![Some(at(0, 0.0, 0.0))], Duration::ZERO);
+            h.quiet(at(0, 0.0, 0.0));
+            let (entered, started) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let clock = h.clock.clone();
+            let mut released = Some(released);
+            h.capture.monitor_source = Some(Box::new(move || {
+                let entered = entered.clone();
+                let released = released.take().unwrap();
+                let mut baseline = true;
+                CursorSource {
+                    reader: Box::new(move || {
+                        if std::mem::take(&mut baseline) {
+                            return Ok(at(0, 0.0, 0.0).into());
+                        }
+                        entered.send(()).unwrap();
+                        released.recv().unwrap();
+                        Ok(at(0, 20.0, 0.0).into())
+                    }),
+                    alive: Box::new(|| true),
+                    clock: clock.clone(),
+                }
+            }));
+            h.enable();
+            h.waited();
+            h.clock.step();
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut monitor = h.capture.monitor.take().unwrap();
+            let flag = monitor.stop.clone();
+            let generation = monitor.generation.clone();
+            let (notice, woken) = mpsc::channel();
+            *h.clock.wake_notice.lock().unwrap() = Some(notice);
+            let stopping = std::thread::spawn(move || monitor.stop());
+            // Release the pending read only after stop publishes its flag, without a sleep.
+            woken.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(flag.load(Ordering::Acquire));
+            assert!(generation.0.try_lock().is_ok());
+            release.send(()).unwrap();
+            stopping.join().unwrap();
+            h.drain();
+            assert_eq!(h.reports.count(), 0);
+        }
+
+        #[test]
+        fn the_thread_ends_by_itself_when_the_compositor_is_gone() {
+            let mut h = Harness::readings(vec![Some(at(0, 1.0, 1.0))], Duration::ZERO);
+            h.quiet(at(0, 1.0, 1.0));
+            h.enable();
+            h.waited();
+            for _ in 0..4 {
+                h.step();
+            }
+            h.alive.store(false, Ordering::Release);
+            h.clock.step();
+            h.capture
+                .monitor
+                .as_mut()
+                .unwrap()
+                .thread
+                .take()
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(h.calls.load(Ordering::SeqCst), 5);
+            h.off();
+            h.drain();
+            assert_eq!(h.reports.count(), 0);
+        }
+
+        // Actual compositor acceptance needs bounded wall-clock waiting for IPC/event delivery.
+        fn wait_for(limit: Duration, condition: impl Fn() -> bool) -> bool {
+            let end = Instant::now() + limit;
+            while Instant::now() < end {
+                if condition() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            condition()
+        }
+
+        /// The acceptance check uses only the named, verified nested instance. With the default
+        /// cleared environment this is skipped before any compositor connection is attempted.
+        #[test]
+        fn nested_real_injection_and_ipc_motion() {
+            if std::env::var("CROSSPANE_NESTED_HYPR").as_deref() != Ok("1") {
+                eprintln!("skipped: WP-1.43 local activity needs CROSSPANE_NESTED_HYPR=1");
+                return;
+            }
+            use crate::hyprland::capture::{HyprlandCapture, NestEndpoints, verify_nest};
+            use crate::hyprland::cursor::cursor_position;
+            use crate::hyprland::inject::{connect, injected_position_for};
+            use crosspane_platform::{InputCapture, IoGate, PointerInjector};
+
+            let proof = verify_nest(&NestEndpoints::from_process())
+                .expect("refusing local activity test outside a helper-owned nest");
+            // Existing capture conformance tests take this lock around nest/output changes,
+            // which can cause the parent to resize every other nested output.
+            let topology_lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(
+                    proof
+                        .endpoint
+                        .runtime_dir
+                        .join("crosspane-capture-topology.lock"),
+                )
+                .unwrap();
+            rustix::fs::flock(&topology_lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+            let ipc = HyprIpc::from_env().unwrap();
+            // The parent's tiling can resize a newly created nest just after its first IPC
+            // reply. Connect the output-bound injector only after startup topology settles.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut layout = ipc.json("monitors").unwrap();
+            let mut stable_since = Instant::now();
+            loop {
+                std::thread::sleep(INTERVAL);
+                let next = ipc.json("monitors").unwrap();
+                if next != layout {
+                    layout = next;
+                    stable_since = Instant::now();
+                }
+                if stable_since.elapsed() >= Duration::from_millis(500) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "nested startup topology did not settle"
+                );
+            }
+            let gate = IoGate::new();
+            gate.set_session_permits(true);
+            gate.set_engine_permits(true);
+            let (keys, mut pointer) = connect(gate.clone(), ipc.clone()).unwrap();
+            let injected = injected_position_for(&gate).unwrap();
+            let mut capture = HyprlandCapture::new_for_nest_test(gate.clone(), &proof).unwrap();
+            let reports = Reports::default();
+            capture.subscribe(reports.sink()).unwrap();
+            let (display, _) = cursor_position(&ipc).unwrap();
+            pointer
+                .move_to(display, PointDevice::new(30.0, 30.0))
+                .unwrap();
+            assert_eq!(
+                injected.last().unwrap().position,
+                PointDevice::new(30.0, 30.0)
+            );
+            capture.set_monitor_local_activity(true).unwrap();
+            // Leave over 150 ms between motions so the settled decision is exercised too.
+            let mut longest = Duration::ZERO;
+            for x in [60.0, 90.0, 120.0, 150.0] {
+                pointer.move_to(display, PointDevice::new(x, 40.0)).unwrap();
+                std::thread::sleep(Duration::from_millis(250));
+                let start = Instant::now();
+                let (seen_display, seen) = cursor_position(&ipc).unwrap();
+                longest = longest.max(start.elapsed());
+                assert_eq!(seen_display, display);
+                assert!(
+                    (seen.x - x).hypot(seen.y - 40.0) <= DIVERGENCE,
+                    "cursor {seen:?}, expected ({x}, 40), monitors {:?}",
+                    ipc.json("monitors").unwrap()
+                );
+                assert_eq!(reports.count(), 0, "injected motion caused local activity");
+            }
+            assert!(
+                longest < INTERVAL,
+                "nested compositor reading stalled: {longest:?}"
+            );
+            // Rejected and gated motions must not replace the position actually submitted.
+            let last = injected.last();
+            assert!(
+                pointer
+                    .move_to(display, PointDevice::new(-1.0, 40.0))
+                    .is_err()
+            );
+            assert_eq!(injected.last(), last);
+            gate.set_engine_permits(false);
+            assert!(
+                pointer
+                    .move_to(display, PointDevice::new(70.0, 40.0))
+                    .is_err()
+            );
+            gate.set_engine_permits(true);
+            assert_eq!(injected.last(), last);
+
+            let raw = ipc.json("cursorpos").unwrap();
+            let (x, y) = (raw["x"].as_f64().unwrap(), raw["y"].as_f64().unwrap());
+            // Hyprland's cursor dispatcher uses layout coordinates, unlike the injector.
+            ipc.dispatch(&format!(
+                "hl.dsp.cursor.move({{ x = {}, y = {} }})",
+                x + 20.0,
+                y + 20.0
+            ))
+            .unwrap();
+            assert!(wait_for(Duration::from_secs(2), || reports.count() == 1));
+            std::thread::sleep(Duration::from_millis(650));
+            assert_eq!(reports.count(), 1, "stale IPC divergence repeated");
+            let stop_started = Instant::now();
+            capture.set_monitor_local_activity(false).unwrap();
+            let stopped_in = stop_started.elapsed();
+            assert!(stopped_in < Duration::from_millis(100));
+            ipc.dispatch(&format!(
+                "hl.dsp.cursor.move({{ x = {}, y = {} }})",
+                x + 40.0,
+                y + 20.0
+            ))
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            assert_eq!(
+                reports.count(),
+                1,
+                "activity reported while monitor was off"
+            );
+            eprintln!(
+                "WP-1.43 nested: 0 injected-only reports; 1 IPC motion report; longest read {longest:?}; stop joined in {stopped_in:?}"
+            );
+            drop(capture);
+            drop(pointer);
+            drop(keys);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,7 +2875,7 @@ mod tests {
 
     /// A handle that was never connected to anything: the commands it sends land in the returned
     /// receiver, which must stay empty when a hook refuses.
-    fn detached(nest: Option<Endpoint>) -> (HyprlandCapture, mpsc::Receiver<Command>) {
+    pub(super) fn detached(nest: Option<Endpoint>) -> (HyprlandCapture, mpsc::Receiver<Command>) {
         let (wake, _receive) = UnixDatagram::pair().unwrap();
         let (commands, requests) = mpsc::channel();
         let capture = HyprlandCapture {
@@ -1165,6 +2889,12 @@ mod tests {
                 wake,
             }),
             nest,
+            gate: IoGate::new(),
+            source: Source::Environment,
+            sink: None,
+            activity_delivery: mpsc::channel().0,
+            monitor: None,
+            monitor_source: None,
         };
         (capture, requests)
     }
