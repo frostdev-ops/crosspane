@@ -151,6 +151,8 @@ const HYPRLAND_PLACEMENT: bool = cfg!(target_os = "linux");
 /// How often the home bind is verified while it is wanted (also at once on a config reload).
 const BIND_CHECK: Duration = Duration::from_secs(1);
 const HOME_WATCHDOG: Duration = Duration::from_millis(500);
+/// Remote E2 input legitimately leaves this node's pointer on the projected window's twin.
+const E2_TWIN_GRACE: Duration = Duration::from_secs(3);
 /// How often a startup removal that failed is tried again (amendment A1).
 const FENCE_RETRY: Duration = Duration::from_secs(2);
 /// How far, in device pixels per axis, the pointer read back after a warp may be from the point it
@@ -374,6 +376,7 @@ struct HomeAgent {
     /// One warning per continuous episode on a twin outside home.
     rescue_reported: bool,
     watchdog_next: Instant,
+    e2_twin_injected: BTreeMap<DisplayId, Instant>,
 }
 
 impl HomeAgent {
@@ -398,6 +401,7 @@ impl HomeAgent {
             fallback: None,
             rescue_reported: false,
             watchdog_next: Instant::now(),
+            e2_twin_injected: BTreeMap::new(),
         }
     }
 
@@ -412,6 +416,20 @@ impl HomeAgent {
         {
             self.inject_error = Some((Instant::now(), text()));
         }
+    }
+
+    /// Any twin in use suspends classification without querying the cursor. Ignore timestamps
+    /// for twins that parking has removed; the last live one determines when reads can resume.
+    fn e2_twin_grace_deadline(&self) -> Option<Instant> {
+        // Failed handovers and a retained release bind need the existing recovery deadline.
+        if self.pointer_unsafe || self.removal.is_some() {
+            return None;
+        }
+        self.e2_twin_injected
+            .iter()
+            .filter(|(display, _)| self.twins.values().any(|twin| twin == *display))
+            .map(|(_, at)| *at + E2_TWIN_GRACE)
+            .max()
     }
 }
 
@@ -860,7 +878,13 @@ impl Agent {
             })
             .min(HOUSEKEEPING);
         if self.home_watchdog_needed() {
-            timeout.min(self.home.watchdog_next.saturating_duration_since(clock_now))
+            let deadline = self
+                .home
+                .e2_twin_grace_deadline()
+                .map_or(self.home.watchdog_next, |until| {
+                    self.home.watchdog_next.max(until)
+                });
+            timeout.min(deadline.saturating_duration_since(clock_now))
         } else {
             timeout
         }
@@ -912,6 +936,7 @@ impl Agent {
                 if self.home.capture == Some(*id) =>
             {
                 self.home.capture = None;
+                self.home.e2_twin_injected.clear();
             }
             Input::Capture(CaptureEvent::Motion { .. }) => self.capture_motion_seen = true,
             Input::Link(LinkEvent::Input {
@@ -1445,6 +1470,7 @@ impl Agent {
             }
             Output::EndCapture { warp_to } => {
                 self.home.capture = None;
+                self.home.e2_twin_injected.clear();
                 if let Some(capture) = &mut self.platform.capture
                     && let Err(e) = capture.end(warp_to)
                 {
@@ -1457,6 +1483,7 @@ impl Agent {
             // read-back of the pointer and then the gate (amendments A3 and B2).
             Output::ReleaseAndWarp { op, warp_to } => {
                 self.home.capture = None;
+                self.home.e2_twin_injected.clear();
                 let twin = self
                     .home
                     .twins
@@ -1518,12 +1545,7 @@ impl Agent {
                 }
             }
             Output::Inject { id, cmd } => {
-                let key_or_button = matches!(cmd, InjectCmd::Key { .. } | InjectCmd::Button { .. });
-                let ok = self.inject(cmd);
-                if key_or_button {
-                    self.tracker.injected(id, ok);
-                }
-                self.pending.push_back(Input::InjectDone { id, ok });
+                self.execute_injection_at(id, cmd, Instant::now());
             }
             Output::SendInput { peer, msg } => {
                 if let Some(link) = self.links.get_mut(&peer) {
@@ -1839,6 +1861,33 @@ impl Agent {
             return;
         };
         audio.submit(output);
+    }
+
+    /// All injections, including WP-2.38 queued targeting, reach this execution point. Only a
+    /// successful E2 move onto a known twin renews grace: releases and retries are not activity.
+    fn execute_injection_at(
+        &mut self,
+        id: crosspane_engine::InjectId,
+        cmd: InjectCmd,
+        clock_now: Instant,
+    ) {
+        let key_or_button = matches!(cmd, InjectCmd::Key { .. } | InjectCmd::Button { .. });
+        let target = match &cmd {
+            InjectCmd::MoveTo { display, .. } => Some(*display),
+            _ => None,
+        }
+        .filter(|display| self.home.twins.values().any(|twin| twin == display));
+        let ok = self.inject(cmd);
+        if ok && let Some(display) = target {
+            self.home
+                .e2_twin_injected
+                .retain(|display, _| self.home.twins.values().any(|twin| twin == display));
+            self.home.e2_twin_injected.insert(display, clock_now);
+        }
+        if key_or_button {
+            self.tracker.injected(id, ok);
+        }
+        self.pending.push_back(Input::InjectDone { id, ok });
     }
 
     fn inject(&mut self, cmd: InjectCmd) -> bool {
@@ -3588,6 +3637,9 @@ impl Agent {
     /// `Output::HomeBind`: install (verified) or remove (verified absent) the release bind, and
     /// answer with `Input::HomeBindSet`.
     fn home_bind(&mut self, op: HomeOp, install: bool) {
+        if install {
+            self.home.e2_twin_injected.clear();
+        }
         self.home.active = install;
         self.home.removal = (!install).then_some(op);
         let result = if install {
@@ -3823,10 +3875,20 @@ impl Agent {
     /// housekeeping shares this deadline: at most one classification read per 500 ms, plus one
     /// fresh physical confirmation only when a rescue is attempted. Exempt states do no IPC.
     fn home_watchdog(&mut self) {
-        if !self.home_watchdog_needed() || Instant::now() < self.home.watchdog_next {
+        self.home_watchdog_at(Instant::now());
+    }
+
+    fn home_watchdog_at(&mut self, clock_now: Instant) {
+        if !self.home_watchdog_needed()
+            || clock_now < self.home.watchdog_next
+            || self
+                .home
+                .e2_twin_grace_deadline()
+                .is_some_and(|until| clock_now < until)
+        {
             return;
         }
-        self.home.watchdog_next = Instant::now() + HOME_WATCHDOG;
+        self.home.watchdog_next = clock_now + HOME_WATCHDOG;
         let Some(Ok((on, _))) = self.platform.home.as_ref().map(|seat| seat.cursor()) else {
             return;
         };
@@ -3837,6 +3899,7 @@ impl Agent {
         if self.physical_display(on) {
             self.home.rescue_reported = false;
             self.home.pointer_unsafe = false;
+            self.home.e2_twin_injected.clear();
             self.home_finish_removal();
             return;
         }
@@ -3856,9 +3919,13 @@ impl Agent {
         self.home
             .twins
             .retain(|_, twin| !physical.iter().any(|d| d.id == *twin));
+        self.home
+            .e2_twin_injected
+            .retain(|display, _| self.home.twins.values().any(|twin| twin == display));
         if physical.iter().any(|d| d.id == on) {
             self.home.pointer_unsafe = false;
             self.home.rescue_reported = false;
+            self.home.e2_twin_injected.clear();
             self.home_finish_removal();
             return;
         }
@@ -3869,11 +3936,19 @@ impl Agent {
             return;
         }
         self.home.pointer_unsafe = true;
+        let after_remote_input = self.home.e2_twin_injected.remove(&on).is_some();
         if !std::mem::replace(&mut self.home.rescue_reported, true) {
-            tracing::warn!(
-                twin_display = on.0,
-                "the pointer is on a twin outside home; returning it to a physical display"
-            );
+            if after_remote_input {
+                tracing::warn!(
+                    twin_display = on.0,
+                    "the pointer was left on a twin after remote input; returning it to a physical display"
+                );
+            } else {
+                tracing::warn!(
+                    twin_display = on.0,
+                    "the pointer is on a twin outside home; returning it to a physical display"
+                );
+            }
         }
         let Some(fallback) = self.home_fallback(&physical) else {
             return;
@@ -3884,6 +3959,7 @@ impl Agent {
         let Some(capture) = &mut self.platform.capture else {
             return;
         };
+        self.home.e2_twin_injected.clear();
         if let Err(error) = capture.end(Some(fallback)) {
             tracing::debug!(%error, "the watchdog fallback could not be completed");
         }
@@ -9090,6 +9166,736 @@ mod home_tests {
         assert_eq!(h.compositor.lock().unwrap().display_reads - displays, 1);
         assert!(!h.rig.agent.home.rescue_reported);
         assert!(!h.rig.agent.home.pointer_unsafe);
+    }
+
+    fn watchdog_injection_at(h: &mut Home, cmd: InjectCmd, clock_now: Instant) {
+        let id = crosspane_engine::InjectId(u64::MAX);
+        h.rig.agent.execute_injection_at(id, cmd, clock_now);
+        assert!(matches!(
+            h.rig.agent.pending.pop_back(),
+            Some(Input::InjectDone { id: got, ok: true }) if got == id
+        ));
+    }
+
+    fn watchdog_logs() -> (impl tracing::Subscriber + Send + Sync, Arc<Mutex<Vec<u8>>>) {
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || Writer(writer.clone()))
+            .finish();
+        (subscriber, logs)
+    }
+
+    #[test]
+    fn repeated_e2_twin_motion_suspends_ipc_then_rescues_once_after_three_seconds() {
+        let (subscriber, logs) = watchdog_logs();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut h = projected_scenario();
+            let start = Instant::now();
+            h.rig.agent.home.watchdog_next = start;
+            h.compositor.lock().unwrap().cursor = Some(TARGET);
+            let reads = h.compositor.lock().unwrap().cursor_reads;
+            let displays = h.compositor.lock().unwrap().display_reads;
+            let ends = h.capture.lock().unwrap().ends.len();
+            // Ten seconds of real execution-point calls, with deterministic monotonic time.
+            for tick in 0..=50 {
+                let clock_now = start + Duration::from_millis(tick * 200);
+                watchdog_injection_at(
+                    &mut h,
+                    InjectCmd::MoveTo {
+                        display: TARGET.0,
+                        position: TARGET.1,
+                    },
+                    clock_now,
+                );
+                for _ in 0..1000 {
+                    h.rig.agent.home_watchdog_at(clock_now);
+                }
+                assert_eq!(h.compositor.lock().unwrap().cursor_reads, reads);
+                assert_eq!(h.compositor.lock().unwrap().display_reads, displays);
+                assert_eq!(h.capture.lock().unwrap().ends.len(), ends);
+                assert!(logs.lock().unwrap().is_empty());
+            }
+            let stopped = start + Duration::from_secs(10);
+            h.rig
+                .agent
+                .home_watchdog_at(stopped + E2_TWIN_GRACE - Duration::from_millis(1));
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads, reads);
+            assert!(logs.lock().unwrap().is_empty());
+            h.rig.agent.home_watchdog_at(stopped + E2_TWIN_GRACE);
+            assert_eq!(h.capture.lock().unwrap().ends.len(), ends + 1);
+            assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, 2);
+            assert_eq!(h.compositor.lock().unwrap().display_reads - displays, 1);
+            for tick in 0..=10 {
+                h.rig
+                    .agent
+                    .home_watchdog_at(stopped + E2_TWIN_GRACE + HOME_WATCHDOG * tick);
+            }
+            assert_eq!(h.capture.lock().unwrap().ends.len(), ends + 1);
+        });
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("left on a twin after remote input").count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(text.matches("WARN").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn only_successful_twin_moves_renew_grace_not_buttons_scroll_keys_or_releases() {
+        let mut h = projected_scenario();
+        let start = Instant::now();
+        h.rig.agent.home.watchdog_next = start;
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::MoveTo {
+                display: TARGET.0,
+                position: TARGET.1,
+            },
+            start,
+        );
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::Button {
+                button: MouseButton::PRIMARY,
+                down: false,
+            },
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(h.rig.agent.home.e2_twin_injected[&TARGET.0], start);
+        let scroll = InjectCmd::Scroll(ScrollDelta {
+            v120_x: 0,
+            v120_y: 120,
+            pixels: None,
+            phase: ScrollPhase::Discrete,
+            stop_x: false,
+            stop_y: false,
+        });
+        watchdog_injection_at(&mut h, scroll.clone(), start + Duration::from_millis(2200));
+        let last_twin = start;
+        assert_eq!(h.rig.agent.home.e2_twin_injected[&TARGET.0], last_twin);
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::Key {
+                usage: HidUsage::keyboard(4),
+                down: false,
+            },
+            start + Duration::from_millis(2400),
+        );
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::MoveTo {
+                display: DisplayId(1),
+                position: PointDevice::zero(),
+            },
+            start + Duration::from_millis(2500),
+        );
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::Button {
+                button: MouseButton::PRIMARY,
+                down: false,
+            },
+            start + Duration::from_millis(2600),
+        );
+        watchdog_injection_at(&mut h, scroll, start + Duration::from_millis(2800));
+        assert_eq!(h.rig.agent.home.e2_twin_injected[&TARGET.0], last_twin);
+        let reads = h.compositor.lock().unwrap().cursor_reads;
+        h.rig
+            .agent
+            .home_watchdog_at(last_twin + E2_TWIN_GRACE - Duration::from_millis(1));
+        assert_eq!(h.compositor.lock().unwrap().cursor_reads, reads);
+        h.rig.agent.home_watchdog_at(last_twin + E2_TWIN_GRACE);
+        assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+    }
+
+    #[test]
+    fn e1_scroll_after_e2_targeting_does_not_extend_the_three_second_grace() {
+        use crosspane_protocol::msg::InputMessage;
+        let (subscriber, logs) = watchdog_logs();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut h = projected_scenario();
+            let peer = h.rig.peer;
+            let session = crosspane_types::id::SessionId(40);
+            start_control(&mut h, peer, session);
+            assert_eq!(h.rig.agent.engine.controlled_by(), Some(peer));
+            let start = Instant::now();
+            h.rig.agent.home.watchdog_next = start;
+            h.compositor.lock().unwrap().cursor = Some(TARGET);
+            watchdog_injection_at(
+                &mut h,
+                InjectCmd::MoveTo {
+                    display: TARGET.0,
+                    position: TARGET.1,
+                },
+                start,
+            );
+            let reads = h.compositor.lock().unwrap().cursor_reads;
+            let ends = h.capture.lock().unwrap().ends.len();
+            for seq in 1..=15 {
+                let outputs = step(
+                    &mut h,
+                    Input::Link(LinkEvent::Input {
+                        peer,
+                        msg: InputMessage::Scroll {
+                            session,
+                            seq,
+                            delta: ScrollDelta {
+                                v120_x: 0,
+                                v120_y: 120,
+                                pixels: None,
+                                phase: ScrollPhase::Discrete,
+                                stop_x: false,
+                                stop_y: false,
+                            },
+                        },
+                    }),
+                );
+                assert!(outputs.iter().any(|output| matches!(
+                    output,
+                    Output::Inject {
+                        cmd: InjectCmd::Scroll(_),
+                        ..
+                    }
+                )));
+                assert_eq!(h.rig.agent.home.e2_twin_injected[&TARGET.0], start);
+                h.rig
+                    .agent
+                    .home_watchdog_at(start + Duration::from_millis(u64::from(seq) * 200));
+                if seq < 15 {
+                    assert_eq!(h.compositor.lock().unwrap().cursor_reads, reads);
+                    assert_eq!(h.capture.lock().unwrap().ends.len(), ends);
+                }
+            }
+            assert_eq!(h.capture.lock().unwrap().ends.len(), ends + 1);
+            assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+        });
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("left on a twin after remote input").count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn release_journal_failure_and_failed_restore_retries_never_renew_e2_grace() {
+        use crate::parking_worker::tests::fake;
+        use crosspane_input::Held;
+        use crosspane_input::journal::{Journal, JournalError, MemoryJournal};
+        use crosspane_protocol::{msg::InputMessage, projection::ProjInput};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailUps(MemoryJournal, Arc<AtomicUsize>);
+        impl Journal for FailUps {
+            fn record_down(&mut self, item: Held) -> Result<(), JournalError> {
+                self.0.record_down(item)
+            }
+            fn record_up(&mut self, _item: Held) -> Result<(), JournalError> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::other("fixture: release journal save failed").into())
+            }
+            fn held(&self) -> Result<Vec<Held>, JournalError> {
+                self.0.held()
+            }
+        }
+        let (subscriber, logs) = watchdog_logs();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut h = bare_scenario();
+            let setup = h.rig.agent.fed.clone();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let (engine, startup) = Engine::new(
+                crosspane_engine::EngineConfig::new(h.rig.local),
+                Box::new(MemoryJournal::default()),
+                Box::new(FailUps(MemoryJournal::default(), attempts.clone())),
+                ms(0),
+            )
+            .unwrap();
+            h.rig.agent.engine = engine;
+            h.rig.agent.execute(startup);
+            process_events(&mut h);
+            for input in setup {
+                step(&mut h, input);
+            }
+            project(&mut h, 1);
+            let (mut backend, _controls) = fake(None);
+            backend.restore_fails = true;
+            replace_parking(&mut h.rig.agent, Box::new(backend));
+            let peer = h.rig.peer;
+            for (seq, down) in [(1, true), (2, false)] {
+                step(
+                    &mut h,
+                    Input::Link(LinkEvent::Input {
+                        peer,
+                        msg: InputMessage::Proj(ProjInput::Button {
+                            projection: ProjectionId(1),
+                            seq,
+                            button: MouseButton::PRIMARY,
+                            down,
+                            position: PointDevice::new(10.0, 20.0),
+                        }),
+                    }),
+                );
+            }
+            assert!(attempts.load(Ordering::SeqCst) > 0);
+            assert_eq!(h.rig.agent.home.twins.get(&WindowId(10)), Some(&TARGET.0));
+            let last_move = h.rig.agent.home.e2_twin_injected[&TARGET.0];
+            h.rig.agent.home.watchdog_next = last_move;
+            h.compositor.lock().unwrap().cursor = Some(TARGET);
+            let ends = h.capture.lock().unwrap().ends.len();
+            let reads = h.compositor.lock().unwrap().cursor_reads;
+            for interval in 1..=80 {
+                let outputs = tick(&mut h, 50);
+                assert!(
+                    outputs.iter().any(|output| matches!(
+                        output,
+                        Output::Inject {
+                            cmd: InjectCmd::Button { down: false, .. },
+                            ..
+                        }
+                    )),
+                    "{outputs:?}"
+                );
+                if interval < 60 {
+                    assert_eq!(h.rig.agent.home.e2_twin_injected[&TARGET.0], last_move);
+                }
+                h.rig
+                    .agent
+                    .home_watchdog_at(last_move + Duration::from_millis(interval * 50));
+                assert_eq!(
+                    h.capture.lock().unwrap().ends.len(),
+                    ends + usize::from(interval >= 60)
+                );
+                if interval < 60 {
+                    assert_eq!(h.compositor.lock().unwrap().cursor_reads, reads);
+                }
+            }
+            assert!(attempts.load(Ordering::SeqCst) >= 80);
+            assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+        });
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("left on a twin after remote input").count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn each_pointer_ownership_handover_discards_all_e2_timestamps() {
+        for handover in 0..5 {
+            let mut h = projected_scenario();
+            let start = Instant::now();
+            h.rig.agent.home.twins.insert(WindowId(20), DisplayId(8));
+            for display in [TARGET.0, DisplayId(8)] {
+                watchdog_injection_at(
+                    &mut h,
+                    InjectCmd::MoveTo {
+                        display,
+                        position: PointDevice::zero(),
+                    },
+                    start,
+                );
+            }
+            assert_eq!(h.rig.agent.home.e2_twin_injected.len(), 2);
+            match handover {
+                0 => {
+                    bind(&mut h, 50, true).unwrap();
+                }
+                1 => {
+                    warp(&mut h, TARGET).unwrap();
+                }
+                2 => h
+                    .rig
+                    .agent
+                    .execute_one(Output::EndCapture { warp_to: None }),
+                3 => {
+                    h.rig.agent.home.capture = Some(CaptureId(50));
+                    h.rig.agent.observe(&Input::Capture(CaptureEvent::Ended {
+                        id: CaptureId(50),
+                        reason: crosspane_platform::EndReason::Requested,
+                    }));
+                }
+                _ => {
+                    h.compositor.lock().unwrap().cursor = Some(TARGET);
+                    h.rig.agent.home.pointer_unsafe = true;
+                    h.rig.agent.home.watchdog_next = start;
+                    h.rig.agent.home_watchdog_at(start);
+                }
+            }
+            assert!(
+                h.rig.agent.home.e2_twin_injected.is_empty(),
+                "handover {handover}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_pointer_or_pending_bind_removal_overrides_grace_and_receive_timeout() {
+        for pending_removal in [false, true] {
+            let mut h = projected_scenario();
+            let start = Instant::now();
+            h.rig.agent.home.watchdog_next = start + HOME_WATCHDOG;
+            h.compositor.lock().unwrap().cursor = Some(TARGET);
+            watchdog_injection_at(
+                &mut h,
+                InjectCmd::MoveTo {
+                    display: TARGET.0,
+                    position: TARGET.1,
+                },
+                start,
+            );
+            if pending_removal {
+                h.rig.agent.home.removal = Some(HomeOp(50));
+            } else {
+                h.rig.agent.home.pointer_unsafe = true;
+            }
+            assert!(h.rig.agent.home.e2_twin_grace_deadline().is_none());
+            assert_eq!(
+                h.rig.agent.receive_timeout(ms(0), start + HOME_WATCHDOG),
+                Duration::ZERO
+            );
+            let reads = h.compositor.lock().unwrap().cursor_reads;
+            let ends = h.capture.lock().unwrap().ends.len();
+            h.rig
+                .agent
+                .home_watchdog_at(start + HOME_WATCHDOG - Duration::from_millis(1));
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads, reads);
+            h.rig.agent.home_watchdog_at(start + HOME_WATCHDOG);
+            assert_eq!(h.capture.lock().unwrap().ends.len(), ends + 1);
+            assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+            assert!(h.rig.agent.home.e2_twin_injected.is_empty());
+            watchdog_injection_at(
+                &mut h,
+                InjectCmd::MoveTo {
+                    display: TARGET.0,
+                    position: TARGET.1,
+                },
+                start + HOME_WATCHDOG,
+            );
+            assert_eq!(
+                h.rig.agent.home.e2_twin_grace_deadline(),
+                Some(start + HOME_WATCHDOG + E2_TWIN_GRACE)
+            );
+        }
+    }
+
+    #[test]
+    fn recent_e2_does_not_delay_failed_home_entry_and_unconfirmed_fallback_recovery() {
+        let mut h = aimed_scenario();
+        let start = Instant::now();
+        h.rig.agent.home.watchdog_next = start + HOME_WATCHDOG;
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        h.capture.lock().unwrap().warp_cursor = None;
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::MoveTo {
+                display: TARGET.0,
+                position: TARGET.1,
+            },
+            start,
+        );
+        let outputs = trigger(&mut h);
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, Output::Notice(Notice::HomeFailed { .. })))
+        );
+        assert!(h.rig.agent.home.pointer_unsafe);
+        assert!(h.rig.agent.home.removal.is_some());
+        assert!(h.rig.agent.home.e2_twin_injected.is_empty());
+        assert!(h.compositor.lock().unwrap().ours);
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(h.rig.agent.test_now.unwrap(), start + HOME_WATCHDOG),
+            Duration::ZERO
+        );
+        h.capture.lock().unwrap().warp_cursor = Some(h.compositor.clone());
+        let ends = h.capture.lock().unwrap().ends.len();
+        h.rig.agent.home_watchdog_at(start + HOME_WATCHDOG);
+        process_events(&mut h);
+        assert_eq!(h.capture.lock().unwrap().ends.len(), ends + 1);
+        assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.removal.is_none());
+    }
+
+    #[test]
+    fn quick_home_exit_and_capture_end_discard_recent_e2_grace_before_rescue() {
+        let mut h = aimed_scenario();
+        let start = Instant::now();
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::MoveTo {
+                display: TARGET.0,
+                position: TARGET.1,
+            },
+            start,
+        );
+        trigger(&mut h);
+        step(
+            &mut h,
+            Input::Windows(WindowEvent::Focused(Some(WindowId(10)))),
+        );
+        assert!(h.rig.agent.home.e2_twin_injected.is_empty());
+        exit_home(&mut h);
+        assert!(h.rig.agent.home_capture_active());
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::MoveTo {
+                display: TARGET.0,
+                position: TARGET.1,
+            },
+            start + Duration::from_millis(100),
+        );
+        h.capture.lock().unwrap().warp_cursor = None;
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert!(!h.rig.agent.home_capture_active());
+        assert!(h.rig.agent.home.e2_twin_injected.is_empty());
+        assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, TARGET.0);
+        h.capture.lock().unwrap().warp_cursor = Some(h.compositor.clone());
+        h.rig.agent.home.watchdog_next = start + HOME_WATCHDOG;
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(h.rig.agent.test_now.unwrap(), start + HOME_WATCHDOG),
+            Duration::ZERO
+        );
+        let ends = h.capture.lock().unwrap().ends.len();
+        h.rig.agent.home_watchdog_at(start + HOME_WATCHDOG);
+        assert_eq!(h.capture.lock().unwrap().ends.len(), ends + 1);
+        assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+    }
+
+    #[test]
+    fn physical_e2_and_e1_moves_do_not_exempt_a_stranded_twin() {
+        for e1 in [false, true] {
+            let mut h = projected_scenario();
+            let clock_now = Instant::now();
+            if e1 {
+                let peer = h.rig.peer;
+                step(
+                    &mut h,
+                    control_input(
+                        peer,
+                        ControlMessage::StartControl {
+                            session: crosspane_types::id::SessionId(40),
+                            entry_display: DisplayId(1),
+                            entry: PointDevice::zero(),
+                            lock_keys: LockKeys::default(),
+                        },
+                    ),
+                );
+                assert_eq!(h.rig.agent.engine.controlled_by(), Some(peer));
+            } else {
+                watchdog_injection_at(
+                    &mut h,
+                    InjectCmd::MoveTo {
+                        display: DisplayId(1),
+                        position: PointDevice::zero(),
+                    },
+                    clock_now,
+                );
+            }
+            assert!(h.rig.agent.home.e2_twin_injected.is_empty());
+            h.compositor.lock().unwrap().cursor = Some(TARGET);
+            h.rig.agent.home.watchdog_next = clock_now;
+            let ends = h.capture.lock().unwrap().ends.len();
+            h.rig.agent.home_watchdog_at(clock_now);
+            assert_eq!(h.capture.lock().unwrap().ends.len(), ends + 1);
+            assert_eq!(h.compositor.lock().unwrap().cursor.unwrap().0, DisplayId(1));
+        }
+    }
+
+    #[test]
+    fn watchdog_event_bursts_stay_bounded_and_any_recent_twin_skips_all_ipc() {
+        let mut h = projected_scenario();
+        let start = Instant::now();
+        h.rig.agent.home.watchdog_next = start;
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(1), PointDevice::zero()));
+        let reads = h.compositor.lock().unwrap().cursor_reads;
+        let displays = h.compositor.lock().unwrap().display_reads;
+        for (ms, count) in [(0, 1), (499, 1), (500, 2), (501, 2)] {
+            for _ in 0..1000 {
+                h.rig
+                    .agent
+                    .home_watchdog_at(start + Duration::from_millis(ms));
+            }
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, count);
+        }
+        let injected = start + Duration::from_millis(600);
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::MoveTo {
+                display: TARGET.0,
+                position: TARGET.1,
+            },
+            injected,
+        );
+        h.rig.agent.home.twins.insert(WindowId(20), DisplayId(8));
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(8), PointDevice::zero()));
+        for ms in (600..3600).step_by(100) {
+            for _ in 0..1000 {
+                h.rig
+                    .agent
+                    .home_watchdog_at(start + Duration::from_millis(ms));
+            }
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, 2);
+            assert_eq!(h.compositor.lock().unwrap().display_reads, displays);
+        }
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(1), PointDevice::zero()));
+        for (ms, count) in [(3600, 3), (4099, 3), (4100, 4)] {
+            for _ in 0..1000 {
+                h.rig
+                    .agent
+                    .home_watchdog_at(start + Duration::from_millis(ms));
+            }
+            assert_eq!(h.compositor.lock().unwrap().cursor_reads - reads, count);
+            assert_eq!(h.compositor.lock().unwrap().display_reads, displays);
+        }
+    }
+
+    #[test]
+    fn the_receive_timeout_waits_for_e2_grace_without_spinning_or_a_late_rescue() {
+        let mut h = projected_scenario();
+        let start = Instant::now();
+        let engine_now = MonoTime::from_nanos(0);
+        h.rig.agent.home.watchdog_next = start;
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::MoveTo {
+                display: TARGET.0,
+                position: TARGET.1,
+            },
+            start,
+        );
+        assert_eq!(h.rig.agent.receive_timeout(engine_now, start), HOUSEKEEPING);
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(engine_now, start + Duration::from_millis(2750)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(engine_now, start + E2_TWIN_GRACE),
+            Duration::ZERO
+        );
+        h.rig.agent.home.twins.insert(WindowId(20), DisplayId(8));
+        watchdog_injection_at(
+            &mut h,
+            InjectCmd::MoveTo {
+                display: DisplayId(8),
+                position: PointDevice::zero(),
+            },
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(engine_now, start + E2_TWIN_GRACE),
+            HOUSEKEEPING
+        );
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(engine_now, start + Duration::from_millis(4750)),
+            Duration::from_millis(250)
+        );
+        h.rig.agent.home.twins.remove(&WindowId(20));
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(engine_now, start + Duration::from_millis(4750)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn queued_e2_targeting_records_the_move_when_its_ack_releases_execution() {
+        use crosspane_protocol::{msg::InputMessage, projection::ProjInput};
+        let mut h = projected_scenario();
+        let now = h.rig.agent.test_now.unwrap();
+        let start = Instant::now();
+        let input = |msg| {
+            Input::Link(LinkEvent::Input {
+                peer: h.rig.peer,
+                msg: InputMessage::Proj(msg),
+            })
+        };
+        let outputs = h.rig.agent.engine.handle(
+            input(ProjInput::Scroll {
+                projection: ProjectionId(1),
+                seq: 1,
+                position: PointDevice::new(10.0, 20.0),
+                delta: ScrollDelta {
+                    v120_x: 0,
+                    v120_y: 120,
+                    pixels: None,
+                    phase: ScrollPhase::Discrete,
+                    stop_x: false,
+                    stop_y: false,
+                },
+            }),
+            now,
+        );
+        let (id, cmd) = outputs
+            .into_iter()
+            .find_map(|out| match out {
+                Output::Inject { id, cmd } => Some((id, cmd)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(cmd, InjectCmd::MoveTo { display, .. } if display == TARGET.0));
+        h.rig.agent.execute_injection_at(id, cmd, start);
+        let acknowledged = h.rig.agent.pending.pop_back().unwrap();
+        let queued = h.rig.agent.engine.handle(
+            input(ProjInput::Motion {
+                projection: ProjectionId(1),
+                seq: 2,
+                position: PointDevice::new(30.0, 40.0),
+            }),
+            now,
+        );
+        assert!(
+            !queued
+                .iter()
+                .any(|out| matches!(out, Output::Inject { .. }))
+        );
+        assert_eq!(h.rig.agent.home.e2_twin_injected[&TARGET.0], start);
+        let released = h.rig.agent.engine.handle(acknowledged, now);
+        assert!(released.iter().any(|out| matches!(out, Output::Inject {
+            cmd: InjectCmd::MoveTo { display, .. }, ..
+        } if *display == TARGET.0)));
+        let executed = start + Duration::from_millis(200);
+        for output in released {
+            if let Output::Inject { id, cmd } = output {
+                h.rig.agent.execute_injection_at(id, cmd, executed);
+                assert!(matches!(
+                    h.rig.agent.pending.pop_back(),
+                    Some(Input::InjectDone { ok: true, .. })
+                ));
+            }
+        }
+        assert_eq!(h.rig.agent.home.e2_twin_injected[&TARGET.0], executed);
     }
 
     #[test]

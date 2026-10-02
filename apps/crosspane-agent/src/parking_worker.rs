@@ -572,10 +572,10 @@ pub(crate) mod tests {
 
     impl Fake {
         fn called(&mut self, kind: Kind, window: WindowId, width: u32) {
-            self.observed.send((kind, window, width)).unwrap();
             if matches!(kind, Kind::Park | Kind::Resize) {
                 self.journal.store(true, Ordering::SeqCst);
             }
+            self.observed.send((kind, window, width)).unwrap();
             assert_ne!(self.panic, Some(kind), "fixture: parking panic");
             if self.block == Some(kind) {
                 self.block_count -= 1;
