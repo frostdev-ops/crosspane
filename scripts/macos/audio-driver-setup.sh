@@ -64,6 +64,23 @@ if [[ ! -e $dest ]]; then
         fail "install"
 fi
 
+# The audio daemon loads plug-ins only when it starts. If the driver is installed but the HAL
+# doesn't list its speakers yet (e.g. an earlier install whose daemon restart failed), restart it.
+loaded() { /usr/sbin/system_profiler SPAudioDataType 2>/dev/null | grep -q 'Crosspane speakers'; }
+if ! loaded; then
+    echo "the audio daemon hasn't loaded the driver yet: restarting it (sound drops for a moment)"
+    /usr/bin/sudo /usr/bin/killall coreaudiod || fail "restart coreaudiod"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        loaded && break
+    done
+fi
+if loaded; then
+    echo "the HAL lists 'Crosspane speakers'"
+else
+    echo "warning: 'Crosspane speakers' is still not listed; the probe will say why"
+fi
+
 step "4/4 probe the installed driver (synthetic tone through the loopback; no real audio)"
 echo "If macOS asks whether Terminal may use the microphone, choose Allow for this test."
 target/macos-audio/audio-loopback-probe --synthetic-speakers

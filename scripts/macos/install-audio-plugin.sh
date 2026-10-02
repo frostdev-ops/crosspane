@@ -61,7 +61,7 @@
 #   - The only privileged commands are the ones printed before anything runs; the script itself
 #     refuses to run as root. If the copy fails verification it is removed again BEFORE the audio
 #     daemon is restarted.
-#   - The audio daemon is restarted with `launchctl kickstart -k system/com.apple.audio.coreaudiod`
+#   - The audio daemon is restarted with `killall coreaudiod`
 #     (all system audio is interrupted for a moment). No other process is killed or signalled. The
 #     script changes no keychain item, TCC entry, system audio device or default device.
 set -euo pipefail
@@ -269,7 +269,7 @@ password prompt (sudo -v, first line) they all run as sudo -n, which never promp
      (if anything fails the reserved directory is removed again, only if it is still the one
      step 1 created: sudo -n /bin/rm -rf -- "$DEST"; the audio daemon is NOT restarted)
   6. sudo -n /bin/chmod 0755 "$DEST"      (the final exposure step), then one more verification as you
-  7. sudo -n /bin/launchctl kickstart -k system/com.apple.audio.coreaudiod
+  7. sudo -n /usr/bin/killall coreaudiod
 Step 7 restarts the system audio daemon: all audio on this Mac is interrupted for a moment.
 Nothing else under $HAL_DIR is touched. No default device, TCC entry or keychain item is changed.
 EOF
@@ -299,7 +299,7 @@ EOF
     echo '== verifying the exposed copy (as you)'
     validate_bundle "$DEST"
     reserved=false # from here the copy stays, even if the daemon restart fails
-    /usr/bin/sudo -n /bin/launchctl kickstart -k system/com.apple.audio.coreaudiod
+    /usr/bin/sudo -n /usr/bin/killall coreaudiod
     echo "installed $DEST and restarted coreaudiod."
     echo 'Next: CROSSPANE_AUDIO_OWNER_ATTENDED=1 target/macos-audio/audio-loopback-probe --synthetic-speakers'
 else
@@ -320,7 +320,7 @@ password prompt (sudo -v) they all run as sudo -n, which never prompts:
   0. sudo -v, then validate the installed driver again (no privileges needed to read it) and require
      it to be the same directory that was just validated
   1. sudo -n /bin/rm -rf -- "$DEST"
-  2. sudo -n /bin/launchctl kickstart -k system/com.apple.audio.coreaudiod
+  2. sudo -n /usr/bin/killall coreaudiod
 Step 2 restarts the system audio daemon: all audio on this Mac is interrupted for a moment.
 Nothing else under $HAL_DIR is touched.
 EOF
@@ -335,6 +335,6 @@ EOF
         fail "$DEST is not the directory that was validated: refusing to remove it"
     /usr/bin/sudo -n /bin/rm -rf -- "$DEST"
     [[ ! -e $DEST && ! -L $DEST ]] || fail "$DEST is still present after removal"
-    /usr/bin/sudo -n /bin/launchctl kickstart -k system/com.apple.audio.coreaudiod
+    /usr/bin/sudo -n /usr/bin/killall coreaudiod
     echo "removed $DEST and restarted coreaudiod."
 fi
