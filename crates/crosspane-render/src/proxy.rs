@@ -311,3 +311,318 @@ pub enum HostError {
     #[error("proxy host has exited")]
     Exited,
 }
+
+/// The macOS smoke test of `HostEvent::Placed` (WP-2.43c). winit's macOS event loop must be
+/// created on the process's main thread, and libtest runs every test on a thread of its own, so
+/// the test compiles a small driver program with `rustc` against the test build's own rlibs (the
+/// way the platform crate's GUI tests do) and runs it. The driver uses the public `ProxyHost`
+/// API only, in the lead's GUI session.
+///
+/// **What it proves:**
+/// - the first report follows `Opened` at once, names an active display (the main display when it
+///   is the only one), repeats the opened size, and starts conservatively as `visible: false`;
+/// - AppKit then posts `Occluded(false)` on first show, so the proxy becomes `visible: true`
+///   (open item U: "AppKit posts Occluded(false) on first show");
+/// - the content lies inside its display and below the display's top edge (a titled window's
+///   content is never at the top, so a zero or defaulted origin fails);
+/// - moving the window by a known 50 points moves the reported origin by 50 points in device
+///   pixels (within one pixel), so a move re-samples the window;
+/// - `SetContentSize` is reported with the new size, and minimising reports `visible: false`.
+///
+/// **What it does not prove:** that the absolute origin is where the window really is (`Open`
+/// has no position, so there is no known point to compare with), that `monitor` is the primary
+/// monitor on a multi-display setup, behaviour across displays of different scale, or display
+/// reconfiguration. The exact-origin and `CGMainDisplayID`/`CGWindowListCopyWindowInfo` checks
+/// (open item U2) are the lead's WP-2.43e live check. It does not restore a minimised window
+/// (`deminiaturize:` is an unsafe binding), so the move is a relative check instead.
+///
+/// Run it from the worktree's own `target` (the driver takes the newest rlibs in the test
+/// binary's `deps` directory) with `OPUS_LIB_DIR` set, as for any Mac build:
+/// `CROSSPANE_MAC_LIVE=1 cargo nextest run -p crosspane-render --run-ignored only live_placement_smoke`
+/// (`placement_driver_compiles` builds the driver without running it).
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod mac_live {
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    /// The driver's source. It never runs unless `CROSSPANE_MAC_LIVE=1`.
+    const DRIVER: &str = r##"
+use std::{
+    sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
+};
+
+use core_graphics::display::CGDisplay;
+use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle, ProxyHost};
+use crosspane_types::geom::PixelSize;
+use objc2_app_kit::{NSApplication, NSWindow};
+use objc2_foundation::{MainThreadMarker, NSPoint};
+
+const ID: u64 = 1;
+/// How far the window is moved, in points.
+const SHIFT: f64 = 50.0;
+
+/// Run `action` on every window of this process, on the main thread.
+fn on_windows(handle: &HostHandle, action: fn(&NSWindow)) {
+    handle
+        .send(HostCommand::Run(Box::new(move || {
+            let mtm = MainThreadMarker::new().expect("Run executes on the main thread");
+            for window in NSApplication::sharedApplication(mtm).windows().iter() {
+                action(window);
+            }
+        })))
+        .expect("run on the main thread");
+}
+
+fn wait_for(
+    events: &Receiver<HostEvent>,
+    what: &str,
+    accept: impl Fn(&HostEvent) -> bool,
+) -> HostEvent {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let event = events
+            .recv_timeout(left)
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        eprintln!("event: {event:?}");
+        match event {
+            HostEvent::Lost { .. } | HostEvent::OpenFailed { .. } => {
+                panic!("the host failed: {event:?}")
+            }
+            _ if accept(&event) => return event,
+            _ => {}
+        }
+    }
+}
+
+fn check(handle: &HostHandle, events: &Receiver<HostEvent>) {
+    handle
+        .send(HostCommand::Open {
+            id: ID,
+            title: "WP-2.43c placement".into(),
+            size: PixelSize::new(640, 480),
+            accent: [10, 20, 30],
+        })
+        .expect("open");
+    let HostEvent::Opened { size: opened, scale, .. } =
+        wait_for(events, "Opened", |e| matches!(e, HostEvent::Opened { id: ID, .. }))
+    else {
+        unreachable!()
+    };
+
+    // The first report comes straight after `Opened`: nothing can come between them.
+    let HostEvent::Placed { id: ID, visible, monitor: Some(monitor), origin, size } =
+        events.recv_timeout(Duration::from_secs(15)).expect("a report after Opened")
+    else {
+        panic!("Opened was not followed by a Placed that names a monitor");
+    };
+    eprintln!("placed: visible {visible}, monitor {monitor}, origin {origin:?}, size {size:?}");
+    assert!(
+        !visible,
+        "a proxy must not report visible before AppKit's Occluded(false)"
+    );
+    assert_eq!(size, opened, "Placed repeats the opened content size");
+    // U2: the native ID is a CGDirectDisplayID, in the same device pixels as the origin.
+    let active = CGDisplay::active_displays().expect("active displays");
+    assert!(active.contains(&monitor), "{monitor} is not an active display: {active:?}");
+    if active.len() == 1 {
+        assert_eq!(monitor, CGDisplay::main().id, "the only display is the main one");
+    }
+    let display = CGDisplay::new(monitor);
+    let wide = display.pixels_wide() as f64 * scale;
+    let high = display.pixels_high() as f64 * scale;
+    // A titled window's content is below the display's top edge: a zero origin is a default.
+    assert!(
+        origin.x >= 0.0
+            && origin.y > 0.0
+            && origin.x + f64::from(size.width) <= wide + 1.0
+            && origin.y + f64::from(size.height) <= high + 1.0,
+        "the content at {origin:?} + {size:?} is not inside the {wide} x {high} pixel display"
+    );
+
+    // Open item: AppKit posts Occluded(false) when the window first shows. Until it does, the
+    // proxy stays reported as hidden (the safe side), and this times out.
+    let HostEvent::Placed { origin: shown_at, .. } = wait_for(
+        events,
+        "a Placed with visible: true (AppKit posts Occluded(false) on first show)",
+        |e| matches!(e, HostEvent::Placed { id: ID, visible: true, .. }),
+    ) else {
+        unreachable!()
+    };
+
+    // A move re-samples the window: 50 points to the right is 50 * scale device pixels.
+    on_windows(handle, |window| {
+        let frame = window.frame();
+        window.setFrameTopLeftPoint(NSPoint::new(
+            frame.origin.x + SHIFT,
+            frame.origin.y + frame.size.height,
+        ));
+    });
+    let shift = SHIFT * scale;
+    let HostEvent::Placed { monitor: moved_on, origin: moved_to, .. } = wait_for(
+        events,
+        "a Placed shifted by 50 points",
+        |e| {
+            matches!(e, HostEvent::Placed { id: ID, origin, .. }
+                if (origin.x - shown_at.x - shift).abs() <= 1.0
+                    && (origin.y - shown_at.y).abs() <= 1.0)
+        },
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(moved_on, Some(monitor), "the move stayed on the display");
+    eprintln!("moved: {shown_at:?} -> {moved_to:?}");
+
+    // A resize reports the new size (an even size: exact at any scale).
+    let want = PixelSize::new(700, 500);
+    handle
+        .send(HostCommand::SetContentSize { id: ID, size: want })
+        .expect("resize");
+    let HostEvent::Placed { monitor: again, visible, .. } = wait_for(
+        events,
+        "a Placed with the new size",
+        |e| matches!(e, HostEvent::Placed { id: ID, size, .. } if *size == want),
+    ) else {
+        unreachable!()
+    };
+    assert_eq!(again, Some(monitor), "resizing does not change the display");
+    assert!(visible, "resizing does not hide the proxy");
+
+    // Minimising covers the proxy: AppKit's occlusion change must reach the report.
+    on_windows(handle, |window| window.miniaturize(None));
+    wait_for(events, "a Placed with visible: false after minimising", |e| {
+        matches!(e, HostEvent::Placed { id: ID, visible: false, .. })
+    });
+    eprintln!("placement driver: passed");
+}
+
+fn main() {
+    if std::env::var("CROSSPANE_MAC_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: the placement driver needs CROSSPANE_MAC_LIVE=1 in the GUI session");
+        return;
+    }
+    let (host, handle) = ProxyHost::new().expect("proxy host");
+    let (sender, events) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let passed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&handle, &events)))
+                .is_ok();
+        let _ = handle.send(HostCommand::Shutdown);
+        passed
+    });
+    host.run(Box::new(move |event| {
+        let _ = sender.send(event);
+    }))
+    .expect("event loop");
+    let passed = worker.join().unwrap_or(false);
+    std::process::exit(if passed { 0 } else { 1 });
+}
+"##;
+
+    /// The newest rlib of `name` in `deps`. With a `version` (`objc2-app-kit-0.2.2/`), only one
+    /// whose dep-info names that source directory: the build also has the objc2 0.6 family.
+    fn library(deps: &Path, name: &str, version: Option<&str>) -> PathBuf {
+        let prefix = format!("lib{name}-");
+        std::fs::read_dir(deps)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+                    && path.extension().is_some_and(|ext| ext == "rlib")
+            })
+            .filter(|path| {
+                version.is_none_or(|version| {
+                    let stem = path.file_stem().unwrap().to_string_lossy();
+                    let info = deps.join(format!("{}.d", stem.trim_start_matches("lib")));
+                    std::fs::read_to_string(info).is_ok_and(|info| info.contains(version))
+                })
+            })
+            .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
+            .unwrap_or_else(|| panic!("missing compiled dependency {name}"))
+    }
+
+    /// Compile [`DRIVER`] next to the test binary and return the executable's path. The files
+    /// are named for the process, the test and a counter, so tests running at the same time (or
+    /// one running twice in a process) never share a source or an executable.
+    fn build_driver(test: &str) -> PathBuf {
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        let deps = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let stem = format!(
+            "placement-driver-{}-{test}-{}",
+            std::process::id(),
+            BUILDS.fetch_add(1, Ordering::Relaxed)
+        );
+        let source = deps.join(format!("{stem}.rs"));
+        let executable = deps.join(&stem);
+        std::fs::write(&source, DRIVER).unwrap();
+        let mut compiler = Command::new("rustc");
+        compiler
+            .args(["--edition=2024", "--crate-name", "placement_driver", "-L"])
+            .arg(format!("dependency={}", deps.display()));
+        // Cargo's build script for libopus (a dependency of the media crate) hands this search
+        // path to the linker; a hand-run `rustc` must pass it itself.
+        if let Some(opus) = std::env::var_os("OPUS_LIB_DIR") {
+            compiler
+                .arg("-L")
+                .arg(format!("native={}", Path::new(&opus).join("lib").display()));
+        }
+        for (name, version) in [
+            ("crosspane_render", None),
+            ("crosspane_types", None),
+            ("core_graphics", Some("core-graphics-0.23.2/")),
+            ("objc2_app_kit", Some("objc2-app-kit-0.2.2/")),
+            ("objc2_foundation", Some("objc2-foundation-0.2.2/")),
+        ] {
+            compiler.arg("--extern").arg(format!(
+                "{name}={}",
+                library(&deps, name, version).display()
+            ));
+        }
+        let status = compiler.arg(&source).arg("-o").arg(&executable).status();
+        std::fs::remove_file(&source).unwrap();
+        assert!(
+            status.unwrap().success(),
+            "the placement driver does not compile"
+        );
+        executable
+    }
+
+    /// Compiles the driver and runs nothing: checks that it still builds against this tree.
+    #[test]
+    #[ignore = "compiles a driver with rustc against the test build's rlibs; opens no window"]
+    fn placement_driver_compiles() {
+        std::fs::remove_file(build_driver("compiles")).unwrap();
+    }
+
+    /// `HostEvent::Placed` on a real window: a smoke test, not the exact-origin check (see the
+    /// module documentation for what it does and does not prove). Lead only.
+    #[test]
+    #[ignore = "opens a window: needs CROSSPANE_MAC_LIVE=1 in the lead's GUI session"]
+    fn live_placement_smoke() {
+        if std::env::var("CROSSPANE_MAC_LIVE").as_deref() != Ok("1") {
+            eprintln!(
+                "skipped: the placement smoke test needs CROSSPANE_MAC_LIVE=1 in the GUI session"
+            );
+            return;
+        }
+        let executable = build_driver("smoke");
+        let status = Command::new(&executable)
+            .env("CROSSPANE_MAC_LIVE", "1")
+            .status()
+            .unwrap();
+        std::fs::remove_file(executable).unwrap();
+        assert!(status.success(), "placement driver failed: {status}");
+    }
+}
