@@ -6,7 +6,7 @@ use std::time::Duration;
 use crosspane_input::Held;
 use crosspane_platform::{
     CaptureTarget, Parked, ParkingKind as PlatformParking, StreamEndReason, StreamId, WindowInfo,
-    WindowRole,
+    WindowRole, WindowState,
 };
 use crosspane_protocol::msg::{Capability, Refusal};
 use crosspane_protocol::projection::{
@@ -107,9 +107,22 @@ pub(super) struct Source {
     inflight: Option<u32>,
     /// The size the destination last asked for (Accepted or Resize).
     wanted: Option<PixelSize>,
-    /// The window's frame when the last park or resize finished.
+    /// The window's frame when the last park or resize finished. (Not when it was issued: parking
+    /// itself moves the window, so the frame before it says nothing about the one after.)
     parked_frame: Option<RectLogical>,
-    /// When the window last moved by itself and was parked again.
+    /// The window's state when the last park or resize was *issued* (WP-2.45b), which is what
+    /// that park was based on: a different state at its end, or later, means the window went
+    /// fullscreen, was hidden, or came back meanwhile, and the parked geometry no longer
+    /// describes it.
+    parked_state: Option<WindowState>,
+    /// The window's state as of the newest window event, so a park can record what it is based
+    /// on when it is issued.
+    window_state: WindowState,
+    /// The window differed from what the last park was based on when it was last looked at, and
+    /// a re-park could not follow at once (a park in flight, or `REPARK_GAP` not yet passed): look
+    /// again, and re-park if it still does, at `last_repark + REPARK_GAP`.
+    repark_due: bool,
+    /// When the window last changed by itself and was parked again.
     last_repark: Option<MonoTime>,
     last_seq: u32,
     parked_scale: f64,
@@ -190,6 +203,9 @@ impl E2 {
                 inflight: None,
                 wanted: None,
                 parked_frame: None,
+                parked_state: None,
+                window_state: info.state,
+                repark_due: false,
                 last_repark: None,
                 last_seq: 0,
                 parked_scale: scale,
@@ -243,6 +259,8 @@ impl E2 {
         source.resizing |= matches!(source.stage, Stage::Parking(_));
         source.latest_resize = None;
         source.resume_geometry = None;
+        // Looked at again when the projection is live again.
+        source.repark_due = false;
         // The placement was reported on the connection that just ended; the destination re-sends
         // it after `Accepted` (the high-water mark stays, so an older report never revives it).
         source.placement.valid = false;
@@ -334,6 +352,8 @@ impl E2 {
                     .values()
                     .filter(|info| {
                         matches!(info.role, WindowRole::Toplevel | WindowRole::Dialog)
+                            // Off-screen or off-Space: not something to pull (WP-2.45b).
+                            && info.state != WindowState::Hidden
                             && !self.sources.values().any(|s| s.window == info.id)
                             && !self.pending_parks.contains_key(&info.id)
                     })
@@ -395,6 +415,7 @@ impl E2 {
                 source.stage = Stage::Parking(now.saturating_add(START_TIMEOUT));
                 source.parked_scale = *scale;
                 source.wanted = Some(*size);
+                source.mark_issued();
                 out.push(Output::Park {
                     window: source.window,
                     size: *size,
@@ -466,7 +487,8 @@ impl E2 {
             out.push(Output::Restore { window });
             return;
         }
-        let frame = self.windows.get(&window).map(|w| w.frame);
+        let current = self.windows.get(&window).map(|w| (w.frame, w.state));
+        let frame = current.map(|(frame, _)| frame);
         let Some((&projection, source)) = self.sources.iter_mut().find(|(_, s)| {
             s.window == window && (matches!(s.stage, Stage::Parking(_)) || s.resizing)
         }) else {
@@ -528,6 +550,12 @@ impl E2 {
             );
             source.resizing = false;
             source.resize_latest(projection, out);
+            // The window may have changed state while this park ran (the app went fullscreen,
+            // or the park itself un-fullscreened it): then the geometry just sent is stale.
+            // Nothing more is coming to say so, so look now (and again at the gap's end).
+            if let Some((frame, state)) = current {
+                source.check_repark(frame, state, now, out);
+            }
         }
     }
 
@@ -560,6 +588,11 @@ impl E2 {
                     source.stream = Some(stream);
                     source.stage = Stage::Live;
                     source.resize_latest(projection, out);
+                    // Window changes were not acted on before the projection was live: look at
+                    // the window as it is now against what the park was based on.
+                    if let Some(w) = self.windows.get(&source.window) {
+                        source.check_repark(w.frame, w.state, now, out);
+                    }
                     if source.focus_wanted {
                         if self.home.is_none() {
                             self.focus_source(projection, now, out);
@@ -854,12 +887,30 @@ impl E2 {
             self.pending_parks.remove(&window);
             out.push(Output::Restore { window });
         }
+        // Re-parks that a change had to wait for (a park in flight, or the gap): the gap has
+        // ended, so look at the window again. Whatever it finds, the flag is spent.
+        let due: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|(_, s)| s.repark_deadline().is_some_and(|deadline| deadline <= now))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in due {
+            let Some(source) = self.sources.get_mut(&id) else {
+                continue;
+            };
+            match self.windows.get(&source.window) {
+                Some(w) => source.check_repark(w.frame, w.state, now, out),
+                None => source.repark_due = false,
+            }
+        }
     }
 
     pub(super) fn source_deadline(&self) -> Option<MonoTime> {
         self.sources
             .values()
             .filter_map(Source::deadline)
+            .chain(self.sources.values().filter_map(Source::repark_deadline))
             .chain(self.pending_parks.values().copied())
             .min()
     }
@@ -871,31 +922,17 @@ impl E2 {
         out: &mut Vec<Output>,
     ) {
         // A parked window that moved or resized by itself (e.g. a bar appeared on, or left, its
-        // twin display and changed the work area) gets parked again at the wanted size, so the
-        // capture crop and the destination's geometry follow it. Compared with its frame when
-        // the last park finished, and at most every REPARK_GAP: parking itself moves the window
-        // for a moment, and that must not start a loop.
+        // twin display and changed the work area), or whose state changed (it went fullscreen,
+        // was hidden, or came back), gets parked again at the wanted size, so the capture crop
+        // and the destination's geometry follow it. Compared with its frame when the last park
+        // finished and its state when it was issued, and at most every REPARK_GAP: parking
+        // itself moves the window for a moment, and that must not start a loop. A change that
+        // can't be followed yet (a park in flight, or the gap) is not lost: it is looked at again
+        // when the park finishes and when the gap ends.
         for source in self.sources.values_mut() {
-            let moved = source
-                .parked_frame
-                .is_some_and(|f| !same_frame(f, window.frame));
-            if source.window == window.id
-                && source.stage == Stage::Live
-                && !source.resizing
-                && moved
-                && source
-                    .last_repark
-                    .is_none_or(|t| now.saturating_duration_since(t) >= REPARK_GAP)
-                && let Some(size) = source.wanted
-            {
-                source.resizing = true;
-                source.inflight = None;
-                source.last_repark = Some(now);
-                out.push(Output::ResizeParked {
-                    window: source.window,
-                    size,
-                    scale: source.parked_scale,
-                });
+            if source.window == window.id {
+                source.window_state = window.state;
+                source.check_repark(window.frame, window.state, now, out);
             }
         }
         if self
@@ -920,6 +957,83 @@ impl E2 {
 }
 
 impl Source {
+    /// Whether a window with this `frame` and `state` no longer matches what the last park was
+    /// based on: its state differs, or it moved while that state was `Normal`. A frame means
+    /// nothing while the window is fullscreen or hidden (the platform reports the display's, or
+    /// an off-screen one), so a move then is not a trigger; the state change out of it is.
+    fn reparks_for(&self, frame: RectLogical, state: WindowState) -> bool {
+        let state_changed = self.parked_state.is_some_and(|s| s != state);
+        let moved = self.parked_state == Some(WindowState::Normal)
+            && self.parked_frame.is_some_and(|f| !same_frame(f, frame));
+        state_changed || moved
+    }
+
+    /// A park or resize is being issued: it is based on the window's state as it is now.
+    fn mark_issued(&mut self) {
+        self.parked_state = Some(self.window_state);
+    }
+
+    /// Park again if the window, as it is now (`frame`, `state`), no longer matches what the last
+    /// park was based on, subject to `REPARK_GAP`. Only a live projection with nothing in
+    /// flight can act on it. Otherwise:
+    /// - in flight, or inside the gap: the change is remembered (`repark_due`) and looked at
+    ///   again when the park finishes and at `last_repark + REPARK_GAP`;
+    /// - not live yet (parking, capturing, restarting, suspended): nothing is remembered, since
+    ///   the projection looks again when it goes live.
+    fn check_repark(
+        &mut self,
+        frame: RectLogical,
+        state: WindowState,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if self.stage != Stage::Live {
+            return;
+        }
+        if !self.reparks_for(frame, state) {
+            self.repark_due = false;
+        } else if self.resizing || !self.gap_passed(now) {
+            self.repark_due = true;
+        } else {
+            self.repark(now, out);
+        }
+    }
+
+    /// `REPARK_GAP` has passed since the last re-park.
+    fn gap_passed(&self, now: MonoTime) -> bool {
+        self.last_repark
+            .is_none_or(|t| now.saturating_duration_since(t) >= REPARK_GAP)
+    }
+
+    /// Park the window again at the wanted size, answering no request.
+    fn repark(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        self.repark_due = false;
+        let Some(size) = self.wanted else {
+            return;
+        };
+        self.resizing = true;
+        self.inflight = None;
+        self.last_repark = Some(now);
+        self.mark_issued();
+        out.push(Output::ResizeParked {
+            window: self.window,
+            size,
+            scale: self.parked_scale,
+        });
+    }
+
+    /// When a re-park that had to wait can be tried: the gap's end. Not while a park is in
+    /// flight (its result looks again) or the projection isn't live.
+    fn repark_deadline(&self) -> Option<MonoTime> {
+        if self.stage != Stage::Live || !self.repark_due || self.resizing {
+            return None;
+        }
+        Some(
+            self.last_repark
+                .map_or(MonoTime::ZERO, |t| t.saturating_add(REPARK_GAP)),
+        )
+    }
+
     fn deadline(&self) -> Option<MonoTime> {
         match self.stage {
             Stage::Offered(deadline)
@@ -950,6 +1064,7 @@ impl Source {
             self.resizing = true;
             self.inflight = None;
             self.parked_scale = scale;
+            self.mark_issued();
             out.push(Output::ResizeParked {
                 window: self.window,
                 size: wanted,
@@ -1058,6 +1173,7 @@ impl Source {
         self.resizing = true;
         self.parked_scale = scale;
         self.inflight = Some(request);
+        self.mark_issued();
         out.push(Output::ResizeParked {
             window: self.window,
             size,
@@ -1117,7 +1233,7 @@ fn focus_on(
     }
 }
 
-/// The least time between two re-parks of a window that moved by itself.
+/// The least time between two re-parks of a window that moved or changed state by itself.
 const REPARK_GAP: Duration = Duration::from_secs(2);
 
 /// Frames within half a logical pixel are the same (Hyprland reports whole pixels; float noise).
