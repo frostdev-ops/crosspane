@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crosspane_engine::io::AudioKey;
+use crosspane_engine::io::{AudioKey, PortalsFailure};
 use crosspane_engine::{
     Command, Engine, Failure, InjectCmd, Input, Notice, Output, ProjectionKey, ProxyEvent,
 };
@@ -26,7 +26,7 @@ use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
 use crosspane_types::audio::AudioKind;
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::id::NodeId;
-use crosspane_types::id::{ProjectionId, WindowId};
+use crosspane_types::id::{DisplayId, ProjectionId, WindowId};
 use serde_json::{Value, json};
 
 use crate::audio::{AudioWorker, WorkerEvent, WorkerStats};
@@ -776,11 +776,16 @@ impl Agent {
         match output {
             Output::SetPortals(portals) => {
                 let portals = if self.crossing { portals } else { Vec::new() };
-                if let Some(capture) = &mut self.platform.capture
-                    && let Err(e) = capture.set_portals(&portals)
-                {
-                    tracing::warn!(error = %e, "set_portals failed");
-                }
+                let ids = portals.iter().map(|p| p.id).collect();
+                let result = match &mut self.platform.capture {
+                    Some(capture) => capture.set_portals(&portals).map_err(|e| {
+                        tracing::warn!(error = %e, "set_portals failed");
+                        portals_failure(&e)
+                    }),
+                    // No backend: nothing was installed and no capture can be live.
+                    None => Err(PortalsFailure::Rejected),
+                };
+                self.pending.push_back(Input::PortalsSet { ids, result });
             }
             Output::MonitorLocalActivity(on) => {
                 if let Some(capture) = &mut self.platform.capture {
@@ -790,7 +795,9 @@ impl Agent {
                     }
                 }
             }
-            Output::BeginCapture { id, portal } => {
+            // WP-2.43e: `drain_first` (a home exit's capture) feeds every event queued during
+            // `begin()` to the engine before `CaptureBegun`; until then it is ignored.
+            Output::BeginCapture { id, portal, .. } => {
                 let result = match &mut self.platform.capture {
                     Some(capture) => capture.begin(id, portal).map_err(failure),
                     None => Err(Failure::Other),
@@ -806,6 +813,29 @@ impl Agent {
                 {
                     tracing::warn!(error = %e, "end capture failed");
                 }
+            }
+            // Freeze placeholder (WP-2.43 B3): the warp is submitted, but the answer is always an
+            // error, never `Done`, so home can't commit before WP-2.43e wires the cursor read-back
+            // (A3) and the gate check (B2). The engine emits no `ReleaseAndWarp` before WP-2.43b.
+            Output::ReleaseAndWarp { op, warp_to } => {
+                if let Some(capture) = &mut self.platform.capture
+                    && let Err(e) = capture.end(Some(warp_to))
+                {
+                    tracing::warn!(error = %e, "release and warp failed");
+                }
+                self.pending.push_back(Input::CaptureReleased {
+                    op,
+                    result: Err(Failure::Other),
+                });
+            }
+            // Freeze placeholder: installing always fails and removal always succeeds, until
+            // WP-2.43e replaces this arm with the `HomeBind` calls.
+            Output::HomeBind { op, install } => {
+                self.pending.push_back(Input::HomeBindSet {
+                    op,
+                    install,
+                    result: if install { Err(Failure::Other) } else { Ok(()) },
+                });
             }
             Output::ShowOverlay { id, overlay } => {
                 let shown = match &mut self.platform.overlay {
@@ -2333,6 +2363,25 @@ impl Agent {
                 id,
                 Box::new(move |key| proxy(key, ProxyEvent::Motion { position })),
             ),
+            HostEvent::Placed {
+                id,
+                visible,
+                monitor,
+                origin,
+                size,
+            } => (
+                id,
+                Box::new(move |key| {
+                    proxy(
+                        key,
+                        ProxyEvent::Placed {
+                            display: monitor.filter(|_| visible).map(DisplayId),
+                            origin,
+                            size,
+                        },
+                    )
+                }),
+            ),
         };
         if let Some(key) = self.proxy_ids.key(id) {
             self.feed(input_of(key));
@@ -2760,6 +2809,18 @@ fn failure(e: PlatformError) -> Failure {
         PlatformError::PointerButtonHeld => Failure::PointerButtonHeld,
         PlatformError::PermissionDenied(_) => Failure::PermissionDenied,
         _ => Failure::Other,
+    }
+}
+
+/// How a failed `set_portals` reads to the engine (WP-2.43 B1). A timeout (the caller's receive
+/// timeout and a worker-reported refresh timeout both surface as `Timeout`) and `Backend(..)` (a
+/// stopped backend, or a rejected set the backend only describes in text) leave unknown whether
+/// the previous set and the capture survive, so they are `Uncertain`: the engine then ends any
+/// capture and waits for its end. Every other error is the backend refusing the set up front.
+fn portals_failure(e: &PlatformError) -> PortalsFailure {
+    match e {
+        PlatformError::Timeout | PlatformError::Backend(_) => PortalsFailure::Uncertain,
+        _ => PortalsFailure::Rejected,
     }
 }
 

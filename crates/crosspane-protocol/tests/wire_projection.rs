@@ -12,7 +12,7 @@ use crosspane_protocol::wire::{
 };
 use crosspane_types::geom::{PixelSize, PointDevice, VectorLogical};
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::{ProjectionId, WindowId};
+use crosspane_types::id::{DisplayId, ProjectionId, WindowId};
 use crosspane_types::input::{ScrollDelta, ScrollPhase};
 use proptest::prelude::*;
 
@@ -307,6 +307,50 @@ proptest! {
         let message = ProjectionMessage::BrowseRefused { request, reason };
         let fields = [number(1, u64::from(request)), number(2, code)].concat();
         prop_assert_eq!(decode_control(&projection_frame(14, &fields)),
+            Ok(ControlMessage::Projection(message.clone())));
+        round_trip_control(message);
+    }
+
+    // WP-2.43: placed and unplaced reports, any generation and size (including 0x0).
+    #[test]
+    fn round_trip_proxy_placed(p in any::<u64>(), generation in any::<u32>(),
+        display in proptest::option::of(any::<u32>()), origin in position(), size in size()) {
+        let message = ProjectionMessage::ProxyPlaced {
+            projection: ProjectionId(p),
+            generation,
+            display: display.map(DisplayId),
+            origin,
+            size,
+        };
+        // Field 15 of the oneof and the field numbers 1..=8, independently of the codec's private
+        // pb types; proto3 omits zero values, and an unplaced report sends display 0.
+        let mut fields = Vec::new();
+        if p != 0 {
+            fields.extend(number(1, p));
+        }
+        if generation != 0 {
+            fields.extend(number(2, u64::from(generation)));
+        }
+        if let Some(display) = display {
+            fields.extend(number(3, 1));
+            if display != 0 {
+                fields.extend(number(4, u64::from(display)));
+            }
+        }
+        if origin.x != 0.0 {
+            fields.extend(double(5, origin.x));
+        }
+        if origin.y != 0.0 {
+            fields.extend(double(6, origin.y));
+        }
+        if size.width != 0 {
+            fields.extend(number(7, u64::from(size.width)));
+        }
+        if size.height != 0 {
+            fields.extend(number(8, u64::from(size.height)));
+        }
+        prop_assert_eq!(control_frame(&message), projection_frame(15, &fields));
+        prop_assert_eq!(decode_control(&projection_frame(15, &fields)),
             Ok(ControlMessage::Projection(message.clone())));
         round_trip_control(message);
     }
@@ -916,8 +960,65 @@ fn rejects_invalid_close_payloads() {
 }
 
 #[test]
+fn proxy_placed_rejects_nonfinite_origin() {
+    // WP-2.43: both directions check that the origin is finite, whether or not it is placed.
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for (origin, tag) in [
+            (PointDevice::new(value, 0.0), 5),
+            (PointDevice::new(0.0, value), 6),
+        ] {
+            for display in [Some(DisplayId(1)), None] {
+                assert_bad_control(ProjectionMessage::ProxyPlaced {
+                    projection: ProjectionId(1),
+                    generation: 1,
+                    display,
+                    origin,
+                    size: PixelSize::new(1, 1),
+                });
+            }
+            for placed in [1, 0] {
+                let mut fields = [number(1, 1), number(2, 1)].concat();
+                if placed == 1 {
+                    fields.extend(number(3, 1));
+                    fields.extend(number(4, 1));
+                }
+                fields.extend(double(tag, value));
+                assert_eq!(
+                    decode_control(&projection_frame(15, &fields)),
+                    Err(WireError::BadValue("non-finite coordinate"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn proxy_placed_unplaced_ignores_a_stale_display_field() {
+    // `placed = false` means the display, origin and size are stale: the display is not read.
+    let fields = [
+        number(1, 9),
+        number(2, 3),
+        number(4, 7),
+        number(7, 5),
+        number(8, 6),
+    ]
+    .concat();
+    assert_eq!(
+        decode_control(&projection_frame(15, &fields)),
+        Ok(ControlMessage::Projection(ProjectionMessage::ProxyPlaced {
+            projection: ProjectionId(9),
+            generation: 3,
+            display: None,
+            origin: PointDevice::new(0.0, 0.0),
+            size: PixelSize::new(5, 6),
+        }))
+    );
+}
+
+#[test]
 fn unknown_projection_variant_is_unknown_control() {
-    for variant in [15, 99, 536_870_911] {
+    // 15 is `proxy_placed` since WP-2.43.
+    for variant in [16, 99, 536_870_911] {
         assert_eq!(
             decode_control(&projection_frame(variant, &[])),
             Err(WireError::UnknownControl)

@@ -76,6 +76,7 @@ message Projection {
     ProjectionWindowList window_list = 12;
     ProjectionPull pull = 13;
     ProjectionBrowseRefused browse_refused = 14;
+    ProjectionProxyPlaced proxy_placed = 15; // Destination -> source: where the proxy's content is (WP-2.43).
   }
 }
 
@@ -170,6 +171,20 @@ message ProjectionPull {
 message ProjectionBrowseRefused {
   uint32 request = 1;
   uint32 reason = 2; // Same 1..5 codes as Refusal above.
+}
+
+// WP-2.43. generation grows with every change and repeats on a resend; placed = false: the proxy
+// is on no display; display, origin and size are then stale and ignored. origin_x/origin_y must
+// be finite.
+message ProjectionProxyPlaced {
+  uint64 projection = 1;
+  uint32 generation = 2;
+  bool placed = 3;
+  uint32 display = 4;
+  double origin_x = 5;
+  double origin_y = 6;
+  uint32 pixel_w = 7;
+  uint32 pixel_h = 8;
 }
 
 // D8: kind 1 speaker(stereo), 2 microphone(mono); stream 1..65535.

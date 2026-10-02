@@ -1035,6 +1035,7 @@ impl ControllerE1 {
                     out.push(Output::BeginCapture {
                         id: capture.id,
                         portal: c.portal,
+                        drain_first: false,
                     });
                     c.capture = Some(capture);
                     c.wait = Wait::Capture(now.saturating_add(START_TIMEOUT));

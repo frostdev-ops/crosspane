@@ -669,6 +669,25 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 reason: projection_refusal_to_pb(*reason),
             })
         }
+        ProjectionMessage::ProxyPlaced {
+            projection,
+            generation,
+            display,
+            origin,
+            size,
+        } => {
+            check_finite(&[origin.x, origin.y])?;
+            Body::ProxyPlaced(pb::ProjectionProxyPlaced {
+                projection: projection.0,
+                generation: *generation,
+                placed: display.is_some(),
+                display: display.map_or(0, |display| display.0),
+                origin_x: origin.x,
+                origin_y: origin.y,
+                pixel_w: size.width,
+                pixel_h: size.height,
+            })
+        }
     };
     Ok(pb::Projection { body: Some(body) })
 }
@@ -805,6 +824,16 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
             request: refused.request,
             reason: projection_refusal_from_pb(refused.reason)?,
         },
+        Body::ProxyPlaced(placed) => {
+            check_finite(&[placed.origin_x, placed.origin_y])?;
+            ProjectionMessage::ProxyPlaced {
+                projection: ProjectionId(placed.projection),
+                generation: placed.generation,
+                display: placed.placed.then_some(DisplayId(placed.display)),
+                origin: PointDevice::new(placed.origin_x, placed.origin_y),
+                size: PixelSize::new(placed.pixel_w, placed.pixel_h),
+            }
+        }
     })
 }
 
@@ -835,7 +864,7 @@ mod pb {
     pub struct Projection {
         #[prost(
             oneof = "projection::Body",
-            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
         )]
         pub body: Option<projection::Body>,
     }
@@ -871,6 +900,8 @@ mod pb {
             Pull(super::ProjectionPull),
             #[prost(message, tag = "14")]
             BrowseRefused(super::ProjectionBrowseRefused),
+            #[prost(message, tag = "15")]
+            ProxyPlaced(super::ProjectionProxyPlaced),
         }
     }
 
@@ -1016,6 +1047,26 @@ mod pb {
         pub request: u32,
         #[prost(uint32, tag = "2")]
         pub reason: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionProxyPlaced {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub generation: u32,
+        #[prost(bool, tag = "3")]
+        pub placed: bool,
+        #[prost(uint32, tag = "4")]
+        pub display: u32,
+        #[prost(double, tag = "5")]
+        pub origin_x: f64,
+        #[prost(double, tag = "6")]
+        pub origin_y: f64,
+        #[prost(uint32, tag = "7")]
+        pub pixel_w: u32,
+        #[prost(uint32, tag = "8")]
+        pub pixel_h: u32,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

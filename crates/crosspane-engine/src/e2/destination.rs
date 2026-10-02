@@ -697,6 +697,8 @@ impl E2 {
                     );
                 }
             }
+            // WP-2.43b forwards this as ProxyPlaced.
+            ProxyEvent::Placed { .. } => {}
         }
         if !sent {
             self.end_destination(key, Reason::Failed, false, false, out);

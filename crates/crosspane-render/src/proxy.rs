@@ -198,6 +198,17 @@ pub enum HostEvent {
         id: u64,
         position: PointDevice,
     },
+    /// Where the content area is: its top-left at `origin` device pixels on monitor `monitor`
+    /// (the platform's native id: the `CGDirectDisplayID` on macOS; `None` where the host can't
+    /// tell, e.g. Wayland), `size` device pixels. `visible: false`: minimised or fully occluded.
+    /// Sent after `Opened` and whenever any of it changes.
+    Placed {
+        id: u64,
+        visible: bool,
+        monitor: Option<u32>,
+        origin: PointDevice,
+        size: PixelSize,
+    },
 }
 
 /// Imports a native picture's planes into the host's GPU `device` without copying them (WP-2.24):

@@ -11,7 +11,7 @@
 
 use crosspane_types::geom::{PixelSize, PointDevice};
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::{ProjectionId, WindowId};
+use crosspane_types::id::{DisplayId, ProjectionId, WindowId};
 use crosspane_types::input::ScrollDelta;
 
 use crate::msg::Refusal;
@@ -145,6 +145,24 @@ pub enum ProjectionMessage {
     Pull { request: u32, window: WindowId },
     /// Source → destination: `ListWindows` or `Pull` number `request` refused.
     BrowseRefused { request: u32, reason: Refusal },
+    /// Destination → source (WP-2.43): where the proxy's content is on the destination.
+    /// `generation` grows by one with every *change* for this projection and never restarts
+    /// while the projection lives; a report re-sent after `Accepted` on a reconnect repeats the
+    /// newest report with its generation unchanged. The source keeps a high-water mark and
+    /// accepts a report only if its generation is higher, or equal with identical contents.
+    /// `display`, `origin`, `size`: the content's display, its top-left in that display's device
+    /// pixels, and its current size in device pixels. `display: None`: the proxy is on no display
+    /// right now (minimised, fully occluded, or the host can't tell); `origin` and `size` are
+    /// then stale. Sent once the proxy is open, on every change, and again after `Accepted` on a
+    /// reconnect. A destination whose generation would overflow sends one final report with
+    /// `generation: u32::MAX` and `display: None`, then nothing more.
+    ProxyPlaced {
+        projection: ProjectionId,
+        generation: u32,
+        display: Option<DisplayId>,
+        origin: PointDevice,
+        size: PixelSize,
+    },
 }
 
 /// Destination → source input for a projected window, on the input stream. `seq` increases per

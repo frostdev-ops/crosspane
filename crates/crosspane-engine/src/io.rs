@@ -39,6 +39,50 @@ pub enum Failure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InjectId(pub u64);
 
+/// One home transaction or home-related warp (WP-2.43): correlates [`Output::ReleaseAndWarp`]
+/// and [`Output::HomeBind`] with their answers. Allocated by the engine, never reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HomeOp(pub u64);
+
+/// What became of the warp requested by [`Output::ReleaseAndWarp`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Warp {
+    /// The capture (if any) was released and the warp was submitted.
+    Done,
+    /// The capture (if any) was released, but the warp was skipped because the platform's I/O
+    /// gate was closed. The pointer is wherever it was.
+    Skipped,
+}
+
+/// Why home (WP-2.43) was not entered or was left without a crossing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HomeFailure {
+    /// An injector this node owns did not confirm its releases in time; the capture stayed live.
+    Drain,
+    /// The home bind could not be installed, or was lost and could not be reinstalled.
+    Bind,
+    /// Releasing the capture failed or timed out.
+    Release,
+    /// The capture was released but the pointer could not be warped (gate closed).
+    Warp,
+    /// The window did not take focus in time.
+    Focus,
+    /// A guard closed during entry (a button was pressed, the gate closed, crossing was disarmed).
+    Guard,
+    /// The projection, its placement or its last usable pointer exit went away.
+    Gone,
+}
+
+/// Why a `SetPortals` was not installed (WP-2.43).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PortalsFailure {
+    /// The backend refused the new set; the previous set and any active capture are intact.
+    Rejected,
+    /// The call timed out or the backend shut down; whether the previous set and the capture
+    /// survive is unknown.
+    Uncertain,
+}
+
 /// A request to the local injectors (`KeyInjector` / `PointerInjector`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum InjectCmd {
@@ -146,6 +190,15 @@ pub enum ProxyEvent {
     },
     Motion {
         position: PointDevice,
+    },
+    /// Where the content area is (WP-2.43): its top-left at `origin` device pixels on this node's
+    /// `display`, `size` device pixels. `display: None`: on no display right now (minimised,
+    /// fully occluded, or the host can't tell). Reported after `Resized` on open and on every
+    /// change.
+    Placed {
+        display: Option<DisplayId>,
+        origin: PointDevice,
+        size: PixelSize,
     },
 }
 
@@ -255,6 +308,32 @@ pub enum Input {
     MediaError {
         key: ProjectionKey,
     },
+    /// The result of [`Output::SetPortals`] (WP-2.43), one per `SetPortals` in order: `ids` are
+    /// the portals the agent asked the backend to install (empty when crossing is off or there
+    /// is no capture backend; then `result` is `Err`).
+    PortalsSet {
+        ids: Vec<PortalId>,
+        result: Result<(), PortalsFailure>,
+    },
+    /// The result of [`Output::ReleaseAndWarp`] with the same `op`.
+    CaptureReleased {
+        op: HomeOp,
+        result: Result<Warp, Failure>,
+    },
+    /// The result of [`Output::HomeBind`] with the same `op` and `install`. While a bind is
+    /// installed, the agent also delivers `install: true, result: Err(..)` whenever it finds the
+    /// bind missing and cannot reinstall it.
+    HomeBindSet {
+        op: HomeOp,
+        install: bool,
+        result: Result<(), Failure>,
+    },
+    /// Fallback cursor only (WP-2.43 phase 2): this node's physical pointer on one of its
+    /// displays while the controller is home in a projected window. The agent polls it only then.
+    LocalPointer {
+        display: DisplayId,
+        position: PointDevice,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -302,9 +381,25 @@ pub enum Output {
     BeginCapture {
         id: CaptureId,
         portal: PortalId,
+        /// WP-2.43: `true` only for the capture begun for a home exit; the agent then feeds every
+        /// event queued during `begin()` to the engine before it delivers `CaptureBegun`.
+        /// Ordinary captures keep today's delivery order.
+        drain_first: bool,
     },
     EndCapture {
         warp_to: Option<(DisplayId, PointDevice)>,
+    },
+    /// WP-2.43: `InputCapture::end(Some(warp_to))`: end the capture if one is live, a plain warp
+    /// otherwise. Answered with [`Input::CaptureReleased`] carrying `op`.
+    ReleaseAndWarp {
+        op: HomeOp,
+        warp_to: (DisplayId, PointDevice),
+    },
+    /// WP-2.43 §2.9: install (`true`) or remove (`false`) the home bind. Answered with
+    /// [`Input::HomeBindSet`] carrying `op` and `install`. Removal is idempotent.
+    HomeBind {
+        op: HomeOp,
+        install: bool,
     },
     ShowOverlay {
         id: OverlayId,
@@ -438,5 +533,16 @@ pub enum Notice {
     ProjectionRefused {
         peer: NodeId,
         reason: Refusal,
+    },
+    /// WP-2.43: this node's input went home into its own projected window (`entered`), or left it.
+    Home {
+        key: ProjectionKey,
+        entered: bool,
+    },
+    /// WP-2.43: home could not be entered, or was left without a crossing; the E1 session is in
+    /// a safe state (captured as before, or ended).
+    HomeFailed {
+        key: ProjectionKey,
+        reason: HomeFailure,
     },
 }
