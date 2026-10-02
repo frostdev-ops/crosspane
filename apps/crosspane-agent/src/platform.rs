@@ -9,7 +9,36 @@ use crosspane_platform::{
     OverlayHost, Permissions, PlatformError, PointerInjector, SessionEvents, TrayHost,
     WindowParking, WindowSource,
 };
+use crosspane_types::geom::PointDevice;
+use crosspane_types::id::DisplayId;
 use crosspane_types::time::MonoTime;
+
+/// What "home on the twin" (WP-2.43) needs from the compositor beyond the platform traits: the
+/// keybind that exists only while this node's input is home in one of its own projected windows
+/// (§2.9), and the physical pointer's position, which is how a warp is confirmed (amendment A3).
+/// Only Hyprland has one; every other platform runs without it and home never commits there.
+///
+/// Every call is short-lived and bounded by the compositor IPC's own timeout. The agent's engine
+/// thread makes them, and no call retries: the agent decides when to try again.
+pub trait HomeSeat: Send {
+    /// The Hyprland key string of the release chord, e.g. `CTRL + SHIFT + ALT + Escape`, for
+    /// notices.
+    fn keys(&self) -> String;
+    /// Install the bind and verify it is listed (`Err` if another bind holds the chord, or if the
+    /// command it runs is missing).
+    fn install(&self) -> Result<(), PlatformError>;
+    /// Remove the bind and verify it is absent. Idempotent; leaves a foreign bind on the chord
+    /// alone (`Ok` when only a foreign bind is there, `Err` when it can't be told apart from ours).
+    fn remove(&self) -> Result<(), PlatformError>;
+    /// Whether the compositor lists exactly our bind.
+    fn installed(&self) -> Result<bool, PlatformError>;
+    /// Where the physical pointer is now: its display and its position in that display's device
+    /// pixels. A plain reader: it knows nothing about the I/O gate.
+    fn cursor(&self) -> Result<(DisplayId, PointDevice), PlatformError>;
+    /// Call `reload` whenever the compositor reloads its config (which drops runtime binds) and
+    /// whenever its event connection is made again (events may have been missed). Called once.
+    fn watch_reload(&mut self, reload: Box<dyn Fn() + Send>) -> Result<(), PlatformError>;
+}
 
 pub struct Platform {
     pub gate: Arc<IoGate>,
@@ -33,6 +62,9 @@ pub struct Platform {
     /// The source side's GPU (GPU-v0): captured frames are hashed and converted to NV12 on it. On
     /// Linux it's the compositor's GPU, which DMA-BUF capture allocates on.
     pub gpu: Option<GpuDevice>,
+    /// Home on the twin (WP-2.43): the release bind and the pointer read-back. `None` off
+    /// Hyprland, and on Hyprland when the bind can't be spelled (the agent logs why).
+    pub home: Option<Box<dyn HomeSeat>>,
 }
 
 /// A wgpu device for the source side's GPU work (docs/wp/GPU-v0.md, decision 3).
@@ -61,6 +93,7 @@ impl std::fmt::Debug for Platform {
             .field("frames", &self.frames.is_some())
             .field("tray", &self.tray.is_some())
             .field("gpu", &self.gpu.is_some())
+            .field("home", &self.home.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -248,6 +281,136 @@ pub fn exit_deadline(after: std::time::Duration) {
 #[cfg(target_os = "linux")]
 const MIRROR_BORDER: &str = "rgb(ff8800)";
 
+/// Hyprland's side of home on the twin: the home bind (WP-2.43f) and the pointer read-back
+/// (WP-2.43d), both over the agent's own IPC endpoint.
+#[cfg(target_os = "linux")]
+struct HyprHomeSeat {
+    ipc: crosspane_platform_linux::hyprland::ipc::HyprIpc,
+    bind: crosspane_platform_linux::hyprland::home_bind::HomeBind,
+    /// `crosspanectl`, which the bind runs. Checked at every install: a bind that runs nothing
+    /// would leave the user without the release it promises.
+    ctl: std::path::PathBuf,
+    /// Keep cleanup and cursor read-back available even when the command cannot be spelled.
+    command_error: bool,
+    /// Dropping it stops the event thread.
+    reload: Option<crosspane_platform_linux::hyprland::ipc::EventStream>,
+}
+
+/// The command the home bind runs: `crosspanectl release` against this agent's control socket,
+/// with the runtime directory pinned (several agents can run on one machine, 02 §3.3). `None` for
+/// a path that isn't UTF-8; `HomeBind::new` refuses one that can't be quoted.
+#[cfg(target_os = "linux")]
+fn home_command(runtime_dir: &std::path::Path, ctl: &std::path::Path) -> Option<String> {
+    let runtime_dir = runtime_dir.to_str()?;
+    let ctl = ctl.to_str()?;
+    if [runtime_dir, ctl].iter().any(|path| {
+        path.contains('\'') || path.contains("]==]") || path.chars().any(char::is_control)
+    }) {
+        return None;
+    }
+    Some(format!(
+        "env CROSSPANE_RUNTIME_DIR='{runtime_dir}' '{ctl}' release"
+    ))
+}
+
+/// Whether `path` is a file this agent's effective user may execute.
+#[cfg(target_os = "linux")]
+fn is_executable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
+        && rustix::fs::accessat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_ok()
+}
+
+/// The home seat for the Hyprland instance `ipc` names, with the engine's release chord and the
+/// `crosspanectl` next to `exe`. Construction must succeed before input is admitted, so startup
+/// can always attempt cleanup of an owned bind.
+#[cfg(target_os = "linux")]
+fn home_seat(
+    ipc: crosspane_platform_linux::hyprland::ipc::HyprIpc,
+    runtime_dir: &std::path::Path,
+    exe: &std::path::Path,
+) -> anyhow::Result<Box<dyn HomeSeat>> {
+    use anyhow::Context;
+    use crosspane_platform_linux::hyprland::home_bind::HomeBind;
+    // The agent never changes the engine's chord (no config key), so its default is the chord.
+    let chord =
+        crosspane_engine::EngineConfig::new(crosspane_types::id::NodeId([0; 32])).release_chord;
+    let ctl = exe
+        .parent()
+        .context("agent executable has no parent directory")?
+        .join("crosspanectl");
+    let command = home_command(runtime_dir, &ctl);
+    let command_error = command.is_none();
+    if command_error {
+        tracing::warn!("home bind install disabled: release command paths cannot be quoted safely");
+    }
+    // A cleanup-only adapter can still remove a leftover owned bind before input is admitted.
+    // Its harmless command is never installed: install() refuses while command_error is set.
+    let command = command.as_deref().unwrap_or("true");
+    let bind = HomeBind::new(ipc.clone(), &chord, command).context("home bind construction")?;
+    Ok(Box::new(HyprHomeSeat {
+        ipc,
+        bind,
+        ctl,
+        command_error,
+        reload: None,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+impl HomeSeat for HyprHomeSeat {
+    fn keys(&self) -> String {
+        self.bind.keys().to_owned()
+    }
+
+    fn install(&self) -> Result<(), PlatformError> {
+        if self.command_error {
+            return Err(PlatformError::Unsupported(
+                "home release command paths cannot be quoted safely",
+            ));
+        }
+        if !is_executable(&self.ctl) {
+            return Err(PlatformError::Backend(format!(
+                "{} is not an executable file, so the release shortcut would do nothing",
+                self.ctl.display()
+            )));
+        }
+        self.bind.install()
+    }
+
+    fn remove(&self) -> Result<(), PlatformError> {
+        self.bind.remove()
+    }
+
+    fn installed(&self) -> Result<bool, PlatformError> {
+        self.bind.installed()
+    }
+
+    fn cursor(&self) -> Result<(DisplayId, PointDevice), PlatformError> {
+        crosspane_platform_linux::hyprland::cursor_position(&self.ipc)
+    }
+
+    fn watch_reload(&mut self, reload: Box<dyn Fn() + Send>) -> Result<(), PlatformError> {
+        use crosspane_platform_linux::hyprland::ipc::IpcEvent;
+        let stream = self.ipc.events(Box::new(move |event| match event {
+            // A reload clears every keybind; a reconnect may have missed one.
+            IpcEvent::Connected => reload(),
+            IpcEvent::Event {
+                name: "configreloaded",
+                ..
+            } => reload(),
+            _ => {}
+        }))?;
+        self.reload = Some(stream);
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn create(
     state_dir: &std::path::Path,
@@ -332,6 +495,11 @@ pub fn create(
                 None
             }
         });
+    // Home on the twin (WP-2.43): the bind runs this agent's own `crosspanectl release`, so it is
+    // spelled with this agent's control-socket directory and executable.
+    let paths = crate::paths::Paths::new().context("home release control-socket paths")?;
+    let exe = std::env::current_exe().context("home release agent executable")?;
+    let home = Some(home_seat(ipc.clone(), &paths.runtime_dir, &exe)?);
     let (keys, pointer) = match optional("injection", inject::connect(gate.clone(), ipc)) {
         Some((k, p)) => (
             Some(Box::new(k) as Box<dyn KeyInjector>),
@@ -340,6 +508,7 @@ pub fn create(
         None => (None, None),
     };
     Ok(Platform {
+        home,
         session: Box::new(session),
         displays: Box::new(displays),
         capture: optional("capture", HyprlandCapture::new(gate.clone()))
@@ -448,6 +617,9 @@ pub fn create(
         tray: Some(Box::new(crosspane_platform_macos::tray::MacTray::new())),
         links: Some(Box::new(crosspane_platform_macos::link::MacLinkInfo::new())),
         gpu: gpu_enabled().then(metal_device).flatten(),
+        // Home on the twin is Hyprland's: a Mac node never commits it (the engine's install
+        // request is answered with an error).
+        home: None,
         gate,
     })
 }
@@ -471,4 +643,89 @@ fn metal_device() -> Option<GpuDevice> {
     .map_err(|e| tracing::info!(error = %e, "no Metal device: CPU frame hashing"))
     .ok()?;
     Some(GpuDevice { device, queue })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn the_home_command_pins_the_runtime_directory_and_runs_release() {
+        let command = home_command(
+            Path::new("/run/user/1000/crosspane"),
+            Path::new("/home/u/.local/bin/crosspanectl"),
+        );
+        assert_eq!(
+            command.as_deref(),
+            Some(
+                "env CROSSPANE_RUNTIME_DIR='/run/user/1000/crosspane' \
+                 '/home/u/.local/bin/crosspanectl' release"
+            )
+        );
+    }
+
+    #[test]
+    fn a_path_that_is_not_text_has_no_home_command() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = Path::new(std::ffi::OsStr::from_bytes(b"/run/\xff"));
+        assert_eq!(home_command(raw, Path::new("/bin/crosspanectl")), None);
+        assert_eq!(home_command(Path::new("/run"), raw), None);
+    }
+
+    #[test]
+    fn home_command_refuses_paths_that_break_shell_or_lua_quoting() {
+        for unsafe_path in ["/run/a'b'c", "/run/a\nb", "/run/]==]", "/run/\0bad"] {
+            let unsafe_path = Path::new(unsafe_path);
+            assert_eq!(
+                home_command(unsafe_path, Path::new("/bin/crosspanectl")),
+                None
+            );
+            assert_eq!(home_command(Path::new("/run"), unsafe_path), None);
+        }
+        assert!(home_command(Path::new("/run/a $b `c`"), Path::new("/bin/a b")).is_some());
+    }
+
+    #[test]
+    fn unquotable_paths_still_construct_a_cleanup_seat_but_cannot_install() {
+        use crosspane_platform_linux::hyprland::ipc::HyprIpc;
+        let ipc = HyprIpc::new(
+            "test-only-no-socket",
+            Path::new("/tmp"),
+            std::time::Duration::from_millis(10),
+        );
+        let seat = home_seat(
+            ipc,
+            Path::new("/run/unquotable'path"),
+            Path::new("/bin/crosspane-agent"),
+        )
+        .unwrap();
+        assert!(matches!(seat.install(), Err(PlatformError::Unsupported(_))));
+        // No socket exists: cleanup is attempted and fails, so startup keeps its fence.
+        assert!(seat.remove().is_err());
+    }
+
+    #[test]
+    fn only_an_executable_file_counts_as_the_ctl() {
+        let dir = std::env::temp_dir().join(format!("crosspane-agent-ctl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("crosspanectl");
+        assert!(!is_executable(&file), "missing");
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable(&file), "not executable");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o001)).unwrap();
+        assert!(
+            !is_executable(&file),
+            "executable by others but not this owner"
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable(&file));
+        assert!(!is_executable(&dir), "a directory is not a program");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

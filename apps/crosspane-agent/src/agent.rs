@@ -8,23 +8,25 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crosspane_engine::io::{AudioKey, PortalsFailure};
+use crosspane_engine::io::{AudioKey, HomeFailure, HomeOp, PortalsFailure, Warp};
 use crosspane_engine::{
     Command, Engine, Failure, InjectCmd, Input, Notice, Output, ProjectionKey, ProxyEvent,
 };
 use crosspane_input::arrange::{self, Side};
 use crosspane_platform::{
-    CaptureEvent, EventSink, FrameEvent, LinkClass, OverlayEvent, Permission, PermissionState,
-    PlatformError, StreamId, WindowEvent,
+    CaptureEvent, CaptureTarget, EventSink, FrameEvent, LinkClass, Permission, PermissionState,
+    PlatformError, StreamId, WindowEvent, WindowInfo, WindowRole, WindowState,
 };
 use crosspane_protocol::audio::AudioPacket;
 use crosspane_protocol::link::{LinkEvent, PeerLink};
 use crosspane_protocol::msg::{
     Capability, ControlMessage, Hello, Placement, Refusal, RevocationNotice,
 };
+use crosspane_protocol::projection::ProjectionMessage;
 use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
 use crosspane_types::audio::AudioKind;
 use crosspane_types::display::DisplayInfo;
+use crosspane_types::geom::{PixelSize, PointDevice};
 use crosspane_types::id::NodeId;
 use crosspane_types::id::{DisplayId, ProjectionId, WindowId};
 use serde_json::{Value, json};
@@ -59,6 +61,9 @@ pub enum Event {
     /// The audio worker reports (WP-3.6d): a device open finished, a stream failed, or the
     /// platform's audio devices changed.
     Audio(WorkerEvent),
+    /// The compositor reloaded its config (which drops runtime keybinds) or its event connection
+    /// was made again: check the home bind now (WP-2.43 §2.9).
+    HomeBind,
 }
 
 /// What the loop knows about a peer.
@@ -136,6 +141,262 @@ impl AudioPlane for AudioWorker {
     }
 }
 
+/// Whether this build produces `ProxyEvent::Placed` from the compositor's window list (the
+/// Hyprland placement source). Wayland tells a client neither its position nor its output; macOS
+/// does (`HostEvent::Placed { monitor: Some(..) }`) and keeps the host's own report.
+const HYPRLAND_PLACEMENT: bool = cfg!(target_os = "linux");
+
+/// How often the home bind is verified while it is wanted (also at once on a config reload).
+const BIND_CHECK: Duration = Duration::from_secs(1);
+/// How often a startup removal that failed is tried again (amendment A1).
+const FENCE_RETRY: Duration = Duration::from_secs(2);
+/// How far, in device pixels per axis, the pointer read back after a warp may be from the point it
+/// was sent to and still count as there (amendment A3).
+const WARP_TOLERANCE: f64 = 2.0;
+/// How long an injection error stays worth naming in a home notice.
+const INJECT_ERROR_AGE: Duration = Duration::from_secs(10);
+
+/// What a proxy reports about where it is: the display (`None`: on none), the content's top-left
+/// in that display's device pixels, and its size. All zero when on no display, so two reports of
+/// "nowhere" are equal.
+type Placed = (Option<DisplayId>, PointDevice, PixelSize);
+
+/// Where each open proxy is, from the host's visibility joined with the compositor's geometry
+/// (WP-2.43e, the Hyprland placement source). Wayland gives a client neither its position nor its
+/// output, so the proxy host says only whether the proxy is visible
+/// (`HostEvent::Placed { monitor: None }`); where it is comes from the compositor's own window
+/// list, matched to the proxy by pid and title. One producer feeds every `ProxyEvent::Placed`, so
+/// the reports can't contradict each other.
+#[derive(Debug)]
+struct PlacementSource {
+    /// This process: the proxies are its windows.
+    pid: u32,
+    /// This node's displays, as the engine knows them.
+    displays: Vec<DisplayInfo>,
+    /// Every window the compositor listed, newest state.
+    windows: BTreeMap<WindowId, WindowInfo>,
+    /// The open proxies and the title each was given (the compositor lists the window under it).
+    proxies: BTreeMap<ProjectionKey, String>,
+    /// What the host last said about each proxy's visibility (minimised, fully occluded: `false`).
+    visible: BTreeMap<ProjectionKey, bool>,
+    /// The last report made for each proxy, so an equal one isn't repeated.
+    last: BTreeMap<ProjectionKey, Placed>,
+}
+
+impl PlacementSource {
+    fn new(pid: u32) -> PlacementSource {
+        PlacementSource {
+            pid,
+            displays: Vec::new(),
+            windows: BTreeMap::new(),
+            proxies: BTreeMap::new(),
+            visible: BTreeMap::new(),
+            last: BTreeMap::new(),
+        }
+    }
+
+    fn set_displays(&mut self, displays: &[DisplayInfo]) {
+        self.displays = displays.to_vec();
+    }
+
+    fn window_event(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::Added(window) | WindowEvent::Changed(window) => {
+                self.windows.insert(window.id, window.clone());
+            }
+            WindowEvent::Removed(window) => {
+                self.windows.remove(window);
+            }
+            _ => {}
+        }
+    }
+
+    /// The proxy `key` is open and its window is called `title`.
+    fn opened(&mut self, key: ProjectionKey, title: &str) {
+        self.proxies.insert(key, title.to_owned());
+    }
+
+    /// The title of an open proxy changed. Preserve the already uniquely identified own window
+    /// across our title request: a window-title event is debounced and may arrive after a flush.
+    /// Geometry still comes from the compositor, and its next event revalidates the identity.
+    fn retitled(&mut self, key: ProjectionKey, title: &str) {
+        if self.compute(&key).0.is_some()
+            && let Some(old) = self.proxies.get(&key)
+            && let Some(window) = self
+                .windows
+                .values_mut()
+                .find(|w| w.pid == Some(self.pid) && &w.title == old)
+        {
+            title.clone_into(&mut window.title);
+        }
+        if let Some(own) = self.proxies.get_mut(&key) {
+            title.clone_into(own);
+        }
+    }
+
+    fn closed(&mut self, key: ProjectionKey) {
+        self.proxies.remove(&key);
+        self.visible.remove(&key);
+        self.last.remove(&key);
+    }
+
+    fn set_visible(&mut self, key: ProjectionKey, visible: bool) {
+        self.visible.insert(key, visible);
+    }
+
+    /// The window of this node's that sits on `display` (a projected window parked alone on its
+    /// twin output), for naming it in notices.
+    fn window_on(&self, display: DisplayId) -> Option<&WindowInfo> {
+        self.windows
+            .values()
+            .find(|w| w.display == Some(display) && w.role == WindowRole::Toplevel)
+    }
+
+    /// Where `key`'s proxy is now.
+    ///
+    /// Only a proxy that is visible (the host's word), whose title names exactly one open proxy
+    /// and exactly one window of this process, whose window is neither hidden nor minimised and
+    /// sits on a display the engine knows, is placed; everything else is nowhere. The origin is the
+    /// window's top-left in that display's device pixels, the size its extent scaled (a size is
+    /// not a point, so the display's origin isn't subtracted from it).
+    fn compute(&self, key: &ProjectionKey) -> Placed {
+        let nowhere = (None, PointDevice::zero(), PixelSize::new(0, 0));
+        let Some(title) = self.proxies.get(key) else {
+            return nowhere;
+        };
+        if !self.visible.get(key).copied().unwrap_or(false)
+            || self.proxies.values().filter(|t| *t == title).count() != 1
+        {
+            return nowhere;
+        }
+        let mut mine = self
+            .windows
+            .values()
+            .filter(|w| w.pid == Some(self.pid) && &w.title == title);
+        let (Some(window), None) = (mine.next(), mine.next()) else {
+            return nowhere;
+        };
+        if matches!(window.state, WindowState::Hidden | WindowState::Minimized) {
+            return nowhere;
+        }
+        let Some(info) = window
+            .display
+            .and_then(|d| self.displays.iter().find(|i| i.id == d))
+        else {
+            return nowhere;
+        };
+        let geometry = &info.geometry;
+        let scaled = |extent: f64| (extent * geometry.scale).round().max(0.0) as u32;
+        (
+            Some(info.id),
+            geometry.logical_to_device(window.frame.origin),
+            PixelSize::new(
+                scaled(window.frame.size.width),
+                scaled(window.frame.size.height),
+            ),
+        )
+    }
+
+    /// Every proxy whose placement differs from what was last reported, with the new placement
+    /// (remembered as reported) and whether the report is notable: the proxy's first, or the one
+    /// that places it after it was nowhere. The first report of a proxy always goes out, placed or
+    /// not.
+    fn changes(&mut self) -> Vec<(ProjectionKey, Placed, bool)> {
+        let keys: Vec<ProjectionKey> = self.proxies.keys().copied().collect();
+        let mut changed = Vec::new();
+        for key in keys {
+            let now = self.compute(&key);
+            let before = self.last.insert(key, now);
+            if before != Some(now) {
+                let notable = before.is_none_or(|b| b.0.is_none() && now.0.is_some());
+                changed.push((key, now, notable));
+            }
+        }
+        changed
+    }
+}
+
+/// Where this node's input is home (WP-2.43): what the notices name.
+#[derive(Clone, Debug)]
+struct HomeNow {
+    key: ProjectionKey,
+    /// The peer whose E1 session stays open while home.
+    peer: Option<NodeId>,
+    title: String,
+}
+
+/// What the agent keeps for home on the twin (WP-2.43e): the release bind it owns on the
+/// compositor, and what it last learned about it.
+#[derive(Debug)]
+struct HomeAgent {
+    /// Set by `Notice::Home { entered: true }`, cleared when home is left or fails.
+    now: Option<HomeNow>,
+    /// The engine's install request in force: set when an install is verified, cleared when the
+    /// engine asks for the removal (or the bind is given up on). While set the bind is verified
+    /// on every config reload and every [`BIND_CHECK`].
+    wanted: Option<HomeOp>,
+    /// What the agent last verified: `Some(true)` present, `Some(false)` absent, `None` unknown
+    /// (never checked, or an install or removal failed part-way). Never reset on a failure.
+    present: Option<bool>,
+    /// The cause of the latest install, reinstall or removal failure, for the notices.
+    error: Option<String>,
+    /// A failed removal was already put in a notice (the engine retries it with backoff; the
+    /// user hears of the episode once). Cleared by the next success.
+    removal_reported: bool,
+    /// Startup (amendment A1): a leftover bind could not be confirmed absent. Until it can, this
+    /// node injects no key press, button press, motion or scroll (E1 target and E2 source alike),
+    /// refuses E1 control, and doesn't install a bind.
+    fence: bool,
+    last_fence_try: Instant,
+    last_check: Instant,
+    /// The compositor reloaded its config: verify at the next housekeeping pass.
+    reload: bool,
+    /// The latest failed injection and when, for the `Drain` notice.
+    inject_error: Option<(Instant, String)>,
+}
+
+impl HomeAgent {
+    fn new() -> HomeAgent {
+        HomeAgent {
+            now: None,
+            wanted: None,
+            present: None,
+            error: None,
+            removal_reported: false,
+            fence: false,
+            last_fence_try: Instant::now(),
+            last_check: Instant::now(),
+            reload: false,
+            inject_error: None,
+        }
+    }
+
+    /// Remember what the injectors last said, for a `Drain` notice. At most once a second: a
+    /// refused injection can repeat at pointer-motion rate, and the text is only ever read when
+    /// a drain fails, which is about the last few seconds.
+    fn note_inject_error(&mut self, text: impl FnOnce() -> String) {
+        if self
+            .inject_error
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(1))
+        {
+            self.inject_error = Some((Instant::now(), text()));
+        }
+    }
+}
+
+/// Whether `cmd` only ever releases: the one kind of injection a fenced node still carries out
+/// (the gate allows releases while closed for the same reason, `IoGate`).
+fn releases_only(cmd: &InjectCmd) -> bool {
+    matches!(
+        cmd,
+        InjectCmd::Key { down: false, .. }
+            | InjectCmd::Button { down: false, .. }
+            | InjectCmd::ReleaseAll
+            | InjectCmd::Recover { .. }
+    )
+}
+
 pub struct Agent {
     node: NodeId,
     name: String,
@@ -208,6 +469,24 @@ pub struct Agent {
     features: Vec<String>,
     /// Sessions playing on this machine's speakers now: the engine's `AudioIndicators`.
     speakers: Vec<AudioKey>,
+    /// Home on the twin (WP-2.43e): the release bind and what the notices name.
+    home: HomeAgent,
+    /// Where this node's proxies are (WP-2.43e); `changes()` is flushed after every input that
+    /// can move one.
+    placement: PlacementSource,
+    placement_dirty: bool,
+    /// Diagnostic only: has this capture produced any local motion for entry corroboration?
+    capture_motion_seen: bool,
+    /// The display each of this node's projections is captured from (the twin output on
+    /// Hyprland), to name the projected window in notices.
+    capture_display: BTreeMap<ProjectionId, DisplayId>,
+    /// Every input fed to the engine, in order (tests only).
+    #[cfg(test)]
+    fed: Vec<Input>,
+    #[cfg(test)]
+    test_now: Option<crosspane_types::time::MonoTime>,
+    #[cfg(test)]
+    emitted: Vec<Output>,
 }
 
 /// The E2 pieces the agent wires in (`media.rs`, the proxy host).
@@ -421,6 +700,17 @@ impl Agent {
             audio,
             features,
             speakers: Vec::new(),
+            home: HomeAgent::new(),
+            placement: PlacementSource::new(std::process::id()),
+            placement_dirty: false,
+            capture_motion_seen: false,
+            capture_display: BTreeMap::new(),
+            #[cfg(test)]
+            fed: Vec::new(),
+            #[cfg(test)]
+            test_now: None,
+            #[cfg(test)]
+            emitted: Vec::new(),
         }
     }
 
@@ -428,6 +718,9 @@ impl Agent {
     /// closes.
     pub fn run(mut self, startup: Vec<Output>, events: &Receiver<Event>) {
         self.granted = self.granted_permissions();
+        // A release bind an earlier run left behind goes first, before any input is admitted
+        // (04 §6, amendment A1). Crash recovery below only ever releases, so it isn't held back.
+        self.home_startup();
         self.execute(startup);
         self.feed(Input::LocalDisplays(self.local_displays.clone()));
         // Speaker v0 hosts no microphone: the worker refuses to open one, and the engine refuses
@@ -436,9 +729,7 @@ impl Agent {
         self.send_grants();
         self.update_layout(false);
         loop {
-            while let Some(input) = self.pending.pop_front() {
-                self.feed(input);
-            }
+            self.settle();
             let now = platform::now();
             let timeout = self
                 .engine
@@ -480,8 +771,92 @@ impl Agent {
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_input(&input);
         }
-        let outputs = self.engine.handle(input, platform::now());
+        #[cfg(test)]
+        self.fed.push(input.clone());
+        self.observe(&input);
+        let now = platform::now();
+        #[cfg(test)]
+        let now = self.test_now.unwrap_or(now);
+        let outputs = self.engine.handle(input, now);
+        #[cfg(test)]
+        self.emitted.extend(outputs.iter().cloned());
         self.execute(outputs);
+        self.flush_placements();
+    }
+
+    /// Carry out the acknowledgements that keep their ordinary delivery order.
+    fn settle(&mut self) {
+        while let Some(input) = self.pending.pop_front() {
+            self.feed(input);
+        }
+    }
+
+    /// What the agent itself needs to learn from an input before the engine sees it.
+    fn observe(&mut self, input: &Input) {
+        match input {
+            Input::Capture(CaptureEvent::Motion { .. }) => self.capture_motion_seen = true,
+            Input::Link(LinkEvent::Input {
+                peer,
+                msg:
+                    crosspane_protocol::msg::InputMessage::Proj(
+                        crosspane_protocol::projection::ProjInput::Motion { projection, .. },
+                    ),
+            }) if self.engine.controlling() == Some(*peer) && !self.capture_motion_seen => {
+                // A truthful observation for the nested harness: the frozen engine interface
+                // does not expose whether prevalidation or corroboration rejected this report.
+                tracing::debug!(
+                    projection = projection.0,
+                    "proxy motion observed without local capture motion"
+                );
+            }
+            Input::Windows(event) => {
+                self.placement.window_event(event);
+                self.placement_dirty = true;
+            }
+            Input::LocalDisplays(displays) => {
+                self.placement.set_displays(displays);
+                self.placement_dirty = true;
+            }
+            // The engine learns the proxy is open from this very input; the report that follows
+            // is queued behind it.
+            Input::ProxyOpened { key, result: Ok(_) } => {
+                let title = self.titles.get(key).map(|(title, _)| title.clone());
+                self.placement
+                    .opened(*key, title.as_deref().unwrap_or_default());
+                self.placement_dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Report every proxy whose placement changed (the Hyprland placement source). Each report is
+    /// an input of its own, queued behind whatever is being handled.
+    fn flush_placements(&mut self) {
+        if !std::mem::take(&mut self.placement_dirty) || !HYPRLAND_PLACEMENT {
+            return;
+        }
+        for (key, (on, origin, size), notable) in self.placement.changes() {
+            // A proxy's first report, and the one that places it, are worth a line at any log
+            // level: they show where the placement source puts the window (and that it does).
+            if notable {
+                tracing::info!(
+                    source = %key.source.short(),
+                    projection = key.projection.0,
+                    display = ?on,
+                    ?origin,
+                    ?size,
+                    "placement source: proxy reported"
+                );
+            }
+            self.pending.push_back(proxy(
+                key,
+                ProxyEvent::Placed {
+                    display: on,
+                    origin,
+                    size,
+                },
+            ));
+        }
     }
 
     fn on_event(&mut self, event: Event) {
@@ -519,6 +894,8 @@ impl Agent {
             Event::Host(event) => self.on_host(event),
             Event::Paired(paired) => self.on_paired(paired),
             Event::Audio(event) => self.on_audio(event),
+            // Checked by the housekeeping pass that follows this event.
+            Event::HomeBind => self.home.reload = true,
         }
     }
 
@@ -795,9 +1172,12 @@ impl Agent {
                     }
                 }
             }
-            // WP-2.43e: `drain_first` (a home exit's capture) feeds every event queued during
-            // `begin()` to the engine before `CaptureBegun`; until then it is ignored.
-            Output::BeginCapture { id, portal, .. } => {
+            Output::BeginCapture {
+                id,
+                portal,
+                drain_first,
+            } => {
+                self.capture_motion_seen = false;
                 let result = match &mut self.platform.capture {
                     Some(capture) => capture.begin(id, portal).map_err(failure),
                     None => Err(Failure::Other),
@@ -805,7 +1185,16 @@ impl Agent {
                 if let Err(f) = &result {
                     tracing::info!(failure = ?f, "capture refused");
                 }
-                self.pending.push_back(Input::CaptureBegun { id, result });
+                let begun = Input::CaptureBegun { id, result };
+                if drain_first {
+                    // Linux delivers activation callbacks before begin returns. Put the answer
+                    // on that same channel: every queued event precedes it, with no drain cap
+                    // and without moving a lock, shutdown or other event out of order (A4, B4).
+                    let _ = self.events.send(Event::Input(begun));
+                } else {
+                    // Every other capture keeps today's order: the answer first.
+                    self.pending.push_back(begun);
+                }
             }
             Output::EndCapture { warp_to } => {
                 if let Some(capture) = &mut self.platform.capture
@@ -814,29 +1203,29 @@ impl Agent {
                     tracing::warn!(error = %e, "end capture failed");
                 }
             }
-            // Freeze placeholder (WP-2.43 B3): the warp is submitted, but the answer is always an
-            // error, never `Done`, so home can't commit before WP-2.43e wires the cursor read-back
-            // (A3) and the gate check (B2). The engine emits no `ReleaseAndWarp` before WP-2.43b.
+            // A home-related warp (WP-2.43 §3.2): the capture, if any, is released and the pointer
+            // sent to `warp_to`. The backend's `Ok` doesn't say the pointer moved (it skips the
+            // warp while the gate is closed and still returns `Ok`), so the answer is built from a
+            // read-back of the pointer and then the gate (amendments A3 and B2).
             Output::ReleaseAndWarp { op, warp_to } => {
-                if let Some(capture) = &mut self.platform.capture
-                    && let Err(e) = capture.end(Some(warp_to))
-                {
-                    tracing::warn!(error = %e, "release and warp failed");
-                }
-                self.pending.push_back(Input::CaptureReleased {
-                    op,
-                    result: Err(Failure::Other),
-                });
+                let ended = match &mut self.platform.capture {
+                    Some(capture) => capture.end(Some(warp_to)).map_err(failure),
+                    None => Err(Failure::Other),
+                };
+                let result = match ended {
+                    Ok(()) => self.warp_result(warp_to),
+                    Err(f) => {
+                        tracing::warn!(failure = ?f, "release and warp failed");
+                        Err(f)
+                    }
+                };
+                self.pending
+                    .push_back(Input::CaptureReleased { op, result });
             }
-            // Freeze placeholder: installing always fails and removal always succeeds, until
-            // WP-2.43e replaces this arm with the `HomeBind` calls.
-            Output::HomeBind { op, install } => {
-                self.pending.push_back(Input::HomeBindSet {
-                    op,
-                    install,
-                    result: if install { Err(Failure::Other) } else { Ok(()) },
-                });
-            }
+            Output::HomeBind { op, install } => self.home_bind(op, install),
+            // The overlay host owes exactly one outcome per configuration it accepted (`Visible`
+            // or `Unavailable`, WP-2.42), so a show it refused outright is only logged: the agent
+            // never makes up a second outcome. The engine's own HUD deadline covers the wait.
             Output::ShowOverlay { id, overlay } => {
                 let shown = match &mut self.platform.overlay {
                     Some(host) => host.show(id, &overlay),
@@ -844,8 +1233,6 @@ impl Agent {
                 };
                 if let Err(e) = shown {
                     tracing::warn!(error = %e, "overlay unavailable");
-                    self.pending
-                        .push_back(Input::Overlay(OverlayEvent::Unavailable(id)));
                 }
             }
             Output::HideOverlay(id) => {
@@ -954,6 +1341,9 @@ impl Agent {
                 };
                 if let Ok(stream) = result {
                     self.streams.insert(stream, projection);
+                    if let CaptureTarget::Display(display) = target {
+                        self.capture_display.insert(projection, display);
+                    }
                     let has = |feature: &str| {
                         self.peers
                             .get(&peer)
@@ -980,7 +1370,9 @@ impl Agent {
                 }
             }
             Output::StopCapture { stream } => {
-                self.streams.remove(&stream);
+                if let Some(projection) = self.streams.remove(&stream) {
+                    self.capture_display.remove(&projection);
+                }
                 let _ = self.source_media.send(SourceCmd::Stop { stream });
                 if let Some(frames) = &mut self.platform.frames {
                     let _ = frames.stop(stream);
@@ -1048,9 +1440,7 @@ impl Agent {
                 if let Some(entry) = self.titles.get_mut(&key) {
                     entry.0.clone_from(&title);
                 }
-                if let (Some(h), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
-                    let _ = h.send(HostCommand::SetTitle { id, title });
-                }
+                self.set_proxy_title(key, title);
             }
             Output::BrowseResult {
                 peer,
@@ -1099,6 +1489,8 @@ impl Agent {
             Output::CloseProxy { key } => {
                 self.projections.remove(&key);
                 self.titles.remove(&key);
+                self.placement.closed(key);
+                self.placement_dirty = true;
                 if let Some(id) = self.proxy_ids.close(key)
                     && let Some(h) = &self.host
                 {
@@ -1170,6 +1562,13 @@ impl Agent {
     }
 
     fn inject(&mut self, cmd: InjectCmd) -> bool {
+        // Amendment A1: while the release bind of an earlier run can't be confirmed gone, a key
+        // injected here could press it (the compositor can't tell a virtual keyboard from a
+        // physical one), so only releases are carried out: E1 target and E2 source input alike.
+        if self.home.fence && !releases_only(&cmd) {
+            tracing::debug!(cmd = %variant(&cmd), "injection refused: a release shortcut may still be bound");
+            return false;
+        }
         let keys = self.platform.keys.as_mut();
         let pointer = self.platform.pointer.as_mut();
         let result = match (cmd, keys, pointer) {
@@ -1190,6 +1589,8 @@ impl Agent {
             }
             (cmd, _, _) => {
                 tracing::debug!(cmd = %variant(&cmd), "no injector for command");
+                self.home
+                    .note_inject_error(|| "no injector for the command".into());
                 return false;
             }
         };
@@ -1197,6 +1598,9 @@ impl Agent {
             Ok(()) => true,
             Err(e) => {
                 tracing::debug!(error = %e, "injection refused");
+                // For the `Drain` notice: what the injectors last said (never a key or its
+                // contents: a platform error names the failure).
+                self.home.note_inject_error(|| e.to_string());
                 false
             }
         }
@@ -1248,8 +1652,15 @@ impl Agent {
                 "audio ({kind:?}) with {} refused: {reason:?}",
                 peer_name(self, peer)
             ),
+            Notice::Home { key, entered } => self.home_notice(*key, *entered),
+            Notice::HomeFailed { key, reason } => self.home_failed_notice(*key, *reason),
             other => format!("{other:?}"),
         };
+        self.say(text);
+    }
+
+    /// Tell the user: a line in the log, the notice history and `crosspanectl status`.
+    fn say(&mut self, text: String) {
         tracing::info!(notice = %text);
         if self.notices.len() == NOTICE_HISTORY {
             self.notices.pop_front();
@@ -1455,10 +1866,20 @@ impl Agent {
             name: self.name.clone(),
             peers,
             local_windows: self.tray.local_windows.clone(),
+            // While input is home in a projected window, its line says so (WP-2.43).
             projections: self
                 .projections
                 .iter()
-                .map(|(k, text)| (*k, text.clone()))
+                .map(|(k, text)| match &self.home.now {
+                    Some(home) if home.key == *k => (
+                        *k,
+                        format!(
+                            "{text} — input is home here ({} returns)",
+                            self.release_keys()
+                        ),
+                    ),
+                    _ => (*k, text.clone()),
+                })
                 .collect(),
             controlling: self.engine.controlling().map(|n| self.peer_label(n)),
             controlled_by: self.engine.controlled_by().map(|n| self.peer_label(n)),
@@ -1817,13 +2238,13 @@ impl Agent {
             .peers
             .get(&source)
             .map_or_else(|| source.short(), |info| info.name.clone());
-        format!("{from} › {title}")
+        proxy_title(format!("{from} › {title}"))
     }
 
     fn latency_titles(&mut self) {
         let keys: Vec<ProjectionKey> = self.titles.keys().copied().collect();
         for key in keys {
-            let (Some(stats), Some(id)) = (self.proxy_ids.stats(key), self.proxy_ids.id(key))
+            let (Some(stats), Some(_id)) = (self.proxy_ids.stats(key), self.proxy_ids.id(key))
             else {
                 continue;
             };
@@ -1836,13 +2257,23 @@ impl Agent {
                 .latency_ms
                 .map_or_else(|| "—".to_owned(), |ms| format!("{ms:.0} ms"));
             let text = format!("{title} — {fps:.0} fps, {latency}");
-            if let Some(h) = &self.host {
-                let _ = h.send(HostCommand::SetTitle { id, title: text });
-            }
+            self.set_proxy_title(key, text);
+        }
+    }
+
+    /// Keep compositor matching in step with every title sent to the proxy host, including the
+    /// optional latency decoration. A title update may change whether a proxy is unambiguous.
+    fn set_proxy_title(&mut self, key: ProjectionKey, title: String) {
+        let title = proxy_title(title);
+        self.placement.retitled(key, &title);
+        self.placement_dirty = true;
+        if let (Some(h), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
+            let _ = h.send(HostCommand::SetTitle { id, title });
         }
     }
 
     fn housekeeping(&mut self) {
+        self.home_housekeeping();
         self.discovery_housekeeping();
         if self.last_ping.elapsed() >= PING_INTERVAL {
             self.last_ping = Instant::now();
@@ -1902,7 +2333,10 @@ impl Agent {
     fn send_grants(&mut self) {
         // A node that can't inject (e.g. macOS without the Accessibility grant) refuses control
         // rather than accept a session whose input would go nowhere.
-        let can_inject = self.platform.keys.is_some() && self.platform.pointer.is_some();
+        // The same while a release bind of an earlier run can't be confirmed gone (amendment A1):
+        // its keys would be injected into a seat that has a bind on them.
+        let can_inject =
+            self.platform.keys.is_some() && self.platform.pointer.is_some() && !self.home.fence;
         // Likewise a node without an audio worker grants neither the speakers nor the microphone:
         // it never advertised `audio`, so nothing could be admitted anyway.
         let can_play = self.audio.is_some();
@@ -2299,6 +2733,24 @@ impl Agent {
     }
 
     fn on_host(&mut self, event: HostEvent) {
+        // Where the host can't say which display a proxy is on (Wayland), it says only whether the
+        // proxy is visible; the placement source supplies the rest and is the only producer of
+        // `ProxyEvent::Placed` there, so the host's own origin and size aren't used.
+        if let HostEvent::Placed {
+            id,
+            visible,
+            monitor: None,
+            ..
+        } = &event
+            && HYPRLAND_PLACEMENT
+        {
+            if let Some(key) = self.proxy_ids.key(*id) {
+                self.placement.set_visible(key, *visible);
+                self.placement_dirty = true;
+                self.flush_placements();
+            }
+            return;
+        }
         let (id, input_of): (u64, Box<dyn FnOnce(ProjectionKey) -> Input>) = match event {
             HostEvent::Opened { id, size, scale } => (
                 id,
@@ -2619,6 +3071,9 @@ impl Agent {
         // The panic ends every audio session too (the engine stops and closes each one, which the
         // worker carries out), so the worker has nothing running when it is shut down below.
         self.feed(Input::Command(Command::Panic));
+        // The engine asked for the home bind's removal as part of that (if it was installed); this
+        // makes sure, whatever became of the answer (amendment A2: never a foreign bind's).
+        self.home_shutdown();
         if let Some(parking) = self.platform.parking.as_mut() {
             match parking.recover() {
                 Ok(windows) => tracing::info!(restored = windows.len(), "parked windows restored"),
@@ -2672,6 +3127,8 @@ impl Agent {
             "listening": self.net.local_addr().to_string(),
             "gate_open": self.platform.gate.is_open(),
             "armed": self.engine.armed(),
+            "controlling": self.engine.controlling().map(|peer| peer.to_string()),
+            "controlled_by": self.engine.controlled_by().map(|peer| peer.to_string()),
             "session": format!("{:?}", self.platform.session.state()),
             "backends": format!("{:?}", self.platform),
             "permissions": self.platform.permissions.required().into_iter().map(|p| {
@@ -2694,6 +3151,12 @@ impl Agent {
                 "speaker_in_use": self.speakers.iter().any(|key| key.peer == *node),
             })).collect::<Vec<_>>(),
             "audio": self.audio_status(),
+            // Home on the twin (WP-2.43): the projection this node's input is home in (`null`
+            // when it isn't) and whether the release bind is installed, as last verified.
+            "home": {
+                "projection": self.home.now.as_ref().map(|h| h.key.projection.0),
+                "bind_installed": self.home.present == Some(true),
+            },
             "layout": self.placements.iter().map(|p| json!({
                 "node": p.node.short(),
                 "display": p.display.0,
@@ -2718,6 +3181,363 @@ impl Agent {
             "uptime_s": now.as_nanos() / 1_000_000_000,
         })
     }
+}
+
+/// Home on the twin (WP-2.43e): the release bind, the warp read-back and the notices. The engine
+/// decides when home is entered, kept and left; this is only what it asks of the compositor.
+impl Agent {
+    /// The release chord as Hyprland spells it, for notices.
+    fn release_keys(&self) -> String {
+        self.platform
+            .home
+            .as_ref()
+            .map_or_else(|| "the release shortcut".to_owned(), |seat| seat.keys())
+    }
+
+    /// The answer to a `ReleaseAndWarp` whose `end(Some(warp_to))` returned `Ok`. That `Ok` says
+    /// nothing about where the pointer is: the backend skips the warp while the I/O gate is
+    /// closed and still returns `Ok`. So the pointer is read back (amendment A3), and the
+    /// authoritative gate (session and engine sides, panic included) is asked **after** the
+    /// read-back (amendment B2): a closed gate is `Skipped` whatever the coordinates say, even
+    /// when the gate closed between the warp and the read-back and the engine hasn't heard of the
+    /// lock yet. `Done` needs an open gate and a pointer on `warp_to`'s display within
+    /// [`WARP_TOLERANCE`] of its point; a read-back that can't be made (or no Hyprland to read
+    /// from) is an error, never `Done`. `Skipped` and an error both make the engine retry the
+    /// warp once the node is unlocked and idle.
+    fn warp_result(&self, warp_to: (DisplayId, PointDevice)) -> Result<Warp, Failure> {
+        let seen = self.platform.home.as_ref().map(|seat| seat.cursor());
+        if !self.platform.gate.is_open() {
+            return Ok(Warp::Skipped);
+        }
+        match seen {
+            Some(Ok((on, at))) => {
+                let (want_display, want) = warp_to;
+                if on == want_display
+                    && (at.x - want.x).abs() <= WARP_TOLERANCE
+                    && (at.y - want.y).abs() <= WARP_TOLERANCE
+                {
+                    Ok(Warp::Done)
+                } else {
+                    tracing::warn!(
+                        ?on,
+                        ?at,
+                        ?warp_to,
+                        "the pointer isn't where it was warped to"
+                    );
+                    Ok(Warp::Skipped)
+                }
+            }
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "the pointer could not be read back after a warp");
+                Err(Failure::Other)
+            }
+            None => Err(Failure::Other),
+        }
+    }
+
+    /// `Output::HomeBind`: install (verified) or remove (verified absent) the release bind, and
+    /// answer with `Input::HomeBindSet`.
+    fn home_bind(&mut self, op: HomeOp, install: bool) {
+        let result = if install {
+            self.home_install(op)
+        } else {
+            self.home_remove()
+        };
+        self.pending.push_back(Input::HomeBindSet {
+            op,
+            install,
+            result,
+        });
+    }
+
+    fn home_install(&mut self, op: HomeOp) -> Result<(), Failure> {
+        // Home never engages while the startup cleanup is unconfirmed (amendment A1), nor where
+        // there is no way to bind (the Mac, a Hyprland without usable IPC).
+        if self.home.fence {
+            self.home.error =
+                Some("a release shortcut of an earlier run is not confirmed removed yet".into());
+            return Err(Failure::Other);
+        }
+        let Some(seat) = &self.platform.home else {
+            self.home.error = Some("this machine can't install a release shortcut".into());
+            return Err(Failure::Other);
+        };
+        match seat.install() {
+            Ok(()) => {
+                tracing::info!(keys = %seat.keys(), "home bind installed and verified");
+                self.home.wanted = Some(op);
+                self.home.present = Some(true);
+                self.home.error = None;
+                self.home.last_check = Instant::now();
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the home bind could not be installed");
+                // Part of it may be there: the removal the engine asks for next finds out.
+                self.home.wanted = None;
+                self.home.present = None;
+                self.home.error = Some(e.to_string());
+                Err(Failure::Other)
+            }
+        }
+    }
+
+    /// Remove the bind, never a foreign one (amendment A2, B5: that is the module's rule). `Err`
+    /// keeps the engine's teardown fence up; it retries with backoff.
+    fn home_remove(&mut self) -> Result<(), Failure> {
+        self.home.wanted = None;
+        let Some(seat) = &self.platform.home else {
+            // Nothing could have been installed here.
+            return Ok(());
+        };
+        let keys = seat.keys();
+        match seat.remove() {
+            Ok(()) => {
+                self.home.present = Some(false);
+                // Rollback precedes HomeFailed in the engine's output list. Keep the install
+                // error until the next install so that notice can still explain the failure.
+                self.home.removal_reported = false;
+                if std::mem::take(&mut self.home.fence) {
+                    self.say(format!(
+                        "The release shortcut {keys} is gone; remote input to this machine is accepted again"
+                    ));
+                    self.send_grants();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the home bind could not be removed");
+                self.home.present = None;
+                self.home.error.get_or_insert_with(|| e.to_string());
+                // The engine retries with backoff: the user hears of the episode once.
+                if !std::mem::replace(&mut self.home.removal_reported, true) {
+                    self.say(format!(
+                        "Crosspane can't remove its release shortcut {keys} ({e}); if another binding uses it, reload your Hyprland config"
+                    ));
+                }
+                Err(Failure::Other)
+            }
+        }
+    }
+
+    /// At start (amendment A1): remove a bind an earlier run left. If that can't be confirmed,
+    /// this node injects nothing but releases and refuses E1 control until it can (retried every
+    /// [`FENCE_RETRY`]). A foreign bind on the chord, ours absent, is confirmed absent: it is left
+    /// alone and doesn't fence (B5).
+    fn home_startup(&mut self) {
+        let Some(seat) = &self.platform.home else {
+            return;
+        };
+        let keys = seat.keys();
+        match seat.remove() {
+            Ok(()) => self.home.present = Some(false),
+            Err(e) => {
+                tracing::warn!(error = %e, "a leftover home bind could not be removed");
+                self.home.fence = true;
+                self.home.error = Some(e.to_string());
+                self.home.last_fence_try = Instant::now();
+                self.say(format!(
+                    "Crosspane can't remove its release shortcut {keys} because another binding uses it; reload your Hyprland config. Remote input to this machine is refused until then ({e})"
+                ));
+            }
+        }
+    }
+
+    /// The periodic part: the startup fence's retry, and the bind's verification while it is
+    /// wanted (on a config reload at once, else every [`BIND_CHECK`]).
+    fn home_housekeeping(&mut self) {
+        if self.home.fence && self.home.last_fence_try.elapsed() >= FENCE_RETRY {
+            self.home.last_fence_try = Instant::now();
+            self.home_fence_retry();
+        }
+        if self.home.wanted.is_none() {
+            self.home.reload = false;
+        } else if self.home.reload || self.home.last_check.elapsed() >= BIND_CHECK {
+            self.home.reload = false;
+            self.home.last_check = Instant::now();
+            self.home_verify();
+        }
+    }
+
+    fn home_fence_retry(&mut self) {
+        let Some(seat) = &self.platform.home else {
+            self.home.fence = false;
+            self.send_grants();
+            return;
+        };
+        let keys = seat.keys();
+        match seat.remove() {
+            Ok(()) => {
+                tracing::info!("the leftover home bind is gone");
+                self.home.fence = false;
+                self.home.present = Some(false);
+                self.home.error = None;
+                self.say(format!(
+                    "The release shortcut {keys} is gone; remote input to this machine is accepted again"
+                ));
+                self.send_grants();
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "the leftover home bind is still there");
+                self.home.error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// While the engine wants the bind: it must be listed. A reload drops runtime binds; if it is
+    /// missing it is reinstalled, silently. Only if that fails is the engine told, and it leaves
+    /// home (04 §6: the escape must exist whenever input is home).
+    fn home_verify(&mut self) {
+        let (Some(op), Some(seat)) = (self.home.wanted, &self.platform.home) else {
+            return;
+        };
+        if matches!(seat.installed(), Ok(true)) {
+            self.home.present = Some(true);
+            return;
+        }
+        match seat.install() {
+            Ok(()) => {
+                tracing::info!("the home bind was missing and is installed again");
+                self.home.present = Some(true);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the home bind was lost and could not be installed again");
+                self.home.present = None;
+                self.home.error = Some(e.to_string());
+                self.home.wanted = None;
+                self.pending.push_back(Input::HomeBindSet {
+                    op,
+                    install: true,
+                    result: Err(Failure::Other),
+                });
+            }
+        }
+    }
+
+    /// At stop: make sure the bind is gone, whatever became of the engine's own removal.
+    fn home_shutdown(&mut self) {
+        self.home.wanted = None;
+        if let Some(seat) = &self.platform.home {
+            match seat.remove() {
+                Ok(()) => self.home.present = Some(false),
+                Err(e) => tracing::warn!(error = %e, "the home bind could not be removed at stop"),
+            }
+        }
+    }
+
+    /// The projected window `key` as the notices name it: its title if the compositor lists it
+    /// on the display it is captured from, else its number.
+    fn home_title(&self, key: ProjectionKey) -> String {
+        self.capture_display
+            .get(&key.projection)
+            .and_then(|display| self.placement.window_on(*display))
+            .map(|window| window.title.as_str())
+            .filter(|title| !title.is_empty())
+            .map_or_else(
+                || format!("projected window {}", key.projection.0),
+                |title| format!("\"{title}\""),
+            )
+    }
+
+    /// `Notice::Home`: this node's input went home into a projected window, or left it.
+    fn home_notice(&mut self, key: ProjectionKey, entered: bool) -> String {
+        let controlling = self.engine.controlling();
+        // Refresh the tray line now rather than at the next second.
+        self.tray.last_update = Instant::now()
+            .checked_sub(TRAY_UPDATE)
+            .unwrap_or_else(Instant::now);
+        if entered {
+            let title = self.home_title(key);
+            let peer =
+                controlling.map_or_else(|| "the other machine".to_owned(), |p| self.peer_label(p));
+            let keys = self.release_keys();
+            self.home.now = Some(HomeNow {
+                key,
+                peer: controlling,
+                title: title.clone(),
+            });
+            return format!(
+                "Input is home in {title}; {peer} stays connected; press {keys} or push past the window's edges to return"
+            );
+        }
+        let was = self.home.now.take_if(|home| home.key == key);
+        match controlling {
+            Some(peer) => format!("Input returned to {}", self.peer_label(peer)),
+            // The session ended with home (a release, a lost link, a lock): input is simply here.
+            None => match was {
+                Some(HomeNow {
+                    peer: Some(peer),
+                    title,
+                    ..
+                }) => format!(
+                    "Input left {title}; control of {} ended",
+                    self.peer_label(peer)
+                ),
+                _ => "Input left the projected window".to_owned(),
+            },
+        }
+    }
+
+    /// `Notice::HomeFailed`: one line per reason, with the agent's own detail where it has one.
+    fn home_failed_notice(&mut self, key: ProjectionKey, reason: HomeFailure) -> String {
+        self.home.now.take_if(|home| home.key == key);
+        self.tray.last_update = Instant::now()
+            .checked_sub(TRAY_UPDATE)
+            .unwrap_or_else(Instant::now);
+        let title = self.home_title(key);
+        let why = match reason {
+            HomeFailure::Drain => {
+                let detail = self
+                    .home
+                    .inject_error
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < INJECT_ERROR_AGE)
+                    .map_or_else(String::new, |(_, e)| {
+                        format!(" (last injection error: {e})")
+                    });
+                format!("a key or button release was not confirmed in time{detail}")
+            }
+            HomeFailure::Bind => {
+                let detail = self
+                    .home
+                    .error
+                    .as_ref()
+                    .map_or_else(String::new, |e| format!(": {e}"));
+                format!(
+                    "the release shortcut {} could not be installed or kept{detail}",
+                    self.release_keys()
+                )
+            }
+            HomeFailure::Release => {
+                "the keyboard and pointer could not be released from the capture in time".to_owned()
+            }
+            HomeFailure::Warp => {
+                "the pointer could not be moved into the window (is the screen locked?)".to_owned()
+            }
+            HomeFailure::Focus => "the window did not take focus in time".to_owned(),
+            HomeFailure::Guard => {
+                "a button was pressed, the screen locked or crossing was turned off while entering"
+                    .to_owned()
+            }
+            HomeFailure::Gone => {
+                "the window, its position or its last pointer exit went away".to_owned()
+            }
+        };
+        format!("Input is not home in {title}: {why}")
+    }
+}
+
+/// Winit's Wayland title limit, applied before sending and matching titles so truncation cannot
+/// turn distinct cached strings into permanently missing or ambiguously named proxies.
+fn proxy_title(mut title: String) -> String {
+    if HYPRLAND_PLACEMENT && title.len() > 1024 {
+        let mut end = 1024;
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        title.truncate(end);
+    }
+    title
 }
 
 /// Match a peer by exact name (case-insensitive), else by a unique node-id prefix of at least 4
@@ -2812,11 +3632,25 @@ fn failure(e: PlatformError) -> Failure {
     }
 }
 
-/// How a failed `set_portals` reads to the engine (WP-2.43 B1). A timeout (the caller's receive
-/// timeout and a worker-reported refresh timeout both surface as `Timeout`) and `Backend(..)` (a
-/// stopped backend, or a rejected set the backend only describes in text) leave unknown whether
-/// the previous set and the capture survive, so they are `Uncertain`: the engine then ends any
-/// capture and waits for its end. Every other error is the backend refusing the set up front.
+/// How a failed `set_portals` reads to the engine (WP-2.43 B1). The Hyprland backend says which it
+/// is, by value (`set_portals_failure`): only a failure its worker reported, before anything
+/// changed, is `Rejected` (the previous set and any capture are intact). The caller's receive
+/// timeout, a backend that is gone or aborted, and anything else leave unknown whether they
+/// survive, so they are `Uncertain`: the engine then ends any capture and waits for its end.
+#[cfg(target_os = "linux")]
+fn portals_failure(e: &PlatformError) -> PortalsFailure {
+    use crosspane_platform_linux::hyprland::capture::{SetPortalsFailure, set_portals_failure};
+    match set_portals_failure(e) {
+        SetPortalsFailure::Rejected => PortalsFailure::Rejected,
+        SetPortalsFailure::Uncertain => PortalsFailure::Uncertain,
+    }
+}
+
+/// The same for the macOS backend, which has no such marker: a timeout and `Backend(..)` (a
+/// stopped backend, or a rejection it only describes in text) leave unknown whether the previous
+/// set and the capture survive, so they are `Uncertain`. Every other error is the backend refusing
+/// the set up front.
+#[cfg(not(target_os = "linux"))]
 fn portals_failure(e: &PlatformError) -> PortalsFailure {
     match e {
         PlatformError::Timeout | PlatformError::Backend(_) => PortalsFailure::Uncertain,
@@ -2894,6 +3728,16 @@ pub fn subscribe_platform(platform: &mut Platform, tx: &Sender<Event>) {
             tracing::warn!(error = %e, "global hotkeys unavailable");
         }
     }
+    // A config reload drops runtime keybinds: the home bind is checked at once, not only at the
+    // next housekeeping pass (WP-2.43 §2.9).
+    if let Some(home) = &mut platform.home {
+        let home_tx = sink(tx);
+        if let Err(e) = home.watch_reload(Box::new(move || {
+            let _ = home_tx.send(Event::HomeBind);
+        })) {
+            tracing::warn!(error = %e, "compositor reloads aren't watched: the home bind is verified once a second");
+        }
+    }
 }
 
 /// Debug trace of engine inputs, without motion noise or key contents (04 §7: logs never
@@ -2918,12 +3762,60 @@ fn log_input(input: &Input) {
         },
         // Many inputs can carry key usages (held-key states, proxy keys, recoveries): log only
         // the variant, except for the few known to hold none.
+        // A destination's report of where its proxy is (WP-2.43): geometry only.
+        Input::Link(LinkEvent::Control {
+            peer,
+            msg:
+                ControlMessage::Projection(ProjectionMessage::ProxyPlaced {
+                    projection,
+                    generation,
+                    display: on,
+                    origin,
+                    size,
+                }),
+        }) => tracing::debug!(
+            peer = %peer.short(),
+            projection = projection.0,
+            generation,
+            display = ?on,
+            ?origin,
+            ?size,
+            "in: proxy placed report"
+        ),
         Input::Link(LinkEvent::Control { peer, .. }) => {
             tracing::debug!(peer = %peer.short(), "in: control")
         }
         Input::Windows(_) | Input::Session(_) | Input::PeerUp { .. } => {
             tracing::debug!(input = ?input, "in")
         }
+        // The answers of the home acknowledgements (WP-2.43): ids, geometry and results only.
+        Input::PortalsSet { ids, result } => {
+            let ids: Vec<u32> = ids.iter().map(|id| id.0).collect();
+            tracing::debug!(?ids, ?result, "in: portals set")
+        }
+        Input::CaptureReleased { op, result } => {
+            tracing::debug!(op = op.0, ?result, "in: capture released")
+        }
+        Input::HomeBindSet {
+            op,
+            install,
+            result,
+        } => tracing::debug!(op = op.0, install, ?result, "in: home bind set"),
+        Input::Proxy {
+            key,
+            event:
+                ProxyEvent::Placed {
+                    display: on,
+                    origin,
+                    size,
+                },
+        } => tracing::debug!(
+            projection = key.projection.0,
+            display = ?on,
+            ?origin,
+            ?size,
+            "in: proxy placed"
+        ),
         other => tracing::debug!(input = %variant(other), "in"),
     }
 }
@@ -3255,21 +4147,23 @@ mod audio_tests {
     }
 
     /// One agent with one trusted peer ("peer-name"), and the recorder in place of the worker.
-    struct Rig {
-        agent: Agent,
+    /// (The home tests build on it too.)
+    pub(super) struct Rig {
+        pub(super) agent: Agent,
         calls: Arc<Mutex<Vec<Call>>>,
         source: mpsc::Receiver<SourceCmd>,
-        local: NodeId,
-        peer: NodeId,
-        // Kept so the channels stay open, and the directory until the end.
-        _events: mpsc::Receiver<Event>,
+        pub(super) local: NodeId,
+        pub(super) peer: NodeId,
+        /// The agent's event channel: what the backends' sinks queue.
+        pub(super) events: mpsc::Receiver<Event>,
+        // Kept so the channel stays open, and the directory until the end.
         _dest: mpsc::Receiver<DestCmd>,
         _dir: TempDir,
     }
 
     const AUDIO: &[&str] = &["e1", "cursor", "audio"];
 
-    fn rig(local_audio: bool) -> Rig {
+    pub(super) fn rig(local_audio: bool) -> Rig {
         let dir = TempDir::new();
         let identity = Arc::new(DeviceIdentity::generate().unwrap());
         let peer_identity = DeviceIdentity::generate().unwrap();
@@ -3326,6 +4220,7 @@ mod audio_tests {
             tray: None,
             links: None,
             gpu: None,
+            home: None,
         };
         let e2 = E2Wiring {
             source_media: source_tx,
@@ -3365,7 +4260,7 @@ mod audio_tests {
             source,
             local,
             peer,
-            _events: events,
+            events,
             _dest: dest,
             _dir: dir,
         }
@@ -3923,5 +4818,2937 @@ mod audio_tests {
                 Input::AudioStreamFailed { key },
             ]
         );
+    }
+}
+
+/// Home on the twin, driven in-process (WP-2.43e): a real engine and agent loop, with fakes for
+/// the compositor's bind and cursor, the capture backend, the injectors and the overlay host, so
+/// what is checked is what the agent asks of each and the order in which it answers the engine.
+#[cfg(test)]
+mod home_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Mutex;
+
+    use crosspane_platform::{
+        CaptureAbort, CaptureId, CapturePortal, CaptureStart, InputCapture, IoGate, KeyInjector,
+        Overlay, OverlayAnchor, OverlayHost, OverlayId, PointerInjector, PortalId, Rgb8,
+    };
+    use crosspane_types::color::ColorSpace;
+    use crosspane_types::geom::{DisplayGeometry, PointLogical, RectLogical, SizeLogical, SizeMm};
+    use crosspane_types::hid::{HidUsage, MouseButton};
+    use crosspane_types::input::{LockKeys, ScrollDelta, ScrollPhase};
+    use crosspane_types::time::MonoTime;
+
+    use super::audio_tests::{Rig, rig};
+    use super::*;
+    use crate::platform::HomeSeat;
+
+    const KEYS: &str = "CTRL + SHIFT + ALT + Escape";
+    const TARGET: (DisplayId, PointDevice) = (DisplayId(7), PointDevice::new(100.0, 50.0));
+
+    // ---- fakes ----
+
+    /// The compositor as home sees it: our bind, a foreign binding on the same chord, the pointer.
+    #[derive(Default)]
+    struct Compositor {
+        ours: bool,
+        foreign: bool,
+        install_error: Option<String>,
+        partial_install: bool,
+        verify_error: bool,
+        remove_error: Option<String>,
+        installs: u32,
+        removes: u32,
+        checks: u32,
+        /// What the read-back sees; `None`: the read-back fails.
+        cursor: Option<(DisplayId, PointDevice)>,
+        /// Runs once, during the read-back (a lock arriving in the middle of a warp).
+        during_cursor: Option<Box<dyn FnOnce() + Send>>,
+        reload: Option<Box<dyn Fn() + Send>>,
+    }
+
+    type Shared = Arc<Mutex<Compositor>>;
+
+    /// A `HomeSeat` that models the module's ownership table: it never removes a foreign binding.
+    struct FakeHome(Shared);
+
+    impl HomeSeat for FakeHome {
+        fn keys(&self) -> String {
+            KEYS.to_owned()
+        }
+
+        fn install(&self) -> Result<(), PlatformError> {
+            let mut c = self.0.lock().unwrap();
+            c.installs += 1;
+            if c.verify_error {
+                return Err(PlatformError::Backend("ownership read ambiguous".into()));
+            }
+            if let Some(e) = c.install_error.clone() {
+                c.ours |= c.partial_install;
+                return Err(PlatformError::Backend(e));
+            }
+            if c.foreign {
+                return Err(PlatformError::Backend(format!(
+                    "home bind: another binding already uses {KEYS}"
+                )));
+            }
+            c.ours = true;
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<(), PlatformError> {
+            let mut c = self.0.lock().unwrap();
+            c.removes += 1;
+            if c.verify_error {
+                return Err(PlatformError::Backend("ownership read ambiguous".into()));
+            }
+            if let Some(e) = &c.remove_error {
+                return Err(PlatformError::Backend(e.clone()));
+            }
+            if c.ours && c.foreign {
+                return Err(PlatformError::Backend(format!(
+                    "home bind: another binding shares {KEYS} with ours; not removing it"
+                )));
+            }
+            // Foreign only: absent, and left alone.
+            c.ours = false;
+            Ok(())
+        }
+
+        fn installed(&self) -> Result<bool, PlatformError> {
+            let mut c = self.0.lock().unwrap();
+            c.checks += 1;
+            if c.verify_error {
+                return Err(PlatformError::Backend("ownership read ambiguous".into()));
+            }
+            Ok(c.ours && !c.foreign)
+        }
+
+        fn cursor(&self) -> Result<(DisplayId, PointDevice), PlatformError> {
+            let during = self.0.lock().unwrap().during_cursor.take();
+            if let Some(f) = during {
+                f();
+            }
+            self.0
+                .lock()
+                .unwrap()
+                .cursor
+                .ok_or_else(|| PlatformError::Backend("no cursor".into()))
+        }
+
+        fn watch_reload(&mut self, reload: Box<dyn Fn() + Send>) -> Result<(), PlatformError> {
+            self.0.lock().unwrap().reload = Some(reload);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureLog {
+        sink: Option<Arc<dyn EventSink<CaptureEvent>>>,
+        /// Emitted through the sink from inside `begin`, in order, before it returns.
+        during_begin: Vec<CaptureEvent>,
+        lifecycle: bool,
+        active: Option<CaptureId>,
+        warp_cursor: Option<Shared>,
+        end_on_set_error: bool,
+        start: Option<CaptureStart>,
+        ends: Vec<Option<(DisplayId, PointDevice)>>,
+        during_end: Option<Box<dyn FnOnce() + Send>>,
+        end_error: Option<fn() -> PlatformError>,
+        sets: Vec<Vec<u32>>,
+        set_error: Option<fn() -> PlatformError>,
+    }
+
+    struct FakeCapture(Arc<Mutex<CaptureLog>>);
+
+    struct NoAbort;
+
+    impl CaptureAbort for NoAbort {
+        fn abort(&self) {}
+    }
+
+    impl InputCapture for FakeCapture {
+        fn set_portals(&mut self, portals: &[CapturePortal]) -> Result<(), PlatformError> {
+            let mut log = self.0.lock().unwrap();
+            log.sets.push(portals.iter().map(|p| p.id.0).collect());
+            match log.set_error {
+                Some(error) => {
+                    if log.end_on_set_error
+                        && let (Some(id), Some(sink)) = (log.active.take(), &log.sink)
+                    {
+                        sink.send(CaptureEvent::Ended {
+                            id,
+                            reason: crosspane_platform::EndReason::Aborted,
+                        });
+                    }
+                    Err(error())
+                }
+                None => Ok(()),
+            }
+        }
+
+        fn subscribe(
+            &mut self,
+            sink: Arc<dyn EventSink<CaptureEvent>>,
+        ) -> Result<(), PlatformError> {
+            self.0.lock().unwrap().sink = Some(sink);
+            Ok(())
+        }
+
+        fn begin(
+            &mut self,
+            id: CaptureId,
+            _portal: PortalId,
+        ) -> Result<CaptureStart, PlatformError> {
+            let (sink, mut events, start, lifecycle) = {
+                let mut log = self.0.lock().unwrap();
+                if log.lifecycle {
+                    log.active = Some(id);
+                }
+                (
+                    log.sink.clone(),
+                    log.during_begin.clone(),
+                    log.start.clone(),
+                    log.lifecycle,
+                )
+            };
+            if lifecycle {
+                events.retain(|e| !matches!(e, CaptureEvent::Started { .. }));
+                events.insert(0, CaptureEvent::Started { id });
+            }
+            if let Some(sink) = sink {
+                for event in events {
+                    sink.send(event);
+                }
+            }
+            Ok(start.unwrap_or(CaptureStart {
+                held_keys: Vec::new(),
+                lock_keys: LockKeys::default(),
+            }))
+        }
+
+        fn end(&mut self, warp_to: Option<(DisplayId, PointDevice)>) -> Result<(), PlatformError> {
+            let (hook, error) = {
+                let mut log = self.0.lock().unwrap();
+                log.ends.push(warp_to);
+                if let (Some(cursor), Some(to)) = (&log.warp_cursor, warp_to) {
+                    cursor.lock().unwrap().cursor = Some(to);
+                }
+                if log.lifecycle
+                    && let (Some(id), Some(sink)) = (log.active.take(), &log.sink)
+                {
+                    sink.send(CaptureEvent::Ended {
+                        id,
+                        reason: crosspane_platform::EndReason::Requested,
+                    });
+                }
+                (log.during_end.take(), log.end_error)
+            };
+            if let Some(f) = hook {
+                f();
+            }
+            match error {
+                Some(error) => Err(error()),
+                None => Ok(()),
+            }
+        }
+
+        fn abort_handle(&self) -> Arc<dyn CaptureAbort> {
+            Arc::new(NoAbort)
+        }
+
+        fn set_monitor_local_activity(&mut self, _on: bool) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    /// Records what the injectors were asked: "key down", "key up", "button down", ...
+    type Injected = Arc<Mutex<Vec<&'static str>>>;
+
+    struct FakeKeys(Injected, Arc<Mutex<BTreeSet<HidUsage>>>);
+    struct FakePointer(Injected);
+
+    impl KeyInjector for FakeKeys {
+        fn key(&mut self, usage: HidUsage, down: bool) -> Result<(), PlatformError> {
+            if down {
+                self.1.lock().unwrap().insert(usage);
+            } else {
+                self.1.lock().unwrap().remove(&usage);
+            }
+            self.0
+                .lock()
+                .unwrap()
+                .push(if down { "key down" } else { "key up" });
+            Ok(())
+        }
+
+        fn lock_keys(&self) -> Result<LockKeys, PlatformError> {
+            Ok(LockKeys::default())
+        }
+
+        fn set_lock_keys(&mut self, _wanted: LockKeys) -> Result<(), PlatformError> {
+            self.0.lock().unwrap().push("lock keys");
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> Result<(), PlatformError> {
+            self.1.lock().unwrap().clear();
+            self.0.lock().unwrap().push("release all keys");
+            Ok(())
+        }
+
+        fn recover_keys(&mut self, _keys: &[HidUsage]) -> Result<(), PlatformError> {
+            self.1.lock().unwrap().clear();
+            self.0.lock().unwrap().push("recover keys");
+            Ok(())
+        }
+    }
+
+    impl PointerInjector for FakePointer {
+        fn move_to(&mut self, _display: DisplayId, _at: PointDevice) -> Result<(), PlatformError> {
+            self.0.lock().unwrap().push("move");
+            Ok(())
+        }
+
+        fn button(&mut self, _button: MouseButton, down: bool) -> Result<(), PlatformError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(if down { "button down" } else { "button up" });
+            Ok(())
+        }
+
+        fn scroll(&mut self, _delta: ScrollDelta) -> Result<(), PlatformError> {
+            self.0.lock().unwrap().push("scroll");
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> Result<(), PlatformError> {
+            self.0.lock().unwrap().push("release all buttons");
+            Ok(())
+        }
+
+        fn recover_buttons(&mut self, _buttons: &[MouseButton]) -> Result<(), PlatformError> {
+            self.0.lock().unwrap().push("recover buttons");
+            Ok(())
+        }
+    }
+
+    /// An overlay host that refuses every `show` outright and counts them.
+    struct RefusingOverlay(Arc<Mutex<u32>>);
+
+    impl OverlayHost for RefusingOverlay {
+        fn subscribe(
+            &mut self,
+            _sink: Arc<dyn EventSink<crosspane_platform::OverlayEvent>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn show(&mut self, _id: OverlayId, _overlay: &Overlay) -> Result<(), PlatformError> {
+            *self.0.lock().unwrap() += 1;
+            Err(PlatformError::NotFound)
+        }
+
+        fn hide(&mut self, _id: OverlayId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    struct FakeParking;
+    impl crosspane_platform::WindowParking for FakeParking {
+        fn park(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            _scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            Ok(crosspane_platform::Parked {
+                window,
+                kind: crosspane_platform::ParkingKind::Twin,
+                display: DisplayId(7),
+                content: crosspane_types::geom::PixelRect::new(
+                    crosspane_types::geom::euclid::Point2D::new(0, 0),
+                    crosspane_types::geom::euclid::Point2D::new(
+                        size.width as i32,
+                        size.height as i32,
+                    ),
+                ),
+            })
+        }
+        fn resize(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            self.park(window, size, scale)
+        }
+        fn geometry(&self, _window: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn restore(&mut self, _window: WindowId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct FakeFrames;
+    impl crosspane_platform::FrameCapture for FakeFrames {
+        fn start(
+            &mut self,
+            _target: CaptureTarget,
+            _crop: Option<crosspane_types::geom::PixelRect>,
+            _max_fps: u32,
+            _sink: Arc<dyn EventSink<FrameEvent>>,
+        ) -> Result<StreamId, PlatformError> {
+            Ok(StreamId(101))
+        }
+        fn set_crop(
+            &mut self,
+            _stream: StreamId,
+            _crop: Option<crosspane_types::geom::PixelRect>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn stop(&mut self, _stream: StreamId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    // ---- the rig ----
+
+    struct Home {
+        rig: Rig,
+        compositor: Shared,
+        capture: Arc<Mutex<CaptureLog>>,
+        injected: Injected,
+        held: Arc<Mutex<BTreeSet<HidUsage>>>,
+        gate: Arc<IoGate>,
+    }
+
+    /// An agent with the fake compositor, capture backend and injectors, an open gate (the session
+    /// side is opened here: the real session backend does that), and nothing fed yet.
+    fn home() -> Home {
+        let mut rig = rig(false);
+        let compositor = Shared::default();
+        let capture = Arc::new(Mutex::new(CaptureLog::default()));
+        let injected = Injected::default();
+        let held = Arc::new(Mutex::new(BTreeSet::new()));
+        let platform = &mut rig.agent.platform;
+        platform.home = Some(Box::new(FakeHome(compositor.clone())));
+        platform.capture = Some(Box::new(FakeCapture(capture.clone())));
+        platform.keys = Some(Box::new(FakeKeys(injected.clone(), held.clone())));
+        platform.pointer = Some(Box::new(FakePointer(injected.clone())));
+        // The capture's sink queues on the agent's channel, as `subscribe_platform` wires it.
+        let tx = rig.agent.events.clone();
+        rig.agent
+            .platform
+            .capture
+            .as_mut()
+            .unwrap()
+            .subscribe(Arc::new(move |event: CaptureEvent| {
+                let _ = tx.send(Event::Input(Input::Capture(event)));
+            }))
+            .unwrap();
+        let gate = rig.agent.platform.gate.clone();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        rig.agent.fed.clear();
+        Home {
+            rig,
+            compositor,
+            capture,
+            injected,
+            held,
+            gate,
+        }
+    }
+
+    fn at() -> MonoTime {
+        MonoTime::from_nanos(1)
+    }
+
+    /// What a capture's activation emits from inside `begin()`: `Started`, a button down and a
+    /// modifier's release.
+    fn activation() -> Vec<CaptureEvent> {
+        vec![
+            CaptureEvent::Started { id: CaptureId(7) },
+            CaptureEvent::Button {
+                button: MouseButton::PRIMARY,
+                down: true,
+                at: at(),
+            },
+            CaptureEvent::Key {
+                usage: HidUsage::keyboard(0xE0),
+                down: false,
+                at: at(),
+            },
+            CaptureEvent::Button {
+                button: MouseButton::PRIMARY,
+                down: false,
+                at: at(),
+            },
+        ]
+    }
+
+    fn label(input: &Input) -> &'static str {
+        match input {
+            Input::Capture(CaptureEvent::Started { .. }) => "started",
+            Input::Capture(CaptureEvent::Button { .. }) => "button",
+            Input::Capture(CaptureEvent::Key { .. }) => "key",
+            Input::Capture(CaptureEvent::Motion { .. }) => "motion",
+            Input::CaptureBegun { .. } => "begun",
+            Input::Session(_) => "session",
+            Input::Grants(_) => "grants",
+            _ => "other",
+        }
+    }
+
+    fn fed(h: &Home) -> Vec<&'static str> {
+        h.rig.agent.fed.iter().map(label).collect()
+    }
+
+    fn begin(h: &mut Home, drain_first: bool) {
+        h.rig.agent.execute(vec![Output::BeginCapture {
+            id: CaptureId(7),
+            portal: PortalId(1),
+            drain_first,
+        }]);
+    }
+
+    /// `ReleaseAndWarp` to `to`, and the engine's answer.
+    fn warp(h: &mut Home, to: (DisplayId, PointDevice)) -> Result<Warp, Failure> {
+        h.rig.agent.execute(vec![Output::ReleaseAndWarp {
+            op: HomeOp(4),
+            warp_to: to,
+        }]);
+        match h.rig.agent.pending.pop_back() {
+            Some(Input::CaptureReleased { op, result }) => {
+                assert_eq!(op, HomeOp(4), "the answer carries the request's op");
+                result
+            }
+            other => panic!("expected CaptureReleased, got {other:?}"),
+        }
+    }
+
+    /// `HomeBind` and the engine's answer.
+    fn bind(h: &mut Home, op: u64, install: bool) -> Result<(), Failure> {
+        h.rig.agent.execute(vec![Output::HomeBind {
+            op: HomeOp(op),
+            install,
+        }]);
+        match h.rig.agent.pending.pop_back() {
+            Some(Input::HomeBindSet {
+                op: got,
+                install: was,
+                result,
+            }) => {
+                assert_eq!(
+                    (got, was),
+                    (HomeOp(op), install),
+                    "the answer echoes the request"
+                );
+                result
+            }
+            other => panic!("expected HomeBindSet, got {other:?}"),
+        }
+    }
+
+    fn key(home: &Home) -> ProjectionKey {
+        ProjectionKey {
+            source: home.rig.local,
+            projection: ProjectionId(3),
+        }
+    }
+
+    fn last_notice(h: &Home) -> String {
+        h.rig.agent.notices.back().cloned().unwrap_or_default()
+    }
+
+    fn grants_of(h: &Home, peer: NodeId) -> BTreeSet<Capability> {
+        h.rig
+            .agent
+            .fed
+            .iter()
+            .rev()
+            .find_map(|input| match input {
+                Input::Grants(map) => map.get(&peer).cloned(),
+                _ => None,
+            })
+            .expect("the engine was sent grants")
+    }
+
+    // Real engine transitions, with only platform backends and time replaced. Acknowledgements
+    // run through the agent's ordinary pending queue and event channel, never swallowed by tests.
+    fn ms(n: u64) -> MonoTime {
+        MonoTime::from_nanos(n * 1_000_000)
+    }
+    fn control_input(peer: NodeId, msg: ControlMessage) -> Input {
+        Input::Link(LinkEvent::Control { peer, msg })
+    }
+    fn projection_input(peer: NodeId, msg: ProjectionMessage) -> Input {
+        control_input(peer, ControlMessage::Projection(msg))
+    }
+    fn step(h: &mut Home, input: Input) -> Vec<Output> {
+        let before = h.rig.agent.emitted.len();
+        let now = h.rig.agent.test_now.unwrap_or(ms(0));
+        h.rig.agent.test_now = Some(MonoTime::from_nanos(now.as_nanos() + 1_000_000));
+        h.rig.agent.feed(input);
+        process_events(h);
+        let mut index = before;
+        while index < h.rig.agent.emitted.len() {
+            use crosspane_protocol::msg::InputMessage;
+            let ack = match &h.rig.agent.emitted[index] {
+                Output::SendInput {
+                    peer,
+                    msg:
+                        InputMessage::Key { session, seq, .. }
+                        | InputMessage::Button { session, seq, .. }
+                        | InputMessage::Scroll { session, seq, .. }
+                        | InputMessage::LockKeys { session, seq, .. }
+                        | InputMessage::State { session, seq, .. },
+                } => Some(Input::Link(LinkEvent::Input {
+                    peer: *peer,
+                    msg: InputMessage::Ack {
+                        session: *session,
+                        seq: *seq,
+                    },
+                })),
+                _ => None,
+            };
+            if let Some(ack) = ack {
+                h.rig.agent.feed(ack);
+                process_events(h);
+            }
+            index += 1;
+        }
+        h.rig.agent.emitted[before..].to_vec()
+    }
+    fn tick(h: &mut Home, delta: u64) -> Vec<Output> {
+        let now = h.rig.agent.test_now.unwrap();
+        h.rig.agent.test_now = Some(MonoTime::from_nanos(now.as_nanos() + delta * 1_000_000));
+        step(h, Input::Tick)
+    }
+    fn motion(h: &mut Home, dx: f64, dy: f64) -> Vec<Output> {
+        step(
+            h,
+            Input::Capture(CaptureEvent::Motion {
+                dx,
+                dy,
+                kind: crosspane_platform::MotionKind::Unaccelerated,
+                at: h.rig.agent.test_now.unwrap(),
+            }),
+        )
+    }
+    fn proj_key(h: &mut Home, seq: u32, down: bool) -> Vec<Output> {
+        use crosspane_protocol::{msg::InputMessage, projection::ProjInput};
+        step(
+            h,
+            Input::Link(LinkEvent::Input {
+                peer: h.rig.peer,
+                msg: InputMessage::Proj(ProjInput::Key {
+                    projection: ProjectionId(1),
+                    seq,
+                    usage: HidUsage::keyboard(4),
+                    down,
+                }),
+            }),
+        )
+    }
+    fn trigger(h: &mut Home) -> Vec<Output> {
+        use crosspane_protocol::{msg::InputMessage, projection::ProjInput};
+        step(
+            h,
+            Input::Link(LinkEvent::Input {
+                peer: h.rig.peer,
+                msg: InputMessage::Proj(ProjInput::Motion {
+                    projection: ProjectionId(1),
+                    seq: 1,
+                    position: PointDevice::new(50.0, 100.0),
+                }),
+            }),
+        )
+    }
+    fn bare_scenario() -> Home {
+        use crosspane_engine::EngineConfig;
+        use crosspane_input::journal::MemoryJournal;
+        use crosspane_types::geom::PointMm;
+        let mut h = home();
+        let mut config = EngineConfig::new(h.rig.local);
+        config.accel.base_mm_per_unit = 0.1;
+        config.accel.max_gain = 1.0;
+        let (engine, startup) = Engine::new(
+            config,
+            Box::new(MemoryJournal::default()),
+            Box::new(MemoryJournal::default()),
+            ms(0),
+        )
+        .unwrap();
+        h.rig.agent.engine = engine;
+        h.rig.agent.test_now = Some(ms(0));
+        h.rig.agent.platform.parking = Some(Box::new(FakeParking));
+        h.rig.agent.platform.frames = Some(Box::new(FakeFrames));
+        {
+            let mut log = h.capture.lock().unwrap();
+            log.lifecycle = true;
+            log.warp_cursor = Some(h.compositor.clone());
+        }
+        h.rig.agent.execute(startup);
+        process_events(&mut h);
+        let mut d = display(1, 1.0, (0.0, 0.0), (1000, 1000));
+        d.geometry.physical_size = SizeMm::new(100.0, 100.0);
+        let peer = h.rig.peer;
+        h.rig
+            .agent
+            .trust
+            .update(|t| {
+                t.set_grant(peer, Capability::InputAccept, true)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .unwrap();
+        h.rig.agent.peers.insert(
+            peer,
+            PeerInfo {
+                name: "peer-name".into(),
+                connected: true,
+                displays: vec![d.clone()],
+                ..PeerInfo::default()
+            },
+        );
+        step(
+            &mut h,
+            Input::Session(crosspane_platform::SessionEvent::State(
+                crosspane_platform::SessionState {
+                    lock: crosspane_platform::LockState::Unlocked,
+                    active: Some(true),
+                },
+            )),
+        );
+        step(&mut h, Input::LocalDisplays(vec![d.clone()]));
+        step(
+            &mut h,
+            Input::PeerDisplays {
+                peer,
+                displays: vec![d],
+            },
+        );
+        let local = h.rig.local;
+        step(
+            &mut h,
+            Input::Layout(vec![
+                Placement {
+                    node: local,
+                    display: DisplayId(1),
+                    origin: PointMm::zero(),
+                    version: 1,
+                },
+                Placement {
+                    node: peer,
+                    display: DisplayId(1),
+                    origin: PointMm::new(100.0, 0.0),
+                    version: 1,
+                },
+            ]),
+        );
+        step(
+            &mut h,
+            Input::Grants(
+                [(
+                    peer,
+                    [
+                        Capability::WindowShare,
+                        Capability::WindowPresent,
+                        Capability::InputAccept,
+                    ]
+                    .into(),
+                )]
+                .into(),
+            ),
+        );
+        step(&mut h, Input::PeerUp { peer });
+        step(
+            &mut h,
+            Input::Windows(WindowEvent::Added(window(
+                10,
+                "fixture",
+                42,
+                Some(1),
+                (0.0, 0.0, 320.0, 240.0),
+                WindowState::Normal,
+            ))),
+        );
+        h
+    }
+    fn projected_scenario() -> Home {
+        let mut h = bare_scenario();
+        let peer = h.rig.peer;
+        let out = step(
+            &mut h,
+            Input::Command(Command::Project {
+                window: WindowId(10),
+                to: peer,
+            }),
+        );
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::SendControl {
+                    msg: ControlMessage::Projection(ProjectionMessage::Start {
+                        projection: ProjectionId(1),
+                        ..
+                    }),
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        let out = step(
+            &mut h,
+            projection_input(
+                peer,
+                ProjectionMessage::Accepted {
+                    projection: ProjectionId(1),
+                    size: PixelSize::new(400, 300),
+                    scale: 1.0,
+                },
+            ),
+        );
+        assert!(
+            out.iter().any(|o| matches!(o, Output::StartCapture { .. })),
+            "{out:?}"
+        );
+        step(
+            &mut h,
+            projection_input(
+                peer,
+                ProjectionMessage::ProxyPlaced {
+                    projection: ProjectionId(1),
+                    generation: 1,
+                    display: Some(DisplayId(1)),
+                    origin: PointDevice::new(200.0, 300.0),
+                    size: PixelSize::new(400, 300),
+                },
+            ),
+        );
+        h
+    }
+    fn cross_scenario(h: &mut Home) {
+        let portal = h
+            .rig
+            .agent
+            .emitted
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Output::SetPortals(ps) => {
+                    ps.iter().find(|p| p.display == DisplayId(1)).map(|p| p.id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let out = step(
+            h,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal,
+                position: 0.5,
+                at: h.rig.agent.test_now.unwrap(),
+            }),
+        );
+        assert!(
+            out.iter().any(|o| matches!(o, Output::ShowOverlay { .. })),
+            "{out:?}"
+        );
+        let out = step(
+            h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::HUD,
+            )),
+        );
+        let session = out
+            .iter()
+            .find_map(|o| match o {
+                Output::SendControl {
+                    msg: ControlMessage::StartControl { session, .. },
+                    ..
+                } => Some(*session),
+                _ => None,
+            })
+            .unwrap();
+        let out = step(
+            h,
+            control_input(h.rig.peer, ControlMessage::ControlStarted { session }),
+        );
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::BeginCapture {
+                    drain_first: false,
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        assert_eq!(h.rig.agent.engine.controlling(), Some(h.rig.peer));
+        assert!(h.capture.lock().unwrap().active.is_some());
+    }
+    fn aimed_scenario() -> Home {
+        let mut h = projected_scenario();
+        cross_scenario(&mut h);
+        motion(&mut h, 250.0, -100.0);
+        h
+    }
+    fn home_scenario() -> Home {
+        let mut h = aimed_scenario();
+        let out = trigger(&mut h);
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::ReleaseAndWarp { .. })),
+            "{out:?}"
+        );
+        step(
+            &mut h,
+            Input::Windows(WindowEvent::Focused(Some(WindowId(10)))),
+        );
+        assert_eq!(h.rig.agent.status()["home"]["projection"], json!(1));
+        assert!(h.compositor.lock().unwrap().ours);
+        assert!(h.capture.lock().unwrap().active.is_none());
+        h
+    }
+    fn exit_home(h: &mut Home) -> Vec<Output> {
+        let mut out = step(
+            h,
+            Input::Capture(CaptureEvent::EdgePressed {
+                portal: PortalId((1 << 30) + 1),
+                position: 0.5,
+                at: h.rig.agent.test_now.unwrap(),
+            }),
+        );
+        assert!(
+            out.iter().any(|o| matches!(o, Output::ShowOverlay { .. })),
+            "{out:?}"
+        );
+        out.extend(step(
+            h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::HUD,
+            )),
+        ));
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::BeginCapture {
+                    drain_first: true,
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        out
+    }
+    fn start_request(h: &mut Home, reason: Refusal) {
+        let peer = NodeId([3; 32]);
+        step(
+            h,
+            Input::Grants(
+                [
+                    (peer, [Capability::InputAccept].into()),
+                    (
+                        h.rig.peer,
+                        [
+                            Capability::WindowShare,
+                            Capability::WindowPresent,
+                            Capability::InputAccept,
+                        ]
+                        .into(),
+                    ),
+                ]
+                .into(),
+            ),
+        );
+        let out = step(
+            h,
+            control_input(
+                peer,
+                ControlMessage::StartControl {
+                    session: crosspane_types::id::SessionId(77),
+                    entry_display: DisplayId(1),
+                    entry: PointDevice::new(1.0, 1.0),
+                    lock_keys: LockKeys::default(),
+                },
+            ),
+        );
+        assert!(out.iter().any(|o| matches!(o, Output::SendControl { msg: ControlMessage::ControlRefused { reason: got, .. }, .. } if *got == reason)), "{out:?}");
+        assert!(h.rig.agent.engine.controlled_by().is_none());
+    }
+
+    #[test]
+    fn real_home_exit_removes_the_bind_and_keeps_control() {
+        let mut h = home_scenario();
+        let out = exit_home(&mut h);
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::HomeBind { install: false, .. })),
+            "{out:?}"
+        );
+        assert!(h.rig.agent.home.now.is_none());
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert_eq!(h.rig.agent.engine.controlling(), Some(h.rig.peer));
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert!(h.held.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn real_failed_install_rolls_back_even_a_partial_install_and_keeps_the_cause() {
+        for partial in [false, true] {
+            let mut h = aimed_scenario();
+            {
+                let mut c = h.compositor.lock().unwrap();
+                c.install_error = Some("fixture install failure".into());
+                c.partial_install = partial;
+            }
+            let out = trigger(&mut h);
+            assert!(
+                out.iter()
+                    .any(|o| matches!(o, Output::HomeBind { install: false, .. })),
+                "{out:?}"
+            );
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    Output::Notice(Notice::HomeFailed {
+                        reason: HomeFailure::Bind,
+                        ..
+                    })
+                )),
+                "{out:?}"
+            );
+            assert!(!h.compositor.lock().unwrap().ours);
+            assert!(last_notice(&h).contains("fixture install failure"));
+            assert!(h.rig.agent.home.now.is_none());
+            step(&mut h, Input::Command(Command::ReleaseControl));
+        }
+    }
+    #[test]
+    fn real_entry_abort_after_install_removes_the_bind() {
+        let mut h = aimed_scenario();
+        h.capture.lock().unwrap().end_error = Some(|| PlatformError::Backend("end failed".into()));
+        let out = trigger(&mut h);
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::ReleaseAndWarp { .. })),
+            "{out:?}"
+        );
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::Notice(Notice::HomeFailed {
+                    reason: HomeFailure::Release,
+                    ..
+                })
+            )),
+            "{out:?}"
+        );
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert!(h.rig.agent.home.now.is_none());
+    }
+    #[test]
+    fn real_session_end_panic_and_lock_remove_home() {
+        for kind in 0..3 {
+            let mut h = home_scenario();
+            let input = match kind {
+                0 => Input::Command(Command::ReleaseControl),
+                1 => Input::Command(Command::Panic),
+                _ => Input::Session(crosspane_platform::SessionEvent::State(
+                    crosspane_platform::SessionState {
+                        lock: crosspane_platform::LockState::Locked,
+                        active: Some(true),
+                    },
+                )),
+            };
+            let out = step(&mut h, input);
+            assert!(
+                out.iter()
+                    .any(|o| matches!(o, Output::HomeBind { install: false, .. })),
+                "{out:?}"
+            );
+            assert!(!h.compositor.lock().unwrap().ours);
+            assert!(h.rig.agent.home.now.is_none());
+            assert!(h.rig.agent.engine.controlling().is_none());
+            assert!(h.held.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn real_teardown_refuses_peer_downs_and_start_control_until_the_fourth_removal() {
+        let mut h = home_scenario();
+        h.compositor.lock().unwrap().remove_error = Some("uncertain ownership".into());
+        let before = h.compositor.lock().unwrap().removes;
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        for delay in [0, 100, 200] {
+            if delay > 0 {
+                tick(&mut h, delay);
+            }
+            proj_key(&mut h, 2 + delay as u32, true);
+            proj_key(&mut h, 3 + delay as u32, false);
+            assert!(h.held.lock().unwrap().is_empty());
+            assert!(!h.injected.lock().unwrap().contains(&"key down"));
+            start_request(&mut h, Refusal::Busy);
+        }
+        assert_eq!(h.compositor.lock().unwrap().removes - before, 3);
+        h.compositor.lock().unwrap().remove_error = None;
+        tick(&mut h, 400);
+        assert_eq!(h.compositor.lock().unwrap().removes - before, 4);
+        assert!(!h.compositor.lock().unwrap().ours);
+        // After verified removal, E2 downs are accepted again. Restore the projection grant
+        // removed by start_request's deliberately isolated E1 grant fixture.
+        let peer = h.rig.peer;
+        step(
+            &mut h,
+            Input::Grants(
+                [(
+                    peer,
+                    [Capability::WindowShare, Capability::WindowPresent].into(),
+                )]
+                .into(),
+            ),
+        );
+        proj_key(&mut h, 500, true);
+        assert!(h.held.lock().unwrap().contains(&HidUsage::keyboard(4)));
+        proj_key(&mut h, 501, false);
+        assert!(h.held.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn the_warp_reads_the_cursor_after_end_moves_it() {
+        let mut h = home();
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(1), PointDevice::zero()));
+        h.capture.lock().unwrap().warp_cursor = Some(h.compositor.clone());
+        assert_eq!(warp(&mut h, TARGET), Ok(Warp::Done));
+        assert_eq!(h.compositor.lock().unwrap().cursor, Some(TARGET));
+    }
+
+    #[test]
+    fn startup_uncertainty_refuses_actual_control_until_absence_is_confirmed() {
+        for ambiguous in [false, true] {
+            let mut h = bare_scenario();
+            let peer = h.rig.peer;
+            {
+                let mut c = h.compositor.lock().unwrap();
+                c.ours = true;
+                c.verify_error = ambiguous;
+                if !ambiguous {
+                    c.remove_error = Some("ownership read failed".into());
+                }
+            }
+            h.rig.agent.home_startup();
+            h.rig.agent.send_grants();
+            process_events(&mut h);
+            let request = || {
+                control_input(
+                    peer,
+                    ControlMessage::StartControl {
+                        session: crosspane_types::id::SessionId(88),
+                        entry_display: DisplayId(1),
+                        entry: PointDevice::new(1.0, 1.0),
+                        lock_keys: LockKeys::default(),
+                    },
+                )
+            };
+            for _ in 0..2 {
+                let out = step(&mut h, request());
+                assert!(
+                    out.iter().any(|o| matches!(
+                        o,
+                        Output::SendControl {
+                            msg: ControlMessage::ControlRefused {
+                                reason: Refusal::Permission,
+                                ..
+                            },
+                            ..
+                        }
+                    )),
+                    "{out:?}"
+                );
+                assert!(h.rig.agent.engine.controlled_by().is_none());
+                assert!(!h.rig.agent.inject(InjectCmd::Key {
+                    usage: HidUsage::keyboard(4),
+                    down: true
+                }));
+                assert!(h.rig.agent.inject(InjectCmd::Key {
+                    usage: HidUsage::keyboard(4),
+                    down: false
+                }));
+                h.rig.agent.home.last_fence_try = Instant::now() - Duration::from_millis(2100);
+                h.rig.agent.home_housekeeping();
+                process_events(&mut h);
+                assert!(h.rig.agent.home.fence);
+            }
+            {
+                let mut c = h.compositor.lock().unwrap();
+                c.ours = false;
+                c.foreign = true;
+                c.verify_error = false;
+                c.remove_error = None;
+            }
+            h.rig.agent.home.last_fence_try = Instant::now() - Duration::from_millis(2100);
+            h.rig.agent.home_housekeeping();
+            process_events(&mut h);
+            let out = step(&mut h, request());
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    Output::SendControl {
+                        msg: ControlMessage::ControlStarted { .. },
+                        ..
+                    }
+                )),
+                "{out:?}"
+            );
+            assert_eq!(h.rig.agent.engine.controlled_by(), Some(peer));
+            assert!(h.compositor.lock().unwrap().foreign);
+            step(&mut h, Input::Command(Command::ReleaseControl));
+            assert!(h.held.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn real_verification_uncertainty_and_mixed_ownership_keep_the_teardown_fence() {
+        for ambiguous in [false, true] {
+            let mut h = home_scenario();
+            {
+                let mut c = h.compositor.lock().unwrap();
+                c.verify_error = ambiguous;
+                c.foreign = !ambiguous;
+            }
+            h.rig.agent.on_event(Event::HomeBind);
+            h.rig.agent.home_housekeeping();
+            process_events(&mut h);
+            assert!(h.rig.agent.home.now.is_none());
+            assert!(h.compositor.lock().unwrap().ours);
+            start_request(&mut h, Refusal::Busy);
+            proj_key(&mut h, 2, true);
+            proj_key(&mut h, 3, false);
+            assert!(h.held.lock().unwrap().is_empty());
+            assert!(!h.injected.lock().unwrap().contains(&"key down"));
+            {
+                let mut c = h.compositor.lock().unwrap();
+                c.ours = false;
+                c.verify_error = false;
+                c.foreign = true;
+            }
+            tick(&mut h, 100);
+            assert_eq!(h.rig.agent.home.present, Some(false));
+            assert!(h.compositor.lock().unwrap().foreign);
+            proj_key(&mut h, 4, true);
+            assert!(h.held.lock().unwrap().contains(&HidUsage::keyboard(4)));
+            proj_key(&mut h, 5, false);
+            assert!(h.held.lock().unwrap().is_empty());
+        }
+    }
+    fn captured_key(h: &mut Home, usage: u16, down: bool) -> Vec<Output> {
+        step(
+            h,
+            Input::Capture(CaptureEvent::Key {
+                usage: HidUsage::keyboard(usage),
+                down,
+                at: h.rig.agent.test_now.unwrap(),
+            }),
+        )
+    }
+    #[test]
+    fn a_button_during_real_exit_activation_cancels_before_commit() {
+        let mut h = home_scenario();
+        h.capture.lock().unwrap().during_begin = vec![CaptureEvent::Button {
+            button: MouseButton::PRIMARY,
+            down: true,
+            at: at(),
+        }];
+        let out = exit_home(&mut h);
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, Output::HomeBind { install: false, .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.rig.agent.status()["home"]["projection"], json!(1));
+        assert!(h.capture.lock().unwrap().active.is_none());
+        assert!(h.compositor.lock().unwrap().ours);
+        step(
+            &mut h,
+            Input::Capture(CaptureEvent::Button {
+                button: MouseButton::PRIMARY,
+                down: false,
+                at: at(),
+            }),
+        );
+        step(&mut h, Input::Command(Command::ReleaseControl));
+    }
+    #[test]
+    fn exit_activation_modifier_down_and_up_reconcile_the_snapshot_in_both_orders() {
+        for down_first in [false, true] {
+            let mut h = home_scenario();
+            let mut events = vec![
+                CaptureEvent::Key {
+                    usage: HidUsage::keyboard(0xE0),
+                    down: down_first,
+                    at: at(),
+                },
+                CaptureEvent::Key {
+                    usage: HidUsage::keyboard(0xE0),
+                    down: !down_first,
+                    at: at(),
+                },
+            ];
+            // Seed the snapshot oppositely to the callback's final state. The exit's event
+            // callbacks must win, and must not forward activation-time keys to the peer.
+            h.capture.lock().unwrap().start = Some(CaptureStart {
+                held_keys: if down_first {
+                    vec![HidUsage::keyboard(0xE0)]
+                } else {
+                    vec![]
+                },
+                lock_keys: LockKeys::default(),
+            });
+            h.capture.lock().unwrap().during_begin.append(&mut events);
+            let out = exit_home(&mut h);
+            assert!(
+                !out.iter().any(|o| matches!(
+                    o,
+                    Output::SendInput {
+                        msg: crosspane_protocol::msg::InputMessage::Key { .. },
+                        ..
+                    }
+                )),
+                "activation keys must not be forwarded: {out:?}"
+            );
+            assert!(
+                out.iter()
+                    .any(|o| matches!(o, Output::HomeBind { install: false, .. })),
+                "{out:?}"
+            );
+            captured_key(&mut h, 0xE1, true);
+            captured_key(&mut h, 0xE2, true);
+            captured_key(&mut h, 0x29, true);
+            assert_eq!(h.rig.agent.engine.controlling().is_none(), !down_first);
+            for usage in [0x29, 0xE2, 0xE1, 0xE0] {
+                captured_key(&mut h, usage, false);
+            }
+            step(&mut h, Input::Command(Command::ReleaseControl));
+            assert!(h.held.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn ordinary_activation_preserves_the_final_modifier_state_for_the_chord() {
+        let mut h = projected_scenario();
+        h.capture.lock().unwrap().start = Some(CaptureStart {
+            held_keys: vec![HidUsage::keyboard(0xE0)],
+            lock_keys: LockKeys::default(),
+        });
+        h.capture.lock().unwrap().during_begin = vec![CaptureEvent::Key {
+            usage: HidUsage::keyboard(0xE0),
+            down: false,
+            at: at(),
+        }];
+        cross_scenario(&mut h);
+        for usage in [0xE1, 0xE2, 0x29] {
+            captured_key(&mut h, usage, true);
+        }
+        assert_eq!(
+            h.rig.agent.engine.controlling(),
+            Some(h.rig.peer),
+            "the released Ctrl must not remain held"
+        );
+        for usage in [0x29, 0xE2, 0xE1, 0xE0] {
+            captured_key(&mut h, usage, false);
+        }
+        step(&mut h, Input::Command(Command::ReleaseControl));
+        assert!(h.held.lock().unwrap().is_empty());
+    }
+    fn refresh_placement(h: &mut Home) -> Vec<Output> {
+        step(
+            h,
+            projection_input(
+                h.rig.peer,
+                ProjectionMessage::ProxyPlaced {
+                    projection: ProjectionId(1),
+                    generation: 2,
+                    display: Some(DisplayId(1)),
+                    origin: PointDevice::new(600.0, 300.0),
+                    size: PixelSize::new(400, 300),
+                },
+            ),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_portal_refresh_preserves_a_real_active_capture() {
+        let mut h = aimed_scenario();
+        let id = h.capture.lock().unwrap().active.unwrap();
+        h.capture.lock().unwrap().set_error = Some(|| {
+            PlatformError::Backend(format!(
+                "{}verified refusal",
+                crosspane_platform_linux::hyprland::capture::PORTALS_REJECTED
+            ))
+        });
+        let out = refresh_placement(&mut h);
+        assert!(
+            out.iter().any(|o| matches!(o, Output::SetPortals(_))),
+            "{out:?}"
+        );
+        assert!(h.rig.agent.fed.iter().any(|i| matches!(
+            i,
+            Input::PortalsSet {
+                result: Err(PortalsFailure::Rejected),
+                ..
+            }
+        )));
+        assert_eq!(h.capture.lock().unwrap().active, Some(id));
+        assert_eq!(h.rig.agent.engine.controlling(), Some(h.rig.peer));
+        assert!(
+            motion(&mut h, 1.0, 0.0)
+                .iter()
+                .any(|o| matches!(o, Output::SendMotion { .. }))
+        );
+        h.capture.lock().unwrap().set_error = None;
+        step(&mut h, Input::Command(Command::ReleaseControl));
+    }
+    #[test]
+    fn uncertain_portal_refresh_ends_capture_and_missing_ended_uses_the_deadline() {
+        for ended in [false, true] {
+            let mut h = aimed_scenario();
+            {
+                let mut log = h.capture.lock().unwrap();
+                log.set_error = Some(|| PlatformError::Timeout);
+                log.end_on_set_error = ended;
+                if !ended {
+                    log.lifecycle = false;
+                }
+            }
+            let out = refresh_placement(&mut h);
+            assert!(
+                out.iter().any(|o| matches!(o, Output::EndCapture { .. })),
+                "{out:?}"
+            );
+            assert!(h.rig.agent.engine.controlling().is_none());
+            if ended {
+                assert!(h.rig.agent.fed.iter().any(|i| matches!(
+                    i,
+                    Input::Capture(CaptureEvent::Ended {
+                        reason: crosspane_platform::EndReason::Aborted,
+                        ..
+                    })
+                )));
+                assert!(
+                    out.iter().any(|o| matches!(o, Output::HideOverlay { .. })),
+                    "{out:?}"
+                );
+            } else {
+                assert!(
+                    !out.iter().any(|o| matches!(o, Output::HideOverlay { .. })),
+                    "before the end deadline: {out:?}"
+                );
+                let out = tick(&mut h, 400);
+                assert!(
+                    !out.iter().any(|o| matches!(o, Output::HideOverlay { .. })),
+                    "{out:?}"
+                );
+                let out = tick(&mut h, 650);
+                assert!(
+                    out.iter().any(|o| matches!(o, Output::HideOverlay { .. })),
+                    "after the deadline: {out:?}"
+                );
+            }
+            assert!(h.held.lock().unwrap().is_empty());
+        }
+    }
+
+    // ---- BeginCapture: the order of an activation's events and its answer (A4, B4) ----
+
+    /// Handle the event channel exactly as the run loop does, settling ordinary answers between
+    /// events. Exit activation answers share this channel with the backend's callbacks.
+    fn process_events(h: &mut Home) {
+        h.rig.agent.settle();
+        while let Ok(event) = h.rig.events.try_recv() {
+            h.rig.agent.on_event(event);
+            h.rig.agent.settle();
+        }
+    }
+
+    #[test]
+    fn a_home_exit_capture_is_answered_after_the_events_of_its_own_activation() {
+        let mut h = home();
+        h.capture.lock().unwrap().during_begin = activation();
+        h.rig.agent.events.send(Event::HomeBind).unwrap();
+        begin(&mut h, true);
+        assert!(h.rig.agent.pending.is_empty());
+        process_events(&mut h);
+        assert_eq!(fed(&h), ["started", "button", "key", "button", "begun"]);
+        assert!(
+            h.rig.agent.home.reload,
+            "an unrelated event keeps its order"
+        );
+        assert!(h.rig.events.try_recv().is_err());
+    }
+
+    #[test]
+    fn activation_does_not_overtake_an_earlier_lock_event() {
+        let mut h = home();
+        h.capture.lock().unwrap().during_begin = activation();
+        h.rig
+            .agent
+            .events
+            .send(Event::Input(Input::Session(
+                crosspane_platform::SessionEvent::State(crosspane_platform::SessionState {
+                    lock: crosspane_platform::LockState::Locked,
+                    active: Some(true),
+                }),
+            )))
+            .unwrap();
+        begin(&mut h, true);
+        process_events(&mut h);
+        assert_eq!(
+            fed(&h),
+            ["session", "started", "button", "key", "button", "begun"]
+        );
+    }
+
+    #[test]
+    fn every_activation_event_precedes_the_answer_even_past_1024_events() {
+        let mut h = home();
+        let mut during = Vec::new();
+        for _ in 0..1100 {
+            during.push(CaptureEvent::Motion {
+                dx: 1.0,
+                dy: 0.0,
+                kind: crosspane_platform::MotionKind::Unaccelerated,
+                at: at(),
+            });
+        }
+        during.extend(activation());
+        h.capture.lock().unwrap().during_begin = during;
+        begin(&mut h, true);
+        process_events(&mut h);
+        let order = fed(&h);
+        assert!(order[..1100].iter().all(|label| *label == "motion"));
+        assert_eq!(
+            &order[1100..],
+            ["started", "button", "key", "button", "begun"]
+        );
+        assert!(h.rig.events.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_refused_home_exit_capture_is_also_answered_after_its_events() {
+        let mut h = home();
+        h.rig.agent.platform.capture = None;
+        begin(&mut h, true);
+        process_events(&mut h);
+        assert_eq!(fed(&h), ["begun"]);
+        assert!(matches!(
+            h.rig.agent.fed[0],
+            Input::CaptureBegun {
+                result: Err(Failure::Other),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_capture_keeps_todays_order_with_the_answer_first() {
+        let mut h = home();
+        // A modifier held at activation and released during `begin()`.
+        let start = CaptureStart {
+            held_keys: vec![HidUsage::keyboard(0xE0)],
+            lock_keys: LockKeys::default(),
+        };
+        {
+            let mut log = h.capture.lock().unwrap();
+            log.during_begin = activation();
+            log.start = Some(start.clone());
+        }
+        begin(&mut h, false);
+        h.rig.agent.settle();
+        assert_eq!(fed(&h), ["begun"]);
+        // The snapshot goes through untouched...
+        assert!(matches!(
+            &h.rig.agent.fed[0],
+            Input::CaptureBegun { result: Ok(s), .. } if *s == start
+        ));
+        // ...and the events of the activation stay queued behind it, in order, for the loop.
+        let queued: Vec<_> = h.rig.events.try_iter().collect();
+        assert!(matches!(
+            queued.as_slice(),
+            [
+                Event::Input(Input::Capture(CaptureEvent::Started { .. })),
+                Event::Input(Input::Capture(CaptureEvent::Button { down: true, .. })),
+                Event::Input(Input::Capture(CaptureEvent::Key { down: false, .. })),
+                Event::Input(Input::Capture(CaptureEvent::Button { down: false, .. })),
+            ]
+        ));
+    }
+
+    // ---- ReleaseAndWarp: the read-back, then the gate (A3, B2, B3) ----
+
+    #[test]
+    fn a_warp_is_done_only_when_the_pointer_reads_back_on_the_target_and_the_gate_is_open() {
+        let mut h = home();
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        assert_eq!(warp(&mut h, TARGET), Ok(Warp::Done));
+        assert_eq!(h.capture.lock().unwrap().ends, [Some(TARGET)]);
+    }
+
+    #[test]
+    fn a_warp_tolerates_two_device_pixels_and_no_more() {
+        let mut h = home();
+        let near =
+            |dx: f64, dy: f64| Some((TARGET.0, PointDevice::new(TARGET.1.x + dx, TARGET.1.y + dy)));
+        for (dx, dy, want) in [
+            (2.0, 0.0, Ok(Warp::Done)),
+            (0.0, -2.0, Ok(Warp::Done)),
+            (1.5, 1.5, Ok(Warp::Done)),
+            (2.5, 0.0, Ok(Warp::Skipped)),
+            (0.0, 3.0, Ok(Warp::Skipped)),
+        ] {
+            h.compositor.lock().unwrap().cursor = near(dx, dy);
+            assert_eq!(warp(&mut h, TARGET), want, "({dx}, {dy}) off");
+        }
+        // The right place on the wrong display is not there.
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(1), TARGET.1));
+        assert_eq!(warp(&mut h, TARGET), Ok(Warp::Skipped));
+    }
+
+    #[test]
+    fn a_closed_gate_wins_over_agreeing_coordinates() {
+        let mut h = home();
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        // The session side (a lock) or the engine side (a panic) is closed.
+        h.gate.set_session_permits(false);
+        assert_eq!(warp(&mut h, TARGET), Ok(Warp::Skipped));
+        h.gate.set_session_permits(true);
+        assert_eq!(warp(&mut h, TARGET), Ok(Warp::Done));
+        h.gate.set_engine_permits(false);
+        assert_eq!(warp(&mut h, TARGET), Ok(Warp::Skipped));
+    }
+
+    #[test]
+    fn a_gate_that_closes_between_end_and_the_read_back_is_skipped_never_done() {
+        let mut h = home();
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        // The lock arrives after `end()` returned `Ok`, and the engine hasn't been told yet
+        // (session-state delivery is delayed): the read-back still agrees with the target.
+        let gate = h.gate.clone();
+        h.compositor.lock().unwrap().during_cursor =
+            Some(Box::new(move || gate.set_session_permits(false)));
+        assert_eq!(warp(&mut h, TARGET), Ok(Warp::Skipped));
+        assert!(
+            !h.rig
+                .agent
+                .fed
+                .iter()
+                .any(|i| matches!(i, Input::Session(_))),
+            "the engine was told of no lock: the answer came from the gate itself"
+        );
+    }
+
+    #[test]
+    fn a_gate_that_closes_inside_end_is_skipped_too() {
+        let mut h = home();
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        let gate = h.gate.clone();
+        h.capture.lock().unwrap().during_end =
+            Some(Box::new(move || gate.set_engine_permits(false)));
+        assert_eq!(warp(&mut h, TARGET), Ok(Warp::Skipped));
+    }
+
+    #[test]
+    fn a_warp_that_cannot_be_confirmed_is_an_error_never_done() {
+        let mut h = home();
+        // The read-back fails.
+        assert_eq!(warp(&mut h, TARGET), Err(Failure::Other));
+        // `end` fails: the error is the engine's own kind of failure.
+        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        h.capture.lock().unwrap().end_error = Some(|| PlatformError::Locked);
+        assert_eq!(warp(&mut h, TARGET), Err(Failure::Locked));
+        h.capture.lock().unwrap().end_error = None;
+        // Nothing to read from (no Hyprland: the Mac), or nothing to end with.
+        h.rig.agent.platform.home = None;
+        assert_eq!(warp(&mut h, TARGET), Err(Failure::Other));
+        h.rig.agent.platform.capture = None;
+        assert_eq!(warp(&mut h, TARGET), Err(Failure::Other));
+    }
+
+    // ---- SetPortals: the backend says why it failed (B1) ----
+
+    fn portal(id: u32) -> CapturePortal {
+        CapturePortal {
+            id: PortalId(id),
+            display: DisplayId(1),
+            edge: crosspane_platform::Edge::Left,
+            from: 0.0,
+            to: 10.0,
+        }
+    }
+
+    fn portals_set(h: &mut Home) -> (Vec<PortalId>, Result<(), PortalsFailure>) {
+        h.rig.agent.execute(vec![Output::SetPortals(vec![
+            portal(1 << 30),
+            portal((1 << 30) + 1),
+        ])]);
+        match h.rig.agent.pending.pop_back() {
+            Some(Input::PortalsSet { ids, result }) => (ids, result),
+            other => panic!("expected PortalsSet, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_set_portals_is_rejected_only_when_the_worker_said_so() {
+        use crosspane_platform_linux::hyprland::capture::PORTALS_REJECTED;
+        let mut h = home();
+        let ids = vec![PortalId(1 << 30), PortalId((1 << 30) + 1)];
+        assert_eq!(portals_set(&mut h), (ids.clone(), Ok(())));
+        h.capture.lock().unwrap().set_error =
+            Some(|| PlatformError::Backend(format!("{PORTALS_REJECTED}no such display")));
+        assert_eq!(
+            portals_set(&mut h),
+            (ids.clone(), Err(PortalsFailure::Rejected))
+        );
+        // The caller's receive timeout, a worker that is gone, and anything unmarked: unknown.
+        for error in [
+            (|| PlatformError::Timeout) as fn() -> PlatformError,
+            || PlatformError::Backend("Hyprland capture: worker gone".into()),
+            || PlatformError::NotFound,
+        ] {
+            h.capture.lock().unwrap().set_error = Some(error);
+            assert_eq!(
+                portals_set(&mut h),
+                (ids.clone(), Err(PortalsFailure::Uncertain))
+            );
+        }
+        // No capture backend: nothing was installed.
+        h.rig.agent.platform.capture = None;
+        assert_eq!(portals_set(&mut h), (ids, Err(PortalsFailure::Rejected)));
+    }
+
+    /// The macOS backend has no marker: a timeout and `Backend(..)` leave the capture's fate
+    /// unknown, everything else is a refusal up front.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_failed_set_portals_off_hyprland_is_uncertain_unless_refused_up_front() {
+        let mut h = home();
+        let ids = vec![PortalId(1 << 30), PortalId((1 << 30) + 1)];
+        for (error, want) in [
+            (
+                (|| PlatformError::Timeout) as fn() -> PlatformError,
+                PortalsFailure::Uncertain,
+            ),
+            (
+                || PlatformError::Backend("tap gone".into()),
+                PortalsFailure::Uncertain,
+            ),
+            (|| PlatformError::NotFound, PortalsFailure::Rejected),
+            (
+                || PlatformError::Unsupported("no"),
+                PortalsFailure::Rejected,
+            ),
+        ] {
+            h.capture.lock().unwrap().set_error = Some(error);
+            assert_eq!(portals_set(&mut h), (ids.clone(), Err(want)));
+        }
+    }
+
+    // ---- the home bind ----
+
+    #[test]
+    fn installing_binds_verifies_and_the_status_says_so() {
+        let mut h = home();
+        let status = h.rig.agent.status();
+        assert_eq!(
+            status["home"],
+            json!({ "projection": null, "bind_installed": false })
+        );
+        assert_eq!(bind(&mut h, 1, true), Ok(()));
+        assert!(h.compositor.lock().unwrap().ours);
+        assert_eq!(h.rig.agent.home.wanted, Some(HomeOp(1)));
+        assert_eq!(h.rig.agent.status()["home"]["bind_installed"], json!(true));
+    }
+
+    #[test]
+    fn a_failed_install_is_an_error_that_names_its_cause_in_the_notice() {
+        let mut h = home();
+        h.compositor.lock().unwrap().install_error = Some("boom".into());
+        assert_eq!(bind(&mut h, 1, true), Err(Failure::Other));
+        assert_eq!(h.rig.agent.home.wanted, None, "nothing to keep verified");
+        assert_eq!(h.rig.agent.home.present, None, "part of it may be there");
+        // The engine emits rollback before the failure notice.
+        assert_eq!(bind(&mut h, 1, false), Ok(()));
+        let key = key(&h);
+        h.rig.agent.notice(&Notice::HomeFailed {
+            key,
+            reason: HomeFailure::Bind,
+        });
+        let text = last_notice(&h);
+        assert!(text.contains("boom") && text.contains(KEYS), "{text}");
+    }
+
+    #[test]
+    fn a_foreign_binding_on_the_chord_refuses_the_install() {
+        let mut h = home();
+        h.compositor.lock().unwrap().foreign = true;
+        assert_eq!(bind(&mut h, 1, true), Err(Failure::Other));
+        let c = h.compositor.lock().unwrap();
+        assert!(c.foreign && !c.ours, "the owner's binding is untouched");
+        assert!(
+            h.rig
+                .agent
+                .home
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("another binding")
+        );
+    }
+
+    #[test]
+    fn without_a_home_seat_installing_fails_and_removing_succeeds() {
+        let mut h = home();
+        h.rig.agent.platform.home = None;
+        assert_eq!(bind(&mut h, 1, true), Err(Failure::Other));
+        assert_eq!(bind(&mut h, 1, false), Ok(()));
+        assert_eq!(h.rig.agent.home.wanted, None);
+    }
+
+    #[test]
+    fn removal_is_verified_idempotent_and_ends_the_verification() {
+        let mut h = home();
+        assert_eq!(bind(&mut h, 1, true), Ok(()));
+        assert_eq!(bind(&mut h, 2, false), Ok(()));
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert_eq!(h.rig.agent.home.wanted, None);
+        assert_eq!(h.rig.agent.home.present, Some(false));
+        assert_eq!(
+            bind(&mut h, 3, false),
+            Ok(()),
+            "a second removal is a no-op"
+        );
+        assert_eq!(h.rig.agent.status()["home"]["bind_installed"], json!(false));
+    }
+
+    #[test]
+    fn a_failing_removal_is_an_error_and_the_user_hears_of_it_once_per_episode() {
+        let mut h = home();
+        h.compositor.lock().unwrap().remove_error = Some("ipc down".into());
+        let before = h.rig.agent.notices.len();
+        for op in 1..=3 {
+            assert_eq!(bind(&mut h, op, false), Err(Failure::Other));
+        }
+        assert_eq!(
+            h.rig.agent.notices.len(),
+            before + 1,
+            "one notice for three attempts"
+        );
+        let text = last_notice(&h);
+        assert!(
+            text.contains("can't remove its release shortcut") && text.contains("ipc down"),
+            "{text}"
+        );
+        // The bind may still be there: unknown, never "absent".
+        assert_eq!(h.rig.agent.home.present, None);
+        // A success ends the episode; the next failure is news again.
+        h.compositor.lock().unwrap().remove_error = None;
+        assert_eq!(bind(&mut h, 4, false), Ok(()));
+        h.compositor.lock().unwrap().remove_error = Some("ipc down".into());
+        assert_eq!(bind(&mut h, 5, false), Err(Failure::Other));
+        assert_eq!(h.rig.agent.notices.len(), before + 2);
+    }
+
+    #[test]
+    fn a_removal_never_touches_a_foreign_binding() {
+        let mut h = home();
+        // Ours and a foreign one share the chord: refused, both stay.
+        {
+            let mut c = h.compositor.lock().unwrap();
+            c.ours = true;
+            c.foreign = true;
+        }
+        assert_eq!(bind(&mut h, 1, false), Err(Failure::Other));
+        {
+            let c = h.compositor.lock().unwrap();
+            assert!(c.ours && c.foreign);
+        }
+        // A config reload drops runtime binds; the next retry finds ours gone: confirmed.
+        h.compositor.lock().unwrap().ours = false;
+        assert_eq!(bind(&mut h, 2, false), Ok(()));
+        assert!(h.compositor.lock().unwrap().foreign);
+    }
+
+    #[test]
+    fn a_reload_that_drops_the_bind_installs_it_again_silently() {
+        let mut h = home();
+        assert_eq!(bind(&mut h, 1, true), Ok(()));
+        let notices = h.rig.agent.notices.len();
+        h.compositor.lock().unwrap().ours = false; // `hyprctl reload` clears runtime binds
+        h.rig.agent.on_event(Event::HomeBind);
+        h.rig.agent.home_housekeeping();
+        assert!(h.compositor.lock().unwrap().ours, "reinstalled");
+        assert!(h.rig.agent.pending.is_empty(), "the engine is told nothing");
+        assert_eq!(h.rig.agent.notices.len(), notices);
+        assert_eq!(h.rig.agent.home.wanted, Some(HomeOp(1)));
+        assert_eq!(h.rig.agent.home.present, Some(true));
+    }
+
+    #[test]
+    fn a_bind_that_cannot_be_installed_again_ends_home() {
+        let mut h = home();
+        assert_eq!(bind(&mut h, 9, true), Ok(()));
+        {
+            let mut c = h.compositor.lock().unwrap();
+            c.ours = false;
+            c.install_error = Some("still gone".into());
+        }
+        h.rig.agent.on_event(Event::HomeBind);
+        h.rig.agent.home_housekeeping();
+        // The engine hears it, for the operation that installed the bind.
+        match h.rig.agent.pending.pop_back() {
+            Some(Input::HomeBindSet {
+                op,
+                install: true,
+                result: Err(Failure::Other),
+            }) => assert_eq!(op, HomeOp(9)),
+            other => panic!("expected an error answer, got {other:?}"),
+        }
+        // Said once: the next pass finds nothing wanted.
+        assert_eq!(h.rig.agent.home.wanted, None);
+        h.rig.agent.home.last_check = Instant::now() - Duration::from_secs(5);
+        h.rig.agent.home_housekeeping();
+        assert!(h.rig.agent.pending.is_empty());
+    }
+
+    #[test]
+    fn a_foreign_binding_that_appears_while_home_ends_home() {
+        let mut h = home();
+        assert_eq!(bind(&mut h, 1, true), Ok(()));
+        // The compositor now lists ours plus another binding on the chord: not exactly ours, and
+        // the install refuses a chord somebody else uses.
+        h.compositor.lock().unwrap().foreign = true;
+        h.rig.agent.home.last_check = Instant::now() - Duration::from_secs(2);
+        h.rig.agent.home_housekeeping();
+        assert!(matches!(
+            h.rig.agent.pending.pop_back(),
+            Some(Input::HomeBindSet {
+                install: true,
+                result: Err(_),
+                ..
+            })
+        ));
+        assert!(h.compositor.lock().unwrap().foreign, "never removed");
+    }
+
+    #[test]
+    fn the_bind_is_verified_every_second_while_wanted_and_never_otherwise() {
+        let mut h = home();
+        // Nothing wanted: no checks, however long it has been.
+        h.rig.agent.home.last_check = Instant::now() - Duration::from_secs(60);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().checks, 0);
+
+        assert_eq!(bind(&mut h, 1, true), Ok(()));
+        h.rig.agent.home.last_check = Instant::now() + Duration::from_secs(3600);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(
+            h.compositor.lock().unwrap().checks,
+            0,
+            "just installed: under a second"
+        );
+        h.rig.agent.home.last_check = Instant::now() - Duration::from_millis(1100);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().checks, 1);
+        h.rig.agent.home.last_check = Instant::now() + Duration::from_secs(3600);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(
+            h.compositor.lock().unwrap().checks,
+            1,
+            "and not again at once"
+        );
+        // A reload is checked at once.
+        h.rig.agent.on_event(Event::HomeBind);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().checks, 2);
+        // Once removed, no more checks, and a late reload event is dropped.
+        assert_eq!(bind(&mut h, 2, false), Ok(()));
+        h.rig.agent.on_event(Event::HomeBind);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().checks, 2);
+        assert!(!h.rig.agent.home.reload);
+    }
+
+    #[test]
+    fn the_seat_reports_compositor_reloads_as_events() {
+        let mut h = home();
+        let (tx, rx) = std::sync::mpsc::channel();
+        subscribe_platform(&mut h.rig.agent.platform, &tx);
+        let reload = h
+            .compositor
+            .lock()
+            .unwrap()
+            .reload
+            .take()
+            .expect("a watch was set up");
+        reload();
+        assert!(matches!(rx.try_recv(), Ok(Event::HomeBind)));
+    }
+
+    // ---- start and stop (A1, A2, B5) ----
+
+    #[test]
+    fn startup_removes_a_leftover_bind_of_ours_and_does_not_fence() {
+        let mut h = home();
+        h.compositor.lock().unwrap().ours = true;
+        h.rig.agent.home_startup();
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert!(!h.rig.agent.home.fence);
+        assert_eq!(h.rig.agent.home.present, Some(false));
+    }
+
+    #[test]
+    fn startup_with_only_a_foreign_binding_leaves_it_alone_and_does_not_fence() {
+        let mut h = home();
+        h.compositor.lock().unwrap().foreign = true;
+        let notices = h.rig.agent.notices.len();
+        h.rig.agent.home_startup();
+        assert!(
+            h.compositor.lock().unwrap().foreign,
+            "the owner's binding is untouched"
+        );
+        assert!(!h.rig.agent.home.fence, "ours is confirmed absent");
+        assert_eq!(h.rig.agent.notices.len(), notices);
+        assert!(h.rig.agent.inject(InjectCmd::Key {
+            usage: HidUsage::keyboard(4),
+            down: true
+        }));
+        assert!(h.rig.agent.inject(InjectCmd::Key {
+            usage: HidUsage::keyboard(4),
+            down: false
+        }));
+        assert!(h.held.lock().unwrap().is_empty());
+    }
+
+    /// Ours and a foreign binding share the chord at start: removal is refused.
+    fn fenced() -> Home {
+        let mut h = home();
+        {
+            let mut c = h.compositor.lock().unwrap();
+            c.ours = true;
+            c.foreign = true;
+        }
+        let peer = h.rig.peer;
+        h.rig
+            .agent
+            .trust
+            .update(|t| {
+                t.set_grant(peer, Capability::InputAccept, true)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .unwrap();
+        h.rig.agent.home_startup();
+        h
+    }
+
+    #[test]
+    fn a_startup_removal_that_fails_fences_injection_and_tells_the_user() {
+        let h = fenced();
+        assert!(h.rig.agent.home.fence);
+        {
+            let c = h.compositor.lock().unwrap();
+            assert!(c.ours && c.foreign, "nothing was removed");
+        }
+        let text = last_notice(&h);
+        assert!(
+            text.contains("can't remove its release shortcut")
+                && text.contains(KEYS)
+                && text.contains("reload your Hyprland config"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_fenced_node_injects_nothing_but_releases() {
+        let mut h = fenced();
+        let key = HidUsage::keyboard(4);
+        for cmd in [
+            InjectCmd::Key {
+                usage: key,
+                down: true,
+            },
+            InjectCmd::Button {
+                button: MouseButton::PRIMARY,
+                down: true,
+            },
+            InjectCmd::MoveTo {
+                display: DisplayId(1),
+                position: PointDevice::new(1.0, 1.0),
+            },
+            InjectCmd::Scroll(ScrollDelta {
+                v120_x: 0,
+                v120_y: 120,
+                pixels: None,
+                phase: ScrollPhase::Discrete,
+                stop_x: false,
+                stop_y: false,
+            }),
+            InjectCmd::LockKeys(LockKeys::default()),
+        ] {
+            assert!(!h.rig.agent.inject(cmd.clone()), "{cmd:?} is refused");
+        }
+        assert!(
+            h.injected.lock().unwrap().is_empty(),
+            "no injector was called"
+        );
+        for cmd in [
+            InjectCmd::Key {
+                usage: key,
+                down: false,
+            },
+            InjectCmd::Button {
+                button: MouseButton::PRIMARY,
+                down: false,
+            },
+            InjectCmd::ReleaseAll,
+            InjectCmd::Recover {
+                keys: vec![key],
+                buttons: vec![MouseButton::PRIMARY],
+            },
+        ] {
+            assert!(
+                h.rig.agent.inject(cmd.clone()),
+                "{cmd:?} still goes through"
+            );
+        }
+        assert_eq!(
+            *h.injected.lock().unwrap(),
+            [
+                "key up",
+                "button up",
+                "release all keys",
+                "release all buttons",
+                "recover keys",
+                "recover buttons"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fenced_node_refuses_e1_control_and_never_installs_a_bind() {
+        let mut h = fenced();
+        let peer = h.rig.peer;
+        h.rig.agent.send_grants();
+        assert!(
+            !grants_of(&h, peer).contains(&Capability::InputAccept),
+            "the engine refuses control with `Refusal::Permission`"
+        );
+        let installs = h.compositor.lock().unwrap().installs;
+        assert_eq!(bind(&mut h, 1, true), Err(Failure::Other));
+        assert_eq!(
+            h.compositor.lock().unwrap().installs,
+            installs,
+            "home never engages"
+        );
+    }
+
+    #[test]
+    fn the_startup_removal_is_retried_every_two_seconds_and_the_fence_lifts_when_it_works() {
+        let mut h = fenced();
+        let peer = h.rig.peer;
+        let removes = h.compositor.lock().unwrap().removes;
+        h.rig.agent.home.last_fence_try = Instant::now() + Duration::from_secs(3600);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(
+            h.compositor.lock().unwrap().removes,
+            removes,
+            "not before two seconds"
+        );
+        // Two seconds on, still refused (the same two bindings): another try, still fenced.
+        h.rig.agent.home.last_fence_try = Instant::now() - Duration::from_millis(2100);
+        h.rig.agent.home_housekeeping();
+        assert_eq!(h.compositor.lock().unwrap().removes, removes + 1);
+        assert!(h.rig.agent.home.fence);
+        let said = h.rig.agent.notices.len();
+        // The owner reloads the config: runtime binds are gone.
+        {
+            let mut c = h.compositor.lock().unwrap();
+            c.ours = false;
+            c.foreign = false;
+        }
+        h.rig.agent.home.last_fence_try = Instant::now() - Duration::from_millis(2100);
+        h.rig.agent.home_housekeeping();
+        assert!(!h.rig.agent.home.fence);
+        assert_eq!(h.rig.agent.notices.len(), said + 1);
+        assert!(
+            last_notice(&h).contains("accepted again"),
+            "{}",
+            last_notice(&h)
+        );
+        // Control is accepted again, and injection with it.
+        assert!(grants_of(&h, peer).contains(&Capability::InputAccept));
+        assert!(h.rig.agent.inject(InjectCmd::Key {
+            usage: HidUsage::keyboard(4),
+            down: true
+        }));
+        assert!(h.rig.agent.inject(InjectCmd::Key {
+            usage: HidUsage::keyboard(4),
+            down: false
+        }));
+        assert!(h.held.lock().unwrap().is_empty());
+        assert_eq!(bind(&mut h, 1, true), Ok(()));
+    }
+
+    #[test]
+    fn a_foreign_binding_alone_confirms_ours_absent_and_lifts_the_fence() {
+        let mut h = fenced();
+        let peer = h.rig.peer;
+        // Ours is gone (a reload dropped it); the owner's binding on the chord is still there.
+        h.compositor.lock().unwrap().ours = false;
+        h.rig.agent.home.last_fence_try = Instant::now() - Duration::from_millis(2100);
+        h.rig.agent.home_housekeeping();
+        assert!(!h.rig.agent.home.fence, "absence of ours is confirmed");
+        assert!(
+            h.compositor.lock().unwrap().foreign,
+            "the owner's binding is untouched"
+        );
+        assert!(grants_of(&h, peer).contains(&Capability::InputAccept));
+        // Home still can't engage: the install refuses a chord somebody else uses.
+        assert_eq!(bind(&mut h, 1, true), Err(Failure::Other));
+        assert!(h.compositor.lock().unwrap().foreign && !h.compositor.lock().unwrap().ours);
+    }
+
+    #[test]
+    fn stopping_removes_our_bind_and_only_ours() {
+        // Ours present.
+        let mut h = home();
+        h.compositor.lock().unwrap().ours = true;
+        h.rig.agent.home_shutdown();
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert_eq!(h.rig.agent.home.present, Some(false));
+        // Only a foreign binding on the chord: left alone.
+        let mut h = home();
+        h.compositor.lock().unwrap().foreign = true;
+        h.rig.agent.home_shutdown();
+        assert!(h.compositor.lock().unwrap().foreign);
+        // A whole shutdown removes it too, after the engine's panic did.
+        let mut h = home();
+        assert_eq!(bind(&mut h, 1, true), Ok(()));
+        h.rig.agent.shutdown();
+        assert!(!h.compositor.lock().unwrap().ours);
+        assert_eq!(h.rig.agent.home.wanted, None);
+    }
+
+    // ---- notices, status, tray ----
+
+    #[test]
+    fn the_home_notices_name_the_window_the_chord_and_the_peer() {
+        let mut h = home();
+        let key = key(&h);
+        h.rig
+            .agent
+            .capture_display
+            .insert(key.projection, DisplayId(9));
+        h.rig
+            .agent
+            .placement
+            .window_event(&WindowEvent::Added(window(
+                1,
+                "Notes",
+                1,
+                Some(9),
+                (0.0, 0.0, 10.0, 10.0),
+                WindowState::Normal,
+            )));
+        h.rig.agent.notice(&Notice::Home { key, entered: true });
+        assert_eq!(
+            last_notice(&h),
+            format!(
+                "Input is home in \"Notes\"; the other machine stays connected; press {KEYS} or push past the window's edges to return"
+            )
+        );
+        assert_eq!(h.rig.agent.status()["home"]["projection"], json!(3));
+        // Home left with its peer's session over: input is simply here.
+        h.rig.agent.home.now.as_mut().unwrap().peer = Some(h.rig.peer);
+        h.rig.agent.notice(&Notice::Home {
+            key,
+            entered: false,
+        });
+        let text = last_notice(&h);
+        assert!(
+            text.starts_with("Input left \"Notes\"; control of "),
+            "{text}"
+        );
+        assert_eq!(h.rig.agent.status()["home"]["projection"], json!(null));
+    }
+
+    #[test]
+    fn an_untitled_window_is_named_by_its_number() {
+        let mut h = home();
+        let key = key(&h);
+        h.rig.agent.notice(&Notice::Home { key, entered: true });
+        assert!(last_notice(&h).starts_with("Input is home in projected window 3;"));
+    }
+
+    #[test]
+    fn each_failure_has_its_own_line_with_the_agents_detail_where_it_has_one() {
+        let mut h = home();
+        let key = key(&h);
+        h.rig.agent.home.error = Some("no such bind".into());
+        h.rig.agent.home.inject_error = Some((Instant::now(), "the pointer is gone".into()));
+        let mut lines = Vec::new();
+        for reason in [
+            HomeFailure::Drain,
+            HomeFailure::Bind,
+            HomeFailure::Release,
+            HomeFailure::Warp,
+            HomeFailure::Focus,
+            HomeFailure::Guard,
+            HomeFailure::Gone,
+        ] {
+            h.rig.agent.notice(&Notice::HomeFailed { key, reason });
+            lines.push(last_notice(&h));
+        }
+        for line in &lines {
+            assert!(
+                line.starts_with("Input is not home in projected window 3: "),
+                "{line}"
+            );
+        }
+        let distinct: BTreeSet<&String> = lines.iter().collect();
+        assert_eq!(distinct.len(), lines.len(), "{lines:?}");
+        assert!(
+            lines[0].contains("last injection error: the pointer is gone"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(KEYS) && lines[1].contains("no such bind"),
+            "{}",
+            lines[1]
+        );
+        // An injection error long ago isn't the cause of this drain.
+        h.rig.agent.home.inject_error =
+            Some((Instant::now() - Duration::from_secs(60), "old".into()));
+        h.rig.agent.notice(&Notice::HomeFailed {
+            key,
+            reason: HomeFailure::Drain,
+        });
+        assert!(!last_notice(&h).contains("old"));
+    }
+
+    #[test]
+    fn a_failed_home_clears_the_status_and_the_tray_line() {
+        let mut h = home();
+        let key = key(&h);
+        h.rig
+            .agent
+            .projections
+            .insert(key, "projecting window 3 to peer".into());
+        h.rig.agent.notice(&Notice::Home { key, entered: true });
+        let view = h.rig.agent.tray_view();
+        assert_eq!(
+            view.projections,
+            [(
+                key,
+                format!("projecting window 3 to peer — input is home here ({KEYS} returns)")
+            )]
+        );
+        h.rig.agent.notice(&Notice::HomeFailed {
+            key,
+            reason: HomeFailure::Gone,
+        });
+        assert_eq!(h.rig.agent.status()["home"]["projection"], json!(null));
+        assert_eq!(
+            h.rig.agent.tray_view().projections,
+            [(key, "projecting window 3 to peer".to_owned())]
+        );
+    }
+
+    // ---- overlay: one outcome per configuration (WP-2.42) ----
+
+    #[test]
+    fn a_refused_overlay_show_makes_up_no_outcome() {
+        let mut h = home();
+        let shown = Arc::new(Mutex::new(0));
+        h.rig.agent.platform.overlay = Some(Box::new(RefusingOverlay(shown.clone())));
+        let show = || Output::ShowOverlay {
+            id: crosspane_engine::io::HUD,
+            overlay: Overlay {
+                display: DisplayId(1),
+                anchor: OverlayAnchor::TopCenter,
+                text: "Input → peer".into(),
+                accent: Rgb8 { r: 1, g: 2, b: 3 },
+            },
+        };
+        h.rig.agent.execute(vec![show()]);
+        assert_eq!(*shown.lock().unwrap(), 1);
+        assert!(
+            h.rig.agent.pending.is_empty(),
+            "no `Unavailable` of the agent's own"
+        );
+        // The same with no overlay backend at all: the engine's HUD deadline covers it.
+        h.rig.agent.platform.overlay = None;
+        h.rig.agent.execute(vec![show()]);
+        assert!(h.rig.agent.pending.is_empty());
+        assert!(h.rig.agent.fed.is_empty());
+    }
+
+    // ---- the placement source ----
+
+    fn display(id: u32, scale: f64, origin: (f64, f64), pixels: (u32, u32)) -> DisplayInfo {
+        DisplayInfo {
+            id: DisplayId(id),
+            name: format!("test-{id}"),
+            geometry: DisplayGeometry {
+                physical_size: SizeMm::new(300.0, 200.0),
+                pixel_size: PixelSize::new(pixels.0, pixels.1),
+                scale,
+                logical_origin: PointLogical::new(origin.0, origin.1),
+            },
+            refresh_millihz: 60_000,
+            color_space: ColorSpace::Srgb,
+            hdr: false,
+        }
+    }
+
+    fn window(
+        id: u64,
+        title: &str,
+        pid: u32,
+        on: Option<u32>,
+        frame: (f64, f64, f64, f64),
+        state: WindowState,
+    ) -> WindowInfo {
+        WindowInfo {
+            id: WindowId(id),
+            title: title.to_owned(),
+            app_id: "crosspane-proxy".into(),
+            pid: Some(pid),
+            display: on.map(DisplayId),
+            frame: RectLogical::new(
+                PointLogical::new(frame.0, frame.1),
+                SizeLogical::new(frame.2, frame.3),
+            ),
+            state,
+            role: WindowRole::Toplevel,
+            parent: None,
+        }
+    }
+
+    const PID: u32 = 4242;
+
+    fn proxy_key(n: u64) -> ProjectionKey {
+        ProjectionKey {
+            source: NodeId([9; 32]),
+            projection: ProjectionId(n),
+        }
+    }
+
+    /// One visible proxy "peer › one" with a matching window on display 1 (scale 2, origin
+    /// (10, 20)), nothing reported yet.
+    fn placed_source() -> PlacementSource {
+        let mut source = PlacementSource::new(PID);
+        source.set_displays(&[
+            display(1, 2.0, (10.0, 20.0), (3000, 2000)),
+            display(2, 1.0, (1500.0, 0.0), (1000, 800)),
+        ]);
+        source.opened(proxy_key(1), "peer › one");
+        source.set_visible(proxy_key(1), true);
+        source.window_event(&WindowEvent::Added(window(
+            1,
+            "peer › one",
+            PID,
+            Some(1),
+            (110.0, 70.0, 400.0, 300.0),
+            WindowState::Normal,
+        )));
+        source
+    }
+
+    fn only(source: &mut PlacementSource) -> Placed {
+        let changes = source.changes();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        changes[0].1
+    }
+
+    const NOWHERE: Placed = (None, PointDevice::new(0.0, 0.0), PixelSize::new(0, 0));
+
+    #[test]
+    fn a_proxy_is_placed_in_device_pixels_of_its_display() {
+        let mut source = placed_source();
+        // The origin subtracts the display's origin then scales; the size only scales.
+        assert_eq!(
+            only(&mut source),
+            (
+                Some(DisplayId(1)),
+                PointDevice::new(200.0, 100.0),
+                PixelSize::new(800, 600)
+            )
+        );
+    }
+
+    #[test]
+    fn a_fractional_size_rounds_to_the_nearest_device_pixel() {
+        let mut source = placed_source();
+        source.set_displays(&[display(1, 1.25, (0.0, 0.0), (3000, 2000))]);
+        source.window_event(&WindowEvent::Changed(window(
+            1,
+            "peer › one",
+            PID,
+            Some(1),
+            (8.0, 8.0, 401.3, 300.5),
+            WindowState::Normal,
+        )));
+        let (shown, origin, size) = only(&mut source);
+        assert_eq!(shown, Some(DisplayId(1)));
+        assert_eq!(origin, PointDevice::new(10.0, 10.0));
+        assert_eq!(size, PixelSize::new(502, 376), "501.625 and 375.625");
+    }
+
+    #[test]
+    fn a_proxy_the_host_hasnt_called_visible_is_nowhere() {
+        let mut source = placed_source();
+        source.set_visible(proxy_key(1), false);
+        assert_eq!(only(&mut source), NOWHERE);
+        // Nothing heard at all is the same.
+        let mut source = placed_source();
+        source.visible.clear();
+        assert_eq!(only(&mut source), NOWHERE);
+    }
+
+    #[test]
+    fn hidden_and_minimised_windows_are_nowhere_but_a_fullscreen_one_is_placed() {
+        for (state, placed) in [
+            (WindowState::Hidden, false),
+            (WindowState::Minimized, false),
+            (WindowState::Fullscreen, true),
+            (WindowState::Normal, true),
+        ] {
+            let mut source = placed_source();
+            source.window_event(&WindowEvent::Changed(window(
+                1,
+                "peer › one",
+                PID,
+                Some(1),
+                (110.0, 70.0, 400.0, 300.0),
+                state,
+            )));
+            assert_eq!(only(&mut source).0.is_some(), placed, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_on_a_display_the_engine_doesnt_know_is_nowhere() {
+        // A projected window parked on a twin output is not on any LocalDisplays display.
+        let mut source = placed_source();
+        source.window_event(&WindowEvent::Changed(window(
+            1,
+            "peer › one",
+            PID,
+            Some(9),
+            (0.0, 0.0, 400.0, 300.0),
+            WindowState::Normal,
+        )));
+        assert_eq!(only(&mut source), NOWHERE);
+        source.window_event(&WindowEvent::Changed(window(
+            1,
+            "peer › one",
+            PID,
+            None,
+            (0.0, 0.0, 400.0, 300.0),
+            WindowState::Normal,
+        )));
+        assert!(source.changes().is_empty(), "still nowhere: nothing to say");
+    }
+
+    #[test]
+    fn only_this_processs_window_with_exactly_the_proxys_title_counts() {
+        let mut source = placed_source();
+        // Somebody else's window with the same title is not the proxy.
+        source.window_event(&WindowEvent::Changed(window(
+            1,
+            "peer › one",
+            PID + 1,
+            Some(1),
+            (110.0, 70.0, 400.0, 300.0),
+            WindowState::Normal,
+        )));
+        assert_eq!(only(&mut source), NOWHERE);
+        // Ours, but under another title.
+        source.window_event(&WindowEvent::Changed(window(
+            1,
+            "peer › one (2)",
+            PID,
+            Some(1),
+            (110.0, 70.0, 400.0, 300.0),
+            WindowState::Normal,
+        )));
+        assert!(source.changes().is_empty());
+    }
+
+    #[test]
+    fn two_windows_with_the_proxys_title_make_it_ambiguous() {
+        let mut source = placed_source();
+        assert!(only(&mut source).0.is_some());
+        source.window_event(&WindowEvent::Added(window(
+            2,
+            "peer › one",
+            PID,
+            Some(1),
+            (0.0, 0.0, 100.0, 100.0),
+            WindowState::Normal,
+        )));
+        assert_eq!(only(&mut source), NOWHERE);
+        // One goes: placed again.
+        source.window_event(&WindowEvent::Removed(WindowId(2)));
+        assert!(only(&mut source).0.is_some());
+    }
+
+    #[test]
+    fn two_proxies_with_one_title_are_both_nowhere() {
+        let mut source = placed_source();
+        source.opened(proxy_key(2), "peer › one");
+        source.set_visible(proxy_key(2), true);
+        let changes = source.changes();
+        assert_eq!(changes.len(), 2);
+        assert!(
+            changes.iter().all(|(_, placed, _)| *placed == NOWHERE),
+            "{changes:?}"
+        );
+        // One is retitled: the title is unique again.
+        source.retitled(proxy_key(2), "peer › two");
+        let changes = source.changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, proxy_key(1));
+        assert!(changes[0].1.0.is_some());
+    }
+
+    #[test]
+    fn a_removed_window_is_nowhere_and_a_display_change_recomputes_every_placement() {
+        let mut source = placed_source();
+        assert!(only(&mut source).0.is_some());
+        // The display's scale changes: the same window, other device pixels.
+        source.set_displays(&[display(1, 1.0, (10.0, 20.0), (1500, 1000))]);
+        assert_eq!(
+            only(&mut source),
+            (
+                Some(DisplayId(1)),
+                PointDevice::new(100.0, 50.0),
+                PixelSize::new(400, 300)
+            )
+        );
+        // The display goes away.
+        source.set_displays(&[]);
+        assert_eq!(only(&mut source), NOWHERE);
+        source.set_displays(&[display(1, 1.0, (10.0, 20.0), (1500, 1000))]);
+        assert!(only(&mut source).0.is_some());
+        source.window_event(&WindowEvent::Removed(WindowId(1)));
+        assert_eq!(only(&mut source), NOWHERE);
+    }
+
+    #[test]
+    fn equal_reports_are_not_repeated_and_the_first_always_goes_out() {
+        let mut source = PlacementSource::new(PID);
+        source.opened(proxy_key(1), "peer › one");
+        // Not visible, no window: the first report is "nowhere" and goes out, once.
+        let first = source.changes();
+        assert_eq!(first, [(proxy_key(1), NOWHERE, true)]);
+        assert!(source.changes().is_empty());
+        // Placing it is a notable report; a move after that is not.
+        source.set_displays(&[display(1, 1.0, (0.0, 0.0), (1000, 800))]);
+        source.set_visible(proxy_key(1), true);
+        source.window_event(&WindowEvent::Added(window(
+            1,
+            "peer › one",
+            PID,
+            Some(1),
+            (5.0, 5.0, 100.0, 100.0),
+            WindowState::Normal,
+        )));
+        let placed = source.changes();
+        assert_eq!(placed.len(), 1);
+        assert!(placed[0].2, "nowhere → placed is notable");
+        source.window_event(&WindowEvent::Changed(window(
+            1,
+            "peer › one",
+            PID,
+            Some(1),
+            (6.0, 5.0, 100.0, 100.0),
+            WindowState::Normal,
+        )));
+        let moved = source.changes();
+        assert_eq!(moved.len(), 1);
+        assert!(!moved[0].2);
+        // The same state again: silence.
+        source.window_event(&WindowEvent::Changed(window(
+            1,
+            "peer › one",
+            PID,
+            Some(1),
+            (6.0, 5.0, 100.0, 100.0),
+            WindowState::Normal,
+        )));
+        assert!(source.changes().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn long_badged_and_decorated_titles_match_wayland_and_share_ambiguity() {
+        let mut h = home();
+        let key = proxy_key(1);
+        let badged = h.rig.agent.badged(key.source, &"é".repeat(512));
+        assert!(badged.len() <= 1024);
+        assert!(badged.starts_with(&format!("{} › ", key.source.short())));
+        h.rig.agent.placement = PlacementSource::new(PID);
+        h.rig
+            .agent
+            .placement
+            .set_displays(&[display(1, 1.0, (0.0, 0.0), (1000, 800))]);
+        h.rig.agent.placement.opened(key, &badged);
+        h.rig.agent.placement.set_visible(key, true);
+        h.rig
+            .agent
+            .placement
+            .window_event(&WindowEvent::Added(window(
+                1,
+                &badged,
+                PID,
+                Some(1),
+                (0.0, 0.0, 400.0, 300.0),
+                WindowState::Normal,
+            )));
+        assert!(only(&mut h.rig.agent.placement).0.is_some());
+        let text = format!("{} — 60 fps, 12 ms", "a".repeat(1020));
+        h.rig.agent.set_proxy_title(key, text.clone());
+        let normalized = proxy_title(text);
+        assert_eq!(normalized.len(), 1024);
+        assert_eq!(h.rig.agent.placement.proxies[&key], normalized);
+        h.rig
+            .agent
+            .placement
+            .window_event(&WindowEvent::Changed(window(
+                1,
+                &normalized,
+                PID,
+                Some(1),
+                (0.0, 0.0, 400.0, 300.0),
+                WindowState::Normal,
+            )));
+        assert!(h.rig.agent.placement.compute(&key).0.is_some());
+        // Distinct suffixes beyond the wire limit cannot evade title ambiguity detection.
+        let shared = "x".repeat(1024);
+        h.rig.agent.set_proxy_title(key, format!("{shared}one"));
+        let other = proxy_key(2);
+        h.rig
+            .agent
+            .placement
+            .opened(other, &proxy_title(format!("{shared}two")));
+        h.rig.agent.placement.set_visible(other, true);
+        assert_eq!(h.rig.agent.placement.compute(&key), NOWHERE);
+        assert_eq!(h.rig.agent.placement.compute(&other), NOWHERE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closing_an_ambiguous_proxy_recomputes_the_survivor_without_a_window_event() {
+        let mut h = home();
+        h.rig.agent.placement = placed_source();
+        let key = proxy_key(1);
+        let other = proxy_key(2);
+        h.rig.agent.placement.opened(other, "peer › one");
+        h.rig.agent.placement.set_visible(other, true);
+        assert_eq!(h.rig.agent.placement.changes().len(), 2);
+        assert_eq!(h.rig.agent.placement.compute(&key), NOWHERE);
+        h.rig.agent.execute(vec![Output::CloseProxy { key: other }]);
+        assert!(h.rig.agent.placement_dirty);
+        h.rig.agent.flush_placements();
+        assert!(h.rig.agent.pending.iter().any(|i| matches!(i, Input::Proxy { key: got, event: ProxyEvent::Placed { display: Some(_), .. } } if *got == key)));
+    }
+
+    #[test]
+    fn decorated_proxy_titles_still_match_the_compositors_window() {
+        let mut h = home();
+        h.rig.agent.placement = placed_source();
+        let key = proxy_key(1);
+        assert!(only(&mut h.rig.agent.placement).0.is_some());
+        let title = "peer › one — 60 fps, 12 ms";
+        h.rig.agent.set_proxy_title(key, title.into());
+        assert!(
+            h.rig.agent.placement.compute(&key).0.is_some(),
+            "our title request must not invalidate the known window before the next poll"
+        );
+        assert!(h.rig.agent.placement_dirty);
+        h.rig.agent.flush_placements();
+        h.rig.agent.settle();
+        assert!(
+            !h.rig.agent.fed.iter().any(|i| matches!(
+                i,
+                Input::Proxy {
+                    event: ProxyEvent::Placed { display: None, .. },
+                    ..
+                }
+            )),
+            "a delayed title event must not send an invalidation"
+        );
+        h.rig
+            .agent
+            .placement
+            .window_event(&WindowEvent::Changed(window(
+                1,
+                title,
+                PID,
+                Some(1),
+                (110.0, 70.0, 400.0, 300.0),
+                WindowState::Normal,
+            )));
+        assert!(h.rig.agent.placement.compute(&key).0.is_some());
+        assert!(!h.rig.agent.placement_dirty);
+    }
+
+    #[test]
+    fn a_closed_proxy_reports_nothing_more() {
+        let mut source = placed_source();
+        assert_eq!(source.changes().len(), 1);
+        source.closed(proxy_key(1));
+        source.set_displays(&[]);
+        assert!(source.changes().is_empty());
+        assert!(source.last.is_empty() && source.visible.is_empty());
+    }
+
+    #[test]
+    fn a_projected_window_is_found_by_the_display_it_is_captured_from() {
+        let mut source = placed_source();
+        source.window_event(&WindowEvent::Added(window(
+            5,
+            "Notes",
+            1,
+            Some(9),
+            (0.0, 0.0, 10.0, 10.0),
+            WindowState::Normal,
+        )));
+        assert_eq!(source.window_on(DisplayId(9)).unwrap().title, "Notes");
+        assert!(source.window_on(DisplayId(8)).is_none());
+        // A dialog of the same app on that output is not the window.
+        let mut dialog = window(
+            6,
+            "Dialog",
+            1,
+            Some(8),
+            (0.0, 0.0, 5.0, 5.0),
+            WindowState::Normal,
+        );
+        dialog.role = WindowRole::Dialog;
+        source.window_event(&WindowEvent::Added(dialog));
+        assert!(source.window_on(DisplayId(8)).is_none());
+    }
+
+    /// The whole path on Linux: windows, displays, the open proxy and the host's visibility in,
+    /// `ProxyEvent::Placed` out; the host's own origin and size are never used.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_agent_reports_the_compositors_placement_once_the_host_says_visible() {
+        let mut h = home();
+        let key = proxy_key(5);
+        h.rig.agent.titles.insert(key, ("peer › win".into(), 0));
+        let id = h.rig.agent.proxy_ids.open(key);
+        h.rig.agent.placement = PlacementSource::new(std::process::id());
+        h.rig.agent.feed(Input::LocalDisplays(vec![display(
+            1,
+            1.0,
+            (0.0, 0.0),
+            (1000, 800),
+        )]));
+        h.rig.agent.feed(Input::Windows(WindowEvent::Added(window(
+            1,
+            "peer › win",
+            std::process::id(),
+            Some(1),
+            (10.0, 20.0, 300.0, 200.0),
+            WindowState::Normal,
+        ))));
+        // The proxy opens. (Not fed to the engine: it has no destination for this key and would
+        // close the proxy again; what the agent learns from the input is the point here.)
+        h.rig.agent.observe(&Input::ProxyOpened {
+            key,
+            result: Ok((PixelSize::new(300, 200), 1.0)),
+        });
+        h.rig.agent.flush_placements();
+        let placed = |h: &mut Home| {
+            let reports: Vec<_> = h
+                .rig
+                .agent
+                .pending
+                .drain(..)
+                .filter_map(|input| match input {
+                    Input::Proxy {
+                        event:
+                            ProxyEvent::Placed {
+                                display: on,
+                                origin,
+                                size,
+                            },
+                        ..
+                    } => Some((on, origin, size)),
+                    _ => None,
+                })
+                .collect();
+            reports
+        };
+        // The proxy is open but the host hasn't said it is visible: the first report is "nowhere".
+        assert_eq!(placed(&mut h), [NOWHERE]);
+        // The host says visible (its own origin and size are Wayland's guess and are ignored).
+        h.rig.agent.on_host(HostEvent::Placed {
+            id,
+            visible: true,
+            monitor: None,
+            origin: PointDevice::new(777.0, 777.0),
+            size: PixelSize::new(1, 1),
+        });
+        assert_eq!(
+            placed(&mut h),
+            [(
+                Some(DisplayId(1)),
+                PointDevice::new(10.0, 20.0),
+                PixelSize::new(300, 200)
+            )]
+        );
+        // Minimised: nowhere again. The same state twice says nothing.
+        h.rig.agent.on_host(HostEvent::Placed {
+            id,
+            visible: false,
+            monitor: None,
+            origin: PointDevice::new(0.0, 0.0),
+            size: PixelSize::new(0, 0),
+        });
+        assert_eq!(placed(&mut h), [NOWHERE]);
+        h.rig.agent.on_host(HostEvent::Placed {
+            id,
+            visible: false,
+            monitor: None,
+            origin: PointDevice::new(0.0, 0.0),
+            size: PixelSize::new(0, 0),
+        });
+        assert!(placed(&mut h).is_empty());
+        // A host that does name a monitor (macOS) is believed as before.
+        h.rig.agent.on_host(HostEvent::Placed {
+            id,
+            visible: true,
+            monitor: Some(3),
+            origin: PointDevice::new(5.0, 6.0),
+            size: PixelSize::new(7, 8),
+        });
+        assert!(h.rig.agent.fed.iter().any(|input| matches!(
+            input,
+            Input::Proxy {
+                event: ProxyEvent::Placed {
+                    display: Some(DisplayId(3)),
+                    ..
+                },
+                ..
+            }
+        )));
     }
 }

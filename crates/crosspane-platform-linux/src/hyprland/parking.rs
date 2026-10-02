@@ -374,11 +374,22 @@ impl WindowParking for HyprlandParking {
             // outputs) means M2 is unavailable here: `Unsupported`, so the agent mirrors the
             // window instead (M1, the reported fallback).
             let twin = (|| {
-                if self.monitor(&entry.output)?.is_none() {
+                let monitors = self.ipc.json("monitors")?;
+                let exists = monitors.as_array().is_some_and(|list| {
+                    list.iter().any(|m| {
+                        m.get("name").and_then(Value::as_str) == Some(entry.output.as_str())
+                    })
+                });
+                if !exists {
+                    let kind = twin_backend(
+                        std::env::var("CROSSPANE_NESTED_HYPR").ok().as_deref(),
+                        std::env::var("CROSSPANE_TWIN_BACKEND").ok().as_deref(),
+                        Some(&monitors),
+                    );
                     expect_ok(
                         &self
                             .ipc
-                            .request(&format!("output create headless {}", entry.output))?,
+                            .request(&format!("output create {kind} {}", entry.output))?,
                     )?;
                 }
                 self.set_mode(&entry, size, scale)
@@ -911,10 +922,84 @@ fn backend(message: String) -> PlatformError {
     PlatformError::Backend(message)
 }
 
+/// The kind of output `output create` makes a twin with: `headless`, except for a **test**
+/// override. A nested Hyprland can't allocate headless outputs (GBM `bo null`), so a nest started
+/// by `scripts/hypr-nested.sh` can ask for `CROSSPANE_TWIN_BACKEND=wayland`: a second output of the
+/// nest itself, which stands in for the twin in the end-to-end script (WP-2.43 P2). The override
+/// requires both exact environment markers and a nonempty monitor list read from this parking
+/// backend's own IPC endpoint where every output is named `WAYLAND-…`. Unknown or other outputs
+/// retain `headless`, including an existing `CROSSPANE-…` twin: this conservative test guard
+/// permits only the first Wayland stand-in in a nest.
+fn twin_backend(
+    nested: Option<&str>,
+    requested: Option<&str>,
+    monitors: Option<&Value>,
+) -> &'static str {
+    if nested == Some("1")
+        && requested == Some("wayland")
+        && monitors.and_then(Value::as_array).is_some_and(|list| {
+            !list.is_empty()
+                && list.iter().all(|m| {
+                    m.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.starts_with("WAYLAND-"))
+                })
+        })
+    {
+        "wayland"
+    } else {
+        "headless"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn the_wayland_twin_backend_is_a_nest_only_test_override() {
+        let wayland = serde_json::json!([{"name": "WAYLAND-1"}, {"name": "WAYLAND-2"}]);
+        // The default, and every spelling that isn't the exact override in a nest.
+        for (nested, requested) in [
+            (None, None),
+            (Some("1"), None),
+            (Some("1"), Some("headless")),
+            (Some("1"), Some("WAYLAND")),
+            (Some("1"), Some("wayland ")),
+            (Some("1 "), Some("wayland")),
+            // Outside a nest the variable is ignored, whatever it says.
+            (None, Some("wayland")),
+            (Some("0"), Some("wayland")),
+            (Some(""), Some("wayland")),
+        ] {
+            assert_eq!(twin_backend(nested, requested, Some(&wayland)), "headless");
+        }
+        // No successful read, an empty or malformed list, and physical or mixed outputs fail closed.
+        assert_eq!(twin_backend(Some("1"), Some("wayland"), None), "headless");
+        for monitors in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([{}]),
+            serde_json::json!([{"name": null}]),
+            serde_json::json!([{"name": "DP-1"}]),
+            serde_json::json!([{"name": "HDMI-A-1"}]),
+            serde_json::json!([{"name": "WAYLAND-1"}, {"name": "DP-1"}]),
+            serde_json::json!([{"name": "WAYLAND-1"}, {"name": "CROSSPANE-1"}]),
+            serde_json::json!([{"name": "wayland-1"}]),
+        ] {
+            assert_eq!(
+                twin_backend(Some("1"), Some("wayland"), Some(&monitors)),
+                "headless",
+                "{monitors}"
+            );
+        }
+        assert_eq!(
+            twin_backend(Some("1"), Some("wayland"), Some(&wayland)),
+            "wayland"
+        );
+    }
 
     #[test]
     fn mode_sizes_are_whole_logical_pixels() {

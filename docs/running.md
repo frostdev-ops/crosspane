@@ -185,6 +185,62 @@ Everything is also available from the command line:
   the window stays hidden at home, and both resume when the machines reconnect. Held keys and
   buttons are released at once. After 20 s the window goes home.
 
+**Use a projected desktop window from the same keyboard (Hyprland).** When this machine
+controls a peer and the pointer moves into a projection of its own twin-parked window, input goes
+home into that window. The notice names the window and **Ctrl+Shift+Alt+Escape**; the peer stays
+connected. Push past an available window edge to resume controlling the peer, or press the chord
+to end control and return to the physical display. The tray marks the home projection.
+
+Entry needs a current proxy placement, recent physical pointer motion, confirmed exit strips,
+settled injectors and a verified release shortcut. It waits during a resize and refuses a
+fullscreen proxy with no usable exit. Move into the proxy before typing: typing from outside a
+proxy that still has focus does not enter home. Mirror parking and Mac sources keep their usual
+behaviour. The peer's cursor stays at the entry point during home; cursor painting is deferred.
+
+The agent installs the home shortcut only for a home transaction, with the description
+`crosspane-home-release`, and verifies/removes it on exit, startup and shutdown. Config reloads
+are watched and a missing shortcut is reinstalled within the one-second housekeeping interval.
+An existing binding on the chord prevents entry. Cleanup leaves a foreign-only binding intact;
+if ours and another binding coexist, or ownership cannot be read, input stays fenced until
+cleanup is confirmed. Reload the Hyprland config when the notice asks. Don't add a permanent
+binding on this chord: it would prevent the verified home shortcut from being installed.
+
+`crosspanectl --json status` includes `home: { projection, bind_installed }`; the projection is
+`null` outside home. `bind_installed` is the last verified presence of our shortcut. Unknown
+presence is reported as false while the cleanup fence remains in force. There is no new config
+setting: the shortcut follows the engine's default release chord. The command uses the agent's
+runtime directory and the `crosspanectl` beside its executable. Paths containing apostrophes,
+control characters or the Lua string terminator are refused for installation.
+
+**Validation for the lead (WP-2.43e).** The nested `scripts/e2e/e1e2-nested.sh` checks twin parking,
+confirmed strips, compositor placements, startup/shutdown ownership and a direct home-bind round
+trip. It also requires a proxy-motion report observed without local capture motion and no home
+notice. The frozen engine API does not expose whether prevalidation or corroboration rejected the
+report. A virtual pointer cannot supply the capture's physical relative motion, so this run cannot
+validate home entry or establish the exact rejection reason. Run it through `scripts/lead/impl-env.sh`, passing the parent display only as
+`CROSSPANE_PARENT_WAYLAND_DISPLAY`; all clients and IPC calls address the named nests. The
+`CROSSPANE_TWIN_BACKEND=wayland` override requires `CROSSPANE_NESTED_HYPR=1` and a nonempty
+monitor list on that IPC endpoint containing only `WAYLAND-*` outputs. Other or unknown outputs
+retain the headless backend; this permits only the first twin stand-in in a nest. The existing
+`e1-nested.sh` changes the outer desktop and remains a lead-run regression check.
+
+The lead's live prerequisite uses one window briefly with a physical mouse and keyboard:
+
+- Entry notice shows the chord.
+- `hyprctl cursorpos` is on the twin.
+- Four strips are on it (`hyprctl layers`).
+- `binds -j` lists the bind.
+- Typing reaches W.
+- Push past an edge: B receives motion, A logs the exit, the bind is gone.
+- Press the chord while home: A warps to the fallback and B reports "control ended".
+- Re-enter.
+- `hyprctl reload` while home: the bind is reinstalled within 1 s.
+
+Record status before, during and after home, the bind verification line and the first placement
+report. Check entry with focus-following enabled and disabled, and check overlapping Mac proxies
+with one not the key window. If the nested twin prerequisite fails, report Mirror-only coverage;
+twin checks then remain live-only. No live check is run by the work-package implementer.
+
 **Machines and permissions.**
 - `crosspanectl allow <peer> input|share|browse|present [--off]` grants or withdraws one thing.
 - `crosspanectl forget <peer>` unpairs a machine and ends its connection at once.

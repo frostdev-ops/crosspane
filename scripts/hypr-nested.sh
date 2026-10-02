@@ -41,12 +41,29 @@ done
 [[ -n ${XDG_RUNTIME_DIR:-} ]] || { echo "hypr-nested: XDG_RUNTIME_DIR is not set" >&2; exit 2; }
 state=$XDG_RUNTIME_DIR/crosspane-hypr-$name
 
+# A process's start time (clock ticks after boot, /proc/PID/stat field 22), or empty if there is
+# no such process. The comm field may hold spaces, so fields are counted after its closing paren.
+starttime() {
+    local stat
+    stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+    awk '{print $20}' <<<"${stat##*) }"
+}
+
+# Whether the recorded process is still the Hyprland this script started: same PID **and** same
+# start time. A PID alone can be reused (by anything, the owner's compositor included), and then
+# nothing here may signal it or address its instance.
+owned() {
+    [[ -f $state/pid && -f $state/start ]] || return 1
+    local now
+    now=$(starttime "$(<"$state/pid")")
+    [[ -n $now && $now == "$(<"$state/start")" ]]
+}
+
 # The nested instance's signature, or empty if it isn't running.
 signature() {
-    [[ -f $state/pid ]] || return 0
+    owned || return 0
     local pid
     pid=$(<"$state/pid")
-    kill -0 "$pid" 2>/dev/null || return 0
     timeout 5 hyprctl instances -j 2>/dev/null |
         jq -r --argjson pid "$pid" '.[] | select(.pid == $pid) | .instance' | head -n1
 }
@@ -74,6 +91,7 @@ start() {
         CROSSPANE_NESTED_WIDTH="$width" CROSSPANE_NESTED_HEIGHT="$height" \
         setsid Hyprland --config "$config" >"$state/stdout.log" 2>&1 </dev/null &
     echo $! >"$state/pid"
+    starttime $! >"$state/start"
 
     local sig="" deadline=$((SECONDS + 20))
     while [[ -z $sig ]]; do
@@ -111,23 +129,30 @@ stop_quiet() {
     [[ -f $state/pid ]] || { rm -rf -- "$state"; return 0; }
     local pid sig
     pid=$(<"$state/pid")
+    if ! owned; then
+        # Gone, or the PID now belongs to another process: never signal it.
+        kill -0 "$pid" 2>/dev/null &&
+            echo "hypr-nested: pid $pid is no longer $name's Hyprland; not signalling it" >&2
+        rm -rf -- "$state"
+        return 0
+    fi
     sig=$(signature)
     if [[ -n $sig ]]; then
         nested "$sig" eval 'hl.dispatch(hl.dsp.exit())' >/dev/null 2>&1 || true
     fi
     local i
     for i in $(seq 1 25); do
-        kill -0 "$pid" 2>/dev/null || break
+        owned || break
         sleep 0.2
     done
-    if kill -0 "$pid" 2>/dev/null; then
+    if owned; then
         kill -TERM "$pid" 2>/dev/null || true
         for i in $(seq 1 25); do
-            kill -0 "$pid" 2>/dev/null || break
+            owned || break
             sleep 0.2
         done
     fi
-    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    owned && kill -KILL "$pid" 2>/dev/null || true
     rm -rf -- "$state"
 }
 
