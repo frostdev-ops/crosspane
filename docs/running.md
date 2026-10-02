@@ -79,6 +79,13 @@ macbook = "swap-ctrl-gui" # none | swap-ctrl-gui (Ctrl ↔ ⌘/Super) | swap-alt
 A remap profile applies while *this* machine's keyboard drives that peer, so set it on the
 machine whose keyboard you use. Changes to `config.toml` apply after `crosspanectl restart`.
 
+By default the agents on a network find each other with mDNS and reconnect by themselves.
+`CROSSPANE_DISCOVERY=0` in the agent's environment turns that off: nothing is advertised or
+browsed, no discovered address is ever dialled, and `crosspanectl pair scan` finds nothing. The
+agent then connects only to the `[[peers]]` addresses and to `crosspanectl dial` addresses; it logs
+"discovery off" at start. Test scripts that run agents set it, so they never contact the agents of
+the machine they run on.
+
 ## Install, start and stop
 
 - **Linux:** `cargo install --locked --path apps/crosspane-agent --root ~/.local --features video`
@@ -180,6 +187,38 @@ Everything is also available from the command line:
 
 `crosspanectl status` shows peers, layout, projections (with received frames), missing
 permissions and recent notices.
+
+## Audio (speakers, v0)
+
+A machine can play its sound on a paired machine's speakers (D8; design in `docs/wp/AUDIO-v0.md`).
+Speakers only: microphones are not shared yet.
+
+- **Use it:** each paired machine that has an audio backend shows a virtual output called
+  "⟨peer⟩ speakers" (on Linux, a PipeWire sink; on the Mac, the Crosspane audio driver's "Crosspane
+  speakers", once the owner has installed it). Pick it in the system's sound settings or in an app.
+  Sound reaches the peer only while an app plays into it, and comes out of the peer's default
+  output.
+- **The speakers' owner decides.** Both sides are off by default: on the machine whose speakers
+  should play, run `crosspanectl allow <peer> speaker` (`--off` to withdraw). Withdrawing it,
+  locking the screen, `crosspanectl panic`, a lost connection or revoking the peer stops the sound
+  within a second. After an unlock, an app has to start playing again.
+- **`crosspanectl allow <peer> mic`** is accepted and stored, and answers that microphones are not
+  supported yet: no microphone is ever opened. An app recording from "⟨peer⟩ microphone" hears
+  silence, and the agent shows a refusal notice.
+- **See it:** `crosspanectl status` shows, per peer, what it may do here (`speaker`, `mic`, ...) and
+  whether it is playing on this machine's speakers; the tray / menu-bar menu lists the peers
+  playing now, and its icon shows the active state.
+- **Needs** PipeWire (Linux) or CoreAudio (Mac) at agent start; the agent logs "audio sharing on"
+  (or why not) and then advertises the `audio` feature. `CROSSPANE_AUDIO=0` in the agent's
+  environment turns audio off and never touches the audio server. Every script under
+  `scripts/e2e/` that starts agents sets it (and `CROSSPANE_DISCOVERY=0`), except
+  `audio-private.sh`, which runs on private audio servers.
+- **Limits (v0):** the Mac plays only when its default output runs at 48 kHz stereo (a 44.1 kHz
+  output, which the built-in one may use, is refused); the Mac's driver serves one peer at a time;
+  an agent whose audio worker died keeps audio refused until it restarts.
+- **Check it without touching your audio:** `scripts/lead/impl-env.sh scripts/e2e/audio-private.sh`
+  runs two agents, each on its own private PipeWire server, plays a 1 kHz tone into one's "speakers"
+  and records what comes out of the other's output.
 
 ## Known limitations (v0)
 

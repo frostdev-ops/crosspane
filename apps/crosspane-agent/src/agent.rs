@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use crosspane_engine::io::AudioKey;
 use crosspane_engine::{
     Command, Engine, Failure, InjectCmd, Input, Notice, Output, ProjectionKey, ProxyEvent,
 };
@@ -16,14 +17,19 @@ use crosspane_platform::{
     CaptureEvent, EventSink, FrameEvent, LinkClass, OverlayEvent, Permission, PermissionState,
     PlatformError, StreamId, WindowEvent,
 };
+use crosspane_protocol::audio::AudioPacket;
 use crosspane_protocol::link::{LinkEvent, PeerLink};
-use crosspane_protocol::msg::{Capability, ControlMessage, Placement, Refusal, RevocationNotice};
+use crosspane_protocol::msg::{
+    Capability, ControlMessage, Hello, Placement, Refusal, RevocationNotice,
+};
 use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
+use crosspane_types::audio::AudioKind;
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::id::NodeId;
 use crosspane_types::id::{ProjectionId, WindowId};
 use serde_json::{Value, json};
 
+use crate::audio::{AudioWorker, WorkerEvent, WorkerStats};
 use crate::ctl::{Request, Response};
 use crate::media::{DestCmd, ProxyIds, Shape, SourceCmd};
 use crate::net::Net;
@@ -50,6 +56,9 @@ pub enum Event {
     Discovery(crosspane_transport::discovery::DiscoveryEvent),
     /// The network interfaces changed (WP-1.7/1.8).
     Links(Vec<crosspane_platform::Interface>),
+    /// The audio worker reports (WP-3.6d): a device open finished, a stream failed, or the
+    /// platform's audio devices changed.
+    Audio(WorkerEvent),
 }
 
 /// What the loop knows about a peer.
@@ -61,6 +70,70 @@ struct PeerInfo {
     displays: Vec<DisplayInfo>,
     connected: bool,
     rtt: Option<Duration>,
+    /// What the engine was last told about audio with this peer (`Input::AudioPeer`).
+    audio: bool,
+}
+
+impl PeerInfo {
+    /// Remember what `hello` says about this peer: its name, the features and displays it
+    /// advertises. Returns whether its displays differ from what was remembered.
+    fn apply_hello(&mut self, name: String, hello: &Hello) -> bool {
+        let displays_changed = self.displays != hello.displays;
+        self.name = name;
+        self.features.clone_from(&hello.features);
+        self.displays.clone_from(&hello.displays);
+        self.connected = true;
+        displays_changed
+    }
+}
+
+/// `CROSSPANE_DISCOVERY=0` (exactly) turns mDNS discovery off.
+fn discovery_switched_off(value: Option<&str>) -> bool {
+    value == Some("0")
+}
+
+/// Whether audio with a peer is available: both `Hello`s advertise `audio`. This node advertises
+/// it exactly when its audio worker runs, and the transport refuses audio on a connection that
+/// didn't negotiate it, so the engine is only told of a peer that can really carry it.
+fn audio_negotiated(local_features: &[String], peer_features: &[String]) -> bool {
+    let has = |features: &[String]| features.iter().any(|f| f == "audio");
+    has(local_features) && has(peer_features)
+}
+
+/// The audio worker as the loop drives it. [`AudioWorker`] is the one implementation; the tests at
+/// the bottom of this file record the calls instead, to pin their order.
+pub(crate) trait AudioPlane: Send {
+    /// Execute one audio output of the engine. Never blocks.
+    fn submit(&self, output: Output);
+    /// An audio datagram from `peer`. Never blocks.
+    fn packet(&self, peer: NodeId, packet: AudioPacket);
+    /// Stop every stream with `peer` at once.
+    fn cancel_peer(&self, peer: NodeId);
+    fn stats(&self) -> WorkerStats;
+    /// Stop everything and wait (bounded) for the worker's threads.
+    fn shutdown(self: Box<Self>);
+}
+
+impl AudioPlane for AudioWorker {
+    fn submit(&self, output: Output) {
+        AudioWorker::submit(self, output);
+    }
+
+    fn packet(&self, peer: NodeId, packet: AudioPacket) {
+        AudioWorker::packet(self, peer, packet);
+    }
+
+    fn cancel_peer(&self, peer: NodeId) {
+        AudioWorker::cancel_peer(self, peer);
+    }
+
+    fn stats(&self) -> WorkerStats {
+        AudioWorker::stats(self)
+    }
+
+    fn shutdown(self: Box<Self>) {
+        AudioWorker::shutdown(*self);
+    }
 }
 
 pub struct Agent {
@@ -129,6 +202,12 @@ pub struct Agent {
     port: u16,
     /// Revocation notices this node issued, sent to every peer that connects (04 §4).
     revocations: crate::revocations::Issued,
+    /// The audio worker (WP-3.6d); `None` when audio sharing is off or has no backend.
+    audio: Option<Box<dyn AudioPlane>>,
+    /// The features this node advertised in its `Hello`.
+    features: Vec<String>,
+    /// Sessions playing on this machine's speakers now: the engine's `AudioIndicators`.
+    speakers: Vec<AudioKey>,
 }
 
 /// The E2 pieces the agent wires in (`media.rs`, the proxy host).
@@ -286,6 +365,8 @@ impl Agent {
         trust: SharedTrust,
         local_displays: Vec<DisplayInfo>,
         e2: E2Wiring,
+        features: Vec<String>,
+        audio: Option<Box<dyn AudioPlane>>,
     ) -> Agent {
         Agent {
             node,
@@ -337,6 +418,9 @@ impl Agent {
             identity: e2.identity,
             port: e2.port,
             revocations: e2.revocations,
+            audio,
+            features,
+            speakers: Vec::new(),
         }
     }
 
@@ -346,6 +430,9 @@ impl Agent {
         self.granted = self.granted_permissions();
         self.execute(startup);
         self.feed(Input::LocalDisplays(self.local_displays.clone()));
+        // Speaker v0 hosts no microphone: the worker refuses to open one, and the engine refuses
+        // microphone sessions without admitting them or showing an indicator (AUDIO-v0 §1).
+        self.feed(Input::AudioMicrophoneSupport { available: false });
         self.send_grants();
         self.update_layout(false);
         loop {
@@ -431,7 +518,27 @@ impl Agent {
             }
             Event::Host(event) => self.on_host(event),
             Event::Paired(paired) => self.on_paired(paired),
+            Event::Audio(event) => self.on_audio(event),
         }
+    }
+
+    /// What the audio worker reports goes to the engine, which owns the policy: a stream that
+    /// failed ends, a device that didn't open refuses the session.
+    fn on_audio(&mut self, event: WorkerEvent) {
+        let input = match event {
+            WorkerEvent::DeviceOpened { key, kind, result } => {
+                if result.is_err() {
+                    tracing::info!(peer = %key.peer.short(), ?kind, "an audio device did not open");
+                }
+                Input::AudioDeviceOpened { key, kind, result }
+            }
+            WorkerEvent::StreamFailed { key } => {
+                tracing::warn!(peer = %key.peer.short(), "an audio stream failed");
+                Input::AudioStreamFailed { key }
+            }
+            WorkerEvent::Platform(event) => Input::Audio(event),
+        };
+        self.feed(input);
     }
 
     fn on_link(&mut self, event: LinkEvent) {
@@ -439,60 +546,23 @@ impl Agent {
             let _ = self.dest_media.send(DestCmd::Media { peer, data });
             return;
         }
+        // Audio datagrams go to the worker, which drops everything that isn't a started playback
+        // stream; the engine has no use for them.
+        if let LinkEvent::Audio { peer, packet } = event {
+            if let Some(audio) = &self.audio {
+                audio.packet(peer, packet);
+            }
+            return;
+        }
+        // A replacement connection's first Hello (the link itself never went down).
+        if let LinkEvent::HelloRefresh { peer, hello } = &event {
+            self.on_hello_refresh(*peer, hello);
+            return;
+        }
         match &event {
             LinkEvent::Control { peer, msg } => match msg {
                 ControlMessage::Hello(hello) => {
-                    let peer = *peer;
-                    // A Hello queued before a forget or revoke: close that link.
-                    if !self.trust.with(|t| t.get(peer).is_some()) {
-                        if let Some(mut link) = self.net.link(peer) {
-                            link.close("forgotten");
-                        }
-                        return;
-                    }
-                    let name = self
-                        .trust
-                        .with(|t| t.get(peer).map(|e| e.name.clone()))
-                        .unwrap_or_else(|| hello.name.clone());
-                    tracing::info!(peer = %peer.short(), %name, "peer connected");
-                    let info = self.peers.entry(peer).or_default();
-                    info.name = name;
-                    info.features = hello.features.clone();
-                    info.displays = hello.displays.clone();
-                    info.connected = true;
-                    if let Some(link) = self.net.link(peer) {
-                        self.links.insert(peer, link);
-                    }
-                    self.update_paths();
-                    self.feed(Input::PeerUp { peer });
-                    self.feed(Input::PeerDisplays {
-                        peer,
-                        displays: hello.displays.clone(),
-                    });
-                    // Revocations this node issued: the peer may have been offline then.
-                    // Skip devices paired here again since (e.g. with `trust add`).
-                    let due: Vec<RevocationNotice> = self
-                        .revocations
-                        .notices()
-                        .iter()
-                        .filter(|n| {
-                            n.revoked != peer && !self.trust.with(|t| t.get(n.revoked).is_some())
-                        })
-                        .cloned()
-                        .collect();
-                    if let Some(link) = self.links.get_mut(&peer) {
-                        for notice in due {
-                            let _ = link.send_control(&ControlMessage::Revocation(notice));
-                        }
-                    }
-                    // Tell the peer our view of the layout; it merges by version.
-                    self.update_layout(false);
-                    let explicit = self.explicit();
-                    if !explicit.is_empty()
-                        && let Some(link) = self.links.get_mut(&peer)
-                    {
-                        let _ = link.send_control(&ControlMessage::Layout(explicit));
-                    }
+                    self.on_hello(*peer, hello);
                     return;
                 }
                 ControlMessage::Displays(displays) => {
@@ -547,11 +617,19 @@ impl Agent {
             },
             LinkEvent::Closed { peer, error } => {
                 tracing::info!(peer = %peer.short(), ?error, "peer disconnected");
+                // Audio with this peer stops before the engine hears of the close, so nothing is
+                // still sent to or played for a connection that is gone (its devices go when the
+                // engine removes the peer).
+                if let Some(audio) = &self.audio {
+                    audio.cancel_peer(*peer);
+                }
                 self.links.remove(peer);
                 self.last_pong.remove(peer);
                 if let Some(info) = self.peers.get_mut(peer) {
                     info.connected = false;
                     info.rtt = None;
+                    // The engine drops its audio availability with the link.
+                    info.audio = false;
                 }
                 // Projections from this peer stay open through the grace period (WP-2.15); a
                 // resumed one starts a new stream whose sequence numbers start again, so the
@@ -563,6 +641,126 @@ impl Agent {
             _ => {}
         }
         self.feed(Input::Link(event));
+    }
+
+    /// Remember what `hello` says about `peer` (its name, features and displays, and the handle to
+    /// its link). `None`, after closing the link, if the peer is no longer trusted: a Hello queued
+    /// before a forget or a revoke. Otherwise whether the peer's displays changed.
+    fn cache_hello(&mut self, peer: NodeId, hello: &Hello) -> Option<bool> {
+        if !self.trust.with(|t| t.get(peer).is_some()) {
+            if let Some(mut link) = self.net.link(peer) {
+                link.close("forgotten");
+            }
+            return None;
+        }
+        let name = self
+            .trust
+            .with(|t| t.get(peer).map(|e| e.name.clone()))
+            .unwrap_or_else(|| hello.name.clone());
+        let displays_changed = self.peers.entry(peer).or_default().apply_hello(name, hello);
+        if let Some(link) = self.net.link(peer) {
+            self.links.insert(peer, link);
+        }
+        self.update_paths();
+        Some(displays_changed)
+    }
+
+    /// A peer's first `Hello` on a new logical link.
+    fn on_hello(&mut self, peer: NodeId, hello: &Hello) {
+        if self.cache_hello(peer, hello).is_none() {
+            return;
+        }
+        tracing::info!(peer = %peer.short(), name = %self.peer_label(peer), "peer connected");
+        self.feed(Input::PeerUp { peer });
+        // After `PeerUp`: the engine ignores audio availability for a peer that isn't up.
+        self.sync_audio_peer(peer);
+        self.feed(Input::PeerDisplays {
+            peer,
+            displays: hello.displays.clone(),
+        });
+        // Streams that outlived the previous link (E2's grace period) pick up the new features.
+        self.peer_features_changed(peer);
+        // Grants go out with the audio capabilities only once the connection has negotiated them,
+        // which is when its Hello has been seen (WP-3.6b).
+        self.send_grants();
+        // Revocations this node issued: the peer may have been offline then.
+        // Skip devices paired here again since (e.g. with `trust add`).
+        let due: Vec<RevocationNotice> = self
+            .revocations
+            .notices()
+            .iter()
+            .filter(|n| n.revoked != peer && !self.trust.with(|t| t.get(n.revoked).is_some()))
+            .cloned()
+            .collect();
+        if let Some(link) = self.links.get_mut(&peer) {
+            for notice in due {
+                let _ = link.send_control(&ControlMessage::Revocation(notice));
+            }
+        }
+        // Tell the peer our view of the layout; it merges by version.
+        self.update_layout(false);
+        let explicit = self.explicit();
+        if !explicit.is_empty()
+            && let Some(link) = self.links.get_mut(&peer)
+        {
+            let _ = link.send_control(&ControlMessage::Layout(explicit));
+        }
+    }
+
+    /// An authenticated connection silently replaced the one an announced link was using, and this
+    /// is its `Hello`, which may carry different features. The link never went down, so the
+    /// engine hears neither `Closed` nor `PeerUp`. The order matters:
+    ///
+    /// 1. the cache takes the new features and displays;
+    /// 2. the worker stops every stream with the peer (they were bound to the old connection),
+    ///    and then the engine is told, so it ends the sessions and keeps its identity counters;
+    /// 3. audio availability is re-evaluated from the new features;
+    /// 4. running video streams pick up the new features (after the cache update).
+    fn on_hello_refresh(&mut self, peer: NodeId, hello: &Hello) {
+        if !self.peers.get(&peer).is_some_and(|info| info.connected) {
+            // Not a link this node has announced to the engine: take it as the first Hello.
+            tracing::debug!(peer = %peer.short(), "refreshed Hello for an unannounced link");
+            self.on_hello(peer, hello);
+            return;
+        }
+        let Some(displays_changed) = self.cache_hello(peer, hello) else {
+            return;
+        };
+        tracing::info!(peer = %peer.short(), name = %self.peer_label(peer), "peer connection replaced");
+        if let Some(audio) = &self.audio {
+            audio.cancel_peer(peer);
+        }
+        self.feed(Input::AudioConnectionReplaced { peer });
+        self.sync_audio_peer(peer);
+        self.peer_features_changed(peer);
+        if displays_changed {
+            self.feed(Input::PeerDisplays {
+                peer,
+                displays: hello.displays.clone(),
+            });
+            self.update_layout(false);
+        }
+        // The new connection's audio capabilities for the grants only exist from its Hello on.
+        self.send_grants();
+    }
+
+    /// Tell the engine whether audio with `peer` is available (both `Hello`s advertise it), when
+    /// that differs from what it was last told. Only for a peer that is up.
+    fn sync_audio_peer(&mut self, peer: NodeId) {
+        let Some(info) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        let available = info.connected && audio_negotiated(&self.features, &info.features);
+        if info.audio == available {
+            return;
+        }
+        info.audio = available;
+        let name = info.name.clone();
+        self.feed(Input::AudioPeer {
+            peer,
+            name,
+            available,
+        });
     }
 
     fn execute(&mut self, outputs: Vec<Output>) {
@@ -878,8 +1076,67 @@ impl Agent {
                 }
                 let _ = self.dest_media.send(DestCmd::Forget(key));
             }
+            // Audio (D8): the worker carries these out off this loop and reports back through
+            // `Event::Audio`.
+            Output::AddAudioPeer { .. }
+            | Output::RemoveAudioPeer { .. }
+            | Output::OpenAudioCapture { .. }
+            | Output::CloseAudioCapture { .. }
+            | Output::OpenAudioPlayback { .. }
+            | Output::CloseAudioPlayback { .. }
+            | Output::StartAudioStream { .. }
+            | Output::StopAudioStream { .. } => self.audio_output(output),
+            Output::AudioIndicators {
+                microphones,
+                speakers,
+            } => {
+                // Speaker v0 hosts no microphone, so this list is empty. If it ever were not, the
+                // indicator is not acknowledged (`AudioIndicatorShown`): the engine's admission
+                // then fails closed and the microphone never opens.
+                if !microphones.is_empty() {
+                    tracing::warn!(
+                        count = microphones.len(),
+                        "microphone sessions listed but microphones are not supported: no indicator is shown"
+                    );
+                }
+                self.speakers = speakers;
+                // Show who is playing now, not at the next refresh.
+                self.tray.last_update = Instant::now()
+                    .checked_sub(TRAY_UPDATE)
+                    .unwrap_or_else(Instant::now);
+            }
             other => tracing::debug!(output = %variant(&other), "unhandled engine output"),
         }
+    }
+
+    /// Hand one audio output of the engine to the worker.
+    fn audio_output(&mut self, output: Output) {
+        let Some(audio) = &self.audio else {
+            // The engine only asks when audio is negotiated, which needs this node's worker. If
+            // it asks anyway, fail what it is waiting for rather than leave it hanging.
+            match output {
+                Output::OpenAudioPlayback { key } => {
+                    self.pending.push_back(Input::AudioDeviceOpened {
+                        key,
+                        kind: AudioKind::Speaker,
+                        result: Err(Failure::Other),
+                    })
+                }
+                Output::OpenAudioCapture { key } => {
+                    self.pending.push_back(Input::AudioDeviceOpened {
+                        key,
+                        kind: AudioKind::Microphone,
+                        result: Err(Failure::Other),
+                    })
+                }
+                Output::StartAudioStream { key, .. } => {
+                    self.pending.push_back(Input::AudioStreamFailed { key });
+                }
+                _ => {}
+            }
+            return;
+        };
+        audio.submit(output);
     }
 
     fn inject(&mut self, cmd: InjectCmd) -> bool {
@@ -952,6 +1209,15 @@ impl Agent {
                     peer_name(self, peer)
                 )
             }
+            Notice::SpeakerInUseBy(p) => {
+                format!("{} is playing sound on these speakers", peer_name(self, p))
+            }
+            Notice::MicInUseBy(p) => format!("{} is using this microphone", peer_name(self, p)),
+            // Both roles report a refusal with the other node as `peer`.
+            Notice::AudioRefused { peer, kind, reason } => format!(
+                "audio ({kind:?}) with {} refused: {reason:?}",
+                peer_name(self, peer)
+            ),
             other => format!("{other:?}"),
         };
         tracing::info!(notice = %text);
@@ -1166,6 +1432,7 @@ impl Agent {
                 .collect(),
             controlling: self.engine.controlling().map(|n| self.peer_label(n)),
             controlled_by: self.engine.controlled_by().map(|n| self.peer_label(n)),
+            speakers: self.speaker_peers().map(|n| self.peer_label(n)).collect(),
             disarmed: !self.engine.armed(),
             missing_permissions,
             pairing: PairingView {
@@ -1217,12 +1484,7 @@ impl Agent {
                 capability,
                 allow,
             } => {
-                let capability = match capability {
-                    Capability::InputAccept => "input",
-                    Capability::WindowShare => "share",
-                    Capability::WindowBrowse => "browse",
-                    _ => "present",
-                };
+                let capability = crate::ctl::capability_name(capability).unwrap_or("present");
                 let peer = name(self, peer);
                 self.on_ctl(Request::Allow {
                     peer,
@@ -1258,9 +1520,18 @@ impl Agent {
     }
 
     /// Start mDNS discovery (03 §2): advertise this node and dial candidates when a paired peer
-    /// is offline. Without it the agent runs on configured addresses.
+    /// is offline. Without it the agent runs on configured addresses. `CROSSPANE_DISCOVERY=0`
+    /// turns it off altogether: nothing is advertised, browsed or dialled from a discovered
+    /// address, so the agent only connects to configured or explicitly dialled addresses (test
+    /// harnesses use this to stay away from other agents on the network).
     pub fn start_discovery(&mut self) {
         use crosspane_transport::discovery::Discovery;
+        if discovery_switched_off(std::env::var("CROSSPANE_DISCOVERY").ok().as_deref()) {
+            tracing::info!(
+                "discovery off (CROSSPANE_DISCOVERY=0): connecting only to configured or explicit addresses"
+            );
+            return;
+        }
         let events = self.events.clone();
         match Discovery::start(
             self.port,
@@ -1352,6 +1623,15 @@ impl Agent {
             .map_or_else(|| node.short(), |info| info.name.clone())
     }
 
+    /// The peers playing sound on this machine's speakers now, each once, in node order.
+    fn speaker_peers(&self) -> impl Iterator<Item = NodeId> {
+        self.speakers
+            .iter()
+            .map(|key| key.peer)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+    }
+
     /// QUIC declares a silent path dead only after its idle timeout, which grows with the probe
     /// backoff (RFC 9000 §10.1: at least 3 PTOs), so a vanished peer (asleep, out of range) can
     /// look connected for a minute or more. A peer that answers pings but hasn't for
@@ -1413,12 +1693,10 @@ impl Agent {
         self.paths = paths;
     }
 
-    /// The video bitrate for streams to `peer`: the configured one, or one for its link class
-    /// (03 §7.4).
-    /// A peer's Hello features changed (a replacement connection with a new feature set): the
-    /// encoder switches its streams to that peer over (video on or off, region video, cursor
-    /// shapes). Called where a refreshed Hello is applied.
-    #[allow(dead_code)] // The caller lands with peer feature refresh (WP-3.6 follow-up).
+    /// A peer's Hello features changed (a replacement connection with a new feature set, or a
+    /// new link while E2 streams outlive the old one): the encoder switches its streams to that
+    /// peer over (video on or off, region video, cursor shapes). Called where a Hello is applied,
+    /// after the cache update.
     pub fn peer_features_changed(&mut self, peer: NodeId) {
         let has = |feature: &str| {
             self.peers
@@ -1433,6 +1711,8 @@ impl Agent {
         });
     }
 
+    /// The video bitrate for streams to `peer`: the configured one, or one for its link class
+    /// (03 §7.4).
     fn video_bits(&self, peer: NodeId) -> u32 {
         let mbps = self
             .video_mbps
@@ -1593,6 +1873,9 @@ impl Agent {
         // A node that can't inject (e.g. macOS without the Accessibility grant) refuses control
         // rather than accept a session whose input would go nowhere.
         let can_inject = self.platform.keys.is_some() && self.platform.pointer.is_some();
+        // Likewise a node without an audio worker grants neither the speakers nor the microphone:
+        // it never advertised `audio`, so nothing could be admitted anyway.
+        let can_play = self.audio.is_some();
         let grants: BTreeMap<NodeId, BTreeSet<Capability>> = self.trust.with(|t| {
             t.peers()
                 .into_iter()
@@ -1600,6 +1883,10 @@ impl Agent {
                     let mut granted = e.granted.clone();
                     if !can_inject {
                         granted.remove(&Capability::InputAccept);
+                    }
+                    if !can_play {
+                        granted.remove(&Capability::AudioSpeaker);
+                        granted.remove(&Capability::AudioMic);
                     }
                     (e.node, granted)
                 })
@@ -2068,16 +2355,8 @@ impl Agent {
                 capability,
                 allow,
             } => {
-                let capability = match capability.as_str() {
-                    "input" => Capability::InputAccept,
-                    "share" => Capability::WindowShare,
-                    "browse" => Capability::WindowBrowse,
-                    "present" => Capability::WindowPresent,
-                    other => {
-                        return Response::err(format!(
-                            "unknown capability {other}: use input, share, browse or present"
-                        ));
-                    }
+                let Some(capability) = crate::ctl::capability_named(&capability) else {
+                    return Response::err(crate::ctl::unknown_capability(&capability));
                 };
                 match self.find_peer(&peer) {
                     Some(node) => match self.trust.update(|t| {
@@ -2086,10 +2365,14 @@ impl Agent {
                     }) {
                         Ok(()) => {
                             self.send_grants();
-                            Response::ok(json!(format!(
+                            let mut text = format!(
                                 "{} {capability:?} for {peer}",
                                 if allow { "allowed" } else { "withdrew" }
-                            )))
+                            );
+                            if let Some(note) = crate::ctl::capability_note(capability) {
+                                text = format!("{text} ({note})");
+                            }
+                            Response::ok(json!(text))
                         }
                         Err(e) => Response::err(format!("could not update the trust store: {e}")),
                     },
@@ -2284,6 +2567,8 @@ impl Agent {
     /// their sessions at once instead of after the idle timeout.
     fn shutdown(&mut self) {
         tracing::info!("stopping");
+        // The panic ends every audio session too (the engine stops and closes each one, which the
+        // worker carries out), so the worker has nothing running when it is shut down below.
         self.feed(Input::Command(Command::Panic));
         if let Some(parking) = self.platform.parking.as_mut() {
             match parking.recover() {
@@ -2294,6 +2579,40 @@ impl Agent {
             }
         }
         self.net.shutdown();
+        // Last: peers already heard of the close, and the worker's stop is bounded (2.5 s) but
+        // can be slower than the rest of this.
+        if let Some(audio) = self.audio.take() {
+            audio.shutdown();
+        }
+    }
+
+    /// The audio part of `status`: whether this node shares audio at all (speakers only in v0),
+    /// who plays on its speakers, and the worker's counters (never samples).
+    fn audio_status(&self) -> Value {
+        let Some(audio) = &self.audio else {
+            return json!({ "enabled": false });
+        };
+        let s = audio.stats();
+        json!({
+            "enabled": true,
+            "speakers_in_use": self.speaker_peers().map(|n| self.peer_label(n)).collect::<Vec<_>>(),
+            "counters": {
+                "sent": s.sent,
+                "congested": s.congested,
+                "received_unknown": s.rx_unknown,
+                "received_overflow": s.rx_overflow,
+                "received_rejected": s.rx_rejected,
+                "played_frames": s.played,
+                "playback_overflow": s.playback_overflow,
+                "discarded_samples": s.discarded_samples,
+                "sanitized_frames": s.sanitized_frames,
+                "stale_replies": s.stale_replies,
+                "commands_over_cap": s.commands_over_cap,
+                "sessions_created": s.sessions_created,
+                "encoders_created": s.encoders_created,
+                "jitters_created": s.jitters_created,
+            },
+        })
     }
 
     fn status(&self) -> Value {
@@ -2320,15 +2639,12 @@ impl Agent {
                 "displays": info.displays.iter().map(display_json).collect::<Vec<_>>(),
                 "features": info.features,
                 "grants": self.trust.with(|t| t.peers().iter().find(|e| e.node == *node).map(|e| {
-                    e.granted.iter().filter_map(|c| match c {
-                        Capability::InputAccept => Some("input"),
-                        Capability::WindowShare => Some("share"),
-                        Capability::WindowBrowse => Some("browse"),
-                        Capability::WindowPresent => Some("present"),
-                        _ => None,
-                    }).collect::<Vec<_>>()
+                    e.granted.iter().filter_map(|c| crate::ctl::capability_name(*c)).collect::<Vec<_>>()
                 }).unwrap_or_default()),
+                // This peer is playing sound on this machine's speakers now.
+                "speaker_in_use": self.speakers.iter().any(|key| key.peer == *node),
             })).collect::<Vec<_>>(),
+            "audio": self.audio_status(),
             "layout": self.placements.iter().map(|p| json!({
                 "node": p.node.short(),
                 "display": p.display.0,
@@ -2662,5 +2978,889 @@ mod tests {
         assert_eq!(find("1111"), Some(NodeId([0x11; 32])));
         let shared = [(NodeId([0x11; 32]), "a"), (NodeId([0x11; 32]), "b")];
         assert_eq!(resolve("1111", shared.iter().copied()), None);
+    }
+}
+
+/// The agent's audio routing (WP-3.6d), driven in-process: a real engine and agent loop, with a
+/// recorder in place of the audio worker, so the order of the calls is what is checked.
+#[cfg(test)]
+mod audio_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
+
+    use crosspane_engine::EngineConfig;
+    use crosspane_engine::io::AudioEndpoint;
+    use crosspane_input::journal::MemoryJournal;
+    use crosspane_platform::{
+        AudioEvent, Displays, IoGate, LockState, Permissions, SessionEvent, SessionEvents,
+        SessionState,
+    };
+    use crosspane_protocol::link::LinkError;
+    use crosspane_security::identity::DeviceIdentity;
+    use crosspane_security::trust::{PeerEntry, default_grants};
+    use crosspane_types::audio::AudioStreamId;
+
+    use super::*;
+
+    fn features(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn only_a_zero_switches_discovery_off() {
+        assert!(discovery_switched_off(Some("0")));
+        for other in [None, Some(""), Some("1"), Some("off"), Some("00")] {
+            assert!(!discovery_switched_off(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn audio_needs_the_feature_on_both_sides() {
+        let audio = features(&["e1", "audio"]);
+        let plain = features(&["e1", "cursor", "h264"]);
+        assert!(audio_negotiated(&audio, &audio));
+        assert!(!audio_negotiated(&audio, &plain));
+        assert!(!audio_negotiated(&plain, &audio));
+        assert!(!audio_negotiated(&plain, &plain));
+        assert!(!audio_negotiated(&[], &audio));
+        assert!(!audio_negotiated(&audio, &[]));
+        // The name is exact.
+        let near = features(&["Audio", "audio2", "audio.speaker"]);
+        assert!(!audio_negotiated(&audio, &near));
+    }
+
+    #[test]
+    fn a_hello_replaces_what_the_cache_knew_and_reports_changed_displays() {
+        let mut info = PeerInfo::default();
+        let mut hello = Hello {
+            minor: crosspane_protocol::PROTOCOL_MINOR,
+            name: "x".into(),
+            features: features(&["e1", "audio"]),
+            displays: Vec::new(),
+        };
+        assert!(!info.apply_hello("peer".into(), &hello));
+        assert_eq!(info.name, "peer");
+        assert_eq!(info.features, features(&["e1", "audio"]));
+        assert!(info.connected);
+        hello.features = features(&["e1"]);
+        assert!(!info.apply_hello("peer".into(), &hello));
+        assert_eq!(info.features, features(&["e1"]));
+    }
+
+    /// What the agent asked of the audio worker.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Call {
+        Submit(Output),
+        Packet(NodeId, AudioStreamId),
+        Cancel(NodeId),
+        Shutdown,
+    }
+
+    impl Call {
+        fn label(&self) -> &'static str {
+            match self {
+                Call::Submit(Output::AddAudioPeer { .. }) => "add",
+                Call::Submit(Output::RemoveAudioPeer { .. }) => "remove",
+                Call::Submit(Output::OpenAudioPlayback { .. }) => "open-playback",
+                Call::Submit(Output::CloseAudioPlayback { .. }) => "close-playback",
+                Call::Submit(Output::OpenAudioCapture { .. }) => "open-capture",
+                Call::Submit(Output::CloseAudioCapture { .. }) => "close-capture",
+                Call::Submit(Output::StartAudioStream {
+                    endpoint: AudioEndpoint::VirtualSpeaker,
+                    ..
+                }) => "start-virtual-speaker",
+                Call::Submit(Output::StartAudioStream {
+                    endpoint: AudioEndpoint::LocalPlayback,
+                    ..
+                }) => "start-playback",
+                Call::Submit(Output::StartAudioStream { .. }) => "start-other",
+                Call::Submit(Output::StopAudioStream { .. }) => "stop",
+                Call::Submit(_) => "other",
+                Call::Packet(..) => "packet",
+                Call::Cancel(_) => "cancel",
+                Call::Shutdown => "shutdown",
+            }
+        }
+    }
+
+    /// Stands in for the worker: records the calls, in order.
+    struct Recorder(Arc<Mutex<Vec<Call>>>);
+
+    impl Recorder {
+        fn push(&self, call: Call) {
+            self.0.lock().unwrap().push(call);
+        }
+    }
+
+    impl AudioPlane for Recorder {
+        fn submit(&self, output: Output) {
+            self.push(Call::Submit(output));
+        }
+
+        fn packet(&self, peer: NodeId, packet: AudioPacket) {
+            self.push(Call::Packet(peer, packet.stream));
+        }
+
+        fn cancel_peer(&self, peer: NodeId) {
+            self.push(Call::Cancel(peer));
+        }
+
+        fn stats(&self) -> WorkerStats {
+            WorkerStats::default()
+        }
+
+        fn shutdown(self: Box<Self>) {
+            self.push(Call::Shutdown);
+        }
+    }
+
+    struct FakeSession;
+
+    impl SessionEvents for FakeSession {
+        fn state(&self) -> SessionState {
+            SessionState {
+                lock: LockState::Unlocked,
+                active: Some(true),
+            }
+        }
+
+        fn subscribe(&mut self, _: Arc<dyn EventSink<SessionEvent>>) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    struct FakeDisplays;
+
+    impl Displays for FakeDisplays {
+        fn displays(&self) -> Result<Vec<DisplayInfo>, PlatformError> {
+            Ok(Vec::new())
+        }
+
+        fn subscribe(
+            &mut self,
+            _: Arc<dyn EventSink<Vec<DisplayInfo>>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    struct FakePermissions;
+
+    impl Permissions for FakePermissions {
+        fn required(&self) -> Vec<Permission> {
+            Vec::new()
+        }
+
+        fn state(&self, _: Permission) -> PermissionState {
+            PermissionState::Granted
+        }
+
+        fn request(&mut self, _: Permission) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn subscribe(
+            &mut self,
+            _: Arc<dyn EventSink<(Permission, PermissionState)>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    /// A scratch directory, removed afterwards.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "crosspane-agent-audio-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One agent with one trusted peer ("peer-name"), and the recorder in place of the worker.
+    struct Rig {
+        agent: Agent,
+        calls: Arc<Mutex<Vec<Call>>>,
+        source: mpsc::Receiver<SourceCmd>,
+        local: NodeId,
+        peer: NodeId,
+        // Kept so the channels stay open, and the directory until the end.
+        _events: mpsc::Receiver<Event>,
+        _dest: mpsc::Receiver<DestCmd>,
+        _dir: TempDir,
+    }
+
+    const AUDIO: &[&str] = &["e1", "cursor", "audio"];
+
+    fn rig(local_audio: bool) -> Rig {
+        let dir = TempDir::new();
+        let identity = Arc::new(DeviceIdentity::generate().unwrap());
+        let peer_identity = DeviceIdentity::generate().unwrap();
+        let (local, peer) = (identity.node(), peer_identity.node());
+        let trust = SharedTrust::load(dir.0.join("trust.json")).unwrap();
+        trust
+            .update(|t| {
+                t.pin(PeerEntry {
+                    node: peer,
+                    spki: peer_identity.spki().to_vec(),
+                    name: "peer-name".into(),
+                    granted: default_grants(),
+                    paired_at_ms: 1,
+                })
+                .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .unwrap();
+        let mut advertised = features(&["e1", "cursor"]);
+        if local_audio {
+            advertised.push("audio".to_owned());
+        }
+        let (tx, events) = mpsc::channel();
+        let hello = Hello {
+            minor: crosspane_protocol::PROTOCOL_MINOR,
+            name: "local".into(),
+            features: advertised.clone(),
+            displays: Vec::new(),
+        };
+        let pins: Arc<dyn crosspane_transport::PinStore> = Arc::new(trust.clone());
+        let net = Net::start(0, identity.clone(), pins, hello, tx.clone()).unwrap();
+        let (engine, _) = Engine::new(
+            EngineConfig::new(local),
+            Box::new(MemoryJournal::default()),
+            Box::new(MemoryJournal::default()),
+            platform::now(),
+        )
+        .unwrap();
+        let (source_tx, source) = mpsc::channel();
+        let (dest_tx, dest) = mpsc::channel();
+        let platform = Platform {
+            gate: IoGate::new(),
+            session: Box::new(FakeSession),
+            displays: Box::new(FakeDisplays),
+            capture: None,
+            keys: None,
+            pointer: None,
+            overlay: None,
+            hotkeys: None,
+            keystore: None,
+            permissions: Box::new(FakePermissions),
+            windows: None,
+            parking: None,
+            frames: None,
+            tray: None,
+            links: None,
+            gpu: None,
+        };
+        let e2 = E2Wiring {
+            source_media: source_tx,
+            dest_media: dest_tx,
+            host: None,
+            proxy_ids: ProxyIds::default(),
+            events: tx,
+            crossing: true,
+            latency_overlay: false,
+            video_mbps: None,
+            identity,
+            port: 0,
+            revocations: crate::revocations::Issued::load(dir.0.join("revocations.json")),
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let audio = local_audio.then(|| Box::new(Recorder(calls.clone())) as Box<dyn AudioPlane>);
+        let mut agent = Agent::new(
+            local,
+            "local".into(),
+            engine,
+            platform,
+            net,
+            trust,
+            Vec::new(),
+            e2,
+            advertised,
+            audio,
+        );
+        // An unlocked, active session: the audio engine's gate opens.
+        agent.feed(Input::Session(SessionEvent::State(SessionState {
+            lock: LockState::Unlocked,
+            active: Some(true),
+        })));
+        Rig {
+            agent,
+            calls,
+            source,
+            local,
+            peer,
+            _events: events,
+            _dest: dest,
+            _dir: dir,
+        }
+    }
+
+    impl Rig {
+        fn hello_msg(names: &[&str]) -> Hello {
+            Hello {
+                minor: crosspane_protocol::PROTOCOL_MINOR,
+                name: "peer-announced".into(),
+                features: features(names),
+                displays: Vec::new(),
+            }
+        }
+
+        /// The peer's first Hello on a new link.
+        fn hello(&mut self, names: &[&str]) {
+            self.control(ControlMessage::Hello(Rig::hello_msg(names)));
+        }
+
+        /// A replacement connection's Hello.
+        fn refresh(&mut self, names: &[&str]) {
+            self.agent.on_link(LinkEvent::HelloRefresh {
+                peer: self.peer,
+                hello: Rig::hello_msg(names),
+            });
+        }
+
+        fn close(&mut self) {
+            self.agent.on_link(LinkEvent::Closed {
+                peer: self.peer,
+                error: LinkError::Closed,
+            });
+        }
+
+        fn control(&mut self, msg: ControlMessage) {
+            self.agent.on_link(LinkEvent::Control {
+                peer: self.peer,
+                msg,
+            });
+        }
+
+        fn worker_says(&mut self, event: WorkerEvent) {
+            self.agent.on_event(Event::Audio(event));
+        }
+
+        /// What the agent asked of the worker so far, as short labels.
+        fn labels(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().iter().map(Call::label).collect()
+        }
+
+        /// The `PeerFeatures` the encoder was sent since the last call: (video, region, cursor).
+        fn features_sent(&self) -> Vec<(bool, bool, bool)> {
+            self.source
+                .try_iter()
+                .filter_map(|cmd| match cmd {
+                    SourceCmd::PeerFeatures {
+                        video,
+                        region,
+                        cursor,
+                        ..
+                    } => Some((video, region, cursor)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The stream ID this node allocates first (odd for the smaller node ID).
+        fn own_stream(&self, n: u16) -> AudioStreamId {
+            AudioStreamId(if self.local < self.peer { 1 } else { 2 } + 2 * n)
+        }
+
+        /// The stream ID the peer allocates first.
+        fn peer_stream(&self, n: u16) -> AudioStreamId {
+            AudioStreamId(if self.peer < self.local { 1 } else { 2 } + 2 * n)
+        }
+
+        /// An app on this machine starts or stops using the peer's virtual speakers.
+        fn speakers_active(&mut self, active: bool) {
+            self.worker_says(WorkerEvent::Platform(AudioEvent::VirtualActive {
+                peer: self.peer,
+                kind: AudioKind::Speaker,
+                active,
+            }));
+        }
+
+        /// The peer opens its `n`th speaker stream to this machine's speakers.
+        fn peer_opens_speakers(&mut self, n: u16) {
+            let stream = self.peer_stream(n);
+            self.control(ControlMessage::AudioOpen {
+                stream,
+                kind: AudioKind::Speaker,
+                channels: 2,
+            });
+        }
+
+        fn grant(&mut self, capability: &str, allow: bool) -> Response {
+            self.agent.on_ctl(Request::Allow {
+                peer: "peer-name".into(),
+                capability: capability.into(),
+                allow,
+            })
+        }
+
+        /// The key of the last `OpenAudioPlayback` the worker was asked for.
+        fn opened_key(&self) -> AudioKey {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|call| match call {
+                    Call::Submit(Output::OpenAudioPlayback { key }) => Some(*key),
+                    _ => None,
+                })
+                .expect("the worker was asked to open a playback")
+        }
+    }
+
+    #[test]
+    fn a_hello_with_audio_on_both_sides_adds_the_peer_and_updates_the_encoder() {
+        let mut rig = rig(true);
+        rig.hello(&["e1", "cursor", "h264", "audio"]);
+        assert_eq!(rig.labels(), ["add"]);
+        assert_eq!(
+            rig.calls.lock().unwrap()[0],
+            Call::Submit(Output::AddAudioPeer {
+                peer: rig.peer,
+                // The name on the devices is the trusted name, not the one the Hello announced.
+                name: "peer-name".into(),
+            })
+        );
+        assert_eq!(rig.features_sent(), [(true, false, true)]);
+    }
+
+    #[test]
+    fn no_audio_on_either_side_means_no_virtual_devices() {
+        let mut peer_without = rig(true);
+        peer_without.hello(&["e1", "cursor"]);
+        assert!(peer_without.labels().is_empty());
+
+        // This node without a worker never advertised `audio`, whatever the peer says.
+        let mut node_without = rig(false);
+        node_without.hello(AUDIO);
+        assert!(node_without.labels().is_empty());
+        // Audio datagrams and refreshes are harmless then.
+        node_without.agent.on_link(LinkEvent::Audio {
+            peer: node_without.peer,
+            packet: AudioPacket {
+                stream: AudioStreamId(1),
+                seq: 0,
+                sample_time: 0,
+                opus: vec![0; 8],
+            },
+        });
+        node_without.refresh(AUDIO);
+        assert!(node_without.labels().is_empty());
+        // The status says audio is off, and never lists a speaker in use.
+        let status = node_without.agent.status();
+        assert_eq!(status["audio"], json!({ "enabled": false }));
+        assert_eq!(status["peers"][0]["speaker_in_use"], json!(false));
+    }
+
+    #[test]
+    fn a_refresh_cancels_the_worker_then_tells_the_engine_then_updates_the_encoder() {
+        let mut rig = rig(true);
+        rig.hello(&["e1", "audio"]);
+        // An app plays into the peer's speakers: the engine opens a stream, and the peer agrees.
+        rig.speakers_active(true);
+        let first = rig.own_stream(0);
+        rig.control(ControlMessage::AudioOpened { stream: first });
+        assert_eq!(rig.labels(), ["add", "start-virtual-speaker"]);
+        assert_eq!(rig.features_sent(), [(false, false, false)]);
+
+        rig.refresh(&["e1", "h264", "audio"]);
+        // The worker stops first; only then does the engine end the session it was told is over.
+        // The peer stays available: no remove, no second add.
+        assert_eq!(
+            rig.labels(),
+            ["add", "start-virtual-speaker", "cancel", "stop"]
+        );
+        // The encoder gets the refreshed features, from the refreshed cache.
+        assert_eq!(rig.features_sent(), [(true, false, false)]);
+
+        // The demand latch is retained: nothing restarts until the app goes inactive and active
+        // again, and then the stream ID continues (never reused after a replacement).
+        rig.speakers_active(true);
+        assert_eq!(rig.labels().len(), 4);
+        rig.speakers_active(false);
+        rig.speakers_active(true);
+        rig.control(ControlMessage::AudioOpened {
+            stream: rig.own_stream(0),
+        });
+        assert_eq!(rig.labels().len(), 4, "the old stream ID is not reused");
+        rig.control(ControlMessage::AudioOpened {
+            stream: rig.own_stream(1),
+        });
+        assert_eq!(
+            rig.labels(),
+            [
+                "add",
+                "start-virtual-speaker",
+                "cancel",
+                "stop",
+                "start-virtual-speaker"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_changes_audio_availability_follows_the_new_features() {
+        let mut dropped = rig(true);
+        dropped.hello(&["e1", "audio"]);
+        dropped.refresh(&["e1"]);
+        assert_eq!(dropped.labels(), ["add", "cancel", "remove"]);
+        // Nothing more is said while the state doesn't change.
+        dropped.refresh(&["e1"]);
+        assert_eq!(dropped.labels(), ["add", "cancel", "remove", "cancel"]);
+
+        let mut gained = rig(true);
+        gained.hello(&["e1"]);
+        assert!(gained.labels().is_empty());
+        gained.refresh(&["e1", "audio"]);
+        assert_eq!(gained.labels(), ["cancel", "add"]);
+    }
+
+    #[test]
+    fn a_refresh_is_not_a_reconnect() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        rig.refresh(AUDIO);
+        assert_eq!(rig.labels(), ["add", "cancel"]);
+        // The link is still the one the engine knows: a later close removes the peer once.
+        rig.close();
+        assert_eq!(rig.labels(), ["add", "cancel", "cancel", "remove"]);
+    }
+
+    #[test]
+    fn closing_the_link_cancels_the_worker_before_the_engine_removes_the_peer() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        rig.speakers_active(true);
+        rig.control(ControlMessage::AudioOpened {
+            stream: rig.own_stream(0),
+        });
+        rig.close();
+        assert_eq!(
+            rig.labels(),
+            ["add", "start-virtual-speaker", "cancel", "stop", "remove"]
+        );
+        // A new link negotiates audio again, from scratch.
+        rig.hello(AUDIO);
+        assert_eq!(
+            rig.labels(),
+            [
+                "add",
+                "start-virtual-speaker",
+                "cancel",
+                "stop",
+                "remove",
+                "add"
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_datagrams_go_to_the_worker() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        rig.agent.on_link(LinkEvent::Audio {
+            peer: rig.peer,
+            packet: AudioPacket {
+                stream: AudioStreamId(7),
+                seq: 3,
+                sample_time: 480 * 3,
+                opus: vec![1; 8],
+            },
+        });
+        assert_eq!(
+            rig.calls.lock().unwrap().last(),
+            Some(&Call::Packet(rig.peer, AudioStreamId(7)))
+        );
+    }
+
+    #[test]
+    fn worker_reports_reach_the_engine_and_the_indicators_the_tray_and_status() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        assert!(rig.grant("speaker", true).ok);
+        rig.peer_opens_speakers(0);
+        assert_eq!(rig.labels(), ["add", "open-playback"]);
+        // The engine's indicator and notice name the peer.
+        assert_eq!(rig.agent.speakers.len(), 1);
+        let view = rig.agent.tray_view();
+        assert_eq!(view.speakers, ["peer-name"]);
+        let status = rig.agent.status();
+        assert_eq!(status["peers"][0]["speaker_in_use"], json!(true));
+        assert_eq!(status["audio"]["speakers_in_use"], json!(["peer-name"]));
+        assert!(
+            rig.agent
+                .notices
+                .iter()
+                .any(|n| n == "peer-name is playing sound on these speakers")
+        );
+
+        // The device opened: the stream starts on the playback.
+        let key = rig.opened_key();
+        rig.worker_says(WorkerEvent::DeviceOpened {
+            key,
+            kind: AudioKind::Speaker,
+            result: Ok(()),
+        });
+        assert_eq!(rig.labels(), ["add", "open-playback", "start-playback"]);
+
+        // The stream fails: the engine ends it, and the indicator clears.
+        rig.worker_says(WorkerEvent::StreamFailed { key });
+        assert_eq!(
+            rig.labels(),
+            [
+                "add",
+                "open-playback",
+                "start-playback",
+                "stop",
+                "close-playback"
+            ]
+        );
+        assert!(rig.agent.speakers.is_empty());
+        assert!(rig.agent.tray_view().speakers.is_empty());
+        assert_eq!(
+            rig.agent.status()["peers"][0]["speaker_in_use"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn a_device_that_does_not_open_ends_the_session() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        assert!(rig.grant("speaker", true).ok);
+        rig.peer_opens_speakers(0);
+        let key = rig.opened_key();
+        rig.worker_says(WorkerEvent::DeviceOpened {
+            key,
+            kind: AudioKind::Speaker,
+            result: Err(Failure::Other),
+        });
+        assert_eq!(
+            rig.labels(),
+            ["add", "open-playback", "stop", "close-playback"]
+        );
+        assert!(rig.agent.speakers.is_empty());
+    }
+
+    #[test]
+    fn a_granted_incoming_microphone_request_opens_nothing() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        // Both grants are stored; only the speakers can be served.
+        assert!(rig.grant("speaker", true).ok);
+        assert!(rig.grant("mic", true).ok);
+        let stream = rig.peer_stream(0);
+        rig.control(ControlMessage::AudioOpen {
+            stream,
+            kind: AudioKind::Microphone,
+            channels: 1,
+        });
+        // No capture is opened, started or closed, no stream starts, and no indicator is listed.
+        assert_eq!(rig.labels(), ["add"]);
+        assert!(rig.agent.speakers.is_empty());
+        let notices: Vec<&String> = rig.agent.notices.iter().collect();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("Microphone") && n.contains("refused")),
+            "{notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|n| n.contains("using this microphone")),
+            "no microphone is in use: {notices:?}"
+        );
+        // The refused request used its ID up, but speakers still work with the next one.
+        rig.peer_opens_speakers(1);
+        assert_eq!(rig.labels(), ["add", "open-playback"]);
+    }
+
+    #[test]
+    fn an_app_recording_from_the_virtual_microphone_is_refused_locally() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        assert!(rig.grant("mic", true).ok);
+        rig.worker_says(WorkerEvent::Platform(AudioEvent::VirtualActive {
+            peer: rig.peer,
+            kind: AudioKind::Microphone,
+            active: true,
+        }));
+        // Nothing is asked of the worker (no virtual microphone is fed, no capture opened), and
+        // the user is told.
+        assert_eq!(rig.labels(), ["add"]);
+        assert!(
+            rig.agent
+                .notices
+                .iter()
+                .any(|n| n.contains("Microphone") && n.contains("refused")),
+            "{:?}",
+            rig.agent.notices
+        );
+    }
+
+    #[test]
+    fn a_speaker_session_is_refused_without_the_grant() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        rig.peer_opens_speakers(0);
+        assert_eq!(rig.labels(), ["add"]);
+        assert!(rig.agent.speakers.is_empty());
+    }
+
+    #[test]
+    fn grants_are_sent_to_the_engine_again_after_a_hello_and_after_a_refresh() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        // The grant changes behind the agent's back (the trust file was edited): the engine only
+        // learns it from a fresh `Grants` input.
+        let peer = rig.peer;
+        rig.agent
+            .trust
+            .update(|t| {
+                t.set_grant(peer, Capability::AudioSpeaker, true)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .unwrap();
+        rig.peer_opens_speakers(0);
+        assert_eq!(
+            rig.labels(),
+            ["add"],
+            "refused: the engine has no grant yet"
+        );
+
+        // A refresh re-sends the grants.
+        rig.refresh(AUDIO);
+        rig.peer_opens_speakers(1);
+        assert_eq!(rig.labels(), ["add", "cancel", "open-playback"]);
+
+        // So does an ordinary Hello on a new link (the grant is withdrawn behind its back).
+        rig.agent
+            .trust
+            .update(|t| {
+                t.set_grant(peer, Capability::AudioSpeaker, false)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .unwrap();
+        rig.close();
+        rig.hello(AUDIO);
+        let before = rig.labels().len();
+        rig.peer_opens_speakers(2);
+        assert_eq!(rig.labels().len(), before, "refused again: no grant");
+    }
+
+    #[test]
+    fn allow_speaker_and_mic_set_the_audio_grants() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        let granted = |rig: &Rig| -> Vec<Capability> {
+            rig.agent
+                .trust
+                .with(|t| t.get(rig.peer).unwrap().granted.iter().copied().collect())
+        };
+        let response = rig.grant("speaker", true);
+        assert!(response.ok, "{response:?}");
+        assert!(granted(&rig).contains(&Capability::AudioSpeaker));
+        let status = rig.agent.status();
+        assert!(
+            status["peers"][0]["grants"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("speaker"))
+        );
+
+        // The microphone grant is stored, and the answer says it does nothing yet.
+        let response = rig.grant("mic", true);
+        assert!(response.ok);
+        assert!(
+            response
+                .result
+                .as_str()
+                .unwrap()
+                .contains("not supported yet"),
+            "{response:?}"
+        );
+        assert!(granted(&rig).contains(&Capability::AudioMic));
+        assert!(
+            rig.agent.status()["peers"][0]["grants"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("mic"))
+        );
+
+        let response = rig.grant("speaker", false);
+        assert!(response.ok);
+        assert!(!granted(&rig).contains(&Capability::AudioSpeaker));
+
+        let response = rig.grant("sound", true);
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("speaker"));
+    }
+
+    #[test]
+    fn stopping_ends_the_audio_sessions_first_and_then_the_worker() {
+        let mut rig = rig(true);
+        rig.hello(AUDIO);
+        rig.speakers_active(true);
+        rig.control(ControlMessage::AudioOpened {
+            stream: rig.own_stream(0),
+        });
+        rig.agent.shutdown();
+        // The panic stops the stream (the worker carries it out); then the worker is shut down.
+        assert_eq!(
+            rig.labels(),
+            ["add", "start-virtual-speaker", "stop", "shutdown"]
+        );
+    }
+
+    #[test]
+    fn a_node_without_a_worker_fails_what_the_engine_waits_for() {
+        // Not reachable through the Hello rule; this is the guard if it ever were.
+        let mut rig = rig(false);
+        let key = AudioKey {
+            peer: rig.peer,
+            stream: AudioStreamId(1),
+            generation: 1,
+        };
+        rig.agent.execute(vec![
+            Output::OpenAudioPlayback { key },
+            Output::OpenAudioCapture { key },
+            Output::StartAudioStream {
+                key,
+                kind: AudioKind::Speaker,
+                endpoint: AudioEndpoint::VirtualSpeaker,
+            },
+        ]);
+        let pending: Vec<Input> = rig.agent.pending.iter().cloned().collect();
+        assert_eq!(
+            pending,
+            [
+                Input::AudioDeviceOpened {
+                    key,
+                    kind: AudioKind::Speaker,
+                    result: Err(Failure::Other),
+                },
+                Input::AudioDeviceOpened {
+                    key,
+                    kind: AudioKind::Microphone,
+                    result: Err(Failure::Other),
+                },
+                Input::AudioStreamFailed { key },
+            ]
+        );
     }
 }

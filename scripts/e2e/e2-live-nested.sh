@@ -13,6 +13,10 @@
 #   2. return  → the window is back and the twin output is gone;
 #   3. project again, then SIGTERM the source agent → the clean shutdown restores the window.
 set -euo pipefail
+# Test agents stay off the machine's audio server and off mDNS (the agents here connect to
+# configured or explicit loopback addresses only), so they never touch the real PipeWire or the
+# deployed agents.
+export CROSSPANE_AUDIO=0 CROSSPANE_DISCOVERY=0
 : "${HYPRLAND_INSTANCE_SIGNATURE:?run this from the live Hyprland session}"
 repo=$(cd "$(dirname "$0")/../.." && pwd -P)
 cd "$repo"

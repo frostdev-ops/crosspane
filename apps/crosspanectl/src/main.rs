@@ -85,7 +85,9 @@ enum Command {
         #[arg(long)]
         menu: Option<String>,
     },
-    /// Let a peer use a capability here (input, share, browse, present), or stop with --off.
+    /// Let a peer use a capability here, or stop with --off: input, share, browse, present,
+    /// speaker (play sound on this machine's speakers) or mic (stored, but microphones are not
+    /// supported yet).
     Allow {
         peer: String,
         capability: String,
@@ -642,6 +644,25 @@ fn print_status(s: &Value) {
             },
             rtt
         );
+        if let Some(grants) = p["grants"].as_array() {
+            let grants: Vec<&str> = grants.iter().filter_map(Value::as_str).collect();
+            println!(
+                "    allowed here: {}",
+                if grants.is_empty() {
+                    "nothing".to_owned()
+                } else {
+                    grants.join(", ")
+                }
+            );
+        }
+        if p["speaker_in_use"] == json!(true) {
+            println!("    playing sound on this machine's speakers now");
+        }
+    }
+    match s["audio"]["enabled"].as_bool() {
+        Some(true) => println!("  audio: speakers (microphones are not supported yet)"),
+        Some(false) => println!("  audio: off"),
+        None => {}
     }
     for l in s["layout"].as_array().into_iter().flatten() {
         println!(

@@ -12,6 +12,10 @@
 #   2. return all four → every proxy closes, A's windows are where they were, the journal is empty;
 #   3. project two again, then SIGTERM A → B's proxies close and A restores both.
 set -euo pipefail
+# Test agents stay off the machine's audio server and off mDNS (the agents here connect to
+# configured or explicit loopback addresses only), so they never touch the real PipeWire or the
+# deployed agents.
+export CROSSPANE_AUDIO=0 CROSSPANE_DISCOVERY=0
 repo=$(cd "$(dirname "$0")/../.." && pwd -P)
 cd "$repo"
 work=${XDG_RUNTIME_DIR:?}/cp-e2e-multi

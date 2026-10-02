@@ -80,6 +80,37 @@ fn off_main<T: Send>(
     })
 }
 
+/// Audio sharing is on unless `CROSSPANE_AUDIO=0` (an escape hatch, and how test harnesses keep an
+/// agent off the machine's audio server).
+fn audio_enabled() -> bool {
+    std::env::var("CROSSPANE_AUDIO").as_deref() != Ok("0")
+}
+
+/// This OS's audio backend for speaker v0 (AUDIO-v0 §4): PipeWire on Linux, CoreAudio on macOS.
+/// Constructing it connects to the audio server, so with `CROSSPANE_AUDIO=0` nothing is touched.
+/// `None` (and a log line) when it can't start: the node then doesn't advertise `audio`, and peers
+/// see it as a machine without audio sharing. The backend refuses to open a device while `gate` is
+/// closed (04 §7).
+pub fn audio_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::AudioHost>> {
+    if !audio_enabled() {
+        tracing::info!("audio sharing is off (CROSSPANE_AUDIO=0)");
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let host = crosspane_platform_linux::audio::PipeWireAudioHost::new(gate)
+        .map(|h| Box::new(h) as Box<dyn crosspane_platform::AudioHost>);
+    #[cfg(target_os = "macos")]
+    let host = crosspane_platform_macos::audio::CoreAudioHost::new(gate)
+        .map(|h| Box::new(h) as Box<dyn crosspane_platform::AudioHost>);
+    match host {
+        Ok(host) => Some(host),
+        Err(e) => {
+            tracing::info!(error = %e, "no audio backend: audio sharing is off");
+            None
+        }
+    }
+}
+
 /// The video codecs for E2's motion path (WP-2.14), if this build and machine have them. With the
 /// source GPU, NVENC takes NV12 straight from GPU memory (WP-2.29).
 pub fn video_codecs(

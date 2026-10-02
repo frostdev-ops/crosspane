@@ -4,6 +4,10 @@
 # revokes C, B restarts and gets the notice on reconnect. Revoked nodes are disconnected and can't
 # come back.
 set -euo pipefail
+# Test agents stay off the machine's audio server and off mDNS (the agents here connect to
+# configured or explicit loopback addresses only), so they never touch the real PipeWire or the
+# deployed agents.
+export CROSSPANE_AUDIO=0 CROSSPANE_DISCOVERY=0
 cd "$(dirname "$0")/../.."
 cargo build -q -p crosspane-agent -p crosspanectl
 bin=$PWD/target/debug

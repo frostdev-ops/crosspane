@@ -385,6 +385,7 @@ enum Stage {
     Written,
     /// A request for a key is being admitted, between the check that the worker lives and the
     /// shadow update, with the shadow's lock held (tests try to kill the worker right here).
+    #[cfg(test)]
     Admitting,
 }
 

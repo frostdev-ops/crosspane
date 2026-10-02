@@ -1,7 +1,6 @@
 //! The per-session daemon wiring engine, platform, and transport (WP-1.37).
 
 mod agent;
-#[allow(dead_code)] // wired in by WP-3.6d
 mod audio;
 mod config;
 mod ctl;
@@ -280,14 +279,24 @@ fn run() -> Result<()> {
             features.push("h264roi".to_owned());
         }
     }
+    // Audio (WP-3.6d, speaker v0): the worker starts before the transport, so `audio` is
+    // advertised exactly when it runs. It reaches the transport through `transport_slot`, filled
+    // once the transport is bound; nothing is sent before a peer's link exists.
+    let transport_slot = Arc::new(std::sync::OnceLock::new());
+    let audio = start_audio(&platform, &transport_slot, &tx);
+    if audio.is_some() {
+        features.push("audio".to_owned());
+    }
     let hello = Hello {
         minor: crosspane_protocol::PROTOCOL_MINOR,
         name: config.name.clone(),
-        features,
+        features: features.clone(),
         displays: local_displays.clone(),
     };
     let pins: Arc<dyn crosspane_transport::PinStore> = Arc::new(trust.clone());
     let net = net::Net::start(config.port, identity.clone(), pins, hello, tx.clone())?;
+    // A failed bind leaves `transport_slot` empty and the worker dropped with it.
+    let _ = transport_slot.set(net.transport());
     stop_on_signal(&net.runtime(), tx.clone());
     #[cfg(target_os = "linux")]
     platform::watch_compositor({
@@ -348,9 +357,51 @@ fn run() -> Result<()> {
         trust,
         local_displays,
         e2,
+        features,
+        audio.map(|worker| Box::new(worker) as Box<dyn agent::AudioPlane>),
     );
     agent.start_discovery();
     run_loop(agent, startup, rx, tx, host.map(|(host, _)| host))
+}
+
+/// Start the audio worker (speaker v0, WP-3.6d) on this OS's audio backend: `None`, with a log
+/// line saying why, when audio is off or this machine has no backend for it.
+///
+/// `transport` is where the transport appears once it is bound: the worker's sends go through
+/// `Transport::link`, and fail (`Closed`) until then.
+fn start_audio(
+    platform: &platform::Platform,
+    transport: &Arc<std::sync::OnceLock<Arc<crosspane_transport::Transport>>>,
+    events: &std::sync::mpsc::Sender<agent::Event>,
+) -> Option<audio::AudioWorker> {
+    let host = platform::audio_host(platform.gate.clone())?;
+    let slot = transport.clone();
+    let send: audio::AudioSend = Arc::new(move |peer, packet| {
+        let mut link = slot
+            .get()
+            .and_then(|transport| transport.link(peer))
+            .ok_or(crosspane_protocol::link::LinkError::Closed)?;
+        link.send_audio(packet)
+    });
+    let events = events.clone();
+    let started = audio::AudioWorker::start(
+        host,
+        send,
+        Arc::new(platform::now),
+        Box::new(move |event| {
+            let _ = events.send(agent::Event::Audio(event));
+        }),
+    );
+    match started {
+        Ok(worker) => {
+            tracing::info!("audio sharing on: speakers (microphones are not supported yet)");
+            Some(worker)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the audio worker did not start: audio sharing is off");
+            None
+        }
+    }
 }
 
 /// SIGTERM or SIGINT asks the engine loop to stop cleanly (`Agent::shutdown`); a second one exits at

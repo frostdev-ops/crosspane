@@ -66,6 +66,7 @@ impl Inbox {
 
     /// Nothing is queued and nothing is running: every reply that will come is already in the
     /// data thread's queue (tests wait on this).
+    #[cfg(test)]
     pub(super) fn is_idle(&self) -> bool {
         let queue = lock(&self.queue);
         queue.is_empty() && self.in_flight.load(Ordering::SeqCst) == 0
@@ -87,6 +88,7 @@ impl Inbox {
     }
 
     /// Requests waiting for the host thread (not counting one it is running).
+    #[cfg(test)]
     pub(super) fn queued(&self) -> usize {
         lock(&self.queue).len()
     }

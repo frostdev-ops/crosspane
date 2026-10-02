@@ -63,6 +63,9 @@ pub struct TrayView {
     pub controlling: Option<String>,
     /// The peer driving this node now.
     pub controlled_by: Option<String>,
+    /// Peers playing sound on this machine's speakers now (04 §5: shared audio is never
+    /// invisible), from the engine's `AudioIndicators`.
+    pub speakers: Vec<String>,
     /// Crossing disarmed (after a panic or release).
     pub disarmed: bool,
     pub missing_permissions: Vec<Permission>,
@@ -190,6 +193,9 @@ pub fn build(view: &TrayView) -> (TrayMenu, BTreeMap<TrayItemId, TrayAction>) {
     }
     if let Some(peer) = &view.controlled_by {
         items.push(label(format!("Controlled by {peer}")));
+    }
+    for peer in &view.speakers {
+        items.push(label(format!("{peer} is playing sound on these speakers")));
     }
     if view.peers.is_empty() {
         items.push(label("No paired machines"));
@@ -327,6 +333,7 @@ pub fn build(view: &TrayView) -> (TrayMenu, BTreeMap<TrayItemId, TrayAction>) {
     let state = if view.controlling.is_some()
         || view.controlled_by.is_some()
         || !view.projections.is_empty()
+        || !view.speakers.is_empty()
     {
         TrayState::Active
     } else if !view.missing_permissions.is_empty()
@@ -341,6 +348,9 @@ pub fn build(view: &TrayView) -> (TrayMenu, BTreeMap<TrayItemId, TrayAction>) {
     let tooltip = match (&view.controlling, &view.controlled_by) {
         (Some(peer), _) => format!("Crosspane: input → {peer}"),
         (_, Some(peer)) => format!("Crosspane: controlled by {peer}"),
+        _ if !view.speakers.is_empty() => {
+            format!("Crosspane: sound from {}", view.speakers.join(", "))
+        }
         _ if connected.is_empty() => "Crosspane: no machine connected".to_owned(),
         _ => format!("Crosspane: {} connected", connected.len()),
     };
@@ -525,6 +535,30 @@ mod tests {
             action_of(&menu, &actions, "Take input back"),
             TrayAction::Release
         );
+    }
+
+    #[test]
+    fn peers_playing_on_the_speakers_are_listed_and_make_the_icon_active() {
+        let mut view = TrayView {
+            name: "desk".into(),
+            peers: vec![peer(1, true)],
+            ..TrayView::default()
+        };
+        let (menu, _) = build(&view);
+        assert_eq!(menu.state, TrayState::Idle);
+        assert!(find(&menu.items, "playing sound").is_none());
+
+        view.speakers = vec!["peer1".into(), "laptop".into()];
+        let (menu, _) = build(&view);
+        assert_eq!(menu.state, TrayState::Active);
+        assert!(find(&menu.items, "peer1 is playing sound on these speakers").is_some());
+        assert!(find(&menu.items, "laptop is playing sound on these speakers").is_some());
+        assert!(menu.tooltip.contains("peer1, laptop"));
+
+        // Control still names itself in the tooltip first.
+        view.controlling = Some("peer1".into());
+        let (menu, _) = build(&view);
+        assert!(menu.tooltip.contains("input → peer1"));
     }
 
     #[test]

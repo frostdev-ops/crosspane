@@ -11,10 +11,52 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crosspane_input::arrange::Side;
+use crosspane_protocol::msg::Capability;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::Event;
+
+/// The capabilities `crosspanectl allow` can grant, by the name used on the command line, in the
+/// settings app and in `status`.
+const CAPABILITIES: [(&str, Capability); 6] = [
+    ("input", Capability::InputAccept),
+    ("share", Capability::WindowShare),
+    ("browse", Capability::WindowBrowse),
+    ("present", Capability::WindowPresent),
+    ("speaker", Capability::AudioSpeaker),
+    ("mic", Capability::AudioMic),
+];
+
+/// The capability a `crosspanectl allow` name stands for.
+pub fn capability_named(name: &str) -> Option<Capability> {
+    CAPABILITIES
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, capability)| *capability)
+}
+
+/// The name `crosspanectl allow` and `status` use for `capability`.
+pub fn capability_name(capability: Capability) -> Option<&'static str> {
+    CAPABILITIES
+        .iter()
+        .find(|(_, known)| *known == capability)
+        .map(|(name, _)| *name)
+}
+
+/// What to tell the user about `capability` being granted or withdrawn, beyond the grant itself.
+/// Microphones are stored but never served in this version (AUDIO-v0 §1: speakers only).
+pub fn capability_note(capability: Capability) -> Option<&'static str> {
+    (capability == Capability::AudioMic).then_some(
+        "microphones are not supported yet: the grant is stored, but no microphone is shared",
+    )
+}
+
+/// The error for a name `crosspanectl allow` doesn't know.
+pub fn unknown_capability(name: &str) -> String {
+    let names: Vec<&str> = CAPABILITIES.iter().map(|(name, _)| *name).collect();
+    format!("unknown capability {name}: use {}", names.join(", "))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -46,7 +88,8 @@ pub enum Request {
         window: u64,
     },
     /// Grant (`allow`) or withdraw a capability for a peer: `input`, `share`, `browse`,
-    /// `present`.
+    /// `present`, `speaker` (the peer may play sound on this machine's speakers) or `mic`
+    /// (accepted and stored, but microphones are not supported yet).
     Allow {
         peer: String,
         capability: String,
@@ -196,6 +239,82 @@ fn handle(stream: UnixStream, events: &Sender<Event>) {
         };
         if writeln!(writer, "{text}").is_err() {
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_capability_has_one_name_that_maps_back() {
+        for (name, capability) in CAPABILITIES {
+            assert_eq!(capability_named(name), Some(capability));
+            assert_eq!(capability_name(capability), Some(name));
+        }
+        let mut names: Vec<_> = CAPABILITIES.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), CAPABILITIES.len());
+    }
+
+    #[test]
+    fn speaker_and_mic_map_to_the_audio_capabilities() {
+        assert_eq!(capability_named("speaker"), Some(Capability::AudioSpeaker));
+        assert_eq!(capability_named("mic"), Some(Capability::AudioMic));
+        // The names are exact: no plural, no case folding.
+        for wrong in ["speakers", "Speaker", "microphone", "audio", ""] {
+            assert_eq!(capability_named(wrong), None, "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_microphone_grant_carries_a_note() {
+        assert!(
+            capability_note(Capability::AudioMic)
+                .is_some_and(|note| note.contains("not supported"))
+        );
+        for (_, capability) in CAPABILITIES {
+            if capability != Capability::AudioMic {
+                assert_eq!(capability_note(capability), None);
+            }
+        }
+    }
+
+    #[test]
+    fn the_unknown_name_error_lists_the_audio_names() {
+        let error = unknown_capability("sound");
+        assert!(error.contains("sound"));
+        assert!(error.contains("speaker") && error.contains("mic"));
+    }
+
+    #[test]
+    fn an_allow_request_for_the_speakers_parses_both_ways() {
+        let on: Request = serde_json::from_str(
+            r#"{"cmd":"allow","peer":"macbook","capability":"speaker","allow":true}"#,
+        )
+        .unwrap();
+        let off: Request = serde_json::from_str(
+            r#"{"cmd":"allow","peer":"macbook","capability":"speaker","allow":false}"#,
+        )
+        .unwrap();
+        match (on, off) {
+            (
+                Request::Allow {
+                    peer,
+                    capability,
+                    allow: true,
+                },
+                Request::Allow { allow: false, .. },
+            ) => {
+                assert_eq!(peer, "macbook");
+                assert_eq!(
+                    capability_named(&capability),
+                    Some(Capability::AudioSpeaker)
+                );
+            }
+            other => panic!("{other:?}"),
         }
     }
 }
