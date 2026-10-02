@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod displays;
 pub mod frame_capture;
+pub mod home_bind;
 pub mod hotkeys;
 pub mod inject;
 pub mod ipc;
