@@ -14,6 +14,7 @@ use crosspane_platform::{LockState, SessionEvent, SessionState, WindowEvent, Win
 use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{Capability, ControlMessage, InputMessage};
 use crosspane_protocol::projection::{ProjectionEndReason as Reason, ProjectionMessage as Message};
+use crosspane_types::geom::{PixelRect, PixelSize, PointDevice};
 use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
@@ -24,6 +25,31 @@ use ledger::Ledgers;
 use source::Source;
 
 const GRACE: Duration = Duration::from_secs(20);
+
+/// N's newest accepted report of where P's proxy content is (WP-2.43 §2.1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Placement {
+    pub generation: u32,
+    pub display: DisplayId,
+    pub origin: PointDevice,
+    pub size: PixelSize,
+}
+
+/// A twin-parked window of this node that `peer` shows, for the E1 controller. Only live
+/// sources with `ParkingKind::Twin` are listed; `placed` is `Some` only when the newest accepted
+/// report is valid for this connection (WP-2.43 §4 "placement state"), has `display: Some` and
+/// `size == content.size()`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TwinHome {
+    pub peer: NodeId,
+    pub projection: ProjectionId,
+    pub window: WindowId,
+    pub display: DisplayId,
+    pub content: PixelRect,
+    pub placed: Option<Placement>,
+    /// `focus_on(windows, focused, window, display)` right now.
+    pub focused: bool,
+}
 
 /// Both E2 roles of one node.
 pub struct E2 {
@@ -47,6 +73,10 @@ pub struct E2 {
     // Don't reuse a window while its previous parking operation can still complete.
     pending_parks: BTreeMap<WindowId, MonoTime>,
     ledgers: Ledgers,
+    /// WP-2.43 §2.4: while the E1 controller is home (entering, home, exiting, or still removing
+    /// its bind), this node's physical input owns the seat: no source injects anything but
+    /// releases, and no focus request is acted on.
+    home: Option<(NodeId, ProjectionId)>,
 }
 
 impl fmt::Debug for E2 {
@@ -90,9 +120,35 @@ impl E2 {
                 destinations: BTreeMap::new(),
                 pending_parks: BTreeMap::new(),
                 ledgers,
+                home: None,
             },
             out,
         ))
+    }
+
+    /// The controller's home (entering, home, exiting, or its bind not yet confirmed removed) or
+    /// none. On `None → Some`: drain every source's ledger (`heartbeat(p, &[], ..)`: releases
+    /// only, journaled) and start the filter of §2.4; on `Some → None`: lift it. Idempotent
+    /// otherwise.
+    pub(crate) fn set_home(
+        &mut self,
+        home: Option<(NodeId, ProjectionId)>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let was_home = self.home.is_some();
+        self.home = home;
+        if !was_home && home.is_some() {
+            let projections: Vec<_> = self.sources.keys().copied().collect();
+            for projection in projections {
+                self.ledgers.heartbeat(projection, &[], now, out);
+            }
+        }
+    }
+
+    /// `Ledgers::settled()`: this node's E2 injectors hold nothing and owe no release.
+    pub(crate) fn settled(&self) -> bool {
+        self.ledgers.settled()
     }
 
     pub fn handle(&mut self, input: &Input, now: MonoTime, out: &mut Vec<Output>) {
@@ -226,7 +282,8 @@ impl E2 {
                     | Message::KeyFrameRequest { .. }
                     | Message::Close { .. }
                     | Message::ListWindows { .. }
-                    | Message::Pull { .. } => self.source_control(*peer, msg, now, out),
+                    | Message::Pull { .. }
+                    | Message::ProxyPlaced { .. } => self.source_control(*peer, msg, now, out),
                     _ => {}
                 }
             }

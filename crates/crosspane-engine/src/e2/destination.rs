@@ -10,7 +10,7 @@ use crosspane_protocol::projection::{
     ParkingKind, ProjInput, ProjectionEndReason as Reason, ProjectionMessage as Message,
 };
 use crosspane_types::geom::{PixelSize, PointDevice};
-use crosspane_types::id::NodeId;
+use crosspane_types::id::{DisplayId, NodeId};
 use crosspane_types::time::MonoTime;
 
 use super::ledger::split;
@@ -76,9 +76,78 @@ pub(super) struct Destination {
     last_heartbeat: MonoTime,
     heartbeat_due: Option<MonoTime>,
     last_keyframe: Option<MonoTime>,
+    /// WP-2.43 §4 "placement production": the generation of the newest `ProxyPlaced` (0 before
+    /// the first). It grows by one with every change and never restarts while the projection
+    /// lives; `u32::MAX` is reserved for the terminal invalidation (A5).
+    placed_gen: u32,
+    /// What the newest report said (the display is `None` when the proxy is on none), kept so a
+    /// repeat is dropped and a reconnect can resend it with `placed_gen` unchanged.
+    placed_last: Option<(Option<DisplayId>, PointDevice, PixelSize)>,
+    /// The terminal report was sent: nothing more is reported for this projection.
+    placed_final: bool,
 }
 
 impl Destination {
+    /// A `ProxyEvent::Placed` (WP-2.43 §4). A report equal to the last is dropped; otherwise the
+    /// generation grows by one, and a destination whose next generation would be `u32::MAX` sends
+    /// one final report with `display: None` and then nothing more. While suspended the newest
+    /// report is only recorded: it is resent after `Accepted`.
+    fn placed(
+        &mut self,
+        key: ProjectionKey,
+        display: Option<DisplayId>,
+        origin: PointDevice,
+        size: PixelSize,
+        out: &mut Vec<Output>,
+    ) {
+        if self.placed_final {
+            return;
+        }
+        // A host that reports a non-finite origin has not told us where the proxy is.
+        let (display, origin) = if origin.x.is_finite() && origin.y.is_finite() {
+            (display, origin)
+        } else {
+            (None, PointDevice::zero())
+        };
+        if self.placed_last == Some((display, origin, size)) {
+            return;
+        }
+        match self
+            .placed_gen
+            .checked_add(1)
+            .filter(|next| *next < u32::MAX)
+        {
+            Some(next) => {
+                self.placed_gen = next;
+                self.placed_last = Some((display, origin, size));
+            }
+            None => {
+                self.placed_gen = u32::MAX;
+                self.placed_final = true;
+                self.placed_last = Some((None, origin, size));
+            }
+        }
+        if self.suspended.is_none() {
+            self.send_placed(key, out);
+        }
+    }
+
+    fn send_placed(&self, key: ProjectionKey, out: &mut Vec<Output>) {
+        if let Some((display, origin, size)) = self.placed_last {
+            send(
+                key.source,
+                Message::ProxyPlaced {
+                    projection: key.projection,
+                    generation: self.placed_gen,
+                    display,
+                    origin,
+                    size,
+                },
+                out,
+            );
+        }
+    }
+
     fn input(
         &mut self,
         key: ProjectionKey,
@@ -354,6 +423,9 @@ impl E2 {
                             self.end_destination(key, Reason::Failed, false, false, out);
                             return;
                         }
+                        // The source dropped the placement with the connection (it keeps only
+                        // its high-water mark): repeat the newest report, generation unchanged.
+                        destination.send_placed(key, out);
                     } else {
                         // The old OpenProxy is still in flight: wait for it, never open twice.
                         destination.open_due = Some(now.saturating_add(OPEN_TIMEOUT));
@@ -405,6 +477,9 @@ impl E2 {
                     last_heartbeat: now,
                     heartbeat_due: None,
                     last_keyframe: None,
+                    placed_gen: 0,
+                    placed_last: None,
+                    placed_final: false,
                 },
             );
             out.push(Output::OpenProxy {
@@ -537,6 +612,16 @@ impl E2 {
         let Some(destination) = self.destinations.get_mut(&key).filter(|d| d.open) else {
             return;
         };
+        if let ProxyEvent::Placed {
+            display,
+            origin,
+            size,
+        } = event
+        {
+            // Not a user action: recorded even while suspended, sent when the link is up.
+            destination.placed(key, *display, *origin, *size, out);
+            return;
+        }
         if let ProxyEvent::Resized { size, scale } = event {
             if destination.unchanged(*size, *scale) {
                 // Nothing changed (the host can report one change twice).
@@ -697,7 +782,7 @@ impl E2 {
                     );
                 }
             }
-            // WP-2.43b forwards this as ProxyPlaced.
+            // Forwarded as `ProxyPlaced` before this match (WP-2.43b).
             ProxyEvent::Placed { .. } => {}
         }
         if !sent {
@@ -882,5 +967,158 @@ fn transition(held: &mut BTreeSet<Held>, item: Held, down: bool) -> bool {
         held.insert(item)
     } else {
         held.remove(&item)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The placement generation's boundary (WP-2.43 A5): a destination can't be driven through
+    //! 2^32 changes from outside the crate, so the counter is set next to its limit directly.
+
+    use crosspane_input::journal::MemoryJournal;
+    use crosspane_platform::{LockState, SessionEvent, SessionState};
+    use crosspane_protocol::link::LinkEvent;
+    use crosspane_protocol::msg::ControlMessage;
+    use crosspane_types::id::ProjectionId;
+
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::io::Input;
+
+    const SOURCE: NodeId = NodeId([1; 32]);
+    const THIS: NodeId = NodeId([2; 32]);
+    const DISPLAY: DisplayId = DisplayId(1);
+
+    fn key() -> ProjectionKey {
+        ProjectionKey {
+            source: SOURCE,
+            projection: ProjectionId(1),
+        }
+    }
+
+    fn start() -> Input {
+        Input::Link(LinkEvent::Control {
+            peer: SOURCE,
+            msg: ControlMessage::Projection(Message::Start {
+                projection: ProjectionId(1),
+                window: crosspane_protocol::projection::WindowSummary {
+                    title: "t".into(),
+                    app_id: "a".into(),
+                },
+                size: PixelSize::new(400, 300),
+            }),
+        })
+    }
+
+    fn destination() -> (E2, Vec<Output>) {
+        let (mut e2, _) = E2::new(
+            &EngineConfig::new(THIS),
+            Box::new(MemoryJournal::default()),
+            MonoTime::ZERO,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        e2.handle(
+            &Input::Session(SessionEvent::State(SessionState {
+                lock: LockState::Unlocked,
+                active: Some(true),
+            })),
+            MonoTime::ZERO,
+            &mut out,
+        );
+        e2.handle(&Input::PeerUp { peer: SOURCE }, MonoTime::ZERO, &mut out);
+        e2.handle(
+            &Input::Grants([(SOURCE, [Capability::WindowPresent].into())].into()),
+            MonoTime::ZERO,
+            &mut out,
+        );
+        e2.handle(&start(), MonoTime::ZERO, &mut out);
+        e2.handle(
+            &Input::ProxyOpened {
+                key: key(),
+                result: Ok((PixelSize::new(400, 300), 1.0)),
+            },
+            MonoTime::ZERO,
+            &mut out,
+        );
+        (e2, out)
+    }
+
+    fn placed(e2: &mut E2, x: f64) -> Vec<(u32, Option<DisplayId>)> {
+        let mut out = Vec::new();
+        e2.handle(
+            &Input::Proxy {
+                key: key(),
+                event: ProxyEvent::Placed {
+                    display: Some(DISPLAY),
+                    origin: PointDevice::new(x, 0.0),
+                    size: PixelSize::new(400, 300),
+                },
+            },
+            MonoTime::ZERO,
+            &mut out,
+        );
+        reports(&out)
+    }
+
+    fn reports(out: &[Output]) -> Vec<(u32, Option<DisplayId>)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::SendControl {
+                    msg:
+                        ControlMessage::Projection(Message::ProxyPlaced {
+                            generation,
+                            display,
+                            ..
+                        }),
+                    ..
+                } => Some((*generation, *display)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generation_overflow_sends_one_terminal_report_and_stops() {
+        let (mut e2, _) = destination();
+        e2.destinations
+            .get_mut(&key())
+            .expect("destination")
+            .placed_gen = u32::MAX - 3;
+        // Ordinary reports up to u32::MAX - 1.
+        assert_eq!(placed(&mut e2, 1.0), vec![(u32::MAX - 2, Some(DISPLAY))]);
+        assert_eq!(placed(&mut e2, 2.0), vec![(u32::MAX - 1, Some(DISPLAY))]);
+        // The next would be u32::MAX, which is reserved: one final report without a display.
+        assert_eq!(placed(&mut e2, 3.0), vec![(u32::MAX, None)]);
+        // Then nothing more for this projection, whatever the host says.
+        assert_eq!(placed(&mut e2, 4.0), vec![]);
+        assert_eq!(placed(&mut e2, 5.0), vec![]);
+        // The terminal report is what a reconnect repeats.
+        let mut out = Vec::new();
+        e2.handle(
+            &Input::Link(LinkEvent::Closed {
+                peer: SOURCE,
+                error: crosspane_protocol::link::LinkError::Closed,
+            }),
+            MonoTime::ZERO,
+            &mut out,
+        );
+        e2.handle(&Input::PeerUp { peer: SOURCE }, MonoTime::ZERO, &mut out);
+        out.clear();
+        e2.handle(&start(), MonoTime::ZERO, &mut out);
+        assert_eq!(reports(&out), vec![(u32::MAX, None)]);
+    }
+
+    #[test]
+    fn generation_overflow_by_checked_add_is_also_terminal() {
+        // A counter already at the limit (cannot happen through reports, but a corrupt one must
+        // not wrap): the next change is the terminal report.
+        let (mut e2, _) = destination();
+        e2.destinations
+            .get_mut(&key())
+            .expect("destination")
+            .placed_gen = u32::MAX;
+        assert_eq!(placed(&mut e2, 1.0), vec![(u32::MAX, None)]);
+        assert_eq!(placed(&mut e2, 2.0), vec![]);
     }
 }

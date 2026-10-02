@@ -17,7 +17,8 @@ pub mod io;
 use crosspane_input::journal::{Journal, JournalError};
 use crosspane_platform::CaptureEvent;
 use crosspane_protocol::link::LinkEvent;
-use crosspane_protocol::msg::{ControlMessage, Refusal};
+use crosspane_protocol::msg::{ControlMessage, InputMessage, Refusal};
+use crosspane_protocol::projection::ProjInput;
 use crosspane_types::id::NodeId;
 use crosspane_types::time::MonoTime;
 
@@ -112,13 +113,41 @@ impl Engine {
             &input,
             Input::Capture(CaptureEvent::EdgePressed { .. } | CaptureEvent::EdgeReleased { .. })
         );
+        // WP-2.43 §2.10: a peer's motion over a proxy of this node's twin-parked window may take
+        // this node's input home. What E2 would accept is decided first (pure); the controller
+        // corroborates it against its own pointer model.
+        let motion = match &input {
+            Input::Link(LinkEvent::Input {
+                peer,
+                msg: InputMessage::Proj(msg @ ProjInput::Motion { .. }),
+            }) => self
+                .e2
+                .prevalidate_motion(*peer, msg)
+                .map(|(projection, at)| (*peer, projection, at)),
+            _ => None,
+        };
         if !(was_controlled && edge_event) {
             self.controller.handle(&input, now, &mut out);
+        }
+        if let Some((peer, projection, position)) = motion {
+            self.controller
+                .peer_motion(peer, projection, position, now, &mut out);
         }
         if !refuse_start {
             self.target.handle(&input, now, &mut out);
         }
+        // Home is decided before E2 sees the input that triggered it (so it is never injected).
+        // E2 drains and filters; the controller advances the entry only once every injector this
+        // node owns has settled, after E2's outputs; E2's changed twin set reaches the controller
+        // last, and the trailing set_home lifts the filter in the same handle as an abort or exit.
+        self.e2.set_home(self.controller.home(), now, &mut out);
         self.e2.handle(&input, now, &mut out);
+        // (Only an entry that is waiting for the drain looks at it, so it is only asked then.)
+        let settled = self.controller.draining() && self.e2.settled() && self.target.settled();
+        self.controller.after_e2(settled, now, &mut out);
+        self.controller
+            .set_twin_homes(self.e2.twin_homes(), now, &mut out);
+        self.e2.set_home(self.controller.home(), now, &mut out);
         let audio_gates: Vec<_> = out
             .iter()
             .filter_map(|output| match output {
@@ -141,6 +170,14 @@ impl Engine {
             // restored portals must not turn that into a crossing of this node's own.
             self.controller.portals_restored(now);
             out.push(Output::SetPortals(self.controller.portals().to_vec()));
+        }
+        // Each `SetPortals` actually emitted (the final list: the controller's own that were
+        // suppressed above are not in it) is answered by one `Input::PortalsSet`, in order, and
+        // registers the mapping it was emitted under (WP-2.43 B1).
+        for output in &out {
+            if let Output::SetPortals(set) = output {
+                self.controller.portal_emitted(set);
+            }
         }
         out
     }

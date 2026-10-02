@@ -17,7 +17,7 @@ use crosspane_types::geom::{PixelSize, PointDevice, RectLogical};
 use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
-use super::{E2, GRACE, send};
+use super::{E2, GRACE, Placement, TwinHome, send};
 use crate::io::{Failure, InjectCmd, Notice, Output, ProjectionKey};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,10 +35,60 @@ enum Stage {
     Restarting(MonoTime),
 }
 
+/// What the destination reported about where its proxy's content is (WP-2.43 §4 "placement
+/// state"). The high-water mark never decreases and survives a suspension; validity does not.
+#[derive(Clone, Copy, Debug, Default)]
+struct PlacementState {
+    hwm: Option<u32>,
+    last: Option<(u32, Option<DisplayId>, PointDevice, PixelSize)>,
+    /// The newest accepted report belongs to this connection: set by an accepted report, cleared
+    /// by a suspension (the destination re-sends its newest report after `Accepted`).
+    valid: bool,
+}
+
+impl PlacementState {
+    /// A `ProxyPlaced` is accepted when its generation is higher than the high-water mark, or
+    /// equal with identical contents (a resend). `u32::MAX` is the terminal invalidation: it never
+    /// carries a display, and no later report can exceed it.
+    fn accept(
+        &mut self,
+        generation: u32,
+        display: Option<DisplayId>,
+        origin: PointDevice,
+        size: PixelSize,
+    ) {
+        if !(origin.x.is_finite() && origin.y.is_finite()) {
+            return;
+        }
+        let display = display.filter(|_| generation != u32::MAX);
+        let report = (generation, display, origin, size);
+        if self.hwm.is_none_or(|hwm| generation > hwm) {
+            self.hwm = Some(generation);
+            self.last = Some(report);
+            self.valid = true;
+        } else if self.hwm == Some(generation) && self.last == Some(report) {
+            self.valid = true;
+        }
+    }
+
+    /// The report as a coherent placement of content `content` pixels large, if there is one.
+    fn placed(&self, content: PixelSize) -> Option<Placement> {
+        let (generation, display, origin, size) = self.last.filter(|_| self.valid)?;
+        let display = display.filter(|_| size == content)?;
+        Some(Placement {
+            generation,
+            display,
+            origin,
+            size,
+        })
+    }
+}
+
 pub(super) struct Source {
     pub peer: NodeId,
     pub window: WindowId,
     stage: Stage,
+    placement: PlacementState,
     parked: Option<Parked>,
     stream: Option<StreamId>,
     capture_pending: bool,
@@ -128,6 +178,7 @@ impl E2 {
                 peer,
                 window,
                 stage: Stage::Offered(now.saturating_add(START_TIMEOUT)),
+                placement: PlacementState::default(),
                 parked: None,
                 stream: None,
                 capture_pending: false,
@@ -192,6 +243,9 @@ impl E2 {
         source.resizing |= matches!(source.stage, Stage::Parking(_));
         source.latest_resize = None;
         source.resume_geometry = None;
+        // The placement was reported on the connection that just ended; the destination re-sends
+        // it after `Accepted` (the high-water mark stays, so an older report never revives it).
+        source.placement.valid = false;
         source.stage = Stage::Suspended(now.saturating_add(GRACE));
     }
 
@@ -310,7 +364,8 @@ impl E2 {
             | Message::Resize { projection, .. }
             | Message::Focus { projection, .. }
             | Message::KeyFrameRequest { projection }
-            | Message::Close { projection, .. } => *projection,
+            | Message::Close { projection, .. }
+            | Message::ProxyPlaced { projection, .. } => *projection,
             _ => return,
         };
         let Some(source) = self.sources.get_mut(&projection).filter(|s| s.peer == peer) else {
@@ -359,6 +414,22 @@ impl E2 {
                 scale,
                 ..
             } => source.on_resize(projection, *request, *size, *scale, out),
+            // Where the proxy's content is: kept in every stage the projection can have a proxy
+            // on this connection, live or not (WP-2.43 §4).
+            Message::ProxyPlaced {
+                generation,
+                display,
+                origin,
+                size,
+                ..
+            } if !matches!(source.stage, Stage::Suspended(_) | Stage::Resuming(_)) => {
+                source
+                    .placement
+                    .accept(*generation, *display, *origin, *size);
+            }
+            // While this node's controller is home, the seat belongs to native input alone: no
+            // focus request, restore or wish is acted on (WP-2.43 §2.4).
+            Message::Focus { .. } if self.home.is_some() => {}
             Message::Focus { focused: true, .. } if source.stage == Stage::Live => {
                 self.focus_source(projection, now, out);
             }
@@ -490,7 +561,12 @@ impl E2 {
                     source.stage = Stage::Live;
                     source.resize_latest(projection, out);
                     if source.focus_wanted {
-                        self.focus_source(projection, now, out);
+                        if self.home.is_none() {
+                            self.focus_source(projection, now, out);
+                        } else {
+                            // The seat is arbitrated (WP-2.43 §2.4): the wish is dropped.
+                            source.focus_wanted = false;
+                        }
                     }
                 }
                 Err(_) => self.end_source(projection, Reason::Failed, false, now, out),
@@ -558,6 +634,13 @@ impl E2 {
             return;
         };
         source.last_seq = seq;
+        // While this node's controller is home (WP-2.43 §2.4) every input of every source only
+        // advances `last_seq`: nothing reaches a ledger and no `MoveTo` is issued, so no
+        // Crosspane-injected key can reach the home bind, and the drain's releases (the only
+        // injections the filter admits) are the last this node's injectors saw.
+        if self.home.is_some() {
+            return;
+        }
         let Some(parked) = source.parked else { return };
         let mut item = None;
         match msg {
@@ -605,6 +688,74 @@ impl E2 {
         {
             self.end_source(projection, Reason::Failed, false, now, out);
         }
+    }
+
+    /// WP-2.43 §2.3: the content position of a `ProjInput::Motion` from `peer` that passes every
+    /// E2 check (the gate, recovery, the peer, a live twin source, `seq > last_seq`, the
+    /// `WindowShare` grant, and a finite position inside `[0, content.size())`). Pure: nothing is
+    /// recorded, so the same motion is then processed by [`E2::source_input`] as usual.
+    pub(crate) fn prevalidate_motion(
+        &self,
+        peer: NodeId,
+        msg: &ProjInput,
+    ) -> Option<(ProjectionId, PointDevice)> {
+        let ProjInput::Motion {
+            projection,
+            seq,
+            position,
+        } = msg
+        else {
+            return None;
+        };
+        if !self.permits_io() || !self.ledgers.recovery_done() {
+            return None;
+        }
+        let source = self.sources.get(projection)?;
+        if source.peer != peer
+            || source.stage != Stage::Live
+            || *seq <= source.last_seq
+            || !self.granted(peer, Capability::WindowShare)
+        {
+            return None;
+        }
+        let (size, kind) = geometry(source.parked?)?;
+        if kind != ParkingKind::Twin
+            || !position.x.is_finite()
+            || !position.y.is_finite()
+            || position.x < 0.0
+            || position.y < 0.0
+            || position.x >= f64::from(size.width)
+            || position.y >= f64::from(size.height)
+        {
+            return None;
+        }
+        Some((*projection, *position))
+    }
+
+    /// WP-2.43 §4: every live twin-parked source, in `ProjectionId` order.
+    pub(crate) fn twin_homes(&self) -> Vec<TwinHome> {
+        self.sources
+            .iter()
+            .filter_map(|(&projection, source)| {
+                if source.stage != Stage::Live {
+                    return None;
+                }
+                let parked = source.parked?;
+                let (size, kind) = geometry(parked)?;
+                if kind != ParkingKind::Twin {
+                    return None;
+                }
+                Some(TwinHome {
+                    peer: source.peer,
+                    projection,
+                    window: source.window,
+                    display: parked.display,
+                    content: parked.content,
+                    placed: source.placement.placed(size),
+                    focused: focus_on(&self.windows, self.focused, source.window, parked.display),
+                })
+            })
+            .collect()
     }
 
     /// The destination focused the proxy: bring the source window forward, unless the OS already

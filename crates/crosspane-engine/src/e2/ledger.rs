@@ -128,6 +128,18 @@ impl Ledgers {
             .is_none_or(|lease| lease.unconfirmed.is_empty())
     }
 
+    /// WP-2.43 §2.3 step 1: nothing is held through any lease, no release is unconfirmed, no retry
+    /// is scheduled, no release is awaiting its `InjectDone`, and startup recovery is done.
+    pub fn settled(&self) -> bool {
+        self.recovery_done()
+            && self.pending.is_empty()
+            && self.leases.values().all(|lease| {
+                lease.unconfirmed.is_empty()
+                    && lease.retry.is_none()
+                    && lease.ledger.held().is_empty()
+            })
+    }
+
     pub fn open(&mut self, owner: ProjectionId) -> Result<(), JournalError> {
         if let Some(lease) = self.leases.get_mut(&owner) {
             // Resume the empty ledger without losing unconfirmed releases, retry deadlines or

@@ -234,6 +234,17 @@ impl TargetE1 {
         self.active.is_some()
     }
 
+    /// WP-2.43 §2.3 step 1: no active session, `recovery` empty, `unconfirmed` empty,
+    /// `release_retry` empty, nothing held through the ledger: this injector holds nothing and has
+    /// no release outstanding.
+    pub(crate) fn settled(&self) -> bool {
+        self.active.is_none()
+            && self.recovery.is_empty()
+            && self.unconfirmed.is_empty()
+            && self.release_retry.is_empty()
+            && self.ledger.held().is_empty()
+    }
+
     /// The node controlling this one, if any.
     pub fn controller(&self) -> Option<NodeId> {
         self.active.map(|s| s.controller)

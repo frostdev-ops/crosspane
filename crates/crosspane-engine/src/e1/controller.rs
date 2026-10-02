@@ -1,30 +1,35 @@
 //! The deterministic controller role: portals, capture fences and remote input sessions.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use crosspane_input::accel::Accelerator;
-use crosspane_input::layout::{Layout, Placed, PointerTracker, Step};
+use crosspane_input::layout::{Layout, Placed, PointerTracker, Portal, Step};
 use crosspane_input::lease::ControllerLease;
 use crosspane_input::router::Router;
 use crosspane_input::{Edge, Held};
+use crosspane_platform::EndReason as CaptureEnd;
 use crosspane_platform::{
-    CaptureEvent, CaptureId, CapturePortal, HotkeyEvent, LockState, MotionKind, Overlay,
-    OverlayAnchor, OverlayEvent, PortalId, Rgb8, SessionEvent, SessionState,
+    CaptureEvent, CaptureId, CapturePortal, CaptureStart, HotkeyEvent, LockState, MotionKind,
+    Overlay, OverlayAnchor, OverlayEvent, PortalId, Rgb8, SessionEvent, SessionState,
 };
 use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{
     ControlMessage, EndReason, InputMessage, MAX_HELD_KEYS, Placement, PointerMessage, TargetStatus,
 };
 use crosspane_types::display::DisplayInfo;
-use crosspane_types::geom::PointDevice;
+use crosspane_types::geom::{DisplayGeometry, PixelRect, PointDevice};
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::{DisplayId, GlobalDisplayId, NodeId, SessionId};
+use crosspane_types::id::{DisplayId, GlobalDisplayId, NodeId, ProjectionId, SessionId, WindowId};
 use crosspane_types::input::LockKeys;
 use crosspane_types::time::MonoTime;
 
 use crate::config::EngineConfig;
-use crate::io::{Command, HUD, Input, Notice, Output};
+use crate::e2::{Placement as Proxy, TwinHome};
+use crate::io::{
+    Command, Failure, HUD, HomeFailure, HomeOp, Input, Notice, Output, PortalsFailure,
+    ProjectionKey, Warp,
+};
 
 const REENTRY_GUARD: Duration = Duration::from_millis(150);
 /// How long after a target session ends the restored portals stay disarmed if the platform never
@@ -37,6 +42,169 @@ const NOT_PERMITTED: SessionState = SessionState {
     lock: LockState::Unknown,
     active: None,
 };
+
+// ---- WP-2.43 "home on the twin" (docs/wp/WP-2.43.md §4, amendments A1-A9, B1) ----
+/// How long every injector this node owns has to confirm its releases before the entry gives up.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long the home bind has to be installed and verified.
+const BIND_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the window has to take focus after the capture is released.
+const FOCUS_TIMEOUT: Duration = Duration::from_millis(500);
+/// A failed entry or exit is not retried for this long (a passive fence).
+const HOME_RETRY: Duration = Duration::from_secs(1);
+/// A peer's motion report only describes the pointer if this node's physical pointer moved this
+/// recently (§2.2.6).
+const LOCAL_MOTION_AGE: Duration = Duration::from_millis(500);
+/// A8: how recent the last physical motion must still be when the capture is about to be
+/// released. The same bound as at the trigger: a pointer that has been still this long is not
+/// being steered into the window.
+const ENTRY_FRESH: Duration = LOCAL_MOTION_AGE;
+/// The tracker and the peer's report may differ by this many device pixels per axis (§2.3).
+const ENTRY_SLACK: f64 = 96.0;
+/// A set of portals that was not installed is offered again this often (§2.8).
+const PORTALS_RETRY: Duration = Duration::from_millis(500);
+/// A pointer left on the twin is warped home again this often, while it can be (§2.7).
+const STRANDED_RETRY: Duration = Duration::from_secs(1);
+const STRANDED_ATTEMPTS: u32 = 10;
+/// Portal ids of twin strips: `TWIN_PORTAL_BASE + 4 * slot + edge index` (§2.5).
+const TWIN_PORTAL_BASE: u32 = 1 << 30;
+/// A slot this large or larger offers no strips.
+const MAX_TWIN_SLOT: u32 = 1 << 28;
+/// B1: after an uncertain portal result the capture is ended explicitly and treated as gone
+/// only once it reports its end or this long has passed.
+const CAPTURE_END_DEADLINE: Duration = Duration::from_secs(1);
+/// A1: the bind removal is retried with this backoff (doubling up to the maximum).
+const TEARDOWN_BACKOFF_MIN: Duration = Duration::from_millis(100);
+const TEARDOWN_BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// The activation of an exit buffers at most this many key and button transitions.
+const ACTIVATION_LOG_MAX: usize = 1024;
+/// Outstanding warp operations remembered (the agent answers each one).
+const WARPS_MAX: usize = 32;
+/// Unanswered portal-set requests remembered (the agent answers every one, in order, at once).
+const PORTAL_REQUESTS_MAX: usize = 64;
+const EDGES: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+
+#[derive(Clone, Copy, Debug)]
+enum Entering {
+    /// Waiting for every injector this node owns to confirm its releases.
+    Draining { deadline: MonoTime },
+    /// Waiting for the home bind to be installed and verified.
+    Binding { deadline: MonoTime },
+    /// The capture is being released and the pointer warped onto the twin.
+    Releasing { deadline: MonoTime },
+    /// The pointer is on the twin; waiting for the window to take focus.
+    Focusing { deadline: MonoTime },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Exiting {
+    /// The HUD is being shown before any capture begins (04 §8 invariant 5).
+    Hud {
+        portal: PortalId,
+        position: f64,
+        strips_gen: u64,
+        deadline: MonoTime,
+    },
+    /// The exit capture is being activated.
+    Activating {
+        id: CaptureId,
+        portal: PortalId,
+        position: f64,
+        strips_gen: u64,
+        deadline: MonoTime,
+    },
+    /// The exit was abandoned; no new capture begins until this one is over.
+    Cancelled { id: CaptureId, deadline: MonoTime },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HomeState {
+    Entering(Entering),
+    Home,
+    Exiting(Exiting),
+}
+
+/// §2.1 "home": this node's physical input drives one of its own projected windows on the twin
+/// output while the E1 session stays open.
+#[derive(Clone, Copy, Debug)]
+struct Home {
+    /// Correlates this attempt's `HomeBind` and entry `ReleaseAndWarp` with their answers.
+    op: HomeOp,
+    /// The node this controller is driving, and its projection of the window.
+    peer: NodeId,
+    projection: ProjectionId,
+    window: WindowId,
+    /// The capture that is ended to go home: once the release is requested its `Ended` is
+    /// expected, not a loss.
+    ended: CaptureId,
+    /// Its `Ended` arrived.
+    ended_seen: bool,
+    /// Where the pointer goes when home ends without a crossing (§2.1).
+    fallback: (DisplayId, PointDevice),
+    /// `HomeBind { install: true }` was requested: the matching removal is owed.
+    bind: bool,
+    /// A8: what the trigger saw, re-checked immediately before the release: the peer's display
+    /// the proxy was on, the placement's generation and the strip generation.
+    display: DisplayId,
+    generation: u32,
+    strips_gen: u64,
+    state: HomeState,
+}
+
+/// A1: the home bind was requested and its removal is not yet confirmed. Until it is, the seat
+/// stays arbitrated exactly as while home.
+#[derive(Clone, Copy, Debug)]
+struct Teardown {
+    /// The current attempt's operation: only its answer counts.
+    op: HomeOp,
+    attempt: u32,
+    /// When the next attempt is made if this one is not confirmed (an actionable deadline).
+    next: MonoTime,
+    peer: NodeId,
+    projection: ProjectionId,
+}
+
+/// §2.7: the pointer may have been left on the invisible twin.
+#[derive(Clone, Copy, Debug)]
+struct Stranded {
+    target: (DisplayId, PointDevice),
+    next: MonoTime,
+    attempts: u32,
+}
+
+/// What a `ReleaseAndWarp` is for, by its `op`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WarpPurpose {
+    /// The entry's release: its answer drives the entry transaction.
+    Entry,
+    /// The pointer is returned to the desktop (or a crossing point): a failure strands it.
+    Leave,
+    /// A stranded pointer's retry: a failure is already accounted for.
+    Retry,
+    /// An exit abandoned because a button is held: the pointer stays on the twin.
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WarpEntry {
+    op: HomeOp,
+    purpose: WarpPurpose,
+    target: (DisplayId, PointDevice),
+}
+
+/// How captured key, button, scroll and motion events are treated right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputMode {
+    /// Not at all: no capture is live for the controller.
+    Off,
+    /// Routed to the peer (today's behaviour).
+    Routing,
+    /// The capture is being released for home: the chord and the held buttons are tracked, nothing
+    /// is routed (§2.4).
+    ChordOnly,
+    /// The exit capture is being activated: transitions are buffered (A4).
+    Buffer,
+}
 
 #[derive(Debug)]
 struct Session {
@@ -106,6 +274,8 @@ struct Crossing {
     // Some during activation or a third-node handshake that keeps the capture.
     capture: Option<Capture>,
     wait: Wait,
+    // The retained capture began on a twin strip (WP-2.43 §2.7).
+    from_twin: bool,
 }
 
 #[derive(Debug)]
@@ -114,6 +284,13 @@ struct Control {
     capture: Capture,
     tracker: PointerTracker,
     hud_display: DisplayId,
+    // WP-2.43: this node's input is home in one of its own projected windows.
+    home: Option<Home>,
+    // The live capture began on a twin strip: the physical pointer is on the invisible twin, so
+    // every end of it warps (§2.7).
+    from_twin: bool,
+    // The `at` of the last physical motion forwarded to the peer (§2.2.6).
+    last_motion: Option<MonoTime>,
 }
 
 #[derive(Debug)]
@@ -124,6 +301,9 @@ enum Phase {
     Returning {
         capture: CaptureId,
         deadline: MonoTime,
+        // When the fence times out: warp here (the capture began on a twin strip, or home was
+        // left) rather than a plain `EndCapture`.
+        warp: Option<(DisplayId, PointDevice)>,
     },
 }
 
@@ -173,7 +353,10 @@ pub struct ControllerE1 {
     // The authoritative hotkey pair for a chord already handled in captured Key events.
     chord_press_outstanding: bool,
     layout: Option<Layout>,
+    // The set this controller offers the capture backend: the layout's portals, then the twin
+    // strips (WP-2.43 §2.5).
     portals: Vec<CapturePortal>,
+    layout_portals: Vec<CapturePortal>,
     accelerator: Accelerator,
     router: Router,
     // The router tracks physical keys; wire usages are fixed at each routed press.
@@ -192,6 +375,88 @@ pub struct ControllerE1 {
     hotkey: Option<HotkeyHold>,
     next_session: Option<u64>,
     next_capture: Option<u64>,
+    // ---- WP-2.43 ----
+    // E2's twin-parked windows, as of the last `set_twin_homes`.
+    twin_homes: Vec<TwinHome>,
+    // Stable per-projection strip slots: removing one projection never renames another's strips.
+    twin_slots: BTreeMap<ProjectionId, u32>,
+    next_slot: u32,
+    twin_strips: Vec<CapturePortal>,
+    // Grows whenever the offered twin strips change; every exit request records it.
+    strips_gen: u64,
+    // What the last answers said about the current set (`portal_requests` holds the ones still
+    // unanswered).
+    portals_installed: bool,
+    portals_failed: bool,
+    portals_retry: Option<MonoTime>,
+    // A failed entry is not retried for this projection until the time (passive).
+    home_fence: Option<(ProjectionId, MonoTime)>,
+    // Presses on a strip are ignored until the time (passive).
+    exit_retry: BTreeMap<PortalId, MonoTime>,
+    next_op: u64,
+    warps: Vec<WarpEntry>,
+    teardown: Option<Teardown>,
+    stranded: Option<Stranded>,
+    // Key and button transitions of the exit capture, buffered until its activation completes.
+    activation: Vec<(Held, bool)>,
+    activation_overflow: bool,
+    // Why the entry or home being ended is ending, for its notice.
+    failure: Option<HomeFailure>,
+    // The exit capture that committed (it is the session's live capture): a repeat of its
+    // `CaptureBegun { Ok }` must not end it.
+    committed_exit: Option<CaptureId>,
+    // The engine's side of the I/O gate is closed by a panic: a stranded pointer's retries wait
+    // for the re-arm instead of spending their budget on skipped warps.
+    gate_closed: bool,
+    // Every `SetPortals` the engine actually emitted and the backend has not answered yet, oldest
+    // first, each with the mapping it was emitted under. Answers are strictly in order, one per
+    // emitted set: each consumes the oldest (B1). A set the engine suppressed (while this node is
+    // controlled) was never emitted and has no entry.
+    portal_requests: VecDeque<PortalRequest>,
+    // Answers still to come for requests dropped on overflow (their snapshots are gone, so what
+    // they installed can't be told). They are the oldest answers: each one consumes this counter
+    // instead of the head of `portal_requests`, so the answers that follow stay aligned with the
+    // snapshots that were kept, and none of the skipped ones can confirm a mapping.
+    portal_skip: usize,
+    // The mapping of the newest set the backend confirmed. Edge events are interpreted through
+    // it: a replacement the backend rejected must not reassign the ids of the strips that are
+    // still installed. `None` until the backend has answered anything (the current layout is then
+    // the only one there is). An empty mapping (nothing can be pressed) after an answer that
+    // leaves the installed set unknown, and after a request was dropped on overflow, until an
+    // answer that is aligned again confirms one.
+    confirmed_portals: Option<PortalMap>,
+    // What each offered layout portal id names, as of the newest set offered: the connection and
+    // everything `Layout::entry` maps a crossing through (both displays' geometry and origin). A
+    // change here re-offers the set even when its strips are identical.
+    portal_mapping: Vec<PortalMapping>,
+}
+
+/// One offered layout portal and the two placed displays its entry coordinate is computed from.
+type PortalMapping = (Portal, Placed, Placed);
+
+/// What a portal id means in the layout it was offered under.
+#[derive(Clone, Debug)]
+struct PortalMap {
+    /// The strips of the set this mapping belongs to.
+    offered: Vec<CapturePortal>,
+    /// `None`: nothing is installed (no strip can be pressed).
+    layout: Option<Layout>,
+}
+
+impl PortalMap {
+    /// Nothing is installed.
+    fn empty() -> PortalMap {
+        PortalMap {
+            offered: Vec::new(),
+            layout: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PortalRequest {
+    ids: Vec<PortalId>,
+    map: PortalMap,
 }
 
 impl ControllerE1 {
@@ -210,6 +475,7 @@ impl ControllerE1 {
             chord_press_outstanding: false,
             layout: None,
             portals: Vec::new(),
+            layout_portals: Vec::new(),
             accelerator: Accelerator::new(config.accel),
             router: Router::new(),
             key_mappings: BTreeMap::new(),
@@ -223,11 +489,35 @@ impl ControllerE1 {
             hotkey: None,
             next_session: Some(1),
             next_capture: Some(1),
+            twin_homes: Vec::new(),
+            twin_slots: BTreeMap::new(),
+            next_slot: 0,
+            twin_strips: Vec::new(),
+            strips_gen: 0,
+            portals_installed: false,
+            portals_failed: false,
+            portals_retry: None,
+            home_fence: None,
+            exit_retry: BTreeMap::new(),
+            next_op: 1,
+            warps: Vec::new(),
+            teardown: None,
+            stranded: None,
+            activation: Vec::new(),
+            activation_overflow: false,
+            failure: None,
+            committed_exit: None,
+            gate_closed: false,
+            portal_requests: VecDeque::new(),
+            portal_skip: 0,
+            confirmed_portals: None,
+            portal_mapping: Vec::new(),
         }
     }
 
     /// Handle one input (every input is offered to both roles), appending outputs.
     pub fn handle(&mut self, input: &Input, now: MonoTime, out: &mut Vec<Output>) {
+        self.prune(now);
         match input {
             Input::LocalDisplays(displays) => {
                 self.displays.insert(self.config.node, displays.clone());
@@ -263,36 +553,11 @@ impl ControllerE1 {
                 }
             }
             Input::Capture(event) => self.capture_event(event, now, out),
-            Input::CaptureBegun { id, result } => {
-                let matches = matches!(&self.phase, Phase::Crossing(c)
-                    if matches!(c.wait, Wait::Capture(_)) && c.capture.is_some_and(|v| v.id == *id));
-                if matches {
-                    match result {
-                        Ok(start) => {
-                            if matches!(&self.phase, Phase::Crossing(c)
-                                if matches!(c.wait, Wait::Capture(deadline) if now >= deadline))
-                            {
-                                self.return_home(EndReason::Released, None, false, true, now, out);
-                            } else {
-                                self.chord_keys.extend(start.held_keys.iter().copied());
-                                self.lock_keys = start.lock_keys;
-                                self.activate(now, out);
-                            }
-                        }
-                        Err(_) => self.return_home(EndReason::Released, None, true, true, now, out),
-                    }
-                } else if result.is_ok() {
-                    // A delayed or duplicate success must never leave an unseen capture alive.
-                    out.push(Output::EndCapture { warp_to: None });
-                } else if result.is_err()
-                    && matches!(self.phase, Phase::Returning { capture, .. } if capture == *id)
-                {
-                    // A rolled-back activation cannot emit an Ended fence.
-                    self.finish_return(out);
-                }
-            }
+            Input::CaptureBegun { id, result } => self.capture_begun(*id, result, now, out),
             Input::Overlay(OverlayEvent::Visible(id)) if *id == HUD => {
-                if let Phase::Crossing(c) = &self.phase
+                if self.exiting_hud() {
+                    self.exit_hud_visible(now, out);
+                } else if let Phase::Crossing(c) = &self.phase
                     && let Wait::Hud(deadline) = c.wait
                 {
                     if now >= deadline {
@@ -303,7 +568,7 @@ impl ControllerE1 {
                 }
             }
             Input::Overlay(OverlayEvent::Unavailable(id)) if *id == HUD => {
-                self.return_home(EndReason::Released, None, false, true, now, out);
+                self.hud_unavailable(now, out);
             }
             Input::Link(event) => self.link_event(event, now, out),
             Input::Hotkey(event) => self.hotkey_event(*event, now, out),
@@ -312,8 +577,72 @@ impl ControllerE1 {
             }
             Input::Command(Command::Panic) => self.panic(now, out),
             Input::Command(Command::Rearm) => self.arm(now, out),
+            Input::PortalsSet { ids, result } => self.portals_set(ids, result, now, out),
+            Input::LocalPointer { display, position } => {
+                self.local_pointer(*display, *position, now, out);
+            }
+            Input::CaptureReleased { op, result } => {
+                self.capture_released(*op, result, now, out);
+            }
+            Input::HomeBindSet {
+                op,
+                install,
+                result,
+            } => self.home_bind_set(*op, *install, result, now, out),
             Input::Tick => self.tick(now, out),
             _ => {}
+        }
+        // A pointer left on the twin is warped home as soon as it can be, on any input (A6).
+        self.stranded_retry(now, out);
+    }
+
+    fn capture_begun(
+        &mut self,
+        id: CaptureId,
+        result: &Result<CaptureStart, Failure>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if self.exit_begun(id, result, now, out) {
+            return;
+        }
+        let matches = matches!(&self.phase, Phase::Crossing(c)
+            if matches!(c.wait, Wait::Capture(_)) && c.capture.is_some_and(|v| v.id == id));
+        if matches {
+            match result {
+                Ok(start) => {
+                    if matches!(&self.phase, Phase::Crossing(c)
+                        if matches!(c.wait, Wait::Capture(deadline) if now >= deadline))
+                    {
+                        self.return_home(EndReason::Released, None, false, true, now, out);
+                    } else {
+                        self.chord_keys.extend(start.held_keys.iter().copied());
+                        self.lock_keys = start.lock_keys;
+                        self.activate(now, out);
+                    }
+                }
+                Err(_) => self.return_home(EndReason::Released, None, true, true, now, out),
+            }
+        } else if result.is_ok() {
+            // A repeat of the success of the exit capture that committed is not a new capture:
+            // it is the session's live one, and ending it would end the session (a stale
+            // success for any other id still ends what it began).
+            if self.committed_exit == Some(id) && self.retains_capture(id) {
+                return;
+            }
+            // Capture ids increase and the backend holds one capture at a time, so a success for
+            // an id older than the capture this controller knows was superseded: the newer
+            // capture's `begin` proves it is gone (WP-2.43 §2.6 "older-id rule").
+            if self.known_capture().is_some_and(|known| id < known) {
+                return;
+            }
+            // A delayed or duplicate success must never leave an unseen capture alive.
+            out.push(Output::EndCapture { warp_to: None });
+        } else if result.is_err()
+            && matches!(self.phase, Phase::Returning { capture, .. } if capture == id)
+        {
+            // A rolled-back activation cannot emit an Ended fence.
+            self.finish_return(out);
         }
     }
 
@@ -343,10 +672,10 @@ impl ControllerE1 {
             .as_ref()
             .filter(|h| !h.fired)
             .map(|h| h.since.saturating_add(self.config.panic_hold));
-        match (phase, panic) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [phase, panic, self.home_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     fn permits_io(&self) -> bool {
@@ -450,10 +779,13 @@ impl ControllerE1 {
     }
 
     /// An acknowledged outgoing session owns the controller role, including capture activation
-    /// and third-node handoffs that retain an existing capture.
+    /// and third-node handoffs that retain an existing capture. Also true while the home bind's
+    /// removal is unconfirmed (WP-2.43 A1): no session is admitted or started until the seat is
+    /// safe again.
     pub(crate) fn started(&self) -> bool {
         matches!(self.phase, Phase::Controlling(_))
             || matches!(&self.phase, Phase::Crossing(c) if c.capture.is_some())
+            || self.teardown.is_some()
     }
 
     /// Yield an unacknowledged crossing before incoming target admission.
@@ -475,7 +807,7 @@ impl ControllerE1 {
     }
 
     fn update_portals(&mut self, now: MonoTime, out: &mut Vec<Output>) {
-        let portals = if self.armed {
+        let layout_portals = if self.armed {
             self.layout.as_ref().map_or_else(Vec::new, |layout| {
                 layout
                     .capture_portals(self.config.node)
@@ -491,9 +823,33 @@ impl ControllerE1 {
         } else {
             Vec::new()
         };
-        let changed = portals != self.portals;
-        if changed {
-            self.portals = portals;
+        let changed = layout_portals != self.layout_portals;
+        self.layout_portals = layout_portals;
+        // The twin strips follow the same rebuild (WP-2.43 §2.5): the offered set is the layout's
+        // portals, then the strips.
+        let strips = self.twin_strip_set();
+        if strips != self.twin_strips {
+            self.twin_strips = strips;
+            self.strips_gen = self.strips_gen.saturating_add(1);
+        }
+        let mut offered = self.layout_portals.clone();
+        offered.extend_from_slice(&self.twin_strips);
+        // What the offered layout portals connect to now, and everything a crossing through them
+        // is mapped by (`Layout::entry`: the portal's span and both displays' geometry, pixel
+        // size, scale and origin). A change re-offers the set even when the strips are
+        // identical (the backend treats an identical set as a no-op): the new meaning gets its
+        // own request, answered in order like any other, so no pending answer can install the
+        // old one afterwards.
+        let mapping: Vec<PortalMapping> = self.layout.as_ref().map_or_else(Vec::new, |layout| {
+            self.layout_portals
+                .iter()
+                .filter_map(|c| layout.portals().iter().find(|p| p.id == c.id))
+                .filter_map(|p| Some((*p, *layout.get(p.from)?, *layout.get(p.to)?)))
+                .collect()
+        });
+        if offered != self.portals || mapping != self.portal_mapping {
+            self.portals = offered;
+            self.portal_mapping = mapping;
             out.push(Output::SetPortals(self.portals.clone()));
         }
         // A disarmed portal stays disarmed only while it is still offered.
@@ -541,9 +897,19 @@ impl ControllerE1 {
         };
     }
 
-    // The physical connection a portal ID names in the current layout.
+    // The layout a portal id from the backend is interpreted in: the one the newest set the
+    // backend confirmed was offered under (B1), not the newest request. Until the backend has
+    // answered anything the newest layout is the only one there is.
+    fn portal_layout(&self) -> Option<&Layout> {
+        match &self.confirmed_portals {
+            Some(map) => map.layout.as_ref(),
+            None => self.layout.as_ref(),
+        }
+    }
+
+    // The physical connection a portal ID names.
     fn connection(&self, portal: PortalId) -> Option<(GlobalDisplayId, GlobalDisplayId, Edge)> {
-        let layout = self.layout.as_ref()?;
+        let layout = self.portal_layout()?;
         let p = layout.portals().iter().find(|p| p.id == portal)?;
         Some((p.from, p.to, p.edge))
     }
@@ -584,10 +950,15 @@ impl ControllerE1 {
         portal: PortalId,
         position: f64,
     ) -> Option<(DisplayId, GlobalDisplayId, PointDevice)> {
-        if !self.armed || !self.permits_io() || !self.router.no_buttons_held() {
+        // No new session starts while a home bind's removal is unconfirmed (WP-2.43 A1).
+        if !self.armed
+            || !self.permits_io()
+            || !self.router.no_buttons_held()
+            || self.teardown.is_some()
+        {
             return None;
         }
-        let layout = self.layout.as_ref()?;
+        let layout = self.portal_layout()?;
         let p = layout.portals().iter().find(|p| {
             p.id == portal && p.from.node == self.config.node && self.peers.contains(&p.to.node)
         })?;
@@ -609,6 +980,7 @@ impl ControllerE1 {
             session: None,
             capture: None,
             wait: Wait::Hud(now.saturating_add(HUD_TIMEOUT)),
+            from_twin: false,
         });
     }
 
@@ -671,6 +1043,7 @@ impl ControllerE1 {
                         session: Some(mut session),
                         capture: Some(capture),
                         hud_display,
+                        from_twin,
                         ..
                     },
                 ) => {
@@ -681,6 +1054,9 @@ impl ControllerE1 {
                         capture,
                         tracker,
                         hud_display,
+                        home: None,
+                        from_twin,
+                        last_motion: None,
                     });
                 }
                 (_, crossing) => {
@@ -708,7 +1084,7 @@ impl ControllerE1 {
                 }
                 if self.reentry.is_some_and(|(from, to, edge, until)| {
                     now < until
-                        && self.layout.as_ref().is_some_and(|layout| {
+                        && self.portal_layout().is_some_and(|layout| {
                             layout.portals().iter().any(|p| {
                                 p.id == *portal && p.from == from && p.to == to && p.edge == edge
                             })
@@ -737,6 +1113,10 @@ impl ControllerE1 {
                     self.push = Some(push);
                 }
             }
+            // WP-2.43 §2.6: a push against a twin strip while home starts the exit.
+            CaptureEvent::EdgePressed {
+                portal, position, ..
+            } if self.home_is_resting() => self.exit_press(*portal, *position, now, out),
             CaptureEvent::EdgeReleased { portal, at } => {
                 self.rearm_portal(*portal, *at);
                 if self.push.is_some_and(|p| p.portal == *portal) {
@@ -748,49 +1128,22 @@ impl ControllerE1 {
                     capture.started = true;
                 }
             }
-            CaptureEvent::Ended { id, .. } => {
-                if matches!(self.phase, Phase::Returning { capture, .. } if capture == *id) {
+            CaptureEvent::Ended { id, reason } => {
+                if self.home_capture_ended(*id, *reason, now, out) {
+                    // Expected, or the exit's own capture: handled there.
+                } else if matches!(self.phase, Phase::Returning { capture, .. } if capture == *id) {
                     self.finish_return(out);
                 } else if self.capture_mut().is_some_and(|c| c.id == *id) {
                     self.return_home(EndReason::Released, None, true, true, now, out);
                 }
             }
-            CaptureEvent::Key { usage, down, .. }
-                if self.capture_mut().is_some_and(|c| c.started) =>
-            {
-                if *down {
-                    self.chord_keys.insert(*usage);
-                } else {
-                    self.chord_keys.remove(usage);
-                }
-                if *down
-                    && *usage == self.config.release_chord.key
-                    && self
-                        .config
-                        .release_chord
-                        .modifiers
-                        .iter()
-                        .all(|k| self.chord_keys.contains(k))
-                {
-                    // The authoritative hotkey pair may arrive after this captured chord.
-                    // Suppress that pair for re-arm purposes without comparing timestamps.
-                    self.chord_press_outstanding = true;
-                    self.release(now, out);
-                } else {
-                    self.route(Held::Key(*usage), *down, now, out);
-                }
+            CaptureEvent::Key { usage, down, .. } if self.input_mode() != InputMode::Off => {
+                self.capture_key(*usage, *down, now, out);
             }
-            CaptureEvent::Button { button, down, .. }
-                if self.capture_mut().is_some_and(|c| c.started) =>
-            {
-                if *down {
-                    self.capture_buttons.insert(*button);
-                } else {
-                    self.capture_buttons.remove(button);
-                }
-                self.route(Held::Button(*button), *down, now, out);
+            CaptureEvent::Button { button, down, .. } if self.input_mode() != InputMode::Off => {
+                self.capture_button(*button, *down, now, out);
             }
-            CaptureEvent::Scroll { delta, .. } if self.capture_mut().is_some_and(|c| c.started) => {
+            CaptureEvent::Scroll { delta, .. } if self.input_mode() == InputMode::Routing => {
                 if self.ensure_sequence_room(now, out)
                     && let Phase::Controlling(c) = &mut self.phase
                 {
@@ -806,7 +1159,7 @@ impl ControllerE1 {
                 }
             }
             CaptureEvent::Motion { dx, dy, kind, at }
-                if self.capture_mut().is_some_and(|c| c.started) =>
+                if self.input_mode() == InputMode::Routing =>
             {
                 self.motion(*dx, *dy, *kind, *at, now, out);
             }
@@ -905,6 +1258,7 @@ impl ControllerE1 {
         let previous = c.tracker.position();
         match c.tracker.step(layout, mm) {
             Step::On { display, position } => {
+                c.last_motion = Some(at);
                 let seq = c.session.motion_seq;
                 c.session.motion_seq = seq.saturating_add(1);
                 out.push(Output::SendMotion {
@@ -922,9 +1276,15 @@ impl ControllerE1 {
                 position,
                 portal,
             } => {
+                // A handoff to a third node starts a new controller session: not while this
+                // node's home bind may still exist (an entry that has requested it, or a
+                // removal that is unconfirmed, WP-2.43 A1). The pointer stays where it was.
+                let fenced = display.node != self.config.node
+                    && (self.teardown.is_some() || c.home.is_some_and(|h| h.bind));
                 if !self.router.no_buttons_held()
                     || !self.capture_buttons.is_empty()
                     || (display.node != self.config.node && !self.peers.contains(&display.node))
+                    || fenced
                 {
                     if let Some(tracker) = PointerTracker::new(layout, previous.0, previous.1) {
                         c.tracker = tracker;
@@ -943,6 +1303,9 @@ impl ControllerE1 {
                                 .find(|p| p.from == returned.to && p.to == returned.from)
                         })
                         .map(|p| (p.from, p.to, p.edge, now.saturating_add(REENTRY_GUARD)));
+                    // The pointer left the peer's display: an entry still before its release is
+                    // over (WP-2.43 §2.4).
+                    self.note_entry_failure(HomeFailure::Gone);
                     self.return_home(
                         EndReason::Released,
                         Some((display.display, position)),
@@ -952,6 +1315,7 @@ impl ControllerE1 {
                         out,
                     );
                 } else {
+                    self.abort_entry_if_entering(HomeFailure::Gone, now, out);
                     self.switch_target(portal, (display, position), now, out);
                 }
             }
@@ -975,6 +1339,7 @@ impl ControllerE1 {
                 session: None,
                 capture: Some(c.capture),
                 wait: Wait::Handshake(now.saturating_add(START_TIMEOUT)),
+                from_twin: c.from_twin,
             });
             self.start_handshake(now, out);
             if matches!(self.phase, Phase::Crossing(_)) {
@@ -1129,6 +1494,27 @@ impl ControllerE1 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        self.release_session_held(session, now, out);
+        let connected = self.peers.contains(&session.peer);
+        if connected && send_end {
+            out.push(Output::SendControl {
+                peer: session.peer,
+                msg: ControlMessage::EndControl {
+                    session: session.id,
+                    reason,
+                },
+            });
+        }
+    }
+
+    /// Send an up for everything the router holds on the session's peer (the first half of
+    /// ending a session: no `EndControl`). Each key goes out under the usage it was pressed as.
+    fn release_session_held(
+        &mut self,
+        session: &mut Session,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
         let held = self.router.release_all(session.peer);
         let connected = self.peers.contains(&session.peer);
         for item in held {
@@ -1141,15 +1527,6 @@ impl ControllerE1 {
             if connected {
                 session.transition(item, false, now, out);
             }
-        }
-        if connected && send_end {
-            out.push(Output::SendControl {
-                peer: session.peer,
-                msg: ControlMessage::EndControl {
-                    session: session.id,
-                    reason,
-                },
-            });
         }
     }
 
@@ -1164,24 +1541,114 @@ impl ControllerE1 {
     ) {
         self.push = None;
         let phase = std::mem::replace(&mut self.phase, Phase::Idle);
-        let (capture, session) = match phase {
-            Phase::Controlling(c) => (Some(c.capture), Some(c.session)),
-            Phase::Crossing(c) => (c.capture, c.session),
+        let (capture, session, home, from_twin, hud_display) = match phase {
+            Phase::Controlling(c) => (
+                Some(c.capture),
+                Some(c.session),
+                c.home,
+                c.from_twin,
+                Some(c.hud_display),
+            ),
+            Phase::Crossing(c) => (c.capture, c.session, None, c.from_twin, Some(c.hud_display)),
             other => {
                 self.phase = other;
                 return;
             }
         };
-        if capture.is_some() && !ended {
-            out.push(Output::EndCapture { warp_to });
+        self.activation.clear();
+        self.activation_overflow = false;
+        self.committed_exit = None;
+        let failure = self.failure.take();
+        // The point a capture that began on a twin strip, or an ended home, returns the pointer
+        // to when no crossing point is given (§2.7).
+        let fallback = home
+            .map(|h| h.fallback)
+            .or_else(|| hud_display.and_then(|d| self.fallback_point(d)));
+        // Whether a capture may still be live, and whether this end warps (§2.7).
+        let mut live = capture.is_some() && !ended;
+        let mut warps = from_twin;
+        if let Some(h) = home {
+            warps = true;
+            // A1: the bind's removal is a phase of its own, started first.
+            if h.bind {
+                self.start_teardown(h.peer, h.projection, now, out);
+            }
+            let key = ProjectionKey {
+                source: self.config.node,
+                projection: h.projection,
+            };
+            let notice = match h.state {
+                // Before the release: the capture is live and the pointer is on a physical
+                // display, so the ordinary end applies; the entry is an abort.
+                HomeState::Entering(Entering::Draining { .. } | Entering::Binding { .. }) => {
+                    warps = from_twin;
+                    self.home_fence = Some((h.projection, now.saturating_add(HOME_RETRY)));
+                    Notice::HomeFailed {
+                        key,
+                        reason: failure.unwrap_or_else(|| failure_for(reason)),
+                    }
+                }
+                // The release is in flight: its capture may still exist unless it already ended.
+                HomeState::Entering(Entering::Releasing { .. }) => {
+                    live &= !h.ended_seen;
+                    Notice::HomeFailed {
+                        key,
+                        reason: failure.unwrap_or_else(|| failure_for(reason)),
+                    }
+                }
+                // The capture is gone and the pointer is on the twin.
+                HomeState::Entering(Entering::Focusing { .. }) => {
+                    live = false;
+                    Notice::HomeFailed {
+                        key,
+                        reason: failure.unwrap_or_else(|| failure_for(reason)),
+                    }
+                }
+                HomeState::Home | HomeState::Exiting(Exiting::Hud { .. }) => {
+                    live = false;
+                    failure.map_or(
+                        Notice::Home {
+                            key,
+                            entered: false,
+                        },
+                        |reason| Notice::HomeFailed { key, reason },
+                    )
+                }
+                // An exit capture is being activated or cancelled: it may exist.
+                HomeState::Exiting(Exiting::Activating { .. } | Exiting::Cancelled { .. }) => {
+                    failure.map_or(
+                        Notice::Home {
+                            key,
+                            entered: false,
+                        },
+                        |reason| Notice::HomeFailed { key, reason },
+                    )
+                }
+            };
+            out.push(Output::Notice(notice));
+        }
+        let point = warp_to.or(fallback).filter(|_| warps);
+        if live {
+            match point {
+                Some(point) => {
+                    self.release_and_warp(WarpPurpose::Leave, point, out);
+                }
+                None => out.push(Output::EndCapture { warp_to }),
+            }
+        } else if let Some(point) = point
+            && (home.is_some() || capture.is_some())
+        {
+            // Nothing to end, but the pointer may be on the invisible twin: a plain warp.
+            self.release_and_warp(WarpPurpose::Leave, point, out);
         }
         if let Some(mut session) = session {
             self.end_session(&mut session, reason, send_end, now, out);
         }
-        if let Some(capture) = capture.filter(|_| !ended) {
+        if let Some(capture) = capture.filter(|_| live) {
             self.phase = Phase::Returning {
                 capture: capture.id,
                 deadline: now.saturating_add(END_TIMEOUT),
+                warp: point,
             };
         } else {
             self.finish_return(out);
@@ -1207,6 +1674,8 @@ impl ControllerE1 {
 
     fn arm(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         self.armed = true;
+        // Every re-arm reopens the engine's side of the gate (the callers emit `EngineGate`).
+        self.gate_closed = false;
         self.update_portals(now, out);
     }
 
@@ -1220,6 +1689,8 @@ impl ControllerE1 {
         if let Some(hold) = &mut self.hotkey {
             hold.fired = true;
         }
+        // The engine gate is closed until the re-arm (the callers emit `EngineGate(false)`).
+        self.gate_closed = true;
         self.return_home(EndReason::Panic, None, false, true, now, out);
         self.disarm(now, out);
         out.push(Output::Notice(Notice::Panic));
@@ -1261,6 +1732,8 @@ impl ControllerE1 {
             out.push(Output::EngineGate(false));
             self.panic(now, out);
         }
+        // WP-2.43: the home deadlines, the bind removal's retries and the portal re-sends.
+        self.home_tick(now, out);
         match &mut self.phase {
             Phase::Idle => {
                 if let Some(push) = self
@@ -1323,11 +1796,1877 @@ impl ControllerE1 {
                     });
                 }
             }
-            Phase::Returning { deadline, .. } if now >= *deadline => {
-                out.push(Output::EndCapture { warp_to: None });
+            Phase::Returning { deadline, warp, .. } if now >= *deadline => {
+                // A capture that began on a twin strip, or whose home ended, always warps (§2.7).
+                match *warp {
+                    Some(point) => {
+                        self.release_and_warp(WarpPurpose::Leave, point, out);
+                    }
+                    None => out.push(Output::EndCapture { warp_to: None }),
+                }
                 self.finish_return(out);
             }
             _ => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// WP-2.43: home on the twin (docs/wp/WP-2.43.md §2, amendments A1-A9 and B1).
+//
+// The controller can *go home* into one of this node's own twin-parked windows that the peer it
+// controls shows: it settles every injector this node owns, installs the home bind, releases the
+// capture, puts the physical pointer on the twin and confirms the window has focus, all while the
+// E1 session stays open. Pushing against a twin strip resumes the session at the proxy's edge.
+// ---------------------------------------------------------------------------------------------
+
+/// Why an entry or a home that ends with its session is reported as failed.
+fn failure_for(reason: EndReason) -> HomeFailure {
+    match reason {
+        EndReason::Released | EndReason::Panic | EndReason::ControllerLocked => HomeFailure::Guard,
+        _ => HomeFailure::Gone,
+    }
+}
+
+/// Whether `p` (device pixels of the proxy's display) is inside the placement.
+fn inside(placement: &Proxy, p: PointDevice) -> bool {
+    p.x >= placement.origin.x
+        && p.y >= placement.origin.y
+        && p.x < placement.origin.x + f64::from(placement.size.width)
+        && p.y < placement.origin.y + f64::from(placement.size.height)
+}
+
+/// §2.5 "Mapping": a press at fraction `t` along a strip on the twin output's `edge` maps to the
+/// host point just outside the proxy's corresponding edge, clamped into the host display.
+fn exit_point(placement: &Proxy, geometry: &DisplayGeometry, edge: Edge, t: f64) -> PointDevice {
+    let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+    let (w, h) = (
+        f64::from(placement.size.width),
+        f64::from(placement.size.height),
+    );
+    let origin = placement.origin;
+    geometry.clamp_device(match edge {
+        Edge::Left => PointDevice::new(origin.x - 1.0, origin.y + t * h),
+        Edge::Right => PointDevice::new(origin.x + w, origin.y + t * h),
+        Edge::Top => PointDevice::new(origin.x + t * w, origin.y - 1.0),
+        Edge::Bottom => PointDevice::new(origin.x + t * w, origin.y + h),
+    })
+}
+
+/// §2.5 "Offerability": an edge is offered only if its mapped point (at `t = 0.5`) is not inside
+/// the placement after clamping, i.e. the proxy does not touch or exceed the display on that side.
+fn offerable(placement: &Proxy, geometry: &DisplayGeometry, edge: Edge) -> bool {
+    !inside(placement, exit_point(placement, geometry, edge, 0.5))
+}
+
+/// §2.5: a strip sits on the twin output's `edge` and spans the content's extent along it, in
+/// device pixels of the twin (as `CapturePortal` requires).
+fn strip_span(content: PixelRect, edge: Edge) -> (f64, f64) {
+    match edge {
+        Edge::Left | Edge::Right => (f64::from(content.min.y), f64::from(content.max.y)),
+        Edge::Top | Edge::Bottom => (f64::from(content.min.x), f64::from(content.max.x)),
+    }
+}
+
+fn edge_index(edge: Edge) -> u32 {
+    match edge {
+        Edge::Left => 0,
+        Edge::Right => 1,
+        Edge::Top => 2,
+        Edge::Bottom => 3,
+    }
+}
+
+/// A1: 100 ms doubling to 2 s.
+fn backoff(attempt: u32) -> Duration {
+    TEARDOWN_BACKOFF_MIN
+        .saturating_mul(1 << attempt.min(8))
+        .min(TEARDOWN_BACKOFF_MAX)
+}
+
+impl ControllerE1 {
+    // ---- state accessors ----
+
+    fn home_copy(&self) -> Option<Home> {
+        match &self.phase {
+            Phase::Controlling(c) => c.home,
+            _ => None,
+        }
+    }
+
+    fn home_state(&self) -> Option<HomeState> {
+        self.home_copy().map(|h| h.state)
+    }
+
+    fn set_home_state(&mut self, state: HomeState) {
+        if let Phase::Controlling(c) = &mut self.phase
+            && let Some(home) = &mut c.home
+        {
+            home.state = state;
+        }
+    }
+
+    fn key_of(&self, projection: ProjectionId) -> ProjectionKey {
+        ProjectionKey {
+            source: self.config.node,
+            projection,
+        }
+    }
+
+    /// The projection this controller is entering, home in, exiting, or whose bind it is still
+    /// removing, if any (WP-2.43 A1: the seat stays arbitrated until removal is confirmed).
+    pub(crate) fn home(&self) -> Option<(NodeId, ProjectionId)> {
+        if let Phase::Controlling(c) = &self.phase
+            && let Some(home) = &c.home
+        {
+            return Some((home.peer, home.projection));
+        }
+        self.teardown.map(|t| (t.peer, t.projection))
+    }
+
+    /// The capture the controller knows about: the live one, or the one being ended.
+    fn known_capture(&self) -> Option<CaptureId> {
+        match &self.phase {
+            Phase::Controlling(c) => Some(c.capture.id),
+            Phase::Crossing(c) => c.capture.map(|c| c.id),
+            Phase::Returning { capture, .. } => Some(*capture),
+            Phase::Idle => None,
+        }
+    }
+
+    /// This controller still holds capture `id` as its live capture: as the session's capture
+    /// (also while an entry that has not released it yet is under way) or retained through a
+    /// handoff to a third node. Not once it is being ended (`Returning`) or has been released.
+    fn retains_capture(&self, id: CaptureId) -> bool {
+        match &self.phase {
+            Phase::Controlling(c) => {
+                c.capture.id == id
+                    && matches!(
+                        c.home.map(|h| h.state),
+                        None | Some(HomeState::Entering(
+                            Entering::Draining { .. } | Entering::Binding { .. }
+                        ))
+                    )
+            }
+            Phase::Crossing(c) => c.capture.is_some_and(|capture| capture.id == id),
+            _ => false,
+        }
+    }
+
+    /// An entry is waiting for every injector this node owns to settle (§2.3 step 1).
+    pub(crate) fn draining(&self) -> bool {
+        matches!(
+            self.home_state(),
+            Some(HomeState::Entering(Entering::Draining { .. }))
+        )
+    }
+
+    fn exiting_hud(&self) -> bool {
+        matches!(
+            self.home_state(),
+            Some(HomeState::Exiting(Exiting::Hud { .. }))
+        )
+    }
+
+    /// Home, with nothing in flight: a press against a strip may start an exit.
+    fn home_is_resting(&self) -> bool {
+        matches!(self.home_state(), Some(HomeState::Home))
+    }
+
+    fn entering_before_release(&self) -> bool {
+        matches!(
+            self.home_state(),
+            Some(HomeState::Entering(
+                Entering::Draining { .. } | Entering::Binding { .. }
+            ))
+        )
+    }
+
+    fn input_mode(&self) -> InputMode {
+        match &self.phase {
+            Phase::Crossing(c) if c.capture.is_some_and(|c| c.started) => InputMode::Routing,
+            Phase::Controlling(c) if c.capture.started => match c.home.map(|h| h.state) {
+                None
+                | Some(HomeState::Entering(Entering::Draining { .. } | Entering::Binding { .. })) => {
+                    InputMode::Routing
+                }
+                // The capture still exists (being released or cancelled): the chord must still
+                // work through it, though nothing is routed.
+                Some(
+                    HomeState::Entering(Entering::Releasing { .. })
+                    | HomeState::Exiting(Exiting::Cancelled { .. }),
+                ) => InputMode::ChordOnly,
+                Some(HomeState::Exiting(Exiting::Activating { .. })) => InputMode::Buffer,
+                Some(_) => InputMode::Off,
+            },
+            _ => InputMode::Off,
+        }
+    }
+
+    fn twin_home(&self, peer: NodeId, projection: ProjectionId) -> Option<TwinHome> {
+        self.twin_homes
+            .iter()
+            .find(|h| h.projection == projection && h.peer == peer)
+            .copied()
+    }
+
+    /// §2.2.1: the coherent placement of `home` (display, geometry of the peer's display in the
+    /// layout), if it has one.
+    fn coherent(&self, home: &TwinHome) -> Option<(Proxy, GlobalDisplayId, DisplayGeometry)> {
+        let placement = home.placed?;
+        let id = GlobalDisplayId {
+            node: home.peer,
+            display: placement.display,
+        };
+        let geometry = self.layout.as_ref()?.get(id)?.geometry;
+        Some((placement, id, geometry))
+    }
+
+    fn strips_of(&self, projection: ProjectionId) -> Vec<CapturePortal> {
+        let Some(slot) = self
+            .twin_slots
+            .get(&projection)
+            .copied()
+            .filter(|slot| *slot < MAX_TWIN_SLOT)
+        else {
+            return Vec::new();
+        };
+        let base = TWIN_PORTAL_BASE + 4 * slot;
+        self.twin_strips
+            .iter()
+            .filter(|s| (base..base + 4).contains(&s.id.0))
+            .copied()
+            .collect()
+    }
+
+    fn portal_offered(&self, projection: ProjectionId, portal: PortalId) -> bool {
+        self.strips_of(projection).iter().any(|s| s.id == portal)
+    }
+
+    /// §2.2.2: at least one exit exists and the current portal set that contains it is installed.
+    fn exits_installed(&self, projection: ProjectionId) -> bool {
+        self.portals_installed && !self.strips_of(projection).is_empty()
+    }
+
+    fn fallback_point(&self, display: DisplayId) -> Option<(DisplayId, PointDevice)> {
+        let info = self
+            .displays
+            .get(&self.config.node)?
+            .iter()
+            .find(|d| d.id == display)?;
+        let size = info.geometry.pixel_size;
+        Some((
+            display,
+            PointDevice::new(f64::from(size.width) / 2.0, f64::from(size.height) / 2.0),
+        ))
+    }
+
+    // ---- operations ----
+
+    fn alloc_op(&mut self) -> HomeOp {
+        let op = HomeOp(self.next_op);
+        self.next_op = self.next_op.saturating_add(1);
+        op
+    }
+
+    fn register_warp(
+        &mut self,
+        op: HomeOp,
+        purpose: WarpPurpose,
+        target: (DisplayId, PointDevice),
+    ) {
+        self.warps.push(WarpEntry {
+            op,
+            purpose,
+            target,
+        });
+        if self.warps.len() > WARPS_MAX {
+            self.warps.remove(0);
+        }
+    }
+
+    fn take_warp(&mut self, op: HomeOp) -> Option<WarpEntry> {
+        let index = self.warps.iter().position(|w| w.op == op)?;
+        Some(self.warps.remove(index))
+    }
+
+    /// End the capture (if one is live) and warp the pointer, correlated by a fresh operation.
+    fn release_and_warp(
+        &mut self,
+        purpose: WarpPurpose,
+        target: (DisplayId, PointDevice),
+        out: &mut Vec<Output>,
+    ) -> HomeOp {
+        let op = self.alloc_op();
+        self.register_warp(op, purpose, target);
+        out.push(Output::ReleaseAndWarp {
+            op,
+            warp_to: target,
+        });
+        op
+    }
+
+    /// A1: the home bind's removal is a phase of its own.
+    fn start_teardown(
+        &mut self,
+        peer: NodeId,
+        projection: ProjectionId,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if self.teardown.is_some() {
+            return;
+        }
+        let op = self.alloc_op();
+        self.teardown = Some(Teardown {
+            op,
+            attempt: 0,
+            next: now.saturating_add(backoff(0)),
+            peer,
+            projection,
+        });
+        out.push(Output::HomeBind { op, install: false });
+    }
+
+    // ---- timers ----
+
+    /// Passive guards are dropped once expired (A6).
+    fn prune(&mut self, now: MonoTime) {
+        self.exit_retry.retain(|_, until| now < *until);
+        if self.home_fence.is_some_and(|(_, until)| now >= until) {
+            self.home_fence = None;
+        }
+    }
+
+    /// A retry can only succeed while the platform's gate is open on both sides: the session
+    /// permits I/O and no panic has closed the engine's side. While it is closed the budget is
+    /// kept, so the re-arm still recovers the pointer.
+    fn stranded_can_run(&self) -> bool {
+        self.permits_io() && !self.gate_closed && matches!(self.phase, Phase::Idle)
+    }
+
+    fn home_deadline(&self) -> Option<MonoTime> {
+        let state = match self.home_state() {
+            Some(HomeState::Entering(
+                Entering::Draining { deadline }
+                | Entering::Binding { deadline }
+                | Entering::Releasing { deadline }
+                | Entering::Focusing { deadline },
+            ))
+            | Some(HomeState::Exiting(
+                Exiting::Hud { deadline, .. }
+                | Exiting::Activating { deadline, .. }
+                | Exiting::Cancelled { deadline, .. },
+            )) => Some(deadline),
+            _ => None,
+        };
+        // Actionable deadlines stay while due, until their action runs (A6); a stranded pointer's
+        // retry can only run while this node is unlocked and idle, so it waits for an input then.
+        let stranded = self
+            .stranded
+            .filter(|_| self.stranded_can_run())
+            .map(|s| s.next);
+        [
+            state,
+            self.teardown.map(|t| t.next),
+            self.portals_retry,
+            stranded,
+            self.home_fence.map(|(_, until)| until),
+            self.exit_retry.values().copied().min(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    fn home_tick(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        // A1: the bind's removal, retried with backoff until confirmed.
+        if let Some(t) = self.teardown
+            && now >= t.next
+        {
+            let op = self.alloc_op();
+            let attempt = t.attempt.saturating_add(1);
+            self.teardown = Some(Teardown {
+                op,
+                attempt,
+                next: now.saturating_add(backoff(attempt)),
+                ..t
+            });
+            out.push(Output::HomeBind { op, install: false });
+        }
+        // §2.8: a portal set that was not installed is offered again.
+        if self.portals_retry.is_some_and(|at| now >= at) {
+            if self.portals_failed
+                && self.portal_requests.is_empty()
+                && !self.twin_strips.is_empty()
+            {
+                self.portals_retry = Some(now.saturating_add(PORTALS_RETRY));
+                out.push(Output::SetPortals(self.portals.clone()));
+            } else {
+                self.portals_retry = None;
+            }
+        }
+        let Some(home) = self.home_copy() else {
+            return;
+        };
+        match home.state {
+            // Settled or not, `after_e2` decides: it alone sees the injectors.
+            HomeState::Entering(Entering::Draining { .. }) | HomeState::Home => {}
+            HomeState::Entering(Entering::Binding { deadline }) if now >= deadline => {
+                self.abort_entry(HomeFailure::Bind, now, out);
+            }
+            HomeState::Entering(Entering::Releasing { deadline }) if now >= deadline => {
+                self.leave_home(Some(HomeFailure::Release), now, out);
+            }
+            HomeState::Entering(Entering::Focusing { deadline }) if now >= deadline => {
+                self.leave_home(Some(HomeFailure::Focus), now, out);
+            }
+            HomeState::Exiting(Exiting::Hud {
+                portal, deadline, ..
+            }) if now >= deadline => {
+                out.push(Output::HideOverlay(HUD));
+                self.set_home_state(HomeState::Home);
+                self.exit_retry
+                    .insert(portal, now.saturating_add(HOME_RETRY));
+            }
+            HomeState::Exiting(Exiting::Activating {
+                id,
+                portal,
+                deadline,
+                ..
+            }) if now >= deadline => self.cancel_exit(id, portal, now, out),
+            HomeState::Exiting(Exiting::Cancelled { deadline, .. }) if now >= deadline => {
+                // No `Ended` came: end it once more (idempotent) and carry on.
+                out.push(Output::EndCapture { warp_to: None });
+                self.exit_resolved();
+            }
+            _ => {}
+        }
+    }
+
+    /// §2.7 "Stranded pointer": a home-related warp that was skipped or failed is retried while
+    /// this node is unlocked and idle, at most `STRANDED_ATTEMPTS` times, until one is done.
+    fn stranded_retry(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        let Some(stranded) = self.stranded else {
+            return;
+        };
+        if now < stranded.next || !self.stranded_can_run() {
+            return;
+        }
+        if stranded.attempts >= STRANDED_ATTEMPTS {
+            self.stranded = None;
+            return;
+        }
+        self.stranded = Some(Stranded {
+            next: now.saturating_add(STRANDED_RETRY),
+            attempts: stranded.attempts + 1,
+            ..stranded
+        });
+        self.release_and_warp(WarpPurpose::Retry, stranded.target, out);
+    }
+
+    // ---- portals ----
+
+    /// The twin strips to offer now (§2.4, §2.5): while this controller controls a peer, four
+    /// edge strips (the offerable ones) for each of that peer's twin homes with a coherent
+    /// placement. Never while idle, crossing or returning, so an injected pointer on the twin
+    /// can never press one.
+    fn twin_strip_set(&self) -> Vec<CapturePortal> {
+        let Phase::Controlling(c) = &self.phase else {
+            return Vec::new();
+        };
+        let mut strips = Vec::new();
+        for home in &self.twin_homes {
+            if home.peer != c.session.peer {
+                continue;
+            }
+            let (Some((placement, _, geometry)), Some(slot)) = (
+                self.coherent(home),
+                self.twin_slots
+                    .get(&home.projection)
+                    .copied()
+                    .filter(|slot| *slot < MAX_TWIN_SLOT),
+            ) else {
+                continue;
+            };
+            for edge in EDGES {
+                let (from, to) = strip_span(home.content, edge);
+                if !offerable(&placement, &geometry, edge) || from >= to {
+                    continue;
+                }
+                strips.push(CapturePortal {
+                    id: PortalId(TWIN_PORTAL_BASE + 4 * slot + edge_index(edge)),
+                    display: home.display,
+                    edge,
+                    from,
+                    to,
+                });
+            }
+        }
+        strips
+    }
+
+    /// One `Output::SetPortals` the engine actually emitted (the engine reports each, in order,
+    /// after it has dropped the ones it suppresses while this node is controlled): it is answered
+    /// by one `Input::PortalsSet`, in order. The mapping it was emitted under is kept until then,
+    /// so what its ids mean is known whichever way the answer goes (B1).
+    pub(crate) fn portal_emitted(&mut self, set: &[CapturePortal]) {
+        if self.portal_requests.len() >= PORTAL_REQUESTS_MAX {
+            // The answers stopped coming: forget the oldest rather than grow. Its answer is still
+            // owed and arrives first, so it is counted: the answers that follow must not be read
+            // against the wrong snapshots (identical ids can mean different strips). What the
+            // backend holds is unknown until an answer that is aligned again confirms a set, so
+            // nothing is confirmed meanwhile: no strip can be pressed (fail closed).
+            self.portal_requests.pop_front();
+            self.portal_skip = self.portal_skip.saturating_add(1);
+            self.confirmed_portals = Some(PortalMap::empty());
+        }
+        self.portal_requests.push_back(PortalRequest {
+            ids: set.iter().map(|p| p.id).collect(),
+            map: PortalMap {
+                offered: set.to_vec(),
+                // An empty set installs nothing: no strip can be pressed under it.
+                layout: if set.is_empty() {
+                    None
+                } else {
+                    self.layout.clone()
+                },
+            },
+        });
+        self.portals_installed = false;
+        self.portals_failed = false;
+        self.portals_retry = None;
+    }
+
+    fn mark_portals_failed(&mut self, now: MonoTime) {
+        self.portals_installed = false;
+        self.portals_failed = true;
+        if !self.twin_strips.is_empty() {
+            self.portals_retry = Some(now.saturating_add(PORTALS_RETRY));
+        }
+    }
+
+    /// `Input::PortalsSet`: the backend's answer to one `SetPortals` (§2.2.2, A9, B1).
+    fn portals_set(
+        &mut self,
+        ids: &[PortalId],
+        result: &Result<(), PortalsFailure>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        // Answers are strictly in order, one per emitted set: this one belongs to the oldest
+        // outstanding request. Its ids only check that the two agree; if they don't (an answer
+        // nobody asked for, or one for another set) nothing can be relied on, which is what an
+        // uncertain answer says. (The engine is sans-IO: there is no log to note it in.)
+        let (request, result) = if self.portal_skip > 0 {
+            // The answer of a request dropped on overflow: there is no snapshot to read it
+            // against, so it confirms nothing, whichever way it went (no request, below). It
+            // still counts for the failure, retry and uncertainty handling.
+            self.portal_skip -= 1;
+            (None, *result)
+        } else {
+            let request = self.portal_requests.pop_front();
+            let consistent = request.as_ref().is_some_and(|r| r.ids == ids);
+            let result = if consistent {
+                *result
+            } else {
+                Err(PortalsFailure::Uncertain)
+            };
+            (request, result)
+        };
+        match (&result, request) {
+            // The set is installed: what its ids mean is what this request was emitted under.
+            (Ok(()), Some(request)) => self.confirmed_portals = Some(request.map),
+            // The previous set stays in force; if the backend never confirmed one, it holds none.
+            (Err(PortalsFailure::Rejected), _) => {
+                if self.confirmed_portals.is_none() {
+                    self.confirmed_portals = Some(PortalMap::empty());
+                }
+            }
+            // Whether the previous set survives is unknown: rely on nothing.
+            _ => self.confirmed_portals = Some(PortalMap::empty()),
+        }
+        match result {
+            Ok(()) => {
+                // Only the answer to the newest set installs it: the set the backend now holds is
+                // the one this controller offers, and nothing newer is outstanding.
+                if self.portal_requests.is_empty() {
+                    if self
+                        .confirmed_portals
+                        .as_ref()
+                        .is_some_and(|map| map.offered == self.portals)
+                    {
+                        self.portals_installed = true;
+                        self.portals_failed = false;
+                        self.portals_retry = None;
+                    } else {
+                        self.mark_portals_failed(now);
+                    }
+                } else {
+                    self.portals_installed = false;
+                }
+            }
+            Err(failure) => {
+                self.portals_installed = false;
+                if self.portal_requests.is_empty() {
+                    self.mark_portals_failed(now);
+                }
+                // B1: a timeout or a stopped backend leaves unknown whether the capture
+                // survives: end it explicitly and wait for its end. A rejection leaves the
+                // previous set and the capture intact.
+                if failure == PortalsFailure::Uncertain {
+                    self.capture_uncertain(now, out);
+                }
+                // A9: while home, no exit may be left that the backend didn't confirm.
+                self.exits_lost(now, out);
+            }
+        }
+    }
+
+    /// B1: end the capture explicitly and treat it as gone only after its `Ended` or
+    /// `CAPTURE_END_DEADLINE`.
+    fn capture_uncertain(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        let has_capture = matches!(self.phase, Phase::Controlling(_))
+            || matches!(&self.phase, Phase::Crossing(c) if c.capture.is_some());
+        if !has_capture {
+            return;
+        }
+        self.failure = Some(HomeFailure::Gone);
+        self.return_home(EndReason::Released, None, false, true, now, out);
+        self.failure = None;
+        if let Phase::Returning { deadline, .. } = &mut self.phase {
+            *deadline = now.saturating_add(CAPTURE_END_DEADLINE);
+        }
+    }
+
+    /// The twin strips are no longer installed: an entry still before its release is abandoned,
+    /// a home is left without a crossing.
+    fn exits_lost(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        if self.entering_before_release() {
+            self.abort_entry(HomeFailure::Gone, now, out);
+        } else if self.home_copy().is_some() {
+            self.leave_home(Some(HomeFailure::Gone), now, out);
+        }
+    }
+
+    // ---- entry (§2.2, §2.3) ----
+
+    /// §2.3: a prevalidated peer motion report; starts the entry transaction when every check of
+    /// §2.2 and the corroboration of §2.3 pass.
+    pub(crate) fn peer_motion(
+        &mut self,
+        peer: NodeId,
+        projection: ProjectionId,
+        position: PointDevice,
+        now: MonoTime,
+        _out: &mut Vec<Output>,
+    ) {
+        let Phase::Controlling(c) = &self.phase else {
+            return;
+        };
+        if c.session.peer != peer || c.home.is_some() || !c.capture.started {
+            return;
+        }
+        let (tracker_display, tracker) = c.tracker.position();
+        let (hud_display, ended, last_motion) = (c.hud_display, c.capture.id, c.last_motion);
+        // §2.2.4: no fence, and no bind removal outstanding (A1).
+        if self.teardown.is_some()
+            || self
+                .home_fence
+                .is_some_and(|(p, until)| p == projection && now < until)
+        {
+            return;
+        }
+        // §2.2.3: the guards of an ordinary crossing.
+        if !self.armed
+            || !self.permits_io()
+            || !self.router.no_buttons_held()
+            || !self.capture_buttons.is_empty()
+        {
+            return;
+        }
+        // §2.2.6: the physical pointer moved recently.
+        if last_motion.is_none_or(|at| now.saturating_duration_since(at) > LOCAL_MOTION_AGE) {
+            return;
+        }
+        // §2.2.1 and §2.2.2: a coherent placement, and an exit that is installed.
+        let Some(twin) = self.twin_home(peer, projection) else {
+            return;
+        };
+        let Some((placement, id, _)) = self.coherent(&twin) else {
+            return;
+        };
+        if !self.exits_installed(projection) {
+            return;
+        }
+        // §2.3: this node's own tracker is inside the placement, and agrees with the report.
+        if tracker_display != id
+            || !inside(&placement, tracker)
+            || (tracker.x - (placement.origin.x + position.x)).abs() > ENTRY_SLACK
+            || (tracker.y - (placement.origin.y + position.y)).abs() > ENTRY_SLACK
+        {
+            return;
+        }
+        let Some(fallback) = self.fallback_point(hud_display) else {
+            return;
+        };
+        let op = self.alloc_op();
+        let home = Home {
+            op,
+            peer,
+            projection,
+            window: twin.window,
+            ended,
+            ended_seen: false,
+            fallback,
+            bind: false,
+            display: placement.display,
+            generation: placement.generation,
+            strips_gen: self.strips_gen,
+            state: HomeState::Entering(Entering::Draining {
+                deadline: now.saturating_add(DRAIN_TIMEOUT),
+            }),
+        };
+        if let Phase::Controlling(c) = &mut self.phase {
+            c.home = Some(home);
+        }
+    }
+
+    /// §2.2 items 1-5, re-checked at the drain-to-bind and (with `release`, A8) bind-to-release
+    /// transitions.
+    fn entry_guards(&self, home: &Home, release: bool, now: MonoTime) -> Result<(), HomeFailure> {
+        let Phase::Controlling(c) = &self.phase else {
+            return Err(HomeFailure::Gone);
+        };
+        let twin = self
+            .twin_home(home.peer, home.projection)
+            .ok_or(HomeFailure::Gone)?;
+        let (placement, id, _) = self.coherent(&twin).ok_or(HomeFailure::Gone)?;
+        if !self.exits_installed(home.projection) || !c.capture.started {
+            return Err(HomeFailure::Gone);
+        }
+        if !self.armed
+            || !self.permits_io()
+            || !self.router.no_buttons_held()
+            || !self.capture_buttons.is_empty()
+        {
+            return Err(HomeFailure::Guard);
+        }
+        if release {
+            // A8: nothing the trigger saw has changed.
+            let (display, position) = c.tracker.position();
+            if display != id
+                || placement.display != home.display
+                || placement.generation != home.generation
+                || self.strips_gen != home.strips_gen
+                || !inside(&placement, position)
+            {
+                return Err(HomeFailure::Gone);
+            }
+            if c.last_motion
+                .is_none_or(|at| now.saturating_duration_since(at) > ENTRY_FRESH)
+            {
+                return Err(HomeFailure::Guard);
+            }
+        }
+        Ok(())
+    }
+
+    /// Called after E2 handled the same input: advances `Entering(Draining)` to `Binding` once
+    /// every injector this node owns has settled (§2.3 step 1), and abandons it on a deadline or
+    /// a failed guard.
+    pub(crate) fn after_e2(&mut self, settled: bool, now: MonoTime, out: &mut Vec<Output>) {
+        let Some(home) = self.home_copy() else {
+            return;
+        };
+        let HomeState::Entering(Entering::Draining { deadline }) = home.state else {
+            return;
+        };
+        if let Err(failure) = self.entry_guards(&home, false, now) {
+            self.abort_entry(failure, now, out);
+        } else if now >= deadline {
+            // The deadline wins over a confirmation that arrives after it, whether or not a
+            // tick has been delivered in between.
+            self.abort_entry(HomeFailure::Drain, now, out);
+        } else if settled {
+            // §2.3 step 2: only now may the bind exist.
+            out.push(Output::HomeBind {
+                op: home.op,
+                install: true,
+            });
+            if let Phase::Controlling(c) = &mut self.phase
+                && let Some(home) = &mut c.home
+            {
+                home.bind = true;
+                home.state = HomeState::Entering(Entering::Binding {
+                    deadline: now.saturating_add(BIND_TIMEOUT),
+                });
+            }
+        }
+    }
+
+    /// `Input::HomeBindSet` (§2.3 step 2, A1, A2).
+    fn home_bind_set(
+        &mut self,
+        op: HomeOp,
+        install: bool,
+        result: &Result<(), Failure>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if !install {
+            // Only the current attempt's answer counts; anything older is stale.
+            if let Some(t) = self.teardown
+                && t.op == op
+                && result.is_ok()
+            {
+                self.teardown = None;
+            }
+            return;
+        }
+        let Some(home) = self.home_copy().filter(|h| h.op == op) else {
+            return;
+        };
+        match (home.state, result) {
+            (HomeState::Entering(Entering::Draining { .. }), _) => {}
+            (HomeState::Entering(Entering::Binding { deadline }), Ok(())) => {
+                if now >= deadline {
+                    self.abort_entry(HomeFailure::Bind, now, out);
+                } else {
+                    self.begin_release(now, out);
+                }
+            }
+            (HomeState::Entering(Entering::Binding { .. }), Err(_)) => {
+                self.abort_entry(HomeFailure::Bind, now, out);
+            }
+            // The bind was lost while home and could not be reinstalled.
+            (_, Err(_)) => self.leave_home(Some(HomeFailure::Bind), now, out),
+            _ => {}
+        }
+    }
+
+    /// §2.3 step 3, after the A8 re-check: release what the router holds on the peer, then end
+    /// the capture and warp the pointer onto the twin at the tracker's current position.
+    fn begin_release(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        let Some(home) = self.home_copy() else {
+            return;
+        };
+        if let Err(failure) = self.entry_guards(&home, true, now) {
+            self.abort_entry(failure, now, out);
+            return;
+        }
+        let Some(twin) = self.twin_home(home.peer, home.projection) else {
+            return;
+        };
+        let (Some((placement, _, _)), Phase::Controlling(c)) = (self.coherent(&twin), &self.phase)
+        else {
+            return;
+        };
+        let (_, position) = c.tracker.position();
+        let content = twin.content;
+        let (w, h) = (content.max.x - content.min.x, content.max.y - content.min.y);
+        if w <= 0 || h <= 0 {
+            self.abort_entry(HomeFailure::Gone, now, out);
+            return;
+        }
+        // The current tracker position, mapped into the placement (A8): never the report's.
+        let x = (position.x - placement.origin.x).clamp(0.0, f64::from(w - 1));
+        let y = (position.y - placement.origin.y).clamp(0.0, f64::from(h - 1));
+        let target = (
+            twin.display,
+            PointDevice::new(f64::from(content.min.x) + x, f64::from(content.min.y) + y),
+        );
+        // The first half of ending a session: an up for everything held, no `EndControl`.
+        let phase = std::mem::replace(&mut self.phase, Phase::Idle);
+        if let Phase::Controlling(mut c) = phase {
+            self.release_session_held(&mut c.session, now, out);
+            self.phase = Phase::Controlling(c);
+        } else {
+            self.phase = phase;
+        }
+        // The capture is released from here on: it is no longer one this controller retains.
+        self.committed_exit = None;
+        self.register_warp(home.op, WarpPurpose::Entry, target);
+        out.push(Output::ReleaseAndWarp {
+            op: home.op,
+            warp_to: target,
+        });
+        self.set_home_state(HomeState::Entering(Entering::Releasing {
+            deadline: now.saturating_add(END_TIMEOUT),
+        }));
+    }
+
+    /// `Input::CaptureReleased` (§3.2): the answer to one `ReleaseAndWarp`.
+    fn capture_released(
+        &mut self,
+        op: HomeOp,
+        result: &Result<Warp, Failure>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        // An answer to an operation that isn't outstanding is stale and changes nothing.
+        let Some(warp) = self.take_warp(op) else {
+            return;
+        };
+        match warp.purpose {
+            WarpPurpose::Entry => self.entry_released(op, result, now, out),
+            WarpPurpose::Leave => match result {
+                Ok(Warp::Done) => self.stranded = None,
+                Ok(Warp::Skipped) | Err(_) => {
+                    self.stranded = Some(Stranded {
+                        target: warp.target,
+                        next: now.saturating_add(STRANDED_RETRY),
+                        attempts: 0,
+                    });
+                }
+            },
+            WarpPurpose::Retry => {
+                if matches!(result, Ok(Warp::Done)) {
+                    self.stranded = None;
+                }
+            }
+            // The pointer was meant to stay on the twin; a warp that failed or was skipped leaves
+            // it wherever it drifted (F5): leave home and put it back on the desktop.
+            WarpPurpose::Cancel => {
+                if !matches!(result, Ok(Warp::Done)) {
+                    self.leave_home(Some(HomeFailure::Warp), now, out);
+                }
+            }
+        }
+    }
+
+    /// §2.3 step 4.
+    fn entry_released(
+        &mut self,
+        op: HomeOp,
+        result: &Result<Warp, Failure>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let Some(home) = self.home_copy().filter(|h| h.op == op) else {
+            return;
+        };
+        let HomeState::Entering(Entering::Releasing { deadline }) = home.state else {
+            return;
+        };
+        match result {
+            Ok(Warp::Done) if now < deadline => {
+                out.push(Output::HideOverlay(HUD));
+                let focused = self
+                    .twin_home(home.peer, home.projection)
+                    .is_some_and(|t| t.focused);
+                if focused {
+                    self.commit_entry(out);
+                } else {
+                    out.push(Output::ActivateWindow {
+                        window: home.window,
+                    });
+                    self.set_home_state(HomeState::Entering(Entering::Focusing {
+                        deadline: now.saturating_add(FOCUS_TIMEOUT),
+                    }));
+                }
+            }
+            Ok(Warp::Skipped) => {
+                // The capture is gone but the pointer was not moved (the gate closed): nothing to
+                // wait for, and the fallback warp is retried once the gate reopens.
+                self.stranded = Some(Stranded {
+                    target: home.fallback,
+                    next: now.saturating_add(STRANDED_RETRY),
+                    attempts: 0,
+                });
+                if let Phase::Controlling(c) = &mut self.phase
+                    && let Some(home) = &mut c.home
+                {
+                    home.ended_seen = true;
+                }
+                self.leave_home(Some(HomeFailure::Warp), now, out);
+            }
+            // An error, or an answer after the deadline: a capture may still exist.
+            _ => self.leave_home(Some(HomeFailure::Release), now, out),
+        }
+    }
+
+    /// §2.3 step 6.
+    fn commit_entry(&mut self, out: &mut Vec<Output>) {
+        let Some(home) = self.home_copy() else {
+            return;
+        };
+        self.set_home_state(HomeState::Home);
+        out.push(Output::Notice(Notice::Home {
+            key: self.key_of(home.projection),
+            entered: true,
+        }));
+    }
+
+    /// Abort before release (§2.3): the capture is still live and the session continues as
+    /// before the trigger; the bind, if one was requested, goes through its removal phase (A1).
+    fn abort_entry(&mut self, failure: HomeFailure, now: MonoTime, out: &mut Vec<Output>) {
+        let home = match &mut self.phase {
+            Phase::Controlling(c) => c.home.take(),
+            _ => None,
+        };
+        let Some(home) = home else {
+            return;
+        };
+        if home.bind {
+            self.start_teardown(home.peer, home.projection, now, out);
+        }
+        self.home_fence = Some((home.projection, now.saturating_add(HOME_RETRY)));
+        out.push(Output::Notice(Notice::HomeFailed {
+            key: self.key_of(home.projection),
+            reason: failure,
+        }));
+    }
+
+    fn abort_entry_if_entering(
+        &mut self,
+        failure: HomeFailure,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if self.entering_before_release() {
+            self.abort_entry(failure, now, out);
+        }
+    }
+
+    /// Record why the entry that the session's end is about to abort failed.
+    fn note_entry_failure(&mut self, failure: HomeFailure) {
+        if self.entering_before_release() {
+            self.failure = Some(failure);
+        }
+    }
+
+    /// §2.7: leave home without a crossing: end the session through the ordinary path, with the
+    /// home rule (a correlated warp to the fallback point).
+    fn leave_home(&mut self, failure: Option<HomeFailure>, now: MonoTime, out: &mut Vec<Output>) {
+        if self.home_copy().is_none() {
+            return;
+        }
+        self.failure = failure;
+        self.return_home(EndReason::Released, None, false, true, now, out);
+        self.failure = None;
+    }
+
+    // ---- E2's twin set (§2.5, §2.8) ----
+
+    /// E2's current twin homes: allocate slots, rebuild the twin strips when they changed
+    /// (bumping `strips_gen`), commit a pending entry when its window is focused, and abandon or
+    /// leave home if its projection, placement or every exit is gone (§2.5, §2.7).
+    pub(crate) fn set_twin_homes(
+        &mut self,
+        homes: Vec<TwinHome>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        // Stable slots: assigned when a projection first appears, freed when it disappears, never
+        // reused while the controller lives.
+        self.twin_slots
+            .retain(|projection, _| homes.iter().any(|h| h.projection == *projection));
+        for home in &homes {
+            if !self.twin_slots.contains_key(&home.projection) {
+                self.twin_slots.insert(home.projection, self.next_slot);
+                self.next_slot = self.next_slot.saturating_add(1);
+            }
+        }
+        self.twin_homes = homes;
+        if self.twin_strip_set() != self.twin_strips {
+            self.update_portals(now, out);
+        }
+        self.home_follow(now, out);
+        // Leaving home ends the phase the strips depend on.
+        if !self.twin_strips.is_empty() && self.twin_strip_set() != self.twin_strips {
+            self.update_portals(now, out);
+        }
+    }
+
+    /// Re-check the home against the twin set that was just updated.
+    fn home_follow(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        let Some(home) = self.home_copy() else {
+            return;
+        };
+        let twin = self.twin_home(home.peer, home.projection);
+        let gone = twin.is_none_or(|t| self.coherent(&t).is_none())
+            || self.strips_of(home.projection).is_empty();
+        match home.state {
+            HomeState::Entering(Entering::Draining { .. } | Entering::Binding { .. }) => {
+                if gone {
+                    self.abort_entry(HomeFailure::Gone, now, out);
+                }
+            }
+            HomeState::Entering(Entering::Focusing { deadline }) => {
+                if gone {
+                    self.leave_home(Some(HomeFailure::Gone), now, out);
+                } else if now >= deadline {
+                    // A focus event that arrives after the deadline is too late, tick or not.
+                    self.leave_home(Some(HomeFailure::Focus), now, out);
+                } else if twin.is_some_and(|t| t.focused) {
+                    self.commit_entry(out);
+                }
+            }
+            HomeState::Entering(Entering::Releasing { .. }) | HomeState::Home => {
+                if gone {
+                    self.leave_home(Some(HomeFailure::Gone), now, out);
+                }
+            }
+            HomeState::Exiting(Exiting::Hud {
+                portal, strips_gen, ..
+            }) => {
+                if gone {
+                    self.leave_home(Some(HomeFailure::Gone), now, out);
+                } else if strips_gen != self.strips_gen {
+                    // The strip set changed under the HUD: this exit is over, the next press
+                    // starts a fresh one.
+                    out.push(Output::HideOverlay(HUD));
+                    self.set_home_state(HomeState::Home);
+                    self.exit_retry
+                        .insert(portal, now.saturating_add(HOME_RETRY));
+                }
+            }
+            // The capture exists: a placement that is incoherent is judged when it is activated.
+            HomeState::Exiting(Exiting::Activating { .. } | Exiting::Cancelled { .. }) => {
+                if twin.is_none() {
+                    self.leave_home(Some(HomeFailure::Gone), now, out);
+                }
+            }
+        }
+    }
+
+    /// §2.4 (the phase 2 fallback cursor): this node's physical pointer on the twin while home is
+    /// mapped through the placement and sent to the peer as ordinary pointer motion, so the
+    /// peer's cursor follows it inside the proxy. Nothing is sent unless the pointer is on the
+    /// twin of the home's window, the placement is coherent and the session may do I/O.
+    fn local_pointer(
+        &mut self,
+        display: DisplayId,
+        position: PointDevice,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let Some(home) = self
+            .home_copy()
+            .filter(|h| matches!(h.state, HomeState::Home))
+        else {
+            return;
+        };
+        if !self.permits_io() || !position.x.is_finite() || !position.y.is_finite() {
+            return;
+        }
+        let Some(twin) = self.twin_home(home.peer, home.projection) else {
+            return;
+        };
+        let Some((placement, id, _)) = self.coherent(&twin) else {
+            return;
+        };
+        let content = twin.content;
+        let (w, h) = (content.max.x - content.min.x, content.max.y - content.min.y);
+        if twin.display != display || w <= 0 || h <= 0 || !self.ensure_sequence_room(now, out) {
+            return;
+        }
+        let x = (position.x - f64::from(content.min.x)).clamp(0.0, f64::from(w - 1));
+        let y = (position.y - f64::from(content.min.y)).clamp(0.0, f64::from(h - 1));
+        let Phase::Controlling(c) = &mut self.phase else {
+            return;
+        };
+        let seq = c.session.motion_seq;
+        c.session.motion_seq = seq.saturating_add(1);
+        out.push(Output::SendMotion {
+            peer: c.session.peer,
+            msg: PointerMessage {
+                session: c.session.id,
+                seq,
+                display: id.display,
+                position: PointDevice::new(placement.origin.x + x, placement.origin.y + y),
+            },
+        });
+    }
+
+    // ---- captured input while an exit is activated (§2.6 step 5, A4) ----
+
+    fn chord_completed(&self, usage: HidUsage) -> bool {
+        usage == self.config.release_chord.key
+            && self
+                .config
+                .release_chord
+                .modifiers
+                .iter()
+                .all(|k| self.chord_keys.contains(k))
+    }
+
+    fn buffer_transition(&mut self, item: Held, down: bool) {
+        if self.activation.len() >= ACTIVATION_LOG_MAX {
+            // Fail closed: an exit whose activation can't be replayed is cancelled.
+            self.activation_overflow = true;
+        } else {
+            self.activation.push((item, down));
+        }
+    }
+
+    fn capture_key(&mut self, usage: HidUsage, down: bool, now: MonoTime, out: &mut Vec<Output>) {
+        let mode = self.input_mode();
+        if mode == InputMode::Buffer {
+            self.buffer_transition(Held::Key(usage), down);
+            return;
+        }
+        if down {
+            self.chord_keys.insert(usage);
+        } else {
+            self.chord_keys.remove(&usage);
+        }
+        if down && self.chord_completed(usage) {
+            // The authoritative hotkey pair may arrive after this captured chord.
+            // Suppress that pair for re-arm purposes without comparing timestamps.
+            self.chord_press_outstanding = true;
+            self.release(now, out);
+        } else if mode == InputMode::Routing {
+            self.route(Held::Key(usage), down, now, out);
+        }
+    }
+
+    fn capture_button(
+        &mut self,
+        button: MouseButton,
+        down: bool,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let mode = self.input_mode();
+        if down {
+            self.capture_buttons.insert(button);
+        } else {
+            self.capture_buttons.remove(&button);
+        }
+        match mode {
+            InputMode::Routing => self.route(Held::Button(button), down, now, out),
+            InputMode::Buffer => self.buffer_transition(Held::Button(button), down),
+            InputMode::ChordOnly | InputMode::Off => {}
+        }
+    }
+
+    /// `CaptureEvent::Ended` while home. True if it was expected or belongs to the exit capture.
+    fn home_capture_ended(
+        &mut self,
+        id: CaptureId,
+        reason: CaptureEnd,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) -> bool {
+        let Some(home) = self.home_copy() else {
+            return false;
+        };
+        match home.state {
+            // The capture that was ended to go home: its `Ended` is expected, not a loss.
+            HomeState::Entering(Entering::Releasing { .. } | Entering::Focusing { .. })
+            | HomeState::Home
+            | HomeState::Exiting(Exiting::Hud { .. })
+                if id == home.ended =>
+            {
+                if let Phase::Controlling(c) = &mut self.phase
+                    && let Some(home) = &mut c.home
+                {
+                    home.ended_seen = true;
+                }
+                true
+            }
+            // The exit capture's end during its activation, or while its cancellation is
+            // outstanding. If this node asked for it, it is over; if the backend or the watchdog
+            // took the capture away (`Lost`, `Aborted`), the strips and portals went with it:
+            // nothing installed is left to push against, so leave home (A9, §2.7).
+            HomeState::Exiting(
+                Exiting::Activating { id: ended, .. } | Exiting::Cancelled { id: ended, .. },
+            ) if ended == id && reason != CaptureEnd::Requested => {
+                self.portals_installed = false;
+                self.failure = Some(HomeFailure::Gone);
+                self.return_home(EndReason::Released, None, true, true, now, out);
+                self.failure = None;
+                true
+            }
+            HomeState::Exiting(Exiting::Activating {
+                id: active, portal, ..
+            }) if active == id => {
+                out.push(Output::HideOverlay(HUD));
+                self.exit_resolved();
+                self.exit_retry
+                    .insert(portal, now.saturating_add(HOME_RETRY));
+                true
+            }
+            HomeState::Exiting(Exiting::Cancelled { id: cancelled, .. }) if cancelled == id => {
+                self.exit_resolved();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // ---- exit (§2.6) ----
+
+    /// A press against a strip while home: show the HUD before any capture (04 §8 invariant 5).
+    fn exit_press(
+        &mut self,
+        portal: PortalId,
+        position: f64,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let Phase::Controlling(c) = &self.phase else {
+            return;
+        };
+        let Some(home) = c.home.filter(|h| matches!(h.state, HomeState::Home)) else {
+            return;
+        };
+        if !self.permits_io()
+            || !self.portals_installed
+            || self
+                .exit_retry
+                .get(&portal)
+                .is_some_and(|until| now < *until)
+            || !self.portal_offered(home.projection, portal)
+        {
+            return;
+        }
+        let hud_display = c.hud_display;
+        self.show_hud(hud_display, home.peer, out);
+        self.set_home_state(HomeState::Exiting(Exiting::Hud {
+            portal,
+            position,
+            strips_gen: self.strips_gen,
+            deadline: now.saturating_add(HUD_TIMEOUT),
+        }));
+    }
+
+    /// The HUD is visible: only now may the exit capture begin.
+    fn exit_hud_visible(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        let Some(home) = self.home_copy() else {
+            return;
+        };
+        let HomeState::Exiting(Exiting::Hud {
+            portal,
+            position,
+            strips_gen,
+            deadline,
+        }) = home.state
+        else {
+            return;
+        };
+        let id = self.next_capture.filter(|_| {
+            now < deadline
+                && strips_gen == self.strips_gen
+                && self.portals_installed
+                && self.portal_offered(home.projection, portal)
+        });
+        let Some(id) = id else {
+            out.push(Output::HideOverlay(HUD));
+            self.set_home_state(HomeState::Home);
+            self.exit_retry
+                .insert(portal, now.saturating_add(HOME_RETRY));
+            return;
+        };
+        self.next_capture = id.checked_add(1);
+        let id = CaptureId(id);
+        out.push(Output::BeginCapture {
+            id,
+            portal,
+            drain_first: true,
+        });
+        self.activation.clear();
+        self.activation_overflow = false;
+        self.capture_buttons.clear();
+        // Nothing observed before this capture says what is held now: the snapshot replaces it
+        // when the activation completes, and until then (a cancelled exit) only what the capture
+        // itself reports counts.
+        self.chord_keys.clear();
+        if let Phase::Controlling(c) = &mut self.phase {
+            c.capture = Capture { id, started: false };
+        }
+        self.set_home_state(HomeState::Exiting(Exiting::Activating {
+            id,
+            portal,
+            position,
+            strips_gen,
+            deadline: now.saturating_add(START_TIMEOUT),
+        }));
+    }
+
+    fn hud_unavailable(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        match self.home_state() {
+            Some(HomeState::Exiting(Exiting::Hud { portal, .. })) => {
+                out.push(Output::HideOverlay(HUD));
+                self.set_home_state(HomeState::Home);
+                self.exit_retry
+                    .insert(portal, now.saturating_add(HOME_RETRY));
+            }
+            // No HUD is shown while home.
+            Some(HomeState::Home) => {}
+            _ => self.return_home(EndReason::Released, None, false, true, now, out),
+        }
+    }
+
+    /// `Input::CaptureBegun` for the exit capture or a cancelled one. True if it was consumed.
+    fn exit_begun(
+        &mut self,
+        id: CaptureId,
+        result: &Result<CaptureStart, Failure>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) -> bool {
+        let Some(home) = self.home_copy() else {
+            return false;
+        };
+        match home.state {
+            HomeState::Exiting(Exiting::Activating {
+                id: active,
+                portal,
+                position,
+                strips_gen,
+                deadline,
+            }) if active == id => {
+                match result {
+                    Ok(start) => {
+                        self.exit_activated(
+                            id, portal, position, strips_gen, deadline, start, now, out,
+                        );
+                    }
+                    Err(failure) => {
+                        // A rolled-back activation emits no `Ended`.
+                        out.push(Output::HideOverlay(HUD));
+                        self.exit_resolved();
+                        self.activation.clear();
+                        self.activation_overflow = false;
+                        if *failure != Failure::Locked {
+                            // A drag in W never leaks; the next press tries again later.
+                            self.exit_retry
+                                .insert(portal, now.saturating_add(HOME_RETRY));
+                        }
+                    }
+                }
+                true
+            }
+            HomeState::Exiting(Exiting::Cancelled { id: cancelled, .. }) if cancelled == id => {
+                match result {
+                    // Idempotent: no other capture can exist (the backend holds one at a time).
+                    Ok(_) => out.push(Output::EndCapture { warp_to: None }),
+                    // No `Ended` will come.
+                    Err(_) => self.exit_resolved(),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The exit capture is effective (§2.6 step 4, A4).
+    #[allow(clippy::too_many_arguments)]
+    fn exit_activated(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        position: f64,
+        strips_gen: u64,
+        deadline: MonoTime,
+        start: &CaptureStart,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let Some(home) = self.home_copy() else {
+            return;
+        };
+        // A4 steps 1 and 2, before anything can cancel the exit: the snapshot replaces the chord
+        // state and the buffered transitions of the activation are applied on top of it in
+        // order, so a cancellation (or a leave) below finds every modifier observed so far.
+        let overflow = std::mem::take(&mut self.activation_overflow);
+        if self.reconcile_chord(Some(&start.held_keys)) {
+            // The release chord was pressed while the exit was activating: end everything.
+            self.chord_press_outstanding = true;
+            self.release(now, out);
+            return;
+        }
+        // Checked on arrival, not only on `Tick`, as a crossing's is.
+        if now >= deadline {
+            self.cancel_exit(id, portal, now, out);
+            return;
+        }
+        // The placement is the newest coherent one at this moment, never a snapshot. If there is
+        // none (the proxy's placement is incoherent or its projection is gone), leave home with
+        // the live capture (§2.7, `Returning`).
+        let coherent = self
+            .twin_home(home.peer, home.projection)
+            .is_some_and(|twin| self.coherent(&twin).is_some());
+        if !coherent {
+            self.leave_home(Some(HomeFailure::Gone), now, out);
+            return;
+        }
+        // A strip set that changed under the exit, or a strip that is gone, cancels it.
+        let target = if strips_gen == self.strips_gen {
+            self.exit_target(&home, portal, position)
+        } else {
+            None
+        };
+        let Some((host, point)) = target else {
+            self.cancel_exit(id, portal, now, out);
+            return;
+        };
+        // A4 step 3: a button still down (or an activation that can't be replayed) cancels the
+        // exit: the pointer stays home and the button's native up reaches the window unpaired,
+        // which is harmless.
+        if overflow || !self.capture_buttons.is_empty() {
+            self.cancel_exit_with_warp(id, portal, position, now, out);
+            return;
+        }
+        self.complete_exit(id, home, host, point, start, now, out);
+    }
+
+    /// Reconcile the chord state with what the exit capture has reported: with a snapshot (the
+    /// keys held when `begin` started) it replaces the state first; the key transitions buffered
+    /// during the activation are then applied in order. True if one of them completed the
+    /// release chord. The buffer is consumed.
+    fn reconcile_chord(&mut self, snapshot: Option<&[HidUsage]>) -> bool {
+        if let Some(held) = snapshot {
+            self.chord_keys = held.iter().copied().collect();
+        }
+        let mut chord = false;
+        for (item, down) in std::mem::take(&mut self.activation) {
+            if let Held::Key(usage) = item {
+                if down {
+                    self.chord_keys.insert(usage);
+                    chord |= self.chord_completed(usage);
+                } else {
+                    self.chord_keys.remove(&usage);
+                }
+            }
+        }
+        chord
+    }
+
+    /// §2.6 step 4 `Ok`: the session resumes at the proxy's edge.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_exit(
+        &mut self,
+        id: CaptureId,
+        home: Home,
+        host: GlobalDisplayId,
+        point: PointDevice,
+        start: &CaptureStart,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if !self.ensure_sequence_room(now, out) {
+            return;
+        }
+        let tracker = self
+            .layout
+            .as_ref()
+            .and_then(|layout| PointerTracker::new(layout, host, point));
+        let Some(tracker) = tracker else {
+            self.leave_home(Some(HomeFailure::Gone), now, out);
+            return;
+        };
+        self.lock_keys = start.lock_keys;
+        self.accelerator = Accelerator::new(self.config.accel);
+        let Phase::Controlling(c) = &mut self.phase else {
+            return;
+        };
+        c.tracker = tracker;
+        c.from_twin = true;
+        c.home = None;
+        c.last_motion = None;
+        // The peer's cursor leaves the proxy at once.
+        let seq = c.session.motion_seq;
+        c.session.motion_seq = seq.saturating_add(1);
+        out.push(Output::SendMotion {
+            peer: c.session.peer,
+            msg: PointerMessage {
+                session: c.session.id,
+                seq,
+                display: host.display,
+                position: point,
+            },
+        });
+        // Caps may have changed in the window.
+        let (session, seq) = c.session.next_input(now);
+        out.push(Output::SendInput {
+            peer: c.session.peer,
+            msg: InputMessage::LockKeys {
+                session,
+                seq,
+                keys: start.lock_keys,
+            },
+        });
+        // The exit capture is now the session's live capture: a repeat of its success is not a
+        // new capture to end.
+        self.committed_exit = Some(id);
+        // A1: the bind goes through its removal phase; E2's filter stays on until it is confirmed.
+        if home.bind {
+            self.start_teardown(home.peer, home.projection, now, out);
+        }
+        self.home_fence = Some((home.projection, now.saturating_add(REENTRY_GUARD)));
+        out.push(Output::Notice(Notice::Home {
+            key: self.key_of(home.projection),
+            entered: false,
+        }));
+    }
+
+    /// §2.5 "Mapping" with the current placement.
+    fn exit_target(
+        &self,
+        home: &Home,
+        portal: PortalId,
+        position: f64,
+    ) -> Option<(GlobalDisplayId, PointDevice)> {
+        let twin = self.twin_home(home.peer, home.projection)?;
+        let (placement, id, geometry) = self.coherent(&twin)?;
+        let strip = self.twin_strips.iter().find(|s| s.id == portal)?;
+        Some((id, exit_point(&placement, &geometry, strip.edge, position)))
+    }
+
+    /// Where on the twin the strip was pressed, one pixel inside the content.
+    fn strip_point(
+        &self,
+        home: &Home,
+        portal: PortalId,
+        position: f64,
+    ) -> Option<(DisplayId, PointDevice)> {
+        let twin = self.twin_home(home.peer, home.projection)?;
+        let strip = self.twin_strips.iter().find(|s| s.id == portal)?;
+        let content = twin.content;
+        let (w, h) = (content.max.x - content.min.x, content.max.y - content.min.y);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let t = if position.is_nan() {
+            0.0
+        } else {
+            position.clamp(0.0, 1.0)
+        };
+        let (dx, dy) = (f64::from(w - 1), f64::from(h - 1));
+        let (x, y) = match strip.edge {
+            Edge::Left => (0.0, t * dy),
+            Edge::Right => (dx, t * dy),
+            Edge::Top => (t * dx, 0.0),
+            Edge::Bottom => (t * dx, dy),
+        };
+        Some((
+            twin.display,
+            PointDevice::new(f64::from(content.min.x) + x, f64::from(content.min.y) + y),
+        ))
+    }
+
+    /// Cancel with capture (§2.6 step 4): end the capture without moving the pointer (it stays on
+    /// the twin, which is home) and serialise any further exit behind its end.
+    fn cancel_exit(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        // What the capture reported during the activation is not lost with the exit: the
+        // modifiers already pressed count toward the chord while the cancellation is outstanding
+        // (and a chord already completed ends everything).
+        if self.reconcile_chord(None) {
+            self.chord_press_outstanding = true;
+            self.release(now, out);
+            return;
+        }
+        out.push(Output::EndCapture { warp_to: None });
+        out.push(Output::HideOverlay(HUD));
+        self.begin_cancelled(id, portal, now);
+    }
+
+    /// A4 step 3: the exit is cancelled because a button is held: the capture is released with a
+    /// warp to the strip's position on the twin (the pointer stays home).
+    fn cancel_exit_with_warp(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        position: f64,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let target = self.home_copy().and_then(|home| {
+            self.strip_point(&home, portal, position)
+                .or(Some(home.fallback))
+        });
+        if let Some(target) = target {
+            self.release_and_warp(WarpPurpose::Cancel, target, out);
+        } else {
+            out.push(Output::EndCapture { warp_to: None });
+        }
+        out.push(Output::HideOverlay(HUD));
+        self.begin_cancelled(id, portal, now);
+    }
+
+    fn begin_cancelled(&mut self, id: CaptureId, portal: PortalId, now: MonoTime) {
+        self.activation.clear();
+        self.activation_overflow = false;
+        self.set_home_state(HomeState::Exiting(Exiting::Cancelled {
+            id,
+            deadline: now.saturating_add(END_TIMEOUT),
+        }));
+        self.exit_retry
+            .insert(portal, now.saturating_add(HOME_RETRY));
+    }
+
+    /// An exit is over without a crossing: home again, with nothing held.
+    fn exit_resolved(&mut self) {
+        // The button's native up reaches the window, unseen: nothing about it is remembered.
+        self.capture_buttons.clear();
+        self.set_home_state(HomeState::Home);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The exit mapping of WP-2.43 §2.5 (pure functions): where a press on a twin strip lands on
+    //! the peer's display, which edges are offered, and the strips' spans.
+
+    use crosspane_types::geom::{PixelSize, PointLogical, SizeMm};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const W: u32 = 1000;
+    const H: u32 = 800;
+
+    fn geometry() -> DisplayGeometry {
+        DisplayGeometry {
+            physical_size: SizeMm::new(f64::from(W) / 10.0, f64::from(H) / 10.0),
+            pixel_size: PixelSize::new(W, H),
+            scale: 1.0,
+            logical_origin: PointLogical::zero(),
+        }
+    }
+
+    fn placement(x: f64, y: f64, w: u32, h: u32) -> Proxy {
+        Proxy {
+            generation: 1,
+            display: DisplayId(1),
+            origin: PointDevice::new(x, y),
+            size: PixelSize::new(w, h),
+        }
+    }
+
+    fn within_display(p: PointDevice) -> bool {
+        p.x >= 0.0 && p.y >= 0.0 && p.x <= f64::from(W - 1) && p.y <= f64::from(H - 1)
+    }
+
+    proptest! {
+        /// All four edges, placements that touch or exceed each side of the host display, and
+        /// strips with padding on each side of the twin's content.
+        #[test]
+        fn exit_mapping_all_edges(
+            x in -400.0..1400.0f64,
+            y in -400.0..1200.0f64,
+            w in 1u32..1400,
+            h in 1u32..1000,
+            t in -0.5..1.5f64,
+            pad in (0i32..120, 0i32..120, 0i32..120, 0i32..120),
+        ) {
+            let pl = placement(x.round(), y.round(), w, h);
+            let (ox, oy) = (pl.origin.x, pl.origin.y);
+            let (fw, fh) = (f64::from(w), f64::from(h));
+            let tc = t.clamp(0.0, 1.0);
+            for edge in EDGES {
+                let p = exit_point(&pl, &geometry(), edge, t);
+                // Always on the host display.
+                prop_assert!(within_display(p), "{edge:?} {p:?}");
+                // Where nothing is clamped the formula is exact: just outside the proxy's
+                // corresponding edge, at the fraction along it.
+                let raw = match edge {
+                    Edge::Left => PointDevice::new(ox - 1.0, oy + tc * fh),
+                    Edge::Right => PointDevice::new(ox + fw, oy + tc * fh),
+                    Edge::Top => PointDevice::new(ox + tc * fw, oy - 1.0),
+                    Edge::Bottom => PointDevice::new(ox + tc * fw, oy + fh),
+                };
+                if within_display(raw) {
+                    prop_assert_eq!(p, raw, "{:?}", edge);
+                    prop_assert!(!inside(&pl, p), "{edge:?} outside the proxy: {p:?}");
+                }
+                // Monotonic along the edge.
+                let q = exit_point(&pl, &geometry(), edge, (t + 0.1).min(1.5));
+                match edge {
+                    Edge::Left | Edge::Right => prop_assert!(q.y >= p.y),
+                    Edge::Top | Edge::Bottom => prop_assert!(q.x >= p.x),
+                }
+                // A proxy with room on a side offers an exit there; one that touches or exceeds
+                // the display's side offers none, provided its middle is on the display.
+                let mid = exit_point(&pl, &geometry(), edge, 0.5);
+                prop_assert_eq!(offerable(&pl, &geometry(), edge), !inside(&pl, mid));
+                // (a proxy that is entirely beyond the display is on no side of it: it can't be
+                // placed there, and the rule says nothing about it)
+                let (room, touches, along_on_display) = match edge {
+                    Edge::Left => (
+                        ox >= 1.0,
+                        ox <= 0.0 && ox + fw > 0.0,
+                        (0.0..f64::from(H)).contains(&(oy + fh / 2.0)),
+                    ),
+                    Edge::Right => (
+                        ox + fw <= f64::from(W) - 1.0,
+                        ox + fw >= f64::from(W) && ox < f64::from(W),
+                        (0.0..f64::from(H)).contains(&(oy + fh / 2.0)),
+                    ),
+                    Edge::Top => (
+                        oy >= 1.0,
+                        oy <= 0.0 && oy + fh > 0.0,
+                        (0.0..f64::from(W)).contains(&(ox + fw / 2.0)),
+                    ),
+                    Edge::Bottom => (
+                        oy + fh <= f64::from(H) - 1.0,
+                        oy + fh >= f64::from(H) && oy < f64::from(H),
+                        (0.0..f64::from(W)).contains(&(ox + fw / 2.0)),
+                    ),
+                };
+                if room && along_on_display {
+                    prop_assert!(offerable(&pl, &geometry(), edge), "{edge:?} room");
+                }
+                if touches && along_on_display {
+                    prop_assert!(!offerable(&pl, &geometry(), edge), "{edge:?} touches");
+                }
+            }
+            // Strips span the content's extent along the edge, whatever the padding around it
+            // (the bar's reserved area on any side of the twin output).
+            let (l, tp, r, b) = pad;
+            let content = PixelRect::new(
+                crosspane_types::geom::euclid::Point2D::new(l, tp),
+                crosspane_types::geom::euclid::Point2D::new(l + w as i32, tp + h as i32),
+            );
+            let _ = (r, b);
+            for edge in [Edge::Left, Edge::Right] {
+                prop_assert_eq!(strip_span(content, edge), (f64::from(tp), f64::from(tp + h as i32)));
+            }
+            for edge in [Edge::Top, Edge::Bottom] {
+                prop_assert_eq!(strip_span(content, edge), (f64::from(l), f64::from(l + w as i32)));
+            }
+        }
+
+        #[test]
+        fn exit_mapping_ignores_nan(x in 0.0..800.0f64, y in 0.0..600.0f64) {
+            let pl = placement(x.round(), y.round(), 100, 100);
+            for edge in EDGES {
+                let nan = exit_point(&pl, &geometry(), edge, f64::NAN);
+                prop_assert_eq!(nan, exit_point(&pl, &geometry(), edge, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn twin_portal_ids_are_disjoint_per_slot_and_edge() {
+        let mut seen = BTreeSet::new();
+        for slot in 0..64u32 {
+            for edge in EDGES {
+                let id = TWIN_PORTAL_BASE + 4 * slot + edge_index(edge);
+                assert!(id >= TWIN_PORTAL_BASE);
+                assert!(seen.insert(id), "slot {slot} {edge:?}");
+            }
+        }
+        // The largest slot that offers strips still fits in a portal id.
+        assert!(
+            u64::from(TWIN_PORTAL_BASE) + 4 * u64::from(MAX_TWIN_SLOT - 1) + 3
+                <= u64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn teardown_backoff_doubles_to_the_cap() {
+        let steps: Vec<_> = (0..9).map(|attempt| backoff(attempt).as_millis()).collect();
+        assert_eq!(steps, [100, 200, 400, 800, 1600, 2000, 2000, 2000, 2000]);
     }
 }
