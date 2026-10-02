@@ -87,7 +87,7 @@ start() {
     done
     local wl
     wl=$(timeout 5 hyprctl instances -j | jq -r --arg sig "$sig" '.[] | select(.instance == $sig) | .wl_socket')
-    printf 'export HYPRLAND_INSTANCE_SIGNATURE=%q\nexport WAYLAND_DISPLAY=%q\nexport CROSSPANE_NESTED_HYPR=1\n' "$sig" "$wl" >"$state/env"
+    printf 'unset WAYLAND_SOCKET\nexport HYPRLAND_INSTANCE_SIGNATURE=%q\nexport WAYLAND_DISPLAY=%q\nexport CROSSPANE_NESTED_HYPR=1\n' "$sig" "$wl" >"$state/env"
     printf 'hypr-nested: %s started in %ss\n  instance %s\n  wayland  %s\n' "$name" "$((SECONDS - t0))" "$sig" "$wl"
 }
 
