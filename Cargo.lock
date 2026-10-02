@@ -859,6 +859,12 @@ version = "0.0.0"
 [[package]]
 name = "crosspane-installer-core"
 version = "0.0.0"
+dependencies = [
+ "crosspane-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "crosspane-media"
