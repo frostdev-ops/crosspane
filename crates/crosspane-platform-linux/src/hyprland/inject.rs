@@ -1,6 +1,16 @@
 //! Hyprland virtual input. Native objects and XKB state stay on one Wayland thread; the two
 //! command handles share that source and seat. Hyprland supplies repeat, so only transitions are
 //! submitted. Device destruction does not release keys by default on 0.56: cleanup sends ups.
+//!
+//! A failed output or keymap refresh (the watcher could not read the configuration, or it could
+//! not be applied) does not end the worker. The worker *pauses*: it releases every held key and
+//! button, answers key-downs, button-downs, motion, scroll and lock changes with the retryable
+//! [`PlatformError::Timeout`] (key-ups, button-ups and recovery are still honoured), binds no new
+//! pointer from the unknown output map, and asks again with backoff (100 ms doubling to 2 s). The
+//! first configuration that is read and applied in full, with no output or keyboard
+//! configuration change seen since the read began, resumes it. A closed `IoGate` is independent:
+//! both must be clear to inject. A lost Wayland connection, a lost configuration watcher, or
+//! both handles being dropped, still ends the worker, whose drop releases whatever is held.
 
 mod config;
 mod wayland;
@@ -112,7 +122,8 @@ pub fn connect(
                 let previous = config.keyboard_addresses.clone();
                 let source = wayland::Source::new(gate, config, deadline)?;
                 let name = config::own_keyboard_name(&worker_ipc, &previous)?;
-                let watcher = config::Watcher::new(worker_ipc, name.clone())?;
+                let watcher =
+                    config::Watcher::new(worker_ipc, name.clone(), source.config_epoch())?;
                 Ok((source, watcher, name))
             })();
             match result {

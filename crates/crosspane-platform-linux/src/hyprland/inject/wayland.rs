@@ -7,8 +7,8 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{IoGate, PlatformError};
@@ -30,7 +30,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 };
 use xkbcommon::xkb;
 
-use super::config::{Config, Rmlvo, Watcher};
+use super::config::{Config, Refresh, Rmlvo, Update, Watcher, snapshot_is_current};
 use super::{Action, CALL_BUDGET, Command, backend};
 
 const TICK: Duration = Duration::from_millis(10);
@@ -178,6 +178,12 @@ pub(super) struct Source {
     buttons_down: BTreeSet<(DisplayId, u32)>,
     released_buttons: BTreeSet<(DisplayId, u32)>,
     sync_serial: u64,
+    /// Paused while a failed configuration refresh leaves the layout and keymap unknown.
+    refresh: Refresh,
+    /// Counts configuration invalidations: output changes this worker sees, and the keyboard and
+    /// output events the watcher's event thread sees. The watcher stamps each read with it, so a
+    /// read that began before a change cannot resume a paused worker.
+    config_epoch: Arc<AtomicU64>,
 }
 
 impl Source {
@@ -224,6 +230,8 @@ impl Source {
             buttons_down: BTreeSet::new(),
             released_buttons: BTreeSet::new(),
             sync_serial: 0,
+            refresh: Refresh::default(),
+            config_epoch: Arc::new(AtomicU64::new(0)),
         };
         source.sync(deadline)?;
         let qh = source.queue.handle();
@@ -261,23 +269,7 @@ impl Source {
                 .filter_map(|(&display, p)| (p.output == id).then_some(display))
                 .collect();
             for display in displays {
-                if let Some(pointer) = self.pointers.remove(&display) {
-                    // Retiring a device still owes explicit releases, even with the gate closed.
-                    for &(held_display, code) in &self.held_buttons {
-                        if held_display == display {
-                            pointer.proxy.button(
-                                time_ms(),
-                                code,
-                                wl_pointer::ButtonState::Released,
-                            );
-                            self.released_buttons.insert((display, code));
-                            self.buttons_down.remove(&(display, code));
-                        }
-                    }
-                    pointer.proxy.frame();
-                    pointer.proxy.destroy();
-                    self.retired = true;
-                }
+                self.retire_pointer(display);
             }
             if let Some(output) = self.outputs.remove(&id) {
                 output.release();
@@ -290,7 +282,11 @@ impl Source {
                     .or_insert_with(|| self.registry.bind(id, 4, &qh, id));
             }
         }
+        // A pointer is bound to the DisplayId that `monitors` gives its output's name. While a
+        // refresh has failed that map may be stale, so create no pointers from it; the refresh
+        // that resumes the worker creates them. Removal above must still run.
         if self.pointers_open
+            && !self.refresh.is_paused()
             && let (Some(seat), Some(manager)) = (&self.seat, &self.pointer_manager)
         {
             for (&id, output) in &self.outputs {
@@ -333,17 +329,70 @@ impl Source {
         }
         if std::mem::take(&mut self.events.outputs_changed) {
             self.refresh_outputs = true;
+            self.config_epoch.fetch_add(1, Ordering::AcqRel);
         }
     }
 
-    fn update_config(&mut self, config: Config, deadline: Instant) -> Result<(), PlatformError> {
+    pub fn config_epoch(&self) -> Arc<AtomicU64> {
+        self.config_epoch.clone()
+    }
+
+    /// Destroy one virtual pointer. Retiring a device still owes explicit releases, even with the
+    /// gate closed.
+    fn retire_pointer(&mut self, display: DisplayId) {
+        let Some(pointer) = self.pointers.remove(&display) else {
+            return;
+        };
+        for &(held_display, code) in &self.held_buttons {
+            if held_display == display {
+                pointer
+                    .proxy
+                    .button(time_ms(), code, wl_pointer::ButtonState::Released);
+                self.released_buttons.insert((display, code));
+                self.buttons_down.remove(&(display, code));
+            }
+        }
+        pointer.proxy.frame();
+        pointer.proxy.destroy();
+        self.retired = true;
+    }
+
+    /// Retire every pointer whose DisplayId is no longer what `monitors` says for its output's
+    /// name (an output recreated under the same name with a new monitor id keeps no old binding).
+    /// `maintain_outputs` binds the right one afterwards.
+    fn reconcile_pointers(&mut self) {
+        let stale = stale_displays(
+            self.pointers.iter().map(|(&display, pointer)| {
+                let name = self
+                    .events
+                    .outputs
+                    .get(&pointer.output)
+                    .and_then(|info| info.name.as_deref());
+                (display, name)
+            }),
+            &self.monitors,
+        );
+        for display in stale {
+            self.retire_pointer(display);
+        }
+    }
+
+    /// Check and install a configuration the watcher read. A rejected one changes nothing.
+    fn install_config(&mut self, config: Config, deadline: Instant) -> Result<(), PlatformError> {
+        // Validate before changing anything, so a rejected configuration leaves no half-applied
+        // state behind.
+        let keymap = if self.keyboard.is_some() {
+            validate_config(&self.names, &config)?
+        } else {
+            None
+        };
         self.monitors = config.monitors.iter().cloned().collect();
+        self.reconcile_pointers();
         self.maintain_outputs();
         if self.keyboard.is_none() {
-            return Ok(());
+            return self.sync(deadline);
         }
-        if self.names != config.names {
-            let keymap = compile_keymap(&config.names)?;
+        if let Some(keymap) = keymap {
             let mut state = xkb::State::new(&keymap);
             for &code in &self.xkb_down {
                 state.update_key((u32::from(code) + 8).into(), xkb::KeyDirection::Down);
@@ -361,8 +410,8 @@ impl Source {
             }
             self.xkb = state;
             self.names = config.names;
+            // Not `allowed`: that refuses while paused, and the sync below enforces the deadline.
             if self.gate.is_open() {
-                self.allowed(deadline)?;
                 self.modifiers();
             }
         } else {
@@ -377,7 +426,6 @@ impl Source {
                     group,
                 );
                 if self.gate.is_open() {
-                    self.allowed(deadline)?;
                     self.modifiers();
                 }
             }
@@ -404,7 +452,16 @@ impl Source {
         if !self.gate.is_open() {
             return Err(PlatformError::Locked);
         }
+        if self.refresh.is_paused() {
+            return Err(PlatformError::Timeout);
+        }
         Ok(())
+    }
+
+    /// Nothing may be injected: the gate is closed, or a failed refresh left the configuration
+    /// unknown. The two are independent and both must be clear.
+    fn blocked(&self) -> bool {
+        !self.gate.is_open() || self.refresh.is_paused()
     }
 
     fn modifiers(&self) {
@@ -525,8 +582,9 @@ impl Source {
         }
     }
 
-    fn gate_release(&mut self) -> bool {
-        if self.gate.is_open() {
+    /// Release everything held while injection is blocked (closed gate or paused refresh).
+    fn blocked_release(&mut self) -> bool {
+        if !self.blocked() {
             return false;
         }
         let needed = !self.xkb_down.is_empty()
@@ -806,7 +864,7 @@ impl Source {
     fn sync(&mut self, deadline: Instant) -> Result<(), PlatformError> {
         let mut target = self.sync_request();
         loop {
-            if self.gate_release() {
+            if self.blocked_release() {
                 // This barrier must follow the cleanup requests, not the earlier press.
                 target = self.sync_request();
             }
@@ -911,6 +969,9 @@ impl Source {
         if Instant::now() >= deadline {
             return Err(PlatformError::Timeout);
         }
+        if refused_while_paused(&self.refresh, self.gate.is_open(), &action) {
+            return Err(PlatformError::Timeout);
+        }
         let result = match action {
             Action::Key(usage, down) => self.key(keycode(usage)?, down, deadline),
             Action::ReleaseKeys => {
@@ -1011,47 +1072,251 @@ pub(super) fn run(
     pointers: Arc<AtomicBool>,
     watcher: Watcher,
 ) {
+    work(
+        &mut source,
+        &commands,
+        &keys,
+        &pointers,
+        &watcher.updates,
+        &watcher.refresh,
+    );
+    // `source` drops here, after the watcher is no longer consulted: its drop releases whatever
+    // is still held.
+}
+
+/// What the worker loop needs from the Wayland side, and the clock. The loop and the handling of
+/// watcher answers (`work`, `apply_update`, `update_config`) are generic over it, so tests run
+/// those very functions against a fake with a controlled clock, since a real `Source` needs a
+/// compositor.
+trait Worker {
+    fn now(&self) -> Instant;
+    fn shut_keys(&mut self, deadline: Instant);
+    fn shut_pointers(&mut self, deadline: Instant);
+    /// Release what is held while injection is blocked. False when the connection is gone.
+    fn settle(&mut self, deadline: Instant) -> bool;
+    /// An output changed since last asked, so a fresh configuration is wanted.
+    fn take_output_change(&mut self) -> bool;
+    fn refresh(&mut self) -> &mut Refresh;
+    /// Check and install a configuration the watcher read. A rejected one changes nothing.
+    fn apply_config(&mut self, config: Config, deadline: Instant) -> Result<(), PlatformError>;
+    /// Whether nothing invalidated the configuration since a snapshot stamped `stamp` began.
+    /// Called after `apply_config`, whose round trip delivers the outputs' latest events.
+    fn is_current(&self, stamp: u64) -> bool;
+    /// The worker just left the paused state: bind what was skipped while the map was unknown.
+    fn resumed(&mut self);
+    /// The Wayland connection itself is gone, as opposed to one request timing out.
+    fn connection_lost(&self) -> bool;
+    /// Record a failed refresh at `now`; true when that paused the worker.
+    fn refresh_failed(&mut self, error: &PlatformError, now: Instant) -> bool;
+    /// Wait for the next command, for one tick at most.
+    fn wait_command(&mut self, commands: &Receiver<Command>) -> Result<Command, RecvTimeoutError>;
+    /// Run one command and reply to it.
+    fn serve(&mut self, command: Command);
+    /// Housekeeping while no command arrived. False when the connection is gone.
+    fn idle(&mut self, deadline: Instant) -> bool;
+}
+
+impl Worker for Source {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn shut_keys(&mut self, deadline: Instant) {
+        self.close_keys(deadline);
+    }
+
+    fn shut_pointers(&mut self, deadline: Instant) {
+        self.close_pointers(deadline);
+    }
+
+    fn settle(&mut self, deadline: Instant) -> bool {
+        release_if_blocked(self, deadline)
+    }
+
+    fn take_output_change(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_outputs)
+    }
+
+    fn refresh(&mut self) -> &mut Refresh {
+        &mut self.refresh
+    }
+
+    fn apply_config(&mut self, config: Config, deadline: Instant) -> Result<(), PlatformError> {
+        self.install_config(config, deadline)
+    }
+
+    fn is_current(&self, stamp: u64) -> bool {
+        snapshot_is_current(stamp, &self.config_epoch)
+    }
+
+    fn resumed(&mut self) {
+        tracing::info!("injection configuration refreshed; input resumed");
+        // Pointers skipped while the output map was unknown can be bound now.
+        self.maintain_outputs();
+    }
+
+    fn connection_lost(&self) -> bool {
+        self.connection.backend().last_error().is_some()
+    }
+
+    fn refresh_failed(&mut self, error: &PlatformError, now: Instant) -> bool {
+        let entered = self.refresh.failed(now);
+        if entered {
+            // Error text only, never key contents.
+            tracing::warn!(%error, "injection configuration refresh failed; input paused");
+        } else {
+            tracing::debug!(%error, "injection configuration refresh failed again");
+        }
+        entered
+    }
+
+    fn wait_command(&mut self, commands: &Receiver<Command>) -> Result<Command, RecvTimeoutError> {
+        commands.recv_timeout(TICK)
+    }
+
+    fn serve(&mut self, command: Command) {
+        let result = self.command(command.action, command.deadline);
+        let _ = command.reply.send(result);
+    }
+
+    fn idle(&mut self, deadline: Instant) -> bool {
+        self.pump(deadline, Duration::ZERO).is_ok()
+    }
+}
+
+/// Whether a fresh configuration should be requested now: an output changed, or a paused
+/// worker's retry is due.
+fn wants_refresh(worker: &mut impl Worker) -> bool {
+    let outputs = worker.take_output_change();
+    let now = worker.now();
+    // Both must run: a retry that comes due is consumed even when an output asked as well.
+    let retry = worker.refresh().retry_due(now);
+    outputs || retry
+}
+
+/// Handle a configuration the watcher read: the one place a refresh result becomes a state
+/// change. A configuration that cannot be installed (for example its keymap does not compile)
+/// is a failed refresh. While paused, success resumes the worker, but only if nothing
+/// invalidated the configuration since the read began: otherwise the snapshot may predate an
+/// output recreated under another id or a changed keyboard layout, so the worker stays paused
+/// and the change's own refresh request supplies the next snapshot.
+fn update_config(
+    worker: &mut impl Worker,
+    update: Update,
+    deadline: Instant,
+) -> Result<(), PlatformError> {
+    let config = update.config?;
+    worker.apply_config(config, deadline)?;
+    if worker.refresh().is_paused() {
+        if !worker.is_current(update.epoch) {
+            return Err(backend("configuration changed while refreshing"));
+        }
+        worker.refresh().applied();
+        worker.resumed();
+    }
+    Ok(())
+}
+
+/// Apply one watcher answer. False when the worker must end.
+fn apply_update(worker: &mut impl Worker, update: Update) -> bool {
+    // Each update gets its own budget; one slow update must not fail the next.
+    let deadline = worker.now() + CALL_BUDGET;
+    let Err(error) = update_config(worker, update, deadline) else {
+        return true;
+    };
+    if worker.connection_lost() {
+        return false;
+    }
+    // Fail closed: continuing with a stale layout or keymap is unsafe, but one failed refresh is
+    // not the end of the worker. Release what is held, refuse input, and retry (see `Refresh`).
+    let now = worker.now();
+    if !worker.refresh_failed(&error, now) {
+        return true;
+    }
+    let deadline = worker.now() + CALL_BUDGET;
+    worker.settle(deadline)
+}
+
+fn work(
+    worker: &mut impl Worker,
+    commands: &Receiver<Command>,
+    keys: &AtomicBool,
+    pointers: &AtomicBool,
+    updates: &Receiver<Update>,
+    refresh: &SyncSender<()>,
+) {
     loop {
-        let deadline = Instant::now() + CALL_BUDGET;
+        let deadline = worker.now() + CALL_BUDGET;
         if !keys.load(Ordering::Acquire) {
-            source.close_keys(deadline);
+            worker.shut_keys(deadline);
         }
         if !pointers.load(Ordering::Acquire) {
-            source.close_pointers(deadline);
+            worker.shut_pointers(deadline);
         }
         if !keys.load(Ordering::Acquire) && !pointers.load(Ordering::Acquire) {
             return;
         }
-        if source.gate_release()
-            && source.sync(deadline).is_err()
-            && source.connection.backend().last_error().is_some()
-        {
+        if !worker.settle(deadline) {
             return;
         }
-        if std::mem::take(&mut source.refresh_outputs) {
-            let _ = watcher.refresh.try_send(());
+        if wants_refresh(worker)
+            && matches!(refresh.try_send(()), Err(TrySendError::Disconnected(_)))
+        {
+            // The watcher is gone, so no refresh can ever answer, running or paused. End the
+            // worker, whose drop releases whatever is held, rather than inject with a
+            // configuration nothing will ever update.
+            return;
         }
-        while let Ok(update) = watcher.updates.try_recv() {
-            if update
-                .and_then(|config| source.update_config(config, deadline))
-                .is_err()
-            {
-                // Continuing with a stale layout after a failed refresh is unsafe.
-                return;
+        // At most one update per iteration: a watcher that keeps its one-slot channel full must
+        // not keep the worker from commands (releases among them) and from the handle checks
+        // above.
+        match updates.try_recv() {
+            Ok(update) => {
+                if !apply_update(worker, update) {
+                    return;
+                }
             }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => return,
         }
-        match commands.recv_timeout(TICK) {
-            Ok(command) => {
-                let result = source.command(command.action, command.deadline);
-                let _ = command.reply.send(result);
-            }
+        match worker.wait_command(commands) {
+            Ok(command) => worker.serve(command),
             Err(RecvTimeoutError::Timeout) => {
-                if source.pump(deadline, Duration::ZERO).is_err() {
+                if !worker.idle(deadline) {
                     return;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+/// Release what is held while injection is blocked and wait for the compositor to confirm it.
+/// False when the Wayland connection is gone, which ends the worker.
+fn release_if_blocked(source: &mut Source, deadline: Instant) -> bool {
+    !(source.blocked_release() && source.sync(deadline).is_err() && source.connection_lost())
+}
+
+/// Whether a failed refresh refuses `action` with the retryable `Timeout`. A closed gate is not
+/// handled here: it answers for itself (`Locked`) and wins, since both must be clear.
+fn refused_while_paused(refresh: &Refresh, gate_open: bool, action: &Action) -> bool {
+    refresh.is_paused() && gate_open && needs_known_config(action)
+}
+
+/// Whether `action` would inject input or depends on the output layout or keymap, so it must be
+/// refused (retryably) while a failed refresh leaves those unknown. Everything else only releases
+/// or recovers state the worker already owes, and is always honoured, so no key or button stays
+/// down because of a pause.
+fn needs_known_config(action: &Action) -> bool {
+    match action {
+        Action::Key(_, down) | Action::Button(_, down) => *down,
+        Action::SetLocks(..) | Action::Move(..) | Action::Scroll(_) => true,
+        Action::ReleaseKeys
+        | Action::RecoverKeys(_)
+        | Action::ReleaseButtons
+        | Action::RecoverButtons(_)
+        | Action::DropKeys
+        | Action::DropPointers => false,
     }
 }
 
@@ -1080,6 +1345,31 @@ fn compile_keymap(names: &Rmlvo) -> Result<xkb::Keymap, PlatformError> {
         xkb::COMPILE_NO_FLAGS,
     )
     .ok_or_else(|| backend("could not compile target keyboard layout"))
+}
+
+/// Check a configuration the way connect does, changing nothing: the keymap it names must
+/// compile. `None` when the names are unchanged, so the keymap in use stays.
+fn validate_config(current: &Rmlvo, config: &Config) -> Result<Option<xkb::Keymap>, PlatformError> {
+    if *current == config.names {
+        return Ok(None);
+    }
+    compile_keymap(&config.names).map(Some)
+}
+
+/// The bound pointers, as `(display, name of its output)`, that `monitors` no longer maps to the
+/// display they are keyed by.
+fn stale_displays<'a>(
+    bound: impl Iterator<Item = (DisplayId, Option<&'a str>)>,
+    monitors: &BTreeMap<String, u32>,
+) -> Vec<DisplayId> {
+    bound
+        .filter(|&(display, name)| {
+            name.and_then(|name| monitors.get(name))
+                .map(|&id| DisplayId(id))
+                != Some(display)
+        })
+        .map(|(display, _)| display)
+        .collect()
 }
 
 fn upload_keymap(
@@ -1225,7 +1515,11 @@ fn connect_display(deadline: Instant) -> Result<Connection, PlatformError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::config::note_event;
     use super::*;
+    use crate::hyprland::ipc::IpcEvent;
+    use std::sync::mpsc;
+    use std::thread;
 
     fn keymap(options: &str) -> xkb::Keymap {
         compile_keymap(&Rmlvo {
@@ -1279,6 +1573,542 @@ mod tests {
             lock_keycode(&remapped, 0, xkb::keysyms::KEY_Num_Lock),
             Some(69)
         );
+    }
+
+    fn injecting_actions() -> Vec<Action> {
+        let wheel = ScrollDelta {
+            v120_x: 0,
+            v120_y: 120,
+            pixels: None,
+            phase: ScrollPhase::Discrete,
+            stop_x: false,
+            stop_y: false,
+        };
+        vec![
+            Action::Key(HidUsage::keyboard(4), true),
+            Action::Button(MouseButton::PRIMARY, true),
+            Action::Move(DisplayId(0), PointDevice::new(1.0, 1.0)),
+            Action::Scroll(wheel),
+            Action::SetLocks(LockKeys::default(), LockKeys::default()),
+        ]
+    }
+
+    fn releasing_actions() -> Vec<Action> {
+        let usage = HidUsage::keyboard(4);
+        vec![
+            Action::Key(usage, false),
+            Action::Button(MouseButton::PRIMARY, false),
+            Action::ReleaseKeys,
+            Action::RecoverKeys(vec![usage]),
+            Action::ReleaseButtons,
+            Action::RecoverButtons(vec![MouseButton::PRIMARY]),
+            Action::DropKeys,
+            Action::DropPointers,
+        ]
+    }
+
+    #[test]
+    fn a_paused_worker_refuses_injection_but_never_a_release() {
+        let mut refresh = Refresh::default();
+        let now = Instant::now();
+        for action in injecting_actions().iter().chain(&releasing_actions()) {
+            assert!(
+                !refused_while_paused(&refresh, true, action),
+                "a running worker refuses nothing"
+            );
+        }
+        assert!(
+            refresh.failed(now),
+            "entering the pause releases held input"
+        );
+        for action in injecting_actions() {
+            assert!(refused_while_paused(&refresh, true, &action));
+        }
+        // Key-up, button-up, recovery and teardown are honoured, so nothing stays down.
+        for action in releasing_actions() {
+            assert!(!refused_while_paused(&refresh, true, &action));
+        }
+        // A closed gate wins: its own `Locked` answer applies, not the retryable one.
+        for action in injecting_actions() {
+            assert!(!refused_while_paused(&refresh, false, &action));
+        }
+        assert!(refresh.applied());
+        for action in injecting_actions() {
+            assert!(!refused_while_paused(&refresh, true, &action));
+        }
+    }
+
+    fn rmlvo(layout: &str) -> Rmlvo {
+        Rmlvo {
+            layout: layout.into(),
+            variant: String::new(),
+            options: String::new(),
+        }
+    }
+
+    fn config(layout: &str) -> Config {
+        Config {
+            names: rmlvo(layout),
+            active_keymap: None,
+            layout_index: None,
+            locks: LockKeys::default(),
+            monitors: Vec::new(),
+            keyboard_addresses: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn a_pointer_keyed_by_an_old_monitor_id_is_stale() {
+        let monitors: BTreeMap<String, u32> = [("A".to_owned(), 2), ("B".to_owned(), 7)].into();
+        let bound = [
+            // Output A was recreated with a new monitor id; its pointer kept the old key.
+            (DisplayId(1), Some("A")),
+            // Still the right id for its output.
+            (DisplayId(7), Some("B")),
+            // Output no longer in the map, or not named yet.
+            (DisplayId(9), Some("gone")),
+            (DisplayId(4), None),
+            // Another output's id is no excuse.
+            (DisplayId(7), Some("A")),
+        ];
+        assert_eq!(
+            stale_displays(bound.into_iter(), &monitors),
+            [DisplayId(1), DisplayId(9), DisplayId(4), DisplayId(7)]
+        );
+        assert!(stale_displays([(DisplayId(2), Some("A"))].into_iter(), &monitors).is_empty());
+    }
+
+    /// A stand-in for the Wayland side, with a virtual clock and a fake watcher. The loop and the
+    /// refresh-result handling run against it are the production ones (`work`, `apply_update`,
+    /// `update_config`); only what needs a compositor is faked.
+    struct Fake {
+        clock: Instant,
+        refresh: Refresh,
+        epoch: Arc<AtomicU64>,
+        /// The keymap in use.
+        names: Rmlvo,
+        configs_applied: usize,
+        resumed: usize,
+        entered_pause: usize,
+        failures_at: Vec<Instant>,
+        served_after_configs: Vec<usize>,
+        log: Vec<&'static str>,
+        /// Report an output change on every iteration, like a worker that keeps asking.
+        output_changes_forever: bool,
+        /// Drop both handles once this many configurations were applied.
+        drop_handles_after: usize,
+        keys: Arc<AtomicBool>,
+        pointers: Arc<AtomicBool>,
+        watcher: Option<FakeWatcher>,
+        requests_at: Vec<Instant>,
+    }
+
+    /// The far end of the refresh channels: it answers every request with a failed read.
+    struct FakeWatcher {
+        requests: Receiver<()>,
+        answers: mpsc::Sender<Update>,
+        /// Drop the handles after this many requests, to end the loop.
+        stop_after: usize,
+    }
+
+    impl Fake {
+        fn new(keys: &Arc<AtomicBool>, pointers: &Arc<AtomicBool>) -> Self {
+            Self {
+                clock: Instant::now(),
+                refresh: Refresh::default(),
+                epoch: Arc::new(AtomicU64::new(0)),
+                names: rmlvo("us"),
+                configs_applied: 0,
+                resumed: 0,
+                entered_pause: 0,
+                failures_at: Vec::new(),
+                served_after_configs: Vec::new(),
+                log: Vec::new(),
+                output_changes_forever: false,
+                drop_handles_after: usize::MAX,
+                keys: keys.clone(),
+                pointers: pointers.clone(),
+                watcher: None,
+                requests_at: Vec::new(),
+            }
+        }
+
+        fn drop_handles(&self) {
+            self.keys.store(false, Ordering::Release);
+            self.pointers.store(false, Ordering::Release);
+        }
+
+        fn answer_requests(&mut self) {
+            let Some(watcher) = &self.watcher else {
+                return;
+            };
+            if watcher.requests.try_recv().is_ok() {
+                self.requests_at.push(self.clock);
+                let _ = watcher.answers.send(Update {
+                    epoch: self.epoch.load(Ordering::Acquire),
+                    config: Err(PlatformError::Timeout),
+                });
+                if self.requests_at.len() == watcher.stop_after {
+                    self.drop_handles();
+                }
+            }
+        }
+    }
+
+    impl Worker for Fake {
+        fn now(&self) -> Instant {
+            self.clock
+        }
+        fn shut_keys(&mut self, _: Instant) {
+            self.log.push("shut_keys");
+        }
+        fn shut_pointers(&mut self, _: Instant) {
+            self.log.push("shut_pointers");
+        }
+        fn settle(&mut self, _: Instant) -> bool {
+            true
+        }
+        fn take_output_change(&mut self) -> bool {
+            self.output_changes_forever
+        }
+        fn refresh(&mut self) -> &mut Refresh {
+            &mut self.refresh
+        }
+        fn apply_config(&mut self, config: Config, _: Instant) -> Result<(), PlatformError> {
+            self.configs_applied += 1;
+            if self.configs_applied == self.drop_handles_after {
+                self.drop_handles();
+            }
+            // The production check, as `Source` does before installing anything.
+            if validate_config(&self.names, &config)?.is_some() {
+                self.names = config.names;
+            }
+            Ok(())
+        }
+        fn is_current(&self, stamp: u64) -> bool {
+            snapshot_is_current(stamp, &self.epoch)
+        }
+        fn resumed(&mut self) {
+            self.resumed += 1;
+        }
+        fn connection_lost(&self) -> bool {
+            false
+        }
+        fn refresh_failed(&mut self, _: &PlatformError, now: Instant) -> bool {
+            self.failures_at.push(now);
+            let entered = self.refresh.failed(now);
+            self.entered_pause += usize::from(entered);
+            entered
+        }
+        fn wait_command(
+            &mut self,
+            commands: &Receiver<Command>,
+        ) -> Result<Command, RecvTimeoutError> {
+            match commands.try_recv() {
+                Ok(command) => Ok(command),
+                Err(TryRecvError::Empty) => {
+                    // One tick passes with no command, in which the watcher answers.
+                    self.answer_requests();
+                    self.clock += TICK;
+                    Err(RecvTimeoutError::Timeout)
+                }
+                Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+            }
+        }
+        fn serve(&mut self, command: Command) {
+            self.served_after_configs.push(self.configs_applied);
+            let _ = command.reply.send(Ok(()));
+        }
+        fn idle(&mut self, _: Instant) -> bool {
+            true
+        }
+    }
+
+    fn update(config: Config) -> Update {
+        Update {
+            epoch: 0,
+            config: Ok(config),
+        }
+    }
+
+    fn handles() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        (
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    /// Run the loop on a thread, so a loop that fails to end fails the test instead of hanging it.
+    fn ends_within_five_seconds(run: impl FnOnce() + Send + 'static) -> bool {
+        let (done, finished) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            run();
+            let _ = done.send(());
+        });
+        finished.recv_timeout(Duration::from_secs(5)).is_ok()
+    }
+
+    #[test]
+    fn an_invalid_then_a_valid_configuration_pause_and_resume_through_the_production_handling() {
+        let (keys, pointers) = handles();
+        let mut worker = Fake::new(&keys, &pointers);
+        let injection = Action::Key(HidUsage::keyboard(4), true);
+        let stamp = |worker: &Fake| worker.epoch.load(Ordering::Acquire);
+        assert!(!refused_while_paused(&worker.refresh, true, &injection));
+
+        // The watcher delivers a configuration whose keymap does not compile. Nothing here picks
+        // the transition: the handling does, so the worker pauses by itself and refuses input.
+        let invalid = config("no-such-layout");
+        let epoch = stamp(&worker);
+        assert!(apply_update(
+            &mut worker,
+            Update {
+                epoch,
+                config: Ok(invalid)
+            }
+        ));
+        assert!(worker.refresh.is_paused(), "an invalid keymap must pause");
+        assert_eq!(worker.entered_pause, 1);
+        assert!(refused_while_paused(&worker.refresh, true, &injection));
+        assert_eq!(
+            worker.names,
+            rmlvo("us"),
+            "a rejected keymap changed nothing"
+        );
+
+        // The retry delivers the same invalid configuration: still paused, still refusing.
+        worker.clock += Duration::from_millis(100);
+        let epoch = stamp(&worker);
+        assert!(apply_update(
+            &mut worker,
+            Update {
+                epoch,
+                config: Ok(config("no-such-layout"))
+            }
+        ));
+        assert!(
+            worker.refresh.is_paused(),
+            "an invalid keymap must not resume"
+        );
+        assert_eq!(worker.entered_pause, 1, "one pause, not a new one");
+        assert!(refused_while_paused(&worker.refresh, true, &injection));
+        assert_eq!(worker.resumed, 0);
+
+        // A valid configuration is installed and resumes, again by itself.
+        worker.clock += Duration::from_millis(200);
+        let epoch = stamp(&worker);
+        assert!(apply_update(
+            &mut worker,
+            Update {
+                epoch,
+                config: Ok(config("de"))
+            }
+        ));
+        assert!(!worker.refresh.is_paused());
+        assert_eq!(worker.resumed, 1);
+        assert_eq!(worker.names, rmlvo("de"));
+        assert!(!refused_while_paused(&worker.refresh, true, &injection));
+    }
+
+    #[test]
+    fn a_keyboard_change_while_a_paused_refresh_is_in_flight_keeps_it_paused() {
+        for event in ["activelayout", "configreloaded"] {
+            let (keys, pointers) = handles();
+            let mut worker = Fake::new(&keys, &pointers);
+            let injection = Action::Key(HidUsage::keyboard(4), true);
+            let dirty = AtomicBool::new(false);
+            assert!(apply_update(&mut worker, update(config("no-such-layout"))));
+            assert!(worker.refresh.is_paused());
+
+            // A retry begins and reads the keyboard configuration as it is now (layout "us")...
+            let stamp = worker.epoch.load(Ordering::Acquire);
+            // ...then the keyboard layout changes before the retry finishes. The outputs did not
+            // change, so only the watcher's event thread knows.
+            note_event(
+                &IpcEvent::Event {
+                    name: event,
+                    data: "",
+                },
+                &dirty,
+                &worker.epoch,
+            );
+            assert!(dirty.load(Ordering::Acquire), "the watcher will read again");
+            // The retry's snapshot arrives. It is valid, but it predates the change.
+            assert!(apply_update(
+                &mut worker,
+                Update {
+                    epoch: stamp,
+                    config: Ok(config("us"))
+                }
+            ));
+            assert!(
+                worker.refresh.is_paused(),
+                "a keyboard snapshot read before {event} resumed injection"
+            );
+            assert!(refused_while_paused(&worker.refresh, true, &injection));
+            assert_eq!(worker.resumed, 0);
+
+            // The read the change asked for began after it, and resumes.
+            let stamp = worker.epoch.load(Ordering::Acquire);
+            assert!(apply_update(
+                &mut worker,
+                Update {
+                    epoch: stamp,
+                    config: Ok(config("de"))
+                }
+            ));
+            assert!(!worker.refresh.is_paused(), "{event}");
+            assert_eq!(worker.names, rmlvo("de"));
+            assert_eq!(worker.resumed, 1);
+        }
+    }
+
+    #[test]
+    fn an_unrelated_event_during_a_paused_refresh_does_not_stop_it_resuming() {
+        let (keys, pointers) = handles();
+        let mut worker = Fake::new(&keys, &pointers);
+        let dirty = AtomicBool::new(false);
+        assert!(apply_update(&mut worker, update(config("no-such-layout"))));
+        let stamp = worker.epoch.load(Ordering::Acquire);
+        note_event(
+            &IpcEvent::Event {
+                name: "workspace",
+                data: "2",
+            },
+            &dirty,
+            &worker.epoch,
+        );
+        assert!(apply_update(
+            &mut worker,
+            Update {
+                epoch: stamp,
+                config: Ok(config("us"))
+            }
+        ));
+        assert!(!worker.refresh.is_paused());
+    }
+
+    #[test]
+    fn a_paused_worker_retries_on_the_exact_backoff_schedule() {
+        let (keys, pointers) = handles();
+        let (answers, updates) = mpsc::channel::<Update>();
+        let (refresh, requests) = mpsc::sync_channel(1);
+        let (_commands_tx, commands) = mpsc::sync_channel(32);
+        let mut worker = Fake::new(&keys, &pointers);
+        worker.watcher = Some(FakeWatcher {
+            requests,
+            answers: answers.clone(),
+            stop_after: 8,
+        });
+        // The first refresh fails; after that the watcher fails every retry.
+        answers
+            .send(Update {
+                epoch: 0,
+                config: Err(PlatformError::Timeout),
+            })
+            .unwrap();
+        work(&mut worker, &commands, &keys, &pointers, &updates, &refresh);
+
+        // The delay from each failure to the next request is the schedule, to the millisecond:
+        // the loop runs on the fake's virtual clock, so no real timing is involved.
+        let delays: Vec<u128> = worker
+            .failures_at
+            .iter()
+            .zip(&worker.requests_at)
+            .map(|(failed, asked)| asked.duration_since(*failed).as_millis())
+            .collect();
+        assert_eq!(delays, [100, 200, 400, 800, 1600, 2000, 2000, 2000]);
+        assert_eq!(worker.entered_pause, 1, "the pause was entered once");
+        assert_eq!(worker.log, ["shut_keys", "shut_pointers"]);
+    }
+
+    #[test]
+    fn a_watcher_that_never_stops_answering_cannot_starve_commands_or_teardown() {
+        let (handle_keys, handle_pointers) = handles();
+        // A hostile watcher: an answer is always waiting, however many the worker takes.
+        let (updates_tx, updates) = mpsc::channel::<Update>();
+        for _ in 0..10_000 {
+            updates_tx.send(update(config("us"))).unwrap();
+        }
+        let (refresh, _requests) = mpsc::sync_channel(1);
+        let (commands_tx, commands) = mpsc::sync_channel(32);
+        // A release is already queued when the loop starts.
+        let (reply, answered) = mpsc::sync_channel(1);
+        commands_tx
+            .send(Command {
+                action: Action::ReleaseKeys,
+                deadline: Instant::now() + Duration::from_secs(10),
+                reply,
+            })
+            .unwrap();
+        let mut fake = Fake::new(&handle_keys, &handle_pointers);
+        fake.drop_handles_after = 3;
+        work(
+            &mut fake,
+            &commands,
+            &handle_keys,
+            &handle_pointers,
+            &updates,
+            &refresh,
+        );
+
+        assert!(
+            matches!(answered.try_recv(), Ok(Ok(()))),
+            "the queued release was served"
+        );
+        assert!(
+            fake.served_after_configs[0] <= 1,
+            "the release waited for {} updates",
+            fake.served_after_configs[0]
+        );
+        // The dropped handles were noticed within an iteration of the third update.
+        assert!(
+            fake.configs_applied <= 4,
+            "{} updates ran after the handles were dropped",
+            fake.configs_applied
+        );
+        assert_eq!(fake.log, ["shut_keys", "shut_pointers"]);
+        drop((commands_tx, updates_tx));
+    }
+
+    #[test]
+    fn a_lost_watcher_ends_the_worker_running_or_paused() {
+        // (the watcher's answers are gone, its requests are gone, a refresh is wanted)
+        for (answers_gone, requests_gone, output_changes, what) in [
+            (true, false, false, "running, answers gone"),
+            (true, false, true, "paused, answers gone"),
+            (
+                false,
+                true,
+                true,
+                "running, an output changed, requests gone",
+            ),
+            (false, true, true, "paused, retry due, requests gone"),
+        ] {
+            let (handle_keys, handle_pointers) = handles();
+            let (updates_tx, updates) = mpsc::sync_channel::<Update>(1);
+            let (refresh, requests) = mpsc::sync_channel(1);
+            let (_commands_tx, commands) = mpsc::sync_channel(32);
+            // Whichever end the watcher would hold stays alive and silent, or is dropped.
+            let (silent, kept) = (
+                (!answers_gone).then_some(updates_tx),
+                (!requests_gone).then_some(requests),
+            );
+            let mut fake = Fake::new(&handle_keys, &handle_pointers);
+            fake.output_changes_forever = output_changes;
+            assert!(
+                ends_within_five_seconds(move || work(
+                    &mut fake,
+                    &commands,
+                    &handle_keys,
+                    &handle_pointers,
+                    &updates,
+                    &refresh,
+                )),
+                "the worker kept running without a watcher: {what}"
+            );
+            drop((silent, kept));
+        }
     }
 
     #[test]
