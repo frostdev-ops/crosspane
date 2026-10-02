@@ -24,5 +24,5 @@ crosspane-ui-kit.workspace = true
 eframe.workspace = true
 png.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix.workspace = true
