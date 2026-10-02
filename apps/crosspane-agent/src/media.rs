@@ -106,21 +106,21 @@ impl ProxyIds {
         if let Some(stats) = map.stats.remove(&key)
             && stats.presented > 0
         {
-            *map.presented_closed.entry(key.source).or_default() += stats.presented;
+            let closed = map.presented_closed.entry(key.source).or_default();
+            *closed = closed.saturating_add(stats.presented);
         }
         Some(id)
     }
 
-    /// The renderer submitted one frame of `key` for presentation (WP-4.5a calls this where it
-    /// does; until it does, [`ProxyIds::presented_from`] says `None`). Counts per projection;
-    /// a frame of a projection that has closed isn't counted, as with the decoder's own stats.
-    #[allow(dead_code)]
-    pub fn presented(&self, key: ProjectionKey) {
+    /// The renderer reported `frames` presented frames of `key`. Counts per projection; a report
+    /// for a projection that has closed isn't counted, as with the decoder's own stats.
+    pub fn presented(&self, key: ProjectionKey, frames: u32) {
         if let Ok(mut map) = self.inner.lock()
             && map.by_key.contains_key(&key)
         {
             map.presented_reported = true;
-            map.stats.entry(key).or_default().presented += 1;
+            let stats = map.stats.entry(key).or_default();
+            stats.presented = stats.presented.saturating_add(u64::from(frames));
         }
     }
 
@@ -137,8 +137,14 @@ impl ProxyIds {
             .iter()
             .filter(|(key, _)| key.source == source)
             .map(|(_, stats)| stats.presented)
-            .sum();
-        Some(map.presented_closed.get(&source).copied().unwrap_or(0) + open)
+            .fold(0, u64::saturating_add);
+        Some(
+            map.presented_closed
+                .get(&source)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(open),
+        )
     }
 
     fn shown(&self, key: ProjectionKey, bytes: usize, captured_ns: u64) {
@@ -1366,7 +1372,7 @@ mod presented_tests {
         // A frame the decoder showed is not a presented frame.
         ids.shown(key(1, 1), 10, 0);
         assert_eq!(ids.presented_from(NodeId([1; 32])), None);
-        ids.presented(key(1, 1));
+        ids.presented(key(1, 1), 1);
         assert_eq!(ids.presented_from(NodeId([1; 32])), Some(1));
         // Once the renderer has reported, a peer it hasn't shown anything of has 0.
         assert_eq!(ids.presented_from(NodeId([2; 32])), Some(0));
@@ -1378,11 +1384,9 @@ mod presented_tests {
         for k in [key(1, 1), key(1, 2), key(2, 1)] {
             ids.open(k);
         }
-        for _ in 0..3 {
-            ids.presented(key(1, 1));
-        }
-        ids.presented(key(1, 2));
-        ids.presented(key(2, 1));
+        ids.presented(key(1, 1), 3);
+        ids.presented(key(1, 2), 1);
+        ids.presented(key(2, 1), 1);
         assert_eq!(ids.presented_from(NodeId([1; 32])), Some(4));
         assert_eq!(ids.presented_from(NodeId([2; 32])), Some(1));
     }
@@ -1391,18 +1395,85 @@ mod presented_tests {
     fn closing_a_projection_never_lowers_its_peers_total() {
         let ids = ProxyIds::default();
         ids.open(key(1, 1));
-        ids.presented(key(1, 1));
-        ids.presented(key(1, 1));
+        ids.presented(key(1, 1), 1);
+        ids.presented(key(1, 1), 1);
         assert_eq!(ids.presented_from(NodeId([1; 32])), Some(2));
         ids.close(key(1, 1));
         assert_eq!(ids.presented_from(NodeId([1; 32])), Some(2));
         // A later projection from the same peer adds to it.
         ids.open(key(1, 2));
-        ids.presented(key(1, 2));
+        ids.presented(key(1, 2), 1);
         assert_eq!(ids.presented_from(NodeId([1; 32])), Some(3));
         // A frame of a projection that is gone isn't counted.
         ids.close(key(1, 2));
-        ids.presented(key(1, 2));
+        ids.presented(key(1, 2), 1);
         assert_eq!(ids.presented_from(NodeId([1; 32])), Some(3));
+    }
+
+    #[test]
+    fn one_projections_presented_count_saturates() {
+        let ids = ProxyIds::default();
+        let key = key(1, 1);
+        ids.open(key);
+        ids.inner
+            .lock()
+            .unwrap()
+            .stats
+            .entry(key)
+            .or_default()
+            .presented = u64::MAX - 1;
+        ids.presented(key, 2);
+        assert_eq!(ids.stats(key).unwrap().presented, u64::MAX);
+        assert_eq!(ids.presented_from(key.source), Some(u64::MAX));
+        ids.presented(key, u32::MAX);
+        assert_eq!(ids.stats(key).unwrap().presented, u64::MAX);
+        assert_eq!(ids.presented_from(key.source), Some(u64::MAX));
+    }
+
+    #[test]
+    fn several_projections_presented_sum_saturates() {
+        let ids = ProxyIds::default();
+        let first = key(1, 1);
+        let second = key(1, 2);
+        ids.open(first);
+        ids.open(second);
+        ids.inner
+            .lock()
+            .unwrap()
+            .stats
+            .entry(first)
+            .or_default()
+            .presented = u64::MAX - 1;
+        ids.presented(second, 2);
+        assert_eq!(ids.presented_from(first.source), Some(u64::MAX));
+        ids.presented(second, 3);
+        assert_eq!(ids.presented_from(first.source), Some(u64::MAX));
+    }
+
+    #[test]
+    fn closed_plus_open_presented_totals_and_close_accumulation_saturate() {
+        let ids = ProxyIds::default();
+        let first = key(1, 1);
+        let second = key(1, 2);
+        let third = key(1, 3);
+        ids.open(first);
+        ids.inner
+            .lock()
+            .unwrap()
+            .stats
+            .entry(first)
+            .or_default()
+            .presented = u64::MAX - 1;
+        ids.close(first);
+        ids.open(second);
+        ids.presented(second, 2);
+        assert_eq!(ids.presented_from(first.source), Some(u64::MAX));
+        ids.close(second);
+        assert_eq!(ids.presented_from(first.source), Some(u64::MAX));
+        ids.open(third);
+        ids.presented(third, u32::MAX);
+        assert_eq!(ids.presented_from(first.source), Some(u64::MAX));
+        ids.close(third);
+        assert_eq!(ids.presented_from(first.source), Some(u64::MAX));
     }
 }

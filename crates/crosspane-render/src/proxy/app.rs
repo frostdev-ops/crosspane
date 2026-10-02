@@ -55,6 +55,7 @@ struct ProxyWindow {
     flash_until: Option<Instant>,
     input: InputState,
     consecutive_surface_losses: u8,
+    presents: PresentCounter,
     /// What `HostEvent::Placed` last said about this window, and the occlusion it is built on.
     placement: PlacementTracker,
 }
@@ -174,6 +175,7 @@ impl App {
             flash_until: None,
             input: InputState::default(),
             consecutive_surface_losses: 0,
+            presents: PresentCounter::new(Instant::now()),
             placement: PlacementTracker::for_new_window(),
         };
         proxy.resize(gpu, actual_size)?;
@@ -275,6 +277,7 @@ impl App {
                 dirty,
             } => {
                 if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
+                    window.presents.content();
                     match window
                         .presenter
                         .upload(&gpu.device, &gpu.queue, size, &pixels, &dirty)
@@ -294,6 +297,7 @@ impl App {
                 picture,
             } => {
                 if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
+                    window.presents.content();
                     match window.presenter.set_video(&gpu.device, size, rect, picture) {
                         Ok(()) => window.window.request_redraw(),
                         Err(error) => {
@@ -310,6 +314,7 @@ impl App {
                 picture,
             } => {
                 if let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) {
+                    window.presents.content();
                     match window
                         .presenter
                         .set_native_video(&gpu.device, size, rect, picture)
@@ -548,7 +553,13 @@ impl ApplicationHandler<HostCommand> for App {
         self.check_gpu();
         let now = Instant::now();
         let mut next = None;
-        for window in self.windows.values_mut() {
+        for (&id, window) in &mut self.windows {
+            if let Some(frames) = window.presents.report(now) {
+                (self.events)(HostEvent::Presented { id, frames });
+            }
+            if let Some(deadline) = window.presents.deadline() {
+                next = Some(next.map_or(deadline, |previous: Instant| previous.min(deadline)));
+            }
             if let Some(deadline) = window.flash_until {
                 if deadline <= now {
                     window.flash_until = None;
@@ -680,10 +691,57 @@ impl ProxyWindow {
         gpu.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
         gpu.queue.present(frame);
+        self.presents.present(true);
         if suboptimal {
             self.resize(gpu, self.window.inner_size())?;
         }
         Ok(())
+    }
+}
+
+const PRESENT_REPORT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Counts new content only after acquisition, drawing and handoff to present. The opening time
+/// starts the first coalescing interval; subsequent intervals start when a report is emitted.
+struct PresentCounter {
+    fresh: bool,
+    unreported: u32,
+    last_report: Instant,
+}
+
+impl PresentCounter {
+    fn new(now: Instant) -> Self {
+        Self {
+            fresh: false,
+            unreported: 0,
+            last_report: now,
+        }
+    }
+
+    fn content(&mut self) {
+        self.fresh = true;
+    }
+
+    fn present(&mut self, successful: bool) {
+        if successful && self.fresh {
+            self.unreported = self.unreported.saturating_add(1);
+            self.fresh = false;
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        (self.unreported > 0).then(|| self.last_report + PRESENT_REPORT_INTERVAL)
+    }
+
+    fn report(&mut self, now: Instant) -> Option<u32> {
+        if self.deadline().is_some_and(|deadline| now >= deadline) {
+            let frames = self.unreported;
+            self.unreported = 0;
+            self.last_report = now;
+            Some(frames)
+        } else {
+            None
+        }
     }
 }
 
@@ -1004,6 +1062,103 @@ fn window_scale(windows: &HashMap<u64, ProxyWindow>, id: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_then_present_counts_one() {
+        let now = Instant::now();
+        let mut counter = PresentCounter::new(now);
+        counter.content();
+        counter.present(true);
+        assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL), Some(1));
+    }
+
+    #[test]
+    fn present_without_new_content_counts_nothing() {
+        let now = Instant::now();
+        let mut counter = PresentCounter::new(now);
+        counter.content();
+        counter.present(true);
+        assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL), Some(1));
+        // Resize, edge flash and cursor changes don't mark content as fresh.
+        for _ in 0..10 {
+            counter.present(true);
+        }
+        assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL * 2), None);
+        assert_eq!(counter.deadline(), None);
+    }
+
+    #[test]
+    fn several_contents_before_one_present_count_one() {
+        let now = Instant::now();
+        let mut counter = PresentCounter::new(now);
+        // Frame, Video and VideoNative all use the same content marker.
+        for _ in 0..3 {
+            counter.content();
+        }
+        counter.present(true);
+        assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL), Some(1));
+    }
+
+    #[test]
+    fn refused_acquisitions_count_nothing_and_keep_content_fresh() {
+        let now = Instant::now();
+        let mut counter = PresentCounter::new(now);
+        counter.content();
+        // Occluded, timeout, outdated and lost acquisitions leave the content pending.
+        for _ in 0..4 {
+            counter.present(false);
+        }
+        assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL), None);
+        assert_eq!(counter.deadline(), None);
+        counter.present(true);
+        assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL), Some(1));
+    }
+
+    #[test]
+    fn presents_are_coalesced_at_most_once_per_interval() {
+        let now = Instant::now();
+        let mut counter = PresentCounter::new(now);
+        for elapsed in 0..250 {
+            counter.content();
+            counter.present(true);
+            assert_eq!(counter.report(now + Duration::from_millis(elapsed)), None);
+        }
+        assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL), Some(250));
+        counter.content();
+        counter.present(true);
+        assert_eq!(counter.report(now + Duration::from_millis(499)), None);
+        assert_eq!(counter.report(now + PRESENT_REPORT_INTERVAL * 2), Some(1));
+    }
+
+    #[test]
+    fn pending_counts_flush_at_the_deadline_without_more_presents() {
+        let now = Instant::now();
+        let mut counter = PresentCounter::new(now);
+        assert_eq!(counter.deadline(), None);
+        counter.content();
+        counter.present(true);
+        let deadline = counter.deadline().expect("pending report deadline");
+        assert_eq!(deadline, now + PRESENT_REPORT_INTERVAL);
+        assert_eq!(counter.report(deadline - Duration::from_nanos(1)), None);
+        assert_eq!(counter.report(deadline), Some(1));
+        assert_eq!(counter.deadline(), None);
+    }
+
+    #[test]
+    fn reports_never_contain_zero_frames() {
+        let now = Instant::now();
+        let mut counter = PresentCounter::new(now);
+        for elapsed in 0..=1000 {
+            counter.present(true);
+            assert_eq!(counter.report(now + Duration::from_millis(elapsed)), None);
+        }
+        counter.content();
+        counter.present(true);
+        assert_eq!(counter.report(now + Duration::from_secs(1)), Some(1));
+        for elapsed in 1000..=2000 {
+            assert_eq!(counter.report(now + Duration::from_millis(elapsed)), None);
+        }
+    }
 
     #[test]
     fn geometry_events_report_the_sampled_size_and_scale_not_their_payload() {

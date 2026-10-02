@@ -178,6 +178,20 @@ pub enum HostEvent {
     Lost {
         id: u64,
     },
+    /// The proxy presented `frames` frames with new content since its previous `Presented`
+    /// report. A frame counts when the window acquires a surface texture, draws and presents it
+    /// after at least one `Frame`, `Video` or `VideoNative` for it arrived since its previous
+    /// counted present. Redraws that only resize, flash the edge or change the cursor don't
+    /// count, and neither do frames whose surface texture couldn't be acquired (occluded,
+    /// timeout, outdated or lost). wgpu doesn't report a presentation the platform rejects after
+    /// a successful acquisition, so such a rare frame may be counted. Reports are coalesced:
+    /// at most one per window per 250 ms, and pending counts go out within 250 ms even when no
+    /// further present happens. `frames` is never 0. Counts still pending when the window closes
+    /// or is lost may be dropped.
+    Presented {
+        id: u64,
+        frames: u32,
+    },
     Key {
         id: u64,
         usage: HidUsage,

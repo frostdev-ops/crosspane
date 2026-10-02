@@ -2924,6 +2924,12 @@ impl Agent {
                 (id, Box::new(|key| proxy(key, ProxyEvent::CloseRequested)))
             }
             HostEvent::Lost { id } => (id, Box::new(|key| proxy(key, ProxyEvent::Lost))),
+            HostEvent::Presented { id, frames } => {
+                if let Some(key) = self.proxy_ids.key(id) {
+                    self.proxy_ids.presented(key, frames);
+                }
+                return;
+            }
             HostEvent::Key { id, usage, down } => (
                 id,
                 Box::new(move |key| proxy(key, ProxyEvent::Key { usage, down })),
@@ -10750,9 +10756,20 @@ mod home_tests {
         );
     }
 
+    fn report_presented_without_feeding_engine(h: &mut Home, id: u64, frames: u32) {
+        let fed = h.rig.agent.fed.clone();
+        let pending = h.rig.agent.pending.clone();
+        h.rig.agent.on_host(HostEvent::Presented { id, frames });
+        assert_eq!(h.rig.agent.fed, fed, "Presented fed an engine input");
+        assert_eq!(
+            h.rig.agent.pending, pending,
+            "Presented queued an engine input"
+        );
+    }
+
     #[test]
     fn frames_presented_is_null_until_the_renderer_reports_and_then_a_number() {
-        let h = bare_scenario();
+        let mut h = bare_scenario();
         let presented =
             |h: &Home| status_installer(h)["peers"][0]["counters"]["e2_frames_presented"].clone();
         assert_eq!(presented(&h), Value::Null);
@@ -10760,13 +10777,31 @@ mod home_tests {
             source: h.rig.peer,
             projection: ProjectionId(1),
         };
-        h.rig.agent.proxy_ids.open(key);
+        let id = h.rig.agent.proxy_ids.open(key);
         // The decoder showing frames is not the renderer presenting them.
         assert_eq!(presented(&h), Value::Null);
-        h.rig.agent.proxy_ids.presented(key);
-        h.rig.agent.proxy_ids.presented(key);
-        assert_eq!(presented(&h), json!(2));
+        report_presented_without_feeding_engine(&mut h, id, 3);
+        assert_eq!(presented(&h), json!(3));
         h.rig.agent.proxy_ids.close(key);
+        assert_eq!(presented(&h), json!(3));
+        report_presented_without_feeding_engine(&mut h, id, 7);
+        assert_eq!(presented(&h), json!(3));
+    }
+
+    #[test]
+    fn presented_for_an_unknown_proxy_is_ignored() {
+        let mut h = bare_scenario();
+        let presented =
+            |h: &Home| status_installer(h)["peers"][0]["counters"]["e2_frames_presented"].clone();
+        report_presented_without_feeding_engine(&mut h, u64::MAX, 5);
+        assert_eq!(presented(&h), Value::Null);
+        let key = ProjectionKey {
+            source: h.rig.peer,
+            projection: ProjectionId(1),
+        };
+        let id = h.rig.agent.proxy_ids.open(key);
+        report_presented_without_feeding_engine(&mut h, id, 2);
+        report_presented_without_feeding_engine(&mut h, u64::MAX, 5);
         assert_eq!(presented(&h), json!(2));
     }
 
