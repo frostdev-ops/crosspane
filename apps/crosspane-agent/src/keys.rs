@@ -11,7 +11,7 @@ use crosspane_security::identity::DeviceIdentity;
 use crate::paths::write_private;
 
 /// The key store entry name.
-const KEY_NAME: &str = "device-key";
+pub(crate) const KEY_NAME: &str = "device-key";
 
 /// Where the device identity came from (`status.result.installer.keystore`, WP-4.5): decided here,
 /// where the load picks between the OS key store and the key file.
@@ -81,6 +81,7 @@ pub fn load_or_create_waiting(
     key_file: &Path,
     allow_file_fallback: bool,
     pacer: &mut dyn Pacer,
+    mut on_locked: impl FnMut() -> Result<()>,
 ) -> Result<Startup> {
     let mut waiting: Option<Waiting> = None;
     loop {
@@ -95,6 +96,9 @@ pub fn load_or_create_waiting(
                 return Ok(Startup::Identity(identity, source));
             }
             Attempt::Locked => {}
+        }
+        if waiting.is_none() {
+            on_locked()?;
         }
         let waiting = waiting.get_or_insert_with(|| {
             tracing::warn!("the OS key store is locked; waiting for it to unlock");
@@ -155,6 +159,12 @@ fn attempt(
     allow_file_fallback: bool,
     wait_on_lock: bool,
 ) -> Result<Attempt> {
+    // Both one-shot identity and startup use this attempt. Do not retain the mutation lock
+    // while startup paces a locked key store: only the actual load/create must exclude erase.
+    let state_dir = key_file
+        .parent()
+        .context("device key has no state directory")?;
+    let mutation = crate::paths::identity_mutation_lock(state_dir)?;
     if let Some(store) = store {
         match store.load(KEY_NAME) {
             Ok(Some(pkcs8)) => {
@@ -164,7 +174,14 @@ fn attempt(
             }
             Ok(None) => {
                 let identity = DeviceIdentity::generate().context("generate device key")?;
-                match store.store(KEY_NAME, identity.pkcs8()) {
+                let stored = store.store(KEY_NAME, identity.pkcs8());
+                if matches!(stored, Err(PlatformError::Timeout)) {
+                    // Both adapters may still be writing after Timeout, and the frozen KeyStore
+                    // cannot establish completion. Keep the descriptor (and flock) until this
+                    // writer process ends, including when the file fallback succeeds below.
+                    std::mem::forget(mutation);
+                }
+                match stored {
                     Ok(()) => {
                         tracing::info!(node = %identity.node().short(), "created device key in the OS key store");
                         return Ok(Attempt::Loaded(identity, KeySource::OsStore));
@@ -502,11 +519,22 @@ mod tests {
         );
         let file = key_file("three-locks");
         let mut pacer = FakePacer::new(None);
+        let mut notices = 0;
         let Startup::Identity(identity, source) =
-            load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap()
+            load_or_create_waiting(Some(&store), &file, false, &mut pacer, || {
+                assert_eq!(store.loads(), 1);
+                // The load attempt has ended before waiting begins. Other short one-shot
+                // mutations may proceed while the OS key store stays locked.
+                let _mutation =
+                    crate::paths::identity_mutation_lock(file.parent().unwrap()).unwrap();
+                notices += 1;
+                Ok(())
+            })
+            .unwrap()
         else {
             panic!("expected the identity");
         };
+        assert_eq!(notices, 1);
         assert_eq!(identity.node(), existing.node());
         assert_eq!(source, KeySource::OsStore);
         // Three locked loads, three pauses of 2 s each, then the fourth load worked.
@@ -524,7 +552,8 @@ mod tests {
         let store = FakeStore::new(&[], Reply::Locked);
         let file = key_file("locked-forever");
         let mut pacer = FakePacer::new(Some(5));
-        let startup = load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap();
+        let startup =
+            load_or_create_waiting(Some(&store), &file, false, &mut pacer, || Ok(())).unwrap();
         assert!(matches!(startup, Startup::Stopped), "{startup:?}");
         // It stopped at the stop request: no further load, no further pause.
         assert_eq!(pacer.pauses.len(), 5);
@@ -538,7 +567,8 @@ mod tests {
         let store = FakeStore::new(&[], Reply::Locked);
         let file = key_file("stop-at-once");
         let mut pacer = FakePacer::new(Some(1));
-        let startup = load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap();
+        let startup =
+            load_or_create_waiting(Some(&store), &file, false, &mut pacer, || Ok(())).unwrap();
         assert!(matches!(startup, Startup::Stopped), "{startup:?}");
         assert_eq!(store.loads(), 1);
         assert_eq!(pacer.pauses, vec![UNLOCK_POLL]);
@@ -551,7 +581,8 @@ mod tests {
         let store = FakeStore::new(&[], Reply::Locked);
         let file = key_file("no-fallback");
         let mut pacer = FakePacer::new(Some(40));
-        let startup = load_or_create_waiting(Some(&store), &file, true, &mut pacer).unwrap();
+        let startup =
+            load_or_create_waiting(Some(&store), &file, true, &mut pacer, || Ok(())).unwrap();
         assert!(matches!(startup, Startup::Stopped), "{startup:?}");
         assert_eq!(store.loads(), 40);
         assert!(!file.exists(), "a lock must not create or use the key file");
@@ -566,7 +597,7 @@ mod tests {
         let file = key_file("long-wait");
         let mut pacer = FakePacer::new(None);
         let Startup::Identity(identity, source) =
-            load_or_create_waiting(Some(&store), &file, true, &mut pacer).unwrap()
+            load_or_create_waiting(Some(&store), &file, true, &mut pacer, || Ok(())).unwrap()
         else {
             panic!("expected the identity");
         };
@@ -583,7 +614,8 @@ mod tests {
         let store = FakeStore::new(&[], Reply::Broken);
         let file = key_file("other-error");
         let mut pacer = FakePacer::new(None);
-        let error = load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap_err();
+        let error =
+            load_or_create_waiting(Some(&store), &file, false, &mut pacer, || Ok(())).unwrap_err();
         assert_eq!(error.to_string(), "load device key: no such service");
         // The same text as `load_or_create` gives.
         let direct = load_or_create(Some(&store), &file, false).unwrap_err();
@@ -600,7 +632,7 @@ mod tests {
         let file = key_file("other-error-fallback");
         let mut pacer = FakePacer::new(None);
         let Startup::Identity(identity, source) =
-            load_or_create_waiting(Some(&store), &file, true, &mut pacer).unwrap()
+            load_or_create_waiting(Some(&store), &file, true, &mut pacer, || Ok(())).unwrap()
         else {
             panic!("expected the identity");
         };
@@ -617,7 +649,7 @@ mod tests {
         let file = key_file("first-run");
         let mut pacer = FakePacer::new(None);
         let Startup::Identity(identity, source) =
-            load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap()
+            load_or_create_waiting(Some(&store), &file, false, &mut pacer, || Ok(())).unwrap()
         else {
             panic!("expected the identity");
         };
@@ -638,7 +670,7 @@ mod tests {
         let file = key_file("first-run-after-lock");
         let mut pacer = FakePacer::new(None);
         let Startup::Identity(identity, source) =
-            load_or_create_waiting(Some(&store), &file, false, &mut pacer).unwrap()
+            load_or_create_waiting(Some(&store), &file, false, &mut pacer, || Ok(())).unwrap()
         else {
             panic!("expected the identity");
         };
@@ -656,14 +688,14 @@ mod tests {
         let file = key_file("no-store-file");
         let mut pacer = FakePacer::new(None);
         let Startup::Identity(first, source) =
-            load_or_create_waiting(None, &file, true, &mut pacer).unwrap()
+            load_or_create_waiting(None, &file, true, &mut pacer, || Ok(())).unwrap()
         else {
             panic!("expected the identity");
         };
         assert_eq!(source, KeySource::File);
         // The same file on the next start.
         let Startup::Identity(second, source) =
-            load_or_create_waiting(None, &file, true, &mut pacer).unwrap()
+            load_or_create_waiting(None, &file, true, &mut pacer, || Ok(())).unwrap()
         else {
             panic!("expected the identity");
         };
@@ -682,7 +714,7 @@ mod tests {
     fn no_store_without_the_fallback_is_an_error_not_a_wait() {
         let file = key_file("no-store");
         let mut pacer = FakePacer::new(None);
-        assert!(load_or_create_waiting(None, &file, false, &mut pacer).is_err());
+        assert!(load_or_create_waiting(None, &file, false, &mut pacer, || Ok(())).is_err());
         assert!(pacer.pauses.is_empty());
         cleanup(&file);
     }

@@ -77,6 +77,18 @@ impl Paths {
         self.runtime_dir.join("agent.sock")
     }
 
+    pub fn bootstrap_file(&self) -> PathBuf {
+        self.runtime_dir.join("bootstrap.json")
+    }
+
+    pub fn exit_receipt(&self) -> PathBuf {
+        self.state_dir.join("last_exit.json")
+    }
+
+    pub fn instance_lock(&self) -> PathBuf {
+        self.state_dir.join("agent.lock")
+    }
+
     /// Fallback device-key file, used only when the OS key store is unavailable and the config
     /// allows it.
     pub fn key_file(&self) -> PathBuf {
@@ -93,20 +105,117 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Serialize identity and trust mutations independently of the running agent's instance lock.
+/// The returned file holds the lock until dropped; a busy writer gets at most five seconds.
+pub fn identity_mutation_lock(state_dir: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = state_dir.join("identity.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("open identity mutation lock {}", path.display()))?;
+    wait_for_mutation_lock(&file, std::time::Duration::from_secs(5))?;
+    Ok(file)
+}
+
+fn wait_for_mutation_lock(file: &std::fs::File, timeout: std::time::Duration) -> Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                MUTATION_LOCK_WAITING.with(|waiting| {
+                    if let Some(waiting) = waiting.borrow_mut().take() {
+                        let _ = waiting.send(());
+                    }
+                });
+                let remaining = timeout.saturating_sub(started.elapsed());
+                anyhow::ensure!(
+                    !remaining.is_zero(),
+                    "identity mutation lock is busy; timed out waiting for another writer"
+                );
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+            }
+            Err(error) => return Err(error).context("lock identity mutations"),
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    // A one-shot observation of actual lock contention, so concurrency fixtures need no sleeps.
+    static MUTATION_LOCK_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_mutation_lock_wait(waiting: std::sync::mpsc::Sender<()>) {
+    MUTATION_LOCK_WAITING.with(|slot| *slot.borrow_mut() = Some(waiting));
+}
+
 /// Write `bytes` to `path` atomically, readable only by this user.
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
-    Ok(())
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let (tmp, mut file) = loop {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp = PathBuf::from(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create private temporary file"),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    #[test]
+    fn identity_mutation_lock_has_a_bounded_wait_and_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("crosspane-mutation-lock-{}", std::process::id()));
+        super::create_private_dir(&dir).unwrap();
+        let held = super::identity_mutation_lock(&dir).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("identity.lock"))
+            .unwrap();
+        let error = super::wait_for_mutation_lock(&other, std::time::Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(
+            other.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(held);
+        super::wait_for_mutation_lock(&other, std::time::Duration::ZERO).unwrap();
+        drop(other);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

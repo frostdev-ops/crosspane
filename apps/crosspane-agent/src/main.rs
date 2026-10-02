@@ -5,6 +5,7 @@ mod audio;
 mod config;
 mod ctl;
 mod keys;
+mod lifecycle;
 mod media;
 mod net;
 mod pairing;
@@ -55,6 +56,12 @@ enum Command {
     Run,
     /// Print this device's node id and public key (SPKI, hex).
     Identity,
+    /// Delete this machine's identity and pairings after a verified clean stop.
+    EraseIdentity {
+        /// Keep the pairings and issued revocations (repair and tests).
+        #[arg(long)]
+        keep_trust: bool,
+    },
     /// Manage trusted peers.
     Trust {
         #[command(subcommand)]
@@ -120,9 +127,32 @@ fn main() -> Result<()> {
     if is_elevated() {
         bail!("crosspane-agent refuses to run elevated (04 §7)");
     }
-    match Cli::parse().command.unwrap_or(Command::Run) {
+    dispatch(Cli::parse().command.unwrap_or(Command::Run), run, one_shot)
+}
+
+fn dispatch(
+    command: Command,
+    run: impl FnOnce() -> Result<()>,
+    one_shot: impl FnOnce(Command) -> Result<()>,
+) -> Result<()> {
+    match command {
         Command::Run => run(),
+        command => one_shot(command),
+    }
+}
+
+fn one_shot(command: Command) -> Result<()> {
+    match command {
+        Command::Run => bail!("run requires the lifecycle startup path"),
         Command::Identity => identity(),
+        Command::EraseIdentity { keep_trust } => {
+            let paths = Paths::new()?;
+            let receipt = lifecycle::erase_identity(&paths, keep_trust, || {
+                platform::keystore().context("standalone key store unavailable")
+            });
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(())
+        }
         Command::Trust { action } => trust(action),
         Command::Permissions {
             request,
@@ -161,6 +191,7 @@ fn load_identity_waiting(
     paths: &Paths,
     config: &Config,
     store: Option<&dyn crosspane_platform::KeyStore>,
+    lifecycle: &mut lifecycle::Lifecycle,
 ) -> Result<Option<(DeviceIdentity, keys::KeySource)>> {
     let (store, allow_file) = keystore_policy(config, store);
     let startup = keys::load_or_create_waiting(
@@ -168,6 +199,7 @@ fn load_identity_waiting(
         &paths.key_file(),
         allow_file,
         &mut keys::SignalPacer::new(),
+        || lifecycle.phase(lifecycle::Phase::WaitingForKeystore, None),
     )?;
     Ok(match startup {
         keys::Startup::Identity(identity, source) => Some((identity, source)),
@@ -230,17 +262,11 @@ fn request_permissions_daily(state_dir: &std::path::Path, platform: &mut platfor
 
 fn run() -> Result<()> {
     let paths = Paths::new()?;
-    // The revision is of the very bytes this run is configured from (WP-4.5).
-    let (config, config_revision) = Config::load_revision(&paths)?;
     // One agent per user, settled before anything touches the session: creating the platform
     // recovers parked windows, which would un-hide a running agent's projections. The lock is
     // held for the life of the process (close-on-exec, so a restart in place takes it again).
-    let lock_path = paths.state_dir.join("agent.lock");
-    let _lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
+    let lock_path = paths.instance_lock();
+    let _lock = lifecycle::instance_lock(&paths)
         .with_context(|| format!("open {}", lock_path.display()))?;
     _lock.try_lock().map_err(|_| {
         anyhow::anyhow!(
@@ -248,22 +274,60 @@ fn run() -> Result<()> {
             lock_path.display()
         )
     })?;
+    let mut lifecycle = lifecycle::Lifecycle::start(&paths)?;
+    let mut failure = lifecycle::Failure::Other;
+    let started = start_agent(&paths, &mut lifecycle, &mut failure);
+    let Some(started) = (match started {
+        Ok(started) => started,
+        Err(error) => {
+            if !lifecycle.ready() {
+                lifecycle.phase(lifecycle::Phase::Failed, Some(failure))?;
+            }
+            return Err(error);
+        }
+    }) else {
+        return Ok(());
+    };
+    run_loop(started, lifecycle)
+}
+
+struct Started {
+    agent: agent::Agent,
+    startup: Vec<crosspane_engine::Output>,
+    rx: std::sync::mpsc::Receiver<agent::Event>,
+    tx: std::sync::mpsc::Sender<agent::Event>,
+    host: Option<crosspane_render::proxy::ProxyHost>,
+}
+
+fn start_agent(
+    paths: &Paths,
+    lifecycle: &mut lifecycle::Lifecycle,
+    failure: &mut lifecycle::Failure,
+) -> Result<Option<Started>> {
+    *failure = lifecycle::Failure::Config;
+    // The revision is of the very bytes this run is configured from (WP-4.5).
+    let (config, config_revision) = Config::load_revision(paths)?;
+    *failure = lifecycle::Failure::Platform;
     let mut platform = platform::create(&paths.state_dir, &config)?;
     tracing::info!(backends = ?platform, "platform ready");
     request_permissions_daily(&paths.state_dir, &mut platform);
     // `_lock` stays held while the key store is waited for, so a second agent still refuses to
     // start.
+    *failure = lifecycle::Failure::Keystore;
     let Some((identity, key_source)) =
-        load_identity_waiting(&paths, &config, platform.keystore.as_deref())?
+        load_identity_waiting(paths, &config, platform.keystore.as_deref(), lifecycle)?
     else {
-        return Ok(());
+        return Ok(None);
     };
+    lifecycle.key_source(key_source);
     let identity = Arc::new(identity);
     let node = identity.node();
     // This run's id and the facts `status` reports about it (WP-4.5), fixed from here on.
     let startup_facts =
-        agent::StartupFacts::collect(node, &paths, key_source, &config, config_revision);
+        agent::StartupFacts::collect(node, paths, key_source, &config, config_revision)
+            .with_instance(lifecycle.instance);
     tracing::info!(node = %node, name = %config.name, "identity");
+    *failure = lifecycle::Failure::Config;
     let trust = trust::SharedTrust::load(paths.trust_file())?;
 
     let local_displays = platform.displays.displays().unwrap_or_else(|e| {
@@ -272,6 +336,7 @@ fn run() -> Result<()> {
     });
 
     // Crash recovery runs first (04 §8 invariant 2): Engine::new returns it as outputs.
+    *failure = lifecycle::Failure::Other;
     let journal = FileJournal::open(&paths.journal_file()).context("open input journal")?;
     let e2_journal =
         FileJournal::open(&paths.e2_journal_file()).context("open projection input journal")?;
@@ -296,7 +361,6 @@ fn run() -> Result<()> {
 
     let (tx, rx) = std::sync::mpsc::channel();
     agent::subscribe_platform(&mut platform, &tx);
-    ctl::serve(&paths.control_socket(), tx.clone())?;
 
     // E2 video (WP-2.14): this node's encoder/decoder, if it has one and video isn't turned off.
     let video = media::VideoSetup {
@@ -399,8 +463,18 @@ fn run() -> Result<()> {
         audio.map(|worker| Box::new(worker) as Box<dyn agent::AudioPlane>),
     );
     agent.set_startup(startup_facts);
+    agent.set_lifecycle_paths(paths.clone());
     agent.start_discovery();
-    run_loop(agent, startup, rx, tx, host.map(|(host, _)| host))
+    *failure = lifecycle::Failure::Socket;
+    ctl::serve(&paths.control_socket(), tx.clone())?;
+    lifecycle.phase(lifecycle::Phase::Ready, None)?;
+    Ok(Some(Started {
+        agent,
+        startup,
+        rx,
+        tx,
+        host: host.map(|(host, _)| host),
+    }))
 }
 
 /// Start the audio worker (speaker v0, WP-3.6d) on this OS's audio backend: `None`, with a log
@@ -471,13 +545,14 @@ fn stop_on_signal(runtime: &tokio::runtime::Handle, events: std::sync::mpsc::Sen
 /// Run the engine loop on its own thread and the proxy host (if any) on this, the main thread.
 /// Without a host on Linux, the engine loop runs here; on macOS the AppKit loop always owns the
 /// main thread.
-fn run_loop(
-    agent: agent::Agent,
-    startup: Vec<crosspane_engine::Output>,
-    rx: std::sync::mpsc::Receiver<agent::Event>,
-    tx: std::sync::mpsc::Sender<agent::Event>,
-    host: Option<crosspane_render::proxy::ProxyHost>,
-) -> Result<()> {
+fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
+    let Started {
+        agent,
+        startup,
+        rx,
+        tx,
+        host,
+    } = started;
     match host {
         Some(host) => {
             let host_tx = tx.clone();
@@ -485,8 +560,9 @@ fn run_loop(
             std::thread::Builder::new()
                 .name("engine".into())
                 .spawn(move || {
-                    exit_on_panic("engine", || agent.run(startup, &rx));
+                    let stopped = exit_on_panic("engine", || agent.run(startup, &rx));
                     drop(tx);
+                    finish_run_or_exit(lifecycle, stopped);
                     std::process::exit(stop_status());
                 })
                 .context("spawn engine thread")?;
@@ -509,8 +585,9 @@ fn run_loop(
                 std::thread::Builder::new()
                     .name("engine".into())
                     .spawn(move || {
-                        exit_on_panic("engine", || agent.run(startup, &rx));
+                        let stopped = exit_on_panic("engine", || agent.run(startup, &rx));
                         drop(tx);
+                        finish_run_or_exit(lifecycle, stopped);
                         std::process::exit(stop_status());
                     })
                     .context("spawn engine thread")?;
@@ -519,14 +596,30 @@ fn run_loop(
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _keep = tx;
-                agent.run(startup, &rx);
+                let stopped = agent.run(startup, &rx);
+                drop(tx);
+                finish_run(lifecycle, stopped)?;
                 if RESTART.load(Ordering::Acquire) {
                     bail!("stopped to be started again");
                 }
                 Ok(())
             }
         }
+    }
+}
+
+fn finish_run(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) -> Result<()> {
+    lifecycle.stopped(stopped.outcomes)?;
+    if stopped.restart {
+        agent::restart();
+    }
+    Ok(())
+}
+
+fn finish_run_or_exit(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) {
+    if let Err(error) = finish_run(lifecycle, stopped) {
+        tracing::error!(%error, "could not write the exit receipt");
+        std::process::exit(1);
     }
 }
 
@@ -543,6 +636,18 @@ fn identity() -> Result<()> {
 
 fn trust(action: TrustAction) -> Result<()> {
     let paths = Paths::new()?;
+    trust_at(&paths, action)
+}
+
+fn trust_at(paths: &Paths, action: TrustAction) -> Result<()> {
+    // Re-read under the same lock as the save, so a command delayed by erase cannot write a
+    // pre-erase snapshot back. The instance lock stays available to the running agent.
+    let _mutation = match &action {
+        TrustAction::List => None,
+        TrustAction::Add { .. } | TrustAction::Remove { .. } => {
+            Some(paths::identity_mutation_lock(&paths.state_dir)?)
+        }
+    };
     let trust = trust::SharedTrust::load(paths.trust_file())?;
     match action {
         TrustAction::Add {
@@ -670,4 +775,263 @@ fn is_elevated() -> bool {
                 .map(|o| o.stdout.starts_with(b"0\n"))
                 .unwrap_or(false)
         })
+}
+
+#[cfg(test)]
+mod lifecycle_dispatch_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crosspane_platform::PlatformError;
+    use std::sync::mpsc;
+
+    #[derive(Clone)]
+    struct PausedEraseStore {
+        key: Arc<std::sync::Mutex<Option<zeroize::Zeroizing<Vec<u8>>>>>,
+        operations: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        deleting: mpsc::Sender<()>,
+        proceed: Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl crosspane_platform::KeyStore for PausedEraseStore {
+        fn load(
+            &self,
+            _name: &str,
+        ) -> std::result::Result<Option<zeroize::Zeroizing<Vec<u8>>>, PlatformError> {
+            self.operations.lock().unwrap().push("load");
+            Ok(self.key.lock().unwrap().clone())
+        }
+
+        fn store(&self, _name: &str, bytes: &[u8]) -> std::result::Result<(), PlatformError> {
+            self.operations.lock().unwrap().push("create");
+            *self.key.lock().unwrap() = Some(zeroize::Zeroizing::new(bytes.to_vec()));
+            Ok(())
+        }
+
+        fn delete(&self, _name: &str) -> std::result::Result<(), PlatformError> {
+            self.operations.lock().unwrap().push("erase started");
+            self.deleting.send(()).unwrap();
+            self.proceed
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            *self.key.lock().unwrap() = None;
+            self.operations.lock().unwrap().push("erase finished");
+            Ok(())
+        }
+    }
+
+    struct NoKeyWait;
+
+    impl keys::Pacer for NoKeyWait {
+        fn pause(&mut self, _duration: std::time::Duration) -> bool {
+            panic!("fixture key store never locks")
+        }
+
+        fn now(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+    }
+
+    #[test]
+    fn erase_excludes_identity_creation_and_trust_save_until_it_finishes() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        for startup in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "crosspane-erase-mutations-{}-{startup}",
+                std::process::id()
+            ));
+            paths::create_private_dir(&dir).unwrap();
+            let paths = Paths {
+                config_dir: dir.clone(),
+                state_dir: dir.clone(),
+                runtime_dir: dir.clone(),
+            };
+            let mut lifecycle = lifecycle::Lifecycle::start(&paths).unwrap();
+            lifecycle.phase(lifecycle::Phase::Ready, None).unwrap();
+            lifecycle
+                .stopped(lifecycle::Shutdown {
+                    parking: lifecycle::Parking::None,
+                    input_journals_empty: true,
+                    audio_stopped: true,
+                })
+                .unwrap();
+            let old_peer = DeviceIdentity::generate().unwrap();
+            trust_at(
+                &paths,
+                TrustAction::Add {
+                    name: "old fixture peer".into(),
+                    spki: keys::hex(old_peer.spki()),
+                    allow_input: false,
+                },
+            )
+            .unwrap();
+            let new_peer = DeviceIdentity::generate().unwrap();
+            let (deleting, delete_started) = mpsc::channel();
+            let (proceed, delete_proceed) = mpsc::channel();
+            let store = PausedEraseStore {
+                key: Arc::new(Mutex::new(Some(zeroize::Zeroizing::new(
+                    DeviceIdentity::generate().unwrap().pkcs8().to_vec(),
+                )))),
+                operations: Arc::new(Mutex::new(Vec::new())),
+                deleting,
+                proceed: Arc::new(Mutex::new(delete_proceed)),
+            };
+            std::thread::scope(|scope| {
+                let erased = scope.spawn(|| {
+                    lifecycle::erase_identity(&paths, false, || Ok(Box::new(store.clone())))
+                });
+                delete_started.recv_timeout(Duration::from_secs(2)).unwrap();
+                let (waiting, wait_started) = mpsc::channel();
+                let identity_waiting = waiting.clone();
+                let identity_paths = &paths;
+                let identity_store = &store;
+                let identity = scope.spawn(move || {
+                    paths::observe_mutation_lock_wait(identity_waiting);
+                    if startup {
+                        assert!(matches!(
+                            keys::load_or_create_waiting(
+                                Some(identity_store),
+                                &identity_paths.key_file(),
+                                false,
+                                &mut NoKeyWait,
+                                || Ok(())
+                            )
+                            .unwrap(),
+                            keys::Startup::Identity(_, keys::KeySource::OsStore)
+                        ));
+                    } else {
+                        load_identity(identity_paths, &Config::default(), Some(identity_store))
+                            .unwrap();
+                    }
+                });
+                let trust_paths = &paths;
+                let peer = &new_peer;
+                let saved = scope.spawn(move || {
+                    paths::observe_mutation_lock_wait(waiting);
+                    trust_at(
+                        trust_paths,
+                        TrustAction::Add {
+                            name: "new fixture peer".into(),
+                            spki: keys::hex(peer.spki()),
+                            allow_input: false,
+                        },
+                    )
+                    .unwrap();
+                });
+                // Each observer fires only after its real flock reports WouldBlock. Both
+                // operations reached their lock while the fake erase is still paused.
+                wait_started.recv_timeout(Duration::from_secs(2)).unwrap();
+                wait_started.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(*store.operations.lock().unwrap(), ["load", "erase started"]);
+                let before = trust::SharedTrust::load(paths.trust_file()).unwrap();
+                assert!(before.with(|t| t.get(old_peer.node()).is_some()));
+                assert!(before.with(|t| t.get(new_peer.node()).is_none()));
+                proceed.send(()).unwrap();
+                let erased = serde_json::to_value(erased.join().unwrap()).unwrap();
+                assert_eq!(erased["result"], "removed");
+                identity.join().unwrap();
+                saved.join().unwrap();
+            });
+            assert_eq!(
+                *store.operations.lock().unwrap(),
+                ["load", "erase started", "erase finished", "load", "create"]
+            );
+            let after = trust::SharedTrust::load(paths.trust_file()).unwrap();
+            assert!(after.with(|t| t.get(old_peer.node()).is_none()));
+            assert!(after.with(|t| t.get(new_peer.node()).is_some()));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn identity_and_trust_mutations_allow_a_running_agent_instance() {
+        let dir = std::env::temp_dir().join(format!(
+            "crosspane-one-shot-mutations-{}",
+            std::process::id()
+        ));
+        paths::create_private_dir(&dir).unwrap();
+        let paths = Paths {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+            runtime_dir: dir.clone(),
+        };
+        let instance = lifecycle::instance_lock(&paths).unwrap();
+        instance.try_lock().unwrap();
+        let config = Config {
+            force_file_keystore: true,
+            ..Config::default()
+        };
+        load_identity(&paths, &config, None).unwrap();
+        assert!(paths.key_file().exists());
+        let peer = DeviceIdentity::generate().unwrap();
+        trust_at(
+            &paths,
+            TrustAction::Add {
+                name: "fixture peer".into(),
+                spki: keys::hex(peer.spki()),
+                allow_input: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            trust::SharedTrust::load(paths.trust_file())
+                .unwrap()
+                .with(|t| t.get(peer.node()).is_some())
+        );
+        trust_at(
+            &paths,
+            TrustAction::Remove {
+                peer: "fixture peer".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            trust::SharedTrust::load(paths.trust_file())
+                .unwrap()
+                .with(|t| t.get(peer.node()).is_none())
+        );
+        drop(instance);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn one_shot_commands_never_enter_the_bootstrap_or_receipt_writer() {
+        let dir =
+            std::env::temp_dir().join(format!("crosspane-one-shot-routing-{}", std::process::id()));
+        crate::paths::create_private_dir(&dir).unwrap();
+        let paths = Paths {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+            runtime_dir: dir.clone(),
+        };
+        for args in [
+            vec!["crosspane-agent", "identity"],
+            vec!["crosspane-agent", "trust", "list"],
+            vec!["crosspane-agent", "permissions"],
+            vec!["crosspane-agent", "erase-identity"],
+            vec!["crosspane-agent", "erase-identity", "--keep-trust"],
+        ] {
+            let command = Cli::try_parse_from(args).unwrap().command.unwrap();
+            let mut called = false;
+            dispatch(
+                command,
+                || {
+                    let _lifecycle = lifecycle::Lifecycle::start(&paths)?;
+                    panic!("one-shot command entered run")
+                },
+                |_| {
+                    called = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(called);
+            assert!(!paths.bootstrap_file().exists());
+            assert!(!paths.exit_receipt().exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

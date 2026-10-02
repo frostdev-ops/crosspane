@@ -69,6 +69,10 @@ pub enum Request {
     Rearm,
     /// Stop cleanly and start again in place (e.g. after granting OS permissions).
     Restart,
+    SettingsUpdate {
+        expected_revision: String,
+        mac_virtual_display: bool,
+    },
     /// Unpair a peer (name or node-id prefix) and end its connection now.
     Forget {
         peer: String,
@@ -246,6 +250,26 @@ fn handle(stream: UnixStream, events: &Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_update_uses_the_frozen_request_shape() {
+        let request = Request::SettingsUpdate {
+            expected_revision: "0123456789abcdef".into(),
+            mac_virtual_display: true,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "cmd": "settings_update", "expected_revision": "0123456789abcdef", "mac_virtual_display": true })
+        );
+        assert!(matches!(
+            serde_json::from_value::<Request>(value).unwrap(),
+            Request::SettingsUpdate {
+                mac_virtual_display: true,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn every_capability_has_one_name_that_maps_back() {

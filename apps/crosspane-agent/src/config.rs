@@ -89,6 +89,54 @@ pub fn revision_of(bytes: Option<&[u8]>) -> String {
     format!("{:016x}", bytes.map_or(0, xxhash_rust::xxh3::xxh3_64))
 }
 
+/// Dispatch policy is OS-specific; the Mac file operation stays testable on either OS.
+pub fn settings_update(
+    paths: &Paths,
+    expected_revision: &str,
+    mac_virtual_display: bool,
+) -> crate::ctl::Response {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (paths, expected_revision, mac_virtual_display);
+        crate::ctl::Response::err("not_supported")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        update_mac_setting(&paths.config_file(), expected_revision, mac_virtual_display)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn update_mac_setting(
+    path: &std::path::Path,
+    expected_revision: &str,
+    mac_virtual_display: bool,
+) -> crate::ctl::Response {
+    let update = || -> Result<crate::ctl::Response> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("read config"),
+        };
+        if revision_of(bytes.as_deref()) != expected_revision {
+            return Ok(crate::ctl::Response::err("revision_conflict"));
+        }
+        let text = std::str::from_utf8(bytes.as_deref().unwrap_or_default())?;
+        let mut table = text.parse::<toml::Table>()?;
+        table.insert(
+            "mac_virtual_display".into(),
+            toml::Value::Boolean(mac_virtual_display),
+        );
+        let text = toml::to_string(&table)?;
+        write_private(path, text.as_bytes())?;
+        Ok(crate::ctl::Response::ok(serde_json::json!({
+            "revision": revision_of(Some(text.as_bytes())),
+            "restart_required": true,
+        })))
+    };
+    update().unwrap_or_else(|_| crate::ctl::Response::err("config_update_failed"))
+}
+
 impl Config {
     pub fn load(paths: &Paths) -> Result<Config> {
         Config::load_revision(paths).map(|(config, _)| config)
@@ -222,5 +270,90 @@ mod tests {
         assert!(Config::load_revision(&paths).is_err());
         std::fs::write(paths.config_file(), b"not = [valid").unwrap();
         assert!(Config::load_revision(&paths).is_err());
+    }
+
+    #[test]
+    fn settings_revision_conflict_changes_nothing_including_missing_files() {
+        let scratch = Scratch::new("settings-conflict");
+        let path = scratch.paths().config_file();
+        let response = update_mac_setting(&path, "0123456789abcdef", true);
+        assert_eq!(response.error.as_deref(), Some("revision_conflict"));
+        assert!(!path.exists());
+        let original =
+            b"# keep until an update succeeds\nname = \"desk\"\nmac_virtual_display = false\n";
+        std::fs::write(&path, original).unwrap();
+        let response = update_mac_setting(&path, &revision_of(None), true);
+        assert_eq!(response.error.as_deref(), Some("revision_conflict"));
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_update_preserves_all_other_keys_and_returns_the_saved_revision() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("settings-preserve");
+        let path = scratch.paths().config_file();
+        let original = b"# comments are not preserved\nname = \"desk\"\nport = 47812\nmac_virtual_display = false\nfuture = [1, 2, 3]\n[remap]\nlaptop = \"swap-ctrl-gui\"\n[[peers]]\naddr = \"127.0.0.1:47811\"\n";
+        std::fs::write(&path, original).unwrap();
+        let expected_revision = revision_of(Some(original));
+        let response = update_mac_setting(&path, &expected_revision, true);
+        assert!(response.ok);
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(
+            response.result["revision"],
+            serde_json::json!(revision_of(Some(&saved)))
+        );
+        assert_eq!(response.result["restart_required"], serde_json::json!(true));
+        let mut before = std::str::from_utf8(original)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        before.insert("mac_virtual_display".into(), toml::Value::Boolean(true));
+        assert_eq!(
+            std::str::from_utf8(&saved)
+                .unwrap()
+                .parse::<toml::Table>()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let conflict = update_mac_setting(&path, &expected_revision, false);
+        assert_eq!(conflict.error.as_deref(), Some("revision_conflict"));
+        assert_eq!(std::fs::read(path).unwrap(), saved);
+    }
+
+    #[test]
+    fn settings_update_accepts_the_zero_revision_only_for_a_missing_config() {
+        let scratch = Scratch::new("settings-missing");
+        let path = scratch.paths().config_file();
+        let response = update_mac_setting(&path, "0000000000000000", false);
+        assert!(response.ok);
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(
+            response.result["revision"],
+            serde_json::json!(revision_of(Some(&saved)))
+        );
+        let table = std::str::from_utf8(&saved)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table["mac_virtual_display"], toml::Value::Boolean(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_update_is_not_supported_on_linux_and_writes_nothing() {
+        let scratch = Scratch::new("settings-linux");
+        let paths = scratch.paths();
+        assert_eq!(
+            settings_update(&paths, "0000000000000000", true)
+                .error
+                .as_deref(),
+            Some("not_supported")
+        );
+        assert!(!paths.config_file().exists());
     }
 }

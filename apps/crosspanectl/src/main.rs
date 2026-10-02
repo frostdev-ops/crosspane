@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 #[command(
     name = "crosspanectl",
     version,
-    about = "Control the running Crosspane agent"
+    about = "Control the running Crosspane agent",
+    after_help = "To delete this machine's identity and pairings after a clean stop, run crosspane-agent erase-identity [--keep-trust]."
 )]
 struct Cli {
     /// Print the raw JSON response.
@@ -36,6 +37,14 @@ enum Command {
     Rearm,
     /// Restart the agent in place (e.g. after granting macOS permissions).
     Restart,
+    /// Update the macOS virtual display setting for the next start. Rewrites config.toml without
+    /// preserving comments. Send `restart` afterwards to apply it.
+    SettingsUpdate {
+        #[arg(long)]
+        expected_revision: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        mac_virtual_display: bool,
+    },
     /// Collect a diagnostics bundle (status, config, paired machines, recent logs, versions) into
     /// a .tar.gz for a bug report. It never contains private keys or typed text.
     Diag {
@@ -116,6 +125,65 @@ enum Command {
     },
 }
 
+#[cfg(test)]
+mod settings_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn settings_update_accepts_explicit_boolean_values_and_json() {
+        for (text, expected) in [("true", true), ("false", false)] {
+            let cli = Cli::try_parse_from([
+                "crosspanectl",
+                "settings-update",
+                "--expected-revision",
+                "0123456789abcdef",
+                "--mac-virtual-display",
+                text,
+                "--json",
+            ])
+            .unwrap();
+            assert!(cli.json);
+            let Command::SettingsUpdate {
+                expected_revision,
+                mac_virtual_display,
+            } = cli.command
+            else {
+                panic!("wrong command")
+            };
+            assert_eq!(expected_revision, "0123456789abcdef");
+            assert_eq!(mac_virtual_display, expected);
+        }
+        assert!(
+            Cli::try_parse_from([
+                "crosspanectl",
+                "settings-update",
+                "--expected-revision",
+                "0123456789abcdef",
+                "--mac-virtual-display",
+                "yes"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn help_documents_comment_loss_and_direct_erase_identity_command() {
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("crosspane-agent erase-identity [--keep-trust]"));
+        let settings = command
+            .find_subcommand_mut("settings-update")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(settings.contains("without preserving comments"));
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum PairAction {
     /// Open a pairing window here (shows a code to compare).
@@ -183,6 +251,14 @@ fn main() -> Result<()> {
         Command::Panic => json!({"cmd": "panic"}),
         Command::Rearm => json!({"cmd": "rearm"}),
         Command::Restart => json!({"cmd": "restart"}),
+        Command::SettingsUpdate {
+            expected_revision,
+            mac_virtual_display,
+        } => json!({
+            "cmd": "settings_update",
+            "expected_revision": expected_revision,
+            "mac_virtual_display": mac_virtual_display,
+        }),
         Command::Diag { out } => return diag(out.clone()),
         Command::Forget { peer } => json!({"cmd": "forget", "peer": peer}),
         Command::RequestPermissions => json!({"cmd": "ask_permissions"}),

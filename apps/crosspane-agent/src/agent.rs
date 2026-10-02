@@ -482,6 +482,8 @@ pub struct Agent {
     capture_display: BTreeMap<ProjectionId, DisplayId>,
     /// What the agent learned about its own process at startup (WP-4.5).
     startup: installer::StartupFacts,
+    /// The actual on-disk config and journals for this run; absent in isolated fixtures.
+    lifecycle_paths: Option<crate::paths::Paths>,
     /// What the agent counts and remembers for `status.result.installer` (WP-4.5).
     tracker: installer::Tracker,
     /// Every input fed to the engine, in order (tests only).
@@ -507,6 +509,12 @@ pub struct E2Wiring {
     pub identity: Arc<crosspane_security::identity::DeviceIdentity>,
     pub port: u16,
     pub revocations: crate::revocations::Issued,
+}
+
+/// Returned after the consumed agent has shut down; the caller writes its final receipt.
+pub struct Stopped {
+    pub outcomes: crate::lifecycle::Shutdown,
+    pub restart: bool,
 }
 
 const NOTICE_HISTORY: usize = 20;
@@ -713,6 +721,7 @@ impl Agent {
             capture_motion_seen: false,
             capture_display: BTreeMap::new(),
             startup: installer::StartupFacts::unknown(node),
+            lifecycle_paths: None,
             tracker: installer::Tracker::new(),
             #[cfg(test)]
             fed: Vec::new(),
@@ -728,9 +737,13 @@ impl Agent {
         self.startup = facts;
     }
 
+    pub fn set_lifecycle_paths(&mut self, paths: crate::paths::Paths) {
+        self.lifecycle_paths = Some(paths);
+    }
+
     /// Carry out `outputs` (crash recovery from `Engine::new` first), then run until the channel
     /// closes.
-    pub fn run(mut self, startup: Vec<Output>, events: &Receiver<Event>) {
+    pub fn run(mut self, startup: Vec<Output>, events: &Receiver<Event>) -> Stopped {
         self.granted = self.granted_permissions();
         // A release bind an earlier run left behind goes first, before any input is admitted
         // (04 §6, amendment A1). Crash recovery below only ever releases, so it isn't held back.
@@ -756,12 +769,19 @@ impl Agent {
                 .min(HOUSEKEEPING);
             match events.recv_timeout(timeout) {
                 Ok(Event::Shutdown) => {
-                    self.shutdown();
-                    return;
+                    return Stopped {
+                        outcomes: self.shutdown(),
+                        restart: false,
+                    };
                 }
                 Ok(event) => self.on_event(event),
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Stopped {
+                        outcomes: self.shutdown(),
+                        restart: false,
+                    };
+                }
             }
             if self
                 .engine
@@ -773,12 +793,16 @@ impl Agent {
             self.housekeeping();
             self.update_tray();
             if self.quit_requested {
-                self.shutdown();
-                return;
+                return Stopped {
+                    outcomes: self.shutdown(),
+                    restart: false,
+                };
             }
             if self.restart_requested || self.permissions_changed() {
-                self.shutdown();
-                restart();
+                return Stopped {
+                    outcomes: self.shutdown(),
+                    restart: true,
+                };
             }
         }
     }
@@ -3042,6 +3066,15 @@ impl Agent {
                 self.restart_requested = true;
                 Response::ok(json!("restarting"))
             }
+            Request::SettingsUpdate {
+                expected_revision,
+                mac_virtual_display,
+            } => match self.lifecycle_paths.as_ref() {
+                Some(paths) => {
+                    crate::config::settings_update(paths, &expected_revision, mac_virtual_display)
+                }
+                None => Response::err("config_update_failed"),
+            },
             Request::Rearm => {
                 self.feed(Input::Command(Command::Rearm));
                 Response::ok(json!("re-armed"))
@@ -3191,27 +3224,54 @@ impl Agent {
     /// control ends (as `crosspanectl panic`), parked windows go back where they were (the journal
     /// would otherwise bring them back only at the next start), then the links close so peers end
     /// their sessions at once instead of after the idle timeout.
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> crate::lifecycle::Shutdown {
         tracing::info!("stopping");
         // The panic ends every audio session too (the engine stops and closes each one, which the
         // worker carries out), so the worker has nothing running when it is shut down below.
         self.feed(Input::Command(Command::Panic));
+        // Releases queue InjectDone answers. The journals forget held input only after those
+        // answers reach the engine; failed releases remain held and make the receipt unclean.
+        self.settle();
         // The engine asked for the home bind's removal as part of that (if it was installed); this
         // makes sure, whatever became of the answer (amendment A2: never a foreign bind's).
         self.home_shutdown();
-        if let Some(parking) = self.platform.parking.as_mut() {
+        let parking = if let Some(parking) = self.platform.parking.as_mut() {
             match parking.recover() {
-                Ok(windows) => tracing::info!(restored = windows.len(), "parked windows restored"),
+                Ok(windows) => {
+                    tracing::info!(restored = windows.len(), "parked windows restored");
+                    if windows.is_empty() {
+                        crate::lifecycle::Parking::NothingParked
+                    } else {
+                        crate::lifecycle::Parking::Restored
+                    }
+                }
                 Err(error) => {
-                    tracing::warn!(%error, "parked windows not restored; the next start restores them")
+                    tracing::warn!(%error, "parked windows not restored; the next start restores them");
+                    crate::lifecycle::Parking::Failed
                 }
             }
-        }
+        } else {
+            crate::lifecycle::Parking::None
+        };
         self.net.shutdown();
         // Last: peers already heard of the close, and the worker's stop is bounded (2.5 s) but
         // can be slower than the rest of this.
-        if let Some(audio) = self.audio.take() {
+        let audio_stopped = if let Some(audio) = self.audio.take() {
+            let started = Instant::now();
             audio.shutdown();
+            // The worker detaches unfinished threads only at its 2.5 s deadline. Counting the
+            // entire call and drop makes reaching that bound unknown, never a clean outcome.
+            started.elapsed() < Duration::from_millis(2500)
+        } else {
+            true
+        };
+        crate::lifecycle::Shutdown {
+            parking,
+            input_journals_empty: self
+                .lifecycle_paths
+                .as_ref()
+                .is_some_and(crate::lifecycle::journals_empty),
+            audio_stopped,
         }
     }
 
@@ -3992,7 +4052,7 @@ fn proxy(key: ProjectionKey, event: ProxyEvent) -> Input {
 
 /// Start this agent again in place (same binary, same arguments, same PID), after a clean
 /// shutdown. Exits if that fails, rather than run on with closed links.
-fn restart() -> ! {
+pub(crate) fn restart() -> ! {
     use std::os::unix::process::CommandExt;
     tracing::info!("restarting");
     let error = match std::env::current_exe() {
@@ -4080,6 +4140,13 @@ mod installer {
             )
         }
 
+        pub fn with_instance(mut self, instance: crate::lifecycle::Instance) -> Self {
+            self.instance_id = instance.id;
+            self.pid = instance.pid;
+            self.started_unix_ms = instance.started_unix_ms;
+            self
+        }
+
         /// Facts for an agent nobody has given any (tests, and the instant before `main` does).
         pub fn unknown(node: NodeId) -> StartupFacts {
             StartupFacts::with(
@@ -4092,7 +4159,7 @@ mod installer {
         }
 
         fn with(
-            node: NodeId,
+            _node: NodeId,
             runtime_dir: &Path,
             config_revision: String,
             key_source: KeySource,
@@ -4103,7 +4170,10 @@ mod installer {
                 .unwrap_or_default();
             let pid = std::process::id();
             StartupFacts {
-                instance_id: instance_id(node, pid, started.as_nanos()),
+                instance_id: crate::lifecycle::instance_id(
+                    pid,
+                    u64::try_from(started.as_nanos()).unwrap_or(u64::MAX),
+                ),
                 pid,
                 uid: rustix::process::geteuid().as_raw(),
                 exe: std::env::current_exe()
@@ -4116,17 +4186,6 @@ mod installer {
                 force_file_keystore,
             }
         }
-    }
-
-    /// The id of one run of the agent: `xxh3_64` over the node id, the PID (little-endian) and the
-    /// start time in nanoseconds since the Unix epoch (little-endian, 128 bits). Computed once; it
-    /// never changes within a process.
-    fn instance_id(node: NodeId, pid: u32, start_ns: u128) -> u64 {
-        let mut bytes = Vec::with_capacity(32 + 4 + 16);
-        bytes.extend_from_slice(&node.0);
-        bytes.extend_from_slice(&pid.to_le_bytes());
-        bytes.extend_from_slice(&start_ns.to_le_bytes());
-        xxhash_rust::xxh3::xxh3_64(&bytes)
     }
 
     /// The E1 sessions this node has established right now: as the controller (the peer has
@@ -4856,12 +4915,29 @@ mod installer {
         }
 
         #[test]
-        fn the_instance_id_depends_on_the_node_the_pid_and_the_start_time() {
-            let id = instance_id(A, 4242, 1_790_950_000_000_000_000);
-            assert_eq!(id, instance_id(A, 4242, 1_790_950_000_000_000_000));
-            assert_ne!(id, instance_id(B, 4242, 1_790_950_000_000_000_000));
-            assert_ne!(id, instance_id(A, 4243, 1_790_950_000_000_000_000));
-            assert_ne!(id, instance_id(A, 4242, 1_790_950_000_000_000_001));
+        fn the_instance_id_uses_the_frozen_pid_then_u64_start_bytes() {
+            use crate::lifecycle::instance_id;
+            let id = instance_id(4242, 0x0102_0304_0506_0708);
+            assert_eq!(
+                id,
+                xxhash_rust::xxh3::xxh3_64(&[0x92, 0x10, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1])
+            );
+            assert_eq!(id, instance_id(4242, 0x0102_0304_0506_0708));
+            assert_ne!(id, instance_id(4243, 0x0102_0304_0506_0708));
+            assert_ne!(id, instance_id(4242, 0x0102_0304_0506_0709));
+        }
+
+        #[test]
+        fn startup_uses_the_bootstrap_instance_stamp_and_keeps_the_loaded_revision() {
+            let facts = StartupFacts::unknown(A).with_instance(crate::lifecycle::Instance {
+                id: 123,
+                pid: 4242,
+                started_unix_ms: 1_790_950_000_000,
+            });
+            assert_eq!(facts.instance_id, 123);
+            assert_eq!(facts.pid, 4242);
+            assert_eq!(facts.started_unix_ms, 1_790_950_000_000);
+            assert_eq!(facts.config_revision, "0000000000000000");
         }
 
         #[test]
@@ -5291,6 +5367,53 @@ mod audio_tests {
             _dest: dest,
             _dir: dir,
         }
+    }
+
+    #[test]
+    fn status_bootstrap_and_exit_receipt_share_the_same_instance_id() {
+        let mut rig = rig(false);
+        let paths = crate::paths::Paths {
+            config_dir: rig._dir.0.clone(),
+            state_dir: rig._dir.0.clone(),
+            runtime_dir: rig._dir.0.clone(),
+        };
+        let mut lifecycle = crate::lifecycle::Lifecycle::start(&paths).unwrap();
+        let facts = StartupFacts::collect(
+            rig.local,
+            &paths,
+            crate::keys::KeySource::File,
+            &crate::config::Config::default(),
+            "0123456789abcdef".into(),
+        )
+        .with_instance(lifecycle.instance);
+        rig.agent.set_startup(facts);
+        let response = rig.agent.on_ctl(Request::Status);
+        assert!(response.ok);
+        let bootstrap: Value =
+            serde_json::from_slice(&std::fs::read(paths.bootstrap_file()).unwrap()).unwrap();
+        assert_eq!(
+            response.result["installer"]["instance"]["id"],
+            bootstrap["instance_id"]
+        );
+        assert_eq!(
+            response.result["installer"]["instance"]["pid"],
+            bootstrap["pid"]
+        );
+        assert_eq!(
+            response.result["installer"]["instance"]["started_unix_ms"],
+            bootstrap["started_unix_ms"]
+        );
+        lifecycle
+            .phase(crate::lifecycle::Phase::Ready, None)
+            .unwrap();
+        lifecycle.stopped(rig.agent.shutdown()).unwrap();
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(paths.exit_receipt()).unwrap()).unwrap();
+        assert_eq!(receipt["instance_id"], bootstrap["instance_id"]);
+        assert_eq!(
+            response.result["installer"]["config_revision"],
+            json!("0123456789abcdef")
+        );
     }
 
     impl Rig {
@@ -6221,6 +6344,205 @@ mod home_tests {
         fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
             Ok(Vec::new())
         }
+    }
+
+    /// The existing parking fixture, with an explicit shutdown recovery result.
+    struct ShutdownParking(Result<Vec<WindowId>, PlatformError>);
+
+    impl crosspane_platform::WindowParking for ShutdownParking {
+        fn park(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            crosspane_platform::WindowParking::park(&mut FakeParking, window, size, scale)
+        }
+        fn resize(
+            &mut self,
+            window: WindowId,
+            size: PixelSize,
+            scale: f64,
+        ) -> Result<crosspane_platform::Parked, PlatformError> {
+            self.park(window, size, scale)
+        }
+        fn geometry(&self, window: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+            crosspane_platform::WindowParking::geometry(&FakeParking, window)
+        }
+        fn restore(&mut self, window: WindowId) -> Result<(), PlatformError> {
+            crosspane_platform::WindowParking::restore(&mut FakeParking, window)
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            std::mem::replace(&mut self.0, Ok(Vec::new()))
+        }
+    }
+
+    #[test]
+    fn shutdown_returns_parking_outcomes_and_failed_recovery_is_unclean() {
+        use crate::lifecycle::{Lifecycle, Parking, Phase};
+        use crosspane_input::journal::FileJournal;
+        for (i, recovered, expected) in [
+            (0, Ok(Vec::new()), Parking::NothingParked),
+            (1, Ok(vec![WindowId(1)]), Parking::Restored),
+            (
+                2,
+                Err(PlatformError::Backend("fixture: recovery failed".into())),
+                Parking::Failed,
+            ),
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("crosspane-shutdown-{}-{i}", std::process::id()));
+            crate::paths::create_private_dir(&dir).unwrap();
+            let paths = crate::paths::Paths {
+                config_dir: dir.clone(),
+                state_dir: dir.clone(),
+                runtime_dir: dir.clone(),
+            };
+            FileJournal::open(&paths.journal_file()).unwrap();
+            FileJournal::open(&paths.e2_journal_file()).unwrap();
+            let mut lifecycle = Lifecycle::start(&paths).unwrap();
+            lifecycle.phase(Phase::Ready, None).unwrap();
+            let mut rig = rig(false);
+            rig.agent.set_lifecycle_paths(paths.clone());
+            rig.agent.platform.parking = Some(Box::new(ShutdownParking(recovered)));
+            let outcomes = rig.agent.shutdown();
+            assert_eq!(outcomes.parking, expected);
+            assert!(outcomes.input_journals_empty && outcomes.audio_stopped);
+            lifecycle.stopped(outcomes).unwrap();
+            let receipt: Value =
+                serde_json::from_slice(&std::fs::read(paths.exit_receipt()).unwrap()).unwrap();
+            assert_eq!(receipt["clean"], json!(expected != Parking::Failed));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// This refusal leaves both release-all (E1) and individual ups (E2) unconfirmed.
+    struct RefuseShutdownReleases;
+
+    impl KeyInjector for RefuseShutdownReleases {
+        fn key(&mut self, _usage: HidUsage, _down: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Backend("fixture: release failed".into()))
+        }
+        fn lock_keys(&self) -> Result<LockKeys, PlatformError> {
+            Ok(LockKeys::default())
+        }
+        fn set_lock_keys(&mut self, _wanted: LockKeys) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn release_all(&mut self) -> Result<(), PlatformError> {
+            Err(PlatformError::Backend("fixture: release failed".into()))
+        }
+        fn recover_keys(&mut self, _keys: &[HidUsage]) -> Result<(), PlatformError> {
+            Err(PlatformError::Backend("fixture: release failed".into()))
+        }
+    }
+
+    fn check_shutdown_journals(releases_ok: bool) {
+        use crate::lifecycle::{Lifecycle, Phase};
+        use crosspane_input::Held;
+        use crosspane_input::journal::{FileJournal, Journal};
+        for e2 in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "crosspane-shutdown-journals-{}-{releases_ok}-{e2}",
+                std::process::id()
+            ));
+            crate::paths::create_private_dir(&dir).unwrap();
+            let paths = crate::paths::Paths {
+                config_dir: dir.clone(),
+                state_dir: dir.clone(),
+                runtime_dir: dir.clone(),
+            };
+            let mut h = bare_scenario();
+            // Keep the scenario's fake platform and initial inputs, but give the real engine
+            // the same persistent journals production startup owns.
+            let setup: Vec<_> = h
+                .rig
+                .agent
+                .fed
+                .iter()
+                .filter(|input| {
+                    matches!(
+                        input,
+                        Input::Session(_)
+                            | Input::LocalDisplays(_)
+                            | Input::PeerDisplays { .. }
+                            | Input::Layout(_)
+                            | Input::Grants(_)
+                            | Input::PeerUp { .. }
+                            | Input::Windows(_)
+                    )
+                })
+                .cloned()
+                .collect();
+            let (engine, startup) = Engine::new(
+                crosspane_engine::EngineConfig::new(h.rig.local),
+                Box::new(FileJournal::open(&paths.journal_file()).unwrap()),
+                Box::new(FileJournal::open(&paths.e2_journal_file()).unwrap()),
+                ms(0),
+            )
+            .unwrap();
+            h.rig.agent.engine = engine;
+            h.rig.agent.execute(startup);
+            process_events(&mut h);
+            for input in setup {
+                step(&mut h, input);
+            }
+            h.rig.agent.set_lifecycle_paths(paths.clone());
+            let mut lifecycle = Lifecycle::start(&paths).unwrap();
+            lifecycle.phase(Phase::Ready, None).unwrap();
+            if e2 {
+                project(&mut h, 1);
+                step(
+                    &mut h,
+                    Input::Windows(WindowEvent::Focused(Some(WindowId(10)))),
+                );
+                proj_key(&mut h, 1, true);
+            } else {
+                h.rig.agent.platform.overlay = Some(Box::new(AcceptingOverlay));
+                let peer = h.rig.peer;
+                let session = crosspane_types::id::SessionId(77);
+                start_control(&mut h, peer, session);
+                from_controller(&mut h, session, key_msg(4, true, 1));
+            }
+            let journal_path = if e2 {
+                paths.e2_journal_file()
+            } else {
+                paths.journal_file()
+            };
+            let held = vec![Held::Key(HidUsage::keyboard(4))];
+            assert_eq!(
+                FileJournal::open(&journal_path).unwrap().held().unwrap(),
+                held,
+                "e2={e2}"
+            );
+            assert!(!crate::lifecycle::journals_empty(&paths));
+            if !releases_ok {
+                h.rig.agent.platform.keys = Some(Box::new(RefuseShutdownReleases));
+            }
+            let outcomes = h.rig.agent.shutdown();
+            assert!(h.rig.agent.pending.is_empty());
+            assert_eq!(outcomes.input_journals_empty, releases_ok);
+            assert_eq!(
+                FileJournal::open(&journal_path).unwrap().held().unwrap(),
+                if releases_ok { Vec::new() } else { held }
+            );
+            lifecycle.stopped(outcomes).unwrap();
+            let receipt: Value =
+                serde_json::from_slice(&std::fs::read(paths.exit_receipt()).unwrap()).unwrap();
+            assert_eq!(receipt["clean"], json!(releases_ok));
+            assert_eq!(receipt["input_journals_empty"], json!(releases_ok));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn shutdown_settles_e1_and_e2_releases_before_writing_a_clean_receipt() {
+        check_shutdown_journals(true);
+    }
+
+    #[test]
+    fn shutdown_keeps_failed_e1_and_e2_releases_in_an_unclean_receipt() {
+        check_shutdown_journals(false);
     }
 
     struct FakeFrames;
