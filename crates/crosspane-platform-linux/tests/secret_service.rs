@@ -29,6 +29,12 @@ impl Drop for Cleanup<'_> {
 
 #[test]
 fn live_round_trip() {
+    // This only enables session keyring testing, which can write items and raise an unlock prompt.
+    if std::env::var("CROSSPANE_SECRET_SERVICE_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set CROSSPANE_SECRET_SERVICE_LIVE=1 to use the session keyring");
+        return;
+    }
+
     let builder = match Builder::session() {
         Ok(builder) => builder,
         Err(_) => {
