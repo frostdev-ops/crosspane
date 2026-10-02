@@ -289,6 +289,98 @@ fn size_change_is_an_idr() {
     }
 }
 
+// WP-2.40: a size NVENC refuses falls back to libx264 for that size only. The dev GPU's NVENC takes
+// nothing below 146x50 (EINVAL); other hardware may take more, and then the encoder stays on NVENC
+// throughout. What must hold everywhere: the encoder goes back to NVENC for every size from 256x256
+// up, whatever came before, and a size's frames neither rebuild the session nor key without cause.
+#[test]
+fn refused_size_falls_back_for_that_size_only() {
+    let codecs = FfmpegCodecs::new().unwrap();
+    let large = PixelSize::new(1280, 720);
+    let mut encoder = encoder(&codecs, large);
+    if encoder.name() != "h264_nvenc" {
+        eprintln!("SKIP WP-2.40: NVENC unavailable");
+        return;
+    }
+    let mut decoder = selected_decoder(&codecs);
+    let mut encoded = Vec::new();
+    let mut decoded = Vec::new();
+    let mut seen_software = false;
+    for size in [
+        large,
+        PixelSize::new(100, 40),
+        large,
+        PixelSize::new(64, 64),
+        PixelSize::new(640, 360),
+        PixelSize::new(90, 30),
+        PixelSize::new(100, 40),
+        PixelSize::new(1920, 1080),
+        PixelSize::new(256, 256),
+        PixelSize::new(101, 75),
+        large,
+    ] {
+        for index in 0..3 {
+            let stride = size.width as usize * 4;
+            let source = content(size, index, stride);
+            let result = encoder
+                .encode(&source, stride as u32, size, false, &mut encoded)
+                .unwrap();
+            // A new size (or a refusal at it) is one session: only its first frame is an IDR.
+            assert_eq!(result.key, index == 0, "{size:?} frame {index}");
+            assert_eq!(
+                decoder.decode(&encoded, &mut decoded).unwrap(),
+                padded(size)
+            );
+            assert!(psnr(&source, stride, &decoded, size) >= 30.0, "{size:?}");
+        }
+        let name = encoder.name().to_string();
+        eprintln!(
+            "WP-2.40 {}x{}: {name}, fallbacks {}",
+            size.width,
+            size.height,
+            codecs.fallbacks()
+        );
+        if size.width >= 256 && size.height >= 256 {
+            assert_eq!(name, "h264_nvenc", "{size:?} must be back on NVENC");
+        }
+        seen_software |= name == "libx264";
+    }
+    // Every fallback was counted: at least one for each size that was served by libx264.
+    assert_eq!(seen_software, codecs.fallbacks() > 0);
+}
+
+// An encoder created at a size NVENC refuses starts on libx264 and moves to NVENC at the next size
+// it supports.
+#[test]
+fn encoder_created_at_a_refused_size_reaches_nvenc_later() {
+    let codecs = FfmpegCodecs::new().unwrap();
+    let large = PixelSize::new(1280, 720);
+    if encoder(&codecs, large).name() != "h264_nvenc" {
+        eprintln!("SKIP WP-2.40: NVENC unavailable");
+        return;
+    }
+    let small = PixelSize::new(100, 40);
+    let mut encoder = codecs.encoder(small, BITRATE, FPS).unwrap();
+    eprintln!("WP-2.40 created at 100x40 on {}", encoder.name());
+    let mut encoded = Vec::new();
+    for size in [small, large] {
+        let stride = size.width as usize * 4;
+        assert!(
+            encoder
+                .encode(
+                    &content(size, 0, stride),
+                    stride as u32,
+                    size,
+                    false,
+                    &mut encoded
+                )
+                .unwrap()
+                .key
+        );
+    }
+    assert_eq!(encoder.name(), "h264_nvenc");
+}
+
 #[test]
 fn non_idr_first_fails_then_idr_recovers() {
     let codecs = FfmpegCodecs::new().unwrap();
@@ -916,6 +1008,61 @@ mod cuda {
                     .key
             );
             native.set_bitrate(BITRATE);
+        }
+    }
+
+    // WP-2.40: no pool for a coded size NVENC refuses a session at turns CUDA input off for that
+    // size only: CPU BGRA covers it, and the next supported size gets its pool and NVENC back.
+    #[test]
+    fn cuda_pool_refusal_is_per_size() {
+        let first = PixelSize::new(1280, 720);
+        let Some((mut native, _first_pool, device, queue)) = native(first) else {
+            return;
+        };
+        let small = PixelSize::new(100, 40);
+        if native.input_pool(small).unwrap().is_some() {
+            eprintln!("SKIP WP-2.40: NVENC takes {small:?} here");
+            return;
+        }
+        let mut out = Vec::new();
+        // The per-frame calls at the refused size answer the same, and CPU input works there.
+        for index in 0..3 {
+            assert!(native.input_pool(small).unwrap().is_none());
+            let stride = small.width as usize * 4;
+            let result = native
+                .encode(
+                    &content(small, index, stride),
+                    stride as u32,
+                    small,
+                    false,
+                    &mut out,
+                )
+                .unwrap();
+            assert_eq!(result.key, index == 0);
+        }
+        // The GPU source stays on: other sizes get a pool, and NVENC on it.
+        for size in [first, PixelSize::new(641, 359)] {
+            let pool = native
+                .input_pool(size)
+                .unwrap()
+                .expect("a pool for a supported size");
+            assert_eq!(pool.size(), padded(size));
+            let input = pool.acquire().unwrap();
+            let (buffer, layout) = nv12_buffer(input.as_ref()).unwrap();
+            let mut bgra = vec![0; size.width as usize * size.height as usize * 4];
+            pattern(&mut bgra, size, 0);
+            let mut staging = vec![0; buffer.size() as usize];
+            nv12(&bgra, size, layout, &mut staging);
+            queue.write_buffer(buffer, 0, &staging);
+            queue.submit([]);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            assert!(
+                native
+                    .encode_native(input.as_ref(), size, false, &mut out)
+                    .unwrap()
+                    .key
+            );
+            assert_eq!(native.name(), "h264_nvenc");
         }
     }
 
