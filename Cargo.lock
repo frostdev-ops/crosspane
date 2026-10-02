@@ -853,6 +853,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crosspane-installer"
+version = "0.0.0"
+
+[[package]]
+name = "crosspane-installer-core"
+version = "0.0.0"
+
+[[package]]
 name = "crosspane-media"
 version = "0.0.0"
 dependencies = [
@@ -1035,6 +1043,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "crosspane-ui-kit"
+version = "0.0.0"
 
 [[package]]
 name = "crosspanectl"

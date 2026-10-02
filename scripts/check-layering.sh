@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Changing either policy variable requires a lead decision.
-OS_FREE=(crosspane-types crosspane-protocol crosspane-security crosspane-input crosspane-media crosspane-platform crosspane-engine)
+OS_FREE=(crosspane-types crosspane-protocol crosspane-security crosspane-input crosspane-media crosspane-platform crosspane-engine crosspane-installer-core)
 PLATFORM_BINDINGS='^(windows|windows-sys|windows-core|objc2.*|block2|dispatch2?|core-foundation(-sys)?|core-graphics.*|cocoa.*|wayland-.*|smithay-client-toolkit|ashpd|pipewire(-sys)?|reis|x11rb.*|x11-dl|xkbcommon.*|libudev.*|evdev.*)$'
 
 set -euo pipefail
