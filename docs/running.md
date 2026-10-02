@@ -1,7 +1,8 @@
 # Running Crosspane (v0)
 
 Crosspane v0 runs one agent per machine (`crosspane-agent`, in the user's desktop session, never as
-root) and is driven with `crosspanectl`. There is no settings UI yet; everything below is CLI.
+root) and is driven with `crosspanectl` or the settings app (`crosspane-ui`, opened from the tray /
+menu-bar item). Everything below is shown with the CLI.
 
 ## Build
 
@@ -221,8 +222,8 @@ Speakers only: microphones are not shared yet.
   environment turns audio off and never touches the audio server. Every script under
   `scripts/e2e/` that starts agents sets it (and `CROSSPANE_DISCOVERY=0`), except
   `audio-private.sh`, which runs on private audio servers.
-- **Limits (v0):** the Mac plays only when its default output runs at 48 kHz stereo (a 44.1 kHz
-  output, which the built-in one may use, is refused); the Mac's driver serves one peer at a time;
+- **Limits (v0):** the Mac resamples the 48 kHz stream to its default output's rate (44.1, 48,
+  88.2, 96, 176.4 or 192 kHz; WP-3.7a/b); the Mac's driver serves one peer at a time;
   an agent whose audio worker died keeps audio refused until it restarts.
 - **Check it without touching your audio:** `scripts/lead/impl-env.sh scripts/e2e/audio-private.sh`
   runs two agents, each on its own private PipeWire server, plays a 1 kHz tone into one's "speakers"
