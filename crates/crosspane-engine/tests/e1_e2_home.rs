@@ -1685,6 +1685,83 @@ fn entry_refused_while_button_held_then_enters_after_release() {
 }
 
 #[test]
+fn home_entry_discards_waiting_targeting_and_its_fifo() {
+    for press in [true, false] {
+        for completion_during_home in [true, false] {
+            let mut h = H::controlling();
+            h.focus(Some(W1));
+            let seq = h.next_proj_seq(B, P1);
+            let pending = if press {
+                ProjInput::Button {
+                    projection: P1,
+                    seq,
+                    button: BUTTON,
+                    down: true,
+                    position: point(10.0, 20.0),
+                }
+            } else {
+                ProjInput::Scroll {
+                    projection: P1,
+                    seq,
+                    delta: scroll_delta(),
+                    position: point(10.0, 20.0),
+                }
+            };
+            let out = h.feed(proj_input(B, pending));
+            let injected = injects(&out);
+            assert_eq!(injected.len(), 1);
+            assert!(matches!(injected[0].1, InjectCmd::MoveTo { .. }));
+            let pending = injected[0].0;
+            assert!(h.proj_key(P1, KEY, true).is_empty());
+            let seq = h.next_proj_seq(B, P1);
+            assert!(
+                h.feed(proj_input(
+                    B,
+                    ProjInput::Button {
+                        projection: P1,
+                        seq,
+                        button: BUTTON,
+                        down: false,
+                        position: point(10.0, 20.0),
+                    }
+                ))
+                .is_empty()
+            );
+            h.aim();
+            let op = h.reach_binding();
+            if completion_during_home {
+                assert!(!has_inject(&h.feed(Input::InjectDone {
+                    id: pending,
+                    ok: true
+                })));
+            }
+            // Abort home and remove its bind: even with the filter lifted, the old move is stale.
+            let out = h.bind_set(op, true, false);
+            let removal = bind(&out, false).unwrap();
+            h.bind_set(removal, false, true);
+            assert!(!has_inject(&h.feed(Input::InjectDone {
+                id: pending,
+                ok: true
+            })));
+            assert!(h.e2_journal.items().is_empty());
+            let seq = h.next_proj_seq(B, P1);
+            let out = h.feed(proj_input(
+                B,
+                ProjInput::Button {
+                    projection: P1,
+                    seq,
+                    button: BUTTON,
+                    down: false,
+                    position: point(10.0, 20.0),
+                },
+            ));
+            assert!(!has_inject(&out));
+            h.quiet();
+        }
+    }
+}
+
+#[test]
 fn entry_order() {
     let mut h = H::controlling();
     // A key B pressed in the proxy is down in W.

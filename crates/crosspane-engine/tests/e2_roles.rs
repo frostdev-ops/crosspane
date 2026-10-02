@@ -699,16 +699,17 @@ fn twin_and_mirror_mapping_clamping_focus_and_sequences() {
         );
         assert_eq!(
             commands(&out),
-            vec![
-                InjectCmd::MoveTo {
-                    display: DISPLAY,
-                    position: PointDevice::new(20.0, 509.0)
-                },
-                InjectCmd::Button {
-                    button: BUTTON,
-                    down: true
-                }
-            ]
+            vec![InjectCmd::MoveTo {
+                display: DISPLAY,
+                position: PointDevice::new(20.0, 509.0)
+            }]
+        );
+        assert_eq!(
+            commands(&f.confirm(&out, true, 0)),
+            vec![InjectCmd::Button {
+                button: BUTTON,
+                down: true
+            }]
         );
         f.handle(Input::Windows(WindowEvent::Focused(Some(WindowId(99)))), 0);
         let out = f.handle(input(B, press(3, true)), 0);
@@ -743,13 +744,14 @@ fn twin_and_mirror_mapping_clamping_focus_and_sequences() {
         );
         assert_eq!(
             commands(&out),
-            vec![
-                InjectCmd::MoveTo {
-                    display: DISPLAY,
-                    position: PointDevice::new(28.0, 39.0)
-                },
-                InjectCmd::Scroll(delta())
-            ]
+            vec![InjectCmd::MoveTo {
+                display: DISPLAY,
+                position: PointDevice::new(28.0, 39.0)
+            }]
+        );
+        assert_eq!(
+            commands(&f.confirm(&out, true, 0)),
+            vec![InjectCmd::Scroll(delta())]
         );
     }
     let mut f = Fixture::ready(A, B);
@@ -907,7 +909,8 @@ fn shared_journal_keeps_other_projection_and_retries_journal_errors() {
     assert!(f.held().is_empty());
 
     let mut f = Fixture::source(PlatformParking::Twin);
-    f.handle(input(B, button(1, true, PointDevice::zero())), 0);
+    let out = f.handle(input(B, button(1, true, PointDevice::zero())), 0);
+    f.confirm(&out, true, 0);
     f.journal.0.lock().unwrap().fail_down = true;
     let out = f.handle(input(B, press(2, true)), 1);
     assert_eq!(
@@ -3280,7 +3283,8 @@ fn grace_round_trip_keeps_parking_and_proxy_and_resumes_input() {
             },
         ] {
             for msg in inputs(&destination.proxy(event, 10)) {
-                source.handle(input(B, msg), 10);
+                let out = source.handle(input(B, msg), 10);
+                source.confirm(&out, true, 10);
             }
         }
         let dropped = source.handle(closed(B), 20);
@@ -4039,7 +4043,8 @@ fn grace_late_platform_results_while_suspended_keep_parking_and_stop_capture() {
 fn grace_resume_preserves_failed_release_retries_and_stale_completion_generations() {
     let mut f = Fixture::source(PlatformParking::Twin);
     f.handle(input(B, press(1, true)), 10);
-    f.handle(input(B, button(2, true, PointDevice::zero())), 10);
+    let out = f.handle(input(B, button(2, true, PointDevice::zero())), 10);
+    f.confirm(&out, true, 10);
     let dropped = f.handle(closed(B), 20);
     let old = injections(&dropped)[0].0;
     f.confirm(&dropped, false, 20);
@@ -4116,7 +4121,9 @@ proptest! {
         for (index, (is_key, down)) in events.into_iter().take(drop_at).enumerate() {
             let seq = index as u32 + 1;
             let msg = if is_key { press(seq, down) } else { button(seq, down, PointDevice::zero()) };
-            let out = f.handle(input(B, msg), index as u64);
+            let mut out = f.handle(input(B, msg), index as u64);
+            // The targeting answer can issue the deferred button, as the agent's settle does.
+            out.extend(f.confirm(&out, true, index as u64));
             for cmd in commands(&out) {
                 match cmd {
                     InjectCmd::Key { usage, down } => transition_fake(&mut injected, Held::Key(usage), down),

@@ -18,7 +18,7 @@ use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
 use super::{E2, GRACE, Placement, TwinHome, send};
-use crate::io::{Failure, InjectCmd, Notice, Output, ProjectionKey};
+use crate::io::{Failure, InjectCmd, InjectId, Notice, Output, ProjectionKey};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const PARK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -250,7 +250,7 @@ impl E2 {
             self.end_source(projection, Reason::LinkLost, true, now, out);
             return;
         }
-        self.ledgers.retire(projection, out);
+        self.ledgers.retire(projection, now, out);
         if let Some(stream) = source.stream.take() {
             out.push(Output::StopCapture { stream });
         }
@@ -265,6 +265,7 @@ impl E2 {
         // it after `Accepted` (the high-water mark stays, so an older report never revives it).
         source.placement.valid = false;
         source.stage = Stage::Suspended(now.saturating_add(GRACE));
+        self.drain_targeting_queue(now, out);
     }
 
     pub(super) fn resume_sources(&mut self, peer: NodeId, now: MonoTime, out: &mut Vec<Output>) {
@@ -674,6 +675,47 @@ impl E2 {
         if self.home.is_some() {
             return;
         }
+        self.source_ready_input(projection, msg, now, out);
+    }
+
+    /// Process inputs whose sequence numbers were already accepted, including a targeting FIFO.
+    fn source_ready_input(
+        &mut self,
+        projection: ProjectionId,
+        msg: &ProjInput,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if self.home.is_some() || !self.permits_io() || !self.ledgers.recovery_done() {
+            return;
+        }
+        let Some(source) = self
+            .sources
+            .get_mut(&projection)
+            .filter(|s| s.stage == Stage::Live)
+        else {
+            return;
+        };
+        // A batch teardown can drain the FIFO before another affected source is retired.
+        if !self.peers.contains(&source.peer)
+            || !self
+                .grants
+                .get(&source.peer)
+                .is_some_and(|grants| grants.contains(&Capability::WindowShare))
+        {
+            return;
+        }
+        // Held reports still refresh the lease and release missing items immediately.
+        if !matches!(msg, ProjInput::Held { .. }) {
+            match self.ledgers.queue_targeted(projection, msg) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(()) => {
+                    self.end_source(projection, Reason::Failed, false, now, out);
+                    return;
+                }
+            }
+        }
         let Some(parked) = source.parked else { return };
         let mut item = None;
         match msg {
@@ -686,14 +728,31 @@ impl E2 {
                 position,
                 ..
             } => {
+                if *down {
+                    self.ledgers.target(
+                        projection,
+                        move_to(parked, *position),
+                        msg.clone(),
+                        now,
+                        out,
+                    );
+                    return;
+                }
+                // A rejected or cancelled press never entered the ledger and owes no release.
+                if !self.ledgers.holds(projection, Held::Button(*button)) {
+                    return;
+                }
                 self.ledgers.inject(move_to(parked, *position), out);
                 item = Some((Held::Button(*button), *down));
             }
-            ProjInput::Scroll {
-                position, delta, ..
-            } => {
-                self.ledgers.inject(move_to(parked, *position), out);
-                self.ledgers.inject(InjectCmd::Scroll(*delta), out);
+            ProjInput::Scroll { position, .. } => {
+                self.ledgers.target(
+                    projection,
+                    move_to(parked, *position),
+                    msg.clone(),
+                    now,
+                    out,
+                );
             }
             ProjInput::Key { usage, down, .. } => {
                 if *down && !focus_on(&self.windows, self.focused, source.window, parked.display) {
@@ -712,7 +771,7 @@ impl E2 {
                     .map(Held::Key)
                     .chain(buttons.iter().copied().map(Held::Button))
                     .collect();
-                self.ledgers.heartbeat(projection, &items, now, out);
+                self.ledgers.input_heartbeat(projection, &items, now, out);
             }
             _ => {}
         }
@@ -720,6 +779,65 @@ impl E2 {
             && !self.ledgers.input(projection, item, down, now, out)
         {
             self.end_source(projection, Reason::Failed, false, now, out);
+        }
+    }
+
+    pub(super) fn source_inject_done(
+        &mut self,
+        id: InjectId,
+        ok: bool,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        // A late callback must not let lease cleanup erase an overdue targeting failure.
+        if let Some(owner) = self.ledgers.targeting_expired(now) {
+            self.end_source(owner, Reason::Failed, false, now, out);
+        }
+        self.ledgers.expire_leases(now, out);
+        let Some(targeting) = self.ledgers.targeted(id) else {
+            self.drain_targeting_queue(now, out);
+            return;
+        };
+        let projection = targeting.owner;
+        if self.home.is_some()
+            || !self.permits_io()
+            || !self
+                .sources
+                .get(&projection)
+                .is_some_and(|s| s.stage == Stage::Live)
+        {
+            return;
+        }
+        if ok {
+            match targeting.input {
+                ProjInput::Button {
+                    button, down: true, ..
+                } => {
+                    if !self
+                        .ledgers
+                        .input(projection, Held::Button(button), true, now, out)
+                    {
+                        self.end_source(projection, Reason::Failed, false, now, out);
+                        return;
+                    }
+                }
+                ProjInput::Scroll { delta, .. } => {
+                    self.ledgers.inject(InjectCmd::Scroll(delta), out)
+                }
+                _ => {}
+            }
+        }
+        self.drain_targeting_queue(now, out);
+    }
+
+    fn drain_targeting_queue(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        if let Some(owner) = self.ledgers.targeting_expired(now) {
+            self.end_source(owner, Reason::Failed, false, now, out);
+        }
+        // Every replay path, including teardown, discards expired entries before they renew leases.
+        self.ledgers.expire_leases(now, out);
+        while let Some((projection, input)) = self.ledgers.next_targeted_input() {
+            self.source_ready_input(projection, &input, now, out);
         }
     }
 
@@ -828,7 +946,7 @@ impl E2 {
         let Some(source) = self.sources.remove(&projection) else {
             return;
         };
-        self.ledgers.retire(projection, out);
+        self.ledgers.retire(projection, now, out);
         if let Some(stream) = source.stream {
             out.push(Output::StopCapture { stream });
         }
@@ -854,9 +972,11 @@ impl E2 {
             },
             reason,
         }));
+        self.drain_targeting_queue(now, out);
     }
 
     pub(super) fn source_tick(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        self.drain_targeting_queue(now, out);
         let expired: Vec<_> = self
             .sources
             .iter()

@@ -4,7 +4,7 @@
 //! after the last owner confirms release. Owner zero is startup recovery. Ended projections keep
 //! only their release bookkeeping until confirmation; they cannot receive any further input.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -12,12 +12,16 @@ use std::time::Duration;
 use crosspane_input::Held;
 use crosspane_input::journal::{Journal, JournalError};
 use crosspane_input::lease::{Action, TargetLedger};
+use crosspane_input::timing::LEASE_TIMEOUT;
+use crosspane_protocol::projection::ProjInput;
 use crosspane_types::id::ProjectionId;
 use crosspane_types::time::MonoTime;
 
 use crate::io::{InjectCmd, InjectId, Output};
 
 const RETRY: Duration = Duration::from_millis(50);
+const TARGET_QUEUE_LIMIT: usize = 64;
+const TARGET_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct Shared {
     journal: Box<dyn Journal>,
@@ -81,6 +85,31 @@ struct Lease {
     unconfirmed: BTreeMap<Held, u64>,
     retry: Option<MonoTime>,
     retired: bool,
+    // Unlike TargetLedger::next_deadline, this also survives an empty held set.
+    expires: Option<MonoTime>,
+}
+
+impl Lease {
+    fn retry_actions(&mut self, now: MonoTime, mut actions: Vec<Action>) -> Vec<Action> {
+        if self.retry.is_some_and(|deadline| deadline <= now) {
+            let already: BTreeSet<_> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Release(item) => Some(*item),
+                    _ => None,
+                })
+                .collect();
+            actions.extend(
+                self.unconfirmed
+                    .keys()
+                    .filter(|item| !already.contains(item))
+                    .copied()
+                    .map(Action::Release),
+            );
+            self.retry = now.checked_add(RETRY);
+        }
+        actions
+    }
 }
 
 struct Pending {
@@ -88,10 +117,20 @@ struct Pending {
     items: Vec<(Held, u64)>,
 }
 
+pub(super) struct Targeting {
+    pub id: InjectId,
+    pub owner: ProjectionId,
+    pub input: ProjInput,
+    pub deadline: MonoTime,
+}
+
 pub(super) struct Ledgers {
     shared: Arc<Mutex<Shared>>,
     leases: BTreeMap<ProjectionId, Lease>,
     pending: BTreeMap<InjectId, Pending>,
+    // Kept with the lease so home drains, retirement and lease expiry also cancel unissued input.
+    targeting: Option<Targeting>,
+    queued: VecDeque<(ProjectionId, ProjInput)>,
     // E1 allocates upward from 1. E2 allocates downward from the other end, so the agent can
     // broadcast InjectDone to both roles without confusing their outstanding requests.
     next_id: u64,
@@ -108,6 +147,8 @@ impl Ledgers {
             shared,
             leases: BTreeMap::new(),
             pending: BTreeMap::new(),
+            targeting: None,
+            queued: VecDeque::new(),
             next_id: u64::MAX,
         };
         this.open(ProjectionId(0))?;
@@ -159,6 +200,7 @@ impl Ledgers {
                 unconfirmed: BTreeMap::new(),
                 retry: None,
                 retired: owner == ProjectionId(0),
+                expires: None,
             },
         );
         Ok(())
@@ -167,6 +209,80 @@ impl Ledgers {
     pub fn inject(&mut self, cmd: InjectCmd, out: &mut Vec<Output>) {
         let id = self.allocate();
         out.push(Output::Inject { id, cmd });
+    }
+
+    pub fn target(
+        &mut self,
+        owner: ProjectionId,
+        cmd: InjectCmd,
+        input: ProjInput,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let id = self.allocate();
+        self.targeting = Some(Targeting {
+            id,
+            owner,
+            input,
+            deadline: now.saturating_add(TARGET_ACK_TIMEOUT),
+        });
+        out.push(Output::Inject { id, cmd });
+    }
+
+    /// Serialize every projection over the shared pointer until its targeting action is emitted.
+    pub fn queue_targeted(&mut self, owner: ProjectionId, input: &ProjInput) -> Result<bool, ()> {
+        if self.targeting.is_none() {
+            return Ok(false);
+        }
+        if self.queued.len() == TARGET_QUEUE_LIMIT {
+            return Err(());
+        }
+        self.queued.push_back((owner, input.clone()));
+        Ok(true)
+    }
+
+    pub fn targeted(&mut self, id: InjectId) -> Option<Targeting> {
+        if self
+            .targeting
+            .as_ref()
+            .is_some_and(|targeting| targeting.id == id)
+        {
+            self.targeting.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn next_targeted_input(&mut self) -> Option<(ProjectionId, ProjInput)> {
+        if self.targeting.is_none() {
+            self.queued.pop_front()
+        } else {
+            None
+        }
+    }
+
+    pub fn targeting_expired(&self, now: MonoTime) -> Option<ProjectionId> {
+        self.targeting
+            .as_ref()
+            .filter(|targeting| targeting.deadline <= now)
+            .map(|targeting| targeting.owner)
+    }
+
+    fn cancel_targeting(&mut self, owner: ProjectionId) {
+        if self
+            .targeting
+            .as_ref()
+            .is_some_and(|targeting| targeting.owner == owner)
+        {
+            self.targeting = None;
+        }
+        self.queued.retain(|(projection, _)| *projection != owner);
+    }
+
+    pub fn holds(&self, owner: ProjectionId, item: Held) -> bool {
+        self.leases
+            .get(&owner)
+            .is_some_and(|lease| lease.ledger.held().contains(&item))
     }
 
     fn allocate(&mut self) -> InjectId {
@@ -247,6 +363,12 @@ impl Ledgers {
         let Some(lease) = self.leases.get_mut(&owner) else {
             return false;
         };
+        let deadline = lease_deadline(now);
+        if down && lease.ledger.held().is_empty() {
+            lease.expires = Some(deadline);
+        } else {
+            lease.expires.get_or_insert(deadline);
+        }
         match lease.ledger.on_input(item, down, now) {
             Ok(action) => {
                 self.actions(owner, action.into_iter().collect(), out);
@@ -261,8 +383,10 @@ impl Ledgers {
                 };
                 if let Ok((ledger, items)) = TargetLedger::open(scope) {
                     lease.ledger = ledger;
+                    lease.expires = None;
                     self.actions(owner, items.into_iter().map(Action::Release).collect(), out);
                 }
+                self.cancel_targeting(owner);
                 false
             }
         }
@@ -275,22 +399,40 @@ impl Ledgers {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        // The home entry path drains with this method; ordinary Held reports keep targeting.
+        self.cancel_targeting(owner);
+        self.input_heartbeat(owner, items, now, out);
+    }
+
+    pub fn input_heartbeat(
+        &mut self,
+        owner: ProjectionId,
+        items: &[Held],
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
         if let Some(lease) = self.leases.get_mut(&owner) {
+            lease.expires = Some(lease_deadline(now));
             let actions = lease.ledger.on_heartbeat(items, now);
             self.actions(owner, actions, out);
         }
     }
 
-    pub fn retire(&mut self, owner: ProjectionId, out: &mut Vec<Output>) {
+    pub fn retire(&mut self, owner: ProjectionId, now: MonoTime, out: &mut Vec<Output>) {
+        self.cancel_targeting(owner);
         if let Some(lease) = self.leases.get_mut(&owner) {
             lease.retired = true;
+            lease.expires = None;
             let actions = lease.ledger.release_all();
+            // Absorb a due retry now, before the same dispatch's tick can repeat fresh releases.
+            let actions = lease.retry_actions(now, actions);
             self.actions(owner, actions, out);
         }
         self.collect();
     }
 
     pub fn tick(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        self.expire_leases(now, out);
         let owners: Vec<_> = self.leases.keys().copied().collect();
         for owner in owners {
             if owner == ProjectionId(0) {
@@ -305,29 +447,30 @@ impl Ledgers {
                 continue;
             }
             if let Some(lease) = self.leases.get_mut(&owner) {
-                let mut actions = lease.ledger.on_tick(now);
-                if lease.retry.is_some_and(|deadline| deadline <= now) {
-                    let already: BTreeSet<_> = actions
-                        .iter()
-                        .filter_map(|a| match a {
-                            Action::Release(item) => Some(*item),
-                            _ => None,
-                        })
-                        .collect();
-                    actions.extend(
-                        lease
-                            .unconfirmed
-                            .keys()
-                            .filter(|item| !already.contains(item))
-                            .copied()
-                            .map(Action::Release),
-                    );
-                    lease.retry = now.checked_add(RETRY);
-                }
+                let actions = lease.retry_actions(now, Vec::new());
                 self.actions(owner, actions, out);
             }
         }
         self.collect();
+    }
+
+    /// Called before the source FIFO is resumed, so expired leases release before survivor input.
+    pub fn expire_leases(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        let owners: Vec<_> = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.expires.is_some_and(|deadline| deadline <= now))
+            .map(|(&owner, _)| owner)
+            .collect();
+        for owner in owners {
+            self.cancel_targeting(owner);
+            if let Some(lease) = self.leases.get_mut(&owner) {
+                lease.expires = None;
+                let actions = lease.ledger.release_all();
+                let actions = lease.retry_actions(now, actions);
+                self.actions(owner, actions, out);
+            }
+        }
     }
 
     /// Returns a projection to end if its journal cannot confirm a successful release.
@@ -374,11 +517,31 @@ impl Ledgers {
 
     pub fn next_deadline(&self) -> Option<MonoTime> {
         self.leases
-            .values()
-            .flat_map(|lease| [lease.ledger.next_deadline(), lease.retry])
+            .iter()
+            .flat_map(|(&owner, lease)| {
+                let unissued = self
+                    .targeting
+                    .as_ref()
+                    .is_some_and(|targeting| targeting.owner == owner)
+                    || self
+                        .queued
+                        .iter()
+                        .any(|(projection, _)| *projection == owner);
+                [
+                    lease.ledger.next_deadline(),
+                    lease.retry,
+                    lease.expires.filter(|_| unissued),
+                ]
+            })
             .flatten()
+            .chain(self.targeting.as_ref().map(|targeting| targeting.deadline))
             .min()
     }
+}
+
+fn lease_deadline(now: MonoTime) -> MonoTime {
+    now.saturating_add(LEASE_TIMEOUT)
+        .saturating_add(Duration::from_nanos(1))
 }
 
 pub(super) fn split(

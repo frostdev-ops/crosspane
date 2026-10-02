@@ -305,6 +305,7 @@ impl E2 {
                 if let Some(owner) = self.ledgers.done(*id, *ok, now) {
                     self.end_source(owner, Reason::Failed, false, now, out);
                 }
+                self.source_inject_done(*id, *ok, now, out);
             }
             Input::Tick => {
                 self.source_tick(now, out);
