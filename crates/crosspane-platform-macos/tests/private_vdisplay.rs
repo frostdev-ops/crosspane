@@ -32,14 +32,20 @@ fn run_driver(live: bool) {
         "objc2_foundation",
         "objc2_app_kit",
         "objc2_application_services",
+        // permissions.rs asks for Microphone access through AVFoundation (WP-4.13a).
+        "objc2_av_foundation",
         "objc2_core_foundation",
         "objc2_core_graphics",
+        "block2",
         "dispatch2",
         "tracing",
     ] {
         let prefix = format!("lib{name}-");
         let native_version = if name == "objc2" {
             Some("objc2-0.6.4/".to_string())
+        } else if name == "block2" {
+            // The workspace also builds block2 0.5 for winit.
+            Some("block2-0.6.2/".to_string())
         } else if name.starts_with("objc2_") {
             Some(format!("{}-0.3.2/", name.replace('_', "-")))
         } else {
@@ -120,6 +126,11 @@ mod clock;
 #[cfg(crosspane_vdisplay_driver)]
 #[path = "../src/main_thread.rs"]
 mod main_thread;
+// private_vdisplay.rs names the twin display's vendor and product ids from this module.
+#[cfg(crosspane_vdisplay_driver)]
+#[allow(dead_code)]
+#[path = "../src/displays.rs"]
+mod displays;
 #[cfg(crosspane_vdisplay_driver)]
 #[allow(dead_code)]
 #[path = "../src/permissions.rs"]

@@ -166,6 +166,9 @@ pub fn permission_reason(permission: Permission) -> &'static str {
         Permission::InputMonitoring => {
             "Input Monitoring — to move this Mac's keyboard and mouse to another machine"
         }
+        Permission::Microphone => {
+            "Microphone — to hear the Crosspane speakers device; your real microphone is never opened"
+        }
         _ => "another permission",
     }
 }

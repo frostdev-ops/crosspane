@@ -115,7 +115,7 @@ fn off_main<T: Send>(
 
 /// Audio sharing is on unless `CROSSPANE_AUDIO=0` (an escape hatch, and how test harnesses keep an
 /// agent off the machine's audio server).
-fn audio_enabled() -> bool {
+pub(crate) fn audio_enabled() -> bool {
     std::env::var("CROSSPANE_AUDIO").as_deref() != Ok("0")
 }
 
@@ -610,7 +610,8 @@ pub fn create(
             .map(|o| Box::new(o) as Box<dyn OverlayHost>),
         hotkeys: None,
         keystore: keystore(),
-        permissions: Box::new(MacPermissions::new()),
+        // Microphone is required while audio is on: the speaker loopback input is gated by it.
+        permissions: Box::new(MacPermissions::new(audio_enabled())),
         windows: windows.map(|w| Box::new(w) as Box<dyn WindowSource>),
         parking,
         frames: frames.map(|f| Box::new(f) as Box<dyn FrameCapture>),

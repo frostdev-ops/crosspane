@@ -612,6 +612,7 @@ fn permission_name(permission: Permission) -> &'static str {
         Permission::ScreenRecording => "screen_recording",
         Permission::Accessibility => "accessibility",
         Permission::InputMonitoring => "input_monitoring",
+        Permission::Microphone => "microphone",
         _ => "other",
     }
 }
@@ -626,7 +627,10 @@ fn state_name(state: PermissionState) -> &'static str {
 
 #[cfg(target_os = "macos")]
 fn platform_permissions() -> Box<dyn Permissions> {
-    Box::new(crosspane_platform_macos::permissions::MacPermissions::new())
+    // Microphone is required unless audio is off (`CROSSPANE_AUDIO=0`), as in `platform::create`.
+    Box::new(crosspane_platform_macos::permissions::MacPermissions::new(
+        platform::audio_enabled(),
+    ))
 }
 
 #[cfg(target_os = "linux")]
