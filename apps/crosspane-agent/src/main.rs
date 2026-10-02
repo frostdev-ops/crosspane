@@ -263,21 +263,32 @@ fn request_permissions_daily(state_dir: &std::path::Path, platform: &mut platfor
 
 fn run() -> Result<()> {
     let paths = Paths::new()?;
+    run_with_startup(&paths, start_agent)
+}
+
+fn run_with_startup(
+    paths: &Paths,
+    start: impl FnOnce(
+        &Paths,
+        &mut lifecycle::Lifecycle,
+        &mut lifecycle::Failure,
+    ) -> Result<Option<Started>>,
+) -> Result<()> {
     // One agent per user, settled before anything touches the session: creating the platform
     // recovers parked windows, which would un-hide a running agent's projections. The lock is
     // held for the life of the process (close-on-exec, so a restart in place takes it again).
     let lock_path = paths.instance_lock();
-    let _lock = lifecycle::instance_lock(&paths)
-        .with_context(|| format!("open {}", lock_path.display()))?;
+    let _lock =
+        lifecycle::instance_lock(paths).with_context(|| format!("open {}", lock_path.display()))?;
     _lock.try_lock().map_err(|_| {
         anyhow::anyhow!(
             "another crosspane-agent is already running for this user ({} is locked)",
             lock_path.display()
         )
     })?;
-    let mut lifecycle = lifecycle::Lifecycle::start(&paths)?;
+    let mut lifecycle = lifecycle::Lifecycle::start(paths)?;
     let mut failure = lifecycle::Failure::Other;
-    let started = start_agent(&paths, &mut lifecycle, &mut failure);
+    let started = start(paths, &mut lifecycle, &mut failure);
     let Some(started) = (match started {
         Ok(started) => started,
         Err(error) => {
@@ -297,6 +308,8 @@ struct Started {
     startup: Vec<crosspane_engine::Output>,
     rx: std::sync::mpsc::Receiver<agent::Event>,
     tx: std::sync::mpsc::Sender<agent::Event>,
+    #[cfg(target_os = "linux")]
+    host_shutdown: Option<crosspane_render::proxy::HostHandle>,
     host: Option<crosspane_render::proxy::ProxyHost>,
 }
 
@@ -400,6 +413,11 @@ fn start_agent(
     let net = net::Net::start(config.port, identity.clone(), pins, hello, tx.clone())?;
     // A failed bind leaves `transport_slot` empty and the worker dropped with it.
     let _ = transport_slot.set(net.transport());
+    #[cfg(target_os = "linux")]
+    stop_on_signal(&net.runtime(), tx.clone()).inspect_err(|error| {
+        tracing::error!(%error, "could not install signal handlers");
+    })?;
+    #[cfg(not(target_os = "linux"))]
     stop_on_signal(&net.runtime(), tx.clone());
     #[cfg(target_os = "linux")]
     platform::watch_compositor({
@@ -474,6 +492,8 @@ fn start_agent(
         startup,
         rx,
         tx,
+        #[cfg(target_os = "linux")]
+        host_shutdown: host.as_ref().map(|(_, handle)| handle.clone()),
         host: host.map(|(host, _)| host),
     }))
 }
@@ -520,6 +540,21 @@ fn start_audio(
 
 /// SIGTERM or SIGINT asks the engine loop to stop cleanly (`Agent::shutdown`); a second one exits at
 /// once, in case the clean stop hangs.
+#[cfg(target_os = "linux")]
+fn stop_on_signal(
+    runtime: &tokio::runtime::Handle,
+    events: std::sync::mpsc::Sender<agent::Event>,
+) -> Result<()> {
+    let _ = runtime;
+    start_linux_signals(events, |task| {
+        std::thread::Builder::new()
+            .name("stop-signals".into())
+            .spawn(task)
+            .map(|_| ())
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
 fn stop_on_signal(runtime: &tokio::runtime::Handle, events: std::sync::mpsc::Sender<agent::Event>) {
     use tokio::signal::unix::{SignalKind, signal};
     runtime.spawn(async move {
@@ -543,6 +578,60 @@ fn stop_on_signal(runtime: &tokio::runtime::Handle, events: std::sync::mpsc::Sen
     });
 }
 
+/// Net is dropped by `Agent::run` before its receipt and the host's teardown. Keep the second
+/// signal listener on its own runtime until process exit, including when that teardown stalls.
+#[cfg(target_os = "linux")]
+fn start_linux_signals(
+    events: std::sync::mpsc::Sender<agent::Event>,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (setup, ready) = std::sync::mpsc::channel();
+    // Spawn first: failure must not install Tokio's permanent process-wide signal hooks.
+    spawn(Box::new(move || {
+        let prepared = (|| -> Result<_> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("start signal runtime")?;
+            let (term, int) = {
+                let _entered = runtime.enter();
+                (
+                    signal(SignalKind::terminate()).context("listen for SIGTERM")?,
+                    signal(SignalKind::interrupt()).context("listen for SIGINT")?,
+                )
+            };
+            Ok((runtime, term, int))
+        })();
+        let (runtime, mut term, mut int) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = setup.send(Err(error));
+                return;
+            }
+        };
+        if setup.send(Ok(())).is_err() {
+            return;
+        }
+        runtime.block_on(async move {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            let _ = events.send(agent::Event::Shutdown);
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            std::process::exit(1);
+        });
+    }))
+    .context("spawn signal thread")?;
+    // Startup cannot reach Ready unless both listeners were installed successfully.
+    ready.recv().context("signal thread ended before setup")?
+}
+
 /// Run the engine loop on its own thread and the proxy host (if any) on this, the main thread.
 /// Without a host on Linux, the engine loop runs here; on macOS the AppKit loop always owns the
 /// main thread.
@@ -552,33 +641,76 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
         startup,
         rx,
         tx,
+        #[cfg(target_os = "linux")]
+        host_shutdown,
         host,
     } = started;
     match host {
         Some(host) => {
             let host_tx = tx.clone();
             let stop_tx = tx.clone();
-            std::thread::Builder::new()
-                .name("engine".into())
-                .spawn(move || {
-                    let stopped = exit_on_panic("engine", || agent.run(startup, &rx));
-                    drop(tx);
-                    finish_run_or_exit(lifecycle, stopped);
-                    std::process::exit(stop_status());
-                })
-                .context("spawn engine thread")?;
-            if let Err(error) = host.run(Box::new(move |event| {
-                let _ = host_tx.send(agent::Event::Host(event));
-            })) {
-                // Usually the display server went away. The engine thread stops cleanly and ends
-                // the process.
-                tracing::error!(%error, "the proxy window host failed; stopping");
-                stop_for_restart(&stop_tx);
-                loop {
-                    std::thread::park();
+            #[cfg(target_os = "linux")]
+            {
+                let host_shutdown = host_shutdown.context("missing proxy host shutdown handle")?;
+                let restart = run_linux_host(
+                    move || {
+                        let stopped = exit_on_panic("engine", || agent.run(startup, &rx));
+                        drop(tx);
+                        let restart = stopped.restart;
+                        lifecycle
+                            .stopped(stopped.outcomes)
+                            .inspect_err(|error| {
+                                tracing::error!(%error, "could not write the exit receipt");
+                            })
+                            .context("could not write the exit receipt")?;
+                        Ok(restart)
+                    },
+                    move || {
+                        host.run(Box::new(move |event| {
+                            let _ = host_tx.send(agent::Event::Host(event));
+                        }))
+                        .map_err(anyhow::Error::from)
+                    },
+                    move || {
+                        let _ = host_shutdown.send(crosspane_render::proxy::HostCommand::Shutdown);
+                    },
+                    move |error| {
+                        tracing::error!(%error, "the proxy window host failed; stopping");
+                        stop_for_restart(&stop_tx);
+                    },
+                    || platform::exit_deadline(std::time::Duration::from_secs(5)),
+                )?;
+                if restart {
+                    agent::restart();
                 }
+                // The host's graphics resources and the engine are gone before libc's exit
+                // handlers run. Exiting from the worker raced those handlers with host teardown.
+                std::process::exit(stop_status());
             }
-            Ok(())
+            #[cfg(not(target_os = "linux"))]
+            {
+                std::thread::Builder::new()
+                    .name("engine".into())
+                    .spawn(move || {
+                        let stopped = exit_on_panic("engine", || agent.run(startup, &rx));
+                        drop(tx);
+                        finish_run_or_exit(lifecycle, stopped);
+                        std::process::exit(stop_status());
+                    })
+                    .context("spawn engine thread")?;
+                if let Err(error) = host.run(Box::new(move |event| {
+                    let _ = host_tx.send(agent::Event::Host(event));
+                })) {
+                    // Usually the display server went away. The engine thread stops cleanly and ends
+                    // the process.
+                    tracing::error!(%error, "the proxy window host failed; stopping");
+                    stop_for_restart(&stop_tx);
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                Ok(())
+            }
         }
         None => {
             #[cfg(target_os = "macos")]
@@ -609,6 +741,37 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
     }
 }
 
+/// The engine completes all shutdown work and attempts its receipt before the host is asked to
+/// stop. Until that handback, SIGTERM relies on the service's stop timeout (or a second signal).
+/// The existing five-second deadline bounds only the remaining host/GPU teardown and thread join;
+/// compositor-loss deadlines are independently armed as before.
+#[cfg(target_os = "linux")]
+fn run_linux_host(
+    run_engine: impl FnOnce() -> Result<bool> + Send + 'static,
+    run_host: impl FnOnce() -> Result<()>,
+    stop_host: impl FnOnce() + Send + 'static,
+    host_failed: impl FnOnce(anyhow::Error),
+    teardown_deadline: impl FnOnce() + Send + 'static,
+) -> Result<bool> {
+    let engine = std::thread::Builder::new()
+        .name("engine".into())
+        .spawn(move || {
+            let result = run_engine();
+            // Even a failed receipt write leaves the shutdown body complete. Bound teardown
+            // without treating that failure as proof of a clean stop.
+            teardown_deadline();
+            stop_host();
+            result
+        })
+        .context("spawn engine thread")?;
+    if let Err(error) = run_host() {
+        host_failed(error);
+    }
+    engine
+        .join()
+        .map_err(|_| anyhow::anyhow!("engine thread panicked"))?
+}
+
 fn finish_run(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) -> Result<()> {
     lifecycle.stopped(stopped.outcomes)?;
     if stopped.restart {
@@ -617,6 +780,7 @@ fn finish_run(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) -> Resul
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn finish_run_or_exit(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) {
     if let Err(error) = finish_run(lifecycle, stopped) {
         tracing::error!(%error, "could not write the exit receipt");
@@ -776,6 +940,447 @@ fn is_elevated() -> bool {
                 .map(|o| o.stdout.starts_with(b"0\n"))
                 .unwrap_or(false)
         })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod host_exit_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, mpsc};
+    use std::time::{Duration, Instant};
+
+    type Trace = Arc<Mutex<Vec<&'static str>>>;
+
+    struct RecordedDrop(Trace, &'static str);
+
+    impl Drop for RecordedDrop {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push(self.1);
+        }
+    }
+
+    thread_local! {
+        static ENGINE_TLS: RefCell<Option<RecordedDrop>> = const { RefCell::new(None) };
+    }
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let next = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("crosspane-host-exit-{}-{next}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn paths(&self) -> Paths {
+            Paths {
+                config_dir: self.0.clone(),
+                state_dir: self.0.clone(),
+                runtime_dir: self.0.clone(),
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn receipt(paths: &Paths) -> Result<()> {
+        let mut lifecycle = lifecycle::Lifecycle::start(paths)?;
+        lifecycle.phase(lifecycle::Phase::Ready, None)?;
+        lifecycle.stopped(lifecycle::Shutdown {
+            parking: lifecycle::Parking::NothingParked,
+            input_journals_empty: true,
+            audio_stopped: true,
+        })
+    }
+
+    fn wait_for_child_marker(child: &mut std::process::Child, marker: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.is_file() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("owned child exited before {}: {status}", marker.display());
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("owned child did not reach {}", marker.display());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn signal_thread_spawn_failure_exits_one_before_ready() {
+        const CHILD: &str = "CROSSPANE_SIGNAL_SPAWN_FAILURE_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let paths = Paths {
+                config_dir: dir.clone(),
+                state_dir: dir.clone(),
+                runtime_dir: dir,
+            };
+            // Exercise the real startup error/phase boundary without creating OS backends.
+            let result = run_with_startup(&paths, |_, lifecycle, _| {
+                let (events, _receiving) = mpsc::channel();
+                start_linux_signals(events, |_task| {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                })?;
+                lifecycle.phase(lifecycle::Phase::Ready, None)?;
+                Ok(None)
+            });
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    // Match the binary's Result termination rather than the test harness's 101.
+                    eprintln!("Error: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        let fixture = Fixture::new();
+        let error_path = fixture.0.join("startup-error.log");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host_exit_tests::signal_thread_spawn_failure_exits_one_before_ready",
+                "--nocapture",
+            ])
+            .env(CHILD, &fixture.0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&error_path).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("the owned child continued after signal setup failed");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(1));
+        let bootstrap: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.0.join("bootstrap.json")).unwrap())
+                .unwrap();
+        assert_eq!(bootstrap["phase"], "failed");
+        assert!(
+            std::fs::read_to_string(error_path)
+                .unwrap()
+                .contains("spawn signal thread")
+        );
+    }
+
+    #[test]
+    fn second_term_or_int_after_receipt_attempt_exits_one_during_blocked_teardown() {
+        const CHILD: &str = "CROSSPANE_SECOND_SIGNAL_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let paths = Paths {
+                config_dir: dir.clone(),
+                state_dir: dir.clone(),
+                runtime_dir: dir.clone(),
+            };
+            let fail = std::env::var("CROSSPANE_SECOND_SIGNAL_TEST_FAIL").unwrap() == "1";
+            let net_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (events, stopping) = mpsc::channel();
+            stop_on_signal(net_runtime.handle(), events).unwrap();
+            std::fs::write(dir.join("signals-ready"), "ready").unwrap();
+            let (stop_host, host_stopping) = mpsc::channel();
+            let _ = run_linux_host(
+                move || {
+                    assert!(matches!(
+                        stopping.recv_timeout(Duration::from_secs(3)).unwrap(),
+                        agent::Event::Shutdown
+                    ));
+                    // Match Agent::run: Net's runtime is gone before the receipt attempt.
+                    drop(net_runtime);
+                    let mut lifecycle = lifecycle::Lifecycle::start(&paths)?;
+                    lifecycle.phase(lifecycle::Phase::Ready, None)?;
+                    if fail {
+                        std::fs::create_dir(paths.state_dir.join("last_exit.json"))?;
+                    }
+                    let result = lifecycle.stopped(lifecycle::Shutdown {
+                        parking: lifecycle::Parking::NothingParked,
+                        input_journals_empty: true,
+                        audio_stopped: true,
+                    });
+                    std::fs::write(
+                        paths.state_dir.join("receipt-attempted"),
+                        if result.is_ok() { "written" } else { "failed" },
+                    )?;
+                    result.map(|()| false)
+                },
+                move || {
+                    host_stopping.recv_timeout(Duration::from_secs(3)).unwrap();
+                    std::fs::write(dir.join("teardown-blocked"), "blocked").unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                },
+                move || stop_host.send(()).unwrap(),
+                |_| panic!("fake host did not fail"),
+                || platform::exit_deadline(Duration::from_secs(5)),
+            );
+            panic!("blocked teardown unexpectedly returned");
+        }
+        for fail in [false, true] {
+            for first in [rustix::process::Signal::TERM, rustix::process::Signal::INT] {
+                for second in [rustix::process::Signal::TERM, rustix::process::Signal::INT] {
+                    let fixture = Fixture::new();
+                    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "host_exit_tests::second_term_or_int_after_receipt_attempt_exits_one_during_blocked_teardown",
+                        ])
+                        .env(CHILD, &fixture.0)
+                        .env("CROSSPANE_SECOND_SIGNAL_TEST_FAIL", if fail { "1" } else { "0" })
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    let pid =
+                        rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+                    wait_for_child_marker(&mut child, &fixture.0.join("signals-ready"));
+                    rustix::process::kill_process(pid, first).unwrap();
+                    wait_for_child_marker(&mut child, &fixture.0.join("teardown-blocked"));
+                    assert_eq!(
+                        std::fs::read_to_string(fixture.0.join("receipt-attempted")).unwrap(),
+                        if fail { "failed" } else { "written" }
+                    );
+                    let started = Instant::now();
+                    rustix::process::kill_process(pid, second).unwrap();
+                    let status = loop {
+                        if let Some(status) = child.try_wait().unwrap() {
+                            break status;
+                        }
+                        if started.elapsed() >= Duration::from_secs(2) {
+                            child.kill().unwrap();
+                            let _ = child.wait();
+                            panic!(
+                                "second {second:?} did not stop the owned child after {first:?}"
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    };
+                    assert_eq!(status.code(), Some(1), "{first:?} then {second:?}");
+                    assert!(started.elapsed() < Duration::from_secs(2));
+                    let receipt = fixture.0.join("last_exit.json");
+                    if fail {
+                        assert!(receipt.is_dir());
+                    } else {
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+                        assert_eq!(value["clean"], true);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_teardown_and_engine_tls_finish_before_main_exit() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+        let engine_trace = trace.clone();
+        let host_trace = trace.clone();
+        let deadline_trace = trace.clone();
+        let deadline_paths = paths.clone();
+        let (stop, stopping) = mpsc::channel();
+        let main_thread = std::thread::current().id();
+        let restart = run_linux_host(
+            move || {
+                ENGINE_TLS.with(|slot| {
+                    *slot.borrow_mut() = Some(RecordedDrop(engine_trace.clone(), "engine TLS"));
+                });
+                let agent = RecordedDrop(engine_trace.clone(), "agent dropped");
+                drop(agent);
+                receipt(&paths)?;
+                engine_trace.lock().unwrap().push("receipt");
+                Ok(true)
+            },
+            move || {
+                let _host = RecordedDrop(host_trace, "host dropped");
+                stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(std::thread::current().id(), main_thread);
+                Ok(())
+            },
+            move || stop.send(()).unwrap(),
+            |_| panic!("fake host did not fail"),
+            move || {
+                assert!(deadline_paths.state_dir.join("last_exit.json").is_file());
+                deadline_trace.lock().unwrap().push("deadline armed");
+            },
+        )
+        .unwrap();
+        assert!(
+            restart,
+            "the restart request must reach the main thread unchanged"
+        );
+        trace.lock().unwrap().push("main exit");
+        let trace = trace.lock().unwrap();
+        let position = |event| trace.iter().position(|entry| *entry == event).unwrap();
+        assert!(position("agent dropped") < position("receipt"));
+        assert!(position("receipt") < position("deadline armed"));
+        assert!(position("deadline armed") < position("host dropped"));
+        assert!(position("host dropped") < position("main exit"));
+        assert!(position("engine TLS") < position("main exit"));
+    }
+
+    #[test]
+    fn host_failure_still_waits_for_shutdown_and_the_exit_receipt() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let completed = paths.state_dir.join("last_exit.json");
+        let (stop_engine, stopping) = mpsc::channel();
+        let result = run_linux_host(
+            move || {
+                stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+                receipt(&paths)?;
+                Ok(false)
+            },
+            || bail!("fake compositor disappeared"),
+            || {},
+            move |error| {
+                assert_eq!(error.to_string(), "fake compositor disappeared");
+                stop_engine.send(()).unwrap();
+            },
+            || {},
+        )
+        .unwrap();
+        assert!(!result);
+        assert!(completed.is_file());
+    }
+
+    #[test]
+    fn receipt_write_error_returns_after_host_teardown_and_join() {
+        let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+        let host_trace = trace.clone();
+        let deadline_trace = trace.clone();
+        let (stop, stopping) = mpsc::channel();
+        let error = run_linux_host(
+            || bail!("could not write the exit receipt"),
+            move || {
+                let _host = RecordedDrop(host_trace, "host dropped");
+                stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            },
+            move || stop.send(()).unwrap(),
+            |_| panic!("fake host did not fail"),
+            move || deadline_trace.lock().unwrap().push("deadline armed"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "could not write the exit receipt");
+        assert_eq!(*trace.lock().unwrap(), ["deadline armed", "host dropped"]);
+    }
+
+    #[test]
+    fn post_receipt_deadline_bounds_hung_teardown_even_if_the_write_failed() {
+        const CHILD: &str = "CROSSPANE_HOST_EXIT_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let paths = Paths {
+                config_dir: dir.clone(),
+                state_dir: dir.clone(),
+                runtime_dir: dir,
+            };
+            let fail = std::env::var("CROSSPANE_HOST_EXIT_TEST_FAIL").unwrap() == "1";
+            let (stop, stopping) = mpsc::channel();
+            let _ = run_linux_host(
+                move || {
+                    let mut lifecycle = lifecycle::Lifecycle::start(&paths)?;
+                    lifecycle.phase(lifecycle::Phase::Ready, None)?;
+                    if fail {
+                        // Refuse the atomic receipt rename after the complete fake shutdown.
+                        std::fs::create_dir(paths.state_dir.join("last_exit.json"))?;
+                    }
+                    let result = lifecycle.stopped(lifecycle::Shutdown {
+                        parking: lifecycle::Parking::NothingParked,
+                        input_journals_empty: true,
+                        audio_stopped: true,
+                    });
+                    std::fs::write(
+                        paths.state_dir.join("receipt-attempted"),
+                        if result.is_ok() { "written" } else { "failed" },
+                    )?;
+                    result.map(|()| false)
+                },
+                move || {
+                    stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                },
+                move || stop.send(()).unwrap(),
+                |_| panic!("fake host did not fail"),
+                || platform::exit_deadline(Duration::from_millis(100)),
+            );
+            panic!("hung teardown unexpectedly returned");
+        }
+        for fail in [false, true] {
+            let fixture = Fixture::new();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host_exit_tests::post_receipt_deadline_bounds_hung_teardown_even_if_the_write_failed",
+                ])
+                .env(CHILD, &fixture.0)
+                .env("CROSSPANE_HOST_EXIT_TEST_FAIL", if fail { "1" } else { "0" })
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("the post-receipt deadline did not stop the owned child");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(status.signal(), Some(9));
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("receipt-attempted")).unwrap(),
+                if fail { "failed" } else { "written" }
+            );
+            let receipt = fixture.0.join("last_exit.json");
+            if fail {
+                assert!(
+                    receipt.is_dir(),
+                    "failed write must not produce a clean receipt"
+                );
+            } else {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+                assert_eq!(value["clean"], true);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

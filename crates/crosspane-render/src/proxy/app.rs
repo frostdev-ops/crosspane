@@ -432,11 +432,11 @@ fn set_cursor(
 impl ApplicationHandler<HostCommand> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.instance.is_none() {
-            self.instance = Some(wgpu::Instance::new(
+            self.instance = Some(wgpu::Instance::new(proxy_instance_descriptor(
                 wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
                     event_loop.owned_display_handle(),
                 )),
-            ));
+            )));
         }
         while let Some(command) = self.pending.pop_front() {
             self.command(event_loop, command);
@@ -571,6 +571,13 @@ impl ApplicationHandler<HostCommand> for App {
         }
         event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
+}
+
+fn proxy_instance_descriptor(mut descriptor: wgpu::InstanceDescriptor) -> wgpu::InstanceDescriptor {
+    // The proxy uses Vulkan/Metal. Unintended EGL initialization registers a driver atexit
+    // cleanup whose GLES debug callback logs after tracing's TLS destruction, aborting the agent.
+    descriptor.backends = wgpu::Backends::PRIMARY;
+    descriptor
 }
 
 impl Gpu {
@@ -1062,6 +1069,23 @@ fn window_scale(windows: &HashMap<u64, ProxyWindow>, id: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_backends_exclude_egl_and_keep_vulkan_and_metal() {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.flags = wgpu::InstanceFlags::empty();
+        descriptor.memory_budget_thresholds.for_resource_creation = Some(75);
+        let descriptor = proxy_instance_descriptor(descriptor);
+        assert!(!descriptor.backends.intersects(wgpu::Backends::GL));
+        assert!(descriptor.backends.contains(wgpu::Backends::VULKAN));
+        assert!(descriptor.backends.contains(wgpu::Backends::METAL));
+        assert_eq!(descriptor.flags, wgpu::InstanceFlags::empty());
+        assert_eq!(
+            descriptor.memory_budget_thresholds.for_resource_creation,
+            Some(75)
+        );
+        assert!(descriptor.display.is_none());
+    }
 
     #[test]
     fn content_then_present_counts_one() {

@@ -201,6 +201,16 @@ current_control() {
       ([.projections[] | select(.source == $source and .projection == $id)] | length == 1)' <<<"$b" >/dev/null
 }
 
+# The active projection on both agents, whatever E1 is doing.
+projection_active() {
+  local a b
+  a=$(status_json a 2>/dev/null) && b=$(status_json b 2>/dev/null) || return 1
+  jq -e --arg source "$source_a" --arg text "$projection_text" --argjson id "$projection_id" '
+    [.projections[] | select(.source == $source and .projection == $id and .text == $text)] | length == 1' <<<"$a" >/dev/null \
+    && jq -e --arg source "$source_a" --argjson id "$projection_id" '
+      [.projections[] | select(.source == $source and .projection == $id)] | length == 1' <<<"$b" >/dev/null
+}
+
 cross() { # A's virtual pointer pushes past A's right edge: E1 enters B
   { echo "abs 400 200"; for _ in $(seq 1 60); do echo "rel 20 0"; echo "sleep 10"; done
     echo "sleep 300"; for _ in $(seq 1 20); do echo "rel 15 5"; echo "sleep 10"; done; echo "sleep 300"
@@ -310,8 +320,17 @@ cx=$((px + pw / 2)); cy=$((py + ph / 2))
 motion_seen() { tail -n +$((before + 1)) "$(clean a)" | grep -F "in: link input peer=$source_b msg=Proj(Motion" > "$work/motion.log"; }
 wait_for 5 motion_seen || fail "A never received the proxy's motion report"
 sleep 2
-current_control || fail "current control or the active projection ended after proxy motion"
-echo "ok: both agents retain current control and the active projection after proxy motion"
+# B's virtual pointer is local input on B, the target (WP-1.43 sees the cursor where A's injector
+# didn't put it), so the owner rule (WP-1.42) hands control back: E1 may end, but only through that
+# handover, and the projection stays.
+projection_active || fail "the active projection ended after proxy motion"
+if current_control; then
+  echo "ok: both agents retain current control and the active projection after proxy motion"
+else
+  grep -qF "notice=e1e2-b was used locally: control returned" "$(clean a)" \
+    || fail "current control ended after proxy motion without the local-use handover"
+  echo "ok: B's local pointer motion handed control back (WP-1.42/1.43); the active projection stays"
+fi
 # The selected projection's observation must follow a fresh B motion before any new input.
 # It observes the missing local motion; it does not expose the engine's rejection reason.
 motion_observed_without_local_capture() {
@@ -400,6 +419,16 @@ echo "ok: stopping the agent removed our home bind"
 stop_agent b
 [ "$(bind_count b "$owner_desc")" = 1 ] || fail "stopping B removed the owner's binding"
 echo "ok: stopping the agent left the owner's binding alone"
+# A stopped agent exits through its shutdown path (WP-2.47): no abort or crash in its log, and the
+# clean-exit receipt (WP-4.6) written.
+for n in a b; do
+  ! grep -Eq "AccessError|Aborted|fatal runtime error|Segmentation fault|panicked at" "$(clean "$n")" \
+    || fail "agent $n crashed on exit: $(grep -Em3 "AccessError|Aborted|fatal runtime error|Segmentation fault|panicked at" "$work/$n/clean.log")"
+  receipt=$work/$n/state/crosspane/last_exit.json
+  [ -f "$receipt" ] && jq -e '.clean == true' "$receipt" >/dev/null \
+    || fail "agent $n left no clean exit receipt: $(cat "$receipt" 2>/dev/null || echo missing)"
+done
+echo "ok: both agents exited through their shutdown path, without a crash, and wrote a clean exit receipt"
 
 if [ "$parking" = Twin ]; then
   echo "PASS: start-up and stop cleanup, twin parking, current twin strips, placement, proxy motion without observed local capture motion and no home, idle twin watchdog rescue (entry and exit are live-only)"
