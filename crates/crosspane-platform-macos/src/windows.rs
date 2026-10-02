@@ -23,9 +23,10 @@ use objc2_core_foundation::{
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGError, CGGetDisplaysWithPoint, CGRectMakeWithDictionaryRepresentation,
+    CGDisplayBounds, CGError, CGGetDisplaysWithPoint, CGRectMakeWithDictionaryRepresentation,
     CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
-    kCGWindowLayer, kCGWindowName, kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
+    kCGWindowIsOnscreen, kCGWindowLayer, kCGWindowName, kCGWindowNumber, kCGWindowOwnerName,
+    kCGWindowOwnerPID,
 };
 
 use crate::{main_thread::on_main, permissions};
@@ -182,9 +183,44 @@ pub(crate) struct RawWindow {
     pub(crate) title: String,
     owner: String,
     pub(crate) frame: RectLogical,
+    /// `kCGWindowIsOnscreen`: the window is ordered in on a Space a display is showing. The key is
+    /// absent for windows on other Spaces, minimized and hidden windows.
+    pub(crate) on_screen: bool,
+}
+
+// Used by the private_vdisplay module's tests only.
+#[cfg(all(test, feature = "private-vdisplay"))]
+impl RawWindow {
+    /// A fixture without going through a Quartz dictionary.
+    pub(crate) fn fixture(id: u64, pid: i32, frame: RectLogical, on_screen: bool) -> Self {
+        Self {
+            id: WindowId(id),
+            pid,
+            title: String::new(),
+            owner: String::new(),
+            frame,
+            on_screen,
+        }
+    }
 }
 
 type QueryReply = mpsc::SyncSender<Result<Vec<RawWindow>, PlatformError>>;
+
+#[cfg(all(test, feature = "private-vdisplay"))]
+impl WindowQuery {
+    /// A query that answers from a script instead of WindowServer: one reply per request, then
+    /// `Timeout`. Lets tests make a Quartz read fail or change between operations.
+    pub(crate) fn scripted(replies: Vec<Result<Vec<RawWindow>, PlatformError>>) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<(bool, QueryReply)>(1);
+        std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            while let Ok((_, reply)) = rx.recv() {
+                let _ = reply.send(replies.next().unwrap_or(Err(PlatformError::Timeout)));
+            }
+        });
+        Self(tx)
+    }
+}
 
 /// A single worker bounds WindowServer waits without accumulating blocked query threads.
 #[derive(Clone, Debug)]
@@ -308,16 +344,68 @@ fn parse_window(dictionary: &CFDictionary) -> Option<RawWindow> {
             .map(|v| v.to_string())
             .unwrap_or_default()
     };
+    // SAFETY: immutable CFString constant exported by CoreGraphics. The key is absent (not false)
+    // for a window that isn't ordered on screen.
+    let on_screen = dictionary
+        .get(unsafe { kCGWindowIsOnscreen })
+        .and_then(|v| v.downcast::<CFBoolean>().ok())
+        .is_some_and(|v| v.as_bool());
     Some(RawWindow {
         id: WindowId(u64::from(id)),
         pid,
         title: string(name),
         owner: string(owner),
         frame,
+        on_screen,
     })
 }
 
-fn map_window(raw: RawWindow, app_id: String, display: Option<DisplayId>) -> WindowInfo {
+/// A window and its display's bounds are equal to this many points (Quartz reports whole points;
+/// the slack only absorbs rounding).
+const BOUNDS_SLACK: f64 = 1.0;
+
+/// Two Quartz or AX frames are the same window frame, within [`BOUNDS_SLACK`].
+pub(crate) fn bounds_equal(a: RectLogical, b: RectLogical) -> bool {
+    (a.origin.x - b.origin.x).abs() <= BOUNDS_SLACK
+        && (a.origin.y - b.origin.y).abs() <= BOUNDS_SLACK
+        && (a.size.width - b.size.width).abs() <= BOUNDS_SLACK
+        && (a.size.height - b.size.height).abs() <= BOUNDS_SLACK
+}
+
+/// The state the engine sees (docs/wp/FULLSCREEN-design.md §6): a window that isn't on screen is
+/// `Hidden` (another Space, minimized, hidden app) and stays in the list; an on-screen window that
+/// fills its display is `Fullscreen`; anything else is `Normal`. A window leaves the list only
+/// when it closes.
+fn window_state(on_screen: bool, frame: RectLogical, display: Option<RectLogical>) -> WindowState {
+    if !on_screen {
+        WindowState::Hidden
+    } else if display.is_some_and(|display| bounds_equal(frame, display)) {
+        WindowState::Fullscreen
+    } else {
+        WindowState::Normal
+    }
+}
+
+fn display_bounds(display: DisplayId) -> Option<RectLogical> {
+    let bounds = CGDisplayBounds(display.0);
+    let frame = RectLogical::new(
+        PointLogical::new(bounds.origin.x, bounds.origin.y),
+        SizeLogical::new(bounds.size.width, bounds.size.height),
+    );
+    valid_frame(frame).then_some(frame)
+}
+
+/// Regular (Dock-visible) apps other than the Dock itself own projectable windows.
+fn projectable_app(regular: bool, app_id: &str) -> bool {
+    regular && app_id != "com.apple.dock"
+}
+
+fn map_window(
+    raw: RawWindow,
+    app_id: String,
+    display: Option<DisplayId>,
+    display_bounds: Option<RectLogical>,
+) -> WindowInfo {
     WindowInfo {
         id: raw.id,
         title: raw.title,
@@ -325,41 +413,54 @@ fn map_window(raw: RawWindow, app_id: String, display: Option<DisplayId>) -> Win
         pid: u32::try_from(raw.pid).ok(),
         display,
         frame: raw.frame,
-        state: WindowState::Normal,
+        state: window_state(raw.on_screen, raw.frame, display_bounds),
         role: WindowRole::Toplevel,
         parent: None,
     }
 }
 
 fn snapshot(query: &WindowQuery) -> Result<(Vec<WindowInfo>, Option<WindowId>), PlatformError> {
-    let raw = query.list(false)?;
+    // Every window, on screen or not: a window on another Space (an app's fullscreen Space, say) is
+    // `Hidden`, not gone, so a projection of it never ends by `Removed` until it closes.
+    let raw = query.list(true)?;
     on_main(MAIN_WAIT, move |_| {
         autoreleasepool(|_| {
             let front = NSWorkspace::sharedWorkspace()
                 .frontmostApplication()
                 .map(|app| app.processIdentifier());
+            // The full list has every hidden window of every app: ask AppKit once per process.
+            let mut apps: HashMap<i32, Option<String>> = HashMap::new();
             let windows: Vec<_> = raw
                 .into_iter()
                 .filter_map(|raw| {
-                    let app =
-                        NSRunningApplication::runningApplicationWithProcessIdentifier(raw.pid)?;
-                    if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
-                        return None;
-                    }
-                    let app_id = app
-                        .bundleIdentifier()
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| raw.owner.clone());
-                    if app_id == "com.apple.dock" {
-                        return None;
-                    }
+                    let app_id = apps
+                        .entry(raw.pid)
+                        .or_insert_with(|| {
+                            let app =
+                                NSRunningApplication::runningApplicationWithProcessIdentifier(
+                                    raw.pid,
+                                )?;
+                            let regular =
+                                app.activationPolicy() == NSApplicationActivationPolicy::Regular;
+                            let app_id = app
+                                .bundleIdentifier()
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| raw.owner.clone());
+                            projectable_app(regular, &app_id).then_some(app_id)
+                        })
+                        .clone()?;
                     let display = display_for_frame(raw.frame).ok();
-                    Some(map_window(raw, app_id, display))
+                    let bounds = display.and_then(display_bounds);
+                    Some(map_window(raw, app_id, display, bounds))
                 })
                 .collect();
+            // Keyboard focus is on a window that is showing, not on one of the app's hidden ones.
             let focused = windows
                 .iter()
-                .find(|w| w.pid.and_then(|p| i32::try_from(p).ok()) == front)
+                .find(|w| {
+                    w.state != WindowState::Hidden
+                        && w.pid.and_then(|p| i32::try_from(p).ok()) == front
+                })
                 .map(|w| w.id);
             (windows, focused)
         })
@@ -424,6 +525,117 @@ fn ax_result(status: AXError) -> Result<(), PlatformError> {
     }
 }
 
+/// What the matcher knows of one AX window of the app.
+#[derive(Clone, Debug, PartialEq)]
+struct AxCandidate {
+    /// `AXTitle`; `None` when it wasn't read (the Quartz window is untitled).
+    title: Option<String>,
+    frame: RectLogical,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AxMatch {
+    One(usize),
+    /// Several windows are equally good matches; moving any of them could be wrong.
+    Ambiguous,
+    /// No AX window is this Quartz window.
+    Missing,
+}
+
+/// The outcome of looking up a Quartz window in its app's AX windows.
+#[derive(Debug)]
+pub(crate) enum AxLookup {
+    Found(AxWindow),
+    /// AX has no window for it (the description names frames only).
+    Missing(String),
+}
+
+/// Which callers a lookup serves, and so how strictly it matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AxPolicy {
+    /// M1 mirror parking (`parking.rs`): the policy from before WP-2.45a, unchanged. The title
+    /// is a filter, and a lone candidate matches whatever its frame.
+    Mirror,
+    /// M2 twin parking: the title is a preference, and there is no lone-candidate fallback. A
+    /// window is another window unless its title or its frame says it is this one.
+    #[cfg_attr(not(feature = "private-vdisplay"), allow(dead_code))]
+    Twin,
+}
+
+/// The slack between the Quartz frame and an AX frame of the same window, in points.
+const AX_SLACK: f64 = 2.0;
+
+fn ax_frame_matches(a: RectLogical, b: RectLogical) -> bool {
+    (a.origin.x - b.origin.x).abs() <= AX_SLACK
+        && (a.origin.y - b.origin.y).abs() <= AX_SLACK
+        && (a.size.width - b.size.width).abs() <= AX_SLACK
+        && (a.size.height - b.size.height).abs() <= AX_SLACK
+}
+
+/// Pick the AX window that is the Quartz window `title`/`frame`, by `policy`.
+fn match_ax_window(
+    policy: AxPolicy,
+    title: &str,
+    frame: RectLogical,
+    candidates: &[AxCandidate],
+) -> AxMatch {
+    match policy {
+        AxPolicy::Mirror => match_mirror(title, frame, candidates),
+        AxPolicy::Twin => match_twin(title, frame, candidates),
+    }
+}
+
+/// The previous matching, exactly: candidates are the AX windows with the Quartz window's title
+/// (all of them when it has none). The frame only picks between several candidates: right after an
+/// AX move or resize Quartz still reports the old frame for a while, so a lone candidate matches
+/// whatever its frame.
+fn match_mirror(title: &str, frame: RectLogical, candidates: &[AxCandidate]) -> AxMatch {
+    let titled = !title.is_empty();
+    let pool: Vec<usize> = (0..candidates.len())
+        .filter(|&i| !titled || candidates[i].title.as_deref() == Some(title))
+        .collect();
+    let framed: Vec<usize> = pool
+        .iter()
+        .copied()
+        .filter(|&i| ax_frame_matches(candidates[i].frame, frame))
+        .collect();
+    match (framed.as_slice(), pool.len()) {
+        ([one], _) => AxMatch::One(*one),
+        ([], 1) => AxMatch::One(pool[0]),
+        ([_, _, ..], _) => AxMatch::Ambiguous,
+        _ => AxMatch::Missing,
+    }
+}
+
+/// The twin's matching: in order, an AX window with the title and the frame, with the title, with
+/// the frame. Equal candidates are `Ambiguous`. Right after an AX move Quartz still reports the old
+/// frame for a while, so a window with the title matches whatever its frame. A window whose title
+/// differs or is empty is the one only if its frame matches the Quartz frame. There is no lone-
+/// window fallback: WebKit's fullscreen window is title-less and often the only AX window while the
+/// page's own window sits on another Space, and writing through it moves the wrong window.
+fn match_twin(title: &str, frame: RectLogical, candidates: &[AxCandidate]) -> AxMatch {
+    let titled = !title.is_empty();
+    let title_is = |c: &AxCandidate| titled && c.title.as_deref() == Some(title);
+    let frame_is = |c: &AxCandidate| ax_frame_matches(c.frame, frame);
+    let tiers: [&dyn Fn(&AxCandidate) -> bool; 3] =
+        [&|c| title_is(c) && frame_is(c), &|c| title_is(c), &|c| {
+            frame_is(c)
+        }];
+    for tier in tiers {
+        let mut hits = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| tier(c))
+            .map(|(index, _)| index);
+        match (hits.next(), hits.next()) {
+            (None, _) => {}
+            (Some(one), None) => return AxMatch::One(one),
+            (Some(_), Some(_)) => return AxMatch::Ambiguous,
+        }
+    }
+    AxMatch::Missing
+}
+
 /// AX attribute names are public string macros in HIServices/AXAttributeConstants.h; the
 /// generated crate omits those macros. AXRaise is from HIServices/AXActionConstants.h.
 #[derive(Debug)]
@@ -447,17 +659,37 @@ impl AxWindow {
     }
 
     fn attribute(&self, name: &str) -> Result<CFRetained<CFType>, PlatformError> {
+        self.attribute_opt(name)?
+            .ok_or_else(|| PlatformError::Backend("empty AX attribute".into()))
+    }
+
+    /// `Ok(None)`: the element has no such attribute, or it has no value (a window without a title
+    /// or a full-screen button).
+    fn attribute_opt(&self, name: &str) -> Result<Option<CFRetained<CFType>>, PlatformError> {
         self.prepare()?;
         let mut value = std::ptr::null();
         // SAFETY: valid retained element/name and writable output pointer. Copy returns +1 ownership.
-        ax_result(unsafe {
+        let status = unsafe {
             self.element
                 .copy_attribute_value(&CFString::from_str(name), NonNull::from(&mut value))
-        })?;
-        let value = NonNull::new(value.cast_mut())
-            .ok_or_else(|| PlatformError::Backend("empty AX attribute".into()))?;
+        };
+        if matches!(status, AXError::AttributeUnsupported | AXError::NoValue) {
+            return Ok(None);
+        }
+        ax_result(status)?;
         // SAFETY: successful Copy supplied a non-null +1 CF object, now owned by this handle.
-        Ok(unsafe { CFRetained::from_raw(value) })
+        Ok(NonNull::new(value.cast_mut()).map(|value| unsafe { CFRetained::from_raw(value) }))
+    }
+
+    /// The window's `AXTitle`; empty when it has none.
+    fn title(&self) -> Result<String, PlatformError> {
+        match self.attribute_opt("AXTitle")? {
+            None => Ok(String::new()),
+            Some(title) => title
+                .downcast::<CFString>()
+                .map(|title| title.to_string())
+                .map_err(|_| PlatformError::Backend("AXTitle is not a string".into())),
+        }
     }
 
     fn set(&self, name: &str, value: &CFType) -> Result<(), PlatformError> {
@@ -478,7 +710,31 @@ impl AxWindow {
         }
     }
 
+    /// The AX window of `raw` for M1 mirror parking, or an error where AX has none. This is the
+    /// matching `parking.rs` had before WP-2.45a, unchanged ([`AxPolicy::Mirror`]); twin parking
+    /// uses [`AxWindow::lookup`].
     pub(crate) fn find(raw: &RawWindow, deadline: Instant) -> Result<Self, PlatformError> {
+        match Self::lookup_with(raw, deadline, AxPolicy::Mirror)? {
+            AxLookup::Found(window) => Ok(window),
+            AxLookup::Missing(why) => Err(PlatformError::Backend(why)),
+        }
+    }
+
+    /// Match the Quartz window to one of its app's AX windows by the twin's policy
+    /// ([`AxPolicy::Twin`]). AX lists only the windows on Spaces a display is showing, so a window
+    /// on another Space (or one covered by a title-less fullscreen stand-in) has no AX
+    /// counterpart: that is [`AxLookup::Missing`], not an error, and callers decide whether it
+    /// matters.
+    #[cfg(feature = "private-vdisplay")]
+    pub(crate) fn lookup(raw: &RawWindow, deadline: Instant) -> Result<AxLookup, PlatformError> {
+        Self::lookup_with(raw, deadline, AxPolicy::Twin)
+    }
+
+    fn lookup_with(
+        raw: &RawWindow,
+        deadline: Instant,
+        policy: AxPolicy,
+    ) -> Result<AxLookup, PlatformError> {
         require_accessibility()?;
         let app = Self::application(raw.pid, deadline);
         let values = app
@@ -488,14 +744,8 @@ impl AxWindow {
         // SAFETY: the public AXWindows attribute is an array of AXUIElement CF objects;
         // each element is additionally downcast before use.
         let values = unsafe { values.cast_unchecked::<CFType>() };
-        // Candidates: the app's AX windows with the Quartz window's title (all of them when it
-        // has none). The frame only picks between several candidates: right after an AX move
-        // or resize, Quartz still reports the old frame for a while, so a lone candidate matches
-        // whatever its frame.
+        let mut windows = Vec::new();
         let mut candidates = Vec::new();
-        let mut framed = Vec::new();
-        // What each AX window looked like, for the error when none matches.
-        let mut seen = Vec::new();
         for value in values.iter() {
             let element = value
                 .downcast::<AXUIElement>()
@@ -506,49 +756,75 @@ impl AxWindow {
                 Err(PlatformError::NotFound) => continue,
                 Err(error) => return Err(error),
             };
-            seen.push(format!(
-                "({:.0},{:.0} {:.0}x{:.0})",
-                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
-            ));
-            if !raw.title.is_empty() {
-                let title = window
-                    .attribute("AXTitle")?
-                    .downcast::<CFString>()
-                    .map_err(|_| PlatformError::Backend("AXTitle is not a string".into()))?;
-                if title.to_string() != raw.title {
-                    seen.push(format!("title {:?}", title.to_string()));
-                    continue;
-                }
-            }
-            if (frame.origin.x - raw.frame.origin.x).abs() <= 2.0
-                && (frame.origin.y - raw.frame.origin.y).abs() <= 2.0
-                && (frame.size.width - raw.frame.size.width).abs() <= 2.0
-                && (frame.size.height - raw.frame.size.height).abs() <= 2.0
-            {
-                framed.push(candidates.len());
-            }
-            candidates.push(window);
+            // Only worth a round trip when Quartz has a title. Mirror reads it as it always did,
+            // failing on a window whose title can't be read; the twin treats that as untitled.
+            let title = if raw.title.is_empty() {
+                None
+            } else if policy == AxPolicy::Mirror {
+                Some(
+                    window
+                        .attribute("AXTitle")?
+                        .downcast::<CFString>()
+                        .map_err(|_| PlatformError::Backend("AXTitle is not a string".into()))?
+                        .to_string(),
+                )
+            } else {
+                Some(window.title()?)
+            };
+            candidates.push(AxCandidate { title, frame });
+            windows.push(window);
         }
-        let pick = match (framed.as_slice(), candidates.len()) {
-            ([one], _) => Some(*one),
-            ([], 1) => Some(0),
-            ([_, _, ..], _) => {
-                return Err(PlatformError::Backend("ambiguous AX window match".into()));
-            }
-            _ => None,
-        };
-        match pick {
-            Some(index) => Ok(candidates.swap_remove(index)),
-            None => Err(PlatformError::Backend(format!(
+        match match_ax_window(policy, &raw.title, raw.frame, &candidates) {
+            AxMatch::One(index) => Ok(AxLookup::Found(windows.swap_remove(index))),
+            AxMatch::Ambiguous => Err(PlatformError::Backend("ambiguous AX window match".into())),
+            // Frames only: titles never go into logs.
+            AxMatch::Missing => Ok(AxLookup::Missing(format!(
                 "Quartz window ({:.0},{:.0} {:.0}x{:.0}) has no matching AX window among {} [{}]",
                 raw.frame.origin.x,
                 raw.frame.origin.y,
                 raw.frame.size.width,
                 raw.frame.size.height,
                 values.len(),
-                seen.join(" "),
+                candidates
+                    .iter()
+                    .map(|c| format!(
+                        "({:.0},{:.0} {:.0}x{:.0})",
+                        c.frame.origin.x, c.frame.origin.y, c.frame.size.width, c.frame.size.height
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" "),
             ))),
         }
+    }
+
+    /// Press the window's full-screen button (`kAXFullScreenButtonAttribute`, `kAXPressAction`),
+    /// which toggles native fullscreen. `Ok(false)`: the window has no such button (a title-less
+    /// window, an app that doesn't do native fullscreen) and nothing was pressed.
+    #[cfg(feature = "private-vdisplay")]
+    pub(crate) fn press_fullscreen_button(&self) -> Result<bool, PlatformError> {
+        let Some(button) = self.attribute_opt("AXFullScreenButton")? else {
+            return Ok(false);
+        };
+        let element = button
+            .downcast::<AXUIElement>()
+            .map_err(|_| PlatformError::Backend("AXFullScreenButton is not an element".into()))?;
+        let button = Self {
+            element,
+            deadline: self.deadline,
+        };
+        button.prepare()?;
+        // SAFETY: valid retained AX button element; AXPress is a public action name
+        // (HIServices/AXActionConstants.h kAXPressAction).
+        let status = unsafe {
+            button
+                .element
+                .perform_action(&CFString::from_str("AXPress"))
+        };
+        if status == AXError::ActionUnsupported {
+            return Ok(false);
+        }
+        ax_result(status)?;
+        Ok(true)
     }
 
     pub(crate) fn frame(&self) -> Result<RectLogical, PlatformError> {
@@ -588,13 +864,32 @@ impl AxWindow {
     }
 
     pub(crate) fn restore(&self, frame: RectLogical) -> Result<(), PlatformError> {
+        self.restore_guarded(frame, &mut || true).map(|_| ())
+    }
+
+    /// [`AxWindow::restore`], but `allowed` is asked immediately before each of the two writes
+    /// (size, then position). `Ok(false)`: it said no, and nothing further was written (a no
+    /// after the size write leaves the new size). The twin uses it to re-read Quartz after the AX
+    /// lookup, which can take up to two seconds, and before every frame write.
+    pub(crate) fn restore_guarded(
+        &self,
+        frame: RectLogical,
+        allowed: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, PlatformError> {
+        if !allowed() {
+            return Ok(false);
+        }
         self.resize(frame.size)?;
+        if !allowed() {
+            return Ok(false);
+        }
         let mut position = CGPoint::new(frame.origin.x, frame.origin.y);
         // SAFETY: public CGPoint AXValue type and valid initialized CGPoint storage; AX copies it.
         let value =
             unsafe { AXValue::new(AXValueType::CGPoint, NonNull::from(&mut position).cast()) }
                 .ok_or_else(|| PlatformError::Backend("create AX position".into()))?;
-        self.set("AXPosition", &value)
+        self.set("AXPosition", &value)?;
+        Ok(true)
     }
 
     fn raise(&self) -> Result<(), PlatformError> {
@@ -609,6 +904,331 @@ impl AxWindow {
 mod tests {
     use super::*;
     use objc2_core_graphics::CGRectCreateDictionaryRepresentation;
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> RectLogical {
+        RectLogical::new(PointLogical::new(x, y), SizeLogical::new(w, h))
+    }
+
+    /// A Quartz window dictionary as `CGWindowListCopyWindowInfo` returns it: `on_screen` is
+    /// `None` for a window that isn't ordered on screen (the key is absent, not false).
+    fn window_dictionary(
+        layer: i32,
+        pid: i64,
+        frame: RectLogical,
+        on_screen: Option<bool>,
+    ) -> CFRetained<CFDictionary<CFString, CFType>> {
+        let number = CFNumber::new_i64(42);
+        let pid = CFNumber::new_i64(pid);
+        let layer = CFNumber::new_i32(layer);
+        let bounds = CGRectCreateDictionaryRepresentation(CGRect::new(
+            CGPoint::new(frame.origin.x, frame.origin.y),
+            CGSize::new(frame.size.width, frame.size.height),
+        ));
+        // SAFETY: immutable public CoreGraphics dictionary keys.
+        let mut keys = unsafe {
+            vec![
+                kCGWindowNumber,
+                kCGWindowOwnerPID,
+                kCGWindowLayer,
+                kCGWindowBounds,
+            ]
+        };
+        let base: [&CFType; 4] = [&number, &pid, &layer, &bounds];
+        let mut values = base.to_vec();
+        if let Some(on_screen) = on_screen {
+            // SAFETY: immutable public CoreGraphics dictionary key.
+            keys.push(unsafe { kCGWindowIsOnscreen });
+            values.push(CFBoolean::new(on_screen));
+        }
+        CFDictionary::<CFString, CFType>::from_slices(&keys, &values)
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn on_screen_is_read_from_the_quartz_dictionary() {
+        let frame = rect(10.0, 20.0, 300.0, 200.0);
+        let shown = window_dictionary(0, 123, frame, Some(true));
+        assert!(parse_window(shown.as_opaque()).unwrap().on_screen);
+        // Other Spaces, minimized and hidden windows have no kCGWindowIsOnscreen key.
+        let absent = window_dictionary(0, 123, frame, None);
+        assert!(!parse_window(absent.as_opaque()).unwrap().on_screen);
+        let explicit_false = window_dictionary(0, 123, frame, Some(false));
+        assert!(!parse_window(explicit_false.as_opaque()).unwrap().on_screen);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn quartz_facts_map_to_window_state() {
+        // The built-in display; a menu bar takes 38 points of a normal window's height.
+        let display = rect(0.0, 0.0, 1800.0, 1169.0);
+        let state = |layer, pid, frame, on_screen, bounds| {
+            let dict = window_dictionary(layer, pid, frame, on_screen);
+            let raw = parse_window(dict.as_opaque())?;
+            Some(map_window(raw, "io.test.fixture".into(), None, bounds).state)
+        };
+        // An on-screen window that fills its display is fullscreen.
+        assert_eq!(
+            state(0, 123, display, Some(true), Some(display)),
+            Some(WindowState::Fullscreen)
+        );
+        // A window that isn't on screen is hidden, whatever its bounds say (Safari's page window
+        // while WebKit's fullscreen window is up).
+        assert_eq!(
+            state(0, 123, display, None, Some(display)),
+            Some(WindowState::Hidden)
+        );
+        assert_eq!(
+            state(0, 123, rect(10.0, 20.0, 300.0, 200.0), None, Some(display)),
+            Some(WindowState::Hidden)
+        );
+        // A normal window, and the maximized-under-the-menu-bar case.
+        assert_eq!(
+            state(
+                0,
+                123,
+                rect(10.0, 20.0, 300.0, 200.0),
+                Some(true),
+                Some(display)
+            ),
+            Some(WindowState::Normal)
+        );
+        assert_eq!(
+            state(
+                0,
+                123,
+                rect(0.0, 38.0, 1800.0, 1131.0),
+                Some(true),
+                Some(display)
+            ),
+            Some(WindowState::Normal)
+        );
+        // No display to compare with: not evidence of fullscreen.
+        assert_eq!(
+            state(0, 123, display, Some(true), None),
+            Some(WindowState::Normal)
+        );
+        // The same size on another display is not fullscreen there.
+        assert_eq!(
+            state(
+                0,
+                123,
+                rect(1800.0, -1169.0, 1800.0, 1169.0),
+                Some(true),
+                Some(display)
+            ),
+            Some(WindowState::Normal)
+        );
+        // Rounding slack, but no more.
+        assert_eq!(
+            state(
+                0,
+                123,
+                rect(0.0, 0.0, 1799.0, 1169.0),
+                Some(true),
+                Some(display)
+            ),
+            Some(WindowState::Fullscreen)
+        );
+        assert_eq!(
+            state(
+                0,
+                123,
+                rect(0.0, 0.0, 1797.0, 1169.0),
+                Some(true),
+                Some(display)
+            ),
+            Some(WindowState::Normal)
+        );
+        // The existing filters still apply: only layer 0 and not this process.
+        assert_eq!(state(25, 123, display, Some(true), Some(display)), None);
+        assert_eq!(
+            state(
+                0,
+                i64::from(std::process::id()),
+                display,
+                Some(true),
+                Some(display)
+            ),
+            None
+        );
+        assert_eq!(state(0, 0, display, Some(true), Some(display)), None);
+        assert!(projectable_app(true, "com.apple.Safari"));
+        assert!(!projectable_app(false, "com.apple.Safari"));
+        assert!(!projectable_app(true, "com.apple.dock"));
+    }
+
+    fn candidate(title: Option<&str>, frame: RectLogical) -> AxCandidate {
+        AxCandidate {
+            title: title.map(str::to_owned),
+            frame,
+        }
+    }
+
+    fn twin(title: &str, frame: RectLogical, candidates: &[AxCandidate]) -> AxMatch {
+        match_ax_window(AxPolicy::Twin, title, frame, candidates)
+    }
+
+    fn mirror(title: &str, frame: RectLogical, candidates: &[AxCandidate]) -> AxMatch {
+        match_ax_window(AxPolicy::Mirror, title, frame, candidates)
+    }
+
+    #[test]
+    fn twin_title_is_a_preference_not_a_filter() {
+        let (a, b) = (rect(0.0, 0.0, 800.0, 600.0), rect(900.0, 0.0, 800.0, 600.0));
+        // The title outranks the frame: Quartz's frame lags right after an AX move.
+        assert_eq!(
+            twin(
+                "Mine",
+                a,
+                &[candidate(Some("Other"), a), candidate(Some("Mine"), b)]
+            ),
+            AxMatch::One(1)
+        );
+        // Title and frame together pick between two windows with the same title.
+        assert_eq!(
+            twin(
+                "Mine",
+                b,
+                &[candidate(Some("Mine"), a), candidate(Some("Mine"), b)]
+            ),
+            AxMatch::One(1)
+        );
+        // No AX window has the title (it changed, or AX reports another): a frame match decides.
+        assert_eq!(
+            twin(
+                "Mine",
+                a,
+                &[candidate(Some("Other"), b), candidate(Some("Else"), a)]
+            ),
+            AxMatch::One(1)
+        );
+        // Equally good matches are ambiguous, never guessed.
+        assert_eq!(
+            twin(
+                "Mine",
+                rect(5.0, 5.0, 10.0, 10.0),
+                &[candidate(Some("Mine"), a), candidate(Some("Mine"), b)]
+            ),
+            AxMatch::Ambiguous
+        );
+        assert_eq!(
+            twin("", a, &[candidate(None, a), candidate(None, a)]),
+            AxMatch::Ambiguous
+        );
+        // The frame matches within 2 points and not beyond.
+        let near = |dx| rect(dx, 0.0, 800.0, 600.0);
+        assert_eq!(
+            twin("", a, &[candidate(None, near(2.0)), candidate(None, b)]),
+            AxMatch::One(0)
+        );
+        assert_eq!(
+            twin("", a, &[candidate(None, near(3.0)), candidate(None, b)]),
+            AxMatch::Missing
+        );
+    }
+
+    #[test]
+    fn twin_accepts_an_untitled_window_only_by_its_frame() {
+        let (mine, far) = (
+            rect(0.0, 0.0, 800.0, 600.0),
+            rect(1800.0, -1406.0, 1710.0, 1406.0),
+        );
+        // An untitled or differently titled window whose frame matches is the window.
+        assert_eq!(
+            twin("YouTube", mine, &[candidate(Some(""), mine)]),
+            AxMatch::One(0)
+        );
+        assert_eq!(
+            twin("YouTube", mine, &[candidate(None, mine)]),
+            AxMatch::One(0)
+        );
+        assert_eq!(
+            twin("YouTube", mine, &[candidate(Some("Other"), mine)]),
+            AxMatch::One(0)
+        );
+        // The failure that ended a projection, and the stand-in write hazard: Quartz has a
+        // title, the only AX window is WebKit's title-less fullscreen window at another frame.
+        // A lone untitled window with a different frame is another window, not this one.
+        assert_eq!(
+            twin("YouTube", mine, &[candidate(Some(""), far)]),
+            AxMatch::Missing
+        );
+        assert_eq!(
+            twin("YouTube", mine, &[candidate(None, far)]),
+            AxMatch::Missing
+        );
+        assert_eq!(
+            twin("", mine, &[candidate(Some("Whatever"), far)]),
+            AxMatch::Missing
+        );
+        assert_eq!(
+            twin("YouTube", mine, &[candidate(Some("Other"), far)]),
+            AxMatch::Missing
+        );
+        // No AX window at all: the app's window is on another Space.
+        assert_eq!(twin("YouTube", mine, &[]), AxMatch::Missing);
+    }
+
+    #[test]
+    fn mirror_matching_is_the_previous_policy() {
+        let (a, b, far) = (
+            rect(0.0, 0.0, 800.0, 600.0),
+            rect(900.0, 0.0, 800.0, 600.0),
+            rect(1800.0, -1406.0, 1710.0, 1406.0),
+        );
+        // Regression (review S1): mirror parking must reject an untitled fullscreen stand-in with
+        // a different frame, as it did before the twin's matching changed.
+        assert_eq!(
+            mirror("YouTube", a, &[candidate(Some(""), far)]),
+            AxMatch::Missing
+        );
+        assert_eq!(
+            mirror("YouTube", a, &[candidate(None, far)]),
+            AxMatch::Missing
+        );
+        // The title is a filter: a window at the frame with another title is not a candidate...
+        assert_eq!(
+            mirror("Mine", a, &[candidate(Some("Other"), a)]),
+            AxMatch::Missing
+        );
+        // ...and the frame only picks between candidates with the title.
+        assert_eq!(
+            mirror(
+                "Mine",
+                a,
+                &[
+                    candidate(Some("Other"), a),
+                    candidate(Some("Mine"), b),
+                    candidate(Some("Mine"), a)
+                ]
+            ),
+            AxMatch::One(2)
+        );
+        // A lone candidate with the title matches whatever its frame (Quartz lags an AX move).
+        assert_eq!(
+            mirror("Mine", a, &[candidate(Some("Mine"), far)]),
+            AxMatch::One(0)
+        );
+        // Without a Quartz title every window is a candidate; a lone one matches any frame.
+        assert_eq!(
+            mirror("", a, &[candidate(Some("Whatever"), far)]),
+            AxMatch::One(0)
+        );
+        assert_eq!(
+            mirror("", a, &[candidate(None, b), candidate(None, a)]),
+            AxMatch::One(1)
+        );
+        // Several candidates and no frame match, or several frame matches: nothing is guessed.
+        assert_eq!(
+            mirror("", a, &[candidate(None, b), candidate(None, far)]),
+            AxMatch::Missing
+        );
+        assert_eq!(
+            mirror("", a, &[candidate(None, a), candidate(None, a)]),
+            AxMatch::Ambiguous
+        );
+        assert_eq!(mirror("Mine", a, &[]), AxMatch::Missing);
+    }
 
     #[test]
     #[allow(clippy::unwrap_used)]
@@ -631,14 +1251,28 @@ mod tests {
                 kCGWindowBounds,
                 kCGWindowName,
                 kCGWindowOwnerName,
+                kCGWindowIsOnscreen,
             ]
         };
         let dict = CFDictionary::<CFString, CFType>::from_slices(
             &keys,
-            &[&number, &pid, &layer, &bounds, &title, &owner],
+            &[
+                &number,
+                &pid,
+                &layer,
+                &bounds,
+                &title,
+                &owner,
+                CFBoolean::new(true),
+            ],
         );
         let raw = parse_window(dict.as_opaque()).unwrap();
-        let info = map_window(raw, "io.test.fixture".into(), Some(DisplayId(7)));
+        let info = map_window(
+            raw,
+            "io.test.fixture".into(),
+            Some(DisplayId(7)),
+            Some(rect(0.0, 0.0, 1800.0, 1169.0)),
+        );
         assert_eq!(info.id, WindowId(42));
         assert_eq!(info.pid, Some(123));
         assert_eq!(info.title, "fixture title");
