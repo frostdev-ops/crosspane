@@ -112,6 +112,9 @@ the machine they run on.
 - **Restart** with `crosspanectl restart`. The agent also restarts by itself when macOS
   permissions change, so new grants take effect; if a grant doesn't show up in
   `crosspanectl status`, restart it.
+- **Locked key store:** if the OS key store (Secret Service or Keychain) is still locked when the
+  agent starts at login, `crosspane-agent run` waits for it, retrying every 2 s and logging once a
+  minute, and SIGTERM still stops it while it waits.
 
 ## Pair two machines (once)
 

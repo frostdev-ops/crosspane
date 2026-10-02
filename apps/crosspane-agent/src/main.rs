@@ -131,17 +131,47 @@ fn main() -> Result<()> {
     }
 }
 
+/// The key store `config` lets the agent use, and whether the key file may stand in for it.
+fn keystore_policy<'a>(
+    config: &Config,
+    store: Option<&'a dyn crosspane_platform::KeyStore>,
+) -> (Option<&'a dyn crosspane_platform::KeyStore>, bool) {
+    (
+        store.filter(|_| !config.force_file_keystore),
+        config.allow_file_keystore || config.force_file_keystore,
+    )
+}
+
+/// The device identity for the one-shot `identity` command: a locked key store is an error.
 fn load_identity(
     paths: &Paths,
     config: &Config,
     store: Option<&dyn crosspane_platform::KeyStore>,
 ) -> Result<DeviceIdentity> {
-    let store = store.filter(|_| !config.force_file_keystore);
-    keys::load_or_create(
+    let (store, allow_file) = keystore_policy(config, store);
+    keys::load_or_create(store, &paths.key_file(), allow_file)
+}
+
+/// The device identity for `run`: a locked key store is waited out (the login keyring is often
+/// still locked when the agent starts at login), until it unlocks or SIGTERM or SIGINT asks the
+/// agent to stop. `None` means "stop requested while waiting": nothing was started yet, and the
+/// caller returns, so the process exits with status 0.
+fn load_identity_waiting(
+    paths: &Paths,
+    config: &Config,
+    store: Option<&dyn crosspane_platform::KeyStore>,
+) -> Result<Option<DeviceIdentity>> {
+    let (store, allow_file) = keystore_policy(config, store);
+    let startup = keys::load_or_create_waiting(
         store,
         &paths.key_file(),
-        config.allow_file_keystore || config.force_file_keystore,
-    )
+        allow_file,
+        &mut keys::SignalPacer::new(),
+    )?;
+    Ok(match startup {
+        keys::Startup::Identity(identity) => Some(identity),
+        keys::Startup::Stopped => None,
+    })
 }
 
 /// Run `f` (a thread's whole body); if it panics, exit the process. A dead engine or media thread
@@ -219,11 +249,13 @@ fn run() -> Result<()> {
     let mut platform = platform::create(&paths.state_dir, &config)?;
     tracing::info!(backends = ?platform, "platform ready");
     request_permissions_daily(&paths.state_dir, &mut platform);
-    let identity = Arc::new(load_identity(
-        &paths,
-        &config,
-        platform.keystore.as_deref(),
-    )?);
+    // `_lock` stays held while the key store is waited for, so a second agent still refuses to
+    // start.
+    let Some(identity) = load_identity_waiting(&paths, &config, platform.keystore.as_deref())?
+    else {
+        return Ok(());
+    };
+    let identity = Arc::new(identity);
     let node = identity.node();
     tracing::info!(node = %node, name = %config.name, "identity");
     let trust = trust::SharedTrust::load(paths.trust_file())?;
