@@ -5,6 +5,8 @@
 
 mod jitter;
 pub use jitter::JitterBuffer;
+mod resample;
+pub use resample::{Processed, Resampler};
 pub mod wire {
     pub use crosspane_protocol::audio::{AudioPacket, decode_audio, encode_audio};
 }
