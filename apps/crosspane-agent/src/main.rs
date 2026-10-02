@@ -9,6 +9,7 @@ mod lifecycle;
 mod media;
 mod net;
 mod pairing;
+mod parking_worker;
 mod paths;
 mod platform;
 mod revocations;

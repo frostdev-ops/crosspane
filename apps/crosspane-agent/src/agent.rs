@@ -43,6 +43,8 @@ use crate::trust::SharedTrust;
 pub enum Event {
     /// A platform event, already in engine terms.
     Input(Input),
+    /// Parking completed off the loop; the actual result supplies the twin identity.
+    Parking(crate::parking_worker::Completion),
     LocalDisplays(Vec<DisplayInfo>),
     Link(LinkEvent),
     Ctl(Request, Sender<Response>),
@@ -430,6 +432,14 @@ pub struct Agent {
     name: String,
     engine: Engine,
     platform: Platform,
+    /// Only scheduling state stays on the loop after the backend is handed to its worker.
+    parking: Option<crate::parking_worker::Worker>,
+    /// Backend presence survives the ownership transfer, including a worker start failure.
+    parking_available: bool,
+    /// Strictly increasing IDs cover every submitted operation, including refused requests.
+    parking_next: Option<u64>,
+    /// Only this request may answer the engine's current Park/Resize for each window.
+    parking_latest: BTreeMap<WindowId, u64>,
     net: Net,
     trust: SharedTrust,
     links: HashMap<NodeId, Box<dyn PeerLink>>,
@@ -690,11 +700,15 @@ impl Agent {
         features: Vec<String>,
         audio: Option<Box<dyn AudioPlane>>,
     ) -> Agent {
-        Agent {
+        let mut agent = Agent {
             node,
             name,
             engine,
             platform,
+            parking: None,
+            parking_available: false,
+            parking_next: Some(1),
+            parking_latest: BTreeMap::new(),
             net,
             trust,
             links: HashMap::new(),
@@ -757,7 +771,9 @@ impl Agent {
             test_now: None,
             #[cfg(test)]
             emitted: Vec::new(),
-        }
+        };
+        agent.parking_start();
+        agent
     }
 
     /// What this process learned about itself before the loop started: `status` reports it.
@@ -981,6 +997,105 @@ impl Agent {
         }
     }
 
+    /// `platform::create` completed startup recovery before handing us this backend.
+    fn parking_start(&mut self) {
+        if self.parking_available {
+            return;
+        }
+        if let Some(backend) = self.platform.parking.take() {
+            self.parking_available = true;
+            match crate::parking_worker::Worker::start(backend, self.events.clone()) {
+                Ok(worker) => self.parking = Some(worker),
+                Err(error) => {
+                    tracing::error!(%error, "parking worker could not start; recovery remains pending")
+                }
+            }
+        }
+    }
+
+    fn parking_submit(&mut self, command: crate::parking_worker::Command) {
+        self.parking_start();
+        let id = self.parking_next.unwrap_or(0);
+        self.parking_next = self.parking_next.and_then(|id| id.checked_add(1));
+        match command {
+            crate::parking_worker::Command::Park { window, .. }
+            | crate::parking_worker::Command::Resize { window, .. } => {
+                self.parking_latest.insert(window, id);
+            }
+            crate::parking_worker::Command::Restore { .. } => self.tracker.restore_started(id),
+        }
+        if let Some(worker) = &mut self.parking
+            && id != 0
+        {
+            worker.enqueue(id, command);
+        } else {
+            if id == 0 {
+                tracing::error!("parking operation IDs exhausted; command refused");
+            }
+            let _ = self.events.send(Event::Parking(
+                crate::parking_worker::Completion::unavailable(id, command),
+            ));
+        }
+    }
+
+    fn parking_completed(&mut self, completion: crate::parking_worker::Completion, feed: bool) {
+        if let Some(worker) = &mut self.parking
+            && !worker.acknowledge(&completion)
+        {
+            return;
+        }
+        match &completion.outcome {
+            crate::parking_worker::Outcome::Started {
+                window,
+                kind: crate::parking_worker::Kind::Park,
+            } => {
+                self.tracker.parking_started(*window, completion.id);
+            }
+            crate::parking_worker::Outcome::Started { .. } => {}
+            crate::parking_worker::Outcome::Parked { window, result } => {
+                self.home_parked(*window, result);
+                if feed && self.parking_latest.get(window) == Some(&completion.id) {
+                    self.parking_latest.remove(window);
+                    self.feed(Input::Parked {
+                        window: *window,
+                        result: *result,
+                    });
+                } else {
+                    tracing::debug!(
+                        operation = completion.id,
+                        window = window.0,
+                        ?result,
+                        "parking completion consumed internally"
+                    );
+                }
+            }
+            crate::parking_worker::Outcome::Restored { window, ok } => {
+                self.tracker.restored(*window, completion.id, *ok);
+                if *ok {
+                    self.home.twins.remove(window);
+                }
+            }
+            crate::parking_worker::Outcome::Panicked => {}
+        }
+    }
+
+    fn parking_shutdown(&mut self, wait: Duration) -> crate::lifecycle::Parking {
+        self.parking_start();
+        let Some(worker) = &mut self.parking else {
+            return if self.parking_available {
+                crate::lifecycle::Parking::Failed
+            } else {
+                crate::lifecycle::Parking::None
+            };
+        };
+        let (outcome, completions) =
+            worker.shutdown(wait.min(crate::parking_worker::SHUTDOWN_WAIT));
+        for completion in completions {
+            self.parking_completed(completion, false);
+        }
+        outcome
+    }
+
     fn on_event(&mut self, event: Event) {
         match event {
             // `run` stops the loop for this one.
@@ -996,6 +1111,7 @@ impl Agent {
                 }
             }
             Event::Input(input) => self.feed(input),
+            Event::Parking(completion) => self.parking_completed(completion, true),
             Event::LocalDisplays(displays) => {
                 if displays == self.local_displays {
                     return;
@@ -1434,44 +1550,25 @@ impl Agent {
                 size,
                 scale,
             } => {
-                self.tracker.parking_started(window);
-                let result = match &mut self.platform.parking {
-                    Some(p) => p.park(window, size, scale).map_err(|error| {
-                        tracing::warn!(%error, "parking failed");
-                        failure(error)
-                    }),
-                    None => Err(Failure::Other),
-                };
-                self.home_parked(window, &result);
-                self.pending.push_back(Input::Parked { window, result });
+                self.parking_submit(crate::parking_worker::Command::Park {
+                    window,
+                    size,
+                    scale,
+                });
             }
             Output::ResizeParked {
                 window,
                 size,
                 scale,
             } => {
-                let result = match &mut self.platform.parking {
-                    Some(p) => p.resize(window, size, scale).map_err(|error| {
-                        tracing::warn!(%error, "resizing a parked window failed");
-                        failure(error)
-                    }),
-                    None => Err(Failure::Other),
-                };
-                self.home_parked(window, &result);
-                self.pending.push_back(Input::Parked { window, result });
+                self.parking_submit(crate::parking_worker::Command::Resize {
+                    window,
+                    size,
+                    scale,
+                });
             }
             Output::Restore { window } => {
-                // Without a parking backend nothing was parked here, and nothing was restored.
-                let restored = match &mut self.platform.parking {
-                    Some(p) => p.restore(window).inspect_err(
-                        |e| tracing::error!(error = %e, "could not restore a parked window"),
-                    ),
-                    None => Err(PlatformError::Unsupported("no parking backend")),
-                };
-                self.tracker.restored(window, restored.is_ok());
-                if restored.is_ok() {
-                    self.home.twins.remove(&window);
-                }
+                self.parking_submit(crate::parking_worker::Command::Restore { window });
             }
             Output::ActivateWindow { window } => {
                 if let Some(w) = &mut self.platform.windows
@@ -3315,24 +3412,7 @@ impl Agent {
         // The engine asked for the home bind's removal as part of that (if it was installed); this
         // makes sure, whatever became of the answer (amendment A2: never a foreign bind's).
         self.home_shutdown();
-        let parking = if let Some(parking) = self.platform.parking.as_mut() {
-            match parking.recover() {
-                Ok(windows) => {
-                    tracing::info!(restored = windows.len(), "parked windows restored");
-                    if windows.is_empty() {
-                        crate::lifecycle::Parking::NothingParked
-                    } else {
-                        crate::lifecycle::Parking::Restored
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "parked windows not restored; the next start restores them");
-                    crate::lifecycle::Parking::Failed
-                }
-            }
-        } else {
-            crate::lifecycle::Parking::None
-        };
+        let parking = self.parking_shutdown(crate::parking_worker::SHUTDOWN_WAIT);
         // A panic's first restore may fail while the final journal recovery succeeds. Only a
         // fresh physical read-back after that recovery permits the remaining bind cleanup.
         self.home_shutdown();
@@ -3398,7 +3478,7 @@ impl Agent {
             "controlling": self.engine.controlling().map(|peer| peer.to_string()),
             "controlled_by": self.engine.controlled_by().map(|peer| peer.to_string()),
             "session": format!("{:?}", self.platform.session.state()),
-            "backends": format!("{:?}", self.platform),
+            "backends": format!("{:?}", self.platform).replacen("parking: false", "parking: true", usize::from(self.parking_available)),
             "permissions": self.platform.permissions.required().into_iter().map(|p| {
                 let name = format!("{p:?}");
                 json!({ "permission": name, "state": format!("{:?}", self.platform.permissions.state(p)) })
@@ -4573,8 +4653,10 @@ mod installer {
         last_parking: BTreeMap<NodeId, &'static str>,
         /// Open proxies of other nodes' windows.
         proxies: BTreeSet<ProjectionKey>,
-        /// What the last `Restore` of this input's outputs came to (true: restored).
-        last_restore: Option<bool>,
+        /// The last Restore registered by this input, to attribute its following source notice.
+        last_restore: Option<u64>,
+        /// Source return attribution survives unrelated inputs until the actual completion.
+        restores: BTreeMap<u64, Option<NodeId>>,
         /// Whether the last `CloseProxy` of this input's outputs was queued to the proxy host.
         last_close: Option<bool>,
         /// Tests only: stands in for sending the host its `Close` (there is no window host).
@@ -4584,7 +4666,7 @@ mod installer {
         established_before: Option<NodeId>,
         /// Windows this instance parked and has not restored since: its journal entries still
         /// unresolved. Entries an earlier run left behind are `startup_recovery`'s.
-        parked: BTreeSet<WindowId>,
+        parked: BTreeMap<WindowId, u64>,
         /// Key and button injections that answer a controller's own message, with that peer.
         e1_injects: BTreeMap<InjectId, NodeId>,
         /// "Controlled from" shows the overlay host accepted and hasn't answered, the peer of
@@ -4624,11 +4706,12 @@ mod installer {
                 last_parking: BTreeMap::new(),
                 proxies: BTreeSet::new(),
                 last_restore: None,
+                restores: BTreeMap::new(),
                 last_close: None,
                 #[cfg(test)]
                 close_seam: None,
                 established_before: None,
-                parked: BTreeSet::new(),
+                parked: BTreeMap::new(),
                 e1_injects: BTreeMap::new(),
                 indicator_pending: 0,
                 indicator_peer: None,
@@ -4831,8 +4914,8 @@ mod installer {
 
         /// A projection ended. A projection that never went live isn't counted at all.
         ///
-        /// As the source: the window is back (the `Restore` just before the notice worked) and
-        /// that is a return, or it isn't and that is a failed return. When the window itself went
+        /// As the source: wait for the Restore registered just before this notice. When it
+        /// completes, the actual outcome counts a return or a failed return. When the window went
         /// away (`WindowClosed`) nothing was returned and nothing failed: a restore of a window
         /// that no longer exists succeeds without putting anything back.
         ///
@@ -4847,12 +4930,19 @@ mod installer {
         ) {
             if key.source == local {
                 self.pending_sources.remove(&key);
-                let restored = self.last_restore.take() == Some(true);
+                let operation = self.last_restore.take();
                 if let Some(peer) = self.sources.remove(&key) {
                     match reason {
                         ProjectionEndReason::WindowClosed => {}
-                        _ if restored => self.counter(peer).e2_source_returned += 1,
-                        _ => self.counter(peer).e2_returns_failed += 1,
+                        _ => {
+                            if let Some(pending) =
+                                operation.and_then(|id| self.restores.get_mut(&id))
+                            {
+                                *pending = Some(peer);
+                            } else {
+                                self.counter(peer).e2_returns_failed += 1;
+                            }
+                        }
                     }
                 }
             } else if self.proxies.remove(&key) && reason == ProjectionEndReason::Returned {
@@ -4865,14 +4955,28 @@ mod installer {
         }
 
         /// This node is about to park `window`: its journal entry exists from now on.
-        pub fn parking_started(&mut self, window: WindowId) {
-            self.parked.insert(window);
+        pub fn parking_started(&mut self, window: WindowId, id: u64) {
+            self.parked
+                .entry(window)
+                .and_modify(|previous| *previous = (*previous).max(id))
+                .or_insert(id);
+        }
+
+        pub fn restore_started(&mut self, id: u64) {
+            self.last_restore = Some(id);
+            self.restores.insert(id, None);
         }
 
         /// A `Restore` of `window` was carried out; `restored` says whether the window is back.
-        pub fn restored(&mut self, window: WindowId, restored: bool) {
-            self.last_restore = Some(restored);
-            if restored {
+        pub fn restored(&mut self, window: WindowId, id: u64, restored: bool) {
+            if let Some(peer) = self.restores.remove(&id).flatten() {
+                if restored {
+                    self.counter(peer).e2_source_returned += 1;
+                } else {
+                    self.counter(peer).e2_returns_failed += 1;
+                }
+            }
+            if restored && self.parked.get(&window).is_some_and(|park| *park < id) {
                 self.parked.remove(&window);
             }
         }
@@ -5018,7 +5122,11 @@ mod installer {
                 optional("hotkeys", p.hotkeys.is_some()),
                 keystore,
                 built("windows", p.windows.is_some(), &[Accessibility]),
-                built("parking", p.parking.is_some(), &[Accessibility]),
+                built(
+                    "parking",
+                    p.parking.is_some() || self.parking_available,
+                    &[Accessibility],
+                ),
                 built("frames", p.frames.is_some(), &[ScreenRecording]),
                 built("tray", p.tray.is_some(), &[]),
                 built("links", p.links.is_some(), &[]),
@@ -7957,10 +8065,547 @@ mod home_tests {
     /// events. Exit activation answers share this channel with the backend's callbacks.
     fn process_events(h: &mut Home) {
         h.rig.agent.settle();
+        loop {
+            let event = match h.rig.events.try_recv() {
+                Ok(event) => event,
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if h.rig
+                        .agent
+                        .parking
+                        .as_ref()
+                        .is_some_and(crate::parking_worker::Worker::pending) =>
+                {
+                    h.rig
+                        .events
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("fake parking completes")
+                }
+                Err(_) => break,
+            };
+            h.rig.agent.on_event(event);
+            h.rig.agent.settle();
+        }
+    }
+
+    /// Fixture replacement waits for the old worker's cleanup, as a real backend swap would.
+    fn replace_parking(agent: &mut Agent, backend: Box<dyn crosspane_platform::WindowParking>) {
+        assert_ne!(
+            agent.parking_shutdown(crate::parking_worker::SHUTDOWN_WAIT),
+            crate::lifecycle::Parking::Failed
+        );
+        agent.parking = None;
+        agent.parking_available = false;
+        agent.platform.parking = Some(backend);
+    }
+
+    #[test]
+    fn parking_resize_storm_keeps_engine_input_ticks_links_and_housekeeping_responsive() {
+        use crate::parking_worker::tests::{Kind, fake};
+        use crosspane_protocol::{msg::InputMessage, projection::ProjInput};
+        let mut h = projected_scenario();
+        step(
+            &mut h,
+            Input::Windows(WindowEvent::Focused(Some(WindowId(10)))),
+        );
+        let (backend, controls) = fake(Some(Kind::Resize));
+        replace_parking(&mut h.rig.agent, Box::new(backend));
+        let peer = h.rig.peer;
+        let resize = |request, width| {
+            projection_input(
+                peer,
+                ProjectionMessage::Resize {
+                    projection: ProjectionId(1),
+                    request,
+                    size: PixelSize::new(width, 300),
+                    scale: 1.0,
+                },
+            )
+        };
+        h.rig.agent.feed(resize(1, 600));
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            (Kind::Resize, WindowId(10), 600)
+        );
+        let fed = h.rig.agent.fed.len();
+        let keys = h.injected.lock().unwrap().len();
+        for request in 2..100 {
+            h.rig
+                .agent
+                .on_event(Event::Input(resize(request, 600 + request)));
+            h.rig.agent.on_event(Event::Input(Input::Tick));
+        }
+        h.rig
+            .agent
+            .on_event(Event::Input(Input::Link(LinkEvent::Input {
+                peer,
+                msg: InputMessage::Proj(ProjInput::Key {
+                    projection: ProjectionId(1),
+                    seq: 1,
+                    usage: HidUsage::keyboard(4),
+                    down: true,
+                }),
+            })));
+        h.rig.agent.settle();
+        h.rig.agent.on_event(Event::Links(Vec::new()));
+        h.rig.agent.housekeeping();
+        assert_eq!(
+            h.rig.agent.fed[fed..]
+                .iter()
+                .filter(|i| matches!(i, Input::Tick))
+                .count(),
+            98
+        );
+        assert!(h.injected.lock().unwrap()[keys..].contains(&"key down"));
+        assert!(
+            controls.observed.try_recv().is_err(),
+            "only one backend call can run"
+        );
+        controls.release.send(()).unwrap();
+        process_events(&mut h);
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            (Kind::Resize, WindowId(10), 699)
+        );
+        assert!(controls.observed.try_recv().is_err());
+        assert_eq!(
+            h.rig.agent.home.twins.get(&WindowId(10)),
+            Some(&DisplayId(37))
+        );
+    }
+
+    #[test]
+    fn parking_twin_identity_uses_completion_display_and_failed_park_records_none() {
+        use crate::parking_worker::tests::{Kind, fake};
+        for failed in [false, true] {
+            let mut h = home();
+            let (mut backend, controls) = fake(Some(Kind::Park));
+            backend.park_fails = failed;
+            replace_parking(&mut h.rig.agent, Box::new(backend));
+            h.rig.agent.execute(vec![Output::Park {
+                window: WindowId(10),
+                size: PixelSize::new(400, 300),
+                scale: 1.0,
+            }]);
+            assert_eq!(
+                controls
+                    .observed
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .0,
+                Kind::Park
+            );
+            assert!(
+                h.rig.agent.home.twins.is_empty(),
+                "submission supplies no guessed identity"
+            );
+            controls.release.send(()).unwrap();
+            process_events(&mut h);
+            assert_eq!(
+                h.rig.agent.home.twins.get(&WindowId(10)).copied(),
+                if failed { None } else { Some(DisplayId(37)) }
+            );
+        }
+    }
+
+    #[test]
+    fn parking_backend_presence_and_legacy_debug_status_survive_worker_handoff() {
+        let mut h = home();
+        h.rig.agent.platform.parking = Some(Box::new(FakeParking));
+        let before = h.rig.agent.status();
+        h.rig.agent.parking_start();
+        assert!(h.rig.agent.platform.parking.is_none());
+        assert!(h.rig.agent.parking.is_some());
+        let after = h.rig.agent.status();
+        assert_eq!(after["backends"], before["backends"]);
+        assert_eq!(
+            after["installer"]["backends"],
+            before["installer"]["backends"]
+        );
+        assert!(
+            after["backends"]
+                .as_str()
+                .unwrap()
+                .contains("parking: true")
+        );
+        let entry = after["installer"]["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["name"] == "parking")
+            .unwrap();
+        assert_eq!(entry["state"], json!("ready"));
+        assert_eq!(
+            after["installer"]["epochs"]["backends"],
+            before["installer"]["epochs"]["backends"]
+        );
+    }
+
+    #[test]
+    fn source_return_counter_waits_for_restore_completion_across_unrelated_inputs() {
+        use crate::parking_worker::tests::{Kind, fake};
+        for failed in [false, true] {
+            let mut h = projected_scenario();
+            let (mut backend, controls) = fake(Some(Kind::Restore));
+            backend.restore_fails = failed;
+            replace_parking(&mut h.rig.agent, Box::new(backend));
+            h.rig
+                .agent
+                .feed(Input::Command(Command::Return(ProjectionKey {
+                    source: h.rig.local,
+                    projection: ProjectionId(1),
+                })));
+            assert_eq!(
+                controls
+                    .observed
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .0,
+                Kind::Restore
+            );
+            assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+            for _ in 0..10 {
+                h.rig.agent.feed(Input::Tick);
+            }
+            assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+            assert_eq!(
+                h.rig.agent.home.twins.get(&WindowId(10)),
+                Some(&DisplayId(7))
+            );
+            controls.release.send(()).unwrap();
+            process_events(&mut h);
+            assert_eq!(
+                nonzero(&h),
+                if failed {
+                    json!({ "e2_source_started": 1, "e2_returns_failed": 1 })
+                } else {
+                    json!({ "e2_source_started": 1, "e2_source_returned": 1 })
+                }
+            );
+            assert_eq!(h.rig.agent.home.twins.contains_key(&WindowId(10)), failed);
+        }
+    }
+
+    #[test]
+    fn a_new_park_start_keeps_recovery_pending_while_blocked_despite_older_restore_completion() {
+        use crate::parking_worker::tests::{Kind, fake};
+        let mut h = projected_scenario();
+        let (backend, controls) = fake(Some(Kind::Park));
+        replace_parking(&mut h.rig.agent, Box::new(backend));
+        h.rig.agent.execute(vec![
+            Output::Restore {
+                window: WindowId(10),
+            },
+            Output::Park {
+                window: WindowId(10),
+                size: PixelSize::new(400, 300),
+                scale: 1.0,
+            },
+        ]);
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            Kind::Restore
+        );
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            Kind::Park
+        );
+        // Deliberately defer the old Restore result until the newer Park's start has been
+        // registered. Its ID must still be unable to clear the newer journal obligation.
+        let mut old_restore = None;
+        for _ in 0..3 {
+            let event = h.rig.events.recv_timeout(Duration::from_secs(1)).unwrap();
+            if matches!(
+                &event,
+                Event::Parking(crate::parking_worker::Completion {
+                    outcome: crate::parking_worker::Outcome::Restored { .. },
+                    ..
+                })
+            ) {
+                old_restore = Some(event);
+            } else {
+                h.rig.agent.on_event(event);
+            }
+        }
+        assert!(controls.journal.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(status_installer(&h)["recovery_pending"].as_u64().unwrap() >= 1);
+        h.rig.agent.on_event(old_restore.unwrap());
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(1));
+        assert!(h.rig.agent.home.twins.is_empty());
+        controls.release.send(()).unwrap();
+        process_events(&mut h);
+        assert_eq!(
+            h.rig.agent.home.twins.get(&WindowId(10)),
+            Some(&DisplayId(37))
+        );
+    }
+
+    #[test]
+    fn an_old_park_completion_cannot_answer_reprojection_after_the_engine_fence_expires() {
+        use crate::parking_worker::tests::{Kind, fake};
+        let mut h = bare_scenario();
+        let (mut backend, controls) = fake(Some(Kind::Park));
+        backend.block_count = 2;
+        backend.increment_display = true;
+        replace_parking(&mut h.rig.agent, Box::new(backend));
+        let peer = h.rig.peer;
+        let accept = |projection| {
+            projection_input(
+                peer,
+                ProjectionMessage::Accepted {
+                    projection: ProjectionId(projection),
+                    size: PixelSize::new(400, 300),
+                    scale: 1.0,
+                },
+            )
+        };
+        h.rig.agent.feed(Input::Command(Command::Project {
+            window: WindowId(10),
+            to: peer,
+        }));
+        h.rig.agent.feed(accept(1));
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            Kind::Park
+        );
+        h.rig
+            .agent
+            .on_event(h.rig.events.recv_timeout(Duration::from_secs(1)).unwrap());
+        let old = h.rig.agent.parking_latest[&WindowId(10)];
+        h.rig
+            .agent
+            .feed(Input::Command(Command::Return(ProjectionKey {
+                source: h.rig.local,
+                projection: ProjectionId(1),
+            })));
+        h.rig.agent.test_now = Some(ms(6000));
+        h.rig.agent.feed(Input::Tick);
+        h.rig.agent.feed(Input::Command(Command::Project {
+            window: WindowId(10),
+            to: peer,
+        }));
+        h.rig.agent.feed(accept(2));
+        let new = h.rig.agent.parking_latest[&WindowId(10)];
+        assert!(new > old);
+        let before = h.rig.agent.emitted.len();
+        let answers = h
+            .rig
+            .agent
+            .fed
+            .iter()
+            .filter(|input| matches!(input, Input::Parked { .. }))
+            .count();
+        controls.release.send(()).unwrap();
+        // Both cancellation restores precede the replacement Park, which is held separately.
+        for expected in [Kind::Restore, Kind::Restore, Kind::Park] {
+            assert_eq!(
+                controls
+                    .observed
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .0,
+                expected
+            );
+        }
         while let Ok(event) = h.rig.events.try_recv() {
             h.rig.agent.on_event(event);
             h.rig.agent.settle();
         }
+        assert_eq!(
+            h.rig
+                .agent
+                .fed
+                .iter()
+                .filter(|input| matches!(input, Input::Parked { .. }))
+                .count(),
+            answers
+        );
+        assert!(
+            !h.rig.agent.emitted[before..]
+                .iter()
+                .any(|output| matches!(output, Output::StartCapture { .. }))
+        );
+        assert_eq!(h.rig.agent.parking_latest[&WindowId(10)], new);
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(1));
+        controls.release.send(()).unwrap();
+        process_events(&mut h);
+        assert_eq!(
+            h.rig
+                .agent
+                .fed
+                .iter()
+                .filter(|input| matches!(input, Input::Parked { .. }))
+                .count(),
+            answers + 1
+        );
+        assert!(h.rig.agent.emitted[before..].iter().any(|output| matches!(
+            output,
+            Output::StartCapture {
+                target: CaptureTarget::Display(DisplayId(38)),
+                ..
+            }
+        )));
+        assert_eq!(
+            h.rig.agent.home.twins.get(&WindowId(10)),
+            Some(&DisplayId(38))
+        );
+    }
+
+    struct ParkingReceiptDir(std::path::PathBuf);
+
+    impl Drop for ParkingReceiptDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn receipt_journals(h: &mut Home) -> ParkingReceiptDir {
+        use crosspane_input::journal::FileJournal;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "crosspane-wp236-shutdown-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        crate::paths::create_private_dir(&dir).unwrap();
+        let paths = crate::paths::Paths {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+            runtime_dir: dir.clone(),
+        };
+        FileJournal::open(&paths.journal_file()).unwrap();
+        FileJournal::open(&paths.e2_journal_file()).unwrap();
+        h.rig.agent.set_lifecycle_paths(paths);
+        ParkingReceiptDir(dir)
+    }
+
+    #[test]
+    fn parking_inflight_shutdown_is_clean_and_source_return_counts_actual_completion() {
+        use crate::parking_worker::tests::{Kind, fake};
+        let mut h = projected_scenario();
+        let _journals = receipt_journals(&mut h);
+        let (backend, controls) = fake(Some(Kind::Resize));
+        replace_parking(&mut h.rig.agent, Box::new(backend));
+        h.rig.agent.execute(vec![Output::ResizeParked {
+            window: WindowId(10),
+            size: PixelSize::new(400, 300),
+            scale: 1.0,
+        }]);
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            Kind::Resize
+        );
+        let release = controls.release.clone();
+        let releaser = std::thread::spawn(move || release.send(()).unwrap());
+        let outcomes = h.rig.agent.shutdown();
+        releaser.join().unwrap();
+        assert_eq!(outcomes.parking, crate::lifecycle::Parking::NothingParked);
+        assert!(outcomes.input_journals_empty && outcomes.audio_stopped);
+        assert_eq!(
+            nonzero(&h),
+            json!({ "e2_source_started": 1, "e2_source_returned": 1 })
+        );
+        assert!(h.rig.agent.home.twins.is_empty());
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            Kind::Restore
+        );
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            Kind::Recover
+        );
+    }
+
+    #[test]
+    fn parking_hung_shutdown_returns_unclean_within_five_seconds_and_no_premature_return() {
+        use crate::parking_worker::tests::{Kind, fake};
+        use std::sync::atomic::Ordering;
+        let mut h = projected_scenario();
+        let _journals = receipt_journals(&mut h);
+        let (backend, controls) = fake(Some(Kind::Resize));
+        replace_parking(&mut h.rig.agent, Box::new(backend));
+        h.rig.agent.execute(vec![Output::ResizeParked {
+            window: WindowId(10),
+            size: PixelSize::new(400, 300),
+            scale: 1.0,
+        }]);
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            Kind::Resize
+        );
+        let started = Instant::now();
+        let outcomes = h.rig.agent.shutdown();
+        assert_eq!(outcomes.parking, crate::lifecycle::Parking::Failed);
+        assert!(started.elapsed() >= crate::parking_worker::SHUTDOWN_WAIT);
+        assert!(started.elapsed() < crate::parking_worker::SHUTDOWN_WAIT + Duration::from_secs(1));
+        assert!(controls.journal.load(Ordering::SeqCst));
+        assert_eq!(nonzero(&h), json!({ "e2_source_started": 1 }));
+        assert!(h.rig.agent.home.twins.contains_key(&WindowId(10)));
+        controls.release.send(()).unwrap();
+    }
+
+    #[test]
+    fn parking_panicked_shutdown_reports_unclean_without_hanging() {
+        use crate::parking_worker::tests::{Kind, fake};
+        let mut h = home();
+        let _journals = receipt_journals(&mut h);
+        let (mut backend, controls) = fake(None);
+        backend.panic = Some(Kind::Park);
+        replace_parking(&mut h.rig.agent, Box::new(backend));
+        h.rig.agent.execute(vec![Output::Park {
+            window: WindowId(10),
+            size: PixelSize::new(400, 300),
+            scale: 1.0,
+        }]);
+        assert_eq!(
+            controls
+                .observed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            Kind::Park
+        );
+        process_events(&mut h);
+        let started = Instant::now();
+        assert_eq!(
+            h.rig.agent.shutdown().parking,
+            crate::lifecycle::Parking::Failed
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(h.rig.agent.home.twins.is_empty());
     }
 
     #[test]
@@ -8381,7 +9026,10 @@ mod home_tests {
     fn shutdown_rechecks_physical_safety_after_final_parking_recovery() {
         let mut h = home_scenario();
         h.capture.lock().unwrap().warp_cursor = None;
-        h.rig.agent.platform.parking = Some(Box::new(RestoreFailureParking(h.compositor.clone())));
+        replace_parking(
+            &mut h.rig.agent,
+            Box::new(RestoreFailureParking(h.compositor.clone())),
+        );
         h.rig.agent.shutdown();
         let c = h.compositor.lock().unwrap();
         assert!(c.restores > 0);
@@ -8395,10 +9043,14 @@ mod home_tests {
     #[test]
     fn a_physical_output_reusing_a_partially_restored_twin_id_is_not_rescued_and_is_pruned() {
         let mut h = projected_scenario();
-        h.rig.agent.platform.parking = Some(Box::new(RestoreFailureParking(h.compositor.clone())));
+        replace_parking(
+            &mut h.rig.agent,
+            Box::new(RestoreFailureParking(h.compositor.clone())),
+        );
         h.rig.agent.execute(vec![Output::Restore {
             window: WindowId(10),
         }]);
+        process_events(&mut h);
         assert_eq!(h.compositor.lock().unwrap().restores, 1);
         assert_eq!(
             h.rig.agent.home.twins.get(&WindowId(10)),
@@ -11536,15 +12188,31 @@ mod home_tests {
         ));
         // The window's parking result is the engine's to see; that starts the capture, whose
         // answer is queued behind it.
-        let at = h
-            .rig
-            .agent
-            .pending
-            .iter()
-            .position(|input| matches!(input, Input::Parked { .. }))
-            .expect("the window was parked");
-        let parked = h.rig.agent.pending.remove(at).unwrap();
-        h.rig.agent.feed(parked);
+        let parked = loop {
+            let event = h
+                .rig
+                .events
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the window was parked");
+            if matches!(
+                &event,
+                Event::Parking(crate::parking_worker::Completion {
+                    outcome: crate::parking_worker::Outcome::Parked { .. },
+                    ..
+                })
+            ) {
+                break event;
+            }
+            h.rig.agent.on_event(event);
+        };
+        assert!(matches!(
+            &parked,
+            Event::Parking(crate::parking_worker::Completion {
+                outcome: crate::parking_worker::Outcome::Parked { .. },
+                ..
+            })
+        ));
+        h.rig.agent.on_event(parked);
         assert!(
             h.rig
                 .agent
@@ -11584,10 +12252,13 @@ mod home_tests {
     #[test]
     fn a_return_whose_window_does_not_come_back_is_a_failed_return() {
         let mut h = projected_scenario();
-        h.rig.agent.platform.parking = Some(Box::new(Parking {
-            kind: crosspane_platform::ParkingKind::Twin,
-            restore_fails: true,
-        }));
+        replace_parking(
+            &mut h.rig.agent,
+            Box::new(Parking {
+                kind: crosspane_platform::ParkingKind::Twin,
+                restore_fails: true,
+            }),
+        );
         give_back(&mut h, 1);
         assert_eq!(
             nonzero(&h),
@@ -11608,10 +12279,13 @@ mod home_tests {
         give_back(&mut h, 1);
         // Never reset: the return doesn't clear it.
         assert_eq!(parking(&h), json!("twin"));
-        h.rig.agent.platform.parking = Some(Box::new(Parking {
-            kind: crosspane_platform::ParkingKind::Mirror,
-            restore_fails: false,
-        }));
+        replace_parking(
+            &mut h.rig.agent,
+            Box::new(Parking {
+                kind: crosspane_platform::ParkingKind::Mirror,
+                restore_fails: false,
+            }),
+        );
         project(&mut h, 2);
         assert_eq!(parking(&h), json!("mirror"));
         assert_eq!(nonzero(&h)["e2_source_started"], json!(2));
