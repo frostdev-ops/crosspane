@@ -856,6 +856,13 @@ dependencies = [
 [[package]]
 name = "crosspane-installer"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crosspane-ui-kit",
+ "eframe",
+ "png",
+]
 
 [[package]]
 name = "crosspane-installer-core"

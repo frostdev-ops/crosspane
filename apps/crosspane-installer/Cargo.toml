@@ -12,3 +12,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crosspane-ui-kit.workspace = true
+eframe.workspace = true
+png.workspace = true
