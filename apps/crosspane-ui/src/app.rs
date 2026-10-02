@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::ctl::{Failure, Request, Target, Worker};
 use crate::layout::{Editor, Fit};
 use crate::model::{Display, Offer, PairStatus, Status, Window, short_id};
+use crate::{art::Art, crossings::crossings, demo::Demo, theme};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -25,9 +26,14 @@ struct CanvasDrag {
     pointer_start: Pos2,
 }
 
-#[derive(Debug)]
 pub struct Settings {
-    worker: Worker,
+    worker: Option<Worker>,
+    demo: Option<Demo>,
+    art: Art,
+    screenshot: Option<std::path::PathBuf>,
+    screenshot_frames: u32,
+    screenshot_started: Option<Instant>,
+    screenshot_requested: Option<Instant>,
     tab: Tab,
     reachable: bool,
     status: Status,
@@ -56,10 +62,27 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn new(worker: Worker) -> Self {
-        Self {
+    pub fn new(worker: Option<Worker>, art: Art, screenshot: Option<std::path::PathBuf>) -> Self {
+        let review = worker.is_none();
+        let tab = if review {
+            match std::env::var("CROSSPANE_UI_TAB").as_deref() {
+                Ok("layout") => Tab::Layout,
+                Ok("pairing") => Tab::Pairing,
+                Ok("windows") => Tab::Windows,
+                _ => Tab::Machines,
+            }
+        } else {
+            Tab::Machines
+        };
+        let mut settings = Self {
             worker,
-            tab: Tab::Machines,
+            demo: review.then(Demo::default),
+            art,
+            screenshot,
+            screenshot_frames: 0,
+            screenshot_started: None,
+            screenshot_requested: None,
+            tab,
             reachable: false,
             status: Status::default(),
             pair: PairStatus::default(),
@@ -84,7 +107,13 @@ impl Settings {
             peer_windows: HashMap::new(),
             peer_windows_messages: HashMap::new(),
             windows_need_refresh: true,
+        };
+        if review {
+            settings.send(Target::Status, Request::Status);
+            settings.send(Target::PairStatus, Request::PairStatus);
+            settings.refresh_windows();
         }
+        settings
     }
 
     fn send(&mut self, target: Target, request: Request) {
@@ -93,7 +122,19 @@ impl Settings {
         {
             return;
         }
-        if self.worker.send(target.clone(), request) {
+        if let Some(demo) = &mut self.demo {
+            let value = demo.reply(request);
+            self.reachable = true;
+            if let Err(error) = self.receive(target.clone(), value) {
+                self.show_error(target, error);
+            }
+            return;
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.send(target.clone(), request))
+        {
             self.pending.insert(target);
         } else {
             self.reachable = false;
@@ -123,7 +164,11 @@ impl Settings {
     }
 
     fn poll(&mut self) {
-        while let Ok(reply) = self.worker.replies.try_recv() {
+        while let Some(reply) = self
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.replies.try_recv().ok())
+        {
             self.pending.remove(&reply.target);
             match reply.result {
                 Err(Failure::Unavailable) => {
@@ -272,106 +317,132 @@ impl Settings {
 
     fn machines(&mut self, ui: &mut egui::Ui) {
         let status = self.status.clone();
-        ui.heading(format!("{} ({})", status.name, short_id(&status.node)));
-        ui.label(format!(
-            "Input gate: {}   Session: {}",
-            if status.gate_open { "open" } else { "closed" },
-            status.session
-        ));
-        for display in &status.displays {
-            display_line(ui, display);
-        }
-        for permission in &status.permissions {
-            if permission.state != "Granted" {
-                ui.colored_label(
-                    Color32::YELLOW,
-                    format!(
-                        "{}: {} — grant in System Settings › Privacy & Security",
-                        permission.permission, permission.state
-                    ),
-                );
+        machine_card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.heading(&status.name);
+                theme::chip(ui, "●  This machine", theme::FROST);
+                theme::chip(ui, "Online", theme::GLACIER);
+            });
+            ui.label(
+                RichText::new(short_id(&status.node))
+                    .small()
+                    .color(theme::QUIET),
+            );
+            ui.label(format!(
+                "Input gate: {}   ·   Session: {}",
+                if status.gate_open { "open" } else { "closed" },
+                status.session
+            ));
+            for display in &status.displays {
+                display_line(ui, display);
             }
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Take input back").clicked() {
-                self.action(Request::Release);
+            for permission in &status.permissions {
+                if permission.state != "Granted" {
+                    ui.colored_label(
+                        theme::WARNING,
+                        format!(
+                            "{}: {} — grant in System Settings › Privacy & Security",
+                            permission.permission, permission.state
+                        ),
+                    );
+                }
             }
-            if ui.button("Panic").clicked() {
-                self.action(Request::Panic);
-            }
-            // Older agents don't report it: then the button is always there.
-            if status.armed != Some(true) && ui.button("Rearm").clicked() {
-                self.action(Request::Rearm);
-            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if theme::primary(ui, "Take input back", true).clicked() {
+                    self.action(Request::Release);
+                }
+                if theme::destructive(ui, "Panic").clicked() {
+                    self.action(Request::Panic);
+                }
+                if status.armed != Some(true) && ui.button("Rearm").clicked() {
+                    self.action(Request::Rearm);
+                }
+            });
         });
-        ui.separator();
+        ui.add_space(10.0);
+        theme::section(ui, "PAIRED MACHINES");
         if status.peers.is_empty() {
-            ui.label("No paired machines.");
+            ui.label("Pair another computer to move the pointer between your machines.");
         }
         for peer in &status.peers {
             let id = short_id(&peer.node);
             ui.push_id(&id, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        if peer.connected {
-                            Color32::GREEN
-                        } else {
-                            Color32::GRAY
-                        },
-                        "●",
-                    );
-                    ui.strong(format!("{} ({id})", peer.name));
-                    ui.label(if peer.connected {
-                        "connected"
-                    } else {
-                        "offline"
+                machine_card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.heading(&peer.name);
+                        theme::chip(
+                            ui,
+                            if peer.connected {
+                                "●  Online"
+                            } else {
+                                "●  Offline"
+                            },
+                            if peer.connected {
+                                theme::GLACIER
+                            } else {
+                                theme::QUIET
+                            },
+                        );
+                        if let Some(link) = &peer.link {
+                            theme::chip(
+                                ui,
+                                match link.as_str() {
+                                    "DirectUsb4Tb" => "direct cable · USB4 / Thunderbolt",
+                                    "DirectEthernet" => "direct cable",
+                                    "Lan" => "LAN",
+                                    "Wifi" => "Wi-Fi",
+                                    _ => "network",
+                                },
+                                theme::QUIET,
+                            );
+                        }
+                        ui.label(
+                            RichText::new(
+                                peer.rtt_ms
+                                    .map_or_else(|| "RTT: —".into(), |rtt| format!("{rtt:.1} ms")),
+                            )
+                            .small()
+                            .color(theme::QUIET),
+                        );
                     });
-                    ui.label(
-                        peer.rtt_ms
-                            .map_or_else(|| "RTT: —".into(), |rtt| format!("RTT: {rtt:.1} ms")),
-                    );
-                    if let Some(link) = &peer.link {
-                        ui.label(match link.as_str() {
-                            "DirectUsb4Tb" => "USB4 / Thunderbolt",
-                            "DirectEthernet" => "direct cable",
-                            "Lan" => "wired LAN",
-                            "Wifi" => "Wi-Fi",
-                            _ => "network",
+                    ui.label(RichText::new(&id).small().color(theme::QUIET));
+                    for display in &peer.displays {
+                        display_line(ui, display);
+                    }
+                    ui.add_space(6.0);
+                    theme::section(ui, "WHAT THIS MACHINE MAY DO HERE");
+                    ui.horizontal_wrapped(|ui| {
+                        for capability in ["input", "share", "browse", "present"] {
+                            // A toggle sends an intent; the next status remains the source of truth.
+                            let mut allow = peer.grants.iter().any(|grant| grant == capability);
+                            if theme::switch(ui, &mut allow, capability).changed() {
+                                self.action(Request::Allow {
+                                    peer: id.clone(),
+                                    capability: capability.into(),
+                                    allow,
+                                });
+                            }
+                        }
+                        if theme::destructive(ui, "Forget…").clicked() {
+                            self.forget = Some(id.clone());
+                        }
+                    });
+                    if self.forget.as_deref() == Some(&id) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("Forget {} and end its connection?", peer.name));
+                            if theme::destructive(ui, "Forget").clicked() {
+                                self.action(Request::Forget { peer: id.clone() });
+                                self.forget = None;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.forget = None;
+                            }
                         });
                     }
                 });
-                ui.horizontal(|ui| {
-                    for capability in ["input", "share", "browse", "present"] {
-                        // A toggle sends an intent; the next status is the source of truth.
-                        let mut allow = peer.grants.iter().any(|grant| grant == capability);
-                        if ui.checkbox(&mut allow, capability).changed() {
-                            self.action(Request::Allow {
-                                peer: id.clone(),
-                                capability: capability.into(),
-                                allow,
-                            });
-                        }
-                    }
-                    if ui.button("Forget…").clicked() {
-                        self.forget = Some(id.clone());
-                    }
-                });
-                if self.forget.as_deref() == Some(&id) {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Forget {} and end its connection?", peer.name));
-                        if ui.button("Forget").clicked() {
-                            self.action(Request::Forget { peer: id.clone() });
-                            self.forget = None;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.forget = None;
-                        }
-                    });
-                }
-                for display in &peer.displays {
-                    display_line(ui, display);
-                }
-                ui.separator();
             });
         }
         for notice in &status.notices {
@@ -383,12 +454,12 @@ impl Settings {
         let busy = self.pending.contains(&Target::Place) || self.place_accepted;
         let overlaps = self.editor.overlaps();
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.editor.edited() && overlaps.is_empty() && !busy && !self.editor.dragging(),
-                    egui::Button::new("Apply"),
-                )
-                .clicked()
+            if theme::primary(
+                ui,
+                "Apply",
+                self.editor.edited() && overlaps.is_empty() && !busy && !self.editor.dragging(),
+            )
+            .clicked()
             {
                 self.place_message = Some("Applying…".into());
                 self.send(Target::Place, self.editor.place_request());
@@ -402,19 +473,43 @@ impl Settings {
                 self.place_message = None;
             }
             if !overlaps.is_empty() {
-                ui.colored_label(Color32::RED, "Displays overlap.");
+                ui.colored_label(theme::WARNING, "Displays overlap.");
             }
         });
         if let Some(message) = &self.place_message {
             ui.label(message);
         }
-        ui.label("The pointer crosses where displays of different machines touch.");
+        ui.label(RichText::new("Drag a machine to where it sits on your desk; the pointer crosses where screens touch").color(theme::QUIET));
+        ui.horizontal_wrapped(|ui| {
+            theme::chip(ui, "●  This machine", theme::FROST);
+            theme::chip(ui, "●  Peers", theme::PEER_ICE);
+            theme::crossing_legend(ui);
+        });
         let (canvas, _) = ui.allocate_exact_size(
             ui.available_size().max(egui::vec2(1.0, 1.0)),
             Sense::hover(),
         );
         let painter = ui.painter_at(canvas);
-        painter.rect_filled(canvas, 4.0, ui.visuals().extreme_bg_color);
+        theme::gradient(
+            &painter,
+            canvas,
+            12.0,
+            theme::alpha(theme::NAVY, 100),
+            theme::alpha(theme::MIDNIGHT, 225),
+        );
+        painter.rect_stroke(
+            canvas,
+            12.0,
+            Stroke::new(1.0, theme::alpha(theme::GLACIER, 45)),
+            StrokeKind::Inside,
+        );
+        // A quiet desk grid establishes scale without competing with the display labels.
+        let grid = canvas.shrink(12.0);
+        for x in (0..(grid.width() / 32.0) as usize).map(|i| grid.left() + i as f32 * 32.0) {
+            for y in (0..(grid.height() / 32.0) as usize).map(|i| grid.top() + i as f32 * 32.0) {
+                painter.circle_filled(egui::pos2(x, y), 0.7, theme::alpha(theme::QUIET, 30));
+            }
+        }
         if !self.editor.displays.iter().any(|display| display.visible()) {
             painter.text(
                 canvas.center(),
@@ -429,6 +524,7 @@ impl Settings {
             .canvas_drag
             .map_or_else(|| Fit::new(&self.editor.displays, canvas), |drag| drag.fit);
         let mut start = None;
+        let mut dragging_node = None;
         for display in self
             .editor
             .displays
@@ -440,6 +536,9 @@ impl Settings {
                 ui.id().with((&display.node, display.display)),
                 if busy { Sense::hover() } else { Sense::drag() },
             );
+            if response.dragged() {
+                dragging_node = Some(display.node.clone());
+            }
             if response.drag_started() {
                 start = ui
                     .input(|input| input.pointer.press_origin())
@@ -475,45 +574,227 @@ impl Settings {
             }
         }
         let overlaps = self.editor.overlaps();
+        let own = short_id(&self.status.node);
         for (index, display) in self.editor.displays.iter().enumerate() {
             if !display.visible() {
                 continue;
             }
             let rect = fit.rect(display);
-            painter.rect_filled(rect, 3.0, machine_colour(&display.node));
+            let accent = if display.node == own {
+                theme::FROST
+            } else {
+                let peer_index = self
+                    .status
+                    .peers
+                    .iter()
+                    .position(|peer| short_id(&peer.node) == display.node)
+                    .unwrap_or(0);
+                if peer_index % 2 == 0 {
+                    theme::PEER_ICE
+                } else {
+                    theme::QUIET
+                }
+            };
+            painter.add(
+                egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 12,
+                    spread: 0,
+                    color: Color32::from_black_alpha(90),
+                }
+                .as_shape(rect, 9),
+            );
+            theme::gradient(
+                &painter,
+                rect,
+                9.0,
+                if display.node == own {
+                    Color32::from_rgb(20, 64, 96)
+                } else {
+                    theme::alpha(theme::NAVY, 95)
+                },
+                if display.node == own {
+                    Color32::from_rgb(9, 31, 51)
+                } else {
+                    theme::alpha(theme::MIDNIGHT, 170)
+                },
+            );
             painter.rect_stroke(
                 rect,
-                3.0,
+                9.0,
                 Stroke::new(
-                    if overlaps.contains(&index) { 3.0 } else { 1.0 },
+                    if overlaps.contains(&index) { 2.0 } else { 1.0 },
                     if overlaps.contains(&index) {
-                        Color32::RED
+                        theme::WARNING
                     } else {
-                        Color32::WHITE
+                        theme::alpha(accent, 240)
                     },
                 ),
                 StrokeKind::Inside,
             );
-            painter.with_clip_rect(rect.intersect(canvas)).text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                format!("{}\n{}", display.machine, display.name),
-                FontId::proportional(14.0),
-                Color32::WHITE,
-            );
+            let top = [
+                rect.left_top() + egui::vec2(10.0, 2.0),
+                rect.right_top() + egui::vec2(-10.0, 2.0),
+            ];
+            for (width, opacity) in [(7.0, 18), (4.0, 35), (2.0, 180)] {
+                painter.line_segment(top, Stroke::new(width, theme::alpha(accent, opacity)));
+            }
+            let displays = if display.node == own {
+                &self.status.displays
+            } else {
+                self.status
+                    .peers
+                    .iter()
+                    .find(|peer| short_id(&peer.node) == display.node)
+                    .map_or(&self.status.displays, |peer| &peer.displays)
+            };
+            let resolution = displays
+                .iter()
+                .find(|screen| screen.id == display.display)
+                .map_or_else(
+                    || display.name.clone(),
+                    |screen| format!("{} × {}", screen.pixels[0], screen.pixels[1]),
+                );
+            let text_painter = painter.with_clip_rect(rect.shrink(3.0).intersect(canvas));
+            display_machine_chip(&text_painter, rect, &display.machine, accent);
+            let name = if display.name.is_empty() {
+                format!("Display {}", display.display)
+            } else {
+                display.name.clone()
+            };
+            let detail = format!("{resolution} · {}", display.machine);
+            for (text, fraction, size, color) in [
+                (
+                    name,
+                    0.52,
+                    (rect.height() * 0.18).clamp(8.0, 15.0),
+                    theme::ICE,
+                ),
+                (
+                    detail,
+                    0.78,
+                    (rect.height() * 0.16).clamp(8.0, 11.0),
+                    theme::QUIET,
+                ),
+            ] {
+                let width = (rect.width() - 12.0).max(1.0);
+                let font = fitted_font(ui, &text, width, size);
+                let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
+                job.wrap.max_width = width;
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                let label = text_painter.layout_job(job);
+                let center = egui::pos2(rect.center().x, rect.top() + rect.height() * fraction);
+                text_painter.galley(center - label.size() / 2.0, label, color);
+            }
+        }
+        for crossing in crossings(&self.editor.displays) {
+            if crossing
+                .displays
+                .iter()
+                .any(|index| overlaps.contains(index))
+            {
+                continue;
+            }
+            let line = [fit.to_screen(crossing.start), fit.to_screen(crossing.end)];
+            theme::crossing_glow(&painter, line, true);
+        }
+        if self.editor.dragging() {
+            // Show only actual alignments, after the editor's existing snap and rounding.
+            for (i, a) in self
+                .editor
+                .displays
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.visible() && dragging_node.as_deref() == Some(&d.node))
+            {
+                for b in self
+                    .editor
+                    .displays
+                    .iter()
+                    .skip(i + 1)
+                    .filter(|b| b.visible() && b.node != a.node)
+                {
+                    for axis in 0..2 {
+                        for ae in [
+                            a.origin[axis],
+                            a.origin[axis] + a.size[axis] / 2.0,
+                            a.origin[axis] + a.size[axis],
+                        ] {
+                            for be in [
+                                b.origin[axis],
+                                b.origin[axis] + b.size[axis] / 2.0,
+                                b.origin[axis] + b.size[axis],
+                            ] {
+                                if (ae - be).abs() <= 1.0 {
+                                    let p = fit.to_screen(if axis == 0 {
+                                        [ae, 0.0]
+                                    } else {
+                                        [0.0, ae]
+                                    });
+                                    let line = if axis == 0 {
+                                        [
+                                            egui::pos2(p.x, canvas.top() + 8.0),
+                                            egui::pos2(p.x, canvas.bottom() - 8.0),
+                                        ]
+                                    } else {
+                                        [
+                                            egui::pos2(canvas.left() + 8.0, p.y),
+                                            egui::pos2(canvas.right() - 8.0, p.y),
+                                        ]
+                                    };
+                                    painter.line_segment(
+                                        line,
+                                        Stroke::new(1.0, theme::alpha(theme::FROST, 100)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     fn pairing(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Pair a new machine");
-        ui.columns(2, |columns| {
-            let here = &mut columns[0];
-            here.heading("Here (show a code)");
-            here.checkbox(
+        if ui.available_width() >= 660.0 {
+            ui.columns(2, |columns| {
+                self.pair_here(&mut columns[0]);
+                self.pair_join(&mut columns[1]);
+            });
+        } else {
+            self.pair_here(ui);
+            self.pair_join(ui);
+        }
+        match self.pair.phase.as_str() {
+            "paired" => {
+                ui.label(format!(
+                    "Paired with {}.",
+                    self.pair.peer.as_deref().unwrap_or("the other machine")
+                ));
+            }
+            "failed" => {
+                ui.colored_label(theme::WARNING, "Pairing failed.");
+            }
+            _ => {}
+        }
+        if let Some(error) = &self.pair.error {
+            ui.colored_label(theme::WARNING, error);
+        }
+    }
+
+    fn pair_here(&mut self, ui: &mut egui::Ui) {
+        machine_card().show(ui, |here| {
+            here.set_width(here.available_width());
+            theme::section(here, "01  ·  ON THIS COMPUTER");
+            here.heading("Show a code");
+            here.label("Open a pairing window, then join from your other computer.");
+            theme::switch(
+                here,
                 &mut self.listen_allow_input,
                 "allow it to control this machine",
             );
-            if here.button("Open pairing window").clicked() {
+            if theme::primary(here, "Open pairing window", true).clicked() {
                 self.action(Request::PairListen {
                     allow_input: self.listen_allow_input,
                 });
@@ -524,33 +805,35 @@ impl Settings {
                 }
                 "confirm" => {
                     if let Some(sas) = &self.pair.sas {
-                        here.label(RichText::new(sas).size(36.0));
+                        sas_card(here, sas);
                     }
                     here.label("Confirm only if the other screen shows the same code.");
                     here.horizontal(|ui| {
-                        if ui.button("Confirm").clicked() {
+                        if theme::primary(ui, "Confirm", true).clicked() {
                             self.action(Request::PairConfirm { accept: true });
                         }
-                        if ui.button("Reject").clicked() {
+                        if theme::destructive(ui, "Reject").clicked() {
                             self.action(Request::PairConfirm { accept: false });
                         }
                     });
                 }
                 _ => {}
             }
-            let join = &mut columns[1];
-            join.heading("Join another machine");
-            join.checkbox(
+        });
+    }
+
+    fn pair_join(&mut self, ui: &mut egui::Ui) {
+        machine_card().show(ui, |join| {
+            join.set_width(join.available_width());
+            theme::section(join, "02  ·  FROM ANOTHER COMPUTER");
+            join.heading("Join a machine");
+            join.label("Find a computer with an open pairing window, or enter its address.");
+            theme::switch(
+                join,
                 &mut self.join_allow_input,
                 "allow it to control this machine",
             );
-            if join
-                .add_enabled(
-                    !self.pending.contains(&Target::Scan),
-                    egui::Button::new("Scan"),
-                )
-                .clicked()
-            {
+            if theme::primary(join, "Scan", !self.pending.contains(&Target::Scan)).clicked() {
                 self.scan_message = Some("Scanning…".into());
                 self.send(Target::Scan, Request::PairScan);
             }
@@ -558,9 +841,9 @@ impl Settings {
                 join.label(message);
             }
             for offer in self.offers.clone() {
-                join.horizontal(|ui| {
+                join.horizontal_wrapped(|ui| {
                     ui.label(format!("{} ({})", offer.name, offer.addr));
-                    if ui.button("Join").clicked() {
+                    if theme::primary(ui, "Join", true).clicked() {
                         self.action(Request::PairJoin {
                             addr: offer.addr,
                             allow_input: self.join_allow_input,
@@ -568,14 +851,8 @@ impl Settings {
                     }
                 });
             }
-            join.add(egui::TextEdit::singleline(&mut self.join_addr).hint_text("host:port"));
-            if join
-                .add_enabled(
-                    !self.join_addr.trim().is_empty(),
-                    egui::Button::new("Join address"),
-                )
-                .clicked()
-            {
+            theme::text_edit(join, &mut self.join_addr, "host:port");
+            if theme::primary(join, "Join address", !self.join_addr.trim().is_empty()).clicked() {
                 self.action(Request::PairJoin {
                     addr: self.join_addr.trim().into(),
                     allow_input: self.join_allow_input,
@@ -587,14 +864,17 @@ impl Settings {
                 }
                 "waiting" => {
                     if let Some(sas) = &self.pair.sas {
-                        join.label(RichText::new(sas).size(36.0));
+                        sas_card(join, sas);
                     }
                     join.label("Waiting for the other machine to confirm…");
                 }
                 "pick" => {
                     join.label("Choose the code shown on the other screen:");
                     for (index, candidate) in self.pair.candidates.clone().into_iter().enumerate() {
-                        if join.button(RichText::new(candidate).size(30.0)).clicked() {
+                        if join
+                            .button(RichText::new(candidate).size(30.0).color(theme::GLACIER))
+                            .clicked()
+                        {
                             self.action(Request::PairPick { index });
                         }
                     }
@@ -602,30 +882,14 @@ impl Settings {
                 _ => {}
             }
         });
-        match self.pair.phase.as_str() {
-            "paired" => {
-                ui.label(format!(
-                    "Paired with {}.",
-                    self.pair.peer.as_deref().unwrap_or("the other machine")
-                ));
-            }
-            "failed" => {
-                ui.colored_label(Color32::RED, "Pairing failed.");
-            }
-            _ => {}
-        }
-        if let Some(error) = &self.pair.error {
-            ui.colored_label(Color32::RED, error);
-        }
     }
 
     fn windows(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Windows");
             if ui.button("Refresh").clicked() {
                 self.refresh_windows();
             }
-            ui.checkbox(&mut self.show_all, "show all");
+            theme::switch(ui, &mut self.show_all, "show all");
         });
         let peers: Vec<_> = self
             .status
@@ -634,20 +898,22 @@ impl Settings {
             .filter(|peer| peer.connected)
             .cloned()
             .collect();
-        ui.heading("This machine's windows");
+        theme::section(ui, "FROM THIS MACHINE");
         if let Some(error) = &self.local_windows_message {
-            ui.colored_label(Color32::RED, error);
+            ui.colored_label(theme::WARNING, error);
         }
         if self.pending.contains(&Target::LocalWindows) {
             ui.label("Loading…");
         }
+        let local_name = self.status.name.clone();
+        let mut local_visible = false;
         for window in self.local_windows.clone() {
             if window.title.is_empty() && !self.show_all {
                 continue;
             }
+            local_visible = true;
             ui.push_id(("local", window.id), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(window_label(&window));
+                window_card(ui, &window, &local_name, "Choose destination", |ui| {
                     ui.menu_button("Show on…", |ui| {
                         if peers.is_empty() {
                             ui.label("No connected peers.");
@@ -665,21 +931,33 @@ impl Settings {
                 });
             });
         }
+        if !local_visible
+            && !self.pending.contains(&Target::LocalWindows)
+            && self.local_windows_message.is_none()
+        {
+            ui.label("No windows to show from this machine.");
+        }
         for peer in &peers {
             let id = short_id(&peer.node);
-            ui.separator();
-            ui.heading(format!("{}'s windows", peer.name));
+            ui.add_space(8.0);
+            theme::section(ui, &format!("FROM {}", peer.name.to_uppercase()));
             if let Some(error) = self.peer_windows_messages.get(&id) {
-                ui.colored_label(Color32::RED, error);
+                ui.colored_label(theme::WARNING, error);
             }
             if self.pending.contains(&Target::PeerWindows(id.clone())) {
                 ui.label("Loading…");
             }
-            for window in self.peer_windows.get(&id).cloned().unwrap_or_default() {
+            let windows = self.peer_windows.get(&id).cloned().unwrap_or_default();
+            if windows.is_empty()
+                && !self.pending.contains(&Target::PeerWindows(id.clone()))
+                && !self.peer_windows_messages.contains_key(&id)
+            {
+                ui.label("No windows reported by this machine.");
+            }
+            for window in windows {
                 ui.push_id((&id, window.id), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(window_label(&window));
-                        if ui.button("Show here").clicked() {
+                    window_card(ui, &window, &peer.name, "This machine", |ui| {
+                        if theme::primary(ui, "Bring here", true).clicked() {
                             self.action(Request::Pull {
                                 peer: id.clone(),
                                 window: window.id,
@@ -689,45 +967,210 @@ impl Settings {
                 });
             }
         }
-        ui.separator();
-        ui.heading("Active projections");
+        ui.add_space(8.0);
+        theme::section(ui, "ACTIVE PROJECTIONS");
         let own = short_id(&self.status.node);
         for projection in self.status.projections.clone() {
             let local = projection.source == own;
+            let source_name = self
+                .status
+                .peers
+                .iter()
+                .find(|peer| short_id(&peer.node) == projection.source)
+                .map_or_else(|| projection.source.clone(), |peer| peer.name.clone());
             ui.push_id((&projection.source, projection.projection), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "{}:{} — {} — shown {}",
-                        projection.source,
-                        projection.projection,
-                        projection.text,
-                        if local { "from here" } else { "here" }
-                    ));
-                    if ui.button("Give back").clicked() {
-                        self.action(Request::Return {
-                            projection: projection.projection,
-                            source: if local {
-                                None
+                machine_card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        theme::chip(
+                            ui,
+                            if local { "From here" } else { &source_name },
+                            theme::QUIET,
+                        );
+                        theme::chip(
+                            ui,
+                            if local {
+                                "On another machine"
                             } else {
-                                Some(projection.source.clone())
+                                "Shown here"
                             },
-                        });
+                            theme::GLACIER,
+                        );
+                        ui.label(&projection.text);
+                        if ui.button("Give back").clicked() {
+                            self.action(Request::Return {
+                                projection: projection.projection,
+                                source: if local {
+                                    None
+                                } else {
+                                    Some(projection.source.clone())
+                                },
+                            });
+                        }
+                    });
+                    ui.small(format!(
+                        "Projection {} · {}",
+                        projection.projection, projection.source
+                    ));
+                    if let Some(received) = &projection.received {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} frames, {:.1} MB, last frame {}",
+                                received.frames,
+                                received.bytes as f64 / 1_000_000.0,
+                                received.last_ms_ago.map_or_else(
+                                    || "not received".into(),
+                                    |ms| format!("{ms} ms ago")
+                                )
+                            ))
+                            .small()
+                            .color(theme::QUIET),
+                        );
                     }
                 });
-                if let Some(received) = &projection.received {
-                    ui.small(format!(
-                        "{} frames, {:.1} MB, last frame {}",
-                        received.frames,
-                        received.bytes as f64 / 1_000_000.0,
-                        received
-                            .last_ms_ago
-                            .map_or_else(|| "not received".into(), |ms| format!("{ms} ms ago"))
-                    ));
-                }
             });
         }
         if self.status.projections.is_empty() {
             ui.label("No active projections.");
+        }
+    }
+
+    fn header(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            self.art.emblem(ui, egui::vec2(56.0, 56.0));
+            ui.vertical(|ui| {
+                let wordmark_size = egui::vec2(260.0, 260.0 * 96.0 / 689.0);
+                self.art.wordmark(ui, wordmark_size);
+                theme::section(ui, "BY FROSTDEV");
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let peers = self
+                    .status
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.connected)
+                    .count();
+                let text = if self.reachable {
+                    let suffix = if peers == 1 { "" } else { "s" };
+                    format!("●  Agent reachable  ·  {peers} peer{suffix} online")
+                } else {
+                    "●  Agent unavailable".into()
+                };
+                let color = if self.reachable {
+                    theme::GLACIER
+                } else {
+                    theme::QUIET
+                };
+                theme::chip(ui, &text, color);
+            });
+        });
+    }
+
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "WORKSPACE");
+        let tabs = [
+            (Tab::Machines, "Machines"),
+            (Tab::Layout, "Layout"),
+            (Tab::Pairing, "Pairing"),
+            (Tab::Windows, "Windows"),
+        ];
+        for (index, (tab, name)) in tabs.into_iter().enumerate() {
+            if navigation(ui, index, name, self.tab == tab).clicked() && self.tab != tab {
+                if self.tab == Tab::Layout {
+                    self.editor.stop_drag();
+                    self.canvas_drag = None;
+                }
+                self.tab = tab;
+                if tab == Tab::Windows {
+                    self.windows_need_refresh = true;
+                }
+                if tab == Tab::Pairing {
+                    self.pair_sent = None;
+                }
+            }
+        }
+        let footer_height = if self.demo.is_some() { 80.0 } else { 50.0 };
+        ui.add_space((ui.available_height() - footer_height).max(20.0));
+        ui.label(
+            RichText::new("Your computers.\nOne workspace.")
+                .size(14.0)
+                .color(theme::QUIET),
+        );
+        if self.demo.is_some() {
+            theme::chip(ui, "Demo workspace", theme::QUIET);
+        }
+    }
+
+    fn content(&mut self, ui: &mut egui::Ui) {
+        let (title, subtitle) = match self.tab {
+            Tab::Machines => (
+                "Your machines",
+                "Move the pointer. Take control back. Choose what each machine may do.",
+            ),
+            Tab::Layout => ("Arrange your desk", "Put every screen in its place."),
+            Tab::Pairing => (
+                "Connect another computer",
+                "Make it part of your workspace, one matching code at a time.",
+            ),
+            Tab::Windows => (
+                "Bring a window over",
+                "Keep your work in view, wherever it is running.",
+            ),
+        };
+        ui.heading(title);
+        ui.label(RichText::new(subtitle).color(theme::QUIET));
+        ui.add_space(12.0);
+        if !self.reachable {
+            ui.vertical_centered(|ui| {
+                ui.add_space(36.0);
+                self.art.emblem(ui, egui::vec2(150.0, 150.0));
+                ui.label("Start the Crosspane agent to bring your computers into one workspace.");
+                if let Some(worker) = &self.worker {
+                    ui.label(RichText::new(&worker.path).small().color(theme::QUIET));
+                }
+            });
+            return;
+        }
+        if let Some(message) = &self.message {
+            egui::Frame::new()
+                .fill(theme::alpha(theme::NAVY, 95))
+                .corner_radius(8)
+                .inner_margin(10)
+                .show(ui, |ui| {
+                    ui.label(message);
+                });
+        }
+        if self.tab == Tab::Layout {
+            self.layout(ui);
+        } else {
+            let scroll = egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    match self.tab {
+                        Tab::Machines => self.machines(ui),
+                        Tab::Pairing => self.pairing(ui),
+                        Tab::Windows => self.windows(ui),
+                        Tab::Layout => {}
+                    }
+                    if self.tab == Tab::Windows {
+                        ui.add_space(24.0);
+                    }
+                });
+            if self.tab == Tab::Windows
+                && scroll.content_size.y - scroll.state.offset.y > scroll.inner_rect.height() + 1.0
+            {
+                let fade = egui::Rect::from_min_max(
+                    scroll.inner_rect.left_bottom() - egui::vec2(0.0, 38.0),
+                    scroll.inner_rect.right_bottom(),
+                );
+                theme::gradient(
+                    &ui.painter().with_clip_rect(scroll.inner_rect),
+                    fade,
+                    0.0,
+                    Color32::TRANSPARENT,
+                    theme::alpha(theme::MIDNIGHT, 245),
+                );
+            }
         }
     }
 }
@@ -737,55 +1180,216 @@ impl eframe::App for Settings {
         self.poll();
         self.schedule();
         ctx.request_repaint_after(Duration::from_millis(500));
+        if let Some(path) = &self.screenshot {
+            let captured = ctx.input(|input| {
+                input.events.iter().find_map(|event| {
+                    if let egui::Event::Screenshot { image, .. } = event {
+                        Some(image.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(image) = captured {
+                if let Err(error) = crate::art::save_screenshot(path, &image) {
+                    eprintln!("Crosspane screenshot: {error:#}");
+                    std::process::exit(1);
+                }
+                self.screenshot = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if self
+                .screenshot_requested
+                .is_some_and(|sent| sent.elapsed() > Duration::from_secs(15))
+            {
+                eprintln!(
+                    "Crosspane screenshot: renderer did not return a capture within 15 seconds"
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (tab, name) in [
-                    (Tab::Machines, "Machines"),
-                    (Tab::Layout, "Layout"),
-                    (Tab::Pairing, "Pairing"),
-                    (Tab::Windows, "Windows"),
-                ] {
-                    if ui.selectable_label(self.tab == tab, name).clicked() && self.tab != tab {
-                        if self.tab == Tab::Layout {
-                            self.editor.stop_drag();
-                            self.canvas_drag = None;
-                        }
-                        self.tab = tab;
-                        if tab == Tab::Windows {
-                            self.windows_need_refresh = true;
-                        }
-                        if tab == Tab::Pairing {
-                            self.pair_sent = None;
-                        }
-                    }
-                }
-            });
-            ui.separator();
-            if !self.reachable {
-                ui.label(format!(
-                    "crosspane-agent isn't running ({})",
-                    self.worker.path
-                ));
-                return;
-            }
-            if let Some(message) = &self.message {
-                ui.label(message);
-            }
-            if self.tab == Tab::Layout {
-                self.layout(ui);
-            } else {
-                egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
-                    Tab::Machines => self.machines(ui),
-                    Tab::Pairing => self.pairing(ui),
-                    Tab::Windows => self.windows(ui),
-                    Tab::Layout => {}
-                });
-            }
+        self.art.background(ui.painter(), ui.max_rect());
+        egui::Frame::new().inner_margin(24).show(ui, |ui| {
+            self.header(ui);
+            ui.add_space(18.0);
+            let body = ui.available_rect_before_wrap();
+            // Fixed sibling rectangles keep panel borders inside the window. Frames inherit
+            // layouts, so each child explicitly starts a vertical column instead of inheriting
+            // a horizontal body layout and consuming its sibling's width.
+            let sidebar = egui::Rect::from_min_size(body.min, egui::vec2(200.0, body.height()));
+            let content =
+                egui::Rect::from_min_max(egui::pos2(sidebar.right() + 16.0, body.top()), body.max);
+            let mut sidebar_ui =
+                glass_column(ui, "sidebar", sidebar, theme::glass().inner_margin(14));
+            self.sidebar(&mut sidebar_ui);
+            let mut content_ui = glass_column(ui, "content", content, theme::glass());
+            self.content(&mut content_ui);
+            ui.allocate_rect(body, Sense::hover());
         });
+        if self.screenshot.is_some() && self.screenshot_requested.is_none() {
+            let started = *self.screenshot_started.get_or_insert_with(Instant::now);
+            self.screenshot_frames = self.screenshot_frames.saturating_add(1);
+            // Allow layout passes, font/texture uploads and the 160 ms selection animation
+            // to settle. Only screenshot mode needs this temporary faster repaint cadence.
+            if self.screenshot_frames >= 12 && started.elapsed() >= Duration::from_millis(350) {
+                self.screenshot_requested = Some(Instant::now());
+                ui.ctx()
+                    .send_viewport_cmd(
+                        egui::ViewportCommand::Screenshot(egui::UserData::default()),
+                    );
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(32));
+            }
+        }
     }
+}
+
+fn fitted_font(ui: &egui::Ui, text: &str, width: f32, desired: f32) -> FontId {
+    let measured = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(text.into(), FontId::proportional(desired), theme::ICE)
+            .size()
+            .x
+    });
+    FontId::proportional((desired * (width / measured.max(1.0)).min(1.0)).max(8.0))
+}
+
+fn display_machine_chip(
+    painter: &egui::Painter,
+    display: egui::Rect,
+    machine: &str,
+    accent: Color32,
+) {
+    let font_size = (display.height() * 0.13).clamp(7.0, 9.0);
+    let font = FontId::proportional(font_size);
+    let label = painter.layout_no_wrap(machine.into(), font, accent);
+    let size = egui::vec2(
+        (label.size().x + 12.0).min((display.width() - 16.0).max(1.0)),
+        label.size().y + 4.0,
+    );
+    let rect = egui::Rect::from_min_size(display.min + egui::vec2(8.0, 5.0), size);
+    painter.rect_filled(rect, 5.0, theme::alpha(accent, 18));
+    painter.rect_stroke(
+        rect,
+        5.0,
+        Stroke::new(1.0, theme::alpha(accent, 70)),
+        StrokeKind::Inside,
+    );
+    painter
+        .with_clip_rect(
+            rect.shrink2(egui::vec2(4.0, 0.0))
+                .intersect(painter.clip_rect()),
+        )
+        .galley(rect.min + egui::vec2(6.0, 2.0), label, accent);
+}
+
+/// Paint a glass surface at its fixed bounds, then create a bounded vertical content UI.
+/// Keeping the frame's bounds independent of child measurements preserves the outer margin.
+fn glass_column(parent: &mut egui::Ui, id: &str, rect: egui::Rect, frame: egui::Frame) -> egui::Ui {
+    let inner = rect - frame.total_margin();
+    parent.painter().add(frame.paint(inner));
+    let mut child = parent.new_child(
+        egui::UiBuilder::new()
+            .id_salt(id)
+            .max_rect(inner)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.set_clip_rect(rect.intersect(parent.clip_rect()));
+    child
+}
+
+fn navigation(ui: &mut egui::Ui, index: usize, label: &str, selected: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    let hover =
+        ui.ctx()
+            .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.16);
+    let glow = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("selection"), selected, 0.16);
+    if hover > 0.0 || glow > 0.0 {
+        ui.painter().rect_filled(
+            rect,
+            9.0,
+            theme::alpha(theme::NAVY, (45.0 * hover + 110.0 * glow) as u8),
+        );
+    }
+    if glow > 0.0 {
+        let bar = egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(0.0, 10.0),
+            egui::vec2(3.0, 26.0),
+        );
+        ui.painter().rect_filled(
+            bar.expand(3.0),
+            5.0,
+            theme::alpha(theme::FROST, (18.0 * glow) as u8),
+        );
+        ui.painter()
+            .rect_filled(bar, 2.0, theme::alpha(theme::FROST, (255.0 * glow) as u8));
+    }
+    theme::icon(
+        ui.painter(),
+        egui::Rect::from_min_size(rect.min + egui::vec2(12.0, 11.0), egui::vec2(24.0, 24.0)),
+        index,
+        if selected { theme::FROST } else { theme::QUIET },
+    );
+    ui.painter().text(
+        rect.min + egui::vec2(46.0, 23.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(14.0),
+        if selected { theme::ICE } else { theme::QUIET },
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn machine_card() -> egui::Frame {
+    theme::glass()
+        .fill(theme::alpha(theme::NAVY, 42))
+        .inner_margin(16)
+        .shadow(egui::epaint::Shadow::NONE)
+}
+
+fn sas_card(ui: &mut egui::Ui, sas: &str) {
+    ui.add_space(12.0);
+    theme::glass()
+        .fill(theme::alpha(theme::NAVY, 100))
+        .show(ui, |ui| {
+            ui.set_width((ui.available_width()).max(1.0));
+            theme::section(ui, "MATCH ON BOTH SCREENS");
+            ui.label(RichText::new(sas).size(44.0).strong().color(theme::GLACIER));
+        });
+}
+
+fn window_card(
+    ui: &mut egui::Ui,
+    window: &Window,
+    source: &str,
+    destination: &str,
+    action: impl FnOnce(&mut egui::Ui),
+) {
+    machine_card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(&window.app);
+            theme::chip(ui, &format!("From {source}"), theme::QUIET);
+            theme::chip(ui, destination, theme::GLACIER);
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(window_label(window));
+            action(ui);
+        });
+    });
 }
 
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, String> {
@@ -801,16 +1405,20 @@ fn reply_text(value: Value) -> String {
 }
 
 fn display_line(ui: &mut egui::Ui, display: &Display) {
-    ui.label(format!(
-        "Display {}: {} — {} × {} px, scale {}, {:.0} × {:.0} mm",
-        display.id,
-        display.name,
-        display.pixels[0],
-        display.pixels[1],
-        display.scale,
-        display.mm[0],
-        display.mm[1]
-    ));
+    ui.label(
+        RichText::new(format!(
+            "Display {}: {} — {} × {} px, scale {}, {:.0} × {:.0} mm",
+            display.id,
+            display.name,
+            display.pixels[0],
+            display.pixels[1],
+            display.scale,
+            display.mm[0],
+            display.mm[1]
+        ))
+        .size(12.0)
+        .color(theme::QUIET),
+    );
 }
 
 fn window_label(window: &Window) -> String {
@@ -823,18 +1431,156 @@ fn window_label(window: &Window) -> String {
         .display
         .map_or_else(String::new, |id| format!(" · display {id}"));
     format!(
-        "{} — {title} · {:.0} × {:.0}{display}",
-        window.app, window.size[0], window.size[1]
+        "{title} · {:.0} × {:.0}{display}",
+        window.size[0], window.size[1]
     )
 }
 
-fn machine_colour(node: &str) -> Color32 {
-    let hash = node.bytes().fold(2_166_136_261_u32, |hash, byte| {
-        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
-    });
-    Color32::from_rgb(
-        45 + (hash & 63) as u8,
-        65 + ((hash >> 8) & 63) as u8,
-        85 + ((hash >> 16) & 63) as u8,
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::App;
+
+    // Inspect the real egui output without a native window, renderer, compositor or socket.
+    // This catches inherited layouts and offscreen content that the model tests cannot detect.
+    #[test]
+    fn every_tab_is_visible_with_stacked_navigation_and_bounded_panels() {
+        fn leaves<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::Shape>) {
+            if let egui::Shape::Vec(shapes) = shape {
+                for shape in shapes {
+                    leaves(shape, out);
+                }
+            } else {
+                out.push(shape);
+            }
+        }
+        for size in [
+            egui::vec2(1072.0, 937.0),
+            egui::vec2(1100.0, 760.0),
+            egui::vec2(800.0, 600.0),
+        ] {
+            for (tab, title, content) in [
+                (Tab::Machines, "Your machines", "desktop"),
+                (Tab::Layout, "Arrange your desk", "3440 × 1440"),
+                (Tab::Pairing, "Connect another computer", "482 719"),
+                (Tab::Windows, "Bring a window over", "Arctic field notes"),
+            ] {
+                let ctx = egui::Context::default();
+                ctx.set_fonts(crate::fonts::load().expect("system font"));
+                ctx.set_theme(egui::Theme::Dark);
+                ctx.set_style_of(egui::Theme::Dark, theme::style());
+                let mut app = Settings::new(None, Art::load(&ctx), None);
+                app.tab = tab;
+                let mut frame = eframe::Frame::_new_kittest();
+                let mut input_center = None;
+                for number in 0..6 {
+                    let mut events = Vec::new();
+                    if let Some(pos) =
+                        input_center.filter(|_| tab == Tab::Pairing && (number == 1 || number == 2))
+                    {
+                        events.push(egui::Event::PointerMoved(pos));
+                        events.push(egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: number == 1,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+                            time: Some(f64::from(number) * 0.1),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| app.ui(ui, &mut frame),
+                    );
+                    // A headless test deliberately has no renderer to apply texture deltas.
+                    output.textures_delta.clear();
+                    let mut texts = Vec::new();
+                    let mut panels = Vec::new();
+                    let mut input = None;
+                    let mut colors = Vec::new();
+                    for clipped in &output.shapes {
+                        let mut shapes = Vec::new();
+                        leaves(&clipped.shape, &mut shapes);
+                        for shape in shapes {
+                            match shape {
+                                egui::Shape::Text(text) => {
+                                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                                    texts.push((text.galley.text(), rect, clipped.clip_rect));
+                                    colors.push((
+                                        text.galley.text(),
+                                        text.galley.job.sections[0].format.color,
+                                    ));
+                                }
+                                egui::Shape::Rect(rect) if rect.fill == theme::glass().fill => {
+                                    panels.push(rect.rect)
+                                }
+                                egui::Shape::Rect(rect)
+                                    if rect.fill == theme::alpha(theme::NAVY, 45) =>
+                                {
+                                    input = Some(rect);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if tab == Tab::Pairing && size.x >= 1000.0 {
+                        let input = input.expect("glass text field");
+                        assert!((34.0..=38.0).contains(&input.rect.height()));
+                        assert_eq!(input.corner_radius, egui::CornerRadius::same(8));
+                        input_center = Some(input.rect.center());
+                        if number >= 3 {
+                            assert_eq!(input.stroke.color, theme::FROST);
+                        }
+                        assert!(colors.contains(&("host:port", theme::QUIET)));
+                        assert!(colors.contains(&("Join address", theme::QUIET)));
+                    } else if tab == Tab::Layout {
+                        assert!(colors.contains(&("Apply", theme::QUIET)));
+                    }
+                    let find = |needle: &str| {
+                        *texts
+                            .iter()
+                            .find(|(text, _, _)| text.contains(needle))
+                            .unwrap_or_else(|| {
+                                panic!("missing {needle:?} on {tab:?} at {size:?}, frame {number}")
+                            })
+                    };
+                    assert_eq!(panels.len(), 2, "sidebar and content panels");
+                    let sidebar = panels[0];
+                    let panel = panels[1];
+                    assert!((sidebar.left() - 24.0).abs() < 0.1);
+                    assert!((sidebar.width() - 200.0).abs() < 0.1);
+                    assert!((size.x - panel.right() - 24.0).abs() < 0.1);
+                    assert!((size.y - panel.bottom() - 24.0).abs() < 0.1);
+                    assert!(sidebar.right() < panel.left());
+                    let mut previous_bottom = sidebar.top();
+                    for label in ["Machines", "Layout", "Pairing", "Windows"] {
+                        let (_, rect, clip) = find(label);
+                        assert!(rect.top() > previous_bottom, "nav rows must stack: {label}");
+                        assert!(sidebar.contains_rect(rect) && clip.contains_rect(rect));
+                        previous_bottom = rect.bottom();
+                    }
+                    let (_, tagline, tagline_clip) = find("Your computers.");
+                    let (_, badge, badge_clip) = find("Demo workspace");
+                    assert!(tagline.top() > previous_bottom);
+                    assert!(badge.top() > tagline.bottom());
+                    assert!(sidebar.contains_rect(tagline) && tagline_clip.contains_rect(tagline));
+                    assert!(sidebar.contains_rect(badge) && badge_clip.contains_rect(badge));
+                    for needle in [title, content] {
+                        let (_, rect, clip) = find(needle);
+                        assert!(
+                            panel.contains_rect(rect),
+                            "{needle:?} outside panel on {tab:?} at {size:?}: {rect:?}"
+                        );
+                        assert!(
+                            clip.contains_rect(rect),
+                            "{needle:?} clipped on {tab:?} at {size:?}: {rect:?}, {clip:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

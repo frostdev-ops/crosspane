@@ -94,7 +94,9 @@ impl Fit {
             min = [0.0; 2];
             max = [1.0; 2];
         }
-        let available = canvas.shrink(28.0);
+        // Fit to 85% on the limiting axis, preserving physical proportions and centering.
+        // A wide desk necessarily leaves vertical room for moving machines above/below it.
+        let available = Rect::from_center_size(canvas.center(), canvas.size() * 0.85);
         let width = (max[0] - min[0]).max(1.0);
         let height = (max[1] - min[1]).max(1.0);
         let scale = (f64::from(available.width().max(1.0)) / width)
@@ -330,6 +332,27 @@ mod tests {
         }
         let screen = Pos2::new(333.5, 222.2);
         assert!(fit.to_screen(fit.to_mm(screen)).distance(screen) < 0.001);
+    }
+
+    #[test]
+    fn fit_uses_eighty_five_percent_of_limiting_axis_and_preserves_aspect() {
+        for size in [Vec2::new(760.0, 570.0), Vec2::new(300.0, 500.0)] {
+            for origins in [[[0.0, 0.0], [500.0, 0.0]], [[0.0, 0.0], [0.0, 500.0]]] {
+                let displays = [display("a", 0, origins[0]), display("b", 0, origins[1])];
+                let canvas = Rect::from_min_size(Pos2::new(20.0, 30.0), size);
+                let fit = Fit::new(&displays, canvas);
+                let bounds = fit.rect(&displays[0]).union(fit.rect(&displays[1]));
+                assert!(bounds.center().distance(canvas.center()) < 0.001);
+                assert!((bounds.width() / size.x).max(bounds.height() / size.y) <= 0.85001);
+                assert!(
+                    ((bounds.width() / size.x).max(bounds.height() / size.y) - 0.85).abs() < 0.001
+                );
+                assert!(
+                    (fit.rect(&displays[0]).width() / fit.rect(&displays[0]).height() - 1.0).abs()
+                        < 0.001
+                );
+            }
+        }
     }
 
     #[test]

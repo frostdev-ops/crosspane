@@ -149,7 +149,12 @@ window projection only. Both machines then show the peer in `crosspanectl status
   where displays of different machines touch;
 - **Pairing**: pair a new machine, as above;
 - **Windows**: send this machine's windows to another one, show another machine's windows here,
-  and give projected windows back.
+  and give projected windows back. The app uses Crosspane's dark arctic artwork and glass panels.
+  For review without an agent, run `CROSSPANE_UI_DEMO=1 cargo run -p crosspane-ui`.
+  To capture a tab and exit, run
+  `CROSSPANE_UI_SCREENSHOT=/tmp/crosspane-layout.png CROSSPANE_UI_TAB=layout cargo run -p crosspane-ui`;
+  tab names are `machines`, `layout`, `pairing` and `windows`. Screenshot mode automatically uses
+  the demo model. Both review modes stay disconnected from the real agent socket.
 
 Everything is also available from the command line:
 
