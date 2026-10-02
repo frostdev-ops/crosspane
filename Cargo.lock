@@ -859,9 +859,14 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crosspane-installer-core",
+ "crosspane-types",
  "crosspane-ui-kit",
  "eframe",
  "png",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

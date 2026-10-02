@@ -84,13 +84,10 @@ fn normal_entry_stays_disconnected_and_cannot_become_a_demo_or_production_job() 
             .iter()
             .all(|row| row.state != RowState::Verified)
     );
+    // The installer core is a dependency since WP-4.4a (its codec); the shell itself still
+    // constructs no production port or job, which the assertions above prove.
     let manifest = include_str!("../Cargo.toml");
-    for dependency in [
-        "crosspane-installer-core",
-        "crosspane-agent",
-        "crosspane-platform",
-        "crosspane-ctl",
-    ] {
+    for dependency in ["crosspane-agent", "crosspane-platform", "crosspane-ctl"] {
         assert!(!manifest.contains(dependency));
     }
 }
