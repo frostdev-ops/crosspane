@@ -644,7 +644,8 @@ async fn a_raw_peer_can_send_a_frame_of_exactly_64_mib() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn media_before_hello_closes_the_connection() {
     let mut rig = rig().await;
-    let _media = open_stream(&rig.conn, 0x03, &delta(1, 1_000)).await;
+    // The type byte can trigger the close before the payload write finishes.
+    let _media = try_open_stream(&rig.conn, 0x03, &delta(1, 1_000)).await;
     rig.expect_protocol_error().await;
 }
 

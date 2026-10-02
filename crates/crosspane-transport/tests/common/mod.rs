@@ -481,8 +481,9 @@ pub async fn open_stream(conn: &quinn::Connection, kind: u8, bytes: &[u8]) -> qu
     send
 }
 
-/// Like [`open_stream`], but `None` if the connection is already closed (a refusal can arrive before
-/// the client has opened anything).
+/// Like [`open_stream`], but `None` if opening or writing fails: a refusal can arrive before the
+/// stream opens or while its bytes are being written. Callers must assert the expected close
+/// separately.
 pub async fn try_open_stream(
     conn: &quinn::Connection,
     kind: u8,
