@@ -14,7 +14,7 @@ use crosspane_platform::{LockState, SessionEvent, SessionState, WindowEvent, Win
 use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{Capability, ControlMessage, InputMessage};
 use crosspane_protocol::projection::{ProjectionEndReason as Reason, ProjectionMessage as Message};
-use crosspane_types::geom::{PixelRect, PixelSize, PointDevice};
+use crosspane_types::geom::{DisplayGeometry, PixelRect, PixelSize, PointDevice};
 use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
@@ -62,6 +62,8 @@ pub struct E2 {
     grants: BTreeMap<NodeId, BTreeSet<Capability>>,
     windows: BTreeMap<WindowId, WindowInfo>,
     scales: BTreeMap<DisplayId, f64>,
+    pub(super) display_bounds: BTreeMap<DisplayId, DisplayGeometry>,
+    proxy_windows: BTreeMap<WindowId, ProjectionKey>,
     focused: Option<WindowId>,
     /// The window that had focus before a parked window was activated for its proxy: focus
     /// goes back to it when the proxy loses focus, so this node's own new windows don't open
@@ -72,6 +74,7 @@ pub struct E2 {
     destinations: BTreeMap<ProjectionKey, Destination>,
     // Don't reuse a window while its previous parking operation can still complete.
     pending_parks: BTreeMap<WindowId, MonoTime>,
+    pending_places: BTreeMap<WindowId, crosspane_protocol::projection::ProxyPlacement>,
     ledgers: Ledgers,
     /// WP-2.43 §2.4: while the E1 controller is home (entering, home, exiting, or still removing
     /// its bind), this node's physical input owns the seat: no source injects anything but
@@ -113,12 +116,15 @@ impl E2 {
                 grants: BTreeMap::new(),
                 windows: BTreeMap::new(),
                 scales: BTreeMap::new(),
+                display_bounds: BTreeMap::new(),
+                proxy_windows: BTreeMap::new(),
                 focused: None,
                 focus_before: None,
                 next_projection: Some(1),
                 sources: BTreeMap::new(),
                 destinations: BTreeMap::new(),
                 pending_parks: BTreeMap::new(),
+                pending_places: BTreeMap::new(),
                 ledgers,
                 home: None,
             },
@@ -159,6 +165,10 @@ impl E2 {
             }
             Input::LocalDisplays(displays) => {
                 self.scales = displays.iter().map(|d| (d.id, d.geometry.scale)).collect();
+                self.display_bounds = displays.iter().map(|d| (d.id, d.geometry)).collect();
+            }
+            Input::ProxyWindow { key, window } => {
+                self.proxy_windows.insert(*window, *key);
             }
             Input::Grants(grants) => {
                 self.grants = grants.clone();
@@ -218,12 +228,16 @@ impl E2 {
                         self.end_source(id, Reason::WindowClosed, false, now, out);
                     }
                     self.pending_parks.remove(window);
+                    self.pending_places.remove(window);
                 }
                 WindowEvent::Focused(window) => self.focused = *window,
                 _ => {}
             },
-            Input::Command(Command::Project { window, to, .. }) => {
+            Input::Command(Command::Project { window, to, place }) => {
                 let _ = self.project(*window, *to, now, out);
+                if let Some(place) = place {
+                    self.place_start(*place, 0, (0, 0), None, out);
+                }
             }
             Input::Command(command @ (Command::Browse { .. } | Command::Pull { .. })) => {
                 self.browse_command(*command, out);
@@ -235,6 +249,7 @@ impl E2 {
                     self.end_destination(*key, Reason::Returned, false, false, out);
                 }
             }
+            Input::Command(Command::ReturnAt(key, place)) => self.return_at(*key, *place, now, out),
             Input::Command(Command::Panic) => {
                 self.panic = true;
                 self.end_all(Reason::Returned, now, out);
@@ -268,6 +283,7 @@ impl E2 {
                 // Dispatch by wire direction, never by whichever map happens to match an id.
                 match msg {
                     Message::Start { .. }
+                    | Message::StartAt { .. }
                     | Message::Geometry { .. }
                     | Message::Title { .. }
                     | Message::End { .. }
@@ -275,6 +291,7 @@ impl E2 {
                     | Message::BrowseRefused { .. } => {
                         self.destination_control(*peer, msg, now, out)
                     }
+                    Message::DragCancel { .. } => self.destination_control(*peer, msg, now, out),
                     Message::Accepted { .. }
                     | Message::Refused { .. }
                     | Message::Resize { .. }
@@ -284,6 +301,22 @@ impl E2 {
                     | Message::ListWindows { .. }
                     | Message::Pull { .. }
                     | Message::ProxyPlaced { .. } => self.source_control(*peer, msg, now, out),
+                    Message::ReturnAt { projection, place }
+                        if self
+                            .sources
+                            .get(projection)
+                            .is_some_and(|s| s.peer == *peer) =>
+                    {
+                        self.return_at(
+                            ProjectionKey {
+                                source: self.node,
+                                projection: *projection,
+                            },
+                            *place,
+                            now,
+                            out,
+                        );
+                    }
                     _ => {}
                 }
             }

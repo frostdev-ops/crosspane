@@ -18,7 +18,7 @@ use crosspane_input::journal::{Journal, JournalError};
 use crosspane_platform::CaptureEvent;
 use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{ControlMessage, InputMessage, Refusal};
-use crosspane_protocol::projection::ProjInput;
+use crosspane_protocol::projection::{ProjInput, ProjectionMessage};
 use crosspane_types::id::NodeId;
 use crosspane_types::time::MonoTime;
 
@@ -109,9 +109,39 @@ impl Engine {
             }
         }
         let was_controlled = self.target.is_controlled();
+        if was_controlled {
+            self.controller.cancel_pending(now, &mut out);
+        }
+        if let Input::Capture(
+            CaptureEvent::DragAtEdge {
+                portal,
+                position,
+                window,
+                ..
+            }
+            | CaptureEvent::DragDroppedAtEdge {
+                portal,
+                position,
+                window,
+                ..
+            },
+        ) = &input
+        {
+            let offer = self
+                .controller
+                .drag_peer(*portal, *position)
+                .and_then(|peer| self.e2.drag_offer(*window, peer));
+            self.controller
+                .prepare_drag(offer, self.e2.drag_title(*window));
+        }
         let edge_event = matches!(
             &input,
-            Input::Capture(CaptureEvent::EdgePressed { .. } | CaptureEvent::EdgeReleased { .. })
+            Input::Capture(
+                CaptureEvent::EdgePressed { .. }
+                    | CaptureEvent::EdgeReleased { .. }
+                    | CaptureEvent::DragAtEdge { .. }
+                    | CaptureEvent::DragDroppedAtEdge { .. }
+            )
         );
         // WP-2.43 §2.10: a peer's motion over a proxy of this node's twin-parked window may take
         // this node's input home. What E2 would accept is decided first (pure); the controller
@@ -142,6 +172,57 @@ impl Engine {
         // last, and the trailing set_home lifts the filter in the same handle as an abort or exit.
         self.e2.set_home(self.controller.home(), now, &mut out);
         self.e2.handle(&input, now, &mut out);
+        if let Some(commit) = self.controller.take_drag_commit() {
+            let key = self.e2.drag_commit(commit, now, &mut out);
+            self.controller.drag_committed(commit, key, now, &mut out);
+        }
+        let updates: Vec<_> = out
+            .iter()
+            .filter(|output| {
+                matches!(
+                    output,
+                    Output::Notice(Notice::ProjectionEnded { .. })
+                        | Output::SendControl {
+                            msg: ControlMessage::Projection(ProjectionMessage::DragReady { .. }),
+                            ..
+                        }
+                )
+            })
+            .cloned()
+            .collect();
+        for output in updates {
+            match output {
+                Output::SendControl {
+                    peer,
+                    msg:
+                        ControlMessage::Projection(ProjectionMessage::DragReady {
+                            projection,
+                            token,
+                            display,
+                            position,
+                        }),
+                } => self.target.prepare_drag(
+                    ProjectionKey {
+                        source: peer,
+                        projection,
+                    },
+                    token,
+                    display,
+                    position,
+                    &mut out,
+                ),
+                Output::Notice(Notice::ProjectionEnded { key, .. }) => {
+                    self.controller.drag_ended(Some(key), now, &mut out);
+                    self.target.drag_ended(key, &mut out);
+                }
+                _ => {}
+            }
+        }
+        if let Some((window, peer)) = self.controller.drag_subject()
+            && self.e2.drag_offer(window, peer).is_none()
+        {
+            self.controller.drag_ended(None, now, &mut out);
+        }
         // (Only an entry that is waiting for the drain looks at it, so it is only asked then.)
         let settled = self.controller.draining() && self.e2.settled() && self.target.settled();
         self.controller.after_e2(settled, now, &mut out);

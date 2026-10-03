@@ -11,7 +11,7 @@ use crosspane_platform::{
 use crosspane_protocol::msg::{Capability, Refusal};
 use crosspane_protocol::projection::{
     BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjInput, ProjectionEndReason as Reason,
-    ProjectionMessage as Message, WindowSummary,
+    ProjectionMessage as Message, ProxyPlacement, WindowSummary,
 };
 use crosspane_types::geom::{PixelSize, PointDevice, RectLogical};
 use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
@@ -87,6 +87,7 @@ impl PlacementState {
 pub(super) struct Source {
     pub peer: NodeId,
     pub window: WindowId,
+    restore_place: Option<ProxyPlacement>,
     stage: Stage,
     placement: PlacementState,
     parked: Option<Parked>,
@@ -133,14 +134,8 @@ pub(super) struct Source {
 }
 
 impl E2 {
-    pub(super) fn project(
-        &mut self,
-        window: WindowId,
-        peer: NodeId,
-        now: MonoTime,
-        out: &mut Vec<Output>,
-    ) -> Result<(), Refusal> {
-        let refusal = if !self.granted(peer, Capability::WindowShare) {
+    fn project_refusal(&self, window: WindowId, peer: NodeId) -> Option<Refusal> {
+        if !self.granted(peer, Capability::WindowShare) {
             Some(Refusal::Permission)
         } else if !self.permits_io() {
             Some(Refusal::Locked)
@@ -154,7 +149,146 @@ impl E2 {
             Some(Refusal::Busy)
         } else {
             None
+        }
+    }
+
+    pub(crate) fn drag_offer(
+        &self,
+        window: WindowId,
+        peer: NodeId,
+    ) -> Option<crate::e1::drag::Offer> {
+        use crate::e1::drag::{Kind, Offer};
+        if let Some(key) = self.proxy_windows.get(&window) {
+            let (size, scale) = self.destinations.get(key)?.drag_geometry()?;
+            return (key.source == peer && self.permits_io()).then_some(Offer {
+                window,
+                kind: Kind::Back(*key),
+                peer,
+                size,
+                scale,
+            });
+        }
+        self.project_refusal(window, peer).is_none().then_some(())?;
+        let (_, size, scale) = self.window_details(self.windows.get(&window)?);
+        Some(Offer {
+            window,
+            kind: Kind::Out(window),
+            peer,
+            size,
+            scale,
+        })
+    }
+
+    pub(crate) fn drag_title(&self, window: WindowId) -> String {
+        if let Some(key) = self.proxy_windows.get(&window)
+            && let Some(destination) = self.destinations.get(key)
+        {
+            return destination.title.clone();
+        }
+        self.windows
+            .get(&window)
+            .map(|info| info.title.clone())
+            .unwrap_or_else(|| "window".into())
+    }
+
+    pub(crate) fn drag_commit(
+        &mut self,
+        commit: crate::e1::drag::Commit,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) -> Option<ProjectionKey> {
+        match commit.kind {
+            crate::e1::drag::Kind::Out(window) => {
+                self.project(window, commit.peer, now, out).ok()?;
+                self.place_start(
+                    commit.place,
+                    commit.token,
+                    commit.anchor,
+                    Some(commit.size),
+                    out,
+                )
+            }
+            crate::e1::drag::Kind::Back(key) => {
+                self.return_at(key, commit.place, now, out);
+                None
+            }
+        }
+    }
+
+    pub(super) fn place_start(
+        &self,
+        place: ProxyPlacement,
+        token: u32,
+        anchor: (i32, i32),
+        placed_size: Option<PixelSize>,
+        out: &mut [Output],
+    ) -> Option<ProjectionKey> {
+        let Output::SendControl {
+            msg: crosspane_protocol::msg::ControlMessage::Projection(msg),
+            ..
+        } = out.last_mut()?
+        else {
+            return None;
         };
+        let Message::Start {
+            projection,
+            window,
+            size,
+        } = msg
+        else {
+            return None;
+        };
+        let key = ProjectionKey {
+            source: self.node,
+            projection: *projection,
+        };
+        *msg = Message::StartAt {
+            projection: *projection,
+            window: window.clone(),
+            size: placed_size.unwrap_or(*size),
+            place,
+            token,
+            anchor,
+        };
+        Some(key)
+    }
+
+    pub(super) fn return_at(
+        &mut self,
+        key: ProjectionKey,
+        place: ProxyPlacement,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if place.drag {
+            return;
+        }
+        if key.source == self.node {
+            if let Some(source) = self.sources.get_mut(&key.projection) {
+                source.restore_place = Some(place);
+            }
+            self.end_source(key.projection, Reason::Returned, false, now, out);
+        } else if self.destinations.contains_key(&key) {
+            send(
+                key.source,
+                Message::ReturnAt {
+                    projection: key.projection,
+                    place,
+                },
+                out,
+            );
+            self.end_destination(key, Reason::Returned, true, false, out);
+        }
+    }
+
+    pub(super) fn project(
+        &mut self,
+        window: WindowId,
+        peer: NodeId,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) -> Result<(), Refusal> {
+        let refusal = self.project_refusal(window, peer);
         if let Some(reason) = refusal {
             out.push(Output::Notice(Notice::ProjectionRefused { peer, reason }));
             return Err(reason);
@@ -190,6 +324,7 @@ impl E2 {
             Source {
                 peer,
                 window,
+                restore_place: None,
                 stage: Stage::Offered(now.saturating_add(START_TIMEOUT)),
                 placement: PlacementState::default(),
                 parked: None,
@@ -487,7 +622,7 @@ impl E2 {
         if self.pending_parks.remove(&window).is_some() {
             out.push(Output::Restore {
                 window,
-                place: None,
+                place: self.pending_places.remove(&window),
             });
             return;
         }
@@ -953,15 +1088,18 @@ impl E2 {
         if let Some(stream) = source.stream {
             out.push(Output::StopCapture { stream });
         }
-        if !matches!(source.stage, Stage::Offered(_)) {
+        if !matches!(source.stage, Stage::Offered(_)) || source.restore_place.is_some() {
             out.push(Output::Restore {
                 window: source.window,
-                place: None,
+                place: source.restore_place,
             });
         }
         if matches!(source.stage, Stage::Parking(_)) || source.resizing {
             self.pending_parks
                 .insert(source.window, now.saturating_add(PARK_CLEANUP_TIMEOUT));
+            if let Some(place) = source.restore_place {
+                self.pending_places.insert(source.window, place);
+            }
         }
         if !peer_ended
             && !matches!(source.stage, Stage::Suspended(_))
@@ -1011,7 +1149,7 @@ impl E2 {
             self.pending_parks.remove(&window);
             out.push(Output::Restore {
                 window,
-                place: None,
+                place: self.pending_places.remove(&window),
             });
         }
         // Re-parks that a change had to wait for (a park in flight, or the gap): the gap has

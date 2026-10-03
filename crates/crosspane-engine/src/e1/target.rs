@@ -2,7 +2,7 @@
 
 use core::fmt;
 use core::time::Duration;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crosspane_input::Held;
 use crosspane_input::journal::{Journal, JournalError};
@@ -14,11 +14,16 @@ use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{
     Capability, ControlMessage, EndReason, InputMessage, PointerMessage, Refusal, TargetStatus,
 };
+use crosspane_types::geom::PointDevice;
+use crosspane_types::hid::MouseButton;
+use crosspane_types::id::DisplayId;
 use crosspane_types::id::{NodeId, SessionId};
 use crosspane_types::time::MonoTime;
 
 use crate::config::EngineConfig;
-use crate::io::{Command, InjectCmd, InjectId, Input, Notice, Output, TARGET_INDICATOR};
+use crate::io::{
+    Command, InjectCmd, InjectId, Input, Notice, Output, ProjectionKey, TARGET_INDICATOR,
+};
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -33,6 +38,15 @@ struct ActiveSession {
 enum Pending {
     Release(Vec<(Held, u64)>),
     Recover(Vec<Held>),
+}
+
+#[derive(Debug)]
+struct DragPress {
+    key: ProjectionKey,
+    token: u32,
+    move_id: Option<InjectId>,
+    until: MonoTime,
+    queue: VecDeque<Input>,
 }
 
 /// The target side of E1: accepting control, injecting through the lease ledger, local override.
@@ -52,6 +66,12 @@ pub struct TargetE1 {
     generations: BTreeMap<Held, u64>,
     unconfirmed: BTreeMap<Held, u64>,
     release_retry: BTreeSet<Held>,
+    drag_offer: Option<(ProjectionKey, u32, DisplayId, PointDevice)>,
+    drag_press: Option<DragPress>,
+    drag_arm: Option<(ProjectionKey, u32, MonoTime)>,
+    drag_ignore_up: Option<SessionId>,
+    drag_used: Option<(ProjectionKey, u32)>,
+    drag_down: Option<InjectId>,
 }
 
 impl fmt::Debug for TargetE1 {
@@ -95,6 +115,12 @@ impl TargetE1 {
             generations: BTreeMap::new(),
             unconfirmed: BTreeMap::new(),
             release_retry: BTreeSet::new(),
+            drag_offer: None,
+            drag_press: None,
+            drag_arm: None,
+            drag_ignore_up: None,
+            drag_used: None,
+            drag_down: None,
         };
         let mut out = Vec::new();
         target.recover(&mut out);
@@ -104,6 +130,17 @@ impl TargetE1 {
     /// Handle one input (every input is offered to both roles), appending outputs.
     pub fn handle(&mut self, input: &Input, now: MonoTime, out: &mut Vec<Output>) {
         self.now = now;
+        if self.drag_press.as_ref().is_some_and(|p| now >= p.until) {
+            self.end_session(Some(EndReason::Released), None, out);
+        }
+        if self.drag_arm.is_some_and(|(_, _, until)| now >= until)
+            && let Some((key, token, _)) = self.drag_arm.take()
+        {
+            out.push(Output::DisarmDrag { key, token });
+        }
+        if self.drag_input(input, out) {
+            return;
+        }
         match input {
             Input::Session(event) => {
                 match event {
@@ -251,10 +288,15 @@ impl TargetE1 {
         } else {
             None
         };
-        [self.ledger.next_deadline(), retry]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.ledger.next_deadline(),
+            retry,
+            self.drag_press.as_ref().map(|p| p.until),
+            self.drag_arm.map(|(_, _, until)| until),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn permits_io(&self) -> bool {
@@ -340,6 +382,8 @@ impl TargetE1 {
         notice: Option<Notice>,
         out: &mut Vec<Output>,
     ) {
+        self.cancel_drag(false, out);
+        self.drag_ignore_up = None;
         let Some(active) = self.active else {
             return;
         };
@@ -419,6 +463,266 @@ impl TargetE1 {
             peer,
             msg: InputMessage::Ack { session, seq },
         });
+    }
+
+    pub(crate) fn prepare_drag(
+        &mut self,
+        key: ProjectionKey,
+        token: u32,
+        display: DisplayId,
+        position: PointDevice,
+        out: &mut Vec<Output>,
+    ) {
+        if self.active.is_some_and(|s| s.controller == key.source) {
+            self.cancel_drag(true, out);
+            self.drag_offer = Some((key, token, display, position));
+        }
+    }
+
+    pub(crate) fn drag_ended(&mut self, key: ProjectionKey, out: &mut Vec<Output>) {
+        if self.drag_key().is_some_and(|(known, _)| known == key) {
+            self.cancel_continuation(out);
+        }
+    }
+
+    fn cancel_continuation(&mut self, out: &mut Vec<Output>) {
+        if self.drag_press.is_some() || self.drag_used.is_some() {
+            self.end_session(Some(EndReason::Released), None, out);
+        } else {
+            self.cancel_drag(true, out);
+        }
+    }
+
+    fn drag_key(&self) -> Option<(ProjectionKey, u32)> {
+        self.drag_offer
+            .map(|(key, token, ..)| (key, token))
+            .or_else(|| self.drag_press.as_ref().map(|p| (p.key, p.token)))
+            .or(self.drag_used)
+    }
+
+    fn cancel_drag(&mut self, flush: bool, out: &mut Vec<Output>) {
+        let press = self.drag_press.take();
+        let held = press.is_some() || self.drag_used.take().is_some();
+        self.drag_down = None;
+        self.drag_offer = None;
+        if let Some((key, token, _)) = self.drag_arm.take() {
+            out.push(Output::DisarmDrag { key, token });
+        } else if let Some(p) = &press {
+            out.push(Output::DisarmDrag {
+                key: p.key,
+                token: p.token,
+            });
+        }
+        if press.is_some() {
+            self.drag_ignore_up = self.active.map(|s| s.session);
+        }
+        if flush && held {
+            self.key_or_button(Held::Button(MouseButton::PRIMARY), false, out);
+            if let Some(p) = press {
+                self.flush_drag(p.queue, out);
+            }
+        }
+    }
+
+    fn flush_drag(&mut self, queue: VecDeque<Input>, out: &mut Vec<Output>) {
+        for input in queue {
+            self.handle(&input, self.now, out);
+        }
+    }
+
+    fn drag_ack(&self, seq: u32, out: &mut Vec<Output>) {
+        if let Some(active) = self.active {
+            out.push(Output::SendInput {
+                peer: active.controller,
+                msg: InputMessage::Ack {
+                    session: active.session,
+                    seq,
+                },
+            });
+        }
+    }
+
+    fn drag_input(&mut self, input: &Input, out: &mut Vec<Output>) -> bool {
+        if self
+            .drag_press
+            .as_ref()
+            .is_some_and(|p| p.queue.len() >= 256)
+        {
+            self.end_session(Some(EndReason::Released), None, out);
+        }
+        match input {
+            Input::InjectDone { id, ok } if self.drag_down == Some(*id) => {
+                self.drag_down = None;
+                if !ok {
+                    self.end_session(Some(EndReason::Released), None, out);
+                }
+                true
+            }
+            Input::InjectDone { id, ok }
+                if self
+                    .drag_press
+                    .as_ref()
+                    .is_some_and(|p| p.move_id == Some(*id)) =>
+            {
+                if *ok {
+                    if let Some(p) = &mut self.drag_press {
+                        p.move_id = None;
+                        let until = self.now.saturating_add(Duration::from_secs(2));
+                        self.drag_arm = Some((p.key, p.token, until));
+                        out.push(Output::ArmDrag {
+                            key: p.key,
+                            token: p.token,
+                            until,
+                        });
+                    }
+                } else {
+                    self.end_session(Some(EndReason::Released), None, out);
+                }
+                true
+            }
+            Input::DragArmed { key, token, ok } => {
+                if self
+                    .drag_press
+                    .as_ref()
+                    .is_some_and(|p| p.key == *key && p.token == *token && p.move_id.is_none())
+                {
+                    if *ok {
+                        if let Some(p) = self.drag_press.take() {
+                            self.drag_used = Some((p.key, p.token));
+                            self.drag_down = Some(InjectId(self.next_id));
+                            self.key_or_button(Held::Button(MouseButton::PRIMARY), true, out);
+                            self.flush_drag(p.queue, out);
+                        }
+                    } else {
+                        self.end_session(Some(EndReason::Released), None, out);
+                    }
+                } else if *ok
+                    && !self
+                        .drag_arm
+                        .is_some_and(|(known, expected, _)| known == *key && expected == *token)
+                {
+                    out.push(Output::DisarmDrag {
+                        key: *key,
+                        token: *token,
+                    });
+                }
+                true
+            }
+            Input::Link(LinkEvent::Control {
+                peer,
+                msg:
+                    ControlMessage::Projection(
+                        crosspane_protocol::projection::ProjectionMessage::DragCancel {
+                            projection,
+                            token,
+                        },
+                    ),
+            }) => {
+                let key = ProjectionKey {
+                    source: *peer,
+                    projection: *projection,
+                };
+                if self.drag_key() == Some((key, *token)) {
+                    self.cancel_continuation(out);
+                }
+                false
+            }
+            Input::Link(LinkEvent::Input {
+                peer,
+                msg:
+                    InputMessage::PressAt {
+                        session,
+                        seq,
+                        button,
+                        display,
+                        position,
+                    },
+            }) => {
+                if self.matches(*peer, *session)
+                    && *button == MouseButton::PRIMARY
+                    && self.permits_io()
+                    && self.drag_offer.is_some_and(|(key, _, expected, point)| {
+                        key.source == *peer && expected == *display && point == *position
+                    })
+                    && let Some((key, token, _, _)) = self.drag_offer.take()
+                {
+                    self.drag_ignore_up = None;
+                    self.drag_ack(*seq, out);
+                    let id = InjectId(self.next_id);
+                    self.drag_press = Some(DragPress {
+                        key,
+                        token,
+                        move_id: Some(id),
+                        until: self.now.saturating_add(Duration::from_millis(500)),
+                        queue: VecDeque::new(),
+                    });
+                    self.inject(
+                        InjectCmd::MoveTo {
+                            display: *display,
+                            position: *position,
+                        },
+                        None,
+                        out,
+                    );
+                }
+                true
+            }
+            Input::Link(LinkEvent::Input { peer, msg })
+                if self.active.is_some_and(|s| s.controller == *peer) =>
+            {
+                if let InputMessage::Button {
+                    session,
+                    seq,
+                    button: MouseButton::PRIMARY,
+                    down: false,
+                } = msg
+                    && self.matches(*peer, *session)
+                    && (self.drag_press.is_some() || self.drag_ignore_up == Some(*session))
+                {
+                    self.cancel_drag(true, out);
+                    self.drag_ignore_up = None;
+                    self.drag_ack(*seq, out);
+                    return true;
+                }
+                if self.drag_press.is_some() {
+                    if let InputMessage::Key { session, seq, .. }
+                    | InputMessage::Button { session, seq, .. }
+                    | InputMessage::Scroll { session, seq, .. }
+                    | InputMessage::LockKeys { session, seq, .. }
+                    | InputMessage::State { session, seq, .. } = msg
+                        && self.matches(*peer, *session)
+                    {
+                        self.drag_ack(*seq, out);
+                        if matches!(msg, InputMessage::State { .. }) {
+                            // Refresh contact without applying this queued heartbeat's releases
+                            // ahead of earlier input. Its real listing is applied in FIFO order.
+                            self.ledger.on_heartbeat(&self.ledger.held(), self.now);
+                        }
+                    }
+                    if let Some(p) = &mut self.drag_press {
+                        p.queue.push_back(input.clone());
+                    }
+                    return true;
+                }
+                if matches!(msg, InputMessage::Button { session, button: MouseButton::PRIMARY, down: false, .. } if self.matches(*peer, *session))
+                {
+                    self.drag_used = None;
+                    if let Some((key, token, _)) = self.drag_arm.take() {
+                        out.push(Output::DisarmDrag { key, token });
+                    }
+                }
+                false
+            }
+            Input::Link(LinkEvent::Motion { peer, msg })
+                if self.matches(*peer, msg.session) && self.drag_press.is_some() =>
+            {
+                if let Some(p) = &mut self.drag_press {
+                    p.queue.push_back(input.clone());
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn key_or_button(&mut self, item: Held, down: bool, out: &mut Vec<Output>) {

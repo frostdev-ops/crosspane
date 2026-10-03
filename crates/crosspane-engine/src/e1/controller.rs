@@ -24,6 +24,9 @@ use crosspane_types::id::{DisplayId, GlobalDisplayId, NodeId, ProjectionId, Sess
 use crosspane_types::input::LockKeys;
 use crosspane_types::time::MonoTime;
 
+use super::drag::{
+    self, Commit as DragCommit, Drag, Kind as DragKind, Offer as DragOffer, Stage as DragStage,
+};
 use crate::config::EngineConfig;
 use crate::e2::{Placement as Proxy, TwinHome};
 use crate::io::{
@@ -505,6 +508,16 @@ pub struct ControllerE1 {
     // everything `Layout::entry` maps a crossing through (both displays' geometry and origin). A
     // change here re-offers the set even when its strips are identical.
     portal_mapping: Vec<PortalMapping>,
+    drag_peers: BTreeSet<NodeId>,
+    drag_offer: Option<DragOffer>,
+    drag_title: String,
+    drag_push: Option<(Push, DragOffer, PointDevice)>,
+    drag: Option<Drag>,
+    drag_drop: Option<(Drag, MonoTime)>,
+    drag_commit: Option<DragCommit>,
+    drag_token: Option<u32>,
+    drag_swallow: Option<CaptureId>,
+    drag_esc: bool,
 }
 
 /// One offered layout portal and the two placed displays its entry coordinate is computed from.
@@ -547,6 +560,289 @@ struct PortalRequest {
 }
 
 impl ControllerE1 {
+    pub(crate) fn drag_peer(&self, portal: PortalId, position: f64) -> Option<NodeId> {
+        let peer = self.portal_entry(portal, position)?.1.node;
+        (self.config.drag_across && self.drag_peers.contains(&peer)).then_some(peer)
+    }
+
+    pub(crate) fn prepare_drag(&mut self, offer: Option<DragOffer>, title: String) {
+        self.drag_offer = offer;
+        self.drag_title = title;
+    }
+
+    fn drag_activating(&self) -> bool {
+        self.drag.is_some() && !matches!(&self.phase, Phase::Controlling(c) if c.capture.started)
+    }
+
+    fn drag_press(
+        &mut self,
+        portal: PortalId,
+        position: f64,
+        grab: PointDevice,
+        at: MonoTime,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let offer = self
+            .drag_offer
+            .filter(|o| self.drag_peer(portal, position) == Some(o.peer));
+        if self
+            .drag
+            .is_some_and(|d| d.portal != portal || Some(d.offer) != offer)
+            && self.drag_activating()
+        {
+            self.return_home(EndReason::Released, None, false, true, now, out);
+            return;
+        }
+        let Some(offer) = offer else {
+            self.drag_push = None;
+            if self.drag_drop.take().is_some() {
+                self.hide_hud(now, out);
+            }
+            return;
+        };
+        if let Some((drag, _)) = self.drag_drop {
+            if drag.portal != portal || drag.offer != offer {
+                self.drag_drop = None;
+                self.hide_hud(now, out);
+            }
+            return;
+        }
+        if !matches!(self.phase, Phase::Idle)
+            || self.drag_swallow.is_some()
+            || self.hud_blocked(now)
+            || self.local_override_until.is_some_and(|until| now < until)
+            || self.is_disarmed(portal, now)
+            || !grab.x.is_finite()
+            || !grab.y.is_finite()
+        {
+            return;
+        }
+        let push = match self.drag_push {
+            Some((push, previous, _)) if push.portal == portal && previous == offer => {
+                Push { position, ..push }
+            }
+            Some(_) => {
+                self.drag_push = None;
+                return;
+            }
+            None => Push {
+                portal,
+                position,
+                since: at,
+            },
+        };
+        self.drag_push = Some((push, offer, grab));
+        if at.saturating_duration_since(push.since) < self.config.drag_push_to_cross {
+            return;
+        }
+        let (Some((hud_display, entry, point)), Some(_), Some((_, _, edge))) = (
+            self.portal_entry(portal, position),
+            self.next_capture,
+            self.connection(portal),
+        ) else {
+            return;
+        };
+        self.drag_push = None;
+        self.push = None;
+        self.drag = Some(Drag {
+            portal,
+            offer,
+            grab,
+            edge,
+            entry,
+            stage: DragStage::Pending,
+            motion: crosspane_types::geom::VectorMm::zero(),
+        });
+        self.phase = Phase::Crossing(Crossing {
+            portal,
+            hud_display,
+            entry: (entry, point),
+            session: None,
+            capture: None,
+            wait: Wait::Hud(now.saturating_add(HUD_TIMEOUT)),
+            from_twin: false,
+        });
+        self.show_hud(hud_display, offer.peer, now, out);
+        if let Some(Output::ShowOverlay { overlay, .. }) = out.last_mut() {
+            overlay.text = format!(
+                "Moving {} to {} — release to cancel",
+                self.drag_title,
+                offer.peer.short()
+            );
+        }
+    }
+
+    pub(crate) fn take_drag_commit(&mut self) -> Option<DragCommit> {
+        self.drag_commit.take()
+    }
+
+    pub(crate) fn drag_subject(&self) -> Option<(WindowId, NodeId)> {
+        self.drag
+            .filter(|d| matches!(d.stage, DragStage::Pending))
+            .map(|d| d.offer)
+            .or(self.drag_drop.map(|(d, _)| d.offer))
+            .or(self.drag_push.map(|(_, offer, _)| offer))
+            .map(|o| (o.window, o.peer))
+    }
+
+    pub(crate) fn drag_ended(
+        &mut self,
+        key: Option<ProjectionKey>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if key.is_none() || self.drag.is_some_and(|d| matches!(d.stage,
+            DragStage::Continuing { key: known, .. } | DragStage::Pressed { key: known } if Some(known) == key)) {
+            self.return_home(EndReason::Released, None, false, true, now, out);
+        }
+    }
+
+    pub(crate) fn drag_committed(
+        &mut self,
+        commit: DragCommit,
+        key: Option<ProjectionKey>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if matches!(commit.kind, DragKind::Out(_)) && key.is_none() {
+            self.hide_hud(now, out);
+            self.return_home(EndReason::Released, None, false, true, now, out);
+        } else if !commit.place.drag {
+            // AwaitingDrop has no capture and no held button; use the ordinary crossing.
+            if self.drag.is_some() {
+                self.drag_clear(now, out);
+            } else if let Some((push, _, _)) = self.drag_push.take() {
+                self.begin_crossing(push, now, out);
+            }
+        } else if let Some(drag) = &mut self.drag {
+            if let Some(key) = key {
+                drag.stage = DragStage::Continuing {
+                    key,
+                    token: commit.token,
+                    until: now.saturating_add(Duration::from_secs(1)),
+                };
+            } else {
+                self.drag_clear(now, out);
+            }
+        }
+    }
+
+    fn drag_clear(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        self.drag_push = None;
+        self.drag_commit = None;
+        if self.drag_drop.take().is_some() {
+            self.hide_hud(now, out);
+        }
+        if let Some(drag) = self.drag.take() {
+            if !matches!(drag.stage, DragStage::Pressed { .. }) {
+                self.drag_swallow = self.known_capture();
+            }
+            if let DragStage::Continuing { key, token, .. } = drag.stage {
+                out.push(Output::SendControl {
+                    peer: drag.offer.peer,
+                    msg: ControlMessage::Projection(
+                        crosspane_protocol::projection::ProjectionMessage::DragCancel {
+                            projection: key.projection,
+                            token,
+                        },
+                    ),
+                });
+                self.drag_resume(drag.motion, now, out);
+            }
+        }
+    }
+
+    fn drag_resume(
+        &mut self,
+        motion: crosspane_types::geom::VectorMm,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if let (Some(layout), Phase::Controlling(c)) = (&self.layout, &mut self.phase) {
+            let previous = c.tracker.position();
+            if matches!(c.tracker.step(layout, motion), Step::Crossed { .. })
+                && let Some(tracker) = PointerTracker::new(
+                    layout,
+                    previous.0,
+                    drag::clamped_motion(layout, previous, motion),
+                )
+            {
+                c.tracker = tracker;
+            }
+            let (display, position) = c.tracker.position();
+            let seq = c.session.motion_seq;
+            c.session.motion_seq = seq.saturating_add(1);
+            out.push(Output::SendMotion {
+                peer: c.session.peer,
+                msg: PointerMessage {
+                    session: c.session.id,
+                    seq,
+                    display: display.display,
+                    position,
+                },
+            });
+            c.last_motion = Some(now);
+        }
+    }
+
+    fn drag_ready(
+        &mut self,
+        peer: NodeId,
+        key: ProjectionKey,
+        token: u32,
+        entry: (DisplayId, PointDevice),
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let (display, position) = entry;
+        let Some(drag) = self.drag.filter(|d| d.offer.peer == peer && matches!(d.stage,
+            DragStage::Continuing { key: known, token: expected, until } if known == key && expected == token && now < until)) else { return; };
+        if !position.x.is_finite()
+            || !position.y.is_finite()
+            || !self.ensure_sequence_room(now, out)
+        {
+            return;
+        }
+        let (Some(layout), Phase::Controlling(c)) = (&self.layout, &mut self.phase) else {
+            return;
+        };
+        let Some(tracker) = PointerTracker::new(
+            layout,
+            GlobalDisplayId {
+                node: peer,
+                display,
+            },
+            position,
+        ) else {
+            return;
+        };
+        c.tracker = tracker;
+        if self
+            .router
+            .route(Held::Button(MouseButton::PRIMARY), true, peer)
+            .is_none()
+        {
+            return;
+        }
+        let (session, seq) = c.session.next_input(now);
+        out.push(Output::SendInput {
+            peer,
+            msg: InputMessage::PressAt {
+                session,
+                seq,
+                button: MouseButton::PRIMARY,
+                display,
+                position,
+            },
+        });
+        self.drag = Some(Drag {
+            stage: DragStage::Pressed { key },
+            ..drag
+        });
+        self.drag_resume(drag.motion, now, out);
+    }
+
     pub fn new(config: &EngineConfig, now: MonoTime) -> ControllerE1 {
         let _ = now;
         ControllerE1 {
@@ -605,6 +901,16 @@ impl ControllerE1 {
             portal_skip: 0,
             confirmed_portals: None,
             portal_mapping: Vec::new(),
+            drag_peers: BTreeSet::new(),
+            drag_offer: None,
+            drag_title: String::new(),
+            drag_push: None,
+            drag: None,
+            drag_drop: None,
+            drag_commit: None,
+            drag_token: Some(1),
+            drag_swallow: None,
+            drag_esc: false,
         }
     }
 
@@ -612,6 +918,19 @@ impl ControllerE1 {
     pub fn handle(&mut self, input: &Input, now: MonoTime, out: &mut Vec<Output>) {
         self.prune(now);
         match input {
+            Input::DragPeer { peer, available } => {
+                if *available {
+                    self.drag_peers.insert(*peer);
+                } else {
+                    self.drag_peers.remove(peer);
+                    if self.drag.is_some_and(|d| d.offer.peer == *peer)
+                        || self.drag_drop.is_some_and(|(d, _)| d.offer.peer == *peer)
+                        || self.drag_push.is_some_and(|(_, o, _)| o.peer == *peer)
+                    {
+                        self.return_home(EndReason::Released, None, false, true, now, out);
+                    }
+                }
+            }
             Input::LocalDisplays(displays) => {
                 self.displays.insert(self.config.node, displays.clone());
                 self.rebuild_layout(now, out);
@@ -657,6 +976,22 @@ impl ControllerE1 {
                 {
                     if now >= deadline {
                         self.return_home(EndReason::Released, None, false, true, now, out);
+                    } else if let Some(drag) = self.drag
+                        && let Some(id) = self.next_capture
+                    {
+                        self.next_capture = id.checked_add(1);
+                        if let Phase::Crossing(c) = &mut self.phase {
+                            c.capture = Some(Capture {
+                                id: CaptureId(id),
+                                started: false,
+                            });
+                            c.wait = Wait::Capture(now.saturating_add(START_TIMEOUT));
+                        }
+                        out.push(Output::BeginDrag {
+                            id: CaptureId(id),
+                            portal: drag.portal,
+                            button: MouseButton::PRIMARY,
+                        });
                     } else {
                         self.start_handshake(now, out);
                     }
@@ -669,7 +1004,9 @@ impl ControllerE1 {
             }
             Input::Link(event) => self.link_event(event, now, out),
             Input::Hotkey(event) => self.hotkey_event(*event, now, out),
-            Input::Command(Command::ReleaseControl) if !matches!(self.phase, Phase::Idle) => {
+            Input::Command(Command::ReleaseControl)
+                if !matches!(self.phase, Phase::Idle) || self.drag_subject().is_some() =>
+            {
                 self.release(ReleaseCause::Command, now, out);
             }
             Input::Command(Command::Panic) => self.panic(now, out),
@@ -700,12 +1037,39 @@ impl ControllerE1 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        // Failed activation rolls back without an Ended fence, even after return timed out.
+        if result.is_err() && self.drag_swallow == Some(id) {
+            self.drag_swallow = None;
+        }
         if self.exit_begun(id, result, now, out) {
             return;
         }
         let matches = matches!(&self.phase, Phase::Crossing(c)
             if matches!(c.wait, Wait::Capture(_)) && c.capture.is_some_and(|v| v.id == id));
         if matches {
+            if matches!(result, Err(Failure::PointerButtonHeld))
+                && matches!(&self.phase, Phase::Crossing(c)
+                    if matches!(c.wait, Wait::Capture(until) if now < until))
+                && let Some(drag) = self.drag.take()
+            {
+                self.phase = Phase::Idle;
+                self.drag_drop = Some((drag, now.saturating_add(Duration::from_secs(10))));
+                self.show_hud(
+                    self.connection(drag.portal)
+                        .map_or(drag.entry.display, |p| p.0.display),
+                    drag.offer.peer,
+                    now,
+                    out,
+                );
+                if let Some(Output::ShowOverlay { overlay, .. }) = out.last_mut() {
+                    overlay.text = format!(
+                        "Release to move {} to {}",
+                        self.drag_title,
+                        drag.offer.peer.short()
+                    );
+                }
+                return;
+            }
             match result {
                 Ok(start) => {
                     if matches!(&self.phase, Phase::Crossing(c)
@@ -715,7 +1079,13 @@ impl ControllerE1 {
                     } else {
                         self.chord_keys.extend(start.held_keys.iter().copied());
                         self.lock_keys = start.lock_keys;
-                        self.activate(now, out);
+                        if let Phase::Crossing(c) = &mut self.phase
+                            && c.session.is_none()
+                        {
+                            self.start_handshake(now, out);
+                        } else {
+                            self.activate(now, out);
+                        }
                     }
                 }
                 Err(_) => self.return_home(EndReason::Released, None, true, true, now, out),
@@ -774,10 +1144,22 @@ impl ControllerE1 {
             .as_ref()
             .filter(|h| !h.fired)
             .map(|h| h.since.saturating_add(self.config.panic_hold));
-        [phase, panic, self.home_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+        let drag = self.drag.and_then(|d| match d.stage {
+            DragStage::Continuing { until, .. } => Some(until),
+            _ => None,
+        });
+        [
+            phase,
+            panic,
+            self.home_deadline(),
+            drag,
+            self.drag_drop.map(|(_, until)| until),
+            self.drag_push
+                .map(|(push, _, _)| push.since.saturating_add(self.config.drag_push_to_cross)),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn permits_io(&self) -> bool {
@@ -903,6 +1285,10 @@ impl ControllerE1 {
     /// Yield an unacknowledged crossing before incoming target admission.
     pub(crate) fn cancel_pending(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         self.push = None;
+        self.drag_push = None;
+        if self.drag_drop.take().is_some() {
+            self.hide_hud(now, out);
+        }
         if matches!(self.phase, Phase::Crossing(_)) && !self.started() {
             if let Some(session) = self.session() {
                 // Session IDs increase monotonically: one watermark per peer covers repeated
@@ -1238,6 +1624,58 @@ impl ControllerE1 {
 
     fn capture_event(&mut self, event: &CaptureEvent, now: MonoTime, out: &mut Vec<Output>) {
         match event {
+            CaptureEvent::DragAtEdge {
+                portal,
+                position,
+                grab,
+                at,
+                ..
+            } => self.drag_press(*portal, *position, *grab, *at, now, out),
+            CaptureEvent::DragDroppedAtEdge {
+                portal,
+                position,
+                window,
+                grab,
+                ..
+            } => {
+                if let Some((drag, until)) = self.drag_drop.take() {
+                    if now < until
+                        && drag.portal == *portal
+                        && drag.offer.window == *window
+                        && self.drag_offer == Some(drag.offer)
+                        && let Some((_, entry, point)) = self.portal_entry(*portal, *position)
+                        && let Some(geometry) = self
+                            .layout
+                            .as_ref()
+                            .and_then(|l| l.get(entry))
+                            .map(|p| p.geometry)
+                    {
+                        let mut commit = drag::placement(
+                            Drag {
+                                grab: *grab,
+                                entry,
+                                ..drag
+                            },
+                            point,
+                            geometry,
+                            0,
+                        );
+                        commit.place.drag = false;
+                        self.drag_commit = Some(commit);
+                        self.drag_push = Some((
+                            Push {
+                                portal: *portal,
+                                position: *position,
+                                since: now,
+                            },
+                            drag.offer,
+                            *grab,
+                        ));
+                    } else {
+                        self.hide_hud(now, out);
+                    }
+                }
+            }
             CaptureEvent::LockKeys(keys) => self.lock_keys = *keys,
             CaptureEvent::EdgePressed {
                 portal,
@@ -1300,6 +1738,16 @@ impl ControllerE1 {
                 }
             }
             CaptureEvent::EdgeReleased { portal, at } => {
+                if self.drag.is_some_and(|d| d.portal == *portal) && self.drag_activating() {
+                    self.return_home(EndReason::Released, None, false, true, now, out);
+                }
+                if self.drag_push.is_some_and(|(p, _, _)| p.portal == *portal) {
+                    self.drag_push = None;
+                }
+                if self.drag_drop.is_some_and(|(d, _)| d.portal == *portal) {
+                    self.drag_drop = None;
+                    self.hide_hud(now, out);
+                }
                 self.rearm_portal(*portal, *at);
                 self.entry_strip_released(*portal);
                 self.exit_strip_released(*portal, now, out);
@@ -1308,11 +1756,17 @@ impl ControllerE1 {
                 }
             }
             CaptureEvent::Started { id } => {
+                if self.drag_swallow.is_some_and(|old| old < *id) {
+                    self.drag_swallow = None;
+                }
                 if let Some(capture) = self.capture_mut().filter(|c| c.id == *id) {
                     capture.started = true;
                 }
             }
             CaptureEvent::Ended { id, reason } => {
+                if self.drag_swallow == Some(*id) {
+                    self.drag_swallow = None;
+                }
                 if self.home_capture_ended(*id, *reason, now, out) {
                     // Expected, or the exit's own capture: handled there.
                 } else if matches!(self.phase, Phase::Returning { capture, .. } if capture == *id) {
@@ -1322,9 +1776,42 @@ impl ControllerE1 {
                 }
             }
             CaptureEvent::Key { usage, down, .. } if self.input_mode() != InputMode::Off => {
+                if *usage == HidUsage::keyboard(0x29)
+                    && (self.drag_esc
+                        || self
+                            .drag
+                            .is_some_and(|d| !matches!(d.stage, DragStage::Pressed { .. })))
+                {
+                    self.drag_esc = *down;
+                    if self.drag_activating() {
+                        self.return_home(EndReason::Released, None, false, true, now, out);
+                    } else {
+                        self.drag_clear(now, out);
+                    }
+                    return;
+                }
                 self.capture_key(*usage, *down, now, out);
             }
             CaptureEvent::Button { button, down, .. } if self.input_mode() != InputMode::Off => {
+                if *button == MouseButton::PRIMARY
+                    && (self.drag_swallow.is_some()
+                        || self
+                            .drag
+                            .is_some_and(|d| !matches!(d.stage, DragStage::Pressed { .. })))
+                {
+                    if !down {
+                        if self.drag_activating() {
+                            self.return_home(EndReason::Released, None, false, true, now, out);
+                        } else {
+                            self.drag_clear(now, out);
+                        }
+                        self.drag_swallow = None;
+                    }
+                    return;
+                }
+                if *button == MouseButton::PRIMARY && !down {
+                    self.drag = None;
+                }
                 self.capture_button(*button, *down, now, out);
             }
             CaptureEvent::Scroll { delta, .. } if self.input_mode() == InputMode::Routing => {
@@ -1436,6 +1923,12 @@ impl ControllerE1 {
                 self.accelerator.accelerated(dx, dy, &info.geometry)
             }
         };
+        if let Some(drag) = &mut self.drag
+            && matches!(drag.stage, DragStage::Continuing { .. })
+        {
+            drag.motion += mm;
+            return;
+        }
         let (Some(layout), Phase::Controlling(c)) = (&self.layout, &mut self.phase) else {
             return;
         };
@@ -1454,6 +1947,16 @@ impl ControllerE1 {
                         position,
                     },
                 });
+                if let Some(drag) = self.drag.filter(|d| matches!(d.stage, DragStage::Pending))
+                    && display == drag.entry
+                    && let Some(geometry) = layout.get(display).map(|p| p.geometry)
+                    && drag::inward(drag.edge, position, geometry)
+                        >= self.config.drag_commit_distance
+                    && let Some(token) = self.drag_token
+                {
+                    self.drag_token = token.checked_add(1);
+                    self.drag_commit = Some(drag::placement(drag, position, geometry, token));
+                }
             }
             Step::Crossed {
                 display,
@@ -1466,11 +1969,19 @@ impl ControllerE1 {
                 let fenced = display.node != self.config.node
                     && (self.teardown.is_some() || c.home.is_some_and(|h| h.bind));
                 if !self.router.no_buttons_held()
+                    || self.drag.is_some()
                     || !self.capture_buttons.is_empty()
                     || (display.node != self.config.node && !self.peers.contains(&display.node))
                     || fenced
                 {
-                    if let Some(tracker) = PointerTracker::new(layout, previous.0, previous.1) {
+                    // Pending drag motion can return to the edge without handing off. Retain
+                    // that displacement, so an out-and-back does not accumulate inward travel.
+                    let position = if self.drag.is_some() {
+                        drag::clamped_motion(layout, previous, mm)
+                    } else {
+                        previous.1
+                    };
+                    if let Some(tracker) = PointerTracker::new(layout, previous.0, position) {
                         c.tracker = tracker;
                     }
                 } else if display.node == self.config.node {
@@ -1537,6 +2048,12 @@ impl ControllerE1 {
     fn link_event(&mut self, event: &LinkEvent, now: MonoTime, out: &mut Vec<Output>) {
         if let LinkEvent::Closed { peer, .. } = event {
             self.peers.remove(peer);
+            self.drag_peers.remove(peer);
+            if self.drag_drop.is_some_and(|(d, _)| d.offer.peer == *peer)
+                || self.drag_push.is_some_and(|(_, o, _)| o.peer == *peer)
+            {
+                self.drag_clear(now, out);
+            }
             self.rtts.remove(peer);
             self.cancelled.remove(peer);
             self.update_portals(now, out);
@@ -1555,6 +2072,30 @@ impl ControllerE1 {
             return;
         }
         match event {
+            LinkEvent::Control {
+                peer,
+                msg:
+                    ControlMessage::Projection(
+                        crosspane_protocol::projection::ProjectionMessage::DragReady {
+                            projection,
+                            token,
+                            display,
+                            position,
+                        },
+                    ),
+            } => {
+                self.drag_ready(
+                    *peer,
+                    ProjectionKey {
+                        source: self.config.node,
+                        projection: *projection,
+                    },
+                    *token,
+                    (*display, *position),
+                    now,
+                    out,
+                );
+            }
             LinkEvent::Control {
                 peer,
                 msg: ControlMessage::ControlStarted { session },
@@ -1731,6 +2272,14 @@ impl ControllerE1 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        if let Some(drag) = &mut self.drag {
+            drag.motion = crosspane_types::geom::VectorMm::zero();
+        }
+        self.drag_clear(now, out);
+        if ended {
+            self.drag_swallow = None;
+        }
+        self.drag_esc = false;
         self.push = None;
         let phase = std::mem::replace(&mut self.phase, Phase::Idle);
         let (capture, session, home, from_twin, hud_display) = match phase {
@@ -1931,6 +2480,19 @@ impl ControllerE1 {
     }
 
     fn tick(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        if self.drag_drop.is_some_and(|(_, until)| now >= until) {
+            self.drag_drop = None;
+            self.hide_hud(now, out);
+        }
+        if self
+            .drag
+            .is_some_and(|d| matches!(d.stage, DragStage::Continuing { until, .. } if now >= until))
+        {
+            self.drag_clear(now, out);
+        }
+        if let Some((push, _, grab)) = self.drag_push {
+            self.drag_press(push.portal, push.position, grab, now, now, out);
+        }
         if self
             .hotkey
             .as_ref()
@@ -2897,6 +3459,9 @@ impl ControllerE1 {
         now: MonoTime,
         _out: &mut Vec<Output>,
     ) {
+        if self.drag.is_some() || self.drag_swallow.is_some() {
+            return;
+        }
         let Phase::Controlling(c) = &self.phase else {
             return;
         };
@@ -4722,6 +5287,120 @@ mod release_cause_tests {
         // The session is over: a second release has none to end.
         let again = rig.send(Input::Command(Command::ReleaseControl));
         assert!(released(&again).is_empty());
+    }
+
+    #[test]
+    fn failed_drop_commit_hides_its_consumed_awaiting_drop_hud() {
+        let mut rig = Rig::new();
+        let mut out = Vec::new();
+        rig.controller.show_hud(DisplayId(1), B, rig.now, &mut out);
+        rig.controller.drag_committed(
+            DragCommit {
+                kind: DragKind::Out(WindowId(10)),
+                peer: B,
+                place: crosspane_protocol::projection::ProxyPlacement {
+                    display: DisplayId(1),
+                    x: 0,
+                    y: 0,
+                    drag: false,
+                },
+                token: 0,
+                anchor: (8, 8),
+                size: PixelSize::new(320, 200),
+            },
+            None,
+            rig.now,
+            &mut out,
+        );
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::HideOverlay(id) if *id == HUD))
+        );
+        assert!(rig.controller.hud_shown.is_none());
+        assert!(rig.controller.drag_subject().is_none());
+    }
+
+    #[test]
+    fn primary_tail_blocks_eligible_home_and_only_its_capture_end_clears_it() {
+        let mut rig = Rig::new();
+        rig.controlling();
+        let c = &mut rig.controller;
+        let mut out = Vec::new();
+        let projection = ProjectionId(1);
+        c.set_twin_homes(
+            vec![TwinHome {
+                peer: B,
+                projection,
+                window: WindowId(10),
+                display: DisplayId(1),
+                content: PixelRect::new(
+                    crosspane_types::geom::euclid::Point2D::new(0, 0),
+                    crosspane_types::geom::euclid::Point2D::new(320, 200),
+                ),
+                placed: Some(Proxy {
+                    generation: 1,
+                    display: DisplayId(1),
+                    origin: PointDevice::new(50.0, 350.0),
+                    size: PixelSize::new(320, 200),
+                }),
+                focused: true,
+            }],
+            rig.now,
+            &mut out,
+        );
+        let portals = c.portals().to_vec();
+        c.portal_emitted(&portals);
+        c.portals_set(
+            &portals.iter().map(|p| p.id).collect::<Vec<_>>(),
+            &Ok(()),
+            rig.now,
+            &mut out,
+        );
+        let point = PointDevice::new(100.0, 400.0);
+        let Phase::Controlling(control) = &mut c.phase else {
+            panic!("not controlling");
+        };
+        let id = control.capture.id;
+        control.tracker = PointerTracker::new(
+            c.layout.as_ref().unwrap(),
+            GlobalDisplayId {
+                node: B,
+                display: DisplayId(1),
+            },
+            point,
+        )
+        .unwrap();
+        control.last_motion = Some(rig.now);
+        let content = PointDevice::new(50.0, 50.0);
+        c.peer_motion(B, projection, content, rig.now, &mut out);
+        assert!(
+            c.home_copy().is_some(),
+            "baseline must be eligible for home"
+        );
+        if let Phase::Controlling(control) = &mut c.phase {
+            control.home = None;
+        }
+        c.drag_swallow = Some(id);
+        c.peer_motion(B, projection, content, rig.now, &mut out);
+        assert!(c.home_copy().is_none());
+        c.handle(
+            &Input::Capture(CaptureEvent::Ended {
+                id: CaptureId(id.0 + 1),
+                reason: CaptureEnd::Requested,
+            }),
+            rig.now,
+            &mut out,
+        );
+        assert_eq!(c.drag_swallow, Some(id));
+        c.handle(
+            &Input::Capture(CaptureEvent::Ended {
+                id,
+                reason: CaptureEnd::Requested,
+            }),
+            rig.now,
+            &mut out,
+        );
+        assert_eq!(c.drag_swallow, None);
     }
 
     #[test]

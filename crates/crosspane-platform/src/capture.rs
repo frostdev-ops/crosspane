@@ -92,6 +92,16 @@ pub enum CaptureEvent {
         grab: PointDevice,
         at: MonoTime,
     },
+    /// While not capturing: a local window move that was pressing against `portal` (DragAtEdge)
+    /// ended because its button was released there (DRAG-v0 D-10). Same fields as DragAtEdge.
+    /// Reported only by backends whose begin_drag can't capture while the button is held.
+    DragDroppedAtEdge {
+        portal: PortalId,
+        position: f64,
+        window: WindowId,
+        grab: PointDevice,
+        at: MonoTime,
+    },
     /// The pointer stopped pressing against a portal: it moved away, left the stretch, or the portal
     /// was removed. Cancels any push-to-cross delay.
     EdgeReleased { portal: PortalId, at: MonoTime },

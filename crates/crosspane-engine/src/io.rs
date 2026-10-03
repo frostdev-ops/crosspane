@@ -235,6 +235,12 @@ pub enum Input {
         id: CaptureId,
         result: Result<CaptureStart, Failure>,
     },
+    /// Host acknowledgement for exactly the requested drag continuation arm.
+    DragArmed {
+        key: ProjectionKey,
+        token: u32,
+        ok: bool,
+    },
     Hotkey(HotkeyEvent),
     Session(SessionEvent),
     Overlay(OverlayEvent),
@@ -404,6 +410,22 @@ pub enum Output {
         /// event queued during `begin()` to the engine before it delivers `CaptureBegun`.
         /// Ordinary captures keep today's delivery order.
         drain_first: bool,
+    },
+    /// `InputCapture::begin_drag`; answered by `CaptureBegun`, after queued physical events.
+    BeginDrag {
+        id: CaptureId,
+        portal: PortalId,
+        button: MouseButton,
+    },
+    /// Install a host arm, acknowledged by `DragArmed`; an unused arm expires at `until`.
+    ArmDrag {
+        key: ProjectionKey,
+        token: u32,
+        until: crosspane_types::time::MonoTime,
+    },
+    DisarmDrag {
+        key: ProjectionKey,
+        token: u32,
     },
     EndCapture {
         warp_to: Option<(DisplayId, PointDevice)>,

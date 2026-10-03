@@ -43,6 +43,7 @@ struct HostRefusal {
 }
 
 pub(super) struct Destination {
+    pub(super) title: String,
     open: bool,
     open_due: Option<MonoTime>,
     suspended: Option<MonoTime>,
@@ -98,9 +99,14 @@ pub(super) struct Destination {
     placed_last: Option<(Option<DisplayId>, PointDevice, PixelSize)>,
     /// The terminal report was sent: nothing more is reported for this projection.
     placed_final: bool,
+    drag: Option<(u32, (i32, i32), bool)>,
 }
 
 impl Destination {
+    pub(super) fn drag_geometry(&self) -> Option<(PixelSize, f64)> {
+        self.current
+            .filter(|_| self.open && self.suspended.is_none())
+    }
     /// A `ProxyEvent::Placed` (WP-2.43 §4). A report equal to the last is dropped; otherwise the
     /// generation grows by one, and a destination whose next generation would be `u32::MAX` sends
     /// one final report with `display: None` and then nothing more. While suspended the newest
@@ -424,8 +430,10 @@ impl E2 {
         }
         let projection = match msg {
             Message::Start { projection, .. }
+            | Message::StartAt { projection, .. }
             | Message::Geometry { projection, .. }
             | Message::Title { projection, .. }
+            | Message::DragCancel { projection, .. }
             | Message::End { projection, .. } => *projection,
             _ => return,
         };
@@ -433,7 +441,7 @@ impl E2 {
             source: peer,
             projection,
         };
-        if let Message::Start { window, size, .. } = msg {
+        if let Message::Start { window, size, .. } | Message::StartAt { window, size, .. } = msg {
             let reason = if !self.granted(peer, Capability::WindowPresent) {
                 Some(Refusal::Permission)
             } else if !self.permits_io() {
@@ -506,6 +514,7 @@ impl E2 {
             self.destinations.insert(
                 key,
                 Destination {
+                    title: window.title.clone(),
                     open: false,
                     open_due: Some(now.saturating_add(OPEN_TIMEOUT)),
                     suspended: None,
@@ -533,6 +542,15 @@ impl E2 {
                     placed_gen: 0,
                     placed_last: None,
                     placed_final: false,
+                    drag: match msg {
+                        Message::StartAt {
+                            place,
+                            token,
+                            anchor,
+                            ..
+                        } if place.drag => Some((*token, *anchor, false)),
+                        _ => None,
+                    },
                 },
             );
             out.push(Output::OpenProxy {
@@ -540,7 +558,10 @@ impl E2 {
                 title: window.title.clone(),
                 app_id: window.app_id.clone(),
                 size: *size,
-                place: None,
+                place: match msg {
+                    Message::StartAt { place, .. } => Some(*place),
+                    _ => None,
+                },
             });
             return;
         }
@@ -548,6 +569,14 @@ impl E2 {
             return;
         };
         match msg {
+            Message::DragCancel { token, .. } => {
+                if destination
+                    .drag
+                    .is_some_and(|(known, _, _)| known == *token)
+                {
+                    destination.drag = None;
+                }
+            }
             Message::Geometry {
                 size,
                 parking,
@@ -577,6 +606,7 @@ impl E2 {
                 }
             }
             Message::Title { title, .. } if destination.open && destination.suspended.is_none() => {
+                destination.title = title.clone();
                 out.push(Output::ProxyTitle {
                     key,
                     title: title.clone(),
@@ -679,6 +709,32 @@ impl E2 {
         {
             // Not a user action: recorded even while suspended, sent when the link is up.
             destination.placed(key, *display, *origin, *size, out);
+            if destination.suspended.is_none()
+                && let Some((token, anchor, false)) = destination.drag
+                && let Some(display) = display.filter(|id| self.display_bounds.contains_key(id))
+                && anchor.0 >= 0
+                && anchor.1 >= 0
+                && (anchor.0 as u32) < size.width
+                && (anchor.1 as u32) < size.height
+                && origin.x.is_finite()
+                && origin.y.is_finite()
+            {
+                destination.drag = Some((token, anchor, true));
+                send(
+                    key.source,
+                    Message::DragReady {
+                        projection: key.projection,
+                        token,
+                        display,
+                        position: *origin
+                            + crosspane_types::geom::VectorDevice::new(
+                                f64::from(anchor.0),
+                                f64::from(anchor.1),
+                            ),
+                    },
+                    out,
+                );
+            }
             return;
         }
         if let ProxyEvent::Resized { size, scale } = event {
@@ -882,6 +938,7 @@ impl E2 {
     pub(super) fn suspend_destination(&mut self, key: ProjectionKey, now: MonoTime) {
         if let Some(destination) = self.destinations.get_mut(&key) {
             destination.held.clear();
+            destination.drag = None;
             destination.suspended = Some(now.saturating_add(GRACE));
             destination.open_due = None;
             destination.motion = None;
