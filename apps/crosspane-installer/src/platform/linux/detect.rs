@@ -1,6 +1,8 @@
 //! Read-only detection data and pure decisions. These reports confer no mutation or readiness
 //! authority. Native acquisition and support-proof assembly belong to WP-4.8b2; runtime/fonts
 //! are registered by WP-4.8c once their real implementations land.
+pub mod fonts;
+pub mod runtime;
 mod session;
 pub use crate::agent_contract::ObservationSource;
 use crate::agent_contract::{

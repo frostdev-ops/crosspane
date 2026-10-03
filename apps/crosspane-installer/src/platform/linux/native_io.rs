@@ -38,6 +38,8 @@ pub enum SystemRead {
     OsReleaseFallback,
     Font(PathBuf),
     ElfPrefix(PathBuf),
+    /// Bare SONAME, with at most three same-directory root-owned library links.
+    Library(String),
 }
 #[derive(Debug)]
 pub struct SystemBytes {
@@ -53,6 +55,10 @@ impl SystemRead {
             Self::OsReleaseFallback => (PathBuf::from("/usr/lib/os-release"), MAX_OS_RELEASE_BYTES),
             Self::Font(path) => (path.clone(), MAX_FONT_BYTES),
             Self::ElfPrefix(path) => (path.clone(), MAX_ELF_PREFIX_BYTES),
+            Self::Library(name) if library_name(name) => {
+                (Path::new("/usr/lib").join(name), MAX_ELF_PREFIX_BYTES)
+            }
+            Self::Library(_) => return Err(NativeError::Foreign),
         };
         if !clean(&path)
             || match self {
@@ -138,6 +144,108 @@ fn read_anchor(path: &Path) -> Result<OwnedFd> {
         Mode::empty(),
     ))
 }
+fn library_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.contains("..")
+        && name != "."
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._+-".contains(&c))
+}
+fn library_snapshot(parent: &ReadParent, name: &str) -> Result<rfs::Stat> {
+    rfs::statat(
+        parent.directories.last().ok_or(NativeError::Invalid)?,
+        name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|e| {
+        if e == rustix::io::Errno::NOENT {
+            NativeError::Unavailable
+        } else {
+            NativeError::Foreign
+        }
+    })
+}
+struct LibraryEntry {
+    name: String,
+    stat: rfs::Stat,
+    fd: OwnedFd,
+}
+fn library_chain(
+    parent: &mut ReadParent,
+    deadline: &Deadline,
+    mut evidence: impl FnMut(rfs::Stat) -> rfs::Stat,
+) -> Result<Vec<LibraryEntry>> {
+    let mut chain = Vec::new();
+    loop {
+        deadline.check()?;
+        let fd = rfs::openat(
+            parent.directories.last().ok_or(NativeError::Invalid)?,
+            &parent.name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| {
+            if e == rustix::io::Errno::NOENT {
+                NativeError::Unavailable
+            } else {
+                NativeError::Foreign
+            }
+        })?;
+        let stat = evidence(native(rfs::fstat(&fd))?);
+        if stat.st_uid != 0 {
+            return Err(NativeError::Foreign);
+        }
+        chain.push(LibraryEntry {
+            name: parent.name.clone(),
+            stat,
+            fd,
+        });
+        if stat.st_mode & 0o170000 == 0o100000 {
+            read_stat(&stat, 0, 0o100000)?;
+            return Ok(chain);
+        }
+        // Linux symlink mode bits are always 0777 and nonfunctional; ownership is checked.
+        if stat.st_mode & 0o170000 != 0o120000 || chain.len() > 3 {
+            return Err(NativeError::Foreign);
+        }
+        let mut bytes = [0u8; 256];
+        // The link's metadata and target come from the same retained no-follow descriptor.
+        let count = native(rfs::readlinkat_raw(
+            &chain.last().ok_or(NativeError::Invalid)?.fd,
+            "",
+            &mut bytes[..],
+        ))?;
+        let target = std::str::from_utf8(&bytes[..count]).map_err(|_| NativeError::Foreign)?;
+        if !library_name(target) {
+            return Err(NativeError::Foreign);
+        }
+        parent.name = target.to_owned();
+    }
+}
+fn library_revalidate(
+    parent: &ReadParent,
+    chain: &[LibraryEntry],
+    deadline: &Deadline,
+    mut evidence: impl FnMut(rfs::Stat) -> rfs::Stat,
+) -> Result<()> {
+    for entry in chain {
+        deadline.check()?;
+        let before = &entry.stat;
+        for after in [
+            evidence(native(rfs::fstat(&entry.fd))?),
+            evidence(library_snapshot(parent, &entry.name)?),
+        ] {
+            if (before.st_dev, before.st_ino, before.st_uid, before.st_mode)
+                != (after.st_dev, after.st_ino, after.st_uid, after.st_mode)
+            {
+                return Err(NativeError::Foreign);
+            }
+        }
+    }
+    Ok(())
+}
 fn system_contents(
     file: &mut File,
     stat: &rfs::Stat,
@@ -149,7 +257,7 @@ fn system_contents(
         return Err(NativeError::Invalid);
     }
     let (_, limit) = request.path_and_limit()?;
-    let prefix = matches!(request, SystemRead::ElfPrefix(_));
+    let prefix = matches!(request, SystemRead::ElfPrefix(_) | SystemRead::Library(_));
     if !prefix && stat.st_size > limit as i64 {
         return Err(NativeError::Oversize);
     }
@@ -1353,15 +1461,38 @@ impl LinuxNativeIo {
         let worker_deadline = deadline.clone();
         bounded_launch(&READ_WORKERS, deadline, move || {
             validate_target(&target)?;
-            let (path, _) = request.path_and_limit()?;
+            let (mut path, _) = request.path_and_limit()?;
             let relative = path.strip_prefix("/").map_err(|_| NativeError::Foreign)?;
-            let parent = read_parent(read_anchor(Path::new("/"))?, relative, 0)?;
+            let mut parent = read_parent(read_anchor(Path::new("/"))?, relative, 0)?;
+            let chain = if let SystemRead::Library(name) = &request {
+                match library_chain(&mut parent, &worker_deadline, std::convert::identity) {
+                    Err(NativeError::Unavailable) => {
+                        path = Path::new("/usr/lib64").join(name);
+                        parent = read_parent(
+                            read_anchor(Path::new("/"))?,
+                            path.strip_prefix("/").map_err(|_| NativeError::Foreign)?,
+                            0,
+                        )?;
+                        library_chain(&mut parent, &worker_deadline, std::convert::identity)?
+                    }
+                    result => result?,
+                }
+            } else {
+                Vec::new()
+            };
             let fd = parent.open_file()?;
             let before = native(rfs::fstat(&fd))?;
+            if chain.last().is_some_and(|entry| {
+                (entry.stat.st_dev, entry.stat.st_ino) != (before.st_dev, before.st_ino)
+            }) {
+                return Err(NativeError::Foreign);
+            }
             let mut file = File::from(fd);
             let bytes = system_contents(&mut file, &before, &request, &worker_deadline)?;
+            let relative = path.strip_prefix("/").map_err(|_| NativeError::Foreign)?;
             let current = read_parent(read_anchor(Path::new("/"))?, relative, 0)?;
             parent.same_as(&current)?;
+            library_revalidate(&current, &chain, &worker_deadline, std::convert::identity)?;
             let after = native(rfs::statat(
                 current.directories.last().ok_or(NativeError::Invalid)?,
                 &parent.name,
@@ -1385,6 +1516,9 @@ impl LinuxNativeIo {
             }
             worker_deadline.check()?;
             validate_target(&target)?;
+            if !chain.is_empty() {
+                path.set_file_name(&parent.name);
+            }
             Ok(SystemBytes {
                 path,
                 bytes,
@@ -2128,6 +2262,185 @@ pub fn parse_ps_start(bytes: &[u8]) -> Result<u64> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn injected_library_snapshot(mut stat: rfs::Stat) -> rfs::Stat {
+        stat.st_uid = 0;
+        stat
+    }
+
+    #[test]
+    fn library_link_swap_and_restore_reads_only_the_pinned_inode_target() {
+        let (io, root) = fixture();
+        fs::write(root.join("real1.so"), b"admitted original bytes").unwrap();
+        fs::write(root.join("real2.so"), b"substituted bytes").unwrap();
+        symlink("real1.so", root.join("link.so")).unwrap();
+        let mut parent = read_parent(
+            read_anchor(&root).unwrap(),
+            Path::new("link.so"),
+            io.target.paths.uid,
+        )
+        .unwrap();
+        let mut observations = 0;
+        let chain = library_chain(&mut parent, &read_deadline(), |stat| {
+            observations += 1;
+            if observations == 1 {
+                // After link fstat, before target read: the basename temporarily names B.
+                fs::rename(root.join("link.so"), root.join("saved.so")).unwrap();
+                symlink("real2.so", root.join("link.so")).unwrap();
+            } else if observations == 2 {
+                // Restore A before the recorded chain is revalidated.
+                fs::remove_file(root.join("link.so")).unwrap();
+                fs::rename(root.join("saved.so"), root.join("link.so")).unwrap();
+            }
+            injected_library_snapshot(stat)
+        })
+        .unwrap();
+        assert_eq!(observations, 2);
+        assert_eq!(parent.name, "real1.so");
+        let mut bytes = Vec::new();
+        File::from(parent.open_file().unwrap())
+            .read_to_end(&mut bytes)
+            .unwrap();
+        library_revalidate(&parent, &chain, &read_deadline(), injected_library_snapshot).unwrap();
+        assert_eq!(bytes, b"admitted original bytes");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn library_same_directory_chains_pin_root_evidence_and_final_descriptor() {
+        for hops in 1..=3 {
+            let (io, root) = fixture();
+            fs::create_dir(root.join("libraries")).unwrap();
+            let mut bytes = vec![0; 64];
+            bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            fs::write(root.join("libraries/real.so"), &bytes).unwrap();
+            for i in 0..hops {
+                let target = if i + 1 == hops {
+                    "real.so".into()
+                } else {
+                    format!("link{}.so", i + 1)
+                };
+                symlink(target, root.join(format!("libraries/link{i}.so"))).unwrap();
+            }
+            let mut parent = read_parent(
+                read_anchor(&root).unwrap(),
+                Path::new("libraries/link0.so"),
+                io.target.paths.uid,
+            )
+            .unwrap();
+            let chain =
+                library_chain(&mut parent, &read_deadline(), injected_library_snapshot).unwrap();
+            assert_eq!(chain.len(), hops + 1);
+            assert_eq!(parent.name, "real.so");
+            let fd = parent.open_file().unwrap();
+            let mut stat = rfs::fstat(&fd).unwrap();
+            stat.st_uid = 0; // root observations injected; the fixture remains ordinary-user owned
+            assert_eq!(
+                system_contents(
+                    &mut File::from(fd),
+                    &stat,
+                    &SystemRead::Library("link0.so".into()),
+                    &read_deadline()
+                )
+                .unwrap(),
+                bytes
+            );
+            library_revalidate(&parent, &chain, &read_deadline(), injected_library_snapshot)
+                .unwrap();
+            // Replacement with the same target text must still invalidate the recorded link inode.
+            fs::rename(
+                root.join("libraries/link0.so"),
+                root.join("libraries/old.so"),
+            )
+            .unwrap();
+            symlink(
+                if hops == 1 { "real.so" } else { "link1.so" },
+                root.join("libraries/link0.so"),
+            )
+            .unwrap();
+            assert_eq!(
+                library_revalidate(&parent, &chain, &read_deadline(), injected_library_snapshot),
+                Err(NativeError::Foreign)
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn library_links_refuse_escape_four_hops_foreign_owner_and_cancelled_reads() {
+        for target in [
+            "nested/real.so",
+            "../real.so",
+            "/usr/lib/real.so",
+            "..",
+            "bad space",
+        ] {
+            let (io, root) = fixture();
+            symlink(target, root.join("link.so")).unwrap();
+            let mut parent = read_parent(
+                read_anchor(&root).unwrap(),
+                Path::new("link.so"),
+                io.target.paths.uid,
+            )
+            .unwrap();
+            assert!(matches!(
+                library_chain(&mut parent, &read_deadline(), injected_library_snapshot),
+                Err(NativeError::Foreign)
+            ));
+            fs::remove_dir_all(root).unwrap();
+        }
+        let (io, root) = fixture();
+        fs::write(root.join("real.so"), b"inert").unwrap();
+        for i in 0..4 {
+            symlink(
+                if i == 3 {
+                    "real.so".into()
+                } else {
+                    format!("link{}.so", i + 1)
+                },
+                root.join(format!("link{i}.so")),
+            )
+            .unwrap();
+        }
+        let mut parent = read_parent(
+            read_anchor(&root).unwrap(),
+            Path::new("link0.so"),
+            io.target.paths.uid,
+        )
+        .unwrap();
+        assert!(matches!(
+            library_chain(&mut parent, &read_deadline(), injected_library_snapshot),
+            Err(NativeError::Foreign)
+        ));
+        parent.name = "link3.so".into();
+        assert!(
+            matches!(
+                library_chain(&mut parent, &read_deadline(), std::convert::identity),
+                Err(NativeError::Foreign)
+            ),
+            "ordinary-user link must not become root evidence"
+        );
+        let cancellation = Cancellation::default();
+        let deadline = Deadline::new(1000, cancellation.clone()).unwrap();
+        cancellation.cancel();
+        assert!(matches!(
+            library_chain(&mut parent, &deadline, injected_library_snapshot),
+            Err(NativeError::Cancelled)
+        ));
+        for name in [
+            "",
+            ".",
+            "..",
+            "../lib.so",
+            "/usr/lib/lib.so",
+            "lib.so/other",
+            "lib..so",
+            &"x".repeat(256),
+        ] {
+            assert!(SystemRead::Library(name.into()).path_and_limit().is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn read_deadline() -> Deadline {
         Deadline::new(1000, Cancellation::default()).unwrap()

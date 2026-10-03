@@ -1100,3 +1100,461 @@ ID_LIKE="arch \linux""#,
         );
     }
 }
+
+mod runtime_tests {
+    use crosspane_installer::{
+        agent_contract::{KeyStoreProvenance, ObservationSource},
+        platform::linux::{
+            detect::{
+                ProbeIssue,
+                runtime::{RuntimeInput, RuntimeReader, inspect_with},
+            },
+            native_io::{Cancellation, Deadline, NativeError, SystemBytes},
+            payload::Architecture,
+        },
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeMap,
+        path::PathBuf,
+        time::Duration,
+    };
+
+    fn put(bytes: &mut [u8], offset: usize, size: usize, value: u64) {
+        bytes[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
+    }
+    // Synthetic metadata has no executable entry point and is never loaded or executed.
+    fn elf(needed: &[&str], soname: Option<&str>) -> Vec<u8> {
+        let mut strings = vec![0];
+        let mut tags = vec![(5, 0), (10, 0)];
+        for name in needed {
+            tags.push((1, strings.len() as u64));
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        if let Some(name) = soname {
+            tags.push((14, strings.len() as u64));
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        tags.push((0, 0));
+        let table = 176 + tags.len() * 16;
+        tags[0].1 = 0x1000 + table as u64;
+        tags[1].1 = strings.len() as u64;
+        let mut bytes = vec![0; table + strings.len()];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (offset, size, value) in [
+            (16, 2, 3),
+            (18, 2, 62),
+            (20, 4, 1),
+            (32, 8, 64),
+            (52, 2, 64),
+            (54, 2, 56),
+            (56, 2, 2),
+            (64, 4, 1),
+            (80, 8, 0x1000),
+            (120, 4, 2),
+            (128, 8, 176),
+            (136, 8, 0x1000 + 176),
+            (152, 8, (tags.len() * 16) as u64),
+            (160, 8, (tags.len() * 16) as u64),
+        ] {
+            put(&mut bytes, offset, size, value);
+        }
+        let length = bytes.len() as u64;
+        put(&mut bytes, 96, 8, length);
+        put(&mut bytes, 104, 8, length);
+        for (index, (tag, value)) in tags.into_iter().enumerate() {
+            put(&mut bytes, 176 + index * 16, 8, tag);
+            put(&mut bytes, 184 + index * 16, 8, value);
+        }
+        bytes[table..].copy_from_slice(&strings);
+        bytes
+    }
+    type Image = Result<(PathBuf, Vec<u8>), NativeError>;
+    struct Reader {
+        images: BTreeMap<String, Image>,
+        calls: RefCell<Vec<String>>,
+        clock: Cell<u64>,
+        secret: Result<bool, NativeError>,
+        secret_calls: Cell<usize>,
+        cancel: Option<Cancellation>,
+        stall: Duration,
+    }
+    impl Reader {
+        fn fixed() -> Self {
+            let mut reader = Self {
+                images: BTreeMap::new(),
+                calls: RefCell::new(Vec::new()),
+                clock: Cell::new(100),
+                secret: Ok(true),
+                secret_calls: Cell::new(0),
+                cancel: None,
+                stall: Duration::ZERO,
+            };
+            for name in [
+                "libopus.so.0",
+                "libpipewire-0.3.so.0",
+                "libxkbcommon.so.0",
+                "libwayland-client.so.0",
+            ] {
+                reader.add(name, &[]);
+            }
+            reader
+        }
+        fn add(&mut self, name: &str, needed: &[&str]) {
+            self.images.insert(
+                name.into(),
+                Ok((
+                    PathBuf::from("/usr/lib").join(name),
+                    elf(needed, Some(name)),
+                )),
+            );
+        }
+    }
+    impl RuntimeReader for Reader {
+        fn source(&self) -> ObservationSource {
+            ObservationSource::Demo
+        }
+        fn library(&self, name: &str, _: &Deadline) -> Result<SystemBytes, NativeError> {
+            self.calls.borrow_mut().push(name.into());
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            if self.stall != Duration::ZERO {
+                std::thread::sleep(self.stall);
+            }
+            self.clock.set(self.clock.get() + 10);
+            self.images
+                .get(name)
+                .unwrap_or(&Err(NativeError::Unavailable))
+                .as_ref()
+                .map(|(path, bytes)| SystemBytes {
+                    path: path.clone(),
+                    file_size: bytes.len() as u64,
+                    bytes: bytes.clone(),
+                })
+                .map_err(|error| *error)
+        }
+        fn secret_service(&self, _: &Deadline) -> Result<bool, NativeError> {
+            self.secret_calls.set(self.secret_calls.get() + 1);
+            self.clock.set(self.clock.get() + 7);
+            self.secret
+        }
+    }
+    fn deadline() -> Deadline {
+        Deadline::new(1000, Cancellation::default()).unwrap()
+    }
+    fn inspect(
+        reader: &Reader,
+        bytes: &[u8],
+        features: &[String],
+        keystore: Option<KeyStoreProvenance>,
+        deadline: &Deadline,
+    ) -> crosspane_installer::platform::linux::detect::RuntimeFacts {
+        inspect_with(
+            reader,
+            deadline,
+            RuntimeInput {
+                architecture: Architecture::X86_64,
+                features,
+                agent_elf_prefix: bytes,
+                keystore,
+            },
+            &|| reader.clock.get(),
+        )
+    }
+
+    #[test]
+    fn structural_software_video_requirements_keep_gpu_libei_and_audio_health_separate() {
+        let mut reader = Reader::fixed();
+        for name in [
+            "libavcodec.so.61",
+            "libavutil.so.59",
+            "libavformat.so.61",
+            "libswscale.so.8",
+            "libx264.so.164",
+        ] {
+            reader.add(name, &[]);
+        }
+        let bytes = elf(
+            &[
+                "libavcodec.so.61",
+                "libavutil.so.59",
+                "libavformat.so.61",
+                "libswscale.so.8",
+                "libx264.so.164",
+            ],
+            None,
+        );
+        let facts = inspect(
+            &reader,
+            &bytes,
+            &["video".into()],
+            Some(KeyStoreProvenance::OsStore),
+            &deadline(),
+        );
+        for value in [
+            &facts.video_feature.value,
+            &facts.ffmpeg.value,
+            &facts.software_video.value,
+            &facts.opus.value,
+            &facts.pipewire_library.value,
+            &facts.xkb.value,
+            &facts.wayland_library.value,
+        ] {
+            assert_eq!(value, &Ok(true));
+        }
+        for value in [
+            &facts.gpu.value,
+            &facts.pipewire.value,
+            &facts.session_manager.value,
+        ] {
+            assert_eq!(value, &Err(ProbeIssue::Unverified));
+        }
+        assert!(!facts.libei_required);
+        assert!(
+            facts
+                .libraries
+                .iter()
+                .all(|row| row.required && row.resolved.value.is_ok())
+        );
+        assert!(
+            !reader
+                .calls
+                .borrow()
+                .iter()
+                .any(|name| name.contains("cuda") || name.contains("libei"))
+        );
+    }
+
+    #[test]
+    fn complete_graph_non_declaration_feature_absence_and_unknown_reads_are_distinct() {
+        let mut reader = Reader::fixed();
+        let bytes = elf(&[], None);
+        let facts = inspect(&reader, &bytes, &[], None, &deadline());
+        assert_eq!(facts.video_feature.value, Ok(false));
+        assert_eq!(facts.ffmpeg.value, Ok(false));
+        assert_eq!(facts.software_video.value, Ok(false));
+        assert_eq!(facts.keystore.value, Err(ProbeIssue::Unverified));
+        reader
+            .images
+            .insert("libconcealed.so.1".into(), Err(NativeError::Unavailable));
+        let bytes = elf(&["libconcealed.so.1"], None);
+        let facts = inspect(&reader, &bytes, &[], None, &deadline());
+        assert_eq!(facts.ffmpeg.value, Err(ProbeIssue::Unavailable));
+        assert_eq!(
+            facts.libraries[0].resolved.value,
+            Err(ProbeIssue::Unavailable)
+        );
+        assert!(
+            facts
+                .libraries
+                .iter()
+                .all(|row| row.resolved.value != Err(ProbeIssue::Missing))
+        );
+    }
+
+    #[test]
+    fn transitive_cycles_deduplicate_and_global_library_bounds_fail_closed() {
+        let mut reader = Reader::fixed();
+        reader.add("libfirst.so.1", &["libsecond.so.1"]);
+        reader.add("libsecond.so.1", &["libfirst.so.1"]);
+        let facts = inspect(
+            &reader,
+            &elf(&["libfirst.so.1"], None),
+            &[],
+            None,
+            &deadline(),
+        );
+        assert_eq!(facts.libraries.len(), 6);
+        assert_eq!(
+            reader
+                .calls
+                .borrow()
+                .iter()
+                .filter(|name| name.as_str() == "libfirst.so.1")
+                .count(),
+            1
+        );
+        let names = (0..60)
+            .map(|i| format!("libfixture{i}.so.1"))
+            .collect::<Vec<_>>();
+        for name in &names {
+            reader.add(name, &[]);
+        }
+        let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        reader.calls.borrow_mut().clear();
+        let facts = inspect(&reader, &elf(&refs, None), &[], None, &deadline());
+        assert_eq!(facts.libraries.len(), 64);
+        assert_eq!(facts.opus.value, Ok(true));
+        reader.add(&names[0], &["libextra.so.1"]);
+        reader.add("libextra.so.1", &[]);
+        reader.calls.borrow_mut().clear();
+        let facts = inspect(&reader, &elf(&refs, None), &[], None, &deadline());
+        assert_eq!(facts.libraries.len(), 64);
+        assert_eq!(reader.calls.borrow().len(), 64);
+        assert_eq!(facts.opus.value, Err(ProbeIssue::Oversize));
+    }
+
+    #[test]
+    fn library_namespace_architecture_soname_and_probe_errors_never_resolve_candidates() {
+        let bytes = elf(&["libwrong.so.1"], None);
+        for error in [
+            NativeError::Unavailable,
+            NativeError::Timeout,
+            NativeError::Foreign,
+            NativeError::Oversize,
+            NativeError::Invalid,
+        ] {
+            let mut reader = Reader::fixed();
+            reader.images.insert("libwrong.so.1".into(), Err(error));
+            let facts = inspect(&reader, &bytes, &[], None, &deadline());
+            let expected = match error {
+                NativeError::Timeout => ProbeIssue::Timeout,
+                NativeError::Foreign => ProbeIssue::Foreign,
+                NativeError::Oversize => ProbeIssue::Oversize,
+                NativeError::Invalid => ProbeIssue::Malformed,
+                _ => ProbeIssue::Unavailable,
+            };
+            assert_eq!(facts.libraries[0].resolved.value, Err(expected));
+        }
+        let mut wrong_architecture = elf(&[], Some("libwrong.so.1"));
+        put(&mut wrong_architecture, 18, 2, 183);
+        let mut executable = elf(&[], Some("libwrong.so.1"));
+        put(&mut executable, 16, 2, 2);
+        for (path, image, expected) in [
+            (
+                "/usr/lib/libwrong.so.1",
+                elf(&[], Some("libother.so.1")),
+                ProbeIssue::Malformed,
+            ),
+            (
+                "/usr/lib/libwrong.so.1",
+                wrong_architecture,
+                ProbeIssue::Malformed,
+            ),
+            ("/usr/lib/libwrong.so.1", executable, ProbeIssue::Malformed),
+            (
+                "/owner/libwrong.so.1",
+                elf(&[], Some("libwrong.so.1")),
+                ProbeIssue::Foreign,
+            ),
+            (
+                "/usr/lib/sub/libwrong.so.1",
+                elf(&[], Some("libwrong.so.1")),
+                ProbeIssue::Foreign,
+            ),
+        ] {
+            let mut reader = Reader::fixed();
+            reader
+                .images
+                .insert("libwrong.so.1".into(), Ok((PathBuf::from(path), image)));
+            let facts = inspect(&reader, &bytes, &[], None, &deadline());
+            assert_eq!(facts.libraries[0].resolved.value, Err(expected));
+        }
+    }
+
+    #[test]
+    fn secret_name_ownership_never_infers_unlock_or_changes_literal_keystore_provenance() {
+        let bytes = elf(&[], None);
+        for secret in [
+            Ok(true),
+            Ok(false),
+            Err(NativeError::Unavailable),
+            Err(NativeError::Timeout),
+        ] {
+            for literal in ["\"os_store\"", "\"file\""] {
+                let keystore: KeyStoreProvenance = serde_json::from_str(literal).unwrap();
+                let mut reader = Reader::fixed();
+                reader.secret = secret;
+                let facts = inspect(&reader, &bytes, &[], Some(keystore), &deadline());
+                assert_eq!(facts.keystore.value, Ok(keystore));
+                assert_eq!(
+                    facts.secret_service.value,
+                    secret.map_err(|error| match error {
+                        NativeError::Timeout => ProbeIssue::Timeout,
+                        _ => ProbeIssue::Unavailable,
+                    })
+                );
+                assert_eq!(reader.secret_calls.get(), 1);
+                assert_eq!(facts.pipewire.value, Err(ProbeIssue::Unverified));
+                assert_eq!(facts.session_manager.value, Err(ProbeIssue::Unverified));
+            }
+        }
+    }
+
+    #[test]
+    fn receipt_stamps_follow_completed_reads_and_preserve_demo_source() {
+        let reader = Reader::fixed();
+        let facts = inspect(
+            &reader,
+            &elf(&[], None),
+            &[],
+            Some(KeyStoreProvenance::File),
+            &deadline(),
+        );
+        for (index, row) in facts.libraries.iter().enumerate() {
+            assert_eq!(row.resolved.observed_at_ms, 110 + index as u64 * 10);
+            assert_eq!(row.resolved.source, ObservationSource::Demo);
+        }
+        assert_eq!(facts.secret_service.observed_at_ms, 147);
+        assert_eq!(facts.keystore.observed_at_ms, 147);
+        assert_eq!(facts.secret_service.source, ObservationSource::Demo);
+    }
+
+    #[test]
+    fn cancellation_deadline_and_malformed_input_cannot_publish_late_probe_success() {
+        let bytes = elf(&[], None);
+        let cancellation = Cancellation::default();
+        let expired = Deadline::new(1000, cancellation.clone()).unwrap();
+        cancellation.cancel();
+        let reader = Reader::fixed();
+        let facts = inspect(&reader, &bytes, &[], None, &expired);
+        assert!(reader.calls.borrow().is_empty());
+        assert_eq!(reader.secret_calls.get(), 0);
+        assert_eq!(facts.opus.value, Err(ProbeIssue::Cancelled));
+        assert_eq!(facts.secret_service.value, Err(ProbeIssue::Cancelled));
+        let cancellation = Cancellation::default();
+        let deadline = Deadline::new(1000, cancellation.clone()).unwrap();
+        let mut reader = Reader::fixed();
+        reader.cancel = Some(cancellation);
+        let facts = inspect(&reader, &bytes, &[], None, &deadline);
+        assert_eq!(reader.calls.borrow().len(), 1);
+        assert!(
+            facts
+                .libraries
+                .iter()
+                .all(|row| row.resolved.value == Err(ProbeIssue::Cancelled))
+        );
+        let mut reader = Reader::fixed();
+        reader.stall = Duration::from_millis(20);
+        let facts = inspect(
+            &reader,
+            &bytes,
+            &[],
+            None,
+            &Deadline::new(5, Cancellation::default()).unwrap(),
+        );
+        assert_eq!(reader.calls.borrow().len(), 1);
+        assert_eq!(facts.opus.value, Err(ProbeIssue::Timeout));
+        assert_eq!(reader.secret_calls.get(), 0);
+        for bytes in [&b"invalid"[..], &vec![0; 4 * 1024 * 1024 + 1][..]] {
+            let reader = Reader::fixed();
+            let facts = inspect(&reader, bytes, &[], None, &super::runtime_tests::deadline());
+            assert!(matches!(
+                facts.opus.value,
+                Err(ProbeIssue::Malformed | ProbeIssue::Oversize)
+            ));
+        }
+        let reader = Reader::fixed();
+        let facts = inspect(
+            &reader,
+            &elf(&[], None),
+            &vec!["video".into(); 33],
+            None,
+            &super::runtime_tests::deadline(),
+        );
+        assert_eq!(facts.video_feature.value, Err(ProbeIssue::Oversize));
+    }
+}
