@@ -1,8 +1,9 @@
 //! M2 twin-output parking on Hyprland (03 §4.3, docs/wp/E2-v0.md decision 4; WP-2.7b, lead).
 //!
 //! A projected window moves alone onto a workspace of its own headless output. The output's mode
-//! is the destination proxy's content size at the destination's scale, so the window renders at the
-//! destination's density and is never visible on this node's screens. The output sits far from the
+//! holds the destination proxy's content at its scale plus sticky margins. Explicit floating
+//! geometry keeps bars from resizing it. The window renders at the destination's density and is
+//! never visible on this node's screens. The output sits far from the
 //! real monitors, so the physical pointer can't wander onto it.
 //!
 //! **No window is lost (04 §8 invariant 4):** every park is journaled (written and synced) before
@@ -12,10 +13,11 @@
 //! **What "the window's size" means here (WP-2.35).** `hyprctl clients` reports Hyprland's *layout
 //! goal* for a window (`GEOMETRIC_GOAL` in HyprCtl.cpp, v0.56.1): the geometry the compositor has
 //! laid out and configured the client with, not the buffer the client has committed. Settling on
-//! that goal is the best signal IPC offers. It shows that the compositor has finished tiling the
+//! that goal is the best signal IPC offers. It shows that the compositor has finished placing the
 //! window onto the new mode and that the layout is stable; it cannot show that the client has
 //! redrawn at that size. A client that ignores its configure is invisible to this module.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -73,6 +75,9 @@ struct Entry {
     workspace: String,
     slot: i64,
     original: Original,
+    /// Written before introducing floating, so crash recovery can undo only our change.
+    #[serde(default)]
+    floated_by_crosspane: bool,
 }
 
 #[derive(Debug)]
@@ -85,7 +90,9 @@ pub struct HyprlandParking {
     /// mode change and is briefly gone, and shrinking the mode then makes it re-create the surface
     /// again. On 2026-10-01 that loop changed one twin's mode hundreds of times and Hyprland
     /// 0.56.2 crashed.
-    padding: BTreeMap<u64, [u32; 4]>,
+    // Geometry observations can remember a larger margin without dispatching on the caller's
+    // thread. The next parking-worker settle applies it; no borrow is held across IPC.
+    padding: RefCell<BTreeMap<u64, [u32; 4]>>,
     /// When a twin output last failed to come up (see [`TWIN_RETRY`]).
     twin_failed: Option<Instant>,
 }
@@ -107,7 +114,7 @@ impl HyprlandParking {
             ipc,
             journal,
             entries,
-            padding: BTreeMap::new(),
+            padding: RefCell::new(BTreeMap::new()),
             twin_failed: None,
         })
     }
@@ -168,29 +175,34 @@ impl HyprlandParking {
     }
 
     /// Grow the padding remembered for `window` to cover `reserved`, and return it.
-    fn grow_padding(&mut self, window: u64, reserved: [u32; 4]) -> [u32; 4] {
-        let padding = self.padding.entry(window).or_default();
+    fn grow_padding(&self, window: u64, reserved: [u32; 4]) -> [u32; 4] {
+        let mut remembered = self.padding.borrow_mut();
+        let padding = remembered.entry(window).or_default();
         *padding = covering(*padding, reserved);
         *padding
+    }
+
+    fn remembered_padding(&self, window: u64) -> [u32; 4] {
+        self.padding
+            .borrow()
+            .get(&window)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The area other clients reserve on `output` (bars' exclusive zones), in logical pixels:
     /// left, top, right, bottom.
     fn reserved(&self, output: &str) -> Result<[u32; 4], PlatformError> {
-        let mut r = [0; 4];
-        if let Some(m) = self.monitor(output)?
-            && let Some(a) = m.get("reserved").and_then(Value::as_array)
-        {
-            for (i, v) in a.iter().take(4).enumerate() {
-                r[i] = v.as_u64().and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
-            }
-        }
-        Ok(r)
+        Ok(self
+            .monitor(output)?
+            .as_ref()
+            .map(reserved_from)
+            .unwrap_or_default())
     }
 
     /// Set the twin's mode so that, after the area bars reserve on it (Waybar puts one on every
-    /// output), the work area is exactly `size`: the window tiles into that work area and the
-    /// capture crops to the window, so the bar never shows in the projection.
+    /// output), there is room for `size`. The floating window is explicitly sized and placed
+    /// inside the sticky margins; bar churn cannot resize it like a tiled work-area layout would.
     fn set_mode_padded(
         &self,
         entry: &Entry,
@@ -214,12 +226,10 @@ impl HyprlandParking {
         ))?;
         let deadline = Instant::now() + SETTLE;
         loop {
-            if let Some(m) = self.monitor(&entry.output)? {
-                let mw = m.get("width").and_then(Value::as_u64).unwrap_or(0);
-                let mh = m.get("height").and_then(Value::as_u64).unwrap_or(0);
-                if mw == u64::from(w) && mh == u64::from(h) {
-                    return Ok(());
-                }
+            if let Some(m) = self.monitor(&entry.output)?
+                && has_mode(&m, (w, h), scale, x)
+            {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(PlatformError::Timeout);
@@ -258,20 +268,24 @@ impl HyprlandParking {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let o = &entry.original;
-            let changed = on_twin || fullscreen != o.fullscreen || floating != o.floating;
+            // A previous restore may have moved home before its geometry dispatch failed.
+            // Matching flags alone do not prove that an originally floating box was restored.
+            let geometry_changed = o.floating
+                && (!same_pair(&client, "at", o.at) || !same_pair(&client, "size", o.size));
+            let changed =
+                on_twin || fullscreen != o.fullscreen || floating != o.floating || geometry_changed;
             if changed {
                 self.ipc.dispatch(&format!(
                     "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = 0, client = 0 }})"
                 ))?;
             }
+            if entry.floated_by_crosspane && floating {
+                self.ipc.dispatch(&format!(
+                    "hl.dsp.window.float({{ window = \"address:{address}\", action = \"unset\" }})"
+                ))?;
+            }
             if on_twin {
                 self.move_window(&address, &workspace_selector(&o.workspace))?;
-            }
-            if changed && o.fullscreen != 0 {
-                self.ipc.dispatch(&format!(
-                    "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = {0}, client = {0} }})",
-                    o.fullscreen
-                ))?;
             }
             if changed && o.floating {
                 self.ipc.dispatch(&format!(
@@ -286,6 +300,14 @@ impl HyprlandParking {
                     o.at[0], o.at[1]
                 ))?;
             }
+            // Size/move dispatchers refuse fullscreen windows. Restore fullscreen after the
+            // original floating geometry, including on a retry following a partial restore.
+            if changed && o.fullscreen != 0 {
+                self.ipc.dispatch(&format!(
+                    "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = {0}, client = {0} }})",
+                    o.fullscreen
+                ))?;
+            }
         }
         if self.monitor(&entry.output)?.is_some() {
             expect_ok(
@@ -295,7 +317,7 @@ impl HyprlandParking {
             )?;
         }
         self.entries.remove(&window);
-        self.padding.remove(&window);
+        self.padding.get_mut().remove(&window);
         self.save()
     }
 }
@@ -354,6 +376,7 @@ impl WindowParking for HyprlandParking {
                     .and_then(Value::as_i64)
                     .unwrap_or(0),
             },
+            floated_by_crosspane: false,
         };
         // What the window measured before it was parked, in the pixels it would have on the twin:
         // a client that still reports it has not answered the new geometry (see `Settling`).
@@ -404,11 +427,6 @@ impl WindowParking for HyprlandParking {
                     "hl.dsp.window.fullscreen({{ window = \"address:{address}\", action = \"unset\" }})"
                 ))?;
             }
-            if entry.original.floating {
-                self.ipc.dispatch(&format!(
-                    "hl.dsp.window.float({{ window = \"address:{address}\", action = \"unset\" }})"
-                ))?;
-            }
             self.move_window(&address, &format!("name:{}", entry.workspace))?;
             self.settle(window, size, scale, before)
         })();
@@ -445,6 +463,10 @@ impl WindowParking for HyprlandParking {
         let monitor = self
             .monitor(&entry.output)?
             .ok_or(PlatformError::NotFound)?;
+        // This method has no production caller restricted to the parking worker. Remember new
+        // margins, but never dispatch from a geometry observation. A larger late bar may overlap
+        // the twin until the next settle/ResizeParked moves it; window video excludes layers.
+        self.grow_padding(window.0, reserved_from(&monitor));
         clipped(
             parked_from(window, &client, &monitor)?,
             output_extent(&monitor)?,
@@ -486,6 +508,71 @@ impl WindowParking for HyprlandParking {
 }
 
 impl HyprlandParking {
+    /// Float only after reaching the twin, recording ownership before the dispatcher can act.
+    fn float_on_twin(&mut self, entry: &Entry, client: &Value) -> Result<(), PlatformError> {
+        if client.get("floating").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        if !entry.original.floating {
+            self.entries
+                .get_mut(&entry.window)
+                .ok_or(PlatformError::NotFound)?
+                .floated_by_crosspane = true;
+            self.save()?;
+        }
+        self.ipc.dispatch(&format!(
+            "hl.dsp.window.float({{ window = \"address:{}\", action = \"set\" }})",
+            entry.address
+        ))
+    }
+
+    /// Set the content once per destination request; margins only move it, never resize it.
+    fn place(
+        &self,
+        entry: &Entry,
+        client: &Value,
+        padding: [u32; 4],
+        requested: Option<PixelSize>,
+        scale: f64,
+    ) -> Result<bool, PlatformError> {
+        let mut resized = false;
+        if let Some(size) = requested {
+            let scale = sane_scale(scale);
+            let (w, h) = mode_size(size, scale);
+            let logical = (f64::from(w) / scale, f64::from(h) / scale);
+            if client_size(client) != Some(logical) {
+                self.ipc.dispatch(&format!(
+                    "hl.dsp.window.resize({{ window = \"address:{}\", x = {}, y = {}, relative = false }})",
+                    entry.address, logical.0, logical.1
+                ))?;
+                resized = true;
+            }
+        }
+        // Hyprland's floating resize keeps the centre fixed, changing the top-left. Use its new
+        // goal before deciding whether a move is needed, even when the old position was exact.
+        let after_resize = if resized {
+            Some(
+                self.client(WindowId(entry.window))?
+                    .ok_or(PlatformError::NotFound)?,
+            )
+        } else {
+            None
+        };
+        let client = after_resize.as_ref().unwrap_or(client);
+        let x = PARK_ORIGIN_X + entry.slot * PARK_STRIDE + i64::from(padding[0]);
+        let y = i64::from(padding[1]);
+        let at = client.get("at").and_then(Value::as_array);
+        let moved = at.and_then(|a| a.first()).and_then(Value::as_f64) != Some(x as f64)
+            || at.and_then(|a| a.get(1)).and_then(Value::as_f64) != Some(y as f64);
+        if moved {
+            self.ipc.dispatch(&format!(
+                "hl.dsp.window.move({{ window = \"address:{}\", x = {x}, y = {y}, relative = false }})",
+                entry.address
+            ))?;
+        }
+        Ok(resized || moved)
+    }
+
     /// Wait until the window has taken its new geometry on its twin output, then report it.
     ///
     /// `before` is the window's content size before the mode changed, in device pixels at the new
@@ -514,23 +601,29 @@ impl HyprlandParking {
             i32::try_from(h).unwrap_or(i32::MAX),
         );
         let started = Instant::now();
+        // A mode can report its dimensions before a bar has re-created its exclusive zone.
+        // Even exact content waits one quiet window, bounded by the existing settle deadline.
+        let mut quiet_since = started;
         let mut settling = Settling::new(requested, before);
         // The work-area size the twin is currently set up for: `size`, until a fit grows it.
         let mut want = size;
         let (mut repads, mut fits) = (0, 0);
+        let mut applied_padding = self.remembered_padding(window.0);
+        let mut placed = None;
         loop {
             // A bar can arrive on the new output after its mode was set: pad for it, a bounded
             // number of times. A bar that is (briefly) gone never shrinks the padding.
             let reserved = self.reserved(&entry.output)?;
-            let padding = self.padding.get(&window.0).copied().unwrap_or_default();
-            if repads < MAX_REPADS && covering(padding, reserved) != padding {
+            let padding = self.grow_padding(window.0, reserved);
+            if repads < MAX_REPADS && padding != applied_padding {
                 repads += 1;
                 // The mode is about to change again. What the window showed before it is no
                 // evidence about what it shows after: take its size now as the baseline and start
                 // the stability clock over.
                 settling.restart(self.baseline(window, scale)?);
-                let padding = self.grow_padding(window.0, reserved);
                 self.set_mode_padded(&entry, want, scale, padding)?;
+                applied_padding = padding;
+                quiet_since = Instant::now();
             }
             let client = self.client(window)?.ok_or(PlatformError::NotFound)?;
             let monitor = self
@@ -539,6 +632,30 @@ impl HyprlandParking {
             let parked = parked_from(window, &client, &monitor)?;
             let on_twin = client.pointer("/workspace/name").and_then(Value::as_str)
                 == Some(entry.workspace.as_str());
+            // Observations beyond MAX_REPADS are remembered for the next worker request, not
+            // placed outside the mode this settle applied. They share the late-bar overlap limit.
+            if on_twin && placed != Some(applied_padding) {
+                let client = if placed.is_none() {
+                    self.float_on_twin(&entry, &client)?;
+                    // Toggling float can restore the remembered floating size/position.
+                    self.client(window)?.ok_or(PlatformError::NotFound)?
+                } else {
+                    client
+                };
+                self.place(
+                    &entry,
+                    &client,
+                    applied_padding,
+                    placed.is_none().then_some(size),
+                    scale,
+                )?;
+                placed = Some(applied_padding);
+                // The snapshot predates our placement. Only a fresh goal can settle it.
+                continue;
+            }
+            // A later Wayland minimum-size clamp can preserve the centre and move the top-left,
+            // even after the output was fitted. Reanchor each observed goal, never reissue resize.
+            let moved = on_twin && self.place(&entry, &client, applied_padding, None, scale)?;
             let elapsed = started.elapsed();
             let decision = settling.observe(Poll {
                 content: parked.content,
@@ -559,6 +676,28 @@ impl HyprlandParking {
             };
             match decision {
                 Decision::Done { content, rule } => {
+                    if waiting_for_bars(elapsed, quiet_since.elapsed()) {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    if moved {
+                        // The pre-move snapshot may drive a fit, but it cannot be reported as
+                        // settled content. Verify the actual fresh goal; never invent its origin.
+                        let client = self.client(window)?.ok_or(PlatformError::NotFound)?;
+                        let actual = parked_from(window, &client, &monitor)?;
+                        let extent = output_extent(&monitor)?;
+                        if rule == Rule::Deadline {
+                            return clipped(actual, extent);
+                        }
+                        if !inside(&extent, &actual.content)
+                            || actual.content.size() != content.size()
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        log(rule.as_str(), Some(actual.content));
+                        return Ok(actual);
+                    }
                     // An app may refuse a size; the geometry is what it took.
                     log(rule.as_str(), Some(content));
                     return Ok(Parked { content, ..parked });
@@ -576,8 +715,8 @@ impl HyprlandParking {
                         u32::try_from(fit.0).unwrap_or(0),
                         u32::try_from(fit.1).unwrap_or(0),
                     );
-                    let padding = self.padding.get(&window.0).copied().unwrap_or_default();
-                    self.set_mode_padded(&entry, want, scale, padding)?;
+                    self.set_mode_padded(&entry, want, scale, applied_padding)?;
+                    quiet_since = Instant::now();
                 }
                 Decision::Wait => {}
             }
@@ -855,6 +994,30 @@ fn covering(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
     ]
 }
 
+fn reserved_from(monitor: &Value) -> [u32; 4] {
+    let mut reserved = [0; 4];
+    if let Some(values) = monitor.get("reserved").and_then(Value::as_array) {
+        for (i, value) in values.iter().take(4).enumerate() {
+            reserved[i] = value
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0);
+        }
+    }
+    reserved
+}
+
+/// A recreated bar gets one settle window, but never extends the overall settle deadline.
+fn waiting_for_bars(elapsed: Duration, quiet: Duration) -> bool {
+    elapsed < SETTLE && quiet < STABLE
+}
+
+fn same_pair(client: &Value, key: &str, expected: [i64; 2]) -> bool {
+    let pair = client.get(key).and_then(Value::as_array);
+    pair.and_then(|p| p.first()).and_then(Value::as_f64) == Some(expected[0] as f64)
+        && pair.and_then(|p| p.get(1)).and_then(Value::as_f64) == Some(expected[1] as f64)
+}
+
 /// Whether `monitor` (from `hyprctl monitors -j`) already has this mode, scale and position.
 fn has_mode(monitor: &Value, (w, h): (u32, u32), scale: f64, x: i64) -> bool {
     let int = |key: &str| monitor.get(key).and_then(Value::as_i64);
@@ -1023,7 +1186,7 @@ mod tests {
     fn padding_only_grows() {
         let dir = std::env::temp_dir().join(format!("cp-pad-{}", std::process::id()));
         let ipc = HyprIpc::new("none", &dir, Duration::from_millis(10));
-        let mut p = HyprlandParking::new(ipc, dir.join("parking.json")).unwrap();
+        let p = HyprlandParking::new(ipc, dir.join("parking.json")).unwrap();
         assert_eq!(p.grow_padding(5, [0, 26, 0, 0]), [0, 26, 0, 0]);
         // The bar re-creating its surface: briefly nothing reserved. The padding stays.
         assert_eq!(p.grow_padding(5, [0, 0, 0, 0]), [0, 26, 0, 0]);
@@ -1688,11 +1851,583 @@ mod tests {
                     size: [3, 4],
                     fullscreen: 0,
                 },
+                floated_by_crosspane: false,
             },
         );
         p.save().unwrap();
         let q = HyprlandParking::new(ipc, path).unwrap();
         assert_eq!(q.entries, p.entries);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A private request socket modelling tiled work-area changes and independent floating
+    /// geometry. It never discovers a session or connects to any socket outside its temp dir.
+    struct BarFixture {
+        dir: PathBuf,
+        world: std::sync::Arc<std::sync::Mutex<BarWorld>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    struct BarWorld {
+        output: bool,
+        mode: (u32, u32),
+        scale: f64,
+        bar: [u32; 4],
+        after_mode: Option<Vec<[u32; 4]>>,
+        pending_bars: std::collections::VecDeque<[u32; 4]>,
+        floating: bool,
+        fullscreen: i64,
+        fullscreen_restore_box: Option<([i64; 2], [i64; 2])>,
+        on_twin: bool,
+        at: [i64; 2],
+        size: [i64; 2],
+        modes: usize,
+        moves: usize,
+        resizes: usize,
+        float_sets: usize,
+        float_unsets: usize,
+        ownership_before_float: bool,
+        fail_home_geometry: Option<&'static str>,
+        clamp_next_resize: Option<([i64; 2], u32)>,
+        pending_clamp: Option<([i64; 2], u32)>,
+        last_clamp: Option<[i64; 2]>,
+        after_fit_drift: Option<[i64; 2]>,
+        journal: PathBuf,
+    }
+
+    impl BarWorld {
+        fn resize_about_centre(&mut self, size: [i64; 2]) {
+            for (i, value) in size.iter().enumerate() {
+                self.at[i] -= (*value - self.size[i]) / 2;
+            }
+            self.size = size;
+        }
+
+        fn tile(&mut self) {
+            if !self.on_twin || self.floating {
+                return;
+            }
+            self.at = [
+                PARK_ORIGIN_X + i64::from(self.bar[0]),
+                i64::from(self.bar[1]),
+            ];
+            self.size = [
+                (f64::from(self.mode.0) / self.scale) as i64
+                    - i64::from(self.bar[0])
+                    - i64::from(self.bar[2]),
+                (f64::from(self.mode.1) / self.scale) as i64
+                    - i64::from(self.bar[1])
+                    - i64::from(self.bar[3]),
+            ];
+        }
+
+        fn handle(&mut self, request: &str) -> String {
+            let quoted = |key: &str| {
+                request
+                    .split_once(&format!("{key} = \""))
+                    .and_then(|(_, rest)| rest.split_once('"').map(|(value, _)| value))
+            };
+            let number = |key: &str| -> f64 {
+                request
+                    .split_once(&format!("{key} = "))
+                    .unwrap()
+                    .1
+                    .split([',', ' ', '}'])
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            if request == "j/monitors" {
+                if let Some(bar) = self.pending_bars.pop_front() {
+                    self.bar = bar;
+                    self.tile();
+                }
+                let mut monitors = vec![serde_json::json!({
+                    "name": "DP-1", "id": 0, "x": 0, "y": 0,
+                    "width": 1920, "height": 1080, "scale": 1.0, "reserved": [0, 0, 0, 0],
+                })];
+                if self.output {
+                    monitors.push(serde_json::json!({
+                        "name": "CROSSPANE-1", "id": 7, "x": PARK_ORIGIN_X, "y": 0,
+                        "width": self.mode.0, "height": self.mode.1,
+                        "scale": self.scale, "reserved": self.bar,
+                    }));
+                }
+                return serde_json::to_string(&monitors).unwrap();
+            }
+            if request == "j/clients" {
+                if let Some((size, polls)) = self.pending_clamp.take() {
+                    if polls == 0 {
+                        self.resize_about_centre(size);
+                        self.last_clamp = Some(size);
+                    } else {
+                        self.pending_clamp = Some((size, polls - 1));
+                    }
+                }
+                return serde_json::json!([{
+                    "address": "0xabc", "stableId": "1", "floating": self.floating,
+                    "fullscreen": self.fullscreen, "at": self.at, "size": self.size,
+                    "workspace": {"name": if self.on_twin {"crosspane-1"} else {"1"}},
+                }])
+                .to_string();
+            }
+            if request.starts_with("/output create headless ") {
+                self.output = true;
+            } else if request.starts_with("/output remove ") {
+                self.output = false;
+            } else if request.starts_with("/eval hl.monitor(") {
+                let mode = quoted("mode").unwrap().split_once('@').unwrap().0;
+                let (w, h) = mode.split_once('x').unwrap();
+                self.mode = (w.parse().unwrap(), h.parse().unwrap());
+                self.scale = number("scale");
+                self.modes += 1;
+                self.tile();
+                let logical = [
+                    (f64::from(self.mode.0) / self.scale) as i64
+                        - i64::from(self.bar[0])
+                        - i64::from(self.bar[2]),
+                    (f64::from(self.mode.1) / self.scale) as i64
+                        - i64::from(self.bar[1])
+                        - i64::from(self.bar[3]),
+                ];
+                if self.last_clamp == Some(logical)
+                    && let Some(drift) = self.after_fit_drift.take()
+                {
+                    // A later commit can publish an older centred placement after the fit.
+                    self.at[0] += drift[0];
+                    self.at[1] += drift[1];
+                }
+                if let Some(bars) = self.after_mode.take() {
+                    self.pending_bars = bars.into();
+                }
+            } else if request.starts_with("/dispatch hl.dsp.window.fullscreen_state(") {
+                self.fullscreen = number("internal") as i64;
+                if self.fullscreen != 0 {
+                    self.fullscreen_restore_box = Some((self.size, self.at));
+                }
+            } else if request.starts_with("/dispatch hl.dsp.window.fullscreen(") {
+                self.fullscreen = if quoted("action") == Some("unset") {
+                    0
+                } else {
+                    1
+                };
+            } else if request.starts_with("/dispatch hl.dsp.window.float(") {
+                if quoted("action") == Some("set") {
+                    let entries: Vec<Entry> =
+                        serde_json::from_str(&std::fs::read_to_string(&self.journal).unwrap())
+                            .unwrap();
+                    self.ownership_before_float = entries[0].floated_by_crosspane;
+                    if !self.floating {
+                        // Hyprland can restore the last floating box on a tiled-to-float switch.
+                        self.at = [100, 100];
+                        self.size = [800, 600];
+                    }
+                    self.floating = true;
+                    self.float_sets += 1;
+                } else {
+                    self.floating = false;
+                    self.float_unsets += 1;
+                    self.tile();
+                }
+            } else if request.starts_with("/dispatch hl.dsp.window.resize(") {
+                if self.fullscreen != 0 {
+                    return "fullscreen window refuses resize".into();
+                }
+                if !self.on_twin && self.fail_home_geometry == Some("resize") {
+                    self.fail_home_geometry = None;
+                    return "scripted restore interruption".into();
+                }
+                let size = [number("x") as i64, number("y") as i64];
+                self.resize_about_centre(size);
+                self.pending_clamp = self.clamp_next_resize.take();
+                self.resizes += 1;
+            } else if request.starts_with("/dispatch hl.dsp.window.move(") {
+                if let Some(workspace) = quoted("workspace") {
+                    self.on_twin = workspace == "name:crosspane-1";
+                    self.tile();
+                } else {
+                    if self.fullscreen != 0 {
+                        return "fullscreen window refuses move".into();
+                    }
+                    if !self.on_twin && self.fail_home_geometry == Some("move") {
+                        self.fail_home_geometry = None;
+                        return "scripted restore interruption".into();
+                    }
+                    self.at = [number("x") as i64, number("y") as i64];
+                    self.moves += 1;
+                }
+            }
+            "ok".into()
+        }
+
+        fn dispatch_counts(&self) -> (usize, usize, usize, usize, usize) {
+            (
+                self.modes,
+                self.moves,
+                self.resizes,
+                self.float_sets,
+                self.float_unsets,
+            )
+        }
+    }
+
+    impl BarFixture {
+        fn new(floating: bool, bar: [u32; 4], after_mode: Option<Vec<[u32; 4]>>) -> Self {
+            use std::io::Read;
+            use std::os::unix::net::UnixListener;
+            use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+            use std::sync::{Arc, Mutex};
+
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "cp-bars-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(dir.join("hypr/test")).unwrap();
+            let listener = UnixListener::bind(dir.join("hypr/test/.socket.sock")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let world = Arc::new(Mutex::new(BarWorld {
+                output: false,
+                mode: (1920, 1080),
+                scale: 1.0,
+                bar,
+                after_mode,
+                pending_bars: Default::default(),
+                floating,
+                fullscreen: 0,
+                fullscreen_restore_box: None,
+                on_twin: false,
+                at: [100, 100],
+                size: [800, 600],
+                modes: 0,
+                moves: 0,
+                resizes: 0,
+                float_sets: 0,
+                float_unsets: 0,
+                ownership_before_float: false,
+                fail_home_geometry: None,
+                clamp_next_resize: None,
+                pending_clamp: None,
+                last_clamp: None,
+                after_fit_drift: None,
+                journal: dir.join("parking.json"),
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (world, stop) = (world.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                stream
+                                    .set_read_timeout(Some(Duration::from_secs(1)))
+                                    .unwrap();
+                                stream
+                                    .set_write_timeout(Some(Duration::from_secs(1)))
+                                    .unwrap();
+                                let mut buffer = [0; 2048];
+                                let count = stream.read(&mut buffer).unwrap();
+                                let reply = world
+                                    .lock()
+                                    .unwrap()
+                                    .handle(&String::from_utf8_lossy(&buffer[..count]));
+                                let _ = stream.write_all(reply.as_bytes());
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("private fake socket: {error}"),
+                        }
+                    }
+                })
+            };
+            Self {
+                dir,
+                world,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn parking(&self) -> HyprlandParking {
+            HyprlandParking::new(
+                HyprIpc::new("test", &self.dir, Duration::from_millis(500)),
+                self.dir.join("parking.json"),
+            )
+            .unwrap()
+        }
+
+        fn bar(&self, bar: [u32; 4]) {
+            let mut world = self.world.lock().unwrap();
+            world.bar = bar;
+            world.tile();
+        }
+    }
+
+    impl Drop for BarFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            self.thread.take().unwrap().join().unwrap();
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn bar_churn_keeps_one_parked_content_and_one_mode() {
+        let fake = BarFixture::new(
+            false,
+            [0, 26, 0, 0],
+            Some(vec![[0; 4], [0, 26, 0, 0], [0; 4], [0, 26, 0, 0]]),
+        );
+        let mut parking = fake.parking();
+        let parked = parking
+            .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+            .unwrap();
+        assert_eq!(parked.content, rect(0, 26, 531, 961));
+        let counts = fake.world.lock().unwrap().dispatch_counts();
+        assert_eq!(counts.0, 1);
+        for bar in [[0; 4], [0, 26, 0, 0], [0; 4], [0, 26, 0, 0]] {
+            fake.bar(bar);
+            assert_eq!(parking.geometry(WindowId(1)).unwrap(), parked);
+            assert_eq!(fake.world.lock().unwrap().dispatch_counts(), counts);
+        }
+    }
+
+    #[test]
+    fn a_larger_late_bar_moves_once_on_resize_without_resizing_content() {
+        let fake = BarFixture::new(false, [0, 26, 0, 0], None);
+        let mut parking = fake.parking();
+        let size = PixelSize::new(531, 935);
+        let parked = parking.park(WindowId(1), size, 1.0).unwrap();
+        let counts = fake.world.lock().unwrap().dispatch_counts();
+        fake.bar([0, 40, 0, 0]);
+        assert_eq!(parking.geometry(WindowId(1)).unwrap(), parked);
+        assert_eq!(fake.world.lock().unwrap().dispatch_counts(), counts);
+        let moved = parking.resize(WindowId(1), size, 1.0).unwrap();
+        assert_eq!(moved.content, rect(0, 40, 531, 975));
+        let after = fake.world.lock().unwrap().dispatch_counts();
+        assert_eq!(
+            after,
+            (counts.0 + 1, counts.1 + 1, counts.2, counts.3, counts.4)
+        );
+        for bar in [[0; 4], [0, 26, 0, 0], [0, 40, 0, 0]] {
+            fake.bar(bar);
+            assert_eq!(parking.geometry(WindowId(1)).unwrap(), moved);
+            assert_eq!(fake.world.lock().unwrap().dispatch_counts(), after);
+        }
+        assert_eq!(parking.resize(WindowId(1), size, 1.0).unwrap(), moved);
+        assert_eq!(fake.world.lock().unwrap().dispatch_counts(), after);
+    }
+
+    #[test]
+    fn destination_resize_changes_floating_content_exactly_once() {
+        let fake = BarFixture::new(false, [10, 26, 6, 14], None);
+        let mut parking = fake.parking();
+        parking
+            .park(WindowId(1), PixelSize::new(1600, 1200), 2.0)
+            .unwrap();
+        let counts = fake.world.lock().unwrap().dispatch_counts();
+        let size = PixelSize::new(1200, 900);
+        let parked = parking.resize(WindowId(1), size, 2.0).unwrap();
+        assert_eq!(parked.content, rect(20, 52, 1220, 952));
+        let after = fake.world.lock().unwrap().dispatch_counts();
+        assert_eq!(after.0, counts.0 + 1);
+        assert_eq!(after.2, counts.2 + 1);
+        assert_eq!(parking.resize(WindowId(1), size, 2.0).unwrap(), parked);
+        assert_eq!(parking.geometry(WindowId(1)).unwrap(), parked);
+        assert_eq!(fake.world.lock().unwrap().dispatch_counts(), after);
+    }
+
+    #[test]
+    fn a_missing_bar_finishes_without_repadding() {
+        let fake = BarFixture::new(false, [0; 4], None);
+        let mut parking = fake.parking();
+        let parked = parking
+            .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+            .unwrap();
+        assert_eq!(parked.content, rect(0, 0, 531, 935));
+        assert_eq!(fake.world.lock().unwrap().modes, 1);
+        // The deadline path itself uses synthetic elapsed times in the existing Settling tests;
+        // this socket case proves that absence of a bar doesn't require one to appear.
+    }
+
+    #[test]
+    fn bar_settle_wait_never_extends_the_deadline() {
+        assert!(waiting_for_bars(
+            SETTLE - Duration::from_millis(1),
+            Duration::ZERO
+        ));
+        for quiet in [Duration::ZERO, STABLE - Duration::from_millis(1), STABLE] {
+            assert!(!waiting_for_bars(SETTLE, quiet));
+            assert!(!waiting_for_bars(SETTLE + STABLE, quiet));
+        }
+        assert!(!waiting_for_bars(Duration::ZERO, STABLE));
+    }
+
+    #[test]
+    fn restore_and_crash_recovery_unfloat_only_crosspane_owned_floating() {
+        for recover in [false, true] {
+            for originally_floating in [false, true] {
+                let fake = BarFixture::new(originally_floating, [0, 26, 0, 0], None);
+                let mut parking = fake.parking();
+                parking
+                    .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+                    .unwrap();
+                assert_eq!(
+                    parking.entries[&1].floated_by_crosspane,
+                    !originally_floating
+                );
+                if !originally_floating {
+                    assert!(fake.world.lock().unwrap().ownership_before_float);
+                }
+                if recover {
+                    drop(parking);
+                    parking = fake.parking();
+                    assert_eq!(parking.recover().unwrap(), [WindowId(1)]);
+                } else {
+                    parking.restore(WindowId(1)).unwrap();
+                }
+                let world = fake.world.lock().unwrap();
+                assert!(!world.on_twin);
+                assert!(!world.output);
+                assert_eq!(world.floating, originally_floating);
+                assert_eq!(world.float_unsets, usize::from(!originally_floating));
+                if originally_floating {
+                    assert_eq!(world.at, [100, 100]);
+                    assert_eq!(world.size, [800, 600]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn old_journal_does_not_claim_floating_ownership() {
+        let fake = BarFixture::new(false, [0; 4], None);
+        let mut parking = fake.parking();
+        parking
+            .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+            .unwrap();
+        let mut journal: Value =
+            serde_json::from_str(&std::fs::read_to_string(&parking.journal).unwrap()).unwrap();
+        journal[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("floated_by_crosspane");
+        std::fs::write(&parking.journal, serde_json::to_vec(&journal).unwrap()).unwrap();
+        drop(parking);
+        let mut recovered = fake.parking();
+        assert!(!recovered.entries[&1].floated_by_crosspane);
+        recovered.recover().unwrap();
+        assert_eq!(fake.world.lock().unwrap().float_unsets, 0);
+    }
+
+    #[test]
+    fn interrupted_floating_restore_retries_geometry_before_removing_the_journal() {
+        for crash in [false, true] {
+            for failure in ["resize", "move"] {
+                let fake = BarFixture::new(true, [0, 26, 0, 0], None);
+                let mut parking = fake.parking();
+                parking
+                    .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+                    .unwrap();
+                fake.world.lock().unwrap().fail_home_geometry = Some(failure);
+                assert!(parking.restore(WindowId(1)).is_err());
+                {
+                    let world = fake.world.lock().unwrap();
+                    assert!(!world.on_twin, "failure is after the move home");
+                    assert!(world.floating);
+                    assert!(world.output);
+                    assert_ne!(world.at, [100, 100]);
+                    if failure == "move" {
+                        assert_eq!(world.size, [800, 600]);
+                    } else {
+                        assert_ne!(world.size, [800, 600]);
+                    }
+                }
+                let journal: Vec<Entry> =
+                    serde_json::from_str(&std::fs::read_to_string(&parking.journal).unwrap())
+                        .unwrap();
+                assert_eq!(journal.len(), 1);
+                assert!(parking.entries.contains_key(&1));
+                if crash {
+                    drop(parking);
+                    parking = fake.parking();
+                    assert_eq!(parking.recover().unwrap(), [WindowId(1)]);
+                } else {
+                    parking.restore(WindowId(1)).unwrap();
+                }
+                let world = fake.world.lock().unwrap();
+                assert!(!world.on_twin);
+                assert!(world.floating);
+                assert_eq!(world.size, [800, 600]);
+                assert_eq!(world.at, [100, 100]);
+                assert!(!world.output);
+                assert_eq!(world.float_unsets, 0);
+                assert!(parking.entries.is_empty());
+                assert_eq!(std::fs::read_to_string(&parking.journal).unwrap(), "[]");
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_minimum_size_clamp_is_reanchored_without_repeating_resize() {
+        for drift_after_fit in [false, true] {
+            let fake = BarFixture::new(false, [0, 26, 0, 0], None);
+            let mut parking = fake.parking();
+            parking
+                .park(WindowId(1), PixelSize::new(800, 600), 1.0)
+                .unwrap();
+            let counts = {
+                let mut world = fake.world.lock().unwrap();
+                world.clamp_next_resize = Some(([400, 300], 2));
+                world.after_fit_drift = drift_after_fit.then_some([-25, -25]);
+                world.dispatch_counts()
+            };
+            let parked = parking
+                .resize(WindowId(1), PixelSize::new(300, 200), 1.0)
+                .unwrap();
+            let world = fake.world.lock().unwrap();
+            assert_eq!(world.mode, (400, 326));
+            assert_eq!(world.size, [400, 300]);
+            assert_eq!(world.at, [PARK_ORIGIN_X, 26]);
+            assert_eq!(world.modes, counts.0 + 2, "request and one fit");
+            assert_eq!(world.resizes, counts.2 + 1, "one destination resize");
+            assert_eq!(world.moves, counts.1 + 2 + usize::from(drift_after_fit));
+            assert_eq!(parked.content, rect(0, 26, 400, 326));
+            drop(world);
+            assert_eq!(parking.geometry(WindowId(1)).unwrap(), parked);
+        }
+    }
+
+    #[test]
+    fn fullscreen_is_restored_after_original_floating_geometry() {
+        for recover in [false, true] {
+            let fake = BarFixture::new(true, [0, 26, 0, 0], None);
+            fake.world.lock().unwrap().fullscreen = 1;
+            let mut parking = fake.parking();
+            parking
+                .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+                .unwrap();
+            assert_eq!(parking.entries[&1].original.fullscreen, 1);
+            assert_eq!(fake.world.lock().unwrap().fullscreen, 0);
+            if recover {
+                drop(parking);
+                parking = fake.parking();
+                assert_eq!(parking.recover().unwrap(), [WindowId(1)]);
+            } else {
+                parking.restore(WindowId(1)).unwrap();
+            }
+            let world = fake.world.lock().unwrap();
+            assert_eq!(world.fullscreen, 1);
+            assert_eq!(world.fullscreen_restore_box, Some(([800, 600], [100, 100])));
+            assert_eq!(world.size, [800, 600]);
+            assert_eq!(world.at, [100, 100]);
+            assert!(world.floating);
+            assert_eq!(world.float_unsets, 0);
+            assert!(parking.entries.is_empty());
+        }
     }
 }
