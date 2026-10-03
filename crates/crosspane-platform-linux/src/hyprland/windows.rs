@@ -358,7 +358,7 @@ fn parse_client(c: &Value) -> Result<Option<Client>, PlatformError> {
     }))
 }
 
-fn parse_hex(value: &str) -> Option<u64> {
+pub(crate) fn parse_hex(value: &str) -> Option<u64> {
     let value = value.strip_prefix("0x").unwrap_or(value);
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;

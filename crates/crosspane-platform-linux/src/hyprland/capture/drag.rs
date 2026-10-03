@@ -35,10 +35,10 @@ impl Sample {
         {
             return None;
         }
-        let window = WindowId(
-            u64::from_str_radix(client["address"].as_str()?.strip_prefix("0x")?, 16).ok()?,
-        );
-        (window.0 != 0).then(|| Self {
+        let window = WindowId(super::super::windows::parse_hex(
+            client["stableId"].as_str()?,
+        )?);
+        Some(Self {
             window,
             workspace: client["workspace"].clone(),
             origin,
@@ -162,13 +162,18 @@ impl Gesture {
     ) -> (Option<PortalId>, Option<Hit>) {
         if let Some(watch) = &self.watch {
             if !watch.valid(sample.as_ref(), portals, monitors, now) {
-                *self = Self::default();
+                return (self.cancel_watch(), None);
             }
             return (None, None);
         }
         let result = self.detector.observe(sample, portals, monitors);
         self.last = result.1.clone(); // Release/cancel invalidates the cached gesture immediately.
         result
+    }
+    pub fn cancel_watch(&mut self) -> Option<PortalId> {
+        let portal = self.watch.as_ref()?.hit.portal;
+        *self = Self::default();
+        Some(portal)
     }
     pub fn refuse(
         &mut self,
@@ -193,17 +198,25 @@ impl Gesture {
         &mut self,
         pending: Vec<Option<Sample>>,
         portal: PortalId,
+        position: f64,
         portals: &[CapturePortal],
         monitors: &[Monitor],
         now: Instant,
-    ) -> Option<Hit> {
+    ) -> (Option<PortalId>, Option<Hit>) {
+        let mut released = None;
         for sample in pending {
-            self.observe(sample, portals, monitors, now);
+            released = released.or(self.observe(sample, portals, monitors, now).0);
         }
-        let hit = Watch::take(&mut self.watch, portal, now);
+        if self.watch.as_ref().is_some_and(|w| now >= w.until) {
+            released = self.cancel_watch().or(released);
+        }
+        let hit = Watch::take(&mut self.watch, portal, now).map(|mut hit| {
+            hit.position = position; // Validated strip entry is finer and newer than polled coordinates.
+            hit
+        });
         self.detector = Detector::default();
         self.last = None;
-        hit
+        (released, hit)
     }
 }
 pub(super) struct Watch {
@@ -448,7 +461,7 @@ mod tests {
     fn recorded(x: f64, scale: f64, tiled: bool) -> Sample {
         let cursor = json!({"x": -200.0 + x / scale, "y": 100.0 + 468.0 / scale});
         let size = if tiled { [516, 898] } else { [360, 240] };
-        Sample::parse(&cursor, &json!({"address":"0x123", "at":[cursor["x"].as_f64().unwrap() - 80.0, cursor["y"].as_f64().unwrap() - 80.0], "size":size, "workspace":{"id":1,"name":"1"},"floating":true})).unwrap()
+        Sample::parse(&cursor, &json!({"stableId":"1800000a", "address":"0x123", "at":[cursor["x"].as_f64().unwrap() - 80.0, cursor["y"].as_f64().unwrap() - 80.0], "size":size, "workspace":{"id":1,"name":"1"},"floating":true})).unwrap()
     }
     fn hit() -> Hit {
         let (portals, monitors) = layout(1.0);
@@ -458,6 +471,118 @@ mod tests {
             .observe(Some(recorded(1071.0, 1.0, false)), &portals, &monitors)
             .1
             .unwrap()
+    }
+    #[test]
+    fn detector_window_id_matches_window_source_for_the_same_client_json() {
+        use super::super::super::{ipc::HyprIpc, windows::HyprlandWindows};
+        use crosspane_platform::WindowSource;
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+        };
+
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Temp(std::env::temp_dir().join(format!(
+            "crosspane-wp255b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        std::fs::create_dir(&dir.0).unwrap();
+        std::fs::create_dir_all(dir.0.join("hypr/fake")).unwrap();
+        let client = json!({
+            "stableId":"1800000a", "address":"0x60aba49bf930", "mapped":true,
+            "hidden":false, "at":[200,100], "size":[360,240],
+            "workspace":{"id":1,"name":"1"}, "monitor":0, "class":"crosspane-test",
+            "initialClass":"crosspane-test", "title":"fixture", "pid":1234, "fullscreen":0
+        });
+        let sample = Sample::parse(&json!({"x":280,"y":180}), &client).unwrap();
+        let reply = serde_json::to_vec(&json!([client])).unwrap();
+        let listener = UnixListener::bind(dir.0.join("hypr/fake/.socket.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let mut connection = loop {
+                    match listener.accept() {
+                        Ok((connection, _)) => break connection,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(e) => panic!("fake IPC accept: {e}"),
+                    }
+                };
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                connection
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = [0; 9];
+                connection.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"j/clients");
+                connection.write_all(&reply).unwrap();
+            }
+        });
+        let source =
+            HyprlandWindows::new(HyprIpc::new("fake", &dir.0, Duration::from_secs(1))).unwrap();
+        let windows = source.windows().unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(sample.window, windows[0].id);
+        assert_eq!(sample.window, WindowId(0x1800000a));
+        assert_ne!(sample.window, WindowId(0x60aba49bf930));
+        assert_eq!(
+            source.address(sample.window).as_deref(),
+            Some("0x60aba49bf930")
+        );
+        server.join().unwrap();
+    }
+    #[test]
+    fn sample_requires_valid_stable_id_and_never_uses_address_for_identity() {
+        let cursor = json!({"x":280,"y":180});
+        let mut client = json!({
+            "stableId":"1800000a", "address":"0x123", "at":[200,100],
+            "size":[360,240], "workspace":{"id":1,"name":"1"}
+        });
+        for (stable_id, expected) in [
+            ("1800000a", 0x1800000a),
+            ("0x1800000a", 0x1800000a),
+            ("0", 0),
+            ("ffffffffffffffff", u64::MAX),
+        ] {
+            client["stableId"] = json!(stable_id);
+            assert_eq!(
+                Sample::parse(&cursor, &client).unwrap().window,
+                WindowId(expected)
+            );
+        }
+        for invalid in [
+            Value::Null,
+            json!(123),
+            json!(""),
+            json!("0x"),
+            json!("not-hex"),
+            json!("10000000000000000"),
+        ] {
+            client["stableId"] = invalid;
+            assert!(Sample::parse(&cursor, &client).is_none());
+        }
+        client.as_object_mut().unwrap().remove("stableId");
+        assert!(Sample::parse(&cursor, &client).is_none());
+        client["stableId"] = json!("1800000a");
+        client["address"] = json!("0x456");
+        assert_eq!(
+            Sample::parse(&cursor, &client).unwrap().window,
+            WindowId(0x1800000a)
+        );
     }
     #[test]
     fn recorded_bindm_and_xdg_float_and_tile_moves_track_and_keep_pressing() {
@@ -482,7 +607,7 @@ mod tests {
                         .observe(Some(edge.clone()), &portals, &monitors)
                         .1
                         .unwrap_or_else(|| panic!("{path}/{tiled}/{scale}"));
-                    assert_eq!(result.sample.window, WindowId(0x123));
+                    assert_eq!(result.sample.window, WindowId(0x1800000a));
                     assert_eq!(result.grab, PointDevice::new(80.0 * scale, 80.0 * scale));
                     assert!((result.position - (468.0 - 937.0 / 4.0) / (937.0 / 2.0)).abs() < 1e-9);
                     assert!(
@@ -618,8 +743,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .publish((why != "failed").then_some(sample));
-            let drop = poller
-                .fence(|pending| gesture.pressed(pending, PortalId(1), &portals, &monitors, now));
+            let (released, drop) = poller.fence(|pending| {
+                gesture.pressed(pending, PortalId(1), 0.5, &portals, &monitors, now)
+            });
+            assert_eq!(released, Some(PortalId(1)));
             assert!(drop.is_none(), "{why} escaped the strip-event fence");
             assert!(gesture.last.is_none());
             assert!(gesture.watch.is_none());
@@ -658,9 +785,10 @@ mod tests {
                     }
                     assert!(publication.pending.len() <= 8);
                 }
-                let drop = poller.fence(|pending| {
-                    gesture.pressed(pending, PortalId(1), &portals, &monitors, now)
+                let (released, drop) = poller.fence(|pending| {
+                    gesture.pressed(pending, PortalId(1), 0.5, &portals, &monitors, now)
                 });
+                assert_eq!(released, Some(PortalId(1)));
                 assert!(drop.is_none(), "{why}/{valid_samples} lost cancellation");
                 assert!(gesture.watch.is_none());
                 assert!(gesture.last.is_none());
@@ -682,14 +810,60 @@ mod tests {
         }
         assert!(
             poller
-                .fence(|pending| gesture.pressed(pending, PortalId(1), &portals, &monitors, now))
+                .fence(|pending| gesture.pressed(
+                    pending,
+                    PortalId(1),
+                    0.5,
+                    &portals,
+                    &monitors,
+                    now
+                ))
+                .1
                 .is_some()
         );
         assert!(
             poller
-                .fence(|pending| gesture.pressed(pending, PortalId(1), &portals, &monitors, now))
+                .fence(|pending| gesture.pressed(
+                    pending,
+                    PortalId(1),
+                    0.5,
+                    &portals,
+                    &monitors,
+                    now
+                ))
+                .1
                 .is_none()
         );
+    }
+    #[test]
+    fn fence_preserves_cancelled_watch_portal_before_a_later_gesture_release() {
+        let (mut portals, monitors) = layout(1.0);
+        let mut other = portals[0];
+        other.id = PortalId(2);
+        other.from = 0.0;
+        other.to = 200.0;
+        portals.push(other);
+        let now = Instant::now();
+        let original = hit();
+        let mut gesture = Gesture {
+            watch: Some(Watch::new(original, now)),
+            ..Default::default()
+        };
+        let poller = Poller::spawn(|| None, || false).unwrap();
+        {
+            let mut publication = poller.shared.0.lock().unwrap();
+            publication.publish(Some(recorded(1067.0, 1.0, false))); // Cancel portal 1's watch.
+            for x in [1067.0, 1071.0, 1067.0] {
+                let mut sample = recorded(x, 1.0, false);
+                sample.cursor[1] = monitors[0].origin[1] + 100.0;
+                sample.origin[1] = sample.cursor[1] - 80.0;
+                publication.publish(Some(sample)); // Enter then leave portal 2 in the same batch.
+            }
+        }
+        let (released, drop) = poller
+            .fence(|pending| gesture.pressed(pending, PortalId(1), 0.5, &portals, &monitors, now));
+        assert_eq!(released, Some(PortalId(1)));
+        assert!(drop.is_none());
     }
     #[test]
     fn released_or_cancelled_hits_cannot_rearm_and_duplicates_keep_bounds() {
@@ -738,17 +912,100 @@ mod tests {
             until - Duration::from_millis(1),
         );
         assert_eq!(gesture.watch.as_ref().unwrap().until, until);
-        assert!(
-            gesture
-                .pressed(Vec::new(), PortalId(1), &portals, &monitors, until)
-                .is_none()
-        );
+        let (released, drop) =
+            gesture.pressed(Vec::new(), PortalId(1), 0.5, &portals, &monitors, until);
+        assert_eq!(released, Some(PortalId(1)));
+        assert!(drop.is_none());
+        assert!(gesture.watch.is_none());
         gesture.refuse(
             PortalId(1),
             crosspane_types::hid::MouseButton::PRIMARY,
             until,
         );
-        assert_eq!(gesture.watch.as_ref().unwrap().until, until);
+        assert!(gesture.watch.is_none());
+    }
+    #[test]
+    fn watch_cancellation_releases_portal_and_allows_immediate_retry_drop() {
+        let (portals, monitors) = layout(1.0);
+        for why in ["leave", "workspace", "client", "failed", "timeout"] {
+            let now = Instant::now();
+            let original = hit();
+            let mut gesture = Gesture {
+                watch: Some(Watch::new(original.clone(), now)),
+                last: Some(original.clone()),
+                ..Default::default()
+            };
+            let mut sample = original.sample.clone();
+            match why {
+                "leave" => sample.cursor[0] -= 4.0,
+                "workspace" => sample.workspace = json!({"id":2}),
+                "client" => sample.window = WindowId(0x456),
+                "failed" | "timeout" => (),
+                _ => unreachable!(),
+            }
+            let cancelled_at = now
+                + if why == "timeout" {
+                    Duration::from_secs(10)
+                } else {
+                    Duration::from_millis(1)
+                };
+            let (released, hit) = gesture.observe(
+                (why != "failed").then_some(sample),
+                &portals,
+                &monitors,
+                cancelled_at,
+            );
+            assert_eq!(released, Some(PortalId(1)), "{why}");
+            assert!(hit.is_none());
+            assert_eq!(gesture.cancel_watch(), None); // No duplicate release after consumption.
+            let retry_at = cancelled_at + Duration::from_millis(1);
+            for x in [1067.0, 1071.0] {
+                let mut sample = recorded(x, 1.0, false);
+                sample.received = retry_at;
+                gesture.observe(Some(sample), &portals, &monitors, retry_at);
+            }
+            gesture.refuse(
+                PortalId(1),
+                crosspane_types::hid::MouseButton::PRIMARY,
+                retry_at,
+            );
+            assert!(gesture.watch.is_some(), "{why}: retry did not arm");
+            let (released, drop) =
+                gesture.pressed(Vec::new(), PortalId(1), 0.75, &portals, &monitors, retry_at);
+            assert!(released.is_none());
+            let drop = drop.unwrap();
+            assert_eq!(drop.position, 0.75);
+            assert_eq!(drop.grab, original.grab);
+            assert!(gesture.watch.is_none());
+        }
+    }
+    #[test]
+    fn drop_reports_current_validated_release_position_and_preserves_original_grab() {
+        let (portals, monitors) = layout(1.0);
+        let now = Instant::now();
+        let original = hit();
+        let mut gesture = Gesture {
+            watch: Some(Watch::new(original.clone(), now)),
+            ..Default::default()
+        };
+        let mut moved = original.sample.clone();
+        moved.cursor[1] =
+            monitors[0].origin[1] + portals[0].from + 0.8 * (portals[0].to - portals[0].from);
+        moved.origin[1] = moved.cursor[1] - original.grab.y;
+        let (released, drop) = gesture.pressed(
+            vec![Some(moved)],
+            PortalId(1),
+            0.8,
+            &portals,
+            &monitors,
+            now,
+        );
+        assert!(released.is_none());
+        let drop = drop.unwrap();
+        assert_ne!(drop.position, original.position);
+        assert_eq!(drop.position, 0.8);
+        assert_eq!(drop.grab, original.grab);
+        assert_eq!(drop.sample.window, original.sample.window);
     }
     #[test]
     fn fake_refusal_arms_watch_without_native_ipc_or_strip_activation() {

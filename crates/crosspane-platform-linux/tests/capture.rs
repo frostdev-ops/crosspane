@@ -3158,6 +3158,15 @@ fn native_refused_drags_publish_one_drop_for_bindm_xdg_float_and_tile() {
             let mut f = Fixture::with_driver(driver, Arc::new(|_| {}));
             let client = ipc.json("activewindow").unwrap();
             let address = client["address"].as_str().unwrap();
+            let source =
+                crosspane_platform_linux::hyprland::windows::HyprlandWindows::new(ipc.clone())
+                    .unwrap();
+            let expected_id = crosspane_platform::WindowSource::windows(&source)
+                .unwrap()
+                .into_iter()
+                .find(|info| source.address(info.id).as_deref() == Some(address))
+                .unwrap()
+                .id;
             assert!(
                 address
                     .chars()
@@ -3223,6 +3232,10 @@ fn native_refused_drags_publish_one_drop_for_bindm_xdg_float_and_tile() {
                 unreachable!();
             };
             assert_eq!(portal, f.portal.id);
+            assert_eq!(
+                id, expected_id,
+                "drag ID must match the nested WindowSource"
+            );
             let started = Instant::now();
             assert!(matches!(
                 f.capture
@@ -3231,6 +3244,26 @@ fn native_refused_drags_publish_one_drop_for_bindm_xdg_float_and_tile() {
             ));
             assert!(started.elapsed() < Duration::from_millis(40));
             let refused = started.elapsed();
+            f.capture.set_portals(&[f.portal]).unwrap(); // The first refusal has armed its watch.
+            let departed = Instant::now();
+            f.driver
+                .absolute_at(f.driver.state.width - 12, f.driver.state.height / 2);
+            f.wait(|e| matches!(e, CaptureEvent::EdgeReleased { portal: p, .. } if *p == portal));
+            assert!(departed.elapsed() < Duration::from_millis(150));
+            let cancellation_latency = departed.elapsed();
+            // A retry need not wait for E1's old ten-second AwaitingDrop timeout.
+            std::thread::sleep(Duration::from_millis(60));
+            f.driver.absolute(Edge::Right, true);
+            let retried = f.wait(|e| matches!(e, CaptureEvent::DragAtEdge { .. }));
+            assert!(
+                matches!(retried, CaptureEvent::DragAtEdge { window: w, grab: g, .. } if w == id && g == grab)
+            );
+            assert!(matches!(
+                f.capture
+                    .begin_drag(CaptureId(100), portal, MouseButton::PRIMARY),
+                Err(PlatformError::PointerButtonHeld)
+            ));
+            assert!(departed.elapsed() < Duration::from_millis(500));
             // Refusal must leave the native move running, with no lock or fabricated press.
             let before = ipc.json("activewindow").unwrap();
             f.driver.motion(0.0, 4.0);
@@ -3258,8 +3291,20 @@ fn native_refused_drags_publish_one_drop_for_bindm_xdg_float_and_tile() {
             let dropped = f.wait(|e| matches!(e, CaptureEvent::DragDroppedAtEdge { .. }));
             assert!(released.elapsed() < Duration::from_millis(150));
             let drop_latency = released.elapsed();
+            let current = f.wait(|e| matches!(e, CaptureEvent::EdgePressed { .. }));
+            let CaptureEvent::EdgePressed {
+                position: release_position,
+                ..
+            } = current
+            else {
+                unreachable!();
+            };
             assert!(
-                matches!(dropped, CaptureEvent::DragDroppedAtEdge { portal: p, position: s, window: w, grab: g, .. } if p == portal && s == position && w == id && g == grab)
+                release_position > position,
+                "the along-edge motion must change release position"
+            );
+            assert!(
+                matches!(dropped, CaptureEvent::DragDroppedAtEdge { portal: p, position: s, window: w, grab: g, .. } if p == portal && s == release_position && w == id && g == grab)
             );
             let until = Instant::now() + Duration::from_millis(150);
             while Instant::now() < until {
@@ -3285,8 +3330,14 @@ fn native_refused_drags_publish_one_drop_for_bindm_xdg_float_and_tile() {
             }
             let post = ipc.json("activewindow").unwrap();
             eprintln!(
-                "native watch {path}/{floating}: refused {:?}; one drop {:?} after release {:?}; post at {} size {} floating {}",
-                refused, dropped, drop_latency, post["at"], post["size"], post["floating"]
+                "native watch {path}/{floating}: refused {:?}; cancelled in {:?} and retried; first position {position}, current {release_position}; one drop {:?} after release {:?}; post at {} size {} floating {}",
+                refused,
+                cancellation_latency,
+                dropped,
+                drop_latency,
+                post["at"],
+                post["size"],
+                post["floating"]
             );
             let clicks = window.received().2;
             f.driver.absolute_at(280, 180);
@@ -3316,6 +3367,7 @@ fn native_worker_cancellation_and_repeated_refusals_preserve_watch_bounds() {
     let driver = Driver::bare();
     let mut window = Toplevel::new();
     let mut f = Fixture::with_driver(driver, Arc::new(|_| {}));
+    let portal = f.portal.id;
     let client = ipc.json("activewindow").unwrap();
     let address = client["address"].as_str().unwrap();
     assert!(
@@ -3368,6 +3420,7 @@ fn native_worker_cancellation_and_repeated_refusals_preserve_watch_bounds() {
     refuse(&mut f);
     f.driver
         .absolute_at(f.driver.state.width - 12, f.driver.state.height / 2);
+    f.wait(|e| matches!(e, CaptureEvent::EdgeReleased { portal: p, .. } if *p == portal));
     std::thread::sleep(Duration::from_millis(65));
     let cancelled = count(&ipc);
     for _ in 0..3 {
@@ -3403,6 +3456,7 @@ fn native_worker_cancellation_and_repeated_refusals_preserve_watch_bounds() {
         "{nudges} nudges in {elapsed:?}"
     );
     std::thread::sleep(Duration::from_millis(10060).saturating_sub(armed.elapsed()));
+    f.wait(|e| matches!(e, CaptureEvent::EdgeReleased { portal: p, .. } if *p == portal));
     let expired = count(&ipc);
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(

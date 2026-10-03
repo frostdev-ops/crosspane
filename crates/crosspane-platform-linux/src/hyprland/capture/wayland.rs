@@ -538,7 +538,10 @@ impl Client {
             &self.state.monitors,
             Instant::now(),
         ) {
-            self.state.gesture = drag::Gesture::default();
+            if let Some(portal) = self.state.gesture.cancel_watch() {
+                self.state
+                    .emit(CaptureEvent::EdgeReleased { portal, at: now() });
+            }
             return Ok(());
         }
         if !watch.nudge(Instant::now()) {
@@ -1654,10 +1657,19 @@ impl State {
             .filter(|p| p.mapped)
             .map(|p| p.portal)
             .collect();
-        let hit = self.drag.fence(|sample| {
-            self.gesture
-                .pressed(sample, portal, &portals, &self.monitors, Instant::now())
+        let (released, hit) = self.drag.fence(|sample| {
+            self.gesture.pressed(
+                sample,
+                portal,
+                position,
+                &portals,
+                &self.monitors,
+                Instant::now(),
+            )
         });
+        if let Some(portal) = released {
+            self.emit(CaptureEvent::EdgeReleased { portal, at });
+        }
         if let Some(hit) = hit.filter(|_| self.gate.is_open() && self.check_epoch().is_ok()) {
             self.emit(CaptureEvent::DragDroppedAtEdge {
                 portal,
