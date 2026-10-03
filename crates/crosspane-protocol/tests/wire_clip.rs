@@ -314,3 +314,43 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn clipboard_event_debug_discloses_length_only() {
+    use crosspane_protocol::clip::ClipDataBytes;
+    use crosspane_protocol::link::LinkEvent;
+    use crosspane_types::id::NodeId;
+    use std::sync::Arc;
+
+    let event = LinkEvent::ClipData {
+        peer: NodeId([7; 32]),
+        fetch: ClipFetchId(11),
+        kind: ClipKind::Text,
+        data: ClipDataBytes(Arc::from(&b"owned-fixture-secret"[..])),
+    };
+    let debug = format!("{event:?}");
+    assert!(debug.contains("ClipDataBytes(20 bytes)"));
+    assert!(!debug.contains("owned-fixture-secret"));
+    assert!(!debug.contains("111, 119, 110"));
+}
+
+#[test]
+fn clipboard_grants_are_filtered_only_without_negotiation() {
+    use crosspane_protocol::clip::grants_for_clip;
+    let grants = vec![
+        Capability::InputAccept,
+        Capability::ClipboardRead,
+        Capability::WindowShare,
+        Capability::ClipboardWrite,
+        Capability::AudioMic,
+    ];
+    assert_eq!(grants_for_clip(&grants, true), grants);
+    assert_eq!(
+        grants_for_clip(&grants, false),
+        [
+            Capability::InputAccept,
+            Capability::WindowShare,
+            Capability::AudioMic
+        ]
+    );
+}

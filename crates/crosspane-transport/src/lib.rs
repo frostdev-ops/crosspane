@@ -12,6 +12,7 @@
 
 #![deny(unsafe_code)]
 
+mod clip;
 pub mod discovery;
 mod hub;
 mod link;
@@ -35,10 +36,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crosspane_protocol::clip::{CLIP_FEATURE, ClipDataHeader};
 use crosspane_protocol::link::{LinkError, LinkEventSink, PeerLink};
-use crosspane_protocol::msg::{ControlMessage, Hello};
+use crosspane_protocol::msg::{ClipFetchId, ControlMessage, Hello};
 use crosspane_protocol::wire::encode_control;
 use crosspane_security::identity::DeviceIdentity;
+use crosspane_types::ClipKind;
 use crosspane_types::id::NodeId;
 use quinn::{IdleTimeout, VarInt};
 
@@ -52,19 +55,19 @@ const KEEP_ALIVE: Duration = Duration::from_secs(1);
 /// A peer silent for this long is dead.
 const IDLE_TIMEOUT_MS: u32 = 10_000;
 /// Streams a peer may have open to us. Two are long-lived (control and input); the rest carry one
-/// media frame each. A few more than two are allowed so a stray control or input stream is seen
+/// media frame or clipboard response each. A few more than two are allowed so a stray stream is seen
 /// and refused as a protocol error instead of silently stalling.
 const MAX_PEER_UNI_STREAMS: u8 = 64;
 /// What a peer may send on one stream before we read it: the largest media frame.
 const STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 /// What a peer may send on the whole connection before we read it. Larger than the unfinished
-/// media a peer may have (64 MiB) plus everything control and input can queue, so media alone can
-/// never use up the connection's credit and stall them.
-const CONNECTION_RECEIVE_WINDOW: u32 = 96 * 1024 * 1024;
+/// media a peer may have (64 MiB), clipboard (16 MiB), and everything control/input can queue,
+/// so these payloads never use up the connection's credit and stall input/control.
+const CONNECTION_RECEIVE_WINDOW: u32 = 112 * 1024 * 1024;
 /// What we may buffer, unacknowledged, across all our streams: the same reasoning on the sending
-/// side. quinn's default (about 10 MB) is shared by every stream, so a few large frames would
-/// make a control or input write wait for them to be acknowledged.
-const SEND_WINDOW: u64 = 80 * 1024 * 1024;
+/// side, including clipboard credit. quinn's default (about 10 MB) is shared by every stream,
+/// so a few large frames would make a control or input write wait for them to be acknowledged.
+const SEND_WINDOW: u64 = 96 * 1024 * 1024;
 /// Datagram buffers are small on purpose: a stale pointer position is worth less than a fresh one.
 const DATAGRAM_RECEIVE_BUFFER: usize = 64 * 1024;
 const DATAGRAM_SEND_BUFFER: usize = 16 * 1024;
@@ -140,6 +143,11 @@ impl Transport {
             .features
             .iter()
             .any(|feature| feature == "audio");
+        let local_clip = config
+            .hello
+            .features
+            .iter()
+            .any(|feature| feature == CLIP_FEATURE);
         let mut hello_frame = Vec::new();
         encode_control(&ControlMessage::Hello(config.hello), &mut hello_frame).map_err(
             |error| {
@@ -181,7 +189,7 @@ impl Transport {
             events,
             hello_frame,
             client_config,
-            local_audio,
+            (local_audio, local_clip),
         ));
         tokio::spawn(inner.clone().accept_loop());
         Ok(Transport { inner, local_addr })
@@ -228,6 +236,40 @@ impl Transport {
     /// [`LinkEvent::Media`](crosspane_protocol::link::LinkEvent::Media).
     pub fn send_media(&self, peer: NodeId, frame: Arc<[u8]>) -> Result<(), LinkError> {
         self.inner.send_media(peer, frame)
+    }
+
+    /// Queue an exact clipboard payload on a new tag-04 stream, priority 0. Both Hellos must
+    /// advertise `clip/0`. Task/byte credit is held until cancellation or the fixed two-second
+    /// expiry.
+    /// Returns `Invalid` for a mismatched length or cap, `Congested` at the clipboard budget,
+    /// and `Closed` without a live peer. Never blocks and never uses the input/control queues.
+    pub fn send_clip_data(
+        &self,
+        peer: NodeId,
+        header: ClipDataHeader,
+        data: Arc<[u8]>,
+    ) -> Result<(), LinkError> {
+        self.inner.clipboard(peer)?.send_clip_data(header, data)
+    }
+
+    /// Admit one clipboard response before sending its `ClipFetch`. An expectation belongs to
+    /// this connection, expires after two seconds and can be consumed only once. At most eight
+    /// remain pending; an existing id is `Invalid`, and a full expectation table is `Congested`.
+    pub fn expect_clip(
+        &self,
+        peer: NodeId,
+        fetch: ClipFetchId,
+        kind: ClipKind,
+    ) -> Result<(), LinkError> {
+        self.inner.clipboard(peer)?.clip.expect(fetch, kind)
+    }
+
+    /// Retire this peer's expectations and interrupt pending clipboard reads/writes. A missing
+    /// peer is a no-op. Later expectations may be registered on the still-live connection.
+    /// Queued old completions cannot enter the sink after this returns. An already-entered sink
+    /// call completes first; calling this from that same sink retires later completions.
+    pub fn cancel_clip(&self, peer: NodeId) {
+        self.inner.cancel_clip(peer);
     }
 
     /// Peers with a live connection, sorted.

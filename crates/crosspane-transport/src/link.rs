@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crosspane_protocol::audio::{AudioPacket, encode_audio, grants_for_features};
+use crosspane_protocol::clip::{ClipDataHeader, grants_for_clip};
 use crosspane_protocol::link::{LinkError, PeerLink};
 use crosspane_protocol::msg::{ControlMessage, InputMessage, PointerMessage};
 use crosspane_protocol::wire::{WireError, encode_control, encode_input, encode_pointer};
@@ -25,6 +26,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::clip;
 use crate::hub::{CODE_NORMAL, CODE_OVERFLOW};
 use crate::media::{self, SendBudget};
 
@@ -128,6 +130,7 @@ pub(crate) struct ConnTx {
     media: Arc<SendBudget>,
     /// Admission belongs to this connection and starts disabled until its first Hello.
     pub(crate) audio_enabled: Arc<AtomicBool>,
+    pub(crate) clip: Arc<clip::Plane>,
     /// Serializes the datagram space check and enqueue across all handles of this connection.
     datagram_send: Arc<Mutex<()>>,
     /// The runtime the connection's tasks run on, for the graceful close.
@@ -153,6 +156,7 @@ impl ConnTx {
             input,
             media: Arc::new(SendBudget::default()),
             audio_enabled: Arc::new(AtomicBool::new(false)),
+            clip: clip::Plane::new(),
             datagram_send: Arc::new(Mutex::new(())),
             rt: Handle::current(),
         };
@@ -222,7 +226,10 @@ impl ConnTx {
                     .then(|| AUDIO_FEATURE.to_owned())
                     .into_iter()
                     .collect();
-                filtered = ControlMessage::Grants(grants_for_features(grants, &negotiated));
+                filtered = ControlMessage::Grants(grants_for_clip(
+                    &grants_for_features(grants, &negotiated),
+                    self.clip.available(),
+                ));
                 &filtered
             }
             _ => msg,
@@ -247,6 +254,17 @@ impl ConnTx {
         // The runtime handle, not `tokio::spawn`, so the engine may call from any thread.
         self.rt
             .spawn(media::write_frame(self.conn.clone(), frame, reservation));
+        Ok(())
+    }
+
+    pub(crate) fn send_clip_data(
+        &self,
+        header: ClipDataHeader,
+        data: Arc<[u8]>,
+    ) -> Result<(), LinkError> {
+        let work = self.clip.sending(header, data.len())?;
+        self.rt
+            .spawn(clip::write(self.conn.clone(), header, data, work));
         Ok(())
     }
 
@@ -299,12 +317,38 @@ impl LinkCell {
             tx.conn
                 .close(VarInt::from_u32(CODE_NORMAL), b"closed by the local engine");
         }
-        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        if let Some(old) = self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(tx)
+        {
+            old.clip.retire();
+        }
     }
 
     /// Close the logical link for good.
     pub(crate) fn clear(&self) {
-        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        if let Some(old) = self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            old.clip.retire();
+        }
+    }
+
+    /// Retire clipboard work even after QUIC closes, before registry/session cleanup runs.
+    pub(crate) fn cancel_clip(&self) {
+        if let Some(tx) = self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            tx.clip.cancel();
+        }
     }
 
     /// Start a graceful close: nothing more can be sent, queued data is flushed, then the
@@ -318,6 +362,7 @@ impl LinkCell {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()?;
+        tx.clip.retire();
         Some(tx.flush_and_close(message.to_owned()))
     }
 
@@ -327,7 +372,7 @@ impl LinkCell {
     }
 
     /// The live connection, if the link is open and the connection hasn't closed.
-    fn live(&self) -> Result<ConnTx, LinkError> {
+    pub(crate) fn live(&self) -> Result<ConnTx, LinkError> {
         if self.closing.load(Ordering::Relaxed) {
             return Err(LinkError::Closed);
         }

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use crosspane_protocol::audio::decode_audio;
 
+use crosspane_protocol::clip::CLIP_FEATURE;
 use crosspane_protocol::link::{LinkError, LinkEvent};
 use crosspane_protocol::msg::{ControlMessage, InputMessage};
 use crosspane_protocol::wire::{
@@ -28,6 +29,7 @@ use quinn::{Chunk, Connection, ConnectionError, ReadError, ReadExactError, RecvS
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{MissedTickBehavior, Sleep, interval, sleep};
 
+use crate::clip;
 use crate::hub::{
     Activity, CODE_NORMAL, CODE_PROTOCOL_ERROR, DUPLICATE_GRACE, Inner, MAX_HOLD, Role, SETTLE,
     is_duplicate_close,
@@ -107,6 +109,7 @@ pub(crate) struct Start {
     pub(crate) role: Role,
     pub(crate) activity: Arc<Activity>,
     pub(crate) audio_enabled: Arc<AtomicBool>,
+    pub(crate) clip: Arc<clip::Plane>,
 }
 
 /// Start the tasks of a registered connection.
@@ -123,6 +126,7 @@ pub(crate) fn spawn(start: Start) {
         role,
         activity,
         audio_enabled,
+        clip,
     } = start;
     tokio::spawn(write_stream(
         conn.clone(),
@@ -151,6 +155,7 @@ pub(crate) fn spawn(start: Start) {
         streams: Streams::default(),
         hello_seen: false,
         audio_enabled,
+        clip,
         settled: !hold,
         role,
         held_since: Instant::now(),
@@ -162,6 +167,7 @@ pub(crate) fn spawn(start: Start) {
         finish_timer: None,
         media: JoinSet::new(),
         media_buffered: Arc::new(AtomicUsize::new(0)),
+        clips: JoinSet::new(),
     };
     tokio::spawn(session.run(first));
 }
@@ -315,6 +321,7 @@ struct Session {
     /// sees the `Hello` first.
     hello_seen: bool,
     audio_enabled: Arc<AtomicBool>,
+    clip: Arc<clip::Plane>,
     /// Whether we dialed this connection or the peer did.
     role: Role,
     /// When the hold began.
@@ -336,6 +343,7 @@ struct Session {
     media: JoinSet<Received>,
     /// Bytes of partly received media across `media`.
     media_buffered: Arc<AtomicUsize>,
+    clips: JoinSet<Option<clip::Received>>,
     guard: Guard,
 }
 
@@ -364,6 +372,7 @@ impl Session {
             }
         }
         self.guard.armed = false;
+        self.clip.retire();
     }
 
     async fn drive(&mut self, first: Option<FirstStream>) -> Outcome {
@@ -410,6 +419,9 @@ impl Session {
                     if let Some(outcome) = self.on_media(done) {
                         return outcome;
                     }
+                }
+                Some(Ok(Some(received))) = self.clips.join_next(), if !self.clips.is_empty() => {
+                    self.inner.deliver_clip(self.peer, self.conn_id, received);
                 }
                 error = &mut closed => return Outcome::Closed(error),
                 accepted = &mut accepting, if self.settled => match accepted {
@@ -489,6 +501,16 @@ impl Session {
     /// The peer opened a stream. Control and input attach to their slot (anything else of those
     /// kinds is a protocol error); each media frame gets a reading task of its own.
     fn on_stream(&mut self, kind: u8, recv: RecvStream) -> Option<Outcome> {
+        if kind == clip::STREAM_CLIP {
+            if !self.hello_seen || !self.clip.available() || self.clips.len() >= clip::MAX_TASKS {
+                let mut recv = recv;
+                let _ = recv.stop(VarInt::from_u32(4));
+            } else {
+                self.clips
+                    .spawn(clip::read(recv, self.clip.clone(), self.peer));
+            }
+            return None;
+        }
         if kind != STREAM_MEDIA {
             return self.streams.install(kind, recv).err().map(Outcome::Fault);
         }
@@ -559,6 +581,10 @@ impl Session {
                     self.audio_enabled.store(
                         self.inner.local_audio
                             && hello.features.iter().any(|feature| feature == "audio"),
+                        Ordering::Release,
+                    );
+                    self.clip.enabled.store(
+                        self.inner.local_clip && hello.features.iter().any(|f| f == CLIP_FEATURE),
                         Ordering::Release,
                     );
                     self.hello_seen = true;

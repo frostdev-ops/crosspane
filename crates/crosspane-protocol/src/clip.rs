@@ -2,6 +2,8 @@
 //! bytes of content. Validate the header before reading content. The receiver additionally checks
 //! the expected fetch/kind and rejects extra bytes. This module never reads clipboard content.
 
+use std::sync::Arc;
+
 use crosspane_types::ClipKind;
 
 use crate::{msg::ClipFetchId, wire::WireError};
@@ -14,6 +16,29 @@ pub const CLIP_FEATURE: &str = "clip/0";
 pub const CLIP_DATA_HEADER_LEN: usize = 13;
 pub const MAX_CLIP_TEXT: u32 = 1 << 20;
 pub const MAX_CLIP_IMAGE: u32 = 16 << 20;
+
+/// Clipboard bytes in transit. Formatting reveals only the length, never the content.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClipDataBytes(pub Arc<[u8]>);
+
+impl std::fmt::Debug for ClipDataBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClipDataBytes({} bytes)", self.0.len())
+    }
+}
+
+/// Remove clipboard capabilities unless both Hellos negotiated `clip/0`.
+pub fn grants_for_clip(
+    grants: &[crate::msg::Capability],
+    negotiated: bool,
+) -> Vec<crate::msg::Capability> {
+    use crate::msg::Capability::{ClipboardRead, ClipboardWrite};
+    grants
+        .iter()
+        .copied()
+        .filter(|cap| negotiated || !matches!(cap, ClipboardRead | ClipboardWrite))
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClipDataHeader {
