@@ -603,7 +603,7 @@ impl ControllerE1 {
         if self.drag_activating()
             && let Some(drag) = &mut self.drag
         {
-            drag.offer = offer;
+            drag.refresh_offer(offer);
         }
         if let Some((drag, _)) = self.drag_drop {
             if drag.portal != portal || !drag.offer.same_gesture(offer) {
@@ -678,16 +678,46 @@ impl ControllerE1 {
     }
 
     pub(crate) fn take_drag_commit(&mut self) -> Option<DragCommit> {
-        self.drag_commit.take()
+        let commit = self.drag_commit.take()?;
+        let Some(drag) = self.drag.filter(|d| matches!(d.stage, DragStage::Pending)) else {
+            return Some(commit);
+        };
+        let Phase::Controlling(c) = &self.phase else {
+            return None;
+        };
+        let (display, position) = c.tracker.position();
+        let geometry = self.layout.as_ref()?.get(display)?.geometry;
+        Some(drag::placement(drag, position, geometry, commit.token))
     }
 
-    pub(crate) fn drag_subject(&self) -> Option<(WindowId, NodeId)> {
+    fn pending_drag_offer(&self) -> Option<DragOffer> {
         self.drag
             .filter(|d| matches!(d.stage, DragStage::Pending))
             .map(|d| d.offer)
             .or(self.drag_drop.map(|(d, _)| d.offer))
             .or(self.drag_push.map(|(_, offer, _)| offer))
-            .map(|o| (o.window, o.peer))
+    }
+
+    pub(crate) fn drag_subject(&self) -> Option<(WindowId, NodeId)> {
+        self.pending_drag_offer().map(|o| (o.window, o.peer))
+    }
+
+    pub(crate) fn refresh_drag(
+        &mut self,
+        offer: Option<DragOffer>,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        if self
+            .pending_drag_offer()
+            .is_some_and(|known| offer.is_none_or(|offer| !known.same_gesture(offer)))
+        {
+            self.drag_ended(None, now, out);
+        } else if let (Some(drag), Some(offer)) = (&mut self.drag, offer)
+            && matches!(drag.stage, DragStage::Pending)
+        {
+            drag.refresh_offer(offer);
+        }
     }
 
     pub(crate) fn drag_ended(

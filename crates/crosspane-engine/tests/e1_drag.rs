@@ -1391,6 +1391,137 @@ fn retile_during_hud_or_capture_activation_refreshes_successful_drag_geometry() 
         h.finish();
     }
 }
+
+#[test]
+fn resize_after_the_last_edge_sample_is_fresh_during_hud_capture_and_commit() {
+    for phase in 0..3 {
+        let mut h = Harness::new(true, true, 1000, 1.0);
+        h.hud_ack = phase != 0;
+        h.start_push();
+        if phase == 2 {
+            h.complete_begin(None);
+        }
+        let mut retiled = window(10);
+        retiled.frame.size = SizeLogical::new(600.0, 700.0);
+        h.feed(0, Input::Windows(WindowEvent::Changed(retiled)));
+        // No further DragAtEdge: the window observation is newer than the last edge sample.
+        if phase == 0 {
+            h.feed(
+                0,
+                Input::Overlay(OverlayEvent::Visible(crosspane_engine::io::HUD)),
+            );
+        }
+        if phase != 2 {
+            h.complete_begin(None);
+        }
+        h.motion(50.0, 0.0);
+        assert_eq!(h.commits(), 1);
+        assert!(
+            h.trace.iter().any(|(node, output)| matches!(
+                (node, output), (0, Output::SendControl {
+                    msg: ControlMessage::Projection(Message::StartAt { size, place, .. }), ..
+                }) if *size == PixelSize::new(600, 700) && place.y == 300 && place.drag
+            )),
+            "phase {phase}: {:#?}",
+            h.trace
+        );
+        assert!(h.trace.iter().any(|(node, output)| matches!(
+            (node, output), (0, Output::Park { size, scale, .. })
+            if *size == PixelSize::new(600, 700) && *scale == 1.0
+        )));
+        h.finish();
+    }
+}
+
+#[test]
+fn scale_change_without_an_edge_sample_preserves_logical_grab_anchor_and_placement() {
+    for phase in 0..3 {
+        let mut h = Harness::new(true, true, 1000, 1.0);
+        h.hud_ack = phase != 0;
+        h.seat.original_down(A);
+        for now in [0, 250] {
+            h.now = now;
+            h.feed(
+                0,
+                Input::Capture(CaptureEvent::DragAtEdge {
+                    portal: h.portal,
+                    position: 0.5,
+                    window: h.window,
+                    grab: PointDevice::new(80.0, 120.0),
+                    at: ms(now),
+                }),
+            );
+        }
+        if phase == 2 {
+            h.complete_begin(None);
+        }
+        h.feed(0, Input::LocalDisplays(vec![display(1000, 2.0)]));
+        let mut resized = window(10);
+        resized.frame.size = SizeLogical::new(360.0, 400.0);
+        h.feed(0, Input::Windows(WindowEvent::Changed(resized)));
+        // The source device grab is now (160, 240); its logical grab remains (80, 120).
+        if phase == 0 {
+            h.feed(
+                0,
+                Input::Overlay(OverlayEvent::Visible(crosspane_engine::io::HUD)),
+            );
+        }
+        if phase != 2 {
+            h.complete_begin(None);
+        }
+        h.motion(120.0, 0.0);
+        assert_eq!(h.commits(), 1);
+        assert!(h.trace.iter().any(|(node, output)| matches!(
+            (node, output), (0, Output::SendControl {
+                msg: ControlMessage::Projection(Message::StartAt { size, place, anchor, .. }), ..
+            }) if *size == PixelSize::new(360, 400) && *anchor == (80, 120)
+                && (place.x, place.y) == (40, 380) && place.drag
+        )), "phase {phase}: {:#?}", h.trace);
+        assert!(h.trace.iter().any(|(node, output)| matches!(
+            (node, output), (0, Output::SendInput {
+                msg: InputMessage::PressAt { position, .. }, ..
+            }) if *position == PointDevice::new(120.0, 500.0)
+        )));
+        h.finish();
+    }
+}
+
+#[test]
+fn changed_classification_without_an_edge_sample_cancels_pending_capture() {
+    let mut h = Harness::new(true, true, 1000, 1.0);
+    h.start_push();
+    let id = h.capture.unwrap();
+    h.proxy_from_b();
+    h.feed(
+        0,
+        Input::ProxyWindow {
+            key: ProjectionKey {
+                source: B,
+                projection: ProjectionId(1),
+            },
+            window: WindowId(10),
+        },
+    );
+    assert!(h.capture.is_none());
+    h.effect_start = h.trace.len();
+    // A late successful activation may settle the local down, but cannot revive the gesture.
+    h.seat.settle(A);
+    h.feed(0, Input::Capture(CaptureEvent::Started { id }));
+    h.feed(
+        0,
+        Input::CaptureBegun {
+            id,
+            result: Ok(CaptureStart {
+                held_keys: vec![],
+                lock_keys: LockKeys::default(),
+            }),
+        },
+    );
+    h.motion(120.0, 0.0);
+    assert_eq!(h.commits(), 0);
+    assert_eq!(h.seat.presses, 0);
+    h.finish();
+}
 #[test]
 fn awaiting_drop_edge_release_timeout_classification_and_refusal_cancel() {
     for case in 0..4 {

@@ -53,6 +53,15 @@ pub(crate) struct Drag {
     pub motion: VectorMm,
 }
 
+impl Drag {
+    pub(crate) fn refresh_offer(&mut self, offer: Offer) {
+        // Preserve the original logical grab when its source's device scale changes.
+        let ratio = offer.scale / self.offer.scale;
+        self.grab = PointDevice::new(self.grab.x * ratio, self.grab.y * ratio);
+        self.offer = offer;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Commit {
     pub kind: Kind,

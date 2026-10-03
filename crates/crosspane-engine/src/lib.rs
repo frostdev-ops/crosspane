@@ -112,6 +112,10 @@ impl Engine {
         if was_controlled {
             self.controller.cancel_pending(now, &mut out);
         }
+        if let Some((window, peer)) = self.controller.drag_subject() {
+            self.controller
+                .refresh_drag(self.e2.drag_offer(window, peer), now, &mut out);
+        }
         if let Input::Capture(
             CaptureEvent::DragAtEdge {
                 portal,
@@ -172,6 +176,10 @@ impl Engine {
         // last, and the trailing set_home lifts the filter in the same handle as an abort or exit.
         self.e2.set_home(self.controller.home(), now, &mut out);
         self.e2.handle(&input, now, &mut out);
+        if let Some((window, peer)) = self.controller.drag_subject() {
+            self.controller
+                .refresh_drag(self.e2.drag_offer(window, peer), now, &mut out);
+        }
         if let Some(commit) = self.controller.take_drag_commit() {
             let key = self.e2.drag_commit(commit, now, &mut out);
             self.controller.drag_committed(commit, key, now, &mut out);
@@ -217,11 +225,6 @@ impl Engine {
                 }
                 _ => {}
             }
-        }
-        if let Some((window, peer)) = self.controller.drag_subject()
-            && self.e2.drag_offer(window, peer).is_none()
-        {
-            self.controller.drag_ended(None, now, &mut out);
         }
         // (Only an entry that is waiting for the drain looks at it, so it is only asked then.)
         let settled = self.controller.draining() && self.e2.settled() && self.target.settled();
