@@ -975,6 +975,7 @@ dependencies = [
 name = "crosspane-platform-windows"
 version = "0.0.0"
 dependencies = [
+ "crosspane-input",
  "crosspane-platform",
  "crosspane-types",
  "proptest",

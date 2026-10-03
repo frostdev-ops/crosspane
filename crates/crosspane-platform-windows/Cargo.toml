@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+crosspane-input.workspace = true
 crosspane-platform.workspace = true
 crosspane-types.workspace = true
 serde.workspace = true
