@@ -1,5 +1,7 @@
 //! Native observations do not imply readiness. Scratch authority stays inside its own target.
+mod removal;
 use crate::agent_contract::{BootstrapV1, InstanceStatus, ObservationSource, parse_bootstrap};
+pub use removal::{ExitReader, ProcessExit, ProcessWatch};
 use rustix::fs::{self as rfs, AtFlags, FlockOperation, Mode, OFlags, ResolveFlags};
 use rustix::net::{self as rnet, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use std::{
@@ -937,6 +939,7 @@ pub struct CommandSpec {
     admission: Option<(LinuxTarget, Option<SupportProof>)>,
     lease: Option<Arc<LeaseGuard>>,
     spawn_attempt: Option<Arc<AtomicBool>>,
+    agent: Option<Arc<removal::InstalledExecutable>>,
 }
 impl Clone for CommandSpec {
     fn clone(&self) -> Self {
@@ -948,6 +951,7 @@ impl Clone for CommandSpec {
             admission: self.admission.clone(),
             lease: None,
             spawn_attempt: self.spawn_attempt.clone(),
+            agent: self.agent.clone(),
         }
     }
 }
@@ -994,6 +998,7 @@ impl CommandSpec {
             admission: None,
             lease: None,
             spawn_attempt: None,
+            agent: None,
         })
     }
     pub fn executable(&self) -> &Path {
@@ -1558,7 +1563,11 @@ fn system_command(spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutp
     deadline.check()?;
     let (target, proof) = spec.admission.as_ref().ok_or(NativeError::Unsupported)?;
     let cleanup = cleanup_admission::<ManagerChild<Child>>(&PROCESS_CLEANUPS)?;
-    let executable = executable_fd(approved_executable(&spec.executable, &spec.argv)?)?;
+    let executable = if let Some(agent) = &spec.agent {
+        agent.revalidate(target, deadline)?
+    } else {
+        executable_fd(approved_executable(&spec.executable, &spec.argv)?)?
+    };
     validate_target(target).map_err(|e| {
         if spec.environment.manager.is_some() {
             NativeError::Foreign
@@ -2339,7 +2348,7 @@ impl LinuxNativeIo {
         Ok(File::from(fd))
     }
     pub fn run(&self, spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput> {
-        if manager_mutation(spec) {
+        if manager_mutation(spec) || spec.agent.is_some() {
             return Err(NativeError::Unsupported);
         }
         self.execute(spec, deadline, None)
@@ -2378,7 +2387,7 @@ impl LinuxNativeIo {
         let target = self.target.clone();
         let runner = self.runner.clone();
         let worker_deadline = deadline.clone();
-        let mutation = manager_mutation(spec);
+        let mutation = manager_mutation(spec) || spec.agent.is_some();
         let started = Arc::new(AtomicBool::new(false));
         let worker_started = started.clone();
         admitted.spawn_attempt = Some(worker_started.clone());
@@ -2431,6 +2440,13 @@ impl LinuxNativeIo {
             worker_deadline.check()?;
             if let Some((_, Some(proof))) = &admitted.admission {
                 proof.check_target(&target)?;
+            }
+            if let Some(agent) = &admitted.agent {
+                agent.revalidate(&target, &worker_deadline)?;
+                worker_deadline.check()?;
+                if let Some((_, Some(proof))) = &admitted.admission {
+                    proof.check_target(&target)?;
+                }
             }
             worker_started.store(true, Ordering::Release);
             let result = runner.run(&admitted, &worker_deadline);

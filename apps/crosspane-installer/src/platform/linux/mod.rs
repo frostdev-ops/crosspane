@@ -3,5 +3,6 @@ pub mod detect;
 pub mod firewall;
 pub mod native_io;
 pub mod payload;
+pub mod removal;
 pub mod service;
 pub mod transport;
