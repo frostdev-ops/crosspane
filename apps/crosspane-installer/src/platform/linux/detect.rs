@@ -2,12 +2,14 @@
 //! authority. Native acquisition and support-proof assembly belong to WP-4.8b2; runtime/fonts
 //! are registered by WP-4.8c once their real implementations land.
 pub mod fonts;
+mod probe;
 pub mod runtime;
 mod session;
 pub use crate::agent_contract::ObservationSource;
 use crate::agent_contract::{
     AgentReply, BootstrapV1, DecodedReply, KeyStoreProvenance, StatusAdmission,
 };
+pub use probe::*;
 pub use session::*;
 use std::path::PathBuf;
 
