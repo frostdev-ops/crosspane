@@ -2,14 +2,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use crosspane_engine::io::{ClipBytes, Warp};
 use crosspane_engine::{
-    Command, Engine, EngineConfig, InjectCmd, Input, Notice, Output, ProjectionKey, ProxyEvent,
+    Command, Engine, EngineConfig, InjectCmd, InjectId, Input, Notice, Output, ProjectionKey,
+    ProxyEvent,
 };
 use crosspane_input::Held;
 use crosspane_input::arrange;
-use crosspane_input::journal::MemoryJournal;
+use crosspane_input::journal::{Journal, JournalError, MemoryJournal};
 use crosspane_input::layout::{Layout, Placed};
 use crosspane_platform::{
     AudioEvent, CaptureEvent, CaptureId, CaptureStart, ClipKinds, ClipboardEvent, ClipboardHost,
@@ -117,11 +119,65 @@ struct Mesh {
     delayed_clip_reads: Vec<(NodeId, Input)>,
     delay_clip_reads: bool,
     defer_targeting: bool,
+    defer_presses: bool,
     fail_next_press: bool,
     defer_releases: bool,
 }
+
+#[derive(Default)]
+struct RecordedState {
+    held: BTreeSet<Held>,
+    fail_down: bool,
+    fail_up: bool,
+    fail_read: bool,
+}
+
+#[derive(Clone, Default)]
+struct RecordedJournal(Arc<Mutex<RecordedState>>);
+
+impl Journal for RecordedJournal {
+    fn record_down(&mut self, item: Held) -> Result<(), JournalError> {
+        let mut state = self.0.lock().unwrap();
+        state.held.insert(item); // Exercise a write that applied before reporting failure.
+        if state.fail_down {
+            Err(std::io::Error::other("N1e fake torn down").into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_up(&mut self, item: Held) -> Result<(), JournalError> {
+        let mut state = self.0.lock().unwrap();
+        if state.fail_up {
+            return Err(std::io::Error::other("N1e fake up failure").into());
+        }
+        state.held.remove(&item);
+        Ok(())
+    }
+
+    fn held(&self) -> Result<Vec<Held>, JournalError> {
+        let state = self.0.lock().unwrap();
+        if state.fail_read {
+            return Err(std::io::Error::other("N1e fake read failure").into());
+        }
+        Ok(state.held.iter().copied().collect())
+    }
+}
+
 impl Mesh {
     fn new(split: bool) -> Self {
+        Self::with_journals(split, None)
+    }
+
+    fn with_journals(split: bool, journals: Option<(RecordedJournal, RecordedJournal)>) -> Self {
+        Self::with_startup_journals(split, journals, false)
+    }
+
+    fn with_startup_journals(
+        split: bool,
+        journals: Option<(RecordedJournal, RecordedJournal)>,
+        defer_startup: bool,
+    ) -> Self {
         let mut startup = Vec::new();
         let engines = NODES
             .into_iter()
@@ -129,13 +185,28 @@ impl Mesh {
                 let mut config = EngineConfig::new(node);
                 config.accel.base_mm_per_unit = 0.1;
                 config.accel.max_gain = 1.0;
-                let (engine, initial) = Engine::new(
-                    config,
-                    Box::<MemoryJournal>::default(),
-                    Box::<MemoryJournal>::default(),
-                    ms(0),
-                )
-                .unwrap();
+                let (e1, e2): (Box<dyn Journal>, Box<dyn Journal>) = if node == A {
+                    journals.as_ref().map_or_else(
+                        || {
+                            (
+                                Box::<MemoryJournal>::default() as Box<dyn Journal>,
+                                Box::<MemoryJournal>::default() as Box<dyn Journal>,
+                            )
+                        },
+                        |(e1, e2)| {
+                            (
+                                Box::new(e1.clone()) as Box<dyn Journal>,
+                                Box::new(e2.clone()) as Box<dyn Journal>,
+                            )
+                        },
+                    )
+                } else {
+                    (
+                        Box::<MemoryJournal>::default(),
+                        Box::<MemoryJournal>::default(),
+                    )
+                };
+                let (engine, initial) = Engine::new(config, e1, e2, ms(0)).unwrap();
                 startup.extend(initial.into_iter().map(|o| (node, o)));
                 (node, engine)
             })
@@ -156,8 +227,9 @@ impl Mesh {
             delayed_clip_reads: Vec::new(),
             delay_clip_reads: false,
             defer_targeting: false,
+            defer_presses: false,
             fail_next_press: false,
-            defer_releases: false,
+            defer_releases: defer_startup,
         };
         for (node, output) in startup {
             m.complete(node, &output);
@@ -241,7 +313,9 @@ impl Mesh {
             );
             m.feed(node, Input::Layout(placements.clone()));
         }
-        m.log.clear();
+        if !defer_startup {
+            m.log.clear();
+        }
         m
     }
     fn feed(&mut self, node: NodeId, input: Input) {
@@ -421,6 +495,10 @@ impl Mesh {
                 ..
             } if self.defer_targeting => None,
             Output::Inject {
+                cmd: InjectCmd::Key { down: true, .. } | InjectCmd::Button { down: true, .. },
+                ..
+            } if self.defer_presses => None,
+            Output::Inject {
                 id,
                 cmd: InjectCmd::Key { down: true, .. } | InjectCmd::Button { down: true, .. },
             } if self.fail_next_press => {
@@ -429,7 +507,10 @@ impl Mesh {
                 Some((node, Input::InjectDone { id: *id, ok: false }))
             }
             Output::Inject {
-                cmd: InjectCmd::Key { down: false, .. } | InjectCmd::Button { down: false, .. },
+                cmd:
+                    InjectCmd::Key { down: false, .. }
+                    | InjectCmd::Button { down: false, .. }
+                    | InjectCmd::Recover { .. },
                 ..
             } if self.defer_releases => None,
             Output::Inject { id, .. } => Some((node, Input::InjectDone { id: *id, ok: true })),
@@ -609,6 +690,21 @@ impl Mesh {
                 at: ms(self.now),
             }),
         );
+    }
+    fn e1_item(&mut self, node: NodeId, item: Held, down: bool) {
+        let event = match item {
+            Held::Key(usage) => CaptureEvent::Key {
+                usage,
+                down,
+                at: ms(self.now),
+            },
+            Held::Button(button) => CaptureEvent::Button {
+                button,
+                down,
+                at: ms(self.now),
+            },
+        };
+        self.feed(node, Input::Capture(event));
     }
     fn project(&mut self, source: NodeId, destination: NodeId, window: WindowId) -> ProjectionKey {
         self.feed(
@@ -1142,7 +1238,10 @@ fn revoking_a_input_grant_ends_control_on_each_other_node() {
             m.count(target, |o| matches!(
                 o,
                 Output::Inject {
-                    cmd: InjectCmd::ReleaseAll,
+                    cmd: InjectCmd::Key {
+                        usage: KEY,
+                        down: false
+                    },
                     ..
                 }
             )),
@@ -1715,7 +1814,6 @@ fn failed_button_cleanup_never_bypasses_pending_pointer_targeting() {
 }
 
 #[test]
-#[ignore = "N1e gap: E1 target ReleaseAll clears another projection's E2 hold"]
 fn ending_e1_target_preserves_another_peers_e2_hold() {
     let mut m = Mesh::new(false);
     let c = m.project(A, C, WINDOW);
@@ -1728,6 +1826,10 @@ fn ending_e1_target_preserves_another_peers_e2_hold() {
     // Removing only B's grant ends A's real E1 target session; C's projection stays authorized.
     m.feed(A, grants(&[C]));
     assert_eq!(m.engines[&A].controlled_by(), None);
+    assert_eq!(
+        m.count(A, |o| matches!(o, Output::Notice(Notice::ControlEnded(B)))),
+        1
+    );
     assert_eq!(m.count(C, |o| matches!(o, Output::CloseProxy { .. })), 0);
     assert_eq!(
         m.count(A, |o| matches!(
@@ -1737,13 +1839,97 @@ fn ending_e1_target_preserves_another_peers_e2_hold() {
                 ..
             }
         )),
-        1,
-        "positive control: the E1 target issued global cleanup"
+        0,
+        "normal E1 teardown must not issue global cleanup"
     );
     assert!(
         m.held.contains(&(A, KEY)),
         "E1 cleanup must preserve C's E2 physical hold"
     );
+    assert!(m.physical_trace(A, Held::Key(KEY)).is_empty());
+    m.log.clear();
+    m.feed(C, Input::Command(Command::Return(c)));
+    m.returned(C, c, WINDOW);
+    assert_eq!(m.physical_trace(A, Held::Key(KEY)), vec![false]);
+    assert!(m.held.is_empty());
+}
+
+#[test]
+fn normal_e1_e2_acquisition_and_teardown_orders_share_one_physical_hold() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        for e1_first in [false, true] {
+            for end_e1_first in [false, true] {
+                let mut m = Mesh::new(false);
+                let c = m.project(A, C, WINDOW);
+                m.enter(B, A, 0.5);
+                m.log.clear();
+                if e1_first {
+                    m.e1_item(B, item, true);
+                }
+                m.proxy_item(C, c, item, true);
+                if !e1_first {
+                    m.e1_item(B, item, true);
+                }
+                assert_eq!(m.physical_trace(A, item), vec![true]);
+                m.log.clear();
+                if end_e1_first {
+                    m.feed(B, Input::Command(Command::ReleaseControl));
+                    assert_eq!(m.engines[&A].controlled_by(), None);
+                    assert_eq!(m.count(C, |o| matches!(o, Output::CloseProxy { .. })), 0);
+                } else {
+                    m.feed(C, Input::Command(Command::Return(c)));
+                    m.returned(C, c, WINDOW);
+                    assert_eq!(m.engines[&A].controlled_by(), Some(B));
+                }
+                assert!(m.physical_trace(A, item).is_empty());
+                m.log.clear();
+                if end_e1_first {
+                    m.feed(C, Input::Command(Command::Return(c)));
+                    m.returned(C, c, WINDOW);
+                } else {
+                    m.feed(B, Input::Command(Command::ReleaseControl));
+                }
+                assert_eq!(m.physical_trace(A, item), vec![false]);
+                assert!(m.held.is_empty());
+                assert!(m.buttons.is_empty());
+                assert_eq!(m.engines[&A].controlled_by(), None);
+                assert_eq!(
+                    m.count(A, |o| matches!(
+                        o,
+                        Output::Inject {
+                            cmd: InjectCmd::ReleaseAll,
+                            ..
+                        }
+                    )),
+                    0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn normal_e1_end_releases_only_its_unshared_items() {
+    let mut m = Mesh::new(false);
+    let c = m.project(A, C, WINDOW);
+    m.enter(B, A, 0.5);
+    m.e1_item(B, Held::Key(KEY), true);
+    m.e1_item(B, Held::Button(MouseButton::PRIMARY), true);
+    m.proxy_item(C, c, Held::Key(KEY), true);
+    m.log.clear();
+    m.feed(B, Input::Command(Command::ReleaseControl));
+    assert!(m.physical_trace(A, Held::Key(KEY)).is_empty());
+    assert_eq!(
+        m.physical_trace(A, Held::Button(MouseButton::PRIMARY)),
+        vec![false]
+    );
+    assert!(m.held.contains(&(A, KEY)));
+    assert!(m.buttons.is_empty());
+    m.log.clear();
+    m.feed(C, Input::Command(Command::Return(c)));
+    m.returned(C, c, WINDOW);
+    assert_eq!(m.physical_trace(A, Held::Key(KEY)), vec![false]);
+    assert!(m.held.is_empty());
 }
 
 fn blocked_down_callback_orders(item: Held, cleanup_first: bool) {
@@ -2089,4 +2275,731 @@ fn clipboard_home_guard_ignores_raw_source_focus_loss() {
         1,
         "ignored focus loss must not clear the accepted focus epoch"
     );
+}
+
+fn item_request(m: &Mesh, item: Held, wanted_down: bool) -> crosspane_engine::io::InjectId {
+    m.log
+        .iter()
+        .rev()
+        .find_map(|(node, output)| match (item, output) {
+            (
+                Held::Key(wanted),
+                Output::Inject {
+                    id,
+                    cmd: InjectCmd::Key { usage, down },
+                },
+            ) if *node == A && wanted == *usage && *down == wanted_down => Some(*id),
+            (
+                Held::Button(wanted),
+                Output::Inject {
+                    id,
+                    cmd: InjectCmd::Button { button, down },
+                },
+            ) if *node == A && wanted == *button && *down == wanted_down => Some(*id),
+            _ => None,
+        })
+        .expect("the exact physical item request")
+}
+
+#[test]
+fn n1e2a_local_override_preserves_shared_projection_items() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        let mut m = Mesh::new(false);
+        let c = m.project(A, C, WINDOW);
+        m.enter(B, A, 0.5);
+        m.e1_item(B, item, true);
+        m.proxy_item(C, c, item, true);
+        m.log.clear();
+        m.feed(A, Input::Capture(CaptureEvent::LocalActivity { at: ms(0) }));
+        assert_eq!(m.engines[&A].controlled_by(), None);
+        assert!(m.physical_trace(A, item).is_empty());
+        m.feed(C, Input::Command(Command::Return(c)));
+        assert_eq!(m.physical_trace(A, item), vec![false]);
+        assert!(m.held.is_empty());
+        assert!(m.buttons.is_empty());
+    }
+}
+
+fn cross_role_uncertain_press(e1_first: bool, late_success: bool) {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        let mut m = Mesh::new(false);
+        let c = m.project(A, C, WINDOW);
+        m.enter(B, A, 0.5);
+        m.defer_presses = true;
+        m.defer_releases = true;
+        m.log.clear();
+        if e1_first {
+            m.e1_item(B, item, true);
+        } else {
+            m.proxy_item(C, c, item, true);
+        }
+        let press = item_request(&m, item, true);
+        if e1_first {
+            m.proxy_item(C, c, item, true);
+        } else {
+            m.e1_item(B, item, true);
+        }
+        assert_eq!(m.physical_trace(A, item), vec![true]);
+        m.log.clear();
+        if late_success {
+            m.now = 501;
+        }
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: press,
+                ok: late_success,
+            },
+        );
+        assert_eq!(m.physical_trace(A, item), vec![false]);
+        let cleanup = item_request(&m, item, false);
+        m.log.clear();
+        // Both owners' old Ups and repeated Downs are absorbed until that exact cleanup confirms.
+        m.e1_item(B, item, false);
+        m.proxy_item(C, c, item, false);
+        m.e1_item(B, item, true);
+        m.proxy_item(C, c, item, true);
+        assert!(m.physical_trace(A, item).is_empty());
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: cleanup,
+                ok: true,
+            },
+        );
+        assert!(m.physical_trace(A, item).is_empty());
+        m.defer_presses = false;
+        m.defer_releases = false;
+        m.now += 300; // Fresh activation respects the ordinary focus guard's grace interval.
+        m.feed(A, Input::Windows(WindowEvent::Focused(None)));
+        m.log.clear();
+        m.proxy_item(C, c, item, false);
+        m.proxy_item(C, c, item, true);
+        assert_eq!(m.physical_trace(A, item), vec![true]);
+        assert!(m.log.iter().any(|(node, output)| {
+            *node == A
+                && match item {
+                    Held::Key(_) => {
+                        matches!(output, Output::ActivateWindow { window } if *window == WINDOW)
+                    }
+                    Held::Button(_) => matches!(
+                        output,
+                        Output::Inject {
+                            cmd: InjectCmd::MoveTo { .. },
+                            ..
+                        }
+                    ),
+                }
+        }));
+        m.proxy_item(C, c, item, false);
+        assert_eq!(m.physical_trace(A, item), vec![true, false]);
+    }
+}
+
+#[test]
+fn n1e2a_failed_e1_press_cleans_both_roles_once() {
+    cross_role_uncertain_press(true, false);
+}
+
+#[test]
+fn n1e2a_failed_e2_press_cleans_both_roles_once() {
+    cross_role_uncertain_press(false, false);
+}
+
+#[test]
+fn n1e2a_late_e1_press_success_before_tick_still_cleans_both_roles() {
+    cross_role_uncertain_press(true, true);
+}
+
+#[test]
+fn n1e2a_late_e2_press_success_before_tick_still_cleans_both_roles() {
+    cross_role_uncertain_press(false, true);
+}
+
+#[test]
+fn n1e2a_shared_cleanup_confirms_each_journal_independently() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        for fail_e1 in [false, true] {
+            let e1 = RecordedJournal::default();
+            let e2 = RecordedJournal::default();
+            let mut m = Mesh::with_journals(false, Some((e1.clone(), e2.clone())));
+            let c = m.project(A, C, WINDOW);
+            let fresh = m.project(A, C, WindowId(11));
+            m.enter(B, A, 0.5);
+            m.defer_presses = true;
+            m.defer_releases = true;
+            m.log.clear();
+            m.e1_item(B, item, true);
+            let press = item_request(&m, item, true);
+            m.proxy_item(C, c, item, true);
+            m.log.clear();
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: press,
+                    ok: false,
+                },
+            );
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            let cleanup = item_request(&m, item, false);
+            assert_eq!(e1.held().unwrap(), vec![item]);
+            assert_eq!(e2.held().unwrap(), vec![item]);
+            let failing = if fail_e1 { &e1 } else { &e2 };
+            let other = if fail_e1 { &e2 } else { &e1 };
+            failing.0.lock().unwrap().fail_up = true;
+            m.log.clear();
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: cleanup,
+                    ok: true,
+                },
+            );
+            assert!(m.physical_trace(A, item).is_empty());
+            assert!(other.held().unwrap().is_empty());
+            assert_eq!(failing.held().unwrap(), vec![item]);
+            m.proxy_item(C, fresh, item, true);
+            assert!(
+                m.physical_trace(A, item).is_empty(),
+                "one journal still owes cleanup"
+            );
+            failing.0.lock().unwrap().fail_up = false;
+            m.now = 50;
+            m.feed(A, Input::Tick);
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            let retry = item_request(&m, item, false);
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: retry,
+                    ok: true,
+                },
+            );
+            assert!(e1.held().unwrap().is_empty());
+            assert!(e2.held().unwrap().is_empty());
+            m.now = 350;
+            m.defer_presses = false;
+            m.defer_releases = false;
+            m.log.clear();
+            m.proxy_item(C, fresh, item, false);
+            m.proxy_item(C, fresh, item, true);
+            assert_eq!(m.physical_trace(A, item), vec![true]);
+            m.proxy_item(C, fresh, item, false);
+            assert_eq!(m.physical_trace(A, item), vec![true, false]);
+            assert!(m.held.is_empty());
+            assert!(m.buttons.is_empty());
+        }
+    }
+}
+
+#[test]
+fn n1e2a_torn_role_journal_never_releases_the_other_roles_item() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        for fail_e1 in [false, true] {
+            let e1 = RecordedJournal::default();
+            let e2 = RecordedJournal::default();
+            let mut m = Mesh::with_journals(false, Some((e1.clone(), e2.clone())));
+            let c = m.project(A, C, WINDOW);
+            m.enter(B, A, 0.5);
+            let failing = if fail_e1 { &e1 } else { &e2 };
+            if fail_e1 {
+                m.proxy_item(C, c, item, true);
+            } else {
+                m.e1_item(B, item, true);
+            }
+            failing.0.lock().unwrap().fail_down = true;
+            m.log.clear();
+            if fail_e1 {
+                m.e1_item(B, item, true);
+            } else {
+                m.proxy_item(C, c, item, true);
+            }
+            assert!(m.physical_trace(A, item).is_empty());
+            assert!(
+                failing.held().unwrap().is_empty(),
+                "torn role record confirms locally"
+            );
+            failing.0.lock().unwrap().fail_down = false;
+            if fail_e1 {
+                m.feed(C, Input::Command(Command::Return(c)));
+            } else {
+                m.feed(B, Input::Command(Command::ReleaseControl));
+            }
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            assert!(e1.held().unwrap().is_empty());
+            assert!(e2.held().unwrap().is_empty());
+            assert!(m.held.is_empty());
+            assert!(m.buttons.is_empty());
+        }
+    }
+}
+
+#[test]
+fn n1e2a_expired_cross_role_press_cleans_before_ordinary_input() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        for e1_first in [false, true] {
+            let mut m = Mesh::new(false);
+            let c = m.project(A, C, WINDOW);
+            m.enter(B, A, 0.5);
+            m.defer_presses = true;
+            m.defer_releases = true;
+            if e1_first {
+                m.e1_item(B, item, true);
+                m.proxy_item(C, c, item, true);
+            } else {
+                m.proxy_item(C, c, item, true);
+                m.e1_item(B, item, true);
+            }
+            m.log.clear();
+            m.now = 501;
+            // No Tick or callback: admission of an ordinary event must first expire the press.
+            m.feed(A, Input::Windows(WindowEvent::Focused(Some(WINDOW))));
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            let cleanup = item_request(&m, item, false);
+            m.log.clear();
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: cleanup,
+                    ok: true,
+                },
+            );
+            assert!(m.physical_trace(A, item).is_empty());
+            assert!(m.held.is_empty());
+            assert!(m.buttons.is_empty());
+        }
+    }
+}
+
+#[test]
+fn n1e2a_shared_cleanup_history_keeps_eight_actual_request_ids() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        let e1 = RecordedJournal::default();
+        let e2 = RecordedJournal::default();
+        let mut m = Mesh::with_journals(false, Some((e1.clone(), e2.clone())));
+        let c = m.project(A, C, WINDOW);
+        m.enter(B, A, 0.5);
+        m.defer_presses = true;
+        m.defer_releases = true;
+        m.e1_item(B, item, true);
+        let press = item_request(&m, item, true);
+        m.proxy_item(C, c, item, true);
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: press,
+                ok: false,
+            },
+        );
+        let first = item_request(&m, item, false);
+        let mut recent = VecDeque::from([first]);
+        for attempt in 1..=20 {
+            m.now = attempt * 50;
+            m.log.clear();
+            m.feed(A, Input::Tick);
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            recent.push_back(item_request(&m, item, false));
+            if recent.len() > 8 {
+                recent.pop_front();
+            }
+            assert_eq!(e1.held().unwrap(), vec![item]);
+            assert_eq!(e2.held().unwrap(), vec![item]);
+        }
+        m.log.clear();
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: first,
+                ok: true,
+            },
+        );
+        assert_eq!(e1.held().unwrap(), vec![item]);
+        assert_eq!(e2.held().unwrap(), vec![item]);
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: recent[0],
+                ok: true,
+            },
+        );
+        assert!(e1.held().unwrap().is_empty());
+        assert!(e2.held().unwrap().is_empty());
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: *recent.back().unwrap(),
+                ok: false,
+            },
+        );
+        m.now += 50;
+        m.feed(A, Input::Tick);
+        assert!(m.physical_trace(A, item).is_empty());
+    }
+}
+
+#[test]
+fn n1e2a_old_role_release_retry_is_absorbed_by_a_fresh_other_role_hold() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        for e1_first in [false, true] {
+            let mut m = Mesh::new(false);
+            let c = m.project(A, C, WINDOW);
+            m.enter(B, A, 0.5);
+            m.defer_releases = true;
+            if e1_first {
+                m.e1_item(B, item, true);
+                m.e1_item(B, item, false);
+            } else {
+                m.proxy_item(C, c, item, true);
+                m.proxy_item(C, c, item, false);
+            }
+            let old = item_request(&m, item, false);
+            m.log.clear();
+            if e1_first {
+                m.proxy_item(C, c, item, true);
+            } else {
+                m.e1_item(B, item, true);
+            }
+            assert_eq!(m.physical_trace(A, item), vec![true]);
+            m.log.clear();
+            m.feed(A, Input::InjectDone { id: old, ok: true });
+            m.now = 50;
+            m.feed(A, Input::Tick);
+            assert!(m.physical_trace(A, item).is_empty());
+            m.defer_releases = false;
+            if e1_first {
+                m.proxy_item(C, c, item, false);
+            } else {
+                m.e1_item(B, item, false);
+            }
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            assert!(m.held.is_empty());
+            assert!(m.buttons.is_empty());
+        }
+    }
+}
+
+fn recovery_requests(m: &Mesh) -> Vec<InjectId> {
+    m.log
+        .iter()
+        .filter_map(|(node, out)| match out {
+            Output::Inject {
+                id,
+                cmd: InjectCmd::Recover { .. },
+            } if *node == A => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn n1e2b_startup_recovers_each_union_item_once() {
+    for e1_items in [
+        vec![],
+        vec![Held::Key(KEY)],
+        vec![Held::Key(KEY), Held::Button(MouseButton::PRIMARY)],
+    ] {
+        for e2_items in [
+            vec![],
+            vec![Held::Key(KEY)],
+            vec![Held::Button(MouseButton::PRIMARY)],
+        ] {
+            let e1 = RecordedJournal::default();
+            let e2 = RecordedJournal::default();
+            e1.0.lock().unwrap().held.extend(&e1_items);
+            e2.0.lock().unwrap().held.extend(&e2_items);
+            let mut m = Mesh::with_startup_journals(false, Some((e1.clone(), e2.clone())), true);
+            let union: BTreeSet<_> = e1_items.iter().chain(&e2_items).copied().collect();
+            for item in &union {
+                assert_eq!(m.physical_trace(A, *item), vec![false]);
+            }
+            assert_eq!(e1.held().unwrap(), e1_items);
+            assert_eq!(e2.held().unwrap(), e2_items);
+            let requests = recovery_requests(&m);
+            for id in requests {
+                m.feed(A, Input::InjectDone { id, ok: true });
+            }
+            assert!(e1.held().unwrap().is_empty());
+            assert!(e2.held().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn n1e2b_startup_in_one_journal_blocks_establishing_downs_in_both_roles() {
+    for crashed in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        let e1 = RecordedJournal::default();
+        let e2 = RecordedJournal::default();
+        e1.0.lock().unwrap().held.insert(crashed);
+        let mut m = Mesh::with_startup_journals(false, Some((e1.clone(), e2)), true);
+        let recovery = recovery_requests(&m)[0];
+        let c = m.project(A, C, WINDOW);
+        m.enter(B, A, 0.5);
+        let fresh = Held::Key(HidUsage::keyboard(5));
+        m.log.clear();
+        m.e1_item(B, fresh, true);
+        m.proxy_item(C, c, fresh, true);
+        assert!(m.physical_trace(A, fresh).is_empty());
+        assert_eq!(e1.held().unwrap(), vec![crashed]);
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: recovery,
+                ok: true,
+            },
+        );
+        m.e1_item(B, fresh, false);
+        m.proxy_item(C, c, fresh, false);
+        m.e1_item(B, fresh, true);
+        m.proxy_item(C, c, fresh, true);
+        assert_eq!(m.physical_trace(A, fresh), vec![true]);
+        m.e1_item(B, fresh, false);
+        m.proxy_item(C, c, fresh, false);
+        assert_eq!(m.physical_trace(A, fresh), vec![true, false]);
+    }
+}
+
+#[test]
+fn n1e2b_startup_shared_success_confirms_journals_independently() {
+    for fail_e1 in [true, false] {
+        for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+            let e1 = RecordedJournal::default();
+            let e2 = RecordedJournal::default();
+            e1.0.lock().unwrap().held.insert(item);
+            e2.0.lock().unwrap().held.insert(item);
+            let mut m = Mesh::with_startup_journals(false, Some((e1.clone(), e2.clone())), true);
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            let initial = recovery_requests(&m)[0];
+            let failing = if fail_e1 { &e1 } else { &e2 };
+            let other = if fail_e1 { &e2 } else { &e1 };
+            failing.0.lock().unwrap().fail_up = true;
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: initial,
+                    ok: true,
+                },
+            );
+            assert_eq!(failing.held().unwrap(), vec![item]);
+            assert!(other.held().unwrap().is_empty());
+            m.enter(B, A, 0.5);
+            let fresh = Held::Key(HidUsage::keyboard(5));
+            m.log.clear();
+            m.e1_item(B, fresh, true);
+            assert!(m.physical_trace(A, fresh).is_empty());
+            m.now = 50;
+            m.feed(A, Input::Tick);
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            let retry = recovery_requests(&m)[0];
+            failing.0.lock().unwrap().fail_up = false;
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: retry,
+                    ok: true,
+                },
+            );
+            assert!(failing.held().unwrap().is_empty());
+            m.e1_item(B, fresh, false);
+            m.e1_item(B, fresh, true);
+            assert_eq!(m.physical_trace(A, fresh), vec![true]);
+            m.e1_item(B, fresh, false);
+            assert_eq!(m.physical_trace(A, fresh), vec![true, false]);
+        }
+    }
+}
+
+#[test]
+fn n1e2b_unanswered_startup_retains_exact_bounded_requests() {
+    let e1 = RecordedJournal::default();
+    let e2 = RecordedJournal::default();
+    let items = [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)];
+    e1.0.lock().unwrap().held.extend(items);
+    e2.0.lock().unwrap().held.extend(items);
+    let mut m = Mesh::with_startup_journals(false, Some((e1.clone(), e2.clone())), true);
+    assert_eq!(recovery_requests(&m).len(), 1);
+    let mut requests = recovery_requests(&m);
+    for n in 1..=20 {
+        m.log.clear();
+        m.now = n * 50;
+        m.feed(A, Input::Tick);
+        let retry = recovery_requests(&m);
+        assert_eq!(retry.len(), 1);
+        requests.extend(retry);
+        for item in items {
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+        }
+    }
+    m.feed(
+        A,
+        Input::InjectDone {
+            id: requests[0],
+            ok: true,
+        },
+    );
+    assert_eq!(e1.held().unwrap(), items);
+    assert_eq!(e2.held().unwrap(), items);
+    m.feed(
+        A,
+        Input::InjectDone {
+            id: requests[requests.len() - 8],
+            ok: true,
+        },
+    );
+    assert!(e1.held().unwrap().is_empty());
+    assert!(e2.held().unwrap().is_empty());
+    m.feed(
+        A,
+        Input::InjectDone {
+            id: *requests.last().unwrap(),
+            ok: false,
+        },
+    );
+    m.log.clear();
+    m.now += 50;
+    m.feed(A, Input::Tick);
+    assert!(recovery_requests(&m).is_empty());
+}
+
+#[test]
+fn n1e2b_read_failure_in_either_journal_returns_no_engine() {
+    for fail_e1 in [true, false] {
+        let e1 = RecordedJournal::default();
+        let e2 = RecordedJournal::default();
+        e1.0.lock().unwrap().held.insert(Held::Key(KEY));
+        e2.0.lock()
+            .unwrap()
+            .held
+            .insert(Held::Button(MouseButton::PRIMARY));
+        if fail_e1 {
+            e1.0.lock().unwrap().fail_read = true;
+        } else {
+            e2.0.lock().unwrap().fail_read = true;
+        }
+        assert!(
+            Engine::new(
+                EngineConfig::new(A),
+                Box::new(e1.clone()),
+                Box::new(e2.clone()),
+                ms(0)
+            )
+            .is_err()
+        );
+        assert_eq!(e1.0.lock().unwrap().held, BTreeSet::from([Held::Key(KEY)]));
+        assert_eq!(
+            e2.0.lock().unwrap().held,
+            BTreeSet::from([Held::Button(MouseButton::PRIMARY)])
+        );
+    }
+}
+
+#[test]
+fn n1e2b_failed_startup_backs_off_shared_cleanup_without_any_down() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        for roles in [[true, false], [false, true], [true, true]] {
+            let e1 = RecordedJournal::default();
+            let e2 = RecordedJournal::default();
+            if roles[0] {
+                e1.0.lock().unwrap().held.insert(item);
+            }
+            if roles[1] {
+                e2.0.lock().unwrap().held.insert(item);
+            }
+            let mut m = Mesh::with_startup_journals(false, Some((e1.clone(), e2.clone())), true);
+            let first = recovery_requests(&m);
+            assert_eq!(first.len(), 1);
+            m.enter(B, A, 0.5);
+            m.now = 7;
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: first[0],
+                    ok: false,
+                },
+            );
+            m.log.clear();
+            let fresh = Held::Key(HidUsage::keyboard(5));
+            m.e1_item(B, fresh, true);
+            assert!(m.physical_trace(A, fresh).is_empty());
+            m.now = 56;
+            m.feed(A, Input::Tick);
+            assert!(recovery_requests(&m).is_empty());
+            m.now = 57;
+            m.feed(A, Input::Tick);
+            let retry = recovery_requests(&m);
+            assert_eq!(retry.len(), 1);
+            assert_ne!(first, retry);
+            assert_eq!(m.physical_trace(A, item), vec![false]);
+            // A superseded failure must not shift the current item's retry deadline.
+            m.now = 58;
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: first[0],
+                    ok: false,
+                },
+            );
+            m.feed(
+                A,
+                Input::InjectDone {
+                    id: retry[0],
+                    ok: true,
+                },
+            );
+            assert!(e1.held().unwrap().is_empty());
+            assert!(e2.held().unwrap().is_empty());
+            m.e1_item(B, fresh, false);
+            m.e1_item(B, fresh, true);
+            m.e1_item(B, fresh, false);
+            assert_eq!(m.physical_trace(A, fresh), vec![true, false]);
+        }
+    }
+}
+
+#[test]
+fn n1e2b_startup_rejects_interleaved_non_recovery_acknowledgments() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        let e1 = RecordedJournal::default();
+        let e2 = RecordedJournal::default();
+        e1.0.lock().unwrap().held.insert(item);
+        e2.0.lock().unwrap().held.insert(item);
+        let mut m = Mesh::with_startup_journals(false, Some((e1.clone(), e2.clone())), true);
+        let first = recovery_requests(&m)[0];
+        m.defer_targeting = true;
+        m.enter(B, A, 0.5);
+        let unrelated = m
+            .log
+            .iter()
+            .find_map(|(node, output)| match output {
+                Output::Inject {
+                    id,
+                    cmd: InjectCmd::MoveTo { .. },
+                } if *node == A => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(first, unrelated);
+        m.log.clear();
+        m.now = 50;
+        m.feed(A, Input::Tick);
+        let current = recovery_requests(&m)[0];
+        assert_ne!(current, unrelated);
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: unrelated,
+                ok: true,
+            },
+        );
+        assert_eq!(e1.held().unwrap(), vec![item]);
+        assert_eq!(e2.held().unwrap(), vec![item]);
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: current,
+                ok: true,
+            },
+        );
+        assert!(e1.held().unwrap().is_empty());
+        assert!(e2.held().unwrap().is_empty());
+    }
 }

@@ -108,6 +108,28 @@ impl E2 {
             .filter_map(|(key, destination)| destination.clipboard_focused.then_some(*key))
     }
 
+    pub(crate) fn cleanup_item(
+        &mut self,
+        item: crosspane_input::Held,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        self.ledgers.cleanup_press(item, now, out);
+    }
+
+    pub(crate) fn physical(&self) -> crate::physical_input::PhysicalInput {
+        self.ledgers.physical()
+    }
+
+    pub(crate) fn set_physical(
+        &mut self,
+        physical: crate::physical_input::PhysicalInput,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) -> Result<(), JournalError> {
+        self.ledgers.set_physical(physical, now, out)
+    }
+
     /// Start the E2 roles. `journal` records keys and buttons injected into projected windows
     /// (separate from E1's); the returned outputs are its crash recovery, run first.
     pub fn new(
@@ -350,7 +372,7 @@ impl E2 {
             Input::Proxy { key, event } => self.proxy_event(*key, event, now, out),
             Input::MediaError { key } => self.media_error(*key, now, out),
             Input::InjectDone { id, ok } => {
-                if let Some(owner) = self.ledgers.done(*id, *ok, now, out) {
+                for owner in self.ledgers.done(*id, *ok, now, out) {
                     self.end_source(owner, Reason::Failed, false, now, out);
                 }
                 self.source_inject_done(*id, *ok, now, out);

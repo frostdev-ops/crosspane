@@ -416,7 +416,12 @@ impl Harness {
                         InjectCmd::Button {
                             button: MouseButton::PRIMARY,
                             down: false,
-                        } => self.seat.up(node),
+                        } => {
+                            // The one refused-Down fixture still receives conservative cleanup.
+                            if !self.fail_down || self.seat.has_hold(node) {
+                                self.seat.up(node);
+                            }
+                        }
                         InjectCmd::Key { usage, down } => {
                             if down {
                                 assert!(self.keys.insert((node, usage)));
@@ -1565,6 +1570,23 @@ fn arm_expiry_and_failed_down_leave_no_routed_primary_or_arm() {
     h.fail_down = true;
     h.motion(50.0, 0.0);
     assert_eq!(h.seat.totals(B).0, 0);
+    assert_eq!(
+        h.trace
+            .iter()
+            .filter(|(node, out)| *node == 1
+                && matches!(
+                    out,
+                    Output::Inject {
+                        cmd: InjectCmd::Button {
+                            button: MouseButton::PRIMARY,
+                            down: false
+                        },
+                        ..
+                    }
+                ))
+            .count(),
+        1
+    );
     assert_eq!(h.engines[0].controlling(), None);
     h.finish();
     let mut h = Harness::new(true, true, 1000, 1.0);

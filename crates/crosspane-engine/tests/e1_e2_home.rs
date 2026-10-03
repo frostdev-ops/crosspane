@@ -1860,6 +1860,63 @@ fn entry_waits_for_drain_confirmation() {
 }
 
 #[test]
+fn n1e2b_home_waits_for_both_startup_journals_and_confirmed_retry() {
+    for (e1_item, e2_item) in [
+        (Held::Key(KEY), Held::Button(BUTTON)),
+        (Held::Button(BUTTON), Held::Key(KEY)),
+    ] {
+        let mut h = H::bare_with(&[e1_item], &[e2_item]);
+        let recovery = injects(&h.startup);
+        assert_eq!(recovery.len(), 2, "disjoint crash items: {recovery:?}");
+        let request = |item| {
+            recovery
+                .iter()
+                .find(|(_, cmd)| match (item, cmd) {
+                    (Held::Key(key), InjectCmd::Recover { keys, .. }) => keys.contains(&key),
+                    (Held::Button(button), InjectCmd::Recover { buttons, .. }) => {
+                        buttons.contains(&button)
+                    }
+                    _ => false,
+                })
+                .unwrap()
+                .0
+        };
+        let e1_id = request(e1_item);
+        let e2_id = request(e2_item);
+        assert_eq!(h.e1_journal.items(), vec![e1_item]);
+        assert_eq!(h.e2_journal.items(), vec![e2_item]);
+        h.feed(Input::InjectDone {
+            id: e2_id,
+            ok: true,
+        });
+        assert!(h.e2_journal.items().is_empty());
+        assert_eq!(h.e1_journal.items(), vec![e1_item]);
+        // Projection creation does not inject: E1's recovery still fences Downs and home.
+        h.project(W1, B, P1, TWIN, content1(), PlatformParking::Twin);
+        h.place(B, P1, 1, Some(Proxy::standard()));
+        h.cross();
+        h.aim();
+        let trigger = h.trigger();
+        assert!(binds(&trigger).is_empty() && warps(&trigger).is_empty());
+        let failed = h.feed(Input::InjectDone {
+            id: e1_id,
+            ok: false,
+        });
+        assert!(binds(&failed).is_empty() && warps(&failed).is_empty());
+        assert_eq!(h.e1_journal.items(), vec![e1_item]);
+        let retry = h.tick_after(50);
+        let requests = injects(&retry);
+        assert_eq!(requests.len(), 1);
+        assert_ne!(requests[0].0, e1_id);
+        assert!(binds(&retry).is_empty() && warps(&retry).is_empty());
+        let confirmed = h.confirm(&retry, true);
+        assert!(h.e1_journal.items().is_empty() && h.e2_journal.items().is_empty());
+        assert!(bind(&confirmed, true).is_some(), "{confirmed:?}");
+        h.quiet();
+    }
+}
+
+#[test]
 fn entry_aborts_on_drain_timeout() {
     let mut h = H::controlling();
     h.focus(Some(W1));

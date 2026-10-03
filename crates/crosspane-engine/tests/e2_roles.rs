@@ -1004,19 +1004,18 @@ fn crash_recovery_is_first_retries_and_has_independent_e1_ids() {
     )
     .unwrap();
     let ids = injections(&out);
-    assert_eq!(ids.len(), 2);
-    assert_ne!(ids[0].0, ids[1].0);
-    engine.handle(
-        Input::InjectDone {
-            id: ids[0].0,
-            ok: true,
-        },
-        ms(0),
+    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        ids[0].1,
+        InjectCmd::Recover {
+            keys: vec![KEY],
+            buttons: vec![]
+        }
     );
     assert_eq!(journal.held().unwrap(), vec![Held::Key(KEY)]);
     engine.handle(
         Input::InjectDone {
-            id: ids[1].0,
+            id: ids[0].0,
             ok: true,
         },
         ms(0),

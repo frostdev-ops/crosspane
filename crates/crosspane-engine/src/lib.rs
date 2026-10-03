@@ -14,6 +14,7 @@ pub mod config;
 pub mod e1;
 pub mod e2;
 pub mod io;
+mod physical_input;
 
 use crosspane_input::journal::{Journal, JournalError};
 use crosspane_platform::CaptureEvent;
@@ -52,9 +53,13 @@ impl Engine {
         e2_journal: Box<dyn Journal>,
         now: MonoTime,
     ) -> Result<(Engine, Vec<Output>), JournalError> {
-        let (target, mut out) = TargetE1::new(&config, journal, now)?;
-        let (e2, e2_out) = E2::new(&config, e2_journal, now)?;
-        out.extend(e2_out);
+        let (mut target, mut out) = TargetE1::new(&config, journal, now)?;
+        let (mut e2, _) = E2::new(&config, e2_journal, now)?;
+        // Both journals are read before either role's startup recovery may be dispatched.
+        out.clear();
+        let physical = physical_input::PhysicalInput::default();
+        target.set_physical(physical.clone(), &mut out)?;
+        e2.set_physical(physical, now, &mut out)?;
         // The engine permits I/O from the start (after recovery); only a panic closes its side.
         out.push(Output::EngineGate(true));
         let controller = ControllerE1::new(&config, now);
@@ -78,6 +83,11 @@ impl Engine {
             Input::Command(Command::Panic) => out.push(Output::EngineGate(false)),
             Input::Command(Command::Rearm) => out.push(Output::EngineGate(true)),
             _ => {}
+        }
+        // Uncertainty ends the item in both roles before any ordinary input can be admitted.
+        for item in self.e2.physical().uncertain(&input, now) {
+            self.target.cleanup_item(item, now, &mut out);
+            self.e2.cleanup_item(item, now, &mut out);
         }
         // While another node controls this one, this node's own portals are inert: the injected
         // pointer enters at an edge, and crossing out from there would bounce control straight
@@ -230,7 +240,10 @@ impl Engine {
             }
         }
         // (Only an entry that is waiting for the drain looks at it, so it is only asked then.)
-        let settled = self.controller.draining() && self.e2.settled() && self.target.settled();
+        let settled = self.controller.draining()
+            && self.e2.settled()
+            && self.target.settled()
+            && self.e2.physical().settled();
         self.controller.after_e2(settled, now, &mut out);
         self.controller
             .set_twin_homes(self.e2.twin_homes(), now, &mut out);

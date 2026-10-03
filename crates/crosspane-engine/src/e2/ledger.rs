@@ -20,9 +20,9 @@ use crosspane_types::id::ProjectionId;
 use crosspane_types::time::MonoTime;
 
 use crate::io::{InjectCmd, InjectId, Output};
+use crate::physical_input::{Owner, PhysicalInput, ReleaseAction};
 
 const RETRY: Duration = Duration::from_millis(50);
-const RELEASE_HISTORY: usize = 8;
 const TARGET_QUEUE_LIMIT: usize = 64;
 const TARGET_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -128,10 +128,8 @@ pub(super) struct Targeting {
 pub(super) struct Ledgers {
     shared: Arc<Mutex<Shared>>,
     leases: BTreeMap<ProjectionId, Lease>,
-    pending: BTreeMap<InjectId, Pending>,
-    // Pending physical presses time out conservatively; None means confirmed down.
-    presses: BTreeMap<Held, Option<(InjectId, MonoTime)>>,
-    blocked: BTreeSet<Held>,
+    pending: BTreeMap<InjectId, Vec<Pending>>,
+    physical: PhysicalInput,
     // Kept with the lease so home drains, retirement and lease expiry also cancel unissued input.
     targeting: Option<Targeting>,
     queued: VecDeque<(ProjectionId, ProjInput)>,
@@ -155,8 +153,7 @@ impl Ledgers {
             shared,
             leases: BTreeMap::new(),
             pending: BTreeMap::new(),
-            presses: BTreeMap::new(),
-            blocked: BTreeSet::new(),
+            physical: PhysicalInput::default(),
             targeting: None,
             queued: VecDeque::new(),
             next_id: u64::MAX,
@@ -168,7 +165,15 @@ impl Ledgers {
             if let Some(lease) = this.leases.get_mut(&ProjectionId(0)) {
                 lease.unconfirmed = items;
             }
-            this.submit_recovery(keys, buttons, now, out);
+            this.physical.startup(
+                false,
+                &this.leases[&ProjectionId(0)]
+                    .unconfirmed
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )?;
+            this.submit_recovery(keys, buttons, now, out)?;
         }
         Ok(this)
     }
@@ -177,6 +182,29 @@ impl Ledgers {
         self.leases
             .get(&ProjectionId(0))
             .is_none_or(|lease| lease.unconfirmed.is_empty())
+    }
+
+    pub fn physical(&self) -> PhysicalInput {
+        self.physical.clone()
+    }
+
+    pub fn set_physical(
+        &mut self,
+        physical: PhysicalInput,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) -> Result<(), JournalError> {
+        self.physical = physical;
+        self.pending.clear();
+        let items = if let Some(lease) = self.leases.get_mut(&ProjectionId(0)) {
+            lease.retry.clear();
+            lease.unconfirmed.keys().copied().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.physical.startup(false, &items)?;
+        let (keys, buttons) = split(&items);
+        self.submit_recovery(keys, buttons, now, out)
     }
 
     /// WP-2.43 §2.3 step 1: nothing is held through any lease, no release is unconfirmed, no retry
@@ -250,7 +278,7 @@ impl Ledgers {
             } => Some(Held::Button(*button)),
             _ => None,
         };
-        if item.is_some_and(|item| self.blocked.contains(&item)) {
+        if item.is_some_and(|item| self.physical.blocked(item).unwrap_or(true)) {
             // Admission is absorbed now; no queue or targeting callback may resurrect this down.
             return Ok(true);
         }
@@ -320,29 +348,34 @@ impl Ledgers {
         buttons: Vec<crosspane_types::hid::MouseButton>,
         now: MonoTime,
         out: &mut Vec<Output>,
-    ) {
+    ) -> Result<(), JournalError> {
         let items: Vec<_> = keys
-            .iter()
-            .map(|&key| (Held::Key(key), 0))
-            .chain(buttons.iter().map(|&button| (Held::Button(button), 0)))
+            .into_iter()
+            .map(Held::Key)
+            .chain(buttons.into_iter().map(Held::Button))
             .collect();
-        let id = self.allocate();
-        if let Some(lease) = self.leases.get_mut(&ProjectionId(0)) {
-            for &(item, _) in &items {
-                lease.retry.insert(item, (now.saturating_add(RETRY), id));
-            }
+        if items.is_empty() {
+            return Ok(());
         }
-        self.pending.insert(
-            id,
-            Pending {
+        let requested = self.allocate();
+        for request in self.physical.recovery(&items, requested, now)? {
+            let items = request
+                .items
+                .iter()
+                .map(|&(item, until)| {
+                    if let Some(lease) = self.leases.get_mut(&ProjectionId(0)) {
+                        lease.retry.insert(item, (until, request.id));
+                    }
+                    (item, 0)
+                })
+                .collect();
+            self.pending.entry(request.id).or_default().push(Pending {
                 owner: ProjectionId(0),
                 items,
-            },
-        );
-        out.push(Output::Inject {
-            id,
-            cmd: InjectCmd::Recover { keys, buttons },
-        });
+            });
+            out.extend(request.output());
+        }
+        Ok(())
     }
 
     fn actions(
@@ -355,15 +388,6 @@ impl Ledgers {
         let mut confirmed = true;
         for action in actions {
             let id = self.allocate();
-            let item = match action {
-                Action::Press(item) | Action::Release(item) => item,
-            };
-            // The scoped journal also includes unconfirmed ups; only active logical holds keep
-            // the physical item down. This check applies to ordinary input and every cleanup/retry.
-            let another_holder = self
-                .leases
-                .iter()
-                .any(|(&other, lease)| other != owner && lease.ledger.held().contains(&item));
             let Some(lease) = self.leases.get_mut(&owner) else {
                 continue;
             };
@@ -378,31 +402,59 @@ impl Ledgers {
                     let generation = lease.generations.get(&item).copied().unwrap_or(0);
                     lease.unconfirmed.insert(item, generation);
                     lease.retry.insert(item, (now.saturating_add(RETRY), id));
-                    self.pending.insert(
-                        id,
-                        Pending {
-                            owner,
-                            items: vec![(item, generation)],
-                        },
-                    );
                     (item, false)
                 }
             };
             if down {
-                // Later logical owners coalesce with the pending or confirmed physical press.
-                if self.presses.contains_key(&item) {
-                    continue;
+                match self.physical.press(
+                    Owner::E2(owner),
+                    item,
+                    id,
+                    Some(now.saturating_add(TARGET_ACK_TIMEOUT)),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_) => {
+                        confirmed = false;
+                        continue;
+                    }
                 }
-                self.presses
-                    .insert(item, Some((id, now.saturating_add(TARGET_ACK_TIMEOUT))));
             } else {
-                if another_holder {
-                    // The other holder keeps the journal record. Confirm this owner's absorbed up
-                    // through the same checked path as an acknowledged physical release.
-                    confirmed &= !self.confirm_release(owner, &[item], true, now);
-                    continue;
+                match self.physical.release(Some(Owner::E2(owner)), item, id, now) {
+                    Ok(ReleaseAction::Absorb) => {
+                        confirmed &= !self.confirm_release(owner, &[item], true, now);
+                        continue;
+                    }
+                    Ok(ReleaseAction::Submit {
+                        id: actual,
+                        until,
+                        emit,
+                    }) => {
+                        if let Some(lease) = self.leases.get_mut(&owner) {
+                            lease.retry.insert(item, (until, actual));
+                            let generation = lease.unconfirmed.get(&item).copied().unwrap_or(0);
+                            self.pending.entry(actual).or_default().push(Pending {
+                                owner,
+                                items: vec![(item, generation)],
+                            });
+                        }
+                        if emit {
+                            let cmd = match item {
+                                Held::Key(usage) => InjectCmd::Key { usage, down: false },
+                                Held::Button(button) => InjectCmd::Button {
+                                    button,
+                                    down: false,
+                                },
+                            };
+                            out.push(Output::Inject { id: actual, cmd });
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        confirmed = false;
+                        continue;
+                    }
                 }
-                self.presses.remove(&item);
             }
             let cmd = match item {
                 Held::Key(usage) => InjectCmd::Key { usage, down },
@@ -423,7 +475,7 @@ impl Ledgers {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) -> bool {
-        if down && self.blocked.contains(&item) {
+        if down && self.physical.blocked(item).unwrap_or(true) {
             return true; // A later input must pass ordinary targeting after cleanup confirms.
         }
         let Some(lease) = self.leases.get_mut(&owner) else {
@@ -503,15 +555,7 @@ impl Ledgers {
 
     pub fn tick(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         self.expire_leases(now, out);
-        let expired: Vec<_> = self
-            .presses
-            .iter()
-            .filter_map(|(&item, pending)| {
-                pending
-                    .filter(|(_, deadline)| *deadline <= now)
-                    .map(|_| item)
-            })
-            .collect();
+        let expired = self.physical.expired(now).unwrap_or_default();
         for item in expired {
             self.cleanup_press(item, now, out);
         }
@@ -529,7 +573,7 @@ impl Ledgers {
                         continue;
                     }
                     let (keys, buttons) = split(&items);
-                    self.submit_recovery(keys, buttons, now, out);
+                    let _ = self.submit_recovery(keys, buttons, now, out);
                 }
                 continue;
             }
@@ -560,9 +604,8 @@ impl Ledgers {
         }
     }
 
-    fn cleanup_press(&mut self, item: Held, now: MonoTime, out: &mut Vec<Output>) {
-        self.presses.remove(&item);
-        self.blocked.insert(item);
+    pub(super) fn cleanup_press(&mut self, item: Held, now: MonoTime, out: &mut Vec<Output>) {
+        let _ = self.physical.cleanup(item);
         let matches_item = |input: &ProjInput| match (input, item) {
             (ProjInput::Key { usage, .. }, Held::Key(key)) => *usage == key,
             (ProjInput::Button { button, .. }, Held::Button(key)) => *button == key,
@@ -586,48 +629,40 @@ impl Ledgers {
         }
     }
 
-    /// Returns a projection to end if its journal cannot confirm a successful release.
+    /// Each contributing journal is confirmed independently by the shared physical request.
     pub fn done(
         &mut self,
         id: InjectId,
         ok: bool,
         now: MonoTime,
         out: &mut Vec<Output>,
-    ) -> Option<ProjectionId> {
-        let press = self.presses.iter().find_map(|(&item, &pending)| {
-            pending
-                .filter(|(current, _)| *current == id)
-                .map(|(_, deadline)| (item, deadline))
-        });
-        if let Some((item, deadline)) = press {
-            if ok && now < deadline {
-                self.presses.insert(item, None);
-            } else {
+    ) -> Vec<ProjectionId> {
+        if let Some((item, confirmed)) = self.physical.press_done(id, ok, now).ok().flatten() {
+            if !confirmed {
                 self.cleanup_press(item, now, out);
             }
-            return None;
+            return Vec::new();
         }
-        let pending = self.pending.remove(&id)?;
-        let lease = self.leases.get_mut(&pending.owner)?;
-        let items: Vec<_> = pending
-            .items
-            .into_iter()
-            .filter(|(item, generation)| {
-                lease.unconfirmed.get(item) == Some(generation)
-                    && (ok
-                        || lease
-                            .retry
-                            .get(item)
-                            .is_some_and(|(_, current)| *current == id))
-            })
-            .map(|(item, _)| item)
-            .collect();
-        if items.is_empty() {
-            return None;
+        let mut failed = Vec::new();
+        for pending in self.pending.remove(&id).unwrap_or_default() {
+            let Some(lease) = self.leases.get(&pending.owner) else {
+                continue;
+            };
+            let items: Vec<_> = pending
+                .items
+                .into_iter()
+                .filter(|(item, generation)| {
+                    lease.unconfirmed.get(item) == Some(generation)
+                        && self.physical.release_member(*item, id, ok)
+                })
+                .map(|(item, _)| item)
+                .collect();
+            if self.confirm_release(pending.owner, &items, ok, now) {
+                failed.push(pending.owner);
+            }
         }
-        let journal_failed = self.confirm_release(pending.owner, &items, ok, now);
         self.collect();
-        journal_failed.then_some(pending.owner)
+        failed
     }
 
     // Do not collect here: an absorbed up can be one of several actions for a retired scope.
@@ -651,8 +686,9 @@ impl Ledgers {
         } else {
             // A current failed request backs off only its own items, never another item's retry.
             for item in items {
-                if let Some((deadline, _)) = lease.retry.get_mut(item) {
+                if let Some((deadline, id)) = lease.retry.get_mut(item) {
                     *deadline = now.saturating_add(RETRY);
+                    self.physical.release_failed(*item, *id, now);
                 }
             }
         }
@@ -662,24 +698,24 @@ impl Ledgers {
     fn collect(&mut self) {
         self.leases
             .retain(|_, lease| !lease.retired || !lease.unconfirmed.is_empty());
-        self.blocked.retain(|item| {
-            self.leases.values().any(|lease| {
-                lease.unconfirmed.contains_key(item) || lease.ledger.held().contains(item)
-            })
-        });
-        // IDs descend; ordered traversal retains eight newest exact requests per generation.
-        let mut histories = BTreeMap::new();
-        self.pending.retain(|_, pending| {
-            self.leases.get(&pending.owner).is_some_and(|lease| {
-                pending.items.retain(|(item, generation)| {
-                    let count = histories
-                        .entry((pending.owner, *item, *generation))
-                        .or_insert(0);
-                    *count += 1;
-                    lease.unconfirmed.get(item) == Some(generation) && *count <= RELEASE_HISTORY
-                });
-                !pending.items.is_empty()
-            })
+        let owing = self
+            .leases
+            .values()
+            .flat_map(|lease| lease.unconfirmed.keys().copied())
+            .collect();
+        let _ = self.physical.retain_blocks(false, owing);
+        // The coordinator's eight exact IDs bound membership independently of ID ordering.
+        self.pending.retain(|id, requests| {
+            requests.retain_mut(|pending| {
+                self.leases.get(&pending.owner).is_some_and(|lease| {
+                    pending.items.retain(|(item, generation)| {
+                        lease.unconfirmed.get(item) == Some(generation)
+                            && self.physical.release_member(*item, *id, true)
+                    });
+                    !pending.items.is_empty()
+                })
+            });
+            !requests.is_empty()
         });
     }
 
@@ -703,11 +739,7 @@ impl Ledgers {
             })
             .flatten()
             .chain(self.targeting.as_ref().map(|targeting| targeting.deadline))
-            .chain(
-                self.presses
-                    .values()
-                    .filter_map(|pending| pending.map(|(_, deadline)| deadline)),
-            )
+            .chain(self.physical.next_deadline().ok().flatten())
             .min()
     }
 }
@@ -958,7 +990,7 @@ mod tests {
             journal.0.lock().unwrap().fail_up = true;
             assert_eq!(
                 ledgers.done(release_id(&out), true, time(0), &mut out),
-                Some(SECOND)
+                vec![SECOND]
             );
             assert_eq!(journal.held().unwrap(), vec![item]);
             out.clear();
@@ -1412,6 +1444,7 @@ mod tests {
                 ledgers
                     .pending
                     .values()
+                    .flatten()
                     .all(|pending| pending.items.len() == 2)
             );
             assert!(!ledgers.recovery_done());
@@ -1551,7 +1584,7 @@ mod tests {
                 panic!("missing release")
             };
             let id = *id;
-            assert_eq!(ledgers.done(id, true, now, &mut out), None);
+            assert!(ledgers.done(id, true, now, &mut out).is_empty());
             assert!(ledgers.leases[&owner].generations.is_empty());
             out.clear();
         }

@@ -418,7 +418,13 @@ fn same_controller_restart_releases_old_session_before_acceptance() {
     let mut f = Fixture::active();
     f.handle(key(1, KEY, true), 0);
     let out = f.handle(start(PEER, SessionId(11)), 1);
-    assert_eq!(commands(&out)[0], InjectCmd::ReleaseAll);
+    assert_eq!(
+        commands(&out)[0],
+        InjectCmd::Key {
+            usage: KEY,
+            down: false
+        }
+    );
     assert_eq!(
         &out[1..5],
         ended(Some(EndReason::Released), Notice::ControlEnded(PEER))
@@ -625,7 +631,7 @@ fn lease_expires_after_300_ms_without_heartbeat() {
             }
         ]
     );
-    assert_eq!(f.target.next_deadline(), None);
+    assert_eq!(f.target.next_deadline(), Some(ms(361)));
     f.confirm(&out, true, 311);
     assert!(f.held().is_empty());
     assert!(f.handle(Input::Tick, 312).is_empty());
@@ -669,7 +675,13 @@ fn controller_end_releases_without_reply_and_clears_session() {
     let mut f = Fixture::active();
     f.handle(key(1, KEY, true), 0);
     let out = f.handle(end(PEER, SESSION), 1);
-    assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(
+        commands(&out),
+        vec![InjectCmd::Key {
+            usage: KEY,
+            down: false
+        }]
+    );
     assert_eq!(&out[1..], ended(None, Notice::ControlEnded(PEER)));
     f.confirm(&out, true, 1);
     assert!(f.held().is_empty());
@@ -698,7 +710,13 @@ fn link_closed_ends_only_its_controller_without_reply() {
         }),
         1,
     );
-    assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(
+        commands(&out),
+        vec![InjectCmd::Button {
+            button: BUTTON,
+            down: false
+        }]
+    );
     assert_eq!(&out[1..], ended(None, Notice::ControlEnded(PEER)));
     f.confirm(&out, true, 1);
     assert!(f.held().is_empty());
@@ -727,7 +745,13 @@ fn locking_unknown_or_inactive_ends_with_specific_notice_and_releases() {
         let mut f = Fixture::active();
         f.handle(key(1, KEY, true), 0);
         let out = f.handle(Input::Session(SessionEvent::State(state)), 1);
-        assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
+        assert_eq!(
+            commands(&out),
+            vec![InjectCmd::Key {
+                usage: KEY,
+                down: false
+            }]
+        );
         assert_eq!(
             &out[1..],
             ended(Some(EndReason::TargetLocked), Notice::TargetLocked(PEER))
@@ -743,7 +767,13 @@ fn sleep_and_wake_require_fresh_state_even_if_state_arrived_while_asleep() {
     let mut f = Fixture::active();
     f.handle(button(1, true), 0);
     let out = f.handle(Input::Session(SessionEvent::WillSleep), 1);
-    assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(
+        commands(&out),
+        vec![InjectCmd::Button {
+            button: BUTTON,
+            down: false
+        }]
+    );
     assert_eq!(
         &out[1..],
         ended(Some(EndReason::TargetLocked), Notice::TargetLocked(PEER))
@@ -781,7 +811,13 @@ fn revocation_ends_session_but_unrelated_grants_do_not() {
         Input::Grants([(PEER, BTreeSet::from([Capability::WindowShare]))].into()),
         1,
     );
-    assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(
+        commands(&out),
+        vec![InjectCmd::Key {
+            usage: KEY,
+            down: false
+        }]
+    );
     assert_eq!(
         &out[1..],
         ended(Some(EndReason::Revoked), Notice::ControlEnded(PEER))
@@ -800,13 +836,25 @@ fn local_override_releases_ends_and_never_resumes() {
     f.handle(key(1, KEY, true), 0);
     f.handle(button(2, true), 0);
     let out = f.handle(activity(), 10);
-    assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(
+        commands(&out),
+        vec![
+            InjectCmd::Key {
+                usage: KEY,
+                down: false
+            },
+            InjectCmd::Button {
+                button: BUTTON,
+                down: false
+            },
+        ]
+    );
     let mut expected = vec![status(TargetStatus::LocalOverride)];
     expected.extend(ended(None, Notice::ControlEnded(PEER)));
-    assert_eq!(&out[1..], expected);
+    assert_eq!(&out[2..], expected);
     assert!(!f.target.is_controlled());
     assert_eq!(f.target.controller(), None);
-    assert_eq!(f.target.next_deadline(), None);
+    assert_eq!(f.target.next_deadline(), Some(ms(60)));
     // Journal records stay until the release is confirmed, exactly as on controller release.
     assert_eq!(f.held(), vec![Held::Key(KEY), Held::Button(BUTTON)]);
     f.confirm(&out, true, 10);
@@ -844,10 +892,10 @@ fn local_override_releases_ends_and_never_resumes() {
 fn local_override_without_held_items_still_releases_and_ends_once() {
     let mut f = Fixture::active();
     let out = f.handle(activity(), 0);
-    assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
+    assert!(commands(&out).is_empty());
     let mut expected = vec![status(TargetStatus::LocalOverride)];
     expected.extend(ended(None, Notice::ControlEnded(PEER)));
-    assert_eq!(&out[1..], expected);
+    assert_eq!(out, expected);
     assert!(!f.target.is_controlled());
     assert!(f.handle(activity(), 1).is_empty());
 }
@@ -868,7 +916,13 @@ fn panic_releases_and_ends_with_panic_reason() {
     let mut f = Fixture::active();
     f.handle(key(1, KEY, true), 0);
     let out = f.handle(Input::Command(Command::Panic), 1);
-    assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(
+        commands(&out),
+        vec![InjectCmd::Key {
+            usage: KEY,
+            down: false
+        }]
+    );
     assert_eq!(
         &out[1..],
         ended(Some(EndReason::Panic), Notice::ControlEnded(PEER))
@@ -911,7 +965,9 @@ fn crash_recovery_precedes_permission_and_clears_journal_only_on_success() {
         vec![Held::Key(KEY), Held::Key(KEY2), Held::Button(BUTTON)]
     );
     assert_eq!(f.target.next_deadline(), Some(ms(57)));
-    assert!(f.handle(Input::Tick, 57).is_empty());
+    let retry = f.handle(Input::Tick, 57);
+    assert_eq!(commands(&retry), commands(&out));
+    assert_ne!(injections(&retry)[0].0, injections(&out)[0].0);
     f.confirm(&out, true, 57);
     assert!(f.held().is_empty());
     assert_eq!(f.target.next_deadline(), None);
@@ -968,11 +1024,23 @@ fn failed_key_button_and_release_all_retry_once_per_tick_even_when_locked() {
     );
     assert!(commands(&ending).is_empty());
     let retry = f.handle(Input::Tick, 52);
-    assert_eq!(commands(&retry), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(
+        commands(&retry),
+        vec![
+            InjectCmd::Key {
+                usage: KEY,
+                down: false
+            },
+            InjectCmd::Button {
+                button: BUTTON,
+                down: false
+            },
+        ]
+    );
     assert_eq!(f.held(), vec![Held::Key(KEY), Held::Button(BUTTON)]);
     f.confirm(&retry, false, 52);
     let later = f.handle(Input::Tick, 102);
-    assert_eq!(commands(&later), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(commands(&later), commands(&retry));
     f.confirm(&later, true, 102);
     assert!(f.held().is_empty());
     assert_eq!(f.target.next_deadline(), None);
@@ -987,11 +1055,28 @@ fn retry_release_all_accounts_for_newly_held_items_too() {
     f.confirm(&up, false, 1);
     f.handle(button(3, true), 2);
     let retry = f.handle(Input::Tick, 51);
-    assert_eq!(commands(&retry), vec![InjectCmd::ReleaseAll]);
+    assert_eq!(
+        commands(&retry),
+        vec![InjectCmd::Key {
+            usage: KEY,
+            down: false
+        }]
+    );
     f.confirm(&retry, true, 51);
+    assert_eq!(f.held(), vec![Held::Button(BUTTON)]);
+    assert_eq!(f.target.next_deadline(), Some(after_ms(302)));
+    let button_up = f.handle(button(4, false), 52);
+    assert_eq!(
+        commands(&button_up),
+        vec![InjectCmd::Button {
+            button: BUTTON,
+            down: false
+        }]
+    );
+    assert_eq!(button_up.last(), Some(&ack(4)));
+    f.confirm(&button_up, true, 52);
     assert!(f.held().is_empty());
     assert_eq!(f.target.next_deadline(), None);
-    assert_eq!(f.handle(button(4, false), 52), vec![ack(4)]);
 }
 
 #[test]
@@ -1014,10 +1099,16 @@ fn delayed_release_confirmation_cannot_clear_a_later_press_or_release() {
 fn failed_press_waits_for_heartbeat_or_lease_and_keeps_journal_record() {
     let mut f = Fixture::active();
     let press = f.handle(key(1, KEY, true), 0);
-    f.confirm(&press, false, 0);
+    let release = f.handle(
+        Input::InjectDone {
+            id: injections(&press)[0].0,
+            ok: false,
+        },
+        0,
+    );
     assert_eq!(f.held(), vec![Held::Key(KEY)]);
-    assert_eq!(f.target.next_deadline(), Some(after_ms(300)));
-    let release = f.handle(heartbeat(2, vec![], vec![]), 50);
+    assert_eq!(f.target.next_deadline(), Some(ms(50)));
+    assert!(commands(&f.handle(heartbeat(2, vec![], vec![]), 50)).is_empty());
     assert_eq!(
         commands(&release),
         vec![InjectCmd::Key {
@@ -1035,9 +1126,21 @@ fn down_journal_failure_ends_session_releases_all_and_acks_without_pressing() {
     f.handle(button(1, true), 0);
     f.journal.0.lock().unwrap().fail_down = true;
     let out = f.handle(key(2, KEY, true), 1);
-    assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
     assert_eq!(
-        &out[1..5],
+        commands(&out),
+        vec![
+            InjectCmd::Key {
+                usage: KEY,
+                down: false
+            },
+            InjectCmd::Button {
+                button: BUTTON,
+                down: false
+            },
+        ]
+    );
+    assert_eq!(
+        &out[2..6],
         ended(Some(EndReason::Released), Notice::ControlEnded(PEER))
     );
     assert_eq!(out.last(), Some(&ack(2)));
@@ -1072,7 +1175,7 @@ fn local_override_clears_lease_deadline_and_keeps_release_retry() {
     f.handle(key(1, KEY, true), 10);
     assert_eq!(f.target.next_deadline(), Some(after_ms(310)));
     let out = f.handle(activity(), 20);
-    assert_eq!(f.target.next_deadline(), None);
+    assert_eq!(f.target.next_deadline(), Some(ms(70)));
     f.confirm(&out, false, 20);
     assert_eq!(f.target.next_deadline(), Some(ms(70)));
     let retry = f.handle(Input::Tick, 70);
@@ -1197,9 +1300,22 @@ fn persistent_record_up_failure_cannot_form_a_completion_feedback_loop() {
     for tick in 1..=10 {
         let now = 2 + tick * 50;
         let out = f.handle(Input::Tick, now);
-        assert_eq!(commands(&out), vec![InjectCmd::ReleaseAll]);
-        let id = injections(&out)[0].0;
-        assert!(f.handle(Input::InjectDone { id, ok: true }, now).is_empty());
+        assert_eq!(
+            commands(&out),
+            vec![
+                InjectCmd::Key {
+                    usage: KEY,
+                    down: false
+                },
+                InjectCmd::Button {
+                    button: BUTTON,
+                    down: false
+                },
+            ]
+        );
+        for (id, _) in injections(&out) {
+            assert!(f.handle(Input::InjectDone { id, ok: true }, now).is_empty());
+        }
     }
     assert_eq!(f.held(), vec![Held::Key(KEY), Held::Button(BUTTON)]);
 }
@@ -1238,13 +1354,22 @@ fn untracked_injections_do_not_accumulate_pending_results() {
             ids.extend(
                 injections(&f.handle(input, 0))
                     .into_iter()
-                    .map(|(id, _)| id),
+                    .map(|(id, cmd)| (id, matches!(cmd, InjectCmd::Key { down: true, .. }))),
             );
         }
     }
     assert!(format!("{:?}", f.target).contains("pending_count: 0"));
-    for id in ids {
-        assert!(f.handle(Input::InjectDone { id, ok: false }, 0).is_empty());
+    for (id, establishing) in ids {
+        assert!(
+            f.handle(
+                Input::InjectDone {
+                    id,
+                    ok: establishing
+                },
+                0
+            )
+            .is_empty()
+        );
     }
     assert_eq!(f.target.next_deadline(), Some(after_ms(300)));
     let up = f.handle(key(1_001, KEY, false), 1);
@@ -1289,6 +1414,95 @@ impl FakeInjector {
     }
 }
 
+#[derive(Default)]
+struct PropertyExecutor {
+    injector: FakeInjector,
+    active: bool,
+    last_id: u64,
+    pending: Vec<(InjectId, bool)>,
+}
+
+struct Execution {
+    now: u64,
+    ok: bool,
+    delayed: bool,
+    permitted: bool,
+    granted: bool,
+}
+
+impl PropertyExecutor {
+    fn run(
+        &mut self,
+        f: &mut Fixture,
+        out: Vec<Output>,
+        execution: Execution,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let mut outputs = std::collections::VecDeque::from(out);
+        let mut steps = 0;
+        while let Some(output) = outputs.pop_front() {
+            steps += 1;
+            prop_assert!(steps < 10_000, "completion feedback loop");
+            match output {
+                Output::Inject { id, cmd } => {
+                    prop_assert!(id.0 > self.last_id);
+                    self.last_id = id.0;
+                    let release = matches!(
+                        cmd,
+                        InjectCmd::Key { down: false, .. }
+                            | InjectCmd::Button { down: false, .. }
+                            | InjectCmd::ReleaseAll
+                            | InjectCmd::Recover { .. }
+                    );
+                    prop_assert!(
+                        release || execution.permitted,
+                        "forbidden injection: {cmd:?}"
+                    );
+                    match &cmd {
+                        InjectCmd::Key { usage, down: true } => {
+                            prop_assert!(self.active && f.held().contains(&Held::Key(*usage)))
+                        }
+                        InjectCmd::Button { button, down: true } => {
+                            prop_assert!(self.active && f.held().contains(&Held::Button(*button)))
+                        }
+                        _ => {}
+                    }
+                    self.injector.apply(&cmd, execution.ok);
+                    if execution.delayed {
+                        self.pending.push((id, execution.ok));
+                    } else {
+                        outputs.extend(f.handle(
+                            Input::InjectDone {
+                                id,
+                                ok: execution.ok,
+                            },
+                            execution.now,
+                        ));
+                    }
+                }
+                Output::SendControl {
+                    msg: ControlMessage::ControlStarted { .. },
+                    ..
+                } => {
+                    prop_assert!(execution.permitted && execution.granted);
+                    self.active = true;
+                }
+                Output::Notice(Notice::ControlEnded(_) | Notice::TargetLocked(_)) => {
+                    self.active = false;
+                }
+                _ => {}
+            }
+        }
+        let journaled = f.held();
+        prop_assert!(
+            self.injector
+                .held
+                .iter()
+                .all(|item| journaled.contains(item))
+        );
+        Ok(())
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 2_000,
@@ -1301,16 +1515,13 @@ proptest! {
         events in prop::collection::vec((0u8..24, any::<u8>(), 0u16..400, any::<bool>()), 1..160)
     ) {
         let mut f = Fixture::new();
-        let mut injector = FakeInjector::default();
+        let mut executor = PropertyExecutor::default();
         let mut state = SessionState { lock: LockState::Locked, active: None };
         let mut asleep = false;
         let mut fresh = false;
         let mut granted = false;
-        let mut active = false;
         let mut now = 0;
         let mut seq = 0;
-        let mut pending = Vec::new();
-        let mut last_id = 0;
         for (kind, arg, elapsed, ok) in events {
             now += u64::from(elapsed);
             seq += 1;
@@ -1337,72 +1548,97 @@ proptest! {
                 19 => Input::Command(Command::Panic),
                 20 => message(InputMessage::Scroll { session: SESSION, seq, delta: scroll() }),
                 21 => message(InputMessage::LockKeys { session: SESSION, seq, keys: locks() }),
-                22 if !pending.is_empty() => {
-                    let index = usize::from(arg) % pending.len();
-                    let (id, ok) = pending.swap_remove(index);
+                22 if !executor.pending.is_empty() => {
+                    let index = usize::from(arg) % executor.pending.len();
+                    let (id, ok) = executor.pending.swap_remove(index);
                     Input::InjectDone { id, ok }
                 }
                 _ => Input::Tick,
             };
             let permitted = state.permits_io() && !asleep && fresh;
             let out = f.handle(input, now);
-            for output in &out {
-                match output {
-                    Output::Inject { id, cmd } => {
-                        prop_assert!(id.0 > last_id);
-                        last_id = id.0;
-                        let release = matches!(cmd, InjectCmd::Key { down: false, .. } | InjectCmd::Button { down: false, .. } | InjectCmd::ReleaseAll | InjectCmd::Recover { .. });
-                        prop_assert!(release || permitted, "forbidden injection: {cmd:?}");
-                        match cmd {
-                            InjectCmd::Key { usage, down: true } => prop_assert!(active && f.held().contains(&Held::Key(*usage))),
-                            InjectCmd::Button { button, down: true } => prop_assert!(active && f.held().contains(&Held::Button(*button))),
-                            _ => {}
-                        }
-                        // Decide the real execution result now, including failed releases. Only
-                        // successful commands affect the fake; deliver that same result later.
-                        injector.apply(cmd, ok);
-                        if arg % 2 == 0 {
-                            // Immediate failed results let subsequent random ticks exercise
-                            // retries during the sequence, as well as during final cleanup.
-                            prop_assert!(
-                                f.handle(Input::InjectDone { id: *id, ok }, now).is_empty(),
-                                "completion unexpectedly emitted outputs"
-                            );
-                        } else {
-                            pending.push((*id, ok));
-                        }
-                    }
-                    Output::SendControl { msg: ControlMessage::ControlStarted { .. }, .. } => {
-                        prop_assert!(permitted && granted);
-                        active = true;
-                    }
-                    Output::Notice(Notice::ControlEnded(_) | Notice::TargetLocked(_)) => {
-                        active = false;
-                    }
-                    _ => {}
-                }
-            }
-            // A failed release may leave physical state held after the session ends. It must
-            // remain journaled until an actually successful retry, even with delayed results.
-            let journaled = f.held();
-            prop_assert!(injector.held.iter().all(|item| journaled.contains(item)));
+            // Returned uncertainty cleanup runs through exactly the same strict fake executor.
+            executor.run(&mut f, out, Execution { now, ok, delayed: arg % 2 != 0, permitted, granted })?;
         }
+        let permitted = state.permits_io() && !asleep && fresh;
         let out = f.handle(Input::Command(Command::Panic), now + 1);
-        for (_, cmd) in injections(&out) { injector.apply(&cmd, true); }
-        // A final successful retry must also clear all journaled releases.
-        f.confirm(&out, true, now + 1);
-        // Report the real outcomes of executions left in flight. Failed releases must enter
-        // the timer retry path rather than being falsely confirmed at the end of the run.
-        for (id, ok) in pending {
-            prop_assert!(
-                commands(&f.handle(Input::InjectDone { id, ok }, now + 1)).is_empty(),
-                "completion unexpectedly emitted injections"
-            );
+        executor.run(&mut f, out, Execution { now: now + 1, ok: true, delayed: false, permitted, granted })?;
+        // Original delayed results retain their real execution outcomes. Newly requested cleanup
+        // is executed successfully, just as the original final successful teardown was.
+        for (id, ok) in std::mem::take(&mut executor.pending) {
+            let cleanup = f.handle(Input::InjectDone { id, ok }, now + 1);
+            executor.run(&mut f, cleanup, Execution { now: now + 1, ok: true, delayed: false, permitted, granted })?;
         }
         let retry = f.handle(Input::Tick, now + 51);
-        for (_, cmd) in injections(&retry) { injector.apply(&cmd, true); }
-        f.confirm(&retry, true, now + 51);
-        prop_assert!(injector.held.is_empty());
+        executor.run(&mut f, retry, Execution { now: now + 51, ok: true, delayed: false, permitted, granted })?;
+        prop_assert!(executor.injector.held.is_empty());
         prop_assert!(f.held().is_empty());
     }
+}
+
+#[test]
+fn n1e2a_unanswered_e1_releases_retry_items_independently() {
+    let mut f = Fixture::active();
+    let key_down = f.handle(key(1, KEY, true), 0);
+    let button_down = f.handle(button(2, true), 0);
+    f.confirm(&key_down, true, 0);
+    f.confirm(&button_down, true, 0);
+    let key_up = f.handle(key(3, KEY, false), 1);
+    let button_up = f.handle(button(4, false), 10);
+    assert_eq!(f.target.next_deadline(), Some(ms(51)));
+    // Failure of only the key cannot postpone the independently unanswered button release.
+    f.confirm(&key_up, false, 49);
+    assert_eq!(f.target.next_deadline(), Some(ms(60)));
+    let retry = f.handle(Input::Tick, 60);
+    assert_eq!(
+        commands(&retry),
+        vec![InjectCmd::Button {
+            button: BUTTON,
+            down: false,
+        }]
+    );
+    f.confirm(&button_up, true, 61);
+    assert_eq!(f.held(), vec![Held::Key(KEY)]);
+    assert_eq!(f.target.next_deadline(), Some(ms(99)));
+    let key_retry = f.handle(Input::Tick, 99);
+    assert_eq!(
+        commands(&key_retry),
+        vec![InjectCmd::Key {
+            usage: KEY,
+            down: false,
+        }]
+    );
+    f.confirm(&key_retry, true, 99);
+    f.confirm(&retry, false, 100);
+    assert!(f.held().is_empty());
+    assert_eq!(f.target.next_deadline(), None);
+}
+
+#[test]
+fn n1e2a_e1_release_membership_is_bounded_and_exact() {
+    let mut f = Fixture::active();
+    let down = f.handle(key(1, KEY, true), 0);
+    f.confirm(&down, true, 0);
+    let first = f.handle(key(2, KEY, false), 1);
+    let unrelated = f.handle(motion(1), 2);
+    let mut newest = Vec::new();
+    for attempt in 1..=20 {
+        newest = f.handle(Input::Tick, 1 + attempt * 50);
+        assert_eq!(
+            commands(&newest),
+            vec![InjectCmd::Key {
+                usage: KEY,
+                down: false,
+            }]
+        );
+        assert!(format!("{:?}", f.target).contains("pending_count: 8") || attempt < 8);
+    }
+    // A numerically interleaved pointer request is not release membership; an evicted Up is
+    // unknown too. Only one of the eight exact retained requests can confirm this generation.
+    f.confirm(&unrelated, true, 1002);
+    f.confirm(&first, true, 1002);
+    assert_eq!(f.held(), vec![Held::Key(KEY)]);
+    f.confirm(&newest, true, 1002);
+    assert!(f.held().is_empty());
+    assert_eq!(f.target.next_deadline(), None);
 }
