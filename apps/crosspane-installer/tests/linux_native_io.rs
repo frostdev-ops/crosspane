@@ -15,6 +15,123 @@ use std::{
 };
 
 static ROOT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn fc_match_is_exactly_allowlisted_and_runs_only_the_injected_runner() {
+    let fixture = Fixture::plain();
+    let environment = ChildEnvironment::selected(fixture.io.target(), BTreeMap::new()).unwrap();
+    let argv = vec!["-f".into(), "%{file}".into(), "sans-serif".into()];
+    for (path, args) in [
+        ("/bin/fc-match", argv.clone()),
+        ("/usr/bin/fc-match", vec!["sans-serif".into()]),
+        (
+            "/usr/bin/fc-match",
+            vec!["-f".into(), "%{family}".into(), "sans-serif".into()],
+        ),
+        (
+            "/usr/bin/fc-match",
+            vec!["-f".into(), "%{file}".into(), "serif".into()],
+        ),
+        (
+            "/usr/bin/fc-match",
+            vec![
+                "-f".into(),
+                "%{file}".into(),
+                "sans-serif".into(),
+                "--verbose".into(),
+            ],
+        ),
+    ] {
+        assert!(CommandSpec::new(path.into(), args, environment.clone(), 256).is_err());
+    }
+    let command =
+        CommandSpec::new("/usr/bin/fc-match".into(), argv.clone(), environment, 256).unwrap();
+    let answer = b"/usr/share/fonts/fixture.ttf".to_vec();
+    *fixture.runner.output.lock().unwrap() = Some((Some(0), answer.clone(), Vec::new()));
+    assert_eq!(
+        fixture.io.run(&command, &deadline()).unwrap().stdout,
+        answer
+    );
+    let calls = fixture.runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].argv(), argv);
+    assert_eq!(
+        calls[0].executable(),
+        std::path::Path::new("/usr/bin/fc-match")
+    );
+    drop(calls);
+    *fixture.runner.output.lock().unwrap() = Some((Some(0), vec![0; 257], Vec::new()));
+    assert_eq!(
+        fixture.io.run(&command, &deadline()).unwrap_err(),
+        NativeError::Oversize
+    );
+}
+
+#[test]
+fn show_environment_is_read_only_pinned_and_drift_discards_fake_output() {
+    use std::os::unix::net::UnixListener;
+    let fixture = Fixture::plain();
+    let root = fixture.io.target().paths().runtime_home.join("systemd");
+    fixture
+        .io
+        .create_private_dir(&fixture.proof(), &root)
+        .unwrap();
+    let path = root.join("private");
+    let _listener = UnixListener::bind(&path).unwrap();
+    let environment = fixture
+        .io
+        .manager_environment(BTreeMap::new(), &deadline())
+        .unwrap();
+    let args = vec!["--user".into(), "show-environment".into()];
+    for args in [
+        vec!["show-environment".into()],
+        vec!["--system".into(), "show-environment".into()],
+        vec![
+            "--user".into(),
+            "show-environment".into(),
+            "foreign.service".into(),
+        ],
+        vec![
+            "--user".into(),
+            "show-environment".into(),
+            "--host=foreign".into(),
+        ],
+    ] {
+        assert!(
+            CommandSpec::new("/usr/bin/systemctl".into(), args, environment.clone(), 256).is_err()
+        );
+    }
+    let command = CommandSpec::new("/usr/bin/systemctl".into(), args, environment, 256).unwrap();
+    *fixture.runner.output.lock().unwrap() = Some((
+        Some(0),
+        b"WAYLAND_DISPLAY=wayland-fixture\n".to_vec(),
+        Vec::new(),
+    ));
+    assert!(fixture.io.run(&command, &deadline()).is_ok());
+    let hook_path = path.clone();
+    *fixture.runner.hook.lock().unwrap() = Some((
+        2,
+        Box::new(move || {
+            fs::rename(&hook_path, hook_path.with_extension("old")).unwrap();
+            let listener = UnixListener::bind(&hook_path).unwrap();
+            drop(listener);
+        }),
+    ));
+    assert_eq!(
+        fixture.io.run(&command, &deadline()).unwrap_err(),
+        NativeError::Foreign
+    );
+    assert_eq!(fixture.runner.calls.lock().unwrap().len(), 2);
+    assert_eq!(
+        fixture.io.run(&command, &deadline()).unwrap_err(),
+        NativeError::Foreign
+    );
+    assert_eq!(
+        fixture.runner.calls.lock().unwrap().len(),
+        2,
+        "preflight drift must make zero runner calls"
+    );
+}
 const START: &[u8] = b"Fri Oct  2 12:00:00 2026\n";
 type FakeOutput = (Option<i32>, Vec<u8>, Vec<u8>);
 type QueryHook = (usize, Box<dyn FnOnce() + Send>);

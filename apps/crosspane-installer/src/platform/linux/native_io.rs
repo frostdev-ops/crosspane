@@ -1,6 +1,7 @@
 //! Native observations do not imply readiness. Scratch authority stays inside its own target.
 use crate::agent_contract::{BootstrapV1, InstanceStatus, ObservationSource, parse_bootstrap};
 use rustix::fs::{self as rfs, AtFlags, FlockOperation, Mode, OFlags, ResolveFlags};
+use rustix::net::{self as rnet, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -8,6 +9,7 @@ use std::{
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::fs::{DirBuilderExt, MetadataExt},
+        unix::net::UnixStream,
     },
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -24,6 +26,289 @@ pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
 pub const MAX_NATIVE_TIMEOUT_MS: u64 = 120_000;
 pub const SUPPORT_LIFETIME: Duration = Duration::from_secs(5);
+pub const MAX_OS_RELEASE_BYTES: usize = 64 * 1024;
+pub const MAX_FONT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ELF_PREFIX_BYTES: usize = 4 * 1024 * 1024;
+static READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Read-only system namespaces; ELF returns a prefix, never executes or resolves a program.
+#[derive(Clone, Debug)]
+pub enum SystemRead {
+    OsRelease,
+    OsReleaseFallback,
+    Font(PathBuf),
+    ElfPrefix(PathBuf),
+}
+#[derive(Debug)]
+pub struct SystemBytes {
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+    /// Full admitted file length; an ELF prefix may be shorter.
+    pub file_size: u64,
+}
+impl SystemRead {
+    fn path_and_limit(&self) -> Result<(PathBuf, usize)> {
+        let (path, limit) = match self {
+            Self::OsRelease => (PathBuf::from("/etc/os-release"), MAX_OS_RELEASE_BYTES),
+            Self::OsReleaseFallback => (PathBuf::from("/usr/lib/os-release"), MAX_OS_RELEASE_BYTES),
+            Self::Font(path) => (path.clone(), MAX_FONT_BYTES),
+            Self::ElfPrefix(path) => (path.clone(), MAX_ELF_PREFIX_BYTES),
+        };
+        if !clean(&path)
+            || match self {
+                Self::Font(_) => {
+                    !path.starts_with("/usr/share/fonts") || path == Path::new("/usr/share/fonts")
+                }
+                Self::ElfPrefix(_) => !["/usr/lib", "/usr/lib64"]
+                    .iter()
+                    .any(|root| path.starts_with(root) && path != Path::new(root)),
+                _ => false,
+            }
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok((path, limit))
+    }
+}
+
+struct ReadParent {
+    directories: Vec<OwnedFd>,
+    name: String,
+}
+impl ReadParent {
+    fn open_file(&self) -> Result<OwnedFd> {
+        rfs::openat(
+            self.directories.last().ok_or(NativeError::Invalid)?,
+            &self.name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| NativeError::Foreign)
+    }
+    fn same_as(&self, other: &Self) -> Result<()> {
+        if self.directories.len() != other.directories.len() {
+            return Err(NativeError::Foreign);
+        }
+        for (old, new) in self.directories.iter().zip(&other.directories) {
+            let a = native(rfs::fstat(old))?;
+            let b = native(rfs::fstat(new))?;
+            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino) {
+                return Err(NativeError::Foreign);
+            }
+        }
+        Ok(())
+    }
+}
+fn read_stat(stat: &rfs::Stat, uid: u32, kind: u32) -> Result<()> {
+    if stat.st_uid != uid || stat.st_mode & 0o170000 != kind || stat.st_mode & 0o022 != 0 {
+        return Err(NativeError::Foreign);
+    }
+    Ok(())
+}
+// The anchor is / for system data, or the admitted private runtime for selected sockets.
+fn read_parent(anchor: OwnedFd, relative: &Path, uid: u32) -> Result<ReadParent> {
+    let name = relative
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or(NativeError::Invalid)?
+        .to_owned();
+    let mut directories = vec![anchor];
+    read_stat(&native(rfs::fstat(&directories[0]))?, uid, 0o040000)?;
+    for component in relative.parent().ok_or(NativeError::Invalid)?.components() {
+        let Component::Normal(name) = component else {
+            return Err(NativeError::Foreign);
+        };
+        let current = directories.last().ok_or(NativeError::Invalid)?;
+        let child = rfs::openat(
+            current,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| NativeError::Foreign)?;
+        read_stat(&native(rfs::fstat(&child))?, uid, 0o040000)?;
+        directories.push(child);
+    }
+    Ok(ReadParent { directories, name })
+}
+fn read_anchor(path: &Path) -> Result<OwnedFd> {
+    native(rfs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ))
+}
+fn system_contents(
+    file: &mut File,
+    stat: &rfs::Stat,
+    request: &SystemRead,
+    deadline: &Deadline,
+) -> Result<Vec<u8>> {
+    read_stat(stat, 0, 0o100000)?;
+    if stat.st_size < 0 {
+        return Err(NativeError::Invalid);
+    }
+    let (_, limit) = request.path_and_limit()?;
+    let prefix = matches!(request, SystemRead::ElfPrefix(_));
+    if !prefix && stat.st_size > limit as i64 {
+        return Err(NativeError::Oversize);
+    }
+    deadline.check()?;
+    let mut bytes = Vec::new();
+    native(
+        file.take((limit + usize::from(!prefix)) as u64)
+            .read_to_end(&mut bytes),
+    )?;
+    deadline.check()?;
+    if bytes.len() > limit {
+        return Err(NativeError::Oversize);
+    }
+    if prefix
+        && (bytes.len() < 16
+            || &bytes[..4] != b"\x7fELF"
+            || !matches!(bytes[4], 1 | 2)
+            || !matches!(bytes[5], 1 | 2)
+            || bytes[6] != 1)
+    {
+        return Err(NativeError::Invalid);
+    }
+    if prefix && bytes.len() < if bytes[4] == 1 { 52 } else { 64 } {
+        return Err(NativeError::Invalid);
+    }
+    Ok(bytes)
+}
+
+#[derive(Clone, Copy)]
+enum ReadSocket {
+    SessionBus,
+    SystemBus,
+    Wayland,
+    Hyprland,
+}
+fn read_socket_stat(stat: &rfs::Stat, uid: u32, public_bus: bool) -> Result<()> {
+    if stat.st_uid != uid
+        || stat.st_mode & 0o170000 != 0o140000
+        || stat.st_nlink != 1
+        || (!public_bus && stat.st_mode & 0o022 != 0)
+    {
+        return Err(NativeError::Foreign);
+    }
+    Ok(())
+}
+fn socket_location(
+    target: &LinuxTarget,
+    environment: Option<&ChildEnvironment>,
+    kind: ReadSocket,
+) -> Result<(PathBuf, u32)> {
+    if matches!(kind, ReadSocket::SystemBus) {
+        return Ok(("/run/dbus/system_bus_socket".into(), 0));
+    }
+    let environment = environment.ok_or(NativeError::Invalid)?;
+    if environment.nonce != target.nonce {
+        return Err(NativeError::Foreign);
+    }
+    let root = &target.paths.runtime_home;
+    let path = match kind {
+        ReadSocket::SessionBus => environment
+            .bus
+            .as_ref()
+            .ok_or(NativeError::Unavailable)?
+            .path
+            .clone(),
+        ReadSocket::Wayland => root.join(
+            environment
+                .values
+                .get("WAYLAND_DISPLAY")
+                .ok_or(NativeError::Unavailable)?,
+        ),
+        ReadSocket::Hyprland => {
+            let signature = environment
+                .values
+                .get("HYPRLAND_INSTANCE_SIGNATURE")
+                .ok_or(NativeError::Unavailable)?;
+            if signature.is_empty()
+                || signature.len() > 256
+                || !signature
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))
+            {
+                return Err(NativeError::Foreign);
+            }
+            root.join("hypr").join(signature).join(".socket.sock")
+        }
+        ReadSocket::SystemBus => return Err(NativeError::Invalid),
+    };
+    if !clean(&path) || !path.starts_with(root) || path == *root {
+        return Err(NativeError::Foreign);
+    }
+    Ok((path, target.paths.uid))
+}
+fn socket_parent(target: &LinuxTarget, path: &Path, uid: u32) -> Result<ReadParent> {
+    let root = if uid == 0 {
+        Path::new("/")
+    } else {
+        &target.paths.runtime_home
+    };
+    let anchor = if uid == 0 {
+        read_anchor(root)?
+    } else {
+        let anchor = walk_dir(target, root, None)?.ok_or(NativeError::Unavailable)?;
+        if native(rfs::fstat(&anchor))?.st_mode & 0o777 != 0o700 {
+            return Err(NativeError::Foreign);
+        }
+        anchor
+    };
+    read_parent(
+        anchor,
+        path.strip_prefix(root).map_err(|_| NativeError::Foreign)?,
+        uid,
+    )
+}
+fn socket_observation(parent: &ReadParent, uid: u32, public_bus: bool) -> Result<rfs::Stat> {
+    let dir = parent.directories.last().ok_or(NativeError::Invalid)?;
+    let stat = rfs::statat(dir, &parent.name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| NativeError::Foreign)?;
+    read_socket_stat(&stat, uid, public_bus)?;
+    Ok(stat)
+}
+fn read_peer(actual: u32, expected: u32) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(NativeError::Foreign)
+    }
+}
+fn connect_read_socket(parent: &ReadParent, uid: u32, deadline: &Deadline) -> Result<UnixStream> {
+    let dir = parent.directories.last().ok_or(NativeError::Invalid)?;
+    let address = native(SocketAddrUnix::new(format!(
+        "/proc/self/fd/{}/{}",
+        dir.as_raw_fd(),
+        parent.name
+    )))?;
+    let fd = native(rnet::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    ))?;
+    loop {
+        deadline.check()?;
+        match rnet::connect(&fd, &address) {
+            Ok(()) | Err(rustix::io::Errno::ISCONN) => break,
+            Err(
+                rustix::io::Errno::AGAIN
+                | rustix::io::Errno::INPROGRESS
+                | rustix::io::Errno::ALREADY,
+            ) => thread::sleep(Duration::from_millis(2)),
+            Err(_) => return Err(NativeError::Unavailable),
+        }
+    }
+    read_peer(
+        native(rnet::sockopt::socket_peercred(&fd))?.uid.as_raw(),
+        uid,
+    )?;
+    Ok(UnixStream::from(fd))
+}
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -555,7 +840,7 @@ impl CommandSpec {
         self.output_limit
     }
 }
-// Fixed mappings only: /bin/ps -> /usr/bin/ps; /usr/bin/systemctl -> /usr/bin/systemctl.
+// Fixed mappings only: /bin/ps -> /usr/bin/ps; systemctl and fc-match use their literal /usr/bin paths.
 /// The sole show query; no caller-selected property, unit, scope or remote target.
 pub const MANAGER_PROPERTIES: &str = "Id,LoadState,FragmentPath,DropInPaths,ExecStart,Environment,User,Group,DynamicUser,ActiveState,SubState,UnitFileState,MainPID,PartOf,After,Requisite,WantedBy,KillSignal,TimeoutStopUSec,Restart,RestartUSec,NeedDaemonReload,ExecStartPre,ExecStartPost,ExecStop,ExecStopPost,ExecReload,EnvironmentFiles,RootDirectory,RootImage,StartLimitIntervalUSec,StartLimitBurst,ExecCondition,Type,Requires,Wants,BindsTo,Upholds,OnFailure,Conflicts,Before,DefaultDependencies,KillMode,SendSIGKILL,FinalKillSignal,RestartKillSignal,SendSIGHUP,UnsetEnvironment,PassEnvironment,WorkingDirectory,UMask,BusName,PIDFile,RemainAfterExit,NotifyAccess,ExecSearchPath,StandardInput,StandardOutput,StandardError,TTYPath,OnSuccess,PropagatesStopTo,PropagatesReloadTo,ReloadPropagatedFrom,StopPropagatedFrom,JoinsNamespaceOf,RequiresMountsFor,WantsMountsFor,RequiredBy,RequisiteOf,BoundBy,UpheldBy,ConsistsOf,ConflictedBy,OnSuccessOf,OnFailureOf,Triggers,TriggeredBy,Following,SliceOf,DelegateControllers,DelegateSubgroup,Conditions,Asserts,ExecConditionEx,ExecStartPreEx,ExecStartPostEx,ExecStopEx,ExecStopPostEx,ExecReloadEx,ExecReloadPost,ExecReloadPostEx,RestartPreventExitStatus,RestartForceExitStatus,SuccessExitStatus,OpenFile,ExtraFileDescriptorNames,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,MountImages,ExtensionImages,ExtensionDirectories,PAMName,Slice,Delegate,OOMPolicy,ManagedOOMSwap,ManagedOOMMemoryPressure,ManagedOOMPreference,SuccessAction,FailureAction,StartLimitAction,JobTimeoutAction,OnSuccessJobMode,OnFailureJobMode,StopWhenUnneeded,RefuseManualStart,RefuseManualStop,AllowIsolate,IgnoreOnIsolate,SurviveFinalKillSignal,JobTimeoutUSec,JobRunningTimeoutUSec,CollectMode,RestartMode,RestartSteps,RestartMaxDelayUSec,TimeoutStartFailureMode,TimeoutStopFailureMode,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,WatchdogUSec,ExitType,FileDescriptorStoreMax,NFileDescriptorStore,FileDescriptorStorePreserve,RootDirectoryStartOnly,RootEphemeral,ExecStartEx,RuntimeDirectory,StateDirectory,CacheDirectory,LogsDirectory,ConfigurationDirectory,RuntimeDirectorySymlink,StateDirectorySymlink,CacheDirectorySymlink,LogsDirectorySymlink,RootMStack,RuntimeDirectoryPreserve";
 fn manager_mutation(spec: &CommandSpec) -> bool {
@@ -568,6 +853,8 @@ fn manager_mutation(spec: &CommandSpec) -> bool {
 fn approved_executable(path: &Path, argv: &[String]) -> Result<&'static str> {
     let a: Vec<_> = argv.iter().map(String::as_str).collect();
     match (path.to_str(), a.as_slice()) {
+        (Some("/usr/bin/fc-match"), ["-f", "%{file}", "sans-serif"]) => Ok("/usr/bin/fc-match"),
+        (Some("/usr/bin/systemctl"), ["--user", "show-environment"]) => Ok("/usr/bin/systemctl"),
         (Some("/bin/ps"), ["-o", "lstart=" | "comm=", "-p", pid])
             if pid
                 .parse::<u32>()
@@ -1045,6 +1332,8 @@ pub struct LinuxNativeIo {
     pub(crate) socket_uid: std::sync::Mutex<Option<u32>>,
     #[cfg(test)]
     pub(crate) peer_uid: std::sync::Mutex<Option<u32>>,
+    #[cfg(test)]
+    read_interleave: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl std::fmt::Debug for LinuxNativeIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1052,6 +1341,127 @@ impl std::fmt::Debug for LinuxNativeIo {
     }
 }
 impl LinuxNativeIo {
+    /// Root-owned, no-link reads in fixed namespaces. Scratch targets cannot probe the host.
+    /// Font candidates stay within /usr/share/fonts and reject every link in the original path.
+    /// ELF data is a bounded prefix only.
+    pub fn read_system(&self, request: SystemRead, deadline: &Deadline) -> Result<SystemBytes> {
+        request.path_and_limit()?;
+        if self.target.scratch {
+            return Err(NativeError::Foreign);
+        }
+        let target = self.target.clone();
+        let worker_deadline = deadline.clone();
+        bounded_launch(&READ_WORKERS, deadline, move || {
+            validate_target(&target)?;
+            let (path, _) = request.path_and_limit()?;
+            let relative = path.strip_prefix("/").map_err(|_| NativeError::Foreign)?;
+            let parent = read_parent(read_anchor(Path::new("/"))?, relative, 0)?;
+            let fd = parent.open_file()?;
+            let before = native(rfs::fstat(&fd))?;
+            let mut file = File::from(fd);
+            let bytes = system_contents(&mut file, &before, &request, &worker_deadline)?;
+            let current = read_parent(read_anchor(Path::new("/"))?, relative, 0)?;
+            parent.same_as(&current)?;
+            let after = native(rfs::statat(
+                current.directories.last().ok_or(NativeError::Invalid)?,
+                &parent.name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ))?;
+            read_stat(&after, 0, 0o100000)?;
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime,
+                before.st_mtime_nsec,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime,
+                after.st_mtime_nsec,
+            ) {
+                return Err(NativeError::Foreign);
+            }
+            worker_deadline.check()?;
+            validate_target(&target)?;
+            Ok(SystemBytes {
+                path,
+                bytes,
+                file_size: u64::try_from(before.st_size).map_err(|_| NativeError::Invalid)?,
+            })
+        })
+    }
+    fn connect_read_endpoint(
+        &self,
+        environment: Option<&ChildEnvironment>,
+        kind: ReadSocket,
+        deadline: &Deadline,
+    ) -> Result<UnixStream> {
+        if matches!(kind, ReadSocket::SystemBus) && self.target.scratch {
+            return Err(NativeError::Foreign);
+        }
+        socket_location(&self.target, environment, kind)?;
+        let target = self.target.clone();
+        let environment = environment.cloned();
+        let worker_deadline = deadline.clone();
+        #[cfg(test)]
+        let interleave = self.read_interleave.clone();
+        bounded_launch(&READ_WORKERS, deadline, move || {
+            validate_target(&target)?;
+            if let Some(bus) = environment.as_ref().and_then(|e| e.bus.as_ref()) {
+                bus.revalidate(&target)?;
+            }
+            let (path, uid) = socket_location(&target, environment.as_ref(), kind)?;
+            let parent = socket_parent(&target, &path, uid)?;
+            let public_bus = matches!(kind, ReadSocket::SessionBus | ReadSocket::SystemBus);
+            let before = socket_observation(&parent, uid, public_bus)?;
+            let stream = connect_read_socket(&parent, uid, &worker_deadline)?;
+            #[cfg(test)]
+            if let Some(interleave) = interleave {
+                interleave();
+            }
+            let current = socket_parent(&target, &path, uid)?;
+            parent.same_as(&current)?;
+            let after = socket_observation(&current, uid, public_bus)?;
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
+                return Err(NativeError::Foreign);
+            }
+            if let Some(bus) = environment.as_ref().and_then(|e| e.bus.as_ref()) {
+                bus.revalidate(&target)?;
+            }
+            worker_deadline.check()?;
+            validate_target(&target)?;
+            Ok(stream)
+        })
+    }
+    /// Connected nonblocking stream, bound to the environment's admitted bus and target.
+    /// No protocol bytes are sent; callers own bounded client I/O and must not reconnect by path.
+    pub fn connect_session_bus(
+        &self,
+        environment: &ChildEnvironment,
+        deadline: &Deadline,
+    ) -> Result<UnixStream> {
+        self.connect_read_endpoint(Some(environment), ReadSocket::SessionBus, deadline)
+    }
+    /// Every ancestor is root-owned/nonwritable; the root-owned socket may be 0666. Peer UID is 0.
+    pub fn connect_system_bus(&self, deadline: &Deadline) -> Result<UnixStream> {
+        self.connect_read_endpoint(None, ReadSocket::SystemBus, deadline)
+    }
+    pub fn connect_wayland(
+        &self,
+        environment: &ChildEnvironment,
+        deadline: &Deadline,
+    ) -> Result<UnixStream> {
+        self.connect_read_endpoint(Some(environment), ReadSocket::Wayland, deadline)
+    }
+    pub fn connect_hyprland(
+        &self,
+        environment: &ChildEnvironment,
+        deadline: &Deadline,
+    ) -> Result<UnixStream> {
+        self.connect_read_endpoint(Some(environment), ReadSocket::Hyprland, deadline)
+    }
     /// Production construction has no fake runner, probe or scratch-proof override.
     pub fn selected(paths: TargetPaths) -> Result<Self> {
         let io = Self {
@@ -1067,6 +1477,8 @@ impl LinuxNativeIo {
             socket_uid: std::sync::Mutex::new(None),
             #[cfg(test)]
             peer_uid: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            read_interleave: None,
         };
         io.validate_target()?;
         Ok(io)
@@ -1104,6 +1516,8 @@ impl LinuxNativeIo {
             socket_uid: std::sync::Mutex::new(None),
             #[cfg(test)]
             peer_uid: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            read_interleave: None,
         })
     }
     pub fn target(&self) -> &LinuxTarget {
@@ -1713,7 +2127,533 @@ pub fn parse_ps_start(bytes: &[u8]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn read_deadline() -> Deadline {
+        Deadline::new(1000, Cancellation::default()).unwrap()
+    }
+
+    #[test]
+    fn system_read_namespaces_and_bounds_are_closed() {
+        assert_eq!(
+            SystemRead::OsRelease.path_and_limit().unwrap(),
+            ("/etc/os-release".into(), 65536)
+        );
+        assert_eq!(
+            SystemRead::OsReleaseFallback.path_and_limit().unwrap(),
+            ("/usr/lib/os-release".into(), 65536)
+        );
+        for path in [
+            "/usr/share/fonts/fixture.ttf",
+            "/usr/share/fonts/nested/fixture.ttf",
+        ] {
+            assert_eq!(
+                SystemRead::Font(path.into()).path_and_limit().unwrap().1,
+                16 * 1024 * 1024
+            );
+        }
+        for path in ["/usr/lib/fixture.so", "/usr/lib64/fixture.so"] {
+            assert_eq!(
+                SystemRead::ElfPrefix(path.into())
+                    .path_and_limit()
+                    .unwrap()
+                    .1,
+                4 * 1024 * 1024
+            );
+        }
+        for path in [
+            "/usr/share/fonts",
+            "/usr/share/fonts-other/a",
+            "/usr/share/fonts/../secret",
+            "/home/foreign/font",
+            "relative",
+            "/usr/share/fonts/a\0",
+            "/usr/share/fonts/a\n",
+        ] {
+            assert!(SystemRead::Font(path.into()).path_and_limit().is_err());
+        }
+        for path in [
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/lib-other/a",
+            "/usr/lib/../secret",
+            "/etc/shadow",
+        ] {
+            assert!(SystemRead::ElfPrefix(path.into()).path_and_limit().is_err());
+        }
+        let (io, root) = fixture();
+        assert_eq!(io.target.source(), ObservationSource::Demo);
+        assert!(matches!(
+            io.read_system(SystemRead::OsRelease, &read_deadline()),
+            Err(NativeError::Foreign)
+        ));
+        assert!(matches!(
+            io.connect_system_bus(&read_deadline()),
+            Err(NativeError::Foreign)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn open_fixture_font(root: &Path, candidate: &Path, uid: u32) -> Result<OwnedFd> {
+        SystemRead::Font(candidate.into()).path_and_limit()?;
+        read_parent(
+            read_anchor(root)?,
+            candidate
+                .strip_prefix("/")
+                .map_err(|_| NativeError::Foreign)?,
+            uid,
+        )?
+        .open_file()
+    }
+
+    /// The fixture anchor substitutes for /; all descriptor operations are production helpers.
+    #[test]
+    fn font_final_link_within_allowed_root_is_refused() {
+        let (io, root) = fixture();
+        let directory = root.join("usr/share/fonts");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("real.ttf"), b"inert font fixture").unwrap();
+        symlink("real.ttf", directory.join("alias.ttf")).unwrap();
+        let candidate = Path::new("/usr/share/fonts/real.ttf");
+        let fd = open_fixture_font(&root, candidate, io.target.paths.uid).unwrap();
+        let mut stat = rfs::fstat(&fd).unwrap();
+        stat.st_uid = 0; // injected root evidence; no elevation or host font inspection
+        assert_eq!(
+            system_contents(
+                &mut File::from(fd),
+                &stat,
+                &SystemRead::Font(candidate.into()),
+                &read_deadline(),
+            )
+            .unwrap(),
+            b"inert font fixture"
+        );
+        assert!(matches!(
+            open_fixture_font(
+                &root,
+                Path::new("/usr/share/fonts/alias.ttf"),
+                io.target.paths.uid,
+            ),
+            Err(NativeError::Foreign)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn font_intermediate_link_within_allowed_root_is_refused() {
+        let (io, root) = fixture();
+        let directory = root.join("usr/share/fonts");
+        fs::create_dir_all(directory.join("real")).unwrap();
+        fs::write(directory.join("real/font.ttf"), b"inert font fixture").unwrap();
+        symlink("real", directory.join("alias")).unwrap();
+        assert!(
+            open_fixture_font(
+                &root,
+                Path::new("/usr/share/fonts/real/font.ttf"),
+                io.target.paths.uid,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            open_fixture_font(
+                &root,
+                Path::new("/usr/share/fonts/alias/font.ttf"),
+                io.target.paths.uid,
+            ),
+            Err(NativeError::Foreign)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Root ownership is injected into scratch-file metadata, never acquired by elevation.
+    #[test]
+    fn system_file_root_evidence_exact_limits_growth_and_elf_prefix_are_bounded() {
+        let (_, root) = fixture();
+        let path = root.join("inert");
+        fs::write(&path, b"NAME=fixture\n").unwrap();
+        let mut file = File::open(&path).unwrap();
+        let mut stat = rfs::fstat(&file).unwrap();
+        assert_eq!(
+            system_contents(&mut file, &stat, &SystemRead::OsRelease, &read_deadline()),
+            Err(NativeError::Foreign)
+        );
+        stat.st_uid = 0;
+        assert_eq!(
+            system_contents(&mut file, &stat, &SystemRead::OsRelease, &read_deadline()).unwrap(),
+            b"NAME=fixture\n"
+        );
+        for (size, request) in [
+            (MAX_OS_RELEASE_BYTES, SystemRead::OsRelease),
+            (
+                MAX_FONT_BYTES,
+                SystemRead::Font("/usr/share/fonts/fixture.ttf".into()),
+            ),
+        ] {
+            File::create(&path).unwrap().set_len(size as u64).unwrap();
+            let mut file = File::open(&path).unwrap();
+            let mut stat = rfs::fstat(&file).unwrap();
+            stat.st_uid = 0;
+            assert_eq!(
+                system_contents(&mut file, &stat, &request, &read_deadline())
+                    .unwrap()
+                    .len(),
+                size
+            );
+            file.set_len(size as u64 + 1).unwrap_err(); // the admitted reader is read-only
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(size as u64 + 1)
+                .unwrap();
+            let mut file = File::open(&path).unwrap();
+            assert_eq!(
+                system_contents(&mut file, &stat, &request, &read_deadline()),
+                Err(NativeError::Oversize),
+                "growth after size observation remains bounded"
+            );
+            stat.st_size += 1;
+            assert_eq!(
+                system_contents(
+                    &mut File::open(&path).unwrap(),
+                    &stat,
+                    &request,
+                    &read_deadline()
+                ),
+                Err(NativeError::Oversize)
+            );
+        }
+        let mut bytes = vec![0; MAX_ELF_PREFIX_BYTES + 123];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        fs::write(&path, &bytes).unwrap();
+        let mut stat = rfs::fstat(File::open(&path).unwrap()).unwrap();
+        stat.st_uid = 0;
+        let elf = SystemRead::ElfPrefix("/usr/lib/fixture.so".into());
+        assert_eq!(
+            system_contents(
+                &mut File::open(&path).unwrap(),
+                &stat,
+                &elf,
+                &read_deadline()
+            )
+            .unwrap()
+            .len(),
+            MAX_ELF_PREFIX_BYTES
+        );
+        for bytes in [
+            Vec::new(),
+            b"not an ELF file".to_vec(),
+            b"\x7fELF\x02\x01\x01".to_vec(),
+            vec![0; 64],
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                system_contents(
+                    &mut File::open(&path).unwrap(),
+                    &stat,
+                    &elf,
+                    &read_deadline()
+                ),
+                Err(NativeError::Invalid)
+            );
+        }
+        for mode in [0o100666, 0o040700, 0o120777, 0o010600] {
+            let mut unsafe_stat = stat;
+            unsafe_stat.st_mode = mode;
+            assert_eq!(
+                read_stat(&unsafe_stat, 0, 0o100000),
+                Err(NativeError::Foreign)
+            );
+        }
+        let stop = Cancellation::default();
+        let d = Deadline::new(1000, stop.clone()).unwrap();
+        stop.cancel();
+        stat.st_size = 64;
+        assert_eq!(
+            system_contents(
+                &mut File::open(&path).unwrap(),
+                &stat,
+                &SystemRead::OsRelease,
+                &d
+            ),
+            Err(NativeError::Cancelled)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn descriptor_read_parents_refuse_every_symlink_level_and_writable_ancestor() {
+        let (io, root) = fixture();
+        let parent = root.join("a/b");
+        fs::create_dir_all(&parent).unwrap();
+        for path in [root.join("a"), parent.clone()] {
+            let saved = root.join("saved");
+            fs::rename(&path, &saved).unwrap();
+            symlink(&saved, &path).unwrap();
+            assert!(matches!(
+                read_parent(
+                    read_anchor(&root).unwrap(),
+                    Path::new("a/b/file"),
+                    io.target.paths.uid
+                ),
+                Err(NativeError::Foreign)
+            ));
+            fs::remove_file(&path).unwrap();
+            fs::rename(&saved, &path).unwrap();
+        }
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            read_parent(
+                read_anchor(&root).unwrap(),
+                Path::new("a/b/file"),
+                io.target.paths.uid
+            ),
+            Err(NativeError::Foreign)
+        ));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let admitted = read_parent(
+            read_anchor(&root).unwrap(),
+            Path::new("a/b/file"),
+            io.target.paths.uid,
+        )
+        .unwrap();
+        fs::write(parent.join("real"), b"inert").unwrap();
+        symlink(parent.join("real"), parent.join("file")).unwrap();
+        assert!(
+            rfs::openat(
+                admitted.directories.last().unwrap(),
+                &admitted.name,
+                OFlags::RDONLY | OFlags::NOFOLLOW,
+                Mode::empty()
+            )
+            .is_err()
+        );
+        fs::rename(root.join("a"), root.join("saved")).unwrap();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::rename(root.join("saved/b"), root.join("a/b")).unwrap();
+        let replaced = read_parent(
+            read_anchor(&root).unwrap(),
+            Path::new("a/b/file"),
+            io.target.paths.uid,
+        )
+        .unwrap();
+        assert_eq!(
+            admitted.same_as(&replaced),
+            Err(NativeError::Foreign),
+            "replacement retaining the final parent inode is still foreign"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn scratch_read_socket(
+        kind: ReadSocket,
+    ) -> (
+        LinuxNativeIo,
+        PathBuf,
+        std::os::unix::net::UnixListener,
+        ChildEnvironment,
+    ) {
+        let (io, root) = fixture();
+        let runtime = &io.target.paths.runtime_home;
+        io.create_private_dir(&io.scratch_support(observations(&io)).unwrap(), runtime)
+            .unwrap();
+        let (path, session) = match kind {
+            ReadSocket::SessionBus => {
+                let path = runtime.join("bus");
+                (
+                    path.clone(),
+                    BTreeMap::from([(
+                        "DBUS_SESSION_BUS_ADDRESS".into(),
+                        format!("unix:path={}", path.display()),
+                    )]),
+                )
+            }
+            ReadSocket::Wayland => (
+                runtime.join("wayland-fixture"),
+                BTreeMap::from([("WAYLAND_DISPLAY".into(), "wayland-fixture".into())]),
+            ),
+            ReadSocket::Hyprland => {
+                let dir = runtime.join("hypr/fixture_1");
+                io.create_private_dir(&io.scratch_support(observations(&io)).unwrap(), &dir)
+                    .unwrap();
+                (
+                    dir.join(".socket.sock"),
+                    BTreeMap::from([("HYPRLAND_INSTANCE_SIGNATURE".into(), "fixture_1".into())]),
+                )
+            }
+            ReadSocket::SystemBus => unreachable!(),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let env = ChildEnvironment::selected(&io.target, session).unwrap();
+        (io, root, listener, env)
+    }
+
+    #[test]
+    fn selected_streams_connect_scratch_endpoints_without_sending_protocol_bytes() {
+        for kind in [
+            ReadSocket::SessionBus,
+            ReadSocket::Wayland,
+            ReadSocket::Hyprland,
+        ] {
+            let (io, root, listener, environment) = scratch_read_socket(kind);
+            let stream = match kind {
+                ReadSocket::SessionBus => io.connect_session_bus(&environment, &read_deadline()),
+                ReadSocket::Wayland => io.connect_wayland(&environment, &read_deadline()),
+                _ => io.connect_hyprland(&environment, &read_deadline()),
+            }
+            .unwrap();
+            drop(stream);
+            let (mut server, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.is_empty());
+            let (other, other_root) = fixture();
+            assert!(matches!(
+                other.connect_read_endpoint(Some(&environment), kind, &read_deadline()),
+                Err(NativeError::Foreign)
+            ));
+            fs::remove_dir_all(other_root).unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn connected_socket_and_runtime_ancestry_replacements_are_discarded() {
+        for replace_runtime in [false, true] {
+            let (mut io, root, listener, environment) = scratch_read_socket(ReadSocket::Wayland);
+            let runtime = io.target.paths.runtime_home.clone();
+            io.read_interleave = Some(Arc::new(move || {
+                if replace_runtime {
+                    fs::rename(&runtime, runtime.with_extension("old")).unwrap();
+                    fs::create_dir(&runtime).unwrap();
+                    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+                    fs::rename(
+                        runtime.with_extension("old").join("wayland-fixture"),
+                        runtime.join("wayland-fixture"),
+                    )
+                    .unwrap();
+                } else {
+                    fs::rename(runtime.join("wayland-fixture"), runtime.join("old.sock")).unwrap();
+                    drop(
+                        std::os::unix::net::UnixListener::bind(runtime.join("wayland-fixture"))
+                            .unwrap(),
+                    );
+                }
+            }));
+            assert!(matches!(
+                io.connect_wayland(&environment, &read_deadline()),
+                Err(NativeError::Foreign)
+            ));
+            let (mut server, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).unwrap();
+            assert!(
+                bytes.is_empty(),
+                "a drifted stream must be closed before protocol writes"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn socket_links_selection_grammar_and_injected_root_peer_evidence_fail_closed() {
+        let (io, root, listener, environment) = scratch_read_socket(ReadSocket::Hyprland);
+        let (path, uid) =
+            socket_location(io.target(), Some(&environment), ReadSocket::Hyprland).unwrap();
+        let parent = socket_parent(io.target(), &path, uid).unwrap();
+        let mut stat = socket_observation(&parent, uid, false).unwrap();
+        stat.st_uid = 0;
+        stat.st_mode = 0o140666;
+        assert!(read_socket_stat(&stat, 0, true).is_ok());
+        assert_eq!(
+            read_socket_stat(&stat, uid, true),
+            Err(NativeError::Foreign)
+        );
+        assert_eq!(read_socket_stat(&stat, 0, false), Err(NativeError::Foreign));
+        assert!(read_peer(0, 0).is_ok());
+        assert_eq!(read_peer(uid, 0), Err(NativeError::Foreign));
+        assert_eq!(read_peer(uid + 1, uid), Err(NativeError::Foreign));
+        stat.st_nlink = 2;
+        assert_eq!(read_socket_stat(&stat, 0, true), Err(NativeError::Foreign));
+        fs::rename(&path, path.with_extension("old")).unwrap();
+        symlink(path.with_extension("old"), &path).unwrap();
+        assert!(matches!(
+            io.connect_hyprland(&environment, &read_deadline()),
+            Err(NativeError::Foreign)
+        ));
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        for signature in [
+            "..",
+            "../foreign",
+            "foreign/nested",
+            "bad space",
+            "",
+            &"x".repeat(257),
+        ] {
+            let mut env = environment.clone();
+            env.values
+                .insert("HYPRLAND_INSTANCE_SIGNATURE".into(), signature.into());
+            assert!(socket_location(io.target(), Some(&env), ReadSocket::Hyprland).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_worker_deadlines_cancellation_and_noncooperative_saturation_keep_admission() {
+        let (io, root, listener, environment) = scratch_read_socket(ReadSocket::Wayland);
+        let (release, gate) = mpsc::channel();
+        let gate = Arc::new(std::sync::Mutex::new(gate));
+        for _ in 0..4 {
+            let gate = gate.clone();
+            assert_eq!(
+                bounded_launch(
+                    &READ_WORKERS,
+                    &Deadline::new(10, Cancellation::default()).unwrap(),
+                    move || {
+                        gate.lock()
+                            .map_err(|_| NativeError::Unavailable)?
+                            .recv()
+                            .map_err(|_| NativeError::Unavailable)?;
+                        Ok(())
+                    }
+                ),
+                Err(NativeError::Timeout)
+            );
+        }
+        assert!(matches!(
+            io.connect_wayland(&environment, &read_deadline()),
+            Err(NativeError::Busy)
+        ));
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        for _ in 0..4 {
+            release.send(()).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(1);
+        while READ_WORKERS.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(2));
+        }
+        let cancel = Cancellation::default();
+        let deadline = Deadline::new(1000, cancel.clone()).unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            io.connect_wayland(&environment, &deadline),
+            Err(NativeError::Cancelled)
+        ));
+        let stream = io.connect_wayland(&environment, &read_deadline()).unwrap();
+        drop(stream);
+        let (mut server, _) = listener.accept().unwrap();
+        assert_eq!(server.read(&mut [0; 1]).unwrap(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn actual_child_environment_preparation_clears_contaminated_fake_parent() {
