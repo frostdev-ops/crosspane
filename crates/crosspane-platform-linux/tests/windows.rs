@@ -10,8 +10,11 @@ use std::sync::{Arc, mpsc};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use crosspane_platform::{PlatformError, WindowEvent, WindowInfo, WindowSource};
+use crosspane_platform::{
+    PlatformError, WindowEvent, WindowInfo, WindowParking, WindowSource, WindowState,
+};
 use crosspane_platform_linux::hyprland::ipc::{DEFAULT_TIMEOUT, HyprIpc};
+use crosspane_platform_linux::hyprland::mirror::HyprlandMirrorParking;
 use crosspane_platform_linux::hyprland::windows::HyprlandWindows;
 use crosspane_types::id::{DisplayId, WindowId};
 
@@ -25,8 +28,17 @@ struct Nest {
 
 impl Nest {
     fn start() -> (Self, HyprIpc, PathBuf) {
+        Self::start_for("wp-2-7-windows")
+    }
+
+    fn start_for(prefix: &str) -> (Self, HyprIpc, PathBuf) {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let nest = Self {
-            name: format!("wp-2-7-windows-{}", std::process::id()),
+            name: format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
         };
         let parent = std::env::var("CROSSPANE_PARENT_WAYLAND_DISPLAY")
             .unwrap_or_else(|_| std::env::var("WAYLAND_DISPLAY").unwrap());
@@ -239,4 +251,84 @@ fn window_lifecycle() {
         |event| matches!(event, WindowEvent::Removed(id) if *id == second.id),
     );
     assert_eq!(source.focused().unwrap(), None);
+}
+
+#[test]
+fn fullscreen_client_only_nested_preserves_foot_size() {
+    if std::env::var("CROSSPANE_NESTED_HYPR").as_deref() != Ok("1") {
+        eprintln!("skipped: needs an explicit nested Hyprland");
+        return;
+    }
+    let (nest, ipc, _fifo) = Nest::start_for("FS5");
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+    let version = ipc.version().unwrap();
+    assert_eq!((version.major, version.minor, version.patch), (0, 56, 2));
+    let class = format!("crosspane-fs5-{}", std::process::id());
+    exec(
+        &ipc,
+        &format!("foot --config=/dev/null --app-id {class} sleep 60"),
+    );
+    let client = || {
+        ipc.json("clients")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["class"] == class)
+            .cloned()
+    };
+    wait_until(|| client().is_some());
+    let before = client().unwrap();
+    let address = before["address"].as_str().unwrap();
+    let window = WindowId(u64::from_str_radix(before["stableId"].as_str().unwrap(), 16).unwrap());
+    ipc.dispatch(&format!("hl.dsp.window.set_prop({{ window = \"address:{address}\", prop = \"sync_fullscreen\", value = \"1\" }})")).unwrap();
+    let journal = runtime
+        .join(format!("crosspane-hypr-{}", nest.name))
+        .join(format!("fs5-mirror-{}.json", std::process::id()));
+    let mut mirror =
+        HyprlandMirrorParking::new(ipc.clone(), journal.clone(), "rgb(123456)").unwrap();
+    let ordinary = mirror
+        .park(window, crosspane_types::geom::PixelSize::new(800, 600), 1.0)
+        .unwrap();
+    mirror.set_fullscreen(window, true).unwrap();
+    let full = client().unwrap();
+    assert_eq!(full["fullscreen"], 0);
+    assert_eq!(full["fullscreenClient"], 2);
+    assert_eq!(full["size"], before["size"]);
+    let geometry = mirror.geometry(window).unwrap();
+    assert!(geometry.fullscreen);
+    assert_eq!(geometry.content, ordinary.content);
+    let source = HyprlandWindows::new(ipc.clone()).unwrap();
+    assert_eq!(
+        source
+            .windows()
+            .unwrap()
+            .iter()
+            .find(|w| w.id == window)
+            .unwrap()
+            .state,
+        WindowState::Fullscreen
+    );
+    mirror.restore(window).unwrap();
+    assert_eq!(
+        ipc.request(&format!("getprop address:{address} sync_fullscreen"))
+            .unwrap()
+            .trim(),
+        "true"
+    );
+    assert_eq!(client().unwrap()["fullscreenClient"], 2);
+    mirror
+        .park(window, crosspane_types::geom::PixelSize::new(800, 600), 1.0)
+        .unwrap();
+    mirror.set_fullscreen(window, false).unwrap();
+    assert_eq!(client().unwrap()["fullscreenClient"], 0);
+    assert_eq!(client().unwrap()["size"], before["size"]);
+    mirror.restore(window).unwrap();
+    assert_eq!(std::fs::read_to_string(&journal).unwrap().trim(), "[]");
+    ipc.dispatch(&format!("hl.dsp.window.set_prop({{ window = \"address:{address}\", prop = \"sync_fullscreen\", value = \"1\" }})")).unwrap();
+    ipc.dispatch(&format!(
+        "hl.dsp.window.close({{ window = \"address:{address}\" }})"
+    ))
+    .unwrap();
+    std::fs::remove_file(journal).unwrap();
 }

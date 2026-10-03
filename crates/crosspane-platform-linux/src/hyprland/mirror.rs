@@ -1,6 +1,7 @@
 //! M1 mirror parking: leave geometry alone and journal both effective border colours before
 //! changing them. Hyprland's `getprop` exposes effective gradients, not override priorities;
 //! restoration writes those exact gradients back and checks them before retiring the journal.
+//! Fullscreen dispatch also overrides sync_fullscreen; new entries preserve its effective value.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -21,6 +22,9 @@ struct Entry {
     window: u64,
     address: String,
     borders: [String; 2],
+    // Older journals did not manage this property; do not guess their original value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_fullscreen: Option<bool>,
 }
 
 /// Mirror a window without moving or resizing its source.
@@ -90,6 +94,14 @@ impl HyprlandMirrorParking {
         Ok(result)
     }
 
+    fn sync_fullscreen(&self, address: &str) -> Result<bool, PlatformError> {
+        self.ipc
+            .request(&format!("getprop address:{address} sync_fullscreen"))?
+            .trim()
+            .parse()
+            .map_err(backend)
+    }
+
     /// Resolve identity inside the same Lua request as each mutation. Addresses can be reused
     /// after a window closes, so an earlier clients snapshot alone is insufficient.
     fn set(&self, entry: &Entry, prop: &str, value: &str) -> Result<(), PlatformError> {
@@ -130,6 +142,9 @@ impl HyprlandMirrorParking {
             for (prop, original) in PROPS.iter().zip(&entry.borders) {
                 self.set(&entry, prop, &gradient_value(original)?)?;
             }
+            if let Some(original) = entry.sync_fullscreen {
+                self.set(&entry, "sync_fullscreen", if original { "1" } else { "0" })?;
+            }
             // A closed window needs no restoration; never read a reused address's properties.
             if let Some(client) = self.client(window)? {
                 if client.get("address").and_then(Value::as_str) != Some(entry.address.as_str()) {
@@ -137,6 +152,11 @@ impl HyprlandMirrorParking {
                 }
                 if self.borders(&entry.address)? != entry.borders {
                     return Err(backend("mirror border restoration did not round trip"));
+                }
+                if let Some(original) = entry.sync_fullscreen
+                    && self.sync_fullscreen(&entry.address)? != original
+                {
+                    return Err(backend("mirror sync restoration did not round trip"));
                 }
             }
         }
@@ -149,8 +169,15 @@ impl HyprlandMirrorParking {
 }
 
 impl WindowParking for HyprlandMirrorParking {
-    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    fn set_fullscreen(&mut self, window: WindowId, fullscreen: bool) -> Result<(), PlatformError> {
+        let entry = self.entries.get(&window.0).ok_or(PlatformError::NotFound)?;
+        super::parking::ensure_client_fullscreen(
+            &self.ipc,
+            window,
+            &entry.address,
+            fullscreen,
+            false,
+        )
     }
 
     fn park(
@@ -174,6 +201,7 @@ impl WindowParking for HyprlandMirrorParking {
         let entry = Entry {
             window: window.0,
             borders: self.borders(&address)?,
+            sync_fullscreen: Some(self.sync_fullscreen(&address)?),
             address,
         };
         let mut entries = self.entries.clone();
@@ -299,7 +327,7 @@ fn parked_from(window: WindowId, client: &Value, monitor: &Value) -> Result<Park
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| backend("invalid monitor id"))?;
     Ok(Parked {
-        fullscreen: false,
+        fullscreen: client.get("fullscreenClient").and_then(Value::as_i64) == Some(2),
         window,
         kind: ParkingKind::Mirror,
         display: DisplayId(id),

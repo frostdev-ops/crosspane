@@ -323,6 +323,9 @@ fn parse_client(c: &Value) -> Result<Option<Client>, PlatformError> {
     };
     let hidden = c["hidden"].as_bool().ok_or_else(|| bad("hidden"))?;
     let fullscreen = c["fullscreen"].as_u64().ok_or_else(|| bad("fullscreen"))?;
+    let fullscreen_client = c.get("fullscreenClient").map_or(Ok(0), |value| {
+        value.as_u64().ok_or_else(|| bad("fullscreenClient"))
+    })?;
     let parent_address = match &c["parent"] {
         Value::String(s) => parse_hex(s),
         Value::Number(n) => n.as_u64(),
@@ -342,7 +345,7 @@ fn parse_client(c: &Value) -> Result<Option<Client>, PlatformError> {
             frame: RectLogical::new(PointLogical::new(x, y), SizeLogical::new(width, height)),
             state: if hidden {
                 WindowState::Hidden
-            } else if fullscreen > 0 {
+            } else if fullscreen > 0 || fullscreen_client > 0 {
                 WindowState::Fullscreen
             } else {
                 WindowState::Normal
@@ -440,6 +443,26 @@ mod tests {
         let mut other_special = client();
         other_special["workspace"]["name"] = json!("special:scratchpad");
         assert_eq!(parse_clients(&json!([other_special])).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn maps_client_only_fullscreen_and_preserves_hidden_priority() {
+        for (internal, client_mode, expected) in [
+            (0, 0, WindowState::Normal),
+            (0, 1, WindowState::Fullscreen),
+            (0, 2, WindowState::Fullscreen),
+            (2, 0, WindowState::Fullscreen),
+        ] {
+            let mut value = client();
+            value["fullscreen"] = json!(internal);
+            value["fullscreenClient"] = json!(client_mode);
+            assert_eq!(parse_client(&value).unwrap().unwrap().info.state, expected);
+            value["hidden"] = json!(true);
+            assert_eq!(
+                parse_client(&value).unwrap().unwrap().info.state,
+                WindowState::Hidden
+            );
+        }
     }
 
     #[test]

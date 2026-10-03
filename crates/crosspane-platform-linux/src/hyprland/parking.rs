@@ -235,6 +235,18 @@ impl HyprlandParking {
         ))
     }
 
+    fn sync_fullscreen(
+        &self,
+        window: u64,
+        address: &str,
+        enabled: bool,
+    ) -> Result<(), PlatformError> {
+        self.ipc.eval(&format!(
+            "local w = hl.get_window(\"address:{0}\"); if w and w.stable_id == {window} then hl.dispatch(hl.dsp.window.set_prop({{ window = \"address:{0}\", prop = \"sync_fullscreen\", value = \"{1}\" }})) end",
+            lua_escape(address), u8::from(enabled)
+        ))
+    }
+
     fn undo(&mut self, window: u64) -> Result<(), PlatformError> {
         let Some(entry) = self.entries.get(&window).cloned() else {
             return Ok(());
@@ -262,8 +274,17 @@ impl HyprlandParking {
             // Matching flags alone do not prove that an originally floating box was restored.
             let geometry_changed = o.floating
                 && (!same_pair(&client, "at", o.at) || !same_pair(&client, "size", o.size));
-            let changed =
-                on_twin || fullscreen != o.fullscreen || floating != o.floating || geometry_changed;
+            let changed = on_twin
+                || fullscreen != o.fullscreen
+                || floating != o.floating
+                || geometry_changed
+                || client
+                    .get("fullscreenClient")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    != 0;
+            // Restore synchronization before clearing client-only fullscreen, including recovery.
+            self.sync_fullscreen(window, &address, true)?;
             if changed {
                 self.ipc.dispatch(&format!(
                     "hl.dsp.window.fullscreen_state({{ window = \"address:{address}\", internal = 0, client = 0 }})"
@@ -315,8 +336,9 @@ impl HyprlandParking {
 }
 
 impl WindowParking for HyprlandParking {
-    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    fn set_fullscreen(&mut self, window: WindowId, fullscreen: bool) -> Result<(), PlatformError> {
+        let entry = self.entries.get(&window.0).ok_or(PlatformError::NotFound)?;
+        ensure_client_fullscreen(&self.ipc, window, &entry.address, fullscreen, true)
     }
 
     fn park(
@@ -424,6 +446,7 @@ impl WindowParking for HyprlandParking {
                 ))?;
             }
             self.move_window(&address, &format!("name:{}", entry.workspace))?;
+            self.sync_fullscreen(window.0, &address, false)?;
             self.settle(window, size, scale, before)
         })();
         if result.is_err() {
@@ -801,11 +824,7 @@ impl HyprlandParking {
                     }
                     // An app may refuse a size; the geometry is what it took.
                     log(rule.as_str(), Some(content));
-                    return Ok(Parked {
-                        content,
-                        fullscreen: false,
-                        ..parked
-                    });
+                    return Ok(Parked { content, ..parked });
                 }
                 Decision::Timeout => {
                     log("timeout", None);
@@ -1029,11 +1048,7 @@ fn clipped(parked: Parked, extent: PixelRect) -> Result<Parked, PlatformError> {
         .content
         .intersection(&extent)
         .ok_or_else(|| backend("parked window lies outside its twin output".into()))?;
-    Ok(Parked {
-        content,
-        fullscreen: false,
-        ..parked
-    })
+    Ok(Parked { content, ..parked })
 }
 
 /// A client's `size` (logical pixels), if it reports one.
@@ -1065,7 +1080,7 @@ pub(crate) fn parked_from(
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| backend("twin output without an id".into()))?;
     Ok(Parked {
-        fullscreen: false,
+        fullscreen: client.get("fullscreenClient").and_then(Value::as_i64) == Some(2),
         window,
         kind: ParkingKind::Twin,
         display: DisplayId(id),
@@ -1107,6 +1122,63 @@ pub(crate) fn client_snapshot(
             .find(|c| stable_id(c) == Some(window.0))
             .cloned()
     }))
+}
+
+/// Client-only fullscreen preserves the source layout. One deadline covers all short-lived IPC.
+pub(super) fn ensure_client_fullscreen(
+    ipc: &HyprIpc,
+    window: WindowId,
+    address: &str,
+    fullscreen: bool,
+    twin: bool,
+) -> Result<(), PlatformError> {
+    let deadline = Instant::now() + SETTLE;
+    let wanted = if fullscreen { 2 } else { 0 };
+    // fullscreen_state assigns sync from mode equality; keep twins decoupled in the same IPC.
+    let decouple = if twin {
+        format!(
+            "; hl.dispatch(hl.dsp.window.set_prop({{ window = \"address:{}\", prop = \"sync_fullscreen\", value = \"0\" }}))",
+            lua_escape(address)
+        )
+    } else {
+        String::new()
+    };
+    let mut dispatched = false;
+    loop {
+        let clients: Value = serde_json::from_str(&ipc.request_until("j/clients", deadline)?)
+            .map_err(|e| backend(format!("fullscreen clients: {e}")))?;
+        let client = clients
+            .as_array()
+            .ok_or_else(|| backend("fullscreen clients is not a list".into()))?
+            .iter()
+            .find(|c| stable_id(c) == Some(window.0))
+            .ok_or(PlatformError::NotFound)?;
+        if client.get("address").and_then(Value::as_str) != Some(address) {
+            return Err(PlatformError::NotFound);
+        }
+        if Instant::now() >= deadline {
+            return Err(PlatformError::Timeout);
+        }
+        if client.get("fullscreenClient").and_then(Value::as_i64) == Some(wanted)
+            && client.get("fullscreen").and_then(Value::as_i64) == Some(0)
+        {
+            return Ok(());
+        }
+        if !dispatched {
+            // Check stable identity in the mutation too: addresses can be reused after a close.
+            expect_ok(&ipc.request_until(&format!(
+                "/eval local w = hl.get_window(\"address:{0}\"); if w and w.stable_id == {1} then hl.dispatch(hl.dsp.window.fullscreen_state({{ window = \"address:{0}\", internal = 0, client = {wanted} }})){decouple} end",
+                lua_escape(address), window.0
+            ), deadline)?)?;
+            dispatched = true;
+        } else {
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(20)),
+            );
+        }
+    }
 }
 
 pub(crate) fn monitor_snapshot(ipc: &HyprIpc, name: &str) -> Result<Option<Value>, PlatformError> {

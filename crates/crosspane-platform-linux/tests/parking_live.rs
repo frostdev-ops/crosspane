@@ -100,15 +100,26 @@ fn park_resize_restore_live() {
     assert_eq!(real, before, "a real monitor moved or changed");
     assert!(during.iter().any(|m| m.0.starts_with(OUTPUT_PREFIX)));
 
+    parking.set_fullscreen(window, true).unwrap();
+    let full = parking.geometry(window).unwrap();
+    assert!(full.fullscreen);
+    assert_eq!(full.content, parked.content);
+    let c = client(&ipc, &class).unwrap();
+    assert_eq!(c["fullscreen"], 0);
+    assert_eq!(c["fullscreenClient"], 2);
+
     let resized = parking
         .resize(window, PixelSize::new(1200, 900), 2.0)
         .unwrap();
     eprintln!("resized: {resized:?}");
+    assert!(resized.fullscreen);
     assert_eq!(
         (resized.content.width(), resized.content.height()),
         (1200, 900)
     );
 
+    parking.set_fullscreen(window, false).unwrap();
+    assert!(!parking.geometry(window).unwrap().fullscreen);
     parking.restore(window).unwrap();
     let c = client(&ipc, &class).unwrap();
     assert_eq!(c["workspace"]["name"].as_str().unwrap(), original_ws);

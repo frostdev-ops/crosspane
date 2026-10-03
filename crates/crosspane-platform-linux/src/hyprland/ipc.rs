@@ -93,6 +93,23 @@ impl HyprIpc {
         self.raw(&format!("/{command}"))
     }
 
+    /// A wire-format request on this endpoint, bounded by an operation's remaining budget.
+    pub(crate) fn request_until(
+        &self,
+        wire: &str,
+        deadline: Instant,
+    ) -> Result<String, PlatformError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(PlatformError::Timeout)?;
+        Self {
+            dir: self.dir.clone(),
+            timeout: self.timeout.min(remaining),
+        }
+        .raw(wire)
+    }
+
     /// One JSON request (`j/<command>`), parsed.
     pub fn json(&self, command: &str) -> Result<serde_json::Value, PlatformError> {
         let reply = self.raw(&format!("j/{command}"))?;
@@ -430,6 +447,28 @@ mod tests {
         assert!(matches!(
             ipc.request("monitors"),
             Err(PlatformError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn request_until_bounds_the_same_endpoint_by_the_remaining_deadline() {
+        let (dir, ipc) = fake_instance();
+        let listener = UnixListener::bind(dir.0.join("hypr/sig/.socket.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut request = [0; 32];
+            let n = c.read(&mut request).unwrap();
+            assert_eq!(&request[..n], b"j/clients");
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = c.write_all(b"[]");
+        });
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let result = ipc.request_until("j/clients", deadline);
+        server.join().unwrap();
+        assert!(matches!(result, Err(PlatformError::Timeout)), "{result:?}");
+        assert!(matches!(
+            ipc.request_until("j/clients", Instant::now()),
+            Err(PlatformError::Timeout)
         ));
     }
 

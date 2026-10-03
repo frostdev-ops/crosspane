@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use crosspane_platform::{Parked, PlatformError, WindowParking};
 use crosspane_platform_linux::hyprland::ipc::HyprIpc;
+use crosspane_platform_linux::hyprland::mirror::HyprlandMirrorParking;
 use crosspane_platform_linux::hyprland::parking::HyprlandParking;
 use crosspane_types::geom::PixelSize;
 use crosspane_types::geom::euclid::point2;
@@ -98,6 +99,15 @@ struct World {
     /// (when it was asked for, and the mode's dimensions in device pixels).
     served: Vec<(Instant, Size)>,
     mode_changes: Vec<(Instant, Size)>,
+    fullscreen: i64,
+    fullscreen_client: i64,
+    sync_fullscreen: bool,
+    fullscreen_lag: u32,
+    pending_fullscreen: Option<(i64, i64, u32)>,
+    refuse_fullscreen: bool,
+    closed: bool,
+    requests: Vec<(String, String)>,
+    borders: [String; 2],
 }
 
 impl World {
@@ -123,6 +133,15 @@ impl World {
             pending_mode: None,
             served: Vec::new(),
             mode_changes: Vec::new(),
+            fullscreen: 0,
+            fullscreen_client: 0,
+            sync_fullscreen: true,
+            fullscreen_lag: 0,
+            pending_fullscreen: None,
+            refuse_fullscreen: false,
+            closed: false,
+            requests: Vec::new(),
+            borders: ["ff112233 0deg".into(), "ff223344 0deg".into()],
         }
     }
 
@@ -134,6 +153,19 @@ impl World {
 
     fn on_twin(&self) -> bool {
         self.workspace.starts_with("crosspane-")
+    }
+
+    fn app_fullscreen(&mut self) {
+        self.fullscreen_client = 2;
+        if self.sync_fullscreen {
+            self.fullscreen = 2;
+            if let Some(twin) = self.twin() {
+                self.size = (
+                    (twin.width as f64 / twin.scale) as i64,
+                    (twin.height as f64 / twin.scale) as i64,
+                );
+            }
+        }
     }
 
     /// The compositor lays the window out in the twin's work area (the mode less the bars); how
@@ -193,6 +225,18 @@ impl World {
             return Value::Array(list).to_string();
         }
         if request == "j/clients" {
+            if self.closed {
+                return "[]".into();
+            }
+            if let Some((internal, client, lag)) = self.pending_fullscreen {
+                if lag == 0 {
+                    self.fullscreen = internal;
+                    self.fullscreen_client = client;
+                    self.pending_fullscreen = None;
+                } else {
+                    self.pending_fullscreen = Some((internal, client, lag - 1));
+                }
+            }
             if let Some(polls) = self.report_in {
                 if polls == 0 {
                     self.reported = self.bar;
@@ -213,10 +257,49 @@ impl World {
             return json!([{
                 "address": ADDRESS, "stableId": "1", "class": "fake",
                 "workspace": {"id": 3, "name": self.workspace},
-                "floating": false, "fullscreen": 0,
+                "floating": false, "fullscreen": self.fullscreen,
+                "fullscreenClient": self.fullscreen_client, "monitor": if self.on_twin() { 5 } else { 0 },
                 "at": [self.at.0, self.at.1], "size": [self.size.0, self.size.1],
             }])
             .to_string();
+        }
+        if request.starts_with("/getprop ") {
+            if request.ends_with("sync_fullscreen") {
+                return self.sync_fullscreen.to_string();
+            }
+            return self.borders[usize::from(request.ends_with("inactive_border_color"))].clone();
+        }
+        if request.contains("hl.dsp.window.fullscreen_state(") {
+            let mode = |key: &str| {
+                request
+                    .split_once(key)
+                    .unwrap()
+                    .1
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            if !self.refuse_fullscreen {
+                // Observed on 0.56.2: every fullscreen_state installs this override.
+                self.sync_fullscreen = mode("internal = ") == mode("client = ");
+                self.pending_fullscreen =
+                    Some((mode("internal = "), mode("client = "), self.fullscreen_lag));
+            }
+        }
+        if request.contains("hl.dsp.window.set_prop(") {
+            match quoted(request, "prop").unwrap() {
+                "sync_fullscreen" => self.sync_fullscreen = quoted(request, "value") == Some("1"),
+                prop => {
+                    let i = usize::from(prop == "inactive_border_color");
+                    self.borders[i] = quoted(request, "value")
+                        .unwrap()
+                        .strip_prefix("gradient ")
+                        .unwrap()
+                        .replace("0x", "");
+                }
+            }
         }
         if let Some(rest) = request.strip_prefix("/output create headless ") {
             self.monitors.push(Monitor {
@@ -302,6 +385,7 @@ impl Fake {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (world, stop) = (world.clone(), stop.clone());
+            let dir_for_thread = dir.clone();
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
@@ -311,7 +395,12 @@ impl Fake {
                             let mut buf = [0u8; 2048];
                             let n = conn.read(&mut buf).unwrap_or(0);
                             let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-                            let reply = world.lock().unwrap().handle(&request);
+                            let journal =
+                                std::fs::read_to_string(dir_for_thread.join("parking.json"))
+                                    .unwrap_or_default();
+                            let mut world = world.lock().unwrap();
+                            world.requests.push((request.clone(), journal));
+                            let reply = world.handle(&request);
                             let _ = conn.write_all(reply.as_bytes());
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(1)),
@@ -429,6 +518,234 @@ fn span(polls: &[(Instant, Size)]) -> Duration {
         (Some((first, _)), Some((last, _))) => last.duration_since(*first),
         _ => Duration::ZERO,
     }
+}
+
+#[test]
+fn fullscreen_park_and_recovery_order_sync_around_the_reset_with_a_durable_journal() {
+    let fake = Fake::start();
+    let mut parking = fake.parking();
+    parking.park(WINDOW, PixelSize::new(800, 600), 1.0).unwrap();
+    {
+        let world = fake.world.lock().unwrap();
+        let moved = world
+            .requests
+            .iter()
+            .position(|(r, _)| r.contains("workspace = \"name:crosspane-1\""))
+            .unwrap();
+        let disabled = world
+            .requests
+            .iter()
+            .position(|(r, _)| {
+                r.contains("prop = \"sync_fullscreen\"") && r.contains("value = \"0\"")
+            })
+            .unwrap();
+        assert!(moved < disabled);
+        assert!(world.requests[disabled].1.contains(ADDRESS));
+        assert!(!world.sync_fullscreen);
+    }
+    drop(parking);
+    assert_eq!(fake.parking().recover().unwrap(), vec![WINDOW]);
+    assert_eq!(fake.journal().trim(), "[]");
+    let world = fake.world.lock().unwrap();
+    let enabled = world
+        .requests
+        .iter()
+        .position(|(r, _)| r.contains("prop = \"sync_fullscreen\"") && r.contains("value = \"1\""))
+        .unwrap();
+    let reset = world
+        .requests
+        .iter()
+        .position(|(r, _)| {
+            r.contains("fullscreen_state(") && r.contains("internal = 0, client = 0")
+        })
+        .unwrap();
+    assert!(enabled < reset);
+    assert!(world.requests[enabled].1.contains(ADDRESS));
+    assert_eq!(world.workspace, "1");
+    assert!(world.sync_fullscreen);
+    assert!(world.twin().is_none());
+}
+
+#[test]
+fn fullscreen_client_only_ensure_polls_and_preserves_geometry_and_journal() {
+    let fake = Fake::start();
+    let mut parking = fake.parking();
+    let ordinary = parking.park(WINDOW, PixelSize::new(800, 600), 1.0).unwrap();
+    let journal = fake.journal();
+    fake.world.lock().unwrap().fullscreen_lag = 3;
+    let polls = fake.served().len();
+    parking.set_fullscreen(WINDOW, true).unwrap();
+    assert!(fake.served().len() >= polls + 5);
+    let full = parking.geometry(WINDOW).unwrap();
+    assert!(full.fullscreen);
+    assert_eq!(full.content, ordinary.content);
+    assert_eq!(fake.world.lock().unwrap().fullscreen, 0);
+    assert_eq!(fake.journal(), journal);
+    let dispatches = fake
+        .world
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(r, _)| r.contains("fullscreen_state("))
+        .count();
+    parking.set_fullscreen(WINDOW, true).unwrap();
+    assert_eq!(
+        fake.world
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(r, _)| r.contains("fullscreen_state("))
+            .count(),
+        dispatches
+    );
+    let resized = parking
+        .resize(WINDOW, PixelSize::new(900, 650), 1.0)
+        .unwrap();
+    assert!(
+        resized.fullscreen,
+        "settle must preserve the observed client bit"
+    );
+    parking.set_fullscreen(WINDOW, false).unwrap();
+    assert!(!parking.geometry(WINDOW).unwrap().fullscreen);
+    parking.restore(WINDOW).unwrap();
+}
+
+#[test]
+fn fullscreen_refusal_times_out_without_ending_parking() {
+    let fake = Fake::start();
+    let mut parking = fake.parking();
+    parking.park(WINDOW, PixelSize::new(800, 600), 1.0).unwrap();
+    fake.world.lock().unwrap().refuse_fullscreen = true;
+    assert!(matches!(
+        parking.set_fullscreen(WINDOW, true),
+        Err(PlatformError::Timeout)
+    ));
+    assert!(!parking.geometry(WINDOW).unwrap().fullscreen);
+    assert!(fake.journal().contains(ADDRESS));
+    assert!(fake.world.lock().unwrap().twin().is_some());
+    parking.restore(WINDOW).unwrap();
+}
+
+#[test]
+fn fullscreen_missing_window_never_dispatches() {
+    let fake = Fake::start();
+    let mut parking = fake.parking();
+    parking.park(WINDOW, PixelSize::new(800, 600), 1.0).unwrap();
+    fake.world.lock().unwrap().closed = true;
+    assert!(matches!(
+        parking.set_fullscreen(WINDOW, true),
+        Err(PlatformError::NotFound)
+    ));
+    assert!(
+        !fake
+            .world
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|(r, _)| r.contains("fullscreen_state("))
+    );
+    parking.restore(WINDOW).unwrap();
+}
+
+#[test]
+fn fullscreen_mirror_ensures_client_state_without_moving_the_real_workspace() {
+    let fake = Fake::start();
+    let mut mirror =
+        HyprlandMirrorParking::new(fake.ipc(), fake.dir.join("mirror.json"), "rgb(123456)")
+            .unwrap();
+    let ordinary = mirror.park(WINDOW, PixelSize::new(800, 600), 1.0).unwrap();
+    mirror.set_fullscreen(WINDOW, true).unwrap();
+    let full = mirror.geometry(WINDOW).unwrap();
+    assert!(full.fullscreen);
+    assert_eq!(full.content, ordinary.content);
+    mirror.set_fullscreen(WINDOW, false).unwrap();
+    assert!(!mirror.geometry(WINDOW).unwrap().fullscreen);
+    assert_eq!(fake.world.lock().unwrap().workspace, "1");
+    assert!(fake.world.lock().unwrap().twin().is_none());
+    mirror.restore(WINDOW).unwrap();
+}
+
+#[test]
+fn fullscreen_twin_stays_decoupled_after_clear_and_an_app_request() {
+    let fake = Fake::start();
+    let mut parking = fake.parking();
+    let ordinary = parking.park(WINDOW, PixelSize::new(800, 600), 1.0).unwrap();
+    parking.set_fullscreen(WINDOW, true).unwrap();
+    parking.set_fullscreen(WINDOW, false).unwrap();
+    {
+        let mut world = fake.world.lock().unwrap();
+        world.app_fullscreen();
+        assert_eq!(world.fullscreen, 0);
+        assert_eq!(world.fullscreen_client, 2);
+        assert!(
+            !world.sync_fullscreen,
+            "0/0 dispatch must not recouple a twin"
+        );
+    }
+    assert_eq!(parking.geometry(WINDOW).unwrap().content, ordinary.content);
+    parking.restore(WINDOW).unwrap();
+}
+
+#[test]
+fn fullscreen_mirror_restore_and_recovery_preserve_original_sync_while_full() {
+    for original in [true, false] {
+        for recovery in [false, true] {
+            let fake = Fake::start();
+            fake.world.lock().unwrap().sync_fullscreen = original;
+            let journal = fake.dir.join("mirror.json");
+            let mut mirror =
+                HyprlandMirrorParking::new(fake.ipc(), journal.clone(), "rgb(123456)").unwrap();
+            mirror.park(WINDOW, PixelSize::new(800, 600), 1.0).unwrap();
+            mirror.set_fullscreen(WINDOW, true).unwrap();
+            let saved: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(saved[0]["sync_fullscreen"], original);
+            assert!(!fake.world.lock().unwrap().sync_fullscreen);
+            assert!(mirror.geometry(WINDOW).unwrap().fullscreen);
+            if recovery {
+                drop(mirror);
+                assert_eq!(
+                    HyprlandMirrorParking::new(fake.ipc(), journal.clone(), "rgb(123456)")
+                        .unwrap()
+                        .recover()
+                        .unwrap(),
+                    vec![WINDOW]
+                );
+            } else {
+                mirror.restore(WINDOW).unwrap();
+            }
+            let world = fake.world.lock().unwrap();
+            assert_eq!(world.sync_fullscreen, original);
+            assert_eq!(world.fullscreen_client, 2);
+            assert_eq!(world.workspace, "1");
+            assert_eq!(std::fs::read_to_string(journal).unwrap().trim(), "[]");
+        }
+    }
+}
+
+#[test]
+fn fullscreen_mirror_legacy_journal_does_not_guess_original_sync() {
+    let fake = Fake::start();
+    let journal = fake.dir.join("mirror.json");
+    let mut mirror =
+        HyprlandMirrorParking::new(fake.ipc(), journal.clone(), "rgb(123456)").unwrap();
+    mirror.park(WINDOW, PixelSize::new(800, 600), 1.0).unwrap();
+    mirror.set_fullscreen(WINDOW, true).unwrap();
+    drop(mirror);
+    let mut entries: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    entries[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("sync_fullscreen");
+    std::fs::write(&journal, serde_json::to_vec(&entries).unwrap()).unwrap();
+    HyprlandMirrorParking::new(fake.ipc(), journal.clone(), "rgb(123456)")
+        .unwrap()
+        .recover()
+        .unwrap();
+    assert!(!fake.world.lock().unwrap().sync_fullscreen);
+    assert_eq!(std::fs::read_to_string(journal).unwrap().trim(), "[]");
 }
 
 #[test]
