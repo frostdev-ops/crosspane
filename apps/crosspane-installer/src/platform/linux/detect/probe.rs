@@ -1,9 +1,15 @@
 //! Read-only acquisition. Streams come only from the frozen native boundary. No reconnect by
 //! pathname, owner-environment fallback, mutation, readiness policy, or support-proof creation.
+mod hyprland;
 mod logind;
+mod manager;
+mod registry;
 use super::*;
 use crate::platform::linux::{native_io::*, transport::CallerClock};
+pub use hyprland::{HyprlandFacts, hyprland_from_stream, parse_hyprland_version};
 pub use logind::{LogindFacts, Properties, decode_session, decode_user, logind_from_stream};
+pub use manager::{ManagerFacts, UnitRows, decode_units, manager_from_stream};
+pub use registry::{REQUIRED_PROTOCOLS, RegistryFacts, protocols_satisfy, registry_from_stream};
 use std::{
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -140,6 +146,71 @@ impl NativeSessionProbes {
                 let mut facts = logind::read(stream, uid, std::process::id(), id, &shared, &clock)?;
                 facts.selected_session.source = source;
                 facts.graphical_sessions.source = source;
+                Ok(facts)
+            },
+        )
+    }
+    pub fn manager(&self, deadline: &Deadline) -> Fact<ManagerFacts> {
+        let shared = deadline.clone();
+        let clock = self.clock.clone();
+        let source = self.io.target().source();
+        self.read(
+            self.io.connect_session_bus(&self.environment, deadline),
+            deadline,
+            move |stream| {
+                let mut facts = manager::read(stream, &shared, clock)?;
+                facts.uwsm_managed.source = source;
+                facts.graphical_target_active.source = source;
+                Ok(facts)
+            },
+        )
+    }
+    pub fn manager_environment(&self, deadline: &Deadline) -> Fact<EffectiveEnvironment> {
+        let result = (|| {
+            let bus = self
+                .environment
+                .values()
+                .get("DBUS_SESSION_BUS_ADDRESS")
+                .map(|v| {
+                    std::collections::BTreeMap::from([(
+                        "DBUS_SESSION_BUS_ADDRESS".into(),
+                        v.clone(),
+                    )])
+                })
+                .unwrap_or_default();
+            let environment = self.io.manager_environment(bus, deadline)?;
+            let command = CommandSpec::new(
+                "/usr/bin/systemctl".into(),
+                vec!["--user".into(), "show-environment".into()],
+                environment,
+                MAX_PROBE_BYTES,
+            )?;
+            self.io.run(&command, deadline)
+        })();
+        manager::environment_output(result, self.io.target().source(), (self.clock)())
+    }
+    pub fn hyprland(&self, deadline: &Deadline) -> Fact<HyprlandFacts> {
+        let clock = self.clock.clone();
+        let source = self.io.target().source();
+        self.read(
+            self.io.connect_hyprland(&self.environment, deadline),
+            deadline,
+            move |stream| {
+                let mut facts = hyprland::read(stream, clock)?;
+                facts.version.source = source;
+                Ok(facts)
+            },
+        )
+    }
+    pub fn registry(&self, deadline: &Deadline) -> Fact<RegistryFacts> {
+        let clock = self.clock.clone();
+        let source = self.io.target().source();
+        self.read(
+            self.io.connect_wayland(&self.environment, deadline),
+            deadline,
+            move |stream| {
+                let mut facts = registry::read(stream, clock)?;
+                facts.protocols.source = source;
                 Ok(facts)
             },
         )

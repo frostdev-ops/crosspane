@@ -3,6 +3,1363 @@
 
 // Runtime tests are owned by WP-4.8c and will be added in a separate runtime_tests block.
 mod session_tests {
+    mod native_desktop {
+        use crosspane_installer::platform::linux::{
+            detect::*,
+            native_io::{
+                Cancellation, ChildEnvironment, CommandOutput, CommandRunner, CommandSpec,
+                Deadline, LinuxNativeIo, NativeError, ProcessFacts, ProcessProbe,
+            },
+            transport::CallerClock,
+        };
+        use std::{
+            collections::BTreeMap,
+            io::{Read, Write},
+            net::Shutdown,
+            num::NonZeroU32,
+            os::unix::net::{UnixListener, UnixStream},
+            path::PathBuf,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicU64, Ordering},
+            },
+            thread::{self, JoinHandle},
+            time::Duration,
+        };
+        use zbus::zvariant::{DynamicType, OwnedObjectPath, OwnedValue, Value};
+        fn path(value: &str) -> OwnedObjectPath {
+            value.try_into().unwrap()
+        }
+        fn value<T: Into<Value<'static>> + DynamicType>(value: T) -> OwnedValue {
+            OwnedValue::try_from(Value::new(value)).unwrap()
+        }
+        const WM: &str = "wayland-wm@Hyprland.service";
+        const SESSION: &str = "wayland-session@Hyprland.target";
+        const GRAPHICAL: &str = "graphical-session.target";
+        fn row(
+            id: &str,
+            object: &str,
+        ) -> (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            OwnedObjectPath,
+            u32,
+            String,
+            OwnedObjectPath,
+        ) {
+            (
+                id.into(),
+                "test description".into(),
+                "loaded".into(),
+                "active".into(),
+                "running".into(),
+                "".into(),
+                path(object),
+                0,
+                "".into(),
+                path("/"),
+            )
+        }
+        fn rows() -> UnitRows {
+            vec![
+                row(GRAPHICAL, "/units/graphical"),
+                row(WM, "/units/wm"),
+                row(SESSION, "/units/session"),
+            ]
+        }
+        fn unit(id: &str, binds: &[&str], requires: &[&str]) -> Properties {
+            [
+                ("Id", value(id.to_string())),
+                ("LoadState", value("loaded".to_string())),
+                ("ActiveState", value("active".to_string())),
+                (
+                    "BindsTo",
+                    value(binds.iter().map(|v| v.to_string()).collect::<Vec<_>>()),
+                ),
+                (
+                    "Requires",
+                    value(requires.iter().map(|v| v.to_string()).collect::<Vec<_>>()),
+                ),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect()
+        }
+        type Exec = (String, Vec<String>, bool, u64, u64, u64, u64, u32, i32, i32);
+        fn exec() -> Exec {
+            (
+                "/usr/bin/uwsm".into(),
+                vec![
+                    "/usr/bin/uwsm".into(),
+                    "aux".into(),
+                    "exec".into(),
+                    "--".into(),
+                    "Hyprland".into(),
+                ],
+                false,
+                123,
+                124,
+                0,
+                0,
+                4242,
+                0,
+                0,
+            )
+        }
+        fn service() -> Properties {
+            [
+                ("Type".into(), value("notify".to_string())),
+                ("MainPID".into(), value(4242u32)),
+                ("ExecStart".into(), value(vec![exec()])),
+            ]
+            .into_iter()
+            .collect()
+        }
+        enum Reply {
+            Rows(UnitRows),
+            Properties(Properties),
+            Text(String),
+            Error,
+        }
+        struct Step {
+            method: &'static str,
+            path: &'static str,
+            interface: &'static str,
+            body: &'static str,
+            reply: Reply,
+        }
+        fn script() -> Vec<Step> {
+            vec![
+                Step {
+                    method: "ListUnitsByPatterns",
+                    path: "/org/freedesktop/systemd1",
+                    interface: "org.freedesktop.systemd1.Manager",
+                    body: "wayland-wm@*.service",
+                    reply: Reply::Rows(rows()),
+                },
+                Step {
+                    method: "GetAll",
+                    path: "/units/graphical",
+                    interface: "org.freedesktop.DBus.Properties",
+                    body: "org.freedesktop.systemd1.Unit",
+                    reply: Reply::Properties(unit(GRAPHICAL, &[], &[])),
+                },
+                Step {
+                    method: "GetAll",
+                    path: "/units/wm",
+                    interface: "org.freedesktop.DBus.Properties",
+                    body: "org.freedesktop.systemd1.Unit",
+                    reply: Reply::Properties(unit(WM, &[SESSION], &[])),
+                },
+                Step {
+                    method: "GetAll",
+                    path: "/units/session",
+                    interface: "org.freedesktop.DBus.Properties",
+                    body: "org.freedesktop.systemd1.Unit",
+                    reply: Reply::Properties(unit(SESSION, &[GRAPHICAL], &[WM])),
+                },
+                Step {
+                    method: "GetAll",
+                    path: "/units/wm",
+                    interface: "org.freedesktop.DBus.Properties",
+                    body: "org.freedesktop.systemd1.Service",
+                    reply: Reply::Properties(service()),
+                },
+            ]
+        }
+        fn properties(step: &mut Step) -> &mut Properties {
+            match &mut step.reply {
+                Reply::Properties(values) => values,
+                _ => panic!("fixture is not properties"),
+            }
+        }
+        fn encoded(text: &str) -> Vec<u8> {
+            let mut result = (text.len() as u32).to_le_bytes().to_vec();
+            result.extend_from_slice(text.as_bytes());
+            result.push(0);
+            result
+        }
+        fn contains(bytes: &[u8], text: &str) -> bool {
+            bytes.windows(text.len() + 5).any(|v| v == encoded(text))
+        }
+        fn line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+            let mut result = Vec::new();
+            while !result.ends_with(b"\r\n") {
+                let mut one = [0];
+                stream.read_exact(&mut one)?;
+                result.push(one[0]);
+                assert!(result.len() <= 4096);
+            }
+            Ok(result)
+        }
+        fn frame(stream: &mut UnixStream) -> std::io::Result<(NonZeroU32, Vec<u8>, Vec<u8>)> {
+            let mut header = [0; 16];
+            stream.read_exact(&mut header)?;
+            assert_eq!(header[0], b'l');
+            let body = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            let fields = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+            let offset = (16 + fields + 7) & !7;
+            assert!(offset + body <= MAX_PROBE_BYTES);
+            let mut bytes = header.to_vec();
+            bytes.resize(offset + body, 0);
+            stream.read_exact(&mut bytes[16..])?;
+            Ok((
+                NonZeroU32::new(u32::from_le_bytes(header[8..12].try_into().unwrap())).unwrap(),
+                bytes.clone(),
+                bytes[offset..].to_vec(),
+            ))
+        }
+        fn reply<T: serde::Serialize + DynamicType>(
+            serial: NonZeroU32,
+            value: &T,
+        ) -> zbus::Message {
+            let dummy = zbus::Message::method_call("/fake", "Read")
+                .unwrap()
+                .serial(serial)
+                .build(&())
+                .unwrap();
+            zbus::Message::method_return(&dummy.header())
+                .unwrap()
+                .sender(":1.1")
+                .unwrap()
+                .build(value)
+                .unwrap()
+        }
+        struct BusServer {
+            stop: UnixStream,
+            join: Option<JoinHandle<std::io::Result<()>>>,
+            log: Arc<Mutex<Vec<String>>>,
+        }
+        impl Drop for BusServer {
+            fn drop(&mut self) {
+                let _ = self.stop.shutdown(Shutdown::Both);
+                if let Some(join) = self.join.take() {
+                    let _ = join.join();
+                }
+            }
+        }
+        impl BusServer {
+            fn new(script: Vec<Step>) -> (UnixStream, Self) {
+                let (client, mut peer) = UnixStream::pair().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let stop = peer.try_clone().unwrap();
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let record = log.clone();
+                let join = thread::spawn(move || {
+                    loop {
+                        let message = line(&mut peer)?;
+                        if message.ends_with(b"BEGIN\r\n") {
+                            break;
+                        }
+                        if message.starts_with(b"\0AUTH") || message.starts_with(b"AUTH") {
+                            peer.write_all(b"OK 0123456789abcdef0123456789abcdef\r\n")?;
+                        } else {
+                            assert!(message.starts_with(b"NEGOTIATE_UNIX_FD"));
+                            peer.write_all(b"ERROR no fd passing\r\n")?;
+                        }
+                    }
+                    let (serial, bytes, _) = frame(&mut peer)?;
+                    assert!(contains(&bytes, "Hello"));
+                    peer.write_all(reply(serial, &":1.42").data().bytes())?;
+                    for step in script {
+                        let (serial, bytes, body) = frame(&mut peer)?;
+                        assert!(contains(&bytes, step.method));
+                        assert!(contains(&bytes, step.path));
+                        assert!(contains(&bytes, step.interface));
+                        assert!(contains(&bytes, "org.freedesktop.systemd1"));
+                        assert!(contains(&body, step.body));
+                        record
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}:{}", step.method, step.path));
+                        let message = match step.reply {
+                            Reply::Rows(rows) => reply(serial, &rows),
+                            Reply::Properties(values) => reply(serial, &values),
+                            Reply::Text(text) => reply(serial, &text),
+                            Reply::Error => {
+                                let dummy = zbus::Message::method_call("/fake", "Read")
+                                    .unwrap()
+                                    .serial(serial)
+                                    .build(&())
+                                    .unwrap();
+                                zbus::Message::error(
+                                    &dummy.header(),
+                                    "org.freedesktop.DBus.Error.AccessDenied",
+                                )
+                                .unwrap()
+                                .sender(":1.1")
+                                .unwrap()
+                                .build(&"fake denied")
+                                .unwrap()
+                            }
+                        };
+                        peer.write_all(message.data().bytes())?;
+                    }
+                    let mut one = [0];
+                    assert_eq!(peer.read(&mut one)?, 0, "unexpected manager request");
+                    Ok(())
+                });
+                (
+                    client,
+                    Self {
+                        stop,
+                        join: Some(join),
+                        log,
+                    },
+                )
+            }
+            fn finish(mut self) -> Vec<String> {
+                self.join.take().unwrap().join().unwrap().unwrap();
+                self.log.lock().unwrap().clone()
+            }
+        }
+        fn clock() -> CallerClock {
+            let value = AtomicU64::new(10);
+            Arc::new(move || value.fetch_add(10, Ordering::SeqCst))
+        }
+        fn manager(script: Vec<Step>) -> (Fact<ManagerFacts>, Vec<String>) {
+            let (stream, server) = BusServer::new(script);
+            let result = manager_from_stream(
+                stream,
+                &Deadline::new(1500, Cancellation::default()).unwrap(),
+                clock(),
+            );
+            (result, server.finish())
+        }
+        #[test]
+        fn systemd_unit_rows_bound_every_field_and_reject_duplicate_identity() {
+            assert_eq!(decode_units(rows()).unwrap(), rows());
+            for mutate in [0, 1, 2, 3] {
+                let mut rows = rows();
+                match mutate {
+                    0 => rows[1].0 = rows[0].0.clone(),
+                    1 => rows[1].6 = rows[0].6.clone(),
+                    2 => rows[1].0.clear(),
+                    _ => rows[0].6 = path("/"),
+                }
+                assert_eq!(decode_units(rows), Err(ProbeIssue::Malformed));
+            }
+            let exact: UnitRows = (0..64)
+                .map(|i| row(&format!("u{i}"), &format!("/unit/u{i}")))
+                .collect();
+            assert_eq!(decode_units(exact.clone()).unwrap().len(), 64);
+            let mut oversized = exact;
+            oversized.push(row("extra", "/unit/extra"));
+            assert_eq!(decode_units(oversized), Err(ProbeIssue::Oversize));
+            for index in 0..7 {
+                let mut rows = rows();
+                let r = &mut rows[0];
+                let target = match index {
+                    0 => &mut r.0,
+                    1 => &mut r.1,
+                    2 => &mut r.2,
+                    3 => &mut r.3,
+                    4 => &mut r.4,
+                    5 => &mut r.5,
+                    _ => &mut r.8,
+                };
+                *target = "x".repeat(513);
+                assert_eq!(decode_units(rows), Err(ProbeIssue::Oversize));
+            }
+        }
+        #[test]
+        fn actual_manager_requires_typed_live_exec_and_graph_with_original_receipts() {
+            let (fact, log) = manager(script());
+            let decoded = fact.value.unwrap();
+            assert_eq!(
+                decoded.uwsm_managed,
+                Fact::known(true, ObservationSource::Demo, 50)
+            );
+            assert_eq!(
+                decoded.graphical_target_active,
+                Fact::known(true, ObservationSource::Demo, 20)
+            );
+            assert_eq!(decoded.compositor_pid, Some(4242));
+            assert_eq!(fact.observed_at_ms, 60);
+            assert_eq!(fact.source, ObservationSource::Demo);
+            assert_eq!(
+                log,
+                [
+                    "ListUnitsByPatterns:/org/freedesktop/systemd1",
+                    "GetAll:/units/graphical",
+                    "GetAll:/units/wm",
+                    "GetAll:/units/session",
+                    "GetAll:/units/wm"
+                ]
+            );
+            assert_eq!(decoded.clone(), decoded);
+        }
+        #[test]
+        fn active_target_and_effective_environment_never_manufacture_uwsm_lifecycle() {
+            let mut steps = script();
+            steps.truncate(2);
+            steps[0].reply = Reply::Rows(vec![rows()[0].clone()]);
+            let (fact, log) = manager(steps);
+            let decoded = fact.value.unwrap();
+            assert_eq!(
+                decoded.uwsm_managed,
+                Fact::known(false, ObservationSource::Demo, 10)
+            );
+            assert_eq!(
+                decoded.graphical_target_active,
+                Fact::known(true, ObservationSource::Demo, 20)
+            );
+            assert_eq!(decoded.compositor_pid, None);
+            assert_eq!(log.len(), 2);
+            let (fact, log) = manager(vec![Step {
+                reply: Reply::Rows(vec![]),
+                ..script().remove(0)
+            }]);
+            let decoded = fact.value.unwrap();
+            assert_eq!(decoded.uwsm_managed.value, Ok(false));
+            assert_eq!(decoded.graphical_target_active.value, Ok(false));
+            assert_eq!(log.len(), 1);
+        }
+        #[test]
+        fn unknown_unit_load_or_active_state_is_pending_not_known_absence() {
+            for active in [false, true] {
+                let mut entries = rows();
+                if active {
+                    entries[1].3 = "future-state".into();
+                } else {
+                    entries[1].2 = "future-state".into();
+                }
+                assert_eq!(decode_units(entries.clone()), Err(ProbeIssue::Malformed));
+                let mut steps = script();
+                steps.truncate(1);
+                steps[0].reply = Reply::Rows(entries);
+                let (fact, log) = manager(steps);
+                assert_eq!(fact.value, Err(ProbeIssue::Malformed));
+                assert_eq!(fact.observed_at_ms, 20);
+                assert_eq!(log.len(), 1);
+            }
+        }
+        #[test]
+        fn known_systemd_state_and_service_type_vocabularies_are_literal() {
+            for load in [
+                "stub",
+                "loaded",
+                "not-found",
+                "bad-setting",
+                "error",
+                "merged",
+                "masked",
+            ] {
+                let mut entries = rows();
+                entries[1].2 = load.into();
+                assert_eq!(decode_units(entries.clone()), Ok(entries));
+            }
+            for active in [
+                "active",
+                "reloading",
+                "inactive",
+                "failed",
+                "activating",
+                "deactivating",
+                "maintenance",
+                "refreshing",
+            ] {
+                let mut entries = rows();
+                entries[1].3 = active.into();
+                assert_eq!(decode_units(entries.clone()), Ok(entries));
+            }
+            for kind in [
+                "simple",
+                "exec",
+                "forking",
+                "oneshot",
+                "dbus",
+                "notify",
+                "notify-reload",
+                "idle",
+            ] {
+                let mut steps = script();
+                properties(&mut steps[4]).insert("Type".into(), value(kind.to_string()));
+                let decoded = manager(steps).0.value.unwrap();
+                assert_eq!(decoded.uwsm_managed.value, Ok(kind == "notify"));
+            }
+            for active in [
+                "reloading",
+                "activating",
+                "deactivating",
+                "maintenance",
+                "refreshing",
+            ] {
+                let mut entries = rows();
+                entries[1].3 = active.into();
+                let mut steps = script();
+                steps.truncate(1);
+                steps[0].reply = Reply::Rows(entries);
+                let (fact, log) = manager(steps);
+                assert_eq!(fact.value, Err(ProbeIssue::Unverified));
+                assert_eq!(log.len(), 1);
+            }
+        }
+        #[test]
+        fn unknown_service_type_is_pending_not_known_non_uwsm() {
+            let mut steps = script();
+            properties(&mut steps[4])
+                .insert("Type".into(), value("future-service-type".to_string()));
+            assert_eq!(manager(steps).0.value, Err(ProbeIssue::Malformed));
+        }
+        #[test]
+        fn session_target_transitions_remain_pending_with_valid_uwsm_service() {
+            for active in [
+                "activating",
+                "deactivating",
+                "reloading",
+                "maintenance",
+                "refreshing",
+            ] {
+                let mut steps = script();
+                let mut entries = rows();
+                entries[2].3 = active.into();
+                steps[0].reply = Reply::Rows(entries);
+                properties(&mut steps[3]).insert("ActiveState".into(), value(active.to_string()));
+                steps.truncate(4);
+                let (fact, log) = manager(steps);
+                assert_eq!(fact.value, Err(ProbeIssue::Unverified));
+                assert_eq!(log.len(), 4);
+            }
+        }
+        #[test]
+        fn each_uwsm_exec_or_graph_contradiction_independently_prevents_management() {
+            for variant in 0..17 {
+                let mut steps = script();
+                let mut executable = exec();
+                match variant {
+                    0 => {
+                        properties(&mut steps[2])
+                            .insert("BindsTo".into(), value(Vec::<String>::new()));
+                    }
+                    1 => {
+                        properties(&mut steps[3])
+                            .insert("BindsTo".into(), value(Vec::<String>::new()));
+                    }
+                    2 => {
+                        properties(&mut steps[3])
+                            .insert("Requires".into(), value(Vec::<String>::new()));
+                    }
+                    3 => {
+                        properties(&mut steps[4])
+                            .insert("Type".into(), value("simple".to_string()));
+                    }
+                    4 => {
+                        properties(&mut steps[4]).insert("MainPID".into(), value(0u32));
+                    }
+                    5 => executable.0 = "/usr/bin/other".into(),
+                    6 => executable.1[0] = "/usr/bin/other".into(),
+                    7 => executable.1[1] = "not-aux".into(),
+                    8 => executable.1[2] = "not-exec".into(),
+                    9 => executable.1[3] = "not-delimiter".into(),
+                    10 => executable.1[4] = "other".into(),
+                    11 => executable.2 = true,
+                    12 => executable.3 = 0,
+                    13 => executable.5 = 1234,
+                    14 => executable.6 = 1234,
+                    15 => executable.7 = 99,
+                    _ => executable.4 = 0,
+                }
+                if variant >= 5 {
+                    properties(&mut steps[4]).insert("ExecStart".into(), value(vec![executable]));
+                }
+                let result = manager(steps).0.value;
+                if matches!(variant, 4 | 12..=16) {
+                    assert_eq!(result, Err(ProbeIssue::Unverified), "variant {variant}");
+                    continue;
+                }
+                let decoded = result.unwrap();
+                assert_eq!(decoded.uwsm_managed.value, Ok(false), "variant {variant}");
+                assert_eq!(decoded.compositor_pid, None);
+            }
+            for exec in [Vec::<Exec>::new(), vec![exec(), exec()]] {
+                let mut steps = script();
+                let empty = exec.is_empty();
+                properties(&mut steps[4]).insert("ExecStart".into(), value(exec));
+                assert_eq!(
+                    manager(steps).0.value,
+                    Err(if empty {
+                        ProbeIssue::Unverified
+                    } else {
+                        ProbeIssue::Ambiguous
+                    })
+                );
+            }
+        }
+        #[test]
+        fn manager_each_required_property_absence_and_wrong_signature_is_pending() {
+            for stage in [1usize, 2, 3, 4] {
+                let keys: &[&str] = if stage == 4 {
+                    &["Type", "MainPID", "ExecStart"]
+                } else {
+                    &["Id", "LoadState", "ActiveState", "BindsTo", "Requires"]
+                };
+                for key in keys {
+                    for missing in [true, false] {
+                        let mut steps = script();
+                        if missing {
+                            properties(&mut steps[stage]).remove(*key);
+                        } else {
+                            properties(&mut steps[stage]).insert((*key).into(), value(7i64));
+                        }
+                        steps.truncate(stage + 1);
+                        let (fact, log) = manager(steps);
+                        assert_eq!(
+                            fact.value,
+                            Err(if missing {
+                                ProbeIssue::Unverified
+                            } else {
+                                ProbeIssue::Malformed
+                            }),
+                            "stage {stage} field {key}"
+                        );
+                        assert_eq!(log.len(), stage + 1);
+                    }
+                }
+            }
+        }
+        #[test]
+        fn systemd_wrong_empty_array_and_short_extra_exec_tuples_fail_without_panic() {
+            for malformed in [
+                value(Vec::<String>::new()),
+                value(vec![("/usr/bin/uwsm".to_string(),)]),
+                value(vec![(exec(), true)]),
+            ] {
+                let mut steps = script();
+                properties(&mut steps[4]).insert("ExecStart".into(), malformed);
+                assert_eq!(manager(steps).0.value, Err(ProbeIssue::Malformed));
+            }
+            let mut steps = script();
+            steps[0].reply = Reply::Text("wrong rows".into());
+            steps.truncate(1);
+            assert_eq!(manager(steps).0.value, Err(ProbeIssue::Malformed));
+        }
+        #[test]
+        fn manager_ambiguity_unreadable_drift_and_bounds_stop_at_receipt() {
+            let mut steps = script();
+            let mut entries = rows();
+            entries.push(row("wayland-wm@other.service", "/units/other"));
+            steps[0].reply = Reply::Rows(entries);
+            steps.truncate(2);
+            assert_eq!(manager(steps).0.value, Err(ProbeIssue::Ambiguous));
+            let mut steps = script();
+            steps[2].reply = Reply::Error;
+            steps.truncate(3);
+            assert_eq!(manager(steps).0.value, Err(ProbeIssue::Unavailable));
+            for key in ["Id", "LoadState", "ActiveState"] {
+                let mut steps = script();
+                properties(&mut steps[2]).insert(key.into(), value("changed".to_string()));
+                steps.truncate(3);
+                assert_eq!(manager(steps).0.value, Err(ProbeIssue::Foreign));
+            }
+            for key in ["BindsTo", "Requires"] {
+                let mut steps = script();
+                properties(&mut steps[2]).insert(key.into(), value(vec!["x".to_string(); 65]));
+                steps.truncate(3);
+                assert_eq!(manager(steps).0.value, Err(ProbeIssue::Oversize));
+            }
+            let mut steps = script();
+            properties(&mut steps[1]).insert("Ignored".into(), value("x".repeat(MAX_PROBE_BYTES)));
+            steps.truncate(2);
+            assert_eq!(manager(steps).0.value, Err(ProbeIssue::Oversize));
+        }
+        #[test]
+        fn uwsm_instance_decoding_preserves_escaped_identity_and_all_configured_arguments() {
+            let wm = "wayland-wm@Hyprland\\x2dtest.service";
+            let session = "wayland-session@Hyprland\\x2dtest.target";
+            let mut steps = script();
+            steps[0].reply = Reply::Rows(vec![
+                rows()[0].clone(),
+                row(wm, "/units/wm"),
+                row(session, "/units/session"),
+            ]);
+            steps[2].reply = Reply::Properties(unit(wm, &[session], &[]));
+            steps[3].reply = Reply::Properties(unit(session, &[GRAPHICAL], &[wm]));
+            let mut command = exec();
+            command.1[4] = "Hyprland-test".into();
+            command
+                .1
+                .extend(["".into(), "--config".into(), "/test/config".into()]);
+            properties(&mut steps[4]).insert("ExecStart".into(), value(vec![command]));
+            assert_eq!(manager(steps).0.value.unwrap().uwsm_managed.value, Ok(true));
+            for instance in ["", r"bad\x", r"bad\xZZ", r"bad\x00", r"bad\xff"] {
+                let wm = format!("wayland-wm@{instance}.service");
+                let session = format!("wayland-session@{instance}.target");
+                let mut steps = script();
+                steps[0].reply = Reply::Rows(vec![
+                    rows()[0].clone(),
+                    row(&wm, "/units/wm"),
+                    row(&session, "/units/session"),
+                ]);
+                steps[2].reply = Reply::Properties(unit(&wm, &[&session], &[]));
+                steps[3].reply = Reply::Properties(unit(&session, &[GRAPHICAL], &[&wm]));
+                assert_eq!(manager(steps).0.value, Err(ProbeIssue::Malformed));
+            }
+        }
+        fn globals() -> Vec<(String, u32)> {
+            REQUIRED_PROTOCOLS
+                .iter()
+                .map(|(name, version)| (name.to_string(), *version))
+                .collect()
+        }
+        #[test]
+        fn every_current_backend_protocol_and_minimum_is_required_without_binding() {
+            assert_eq!(protocols_satisfy(&globals()), Ok(true));
+            for index in 0..REQUIRED_PROTOCOLS.len() {
+                let mut entries = globals();
+                entries.remove(index);
+                assert_eq!(protocols_satisfy(&entries), Ok(false));
+                let mut entries = globals();
+                entries[index].1 -= 1;
+                assert_eq!(
+                    protocols_satisfy(&entries),
+                    if entries[index].1 == 0 {
+                        Err(ProbeIssue::Malformed)
+                    } else {
+                        Ok(false)
+                    }
+                );
+            }
+            assert_eq!(
+                protocols_satisfy(&vec![("valid".into(), 1); 256]),
+                Ok(false)
+            );
+            assert_eq!(
+                protocols_satisfy(&vec![("valid".into(), 1); 257]),
+                Err(ProbeIssue::Oversize)
+            );
+            for entries in [
+                vec![("".into(), 1)],
+                vec![("bad\n".into(), 1)],
+                vec![("wl_seat".into(), 0)],
+            ] {
+                assert_eq!(protocols_satisfy(&entries), Err(ProbeIssue::Malformed));
+            }
+            assert_eq!(
+                protocols_satisfy(&[("x".repeat(129), 1)]),
+                Err(ProbeIssue::Oversize)
+            );
+        }
+        #[test]
+        fn capture_managers_are_independently_required_at_backend_minimum_versions() {
+            let complete = globals();
+            for name in [
+                "ext_image_copy_capture_manager_v1",
+                "ext_output_image_capture_source_manager_v1",
+            ] {
+                assert_eq!(
+                    REQUIRED_PROTOCOLS
+                        .iter()
+                        .find(|(interface, _)| *interface == name)
+                        .unwrap()
+                        .1,
+                    1
+                );
+                let mut missing = complete.clone();
+                missing.retain(|(interface, _)| interface != name);
+                assert_eq!(protocols_satisfy(&missing), Ok(false), "missing {name}");
+                let mut wrong = complete.clone();
+                wrong
+                    .iter_mut()
+                    .find(|(interface, _)| interface == name)
+                    .unwrap()
+                    .1 = 0;
+                assert_eq!(
+                    protocols_satisfy(&wrong),
+                    Err(ProbeIssue::Malformed),
+                    "version {name}"
+                );
+            }
+        }
+        #[test]
+        fn hyprland_version_boundary_unknown_and_protocol_envelope_are_literal() {
+            for (version, expected) in [
+                ("0.55.9", [0, 55, 9]),
+                ("0.56.0", [0, 56, 0]),
+                ("0.56.1", [0, 56, 1]),
+                ("1.0.0", [1, 0, 0]),
+                ("65535.65535.65535", [65535; 3]),
+            ] {
+                assert_eq!(
+                    parse_hyprland_version(
+                        format!(
+                            "Hyprland {version} built from branch main at commit abc.\nDate: test\n"
+                        )
+                        .as_bytes()
+                    ),
+                    Ok(expected)
+                );
+            }
+            for value in [
+                "",
+                "0.56.0",
+                "Other 0.56.0 built from branch main",
+                "Hyprland 0.56.0",
+                "Hyprland 0.56 built from branch main",
+                "Hyprland 0.56.0.1 built from branch main",
+                "Hyprland 0.56.0-dev built from branch main",
+                "Hyprland -1.56.0 built from branch main",
+                "Hyprland 65536.56.0 built from branch main",
+            ] {
+                assert_eq!(
+                    parse_hyprland_version(value.as_bytes()),
+                    Err(ProbeIssue::Malformed)
+                );
+            }
+            assert_eq!(parse_hyprland_version(&[0xff]), Err(ProbeIssue::Malformed));
+            assert_eq!(
+                parse_hyprland_version(&vec![b'x'; MAX_PROBE_BYTES + 1]),
+                Err(ProbeIssue::Oversize)
+            );
+        }
+        struct OwnedPeer {
+            stop: UnixStream,
+            join: Option<JoinHandle<()>>,
+        }
+        impl Drop for OwnedPeer {
+            fn drop(&mut self) {
+                let _ = self.stop.shutdown(Shutdown::Both);
+                if let Some(join) = self.join.take() {
+                    let _ = join.join();
+                }
+            }
+        }
+        impl OwnedPeer {
+            fn new(work: impl FnOnce(UnixStream) + Send + 'static) -> (UnixStream, Self) {
+                let (client, peer) = UnixStream::pair().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let stop = peer.try_clone().unwrap();
+                let join = Some(thread::spawn(move || work(peer)));
+                (client, Self { stop, join })
+            }
+            fn finish(mut self) {
+                self.join.take().unwrap().join().unwrap();
+            }
+        }
+        #[test]
+        fn actual_hyprland_partial_reply_pins_exact_read_request_peer_and_receipt() {
+            let (stream, server) = OwnedPeer::new(|mut peer| {
+                let mut request = [0; 8];
+                peer.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"/version");
+                for part in [
+                    b"Hyprland 0.".as_slice(),
+                    b"56.0 built from ",
+                    b"branch main at commit test.\n",
+                ] {
+                    peer.write_all(part).unwrap();
+                }
+                peer.shutdown(Shutdown::Write).unwrap();
+                let mut one = [0];
+                assert_eq!(peer.read(&mut one).unwrap(), 0);
+            });
+            let fact = hyprland_from_stream(
+                stream,
+                &Deadline::new(500, Cancellation::default()).unwrap(),
+                clock(),
+            );
+            server.finish();
+            let facts = fact.value.unwrap();
+            assert_eq!(facts.pid, std::process::id());
+            assert_eq!(
+                facts.version,
+                Fact::known([0, 56, 0], ObservationSource::Demo, 10)
+            );
+            assert_eq!(fact.observed_at_ms, 20);
+            assert_eq!(fact.source, ObservationSource::Demo);
+            assert_eq!(facts.clone(), facts);
+        }
+        #[test]
+        fn hyprland_oversized_malformed_and_stalled_reads_never_report_version_success() {
+            for (bytes, expected) in [
+                (vec![b'x'; MAX_PROBE_BYTES + 1], ProbeIssue::Oversize),
+                (b"not Hyprland".to_vec(), ProbeIssue::Malformed),
+            ] {
+                let (stream, server) = OwnedPeer::new(move |mut peer| {
+                    let mut request = [0; 8];
+                    peer.read_exact(&mut request).unwrap();
+                    assert_eq!(&request, b"/version");
+                    peer.write_all(&bytes).unwrap();
+                    peer.shutdown(Shutdown::Write).unwrap();
+                });
+                let result = hyprland_from_stream(
+                    stream,
+                    &Deadline::new(500, Cancellation::default()).unwrap(),
+                    clock(),
+                );
+                server.finish();
+                assert_eq!(result.value.unwrap().version.value, Err(expected));
+            }
+            let (stream, server) = OwnedPeer::new(|mut peer| {
+                let mut request = [0; 8];
+                peer.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"/version");
+                let mut one = [0];
+                assert_eq!(peer.read(&mut one).unwrap(), 0);
+            });
+            assert_eq!(
+                hyprland_from_stream(
+                    stream,
+                    &Deadline::new(40, Cancellation::default()).unwrap(),
+                    clock()
+                )
+                .value,
+                Err(ProbeIssue::Timeout)
+            );
+            server.finish();
+        }
+        fn wl_request(peer: &mut UnixStream) -> (u32, u16, Vec<u8>) {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header).unwrap();
+            let object = u32::from_ne_bytes(header[..4].try_into().unwrap());
+            let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+            let len = (word >> 16) as usize;
+            assert!((8..=MAX_PROBE_BYTES).contains(&len));
+            let mut body = vec![0; len - 8];
+            peer.read_exact(&mut body).unwrap();
+            (object, word as u16, body)
+        }
+        fn wl_event(peer: &mut UnixStream, object: u32, opcode: u16, body: &[u8]) {
+            assert_eq!(body.len() % 4, 0);
+            let mut bytes = object.to_ne_bytes().to_vec();
+            bytes.extend_from_slice(
+                &((((body.len() + 8) as u32) << 16) | u32::from(opcode)).to_ne_bytes(),
+            );
+            bytes.extend_from_slice(body);
+            peer.write_all(&bytes).unwrap();
+        }
+        fn wl_global(
+            peer: &mut UnixStream,
+            registry: u32,
+            name: u32,
+            interface: &str,
+            version: u32,
+        ) {
+            let mut body = name.to_ne_bytes().to_vec();
+            body.extend_from_slice(&((interface.len() + 1) as u32).to_ne_bytes());
+            body.extend_from_slice(interface.as_bytes());
+            body.push(0);
+            while !body.len().is_multiple_of(4) {
+                body.push(0);
+            }
+            body.extend_from_slice(&version.to_ne_bytes());
+            wl_event(peer, registry, 0, &body);
+        }
+        fn registry_peer(
+            work: impl FnOnce(&mut UnixStream, u32) + Send + 'static,
+        ) -> (UnixStream, OwnedPeer) {
+            OwnedPeer::new(move |mut peer| {
+                let (object, opcode, body) = wl_request(&mut peer);
+                assert_eq!((object, opcode), (1, 1));
+                assert_eq!(body.len(), 4);
+                let registry = u32::from_ne_bytes(body.try_into().unwrap());
+                let (object, opcode, body) = wl_request(&mut peer);
+                assert_eq!((object, opcode), (1, 0));
+                assert_eq!(body.len(), 4);
+                let callback = u32::from_ne_bytes(body.try_into().unwrap());
+                work(&mut peer, registry);
+                wl_event(&mut peer, callback, 0, &7u32.to_ne_bytes());
+                // No bind request, capture/input/output object, or additional display request.
+                let mut one = [0];
+                assert_eq!(
+                    peer.read(&mut one).unwrap(),
+                    0,
+                    "registry-only read sent another request"
+                );
+            })
+        }
+        #[test]
+        fn actual_registry_only_sends_get_registry_and_sync_and_retains_peer_receipt() {
+            let (stream, server) = registry_peer(|peer, registry| {
+                for (index, (name, version)) in REQUIRED_PROTOCOLS.iter().enumerate() {
+                    wl_global(peer, registry, index as u32 + 1, name, *version);
+                }
+            });
+            let result = registry_from_stream(
+                stream,
+                &Deadline::new(500, Cancellation::default()).unwrap(),
+                clock(),
+            );
+            server.finish();
+            let facts = result.value.unwrap();
+            assert_eq!(facts.pid, std::process::id());
+            assert_eq!(facts.globals, globals());
+            assert_eq!(
+                facts.protocols,
+                Fact::known(true, ObservationSource::Demo, 10)
+            );
+            assert_eq!(result.observed_at_ms, 20);
+            assert_eq!(result.source, ObservationSource::Demo);
+        }
+        #[test]
+        fn registry_removal_changes_snapshot_and_duplicate_or_bad_events_fail_closed() {
+            let (stream, server) = registry_peer(|peer, registry| {
+                for (index, (name, version)) in REQUIRED_PROTOCOLS.iter().enumerate() {
+                    wl_global(peer, registry, index as u32 + 1, name, *version);
+                }
+                wl_event(peer, registry, 1, &1u32.to_ne_bytes());
+            });
+            let result = registry_from_stream(
+                stream,
+                &Deadline::new(500, Cancellation::default()).unwrap(),
+                clock(),
+            );
+            server.finish();
+            assert_eq!(result.value.unwrap().protocols.value, Ok(false));
+            for variant in 0..4 {
+                let (stream, server) = OwnedPeer::new(move |mut peer| {
+                    let (_, _, body) = wl_request(&mut peer);
+                    let registry = u32::from_ne_bytes(body.try_into().unwrap());
+                    let _ = wl_request(&mut peer);
+                    match variant {
+                        0 => {
+                            wl_global(&mut peer, registry, 1, "wl_seat", 5);
+                            wl_global(&mut peer, registry, 1, "wl_seat", 5);
+                        }
+                        1 => wl_global(&mut peer, registry, 0, "wl_seat", 5),
+                        2 => wl_global(&mut peer, registry, 1, "wl_seat", 0),
+                        _ => wl_event(&mut peer, registry, 1, &7u32.to_ne_bytes()),
+                    }
+                    let mut one = [0];
+                    assert_eq!(peer.read(&mut one).unwrap(), 0);
+                });
+                let result = registry_from_stream(
+                    stream,
+                    &Deadline::new(500, Cancellation::default()).unwrap(),
+                    clock(),
+                );
+                server.finish();
+                assert_eq!(
+                    result.value,
+                    Err(ProbeIssue::Malformed),
+                    "variant {variant}"
+                );
+            }
+        }
+        #[test]
+        fn registry_global_row_and_string_limits_close_owned_stream_without_binding() {
+            for (count, interface) in [(257, "valid".to_string()), (1, "x".repeat(129))] {
+                let (stream, server) = OwnedPeer::new(move |mut peer| {
+                    let (_, _, body) = wl_request(&mut peer);
+                    let registry = u32::from_ne_bytes(body.try_into().unwrap());
+                    let _ = wl_request(&mut peer);
+                    for name in 1..=count {
+                        wl_global(&mut peer, registry, name, &interface, 1);
+                    }
+                    let mut one = [0];
+                    assert_eq!(peer.read(&mut one).unwrap(), 0);
+                });
+                let result = registry_from_stream(
+                    stream,
+                    &Deadline::new(500, Cancellation::default()).unwrap(),
+                    clock(),
+                );
+                server.finish();
+                assert_eq!(result.value, Err(ProbeIssue::Oversize));
+            }
+        }
+        #[test]
+        fn manager_registry_auth_and_reads_share_deadline_cancel_without_other_socket_effects() {
+            for registry in [false, true] {
+                let (stream, server) = OwnedPeer::new(|mut peer| {
+                    let mut one = [0];
+                    loop {
+                        if peer.read(&mut one).unwrap() == 0 {
+                            break;
+                        }
+                    }
+                });
+                let deadline = Deadline::new(40, Cancellation::default()).unwrap();
+                let issue = if registry {
+                    registry_from_stream(stream, &deadline, clock()).value.err()
+                } else {
+                    manager_from_stream(stream, &deadline, clock()).value.err()
+                };
+                server.finish();
+                assert_eq!(issue, Some(ProbeIssue::Timeout));
+            }
+            for probe in 0..3 {
+                let (stream, mut peer) = UnixStream::pair().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let cancellation = Cancellation::default();
+                cancellation.cancel();
+                let deadline = Deadline::new(500, cancellation).unwrap();
+                let issue = match probe {
+                    0 => manager_from_stream(stream, &deadline, clock()).value.err(),
+                    1 => hyprland_from_stream(stream, &deadline, clock()).value.err(),
+                    _ => registry_from_stream(stream, &deadline, clock()).value.err(),
+                };
+                assert_eq!(issue, Some(ProbeIssue::Cancelled));
+                let mut one = [0];
+                assert_eq!(peer.read(&mut one).unwrap(), 0);
+            }
+            let (mut unrelated, mut peer) = UnixStream::pair().unwrap();
+            unrelated.write_all(b"owned").unwrap();
+            let mut bytes = [0; 5];
+            peer.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"owned");
+        }
+        struct NeverProcess;
+        #[test]
+        fn cancellation_after_each_owned_protocol_starts_shuts_down_and_releases_worker() {
+            for protocol in 0..3 {
+                let (send, receive) = std::sync::mpsc::sync_channel(1);
+                let (stream, server) = OwnedPeer::new(move |mut peer| {
+                    match protocol {
+                        0 => {
+                            assert!(line(&mut peer).unwrap().starts_with(b"\0AUTH"));
+                        }
+                        1 => {
+                            let mut request = [0; 8];
+                            peer.read_exact(&mut request).unwrap();
+                            assert_eq!(&request, b"/version");
+                        }
+                        _ => {
+                            assert_eq!(wl_request(&mut peer).0, 1);
+                            assert_eq!(wl_request(&mut peer).0, 1);
+                        }
+                    }
+                    send.send(()).unwrap();
+                    let mut one = [0];
+                    assert_eq!(peer.read(&mut one).unwrap(), 0);
+                });
+                let cancellation = Cancellation::default();
+                let deadline = Deadline::new(1000, cancellation.clone()).unwrap();
+                let caller = thread::spawn(move || match protocol {
+                    0 => manager_from_stream(stream, &deadline, clock()).value.err(),
+                    1 => hyprland_from_stream(stream, &deadline, clock()).value.err(),
+                    _ => registry_from_stream(stream, &deadline, clock()).value.err(),
+                });
+                receive.recv_timeout(Duration::from_secs(1)).unwrap();
+                cancellation.cancel();
+                assert_eq!(caller.join().unwrap(), Some(ProbeIssue::Cancelled));
+                server.finish();
+            }
+            // A successful next owned exchange confirms cancelled clients retired their workers.
+            assert_eq!(
+                manager(script()).0.value.unwrap().uwsm_managed.value,
+                Ok(true)
+            );
+        }
+        impl ProcessProbe for NeverProcess {
+            fn snapshot(&self, _: u32, _: &Deadline) -> Result<ProcessFacts, NativeError> {
+                panic!("detector queried an agent process")
+            }
+        }
+        struct Runner {
+            reply: Mutex<Option<Result<CommandOutput, NativeError>>>,
+            calls: Mutex<usize>,
+        }
+        impl CommandRunner for Runner {
+            fn run(
+                &self,
+                spec: &CommandSpec,
+                deadline: &Deadline,
+            ) -> Result<CommandOutput, NativeError> {
+                deadline.check()?;
+                assert_eq!(
+                    spec.executable(),
+                    std::path::Path::new("/usr/bin/systemctl")
+                );
+                assert_eq!(spec.argv(), ["--user", "show-environment"]);
+                assert_eq!(spec.output_limit(), MAX_PROBE_BYTES);
+                assert_eq!(spec.environment().values()["LC_ALL"], "C");
+                assert_eq!(spec.environment().values()["TZ"], "UTC");
+                assert!(
+                    !spec
+                        .environment()
+                        .values()
+                        .contains_key("DBUS_SYSTEM_BUS_ADDRESS")
+                );
+                *self.calls.lock().unwrap() += 1;
+                self.reply.lock().unwrap().take().unwrap()
+            }
+        }
+        static ROOT_IDS: AtomicU64 = AtomicU64::new(1);
+        struct Scratch {
+            io: Arc<LinuxNativeIo>,
+            root: rustix::fd::OwnedFd,
+            parent: rustix::fd::OwnedFd,
+            run: rustix::fd::OwnedFd,
+            systemd: rustix::fd::OwnedFd,
+            name: String,
+            listener: Option<UnixListener>,
+        }
+        impl Scratch {
+            fn new(runner: Arc<Runner>) -> Self {
+                use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, open, openat, statat};
+                let name = format!(
+                    "crosspane-a2-{}-{}",
+                    std::process::id(),
+                    ROOT_IDS.fetch_add(1, Ordering::SeqCst)
+                );
+                let path = PathBuf::from("/tmp").join(&name);
+                // Frozen scratch construction exclusively creates this root; existing names fail.
+                let io = Arc::new(
+                    LinuxNativeIo::scratch(&path, runner, Arc::new(NeverProcess)).unwrap(),
+                );
+                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                let parent = open("/tmp", flags, Mode::empty()).unwrap();
+                let root = openat(&parent, &name, flags, Mode::empty()).unwrap();
+                mkdirat(&root, "run", Mode::RUSR | Mode::WUSR | Mode::XUSR).unwrap();
+                let run = openat(&root, "run", flags, Mode::empty()).unwrap();
+                mkdirat(&run, "systemd", Mode::RUSR | Mode::WUSR | Mode::XUSR).unwrap();
+                let systemd = openat(&run, "systemd", flags, Mode::empty()).unwrap();
+                // Pathname bind is confined to this newly exclusive private root; verify immediately.
+                let listener = UnixListener::bind(path.join("run/systemd/private")).unwrap();
+                let socket = statat(&systemd, "private", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+                assert_eq!(socket.st_uid, io.target().paths().uid);
+                assert_eq!(socket.st_mode & 0o170000, 0o140000);
+                Self {
+                    io,
+                    root,
+                    parent,
+                    run,
+                    systemd,
+                    name,
+                    listener: Some(listener),
+                }
+            }
+        }
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                use rustix::fs::{AtFlags, fstat, statat, unlinkat};
+                self.listener.take();
+                unlinkat(&self.systemd, "private", AtFlags::empty()).unwrap();
+                unlinkat(&self.run, "systemd", AtFlags::REMOVEDIR).unwrap();
+                unlinkat(&self.root, "run", AtFlags::REMOVEDIR).unwrap();
+                let expected = fstat(&self.root).unwrap();
+                let current = statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+                assert_eq!(
+                    (expected.st_dev, expected.st_ino),
+                    (current.st_dev, current.st_ino)
+                );
+                unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR).unwrap();
+            }
+        }
+        #[test]
+        fn effective_environment_uses_only_exact_injected_show_environment_and_receipt() {
+            let runner = Arc::new(Runner {
+                reply: Mutex::new(None),
+                calls: Mutex::new(0),
+            });
+            let scratch = Scratch::new(runner.clone());
+            let runtime = scratch.io.target().paths().runtime_home.clone();
+            let output = format!(
+                "XDG_RUNTIME_DIR={}\nWAYLAND_DISPLAY=wayland-test\nHYPRLAND_INSTANCE_SIGNATURE=test-instance\nXDG_SESSION_ID=c7\n",
+                runtime.display()
+            );
+            *runner.reply.lock().unwrap() = Some(Ok(CommandOutput {
+                code: Some(0),
+                stdout: output.into_bytes(),
+                stderr: vec![],
+            }));
+            let environment =
+                ChildEnvironment::selected(scratch.io.target(), BTreeMap::new()).unwrap();
+            let probes =
+                NativeSessionProbes::new(scratch.io.clone(), environment, clock()).unwrap();
+            let result =
+                probes.manager_environment(&Deadline::new(500, Cancellation::default()).unwrap());
+            assert_eq!(
+                result,
+                Fact::known(
+                    EffectiveEnvironment {
+                        runtime_dir: runtime,
+                        wayland_display: "wayland-test".into(),
+                        hyprland_instance_signature: "test-instance".into(),
+                        session_id: Some("c7".into())
+                    },
+                    ObservationSource::Demo,
+                    10
+                )
+            );
+            assert_eq!(*runner.calls.lock().unwrap(), 1);
+            // No installation, config, service file, agent directory, or environment import exists.
+            assert_eq!(
+                rustix::fs::statat(
+                    &scratch.root,
+                    ".local",
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW
+                )
+                .unwrap_err(),
+                rustix::io::Errno::NOENT
+            );
+        }
+        #[test]
+        fn effective_environment_failure_timeout_malformed_and_oversize_remain_pending() {
+            let runner = Arc::new(Runner {
+                reply: Mutex::new(None),
+                calls: Mutex::new(0),
+            });
+            let scratch = Scratch::new(runner.clone());
+            let probes = NativeSessionProbes::new(
+                scratch.io.clone(),
+                ChildEnvironment::selected(scratch.io.target(), BTreeMap::new()).unwrap(),
+                clock(),
+            )
+            .unwrap();
+            for (output, expected) in [
+                (Err(NativeError::Timeout), ProbeIssue::Timeout),
+                (Err(NativeError::Cancelled), ProbeIssue::Cancelled),
+                (
+                    Ok(CommandOutput {
+                        code: Some(1),
+                        stdout: vec![],
+                        stderr: b"fake denied".to_vec(),
+                    }),
+                    ProbeIssue::Unavailable,
+                ),
+                (
+                    Ok(CommandOutput {
+                        code: Some(0),
+                        stdout: vec![0xff],
+                        stderr: vec![],
+                    }),
+                    ProbeIssue::Malformed,
+                ),
+                (
+                    Ok(CommandOutput {
+                        code: Some(0),
+                        stdout: b"WAYLAND_DISPLAY=only-one-fact\n".to_vec(),
+                        stderr: vec![],
+                    }),
+                    ProbeIssue::Missing,
+                ),
+                (
+                    Ok(CommandOutput {
+                        code: Some(0),
+                        stdout: vec![b'x'; MAX_PROBE_BYTES + 1],
+                        stderr: vec![],
+                    }),
+                    ProbeIssue::Oversize,
+                ),
+            ] {
+                *runner.reply.lock().unwrap() = Some(output);
+                let result = probes
+                    .manager_environment(&Deadline::new(500, Cancellation::default()).unwrap());
+                assert_eq!(result.value, Err(expected));
+                assert_eq!(result.source, ObservationSource::Demo);
+            }
+            assert_eq!(*runner.calls.lock().unwrap(), 6);
+            let cancel = Cancellation::default();
+            cancel.cancel();
+            assert_eq!(
+                probes
+                    .manager_environment(&Deadline::new(500, cancel).unwrap())
+                    .value,
+                Err(ProbeIssue::Cancelled)
+            );
+            assert_eq!(*runner.calls.lock().unwrap(), 6);
+        }
+    }
     mod native_logind {
         use crosspane_installer::agent_contract::ObservationSource;
         use crosspane_installer::platform::linux::{
