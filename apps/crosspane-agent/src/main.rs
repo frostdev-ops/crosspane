@@ -370,6 +370,7 @@ fn start_agent(
     let e2_journal =
         FileJournal::open(&paths.e2_journal_file()).context("open projection input journal")?;
     let mut engine_config = EngineConfig::new(node);
+    engine_config.drag_across = config.drag.across;
     engine_config.push_to_cross =
         std::time::Duration::from_millis(config.push_to_cross_ms.min(200));
     for (name, profile) in &config.remap {
@@ -402,6 +403,9 @@ fn start_agent(
     };
     // `cursor`: this node shows the source's cursor shapes on its proxies (WP-2.16).
     let mut features = vec!["e1".to_owned(), "cursor".to_owned()];
+    if config.drag.across {
+        features.push(crosspane_protocol::projection::DRAG_FEATURE.to_owned());
+    }
     if video.codecs.is_some() {
         features.push("h264".to_owned());
         // Region video (WP-2.32): this node shows a video rectangle over its lossless canvas.

@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use crosspane_engine::Failure;
 use crosspane_platform::{Parked, PlatformError, WindowParking};
-use crosspane_types::geom::PixelSize;
-use crosspane_types::id::WindowId;
+use crosspane_types::geom::{PixelSize, PointDevice};
+use crosspane_types::id::{DisplayId, WindowId};
 
 use crate::agent::Event;
 use crate::lifecycle::Parking;
@@ -36,6 +36,7 @@ pub(crate) enum Command {
     },
     Restore {
         window: WindowId,
+        place: Option<(DisplayId, PointDevice)>,
     },
 }
 
@@ -49,9 +50,9 @@ pub(crate) enum Kind {
 impl Command {
     fn window(self) -> WindowId {
         match self {
-            Self::Park { window, .. } | Self::Resize { window, .. } | Self::Restore { window } => {
-                window
-            }
+            Self::Park { window, .. }
+            | Self::Resize { window, .. }
+            | Self::Restore { window, .. } => window,
         }
     }
     fn kind(self) -> Kind {
@@ -80,7 +81,7 @@ impl Completion {
         Self {
             id,
             outcome: match command {
-                Command::Restore { window } => Outcome::Restored { window, ok: false },
+                Command::Restore { window, .. } => Outcome::Restored { window, ok: false },
                 _ => Outcome::Parked {
                     window: command.window(),
                     result: Err(Failure::Other),
@@ -445,10 +446,12 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
             });
             Outcome::Parked { window, result }
         }
-        Command::Restore { window } => {
-            let result = backend
-                .restore(window)
-                .inspect_err(|error| tracing::error!(%error, "could not restore a parked window"));
+        Command::Restore { window, place } => {
+            let result = match place {
+                Some((display, at)) => backend.restore_at(window, display, at),
+                None => backend.restore(window),
+            }
+            .inspect_err(|error| tracing::error!(%error, "could not restore a parked window"));
             Outcome::Restored {
                 window,
                 ok: result.is_ok(),
@@ -526,6 +529,8 @@ pub(crate) mod tests {
         Recover,
     }
 
+    type RestorePlacements = Arc<Mutex<Vec<Option<(DisplayId, PointDevice)>>>>;
+
     pub(crate) struct Fake {
         observed: mpsc::Sender<(Kind, WindowId, u32)>,
         release: mpsc::Receiver<()>,
@@ -537,18 +542,21 @@ pub(crate) mod tests {
         pub(crate) restore_fails: bool,
         pub(crate) display: DisplayId,
         pub(crate) journal: Arc<AtomicBool>,
+        pub(crate) restored_at: RestorePlacements,
     }
 
     pub(crate) struct Controls {
         pub(crate) observed: mpsc::Receiver<(Kind, WindowId, u32)>,
         pub(crate) release: mpsc::Sender<()>,
         pub(crate) journal: Arc<AtomicBool>,
+        pub(crate) restored_at: RestorePlacements,
     }
 
     pub(crate) fn fake(block: Option<Kind>) -> (Fake, Controls) {
         let (observed, calls) = mpsc::channel();
         let (release, releases) = mpsc::channel();
         let journal = Arc::new(AtomicBool::new(false));
+        let restored_at = Arc::new(Mutex::new(Vec::new()));
         (
             Fake {
                 observed,
@@ -561,11 +569,13 @@ pub(crate) mod tests {
                 restore_fails: false,
                 display: DisplayId(37),
                 journal: journal.clone(),
+                restored_at: restored_at.clone(),
             },
             Controls {
                 observed: calls,
                 release,
                 journal,
+                restored_at,
             },
         )
     }
@@ -629,6 +639,21 @@ pub(crate) mod tests {
             self.parked(window, PixelSize::new(1, 1))
         }
         fn restore(&mut self, window: WindowId) -> Result<(), PlatformError> {
+            self.restored_at.lock().unwrap().push(None);
+            self.called(Kind::Restore, window, 0);
+            if self.restore_fails {
+                return Err(PlatformError::NotFound);
+            }
+            self.journal.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+        fn restore_at(
+            &mut self,
+            window: WindowId,
+            display: DisplayId,
+            at: PointDevice,
+        ) -> Result<(), PlatformError> {
+            self.restored_at.lock().unwrap().push(Some((display, at)));
             self.called(Kind::Restore, window, 0);
             if self.restore_fails {
                 return Err(PlatformError::NotFound);
@@ -729,6 +754,7 @@ pub(crate) mod tests {
         waiting.recv_timeout(Duration::from_secs(1)).unwrap();
         worker.submit(Command::Restore {
             window: WindowId(1),
+            place: None,
         });
         release.send(()).unwrap();
         assert_eq!(call(&controls).0, Kind::Restore);
@@ -791,6 +817,7 @@ pub(crate) mod tests {
         next(&mut worker, &rx);
         worker.submit(Command::Restore {
             window: WindowId(1),
+            place: None,
         });
         assert_eq!(call(&controls).0, Kind::Restore);
         next(&mut worker, &rx);
@@ -804,6 +831,7 @@ pub(crate) mod tests {
         worker.submit(resize(1, 200));
         worker.submit(Command::Restore {
             window: WindowId(1),
+            place: None,
         });
         controls.release.send(()).unwrap();
         next(&mut worker, &rx);
@@ -811,6 +839,33 @@ pub(crate) mod tests {
         next(&mut worker, &rx);
         assert!(controls.observed.try_recv().is_err());
         worker.shutdown(SHUTDOWN_WAIT);
+    }
+
+    #[test]
+    fn placed_restore_keeps_serial_order_cancels_resize_and_failure_retains_recovery() {
+        for fails in [false, true] {
+            let (mut backend, controls) = fake(Some(Kind::Park));
+            backend.restore_fails = fails;
+            let (events, rx) = mpsc::channel();
+            let mut worker = Worker::start(Box::new(backend), events).unwrap();
+            worker.submit(park(1));
+            assert_eq!(call(&controls), (Kind::Park, WindowId(1), 100));
+            worker.submit(resize(1, 300));
+            let place = Some((DisplayId(2), PointDevice::new(31.0, 44.0)));
+            worker.submit(Command::Restore {
+                window: WindowId(1),
+                place,
+            });
+            assert!(controls.restored_at.lock().unwrap().is_empty());
+            controls.release.send(()).unwrap();
+            assert!(matches!(next(&mut worker, &rx), Outcome::Parked { .. }));
+            assert_eq!(call(&controls), (Kind::Restore, WindowId(1), 0));
+            assert!(matches!(next(&mut worker, &rx), Outcome::Restored { ok, .. } if ok == !fails));
+            assert_eq!(*controls.restored_at.lock().unwrap(), [place]);
+            assert_eq!(controls.journal.load(Ordering::SeqCst), fails);
+            assert!(controls.observed.try_recv().is_err());
+            worker.shutdown(SHUTDOWN_WAIT);
+        }
     }
 
     #[test]
@@ -836,6 +891,7 @@ pub(crate) mod tests {
         );
         worker.submit(Command::Restore {
             window: WindowId(2),
+            place: None,
         });
         worker.submit(resize(1, 300));
         controls.release.send(()).unwrap();
@@ -879,9 +935,11 @@ pub(crate) mod tests {
         ));
         worker.submit(Command::Restore {
             window: WindowId(1),
+            place: None,
         });
         worker.submit(Command::Restore {
             window: WindowId(2),
+            place: None,
         });
         assert_eq!(worker.state.lock().unwrap().ready.len(), QUEUE_CAP);
         assert_eq!(worker.state.lock().unwrap().waiting_restores.len(), 2);
@@ -918,6 +976,7 @@ pub(crate) mod tests {
         worker.submit(resize(3, 200));
         worker.submit(Command::Restore {
             window: WindowId(1),
+            place: None,
         });
         let scheduler = worker.state.clone();
         let shutdown = std::thread::spawn(move || worker.shutdown(SHUTDOWN_WAIT));

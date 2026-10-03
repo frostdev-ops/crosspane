@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use crosspane_platform::{
     Displays, FrameCapture, GlobalHotkeys, InputCapture, IoGate, KeyInjector, KeyStore,
-    OverlayHost, Permissions, PlatformError, PointerInjector, SessionEvents, TrayHost,
+    OverlayHost, Permissions, PlatformError, PointerInjector, SessionEvents, TrayHost, WindowInfo,
     WindowParking, WindowSource,
 };
-use crosspane_types::geom::PointDevice;
+use crosspane_types::display::DisplayInfo;
+use crosspane_types::geom::{PointDevice, RectLogical};
 use crosspane_types::id::DisplayId;
 use crosspane_types::time::MonoTime;
 
@@ -38,6 +39,210 @@ pub trait HomeSeat: Send {
     /// Call `reload` whenever the compositor reloads its config (which drops runtime binds) and
     /// whenever its event connection is made again (events may have been missed). Called once.
     fn watch_reload(&mut self, reload: Box<dyn Fn() + Send>) -> Result<(), PlatformError>;
+}
+
+/// Move only an identified proxy; return the compositor's freshly confirmed content frame.
+pub trait ProxyPlacementSeat: Send {
+    fn place(
+        &self,
+        window: &WindowInfo,
+        display: &DisplayInfo,
+        at: PointDevice,
+    ) -> Result<RectLogical, PlatformError>;
+}
+
+#[cfg(target_os = "linux")]
+struct HyprProxyPlacement<F>(F);
+
+#[cfg(target_os = "linux")]
+impl<F> ProxyPlacementSeat for HyprProxyPlacement<F>
+where
+    F: Fn(&str, std::time::Duration) -> Result<serde_json::Value, PlatformError> + Send,
+{
+    fn place(
+        &self,
+        window: &WindowInfo,
+        display: &DisplayInfo,
+        at: PointDevice,
+    ) -> Result<RectLogical, PlatformError> {
+        use crosspane_types::geom::{PointLogical, SizeLogical};
+        use serde_json::Value;
+        use std::time::{Duration, Instant};
+        let bad = || PlatformError::Backend("drag proxy identity or geometry not confirmed".into());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let request = |command: &str| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(PlatformError::Timeout);
+            }
+            let result = (self.0)(command, left)?;
+            if Instant::now() >= deadline {
+                return Err(PlatformError::Timeout);
+            }
+            Ok(result)
+        };
+        let client = |json: &Value| -> Result<Value, PlatformError> {
+            let mut matching = json.as_array().ok_or_else(bad)?.iter().filter(|c| {
+                c["stableId"]
+                    .as_str()
+                    .and_then(|s| u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok())
+                    == Some(window.id.0)
+            });
+            let c = matching.next().ok_or_else(bad)?;
+            if matching.next().is_some()
+                || c["pid"].as_u64() != window.pid.map(u64::from)
+                || c["title"].as_str() != Some(window.title.as_str())
+                || c["mapped"] != true
+            {
+                return Err(bad());
+            }
+            Ok(c.clone())
+        };
+        let pair = |json: &Value| -> Result<(f64, f64), PlatformError> {
+            let v = json.as_array().filter(|v| v.len() == 2).ok_or_else(bad)?;
+            let (x, y) = (
+                v[0].as_f64().ok_or_else(bad)?,
+                v[1].as_f64().ok_or_else(bad)?,
+            );
+            if !x.is_finite() || !y.is_finite() {
+                return Err(bad());
+            }
+            Ok((x, y))
+        };
+        let before = client(&request("clients")?)?;
+        let address = before["address"].as_str().ok_or_else(bad)?;
+        let hex = address
+            .strip_prefix("0x")
+            .filter(|s| !s.is_empty() && s.len() <= 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(bad)?;
+        let address = format!("0x{hex}");
+        let monitors = request("monitors")?;
+        let mut matching = monitors
+            .as_array()
+            .ok_or_else(bad)?
+            .iter()
+            .filter(|m| m["id"].as_u64() == Some(u64::from(display.id.0)));
+        let monitor = matching.next().ok_or_else(bad)?;
+        if matching.next().is_some() {
+            return Err(bad());
+        }
+        let workspace = monitor["activeWorkspace"]["id"]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or_else(bad)?;
+        let reserved = monitor["reserved"]
+            .as_array()
+            .filter(|v| v.len() == 4)
+            .ok_or_else(bad)?;
+        let mut r = [0.0; 4];
+        for (out, value) in r.iter_mut().zip(reserved) {
+            *out = value
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(bad)?;
+        }
+        let g = &display.geometry;
+        let mut dimensions = (
+            monitor["width"].as_u64().ok_or_else(bad)?,
+            monitor["height"].as_u64().ok_or_else(bad)?,
+        );
+        if monitor["transform"].as_u64().ok_or_else(bad)? % 2 == 1 {
+            dimensions = (dimensions.1, dimensions.0);
+        }
+        if !at.x.is_finite()
+            || !at.y.is_finite()
+            || !g.scale.is_finite()
+            || g.scale <= 0.0
+            || monitor["scale"].as_f64() != Some(g.scale)
+            || monitor["x"].as_f64() != Some(g.logical_origin.x)
+            || monitor["y"].as_f64() != Some(g.logical_origin.y)
+            || dimensions
+                != (
+                    u64::from(g.pixel_size.width),
+                    u64::from(g.pixel_size.height),
+                )
+            || r[0] + r[2] >= f64::from(g.pixel_size.width) / g.scale
+            || r[1] + r[3] >= f64::from(g.pixel_size.height) / g.scale
+        {
+            return Err(bad());
+        }
+        let guard = format!(
+            "local w = hl.get_window(\"address:{address}\"); if not w or w.stable_id ~= {} then error(\"proxy changed\") end; hl.dispatch(",
+            window.id.0
+        );
+        request(&format!(
+            "{guard}hl.dsp.window.move({{ window = \"address:{address}\", workspace = \"{workspace}\", follow = false }}))"
+        ))?;
+        request(&format!(
+            "{guard}hl.dsp.window.float({{ window = \"address:{address}\", action = \"enable\" }}))"
+        ))?;
+        // Enabling float can restore a remembered floating size; clamp that actual content.
+        let floated = client(&request("clients")?)?;
+        if floated["address"].as_str() != Some(address.as_str()) || floated["floating"] != true {
+            return Err(bad());
+        }
+        let (width, height) = pair(&floated["size"])?;
+        if width <= 0.0 || height <= 0.0 {
+            return Err(bad());
+        }
+        let min_x = (g.logical_origin.x + r[0]).ceil();
+        let min_y = (g.logical_origin.y + r[1]).ceil();
+        let max_x = (g.logical_origin.x + f64::from(g.pixel_size.width) / g.scale - r[2] - width)
+            .floor()
+            .max(min_x);
+        let max_y = (g.logical_origin.y + f64::from(g.pixel_size.height) / g.scale - r[3] - height)
+            .floor()
+            .max(min_y);
+        let x = (g.logical_origin.x + at.x / g.scale)
+            .round()
+            .clamp(min_x, max_x);
+        let y = (g.logical_origin.y + at.y / g.scale)
+            .round()
+            .clamp(min_y, max_y);
+        request(&format!(
+            "{guard}hl.dsp.window.move({{ window = \"address:{address}\", x = {x}, y = {y}, relative = false }}))"
+        ))?;
+        let after = client(&request("clients")?)?;
+        let (seen_x, seen_y) = pair(&after["at"])?;
+        let (width, height) = pair(&after["size"])?;
+        if after["address"].as_str() != Some(address.as_str())
+            || after["floating"] != true
+            || after["monitor"].as_u64() != Some(u64::from(display.id.0))
+            || after["workspace"]["id"].as_i64() != Some(workspace)
+            || ((seen_x - x) * g.scale).abs() > 1.0
+            || ((seen_y - y) * g.scale).abs() > 1.0
+            || width <= 0.0
+            || height <= 0.0
+            || seen_x < g.logical_origin.x + r[0]
+            || seen_y < g.logical_origin.y + r[1]
+            || seen_x + width > g.logical_origin.x + f64::from(g.pixel_size.width) / g.scale - r[2]
+            || seen_y + height
+                > g.logical_origin.y + f64::from(g.pixel_size.height) / g.scale - r[3]
+        {
+            return Err(bad());
+        }
+        Ok(RectLogical::new(
+            PointLogical::new(seen_x, seen_y),
+            SizeLogical::new(width, height),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proxy_placement() -> anyhow::Result<Box<dyn ProxyPlacementSeat>> {
+    use anyhow::Context;
+    use crosspane_platform_linux::hyprland::ipc::HyprIpc;
+    let signature =
+        std::env::var("HYPRLAND_INSTANCE_SIGNATURE").context("proxy Hyprland instance")?;
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("proxy Hyprland runtime")?;
+    Ok(Box::new(HyprProxyPlacement(move |command: &str, left| {
+        let ipc = HyprIpc::new(&signature, std::path::Path::new(&runtime), left);
+        if matches!(command, "clients" | "monitors") {
+            ipc.json(command)
+        } else {
+            ipc.eval(command).map(|()| serde_json::Value::Null)
+        }
+    })))
 }
 
 /// What the startup recovery of parked windows came to (WP-4.5). `create` runs every parking
@@ -113,6 +318,7 @@ pub struct Platform {
     /// Home on the twin (WP-2.43): the release bind and the pointer read-back. `None` off
     /// Hyprland, and on Hyprland when the bind can't be spelled (the agent logs why).
     pub home: Option<Box<dyn HomeSeat>>,
+    pub proxy_placement: Option<Box<dyn ProxyPlacementSeat>>,
     /// What the startup recovery of parked windows came to (WP-4.5).
     pub startup_recovery: StartupRecovery,
 }
@@ -628,6 +834,7 @@ pub fn create(
     };
     Ok(Platform {
         home,
+        proxy_placement: Some(proxy_placement()?),
         startup_recovery,
         session: Box::new(session),
         displays: Box::new(displays),
@@ -755,6 +962,7 @@ pub fn create(
         // Home on the twin is Hyprland's: a Mac node never commits it (the engine's install
         // request is answered with an error).
         home: None,
+        proxy_placement: None,
         gate,
     })
 }
@@ -862,6 +1070,220 @@ mod tests {
         assert!(is_executable(&file));
         assert!(!is_executable(&dir), "a directory is not a program");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod drag_placement_tests {
+    use super::*;
+    use crosspane_platform::{WindowRole, WindowState};
+    use crosspane_types::color::ColorSpace;
+    use crosspane_types::geom::{DisplayGeometry, PixelSize, PointLogical, SizeLogical, SizeMm};
+    use crosspane_types::id::WindowId;
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    fn fixture() -> (WindowInfo, DisplayInfo, Value, Value, Value) {
+        let window = WindowInfo {
+            id: WindowId(0xabc),
+            title: "proxy".into(),
+            app_id: "app".into(),
+            pid: Some(77),
+            display: Some(DisplayId(1)),
+            frame: RectLogical::new(
+                PointLogical::new(10.0, 20.0),
+                SizeLogical::new(200.0, 100.0),
+            ),
+            state: WindowState::Normal,
+            role: WindowRole::Toplevel,
+            parent: None,
+        };
+        let display = DisplayInfo {
+            id: DisplayId(7),
+            name: "fake".into(),
+            geometry: DisplayGeometry {
+                pixel_size: PixelSize::new(1600, 1000),
+                physical_size: SizeMm::new(300.0, 200.0),
+                scale: 2.0,
+                logical_origin: PointLogical::new(100.0, 200.0),
+            },
+            refresh_millihz: 60000,
+            color_space: ColorSpace::Srgb,
+            hdr: false,
+        };
+        let before = json!([{"stableId":"abc", "address":"0x123", "pid":77, "title":"proxy", "mapped":true, "floating":false, "monitor":1, "workspace":{"id":3}, "at":[10,20], "size":[100,50]}]);
+        let mut after = before.clone();
+        after[0]["floating"] = json!(true);
+        after[0]["monitor"] = json!(7);
+        after[0]["workspace"]["id"] = json!(17);
+        after[0]["at"] = json!([660, 230]);
+        after[0]["size"] = json!([200, 100]);
+        let monitors = json!([{"id":7, "activeWorkspace":{"id":17}, "x":100, "y":200, "scale":2.0, "width":1600, "height":1000, "transform":0, "reserved":[20,30,40,50]}]);
+        (window, display, before, after, monitors)
+    }
+
+    #[test]
+    fn float_enable_move_clamp_and_fresh_confirmation_share_one_deadline() {
+        let (window, display, before, after, monitors) = fixture();
+        let current = Mutex::new(before);
+        let calls = Mutex::new(Vec::<(String, Duration)>::new());
+        let seat = HyprProxyPlacement(|command: &str, left| {
+            let mut calls = calls.lock().unwrap();
+            calls.push((command.to_owned(), left));
+            let mut current = current.lock().unwrap();
+            if command.contains("workspace = \"17\", follow = false") {
+                current[0]["monitor"] = json!(7);
+                current[0]["workspace"]["id"] = json!(17);
+            } else if command.contains("hl.dsp.window.float(") {
+                current[0]["floating"] = json!(true);
+                current[0]["size"] = json!([200, 100]);
+            } else if command.contains("x = 660, y = 230, relative = false") {
+                // Coordinates never move a window between workspaces or monitors.
+                current[0]["at"] = json!([660, 230]);
+            }
+            Ok(if command == "clients" {
+                current.clone()
+            } else if command == "monitors" {
+                monitors.clone()
+            } else {
+                Value::Null
+            })
+        });
+        let frame = seat
+            .place(&window, &display, PointDevice::new(9999.0, -9999.0))
+            .unwrap();
+        assert_eq!(frame.origin, PointLogical::new(660.0, 230.0));
+        assert_eq!(
+            display.geometry.logical_to_device(frame.origin),
+            PointDevice::new(1120.0, 60.0)
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(*current.lock().unwrap(), after);
+        assert_eq!(calls.len(), 7);
+        assert_eq!(calls[0].0, "clients");
+        assert_eq!(calls[1].0, "monitors");
+        assert!(calls[2].0.contains("workspace = \"17\", follow = false"));
+        assert!(calls[3].0.contains("hl.dsp.window.float("));
+        assert!(calls[3].0.contains("action = \"enable\""));
+        assert_eq!(calls[4].0, "clients");
+        assert!(calls[5].0.contains("hl.dsp.window.move("));
+        assert!(calls[5].0.contains("x = 660, y = 230, relative = false"));
+        for (command, _) in [&calls[2], &calls[3], &calls[5]] {
+            assert!(command.contains("address:0x123"));
+            assert!(command.contains("w.stable_id ~= 2748"));
+            assert!(!command.contains("focus"));
+        }
+        assert_eq!(calls[6].0, "clients");
+        assert!(
+            calls
+                .iter()
+                .all(|(_, left)| !left.is_zero() && *left <= Duration::from_secs(1))
+        );
+        assert!(calls.windows(2).all(|c| c[1].1 <= c[0].1));
+    }
+
+    #[test]
+    fn any_ipc_failure_aborts_without_confirmation_or_retry() {
+        for fail_at in 0..7 {
+            let (window, display, before, after, monitors) = fixture();
+            let calls = Mutex::new(Vec::new());
+            let seat = HyprProxyPlacement(|command: &str, _| {
+                let mut calls = calls.lock().unwrap();
+                let index = calls.len();
+                calls.push(command.to_owned());
+                if index == fail_at {
+                    return Err(PlatformError::Timeout);
+                }
+                let mut floated = before.clone();
+                floated[0]["floating"] = json!(true);
+                floated[0]["size"] = json!([200, 100]);
+                Ok(match command {
+                    "clients" if index == 6 => after.clone(),
+                    "clients" if index == 4 => floated,
+                    "clients" => before.clone(),
+                    "monitors" => monitors.clone(),
+                    _ => Value::Null,
+                })
+            });
+            assert!(matches!(
+                seat.place(&window, &display, PointDevice::new(9999.0, -9999.0)),
+                Err(PlatformError::Timeout)
+            ));
+            assert_eq!(calls.lock().unwrap().len(), fail_at + 1);
+        }
+    }
+
+    #[test]
+    fn stale_wrong_or_ambiguous_client_confirmation_never_succeeds() {
+        for (field, value) in [
+            ("stableId", json!("def")),
+            ("address", json!("0x456")),
+            ("pid", json!(78)),
+            ("title", json!("foreign")),
+            ("mapped", json!(false)),
+            ("floating", json!(false)),
+            ("monitor", json!(1)),
+            ("workspace", json!({"id":3})),
+            ("at", json!([10, 20])),
+        ] {
+            let (window, display, before, mut after, monitors) = fixture();
+            after[0][field] = value;
+            let calls = Mutex::new(0);
+            let seat = HyprProxyPlacement(|command: &str, _| {
+                let mut calls = calls.lock().unwrap();
+                *calls += 1;
+                let mut floated = before.clone();
+                floated[0]["floating"] = json!(true);
+                floated[0]["size"] = json!([200, 100]);
+                Ok(match command {
+                    "clients" if *calls == 7 => after.clone(),
+                    "clients" if *calls == 5 => floated,
+                    "clients" => before.clone(),
+                    "monitors" => monitors.clone(),
+                    _ => Value::Null,
+                })
+            });
+            assert!(
+                seat.place(&window, &display, PointDevice::new(9999.0, -9999.0))
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let (window, display, before, _, _) = fixture();
+        let duplicate = json!([before[0], before[0]]);
+        let seat = HyprProxyPlacement(|_: &str, _| Ok(duplicate.clone()));
+        assert!(seat.place(&window, &display, PointDevice::zero()).is_err());
+    }
+
+    #[test]
+    fn final_size_change_that_crosses_the_reserved_work_area_is_refused() {
+        let (window, display, before, mut after, monitors) = fixture();
+        after[0]["size"] = json!([300, 100]);
+        let calls = Mutex::new(0);
+        let seat = HyprProxyPlacement(|command: &str, _| {
+            let mut calls = calls.lock().unwrap();
+            *calls += 1;
+            let mut floated = before.clone();
+            floated[0]["floating"] = json!(true);
+            floated[0]["size"] = json!([200, 100]);
+            Ok(match command {
+                "clients" if *calls == 7 => after.clone(),
+                "clients" if *calls == 5 => floated,
+                "clients" => before.clone(),
+                "monitors" => monitors.clone(),
+                _ => Value::Null,
+            })
+        });
+        assert!(
+            seat.place(&window, &display, PointDevice::new(9999.0, -9999.0))
+                .is_err()
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            7,
+            "no retry outside the shared deadline"
+        );
     }
 }
 

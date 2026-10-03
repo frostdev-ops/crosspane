@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 
 use crosspane_platform::{Parked, PlatformError, WindowParking};
-use crosspane_types::geom::PixelSize;
-use crosspane_types::id::WindowId;
+use crosspane_types::geom::{PixelSize, PointDevice};
+use crosspane_types::id::{DisplayId, WindowId};
 
 pub struct TwinOrMirror {
     twin: Box<dyn WindowParking>,
@@ -80,6 +80,19 @@ impl WindowParking for TwinOrMirror {
         result
     }
 
+    fn restore_at(
+        &mut self,
+        window: WindowId,
+        display: DisplayId,
+        at: PointDevice,
+    ) -> Result<(), PlatformError> {
+        let result = self.backend(window).restore_at(window, display, at);
+        if result.is_ok() {
+            self.mirrored.remove(&window);
+        }
+        result
+    }
+
     /// Both backends recover, each from its own journal; the first error is returned after both
     /// have run.
     fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
@@ -117,6 +130,7 @@ mod tests {
     struct Fake {
         name: &'static str,
         unsupported: bool,
+        restore_fails: bool,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -160,6 +174,19 @@ mod tests {
             self.log("restore", w);
             Ok(())
         }
+        fn restore_at(
+            &mut self,
+            w: WindowId,
+            display: DisplayId,
+            at: PointDevice,
+        ) -> Result<(), PlatformError> {
+            self.log(&format!("restore_at {} {},{}", display.0, at.x, at.y), w);
+            if self.restore_fails {
+                Err(PlatformError::NotFound)
+            } else {
+                Ok(())
+            }
+        }
         fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
             self.calls
                 .lock()
@@ -174,11 +201,13 @@ mod tests {
         let twin = Fake {
             name: "twin",
             unsupported: twin_unsupported,
+            restore_fails: false,
             calls: calls.clone(),
         };
         let mirror = Fake {
             name: "mirror",
             unsupported: false,
+            restore_fails: false,
             calls: calls.clone(),
         };
         (TwinOrMirror::new(Box::new(twin), Box::new(mirror)), calls)
@@ -225,5 +254,43 @@ mod tests {
                 "mirror recover"
             ]
         );
+    }
+
+    #[test]
+    fn placed_restore_uses_the_selected_backend_and_failed_mirror_restore_retains_selection() {
+        for mirrored in [false, true] {
+            let (mut p, calls) = parking(mirrored);
+            p.park(WindowId(8), PixelSize::new(800, 600), 1.0).unwrap();
+            if mirrored {
+                p.mirror = Box::new(Fake {
+                    name: "mirror",
+                    unsupported: false,
+                    restore_fails: true,
+                    calls: calls.clone(),
+                });
+                assert!(
+                    p.restore_at(WindowId(8), DisplayId(7), PointDevice::new(30.0, 40.0))
+                        .is_err()
+                );
+                assert!(p.mirrored.contains(&WindowId(8)));
+                p.mirror = Box::new(Fake {
+                    name: "mirror",
+                    unsupported: false,
+                    restore_fails: false,
+                    calls: calls.clone(),
+                });
+            }
+            p.restore_at(WindowId(8), DisplayId(7), PointDevice::new(30.0, 40.0))
+                .unwrap();
+            assert!(!p.mirrored.contains(&WindowId(8)));
+            assert_eq!(
+                calls.lock().unwrap().last().unwrap(),
+                if mirrored {
+                    "mirror restore_at 7 30,40 8"
+                } else {
+                    "twin restore_at 7 30,40 8"
+                }
+            );
+        }
     }
 }

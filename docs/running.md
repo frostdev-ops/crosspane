@@ -289,6 +289,12 @@ Speakers only: microphones are not shared yet.
 
 ## Known limitations (v0)
 
+Drag a window across: on paired machines with drag enabled, drag its title bar against the
+screen edge toward the peer. On Hyprland, release when the HUD says “Release to move”; the window
+is projected there and ordinary pointer crossing resumes. Both peers must advertise `drag/0`;
+`[drag] across = false` in `config.toml` disables the offer. `crosspanectl status` shows the
+negotiated drag setting per peer and the active gesture's HUD label.
+
 - **Notifications** that your notification daemon shows on the output where a projected window is
   parked appear in that projected window (they're captured with it). Pinning the daemon to a real
   output (e.g. mako's `output=`) avoids it.

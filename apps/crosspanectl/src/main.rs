@@ -675,6 +675,9 @@ fn print_status(s: &Value) {
         }
     );
     println!("  backends: {}", s["backends"].as_str().unwrap_or("?"));
+    if let Some(label) = format_drag_label(s) {
+        println!("{label}");
+    }
     let missing: Vec<&str> = s["permissions"]
         .as_array()
         .into_iter()
@@ -710,7 +713,7 @@ fn print_status(s: &Value) {
             .as_str()
             .map_or_else(String::new, |link| format!("  link {link}"));
         println!(
-            "  peer {} ({})  {}  rtt {}{link}",
+            "  peer {} ({})  {}  rtt {}{link}  {}",
             p["name"].as_str().unwrap_or("?"),
             short(&p["node"]),
             if p["connected"] == json!(true) {
@@ -718,7 +721,8 @@ fn print_status(s: &Value) {
             } else {
                 "offline"
             },
-            rtt
+            rtt,
+            format_peer_drag(&p)
         );
         if let Some(grants) = p["grants"].as_array() {
             let grants: Vec<&str> = grants.iter().filter_map(Value::as_str).collect();
@@ -772,5 +776,36 @@ fn print_status(s: &Value) {
     }
     for n in s["notices"].as_array().into_iter().flatten() {
         println!("  notice: {}", n.as_str().unwrap_or(""));
+    }
+}
+
+fn format_peer_drag(peer: &Value) -> &'static str {
+    if peer["drag"] == "on" {
+        "drag:on"
+    } else {
+        "drag:off"
+    }
+}
+
+fn format_drag_label(status: &Value) -> Option<String> {
+    status["drag"]
+        .as_str()
+        .map(|label| format!("  drag: {label}"))
+}
+
+#[cfg(test)]
+mod drag_status_tests {
+    use super::*;
+
+    #[test]
+    fn formatted_status_names_each_peers_drag_and_the_active_engine_label() {
+        assert_eq!(format_peer_drag(&json!({"drag":"on"})), "drag:on");
+        assert_eq!(format_peer_drag(&json!({"drag":"off"})), "drag:off");
+        assert_eq!(format_peer_drag(&json!({})), "drag:off");
+        assert_eq!(
+            format_drag_label(&json!({"drag":"Dragging to Moon"})),
+            Some("  drag: Dragging to Moon".into())
+        );
+        assert_eq!(format_drag_label(&json!({"drag":null})), None);
     }
 }

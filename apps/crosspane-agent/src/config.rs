@@ -27,6 +27,8 @@ pub struct Config {
     /// E1 edge crossing from this node. `false` keeps this node's screen edges inert (it can
     /// still be controlled and project windows).
     pub crossing: bool,
+    /// Drag-across offers (DRAG-v0), negotiated with each peer.
+    pub drag: Drag,
     /// macOS: hide projected windows on a private-API virtual display (D7) instead of mirroring
     /// them in place (M1). Needs a build with the `private-vdisplay` feature; ignored otherwise.
     pub mac_virtual_display: bool,
@@ -48,6 +50,18 @@ pub struct PeerAddr {
     pub addr: SocketAddr,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Drag {
+    pub across: bool,
+}
+
+impl Default for Drag {
+    fn default() -> Self {
+        Self { across: true }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -58,6 +72,7 @@ impl Default for Config {
             allow_file_keystore: cfg!(target_os = "macos"),
             force_file_keystore: false,
             crossing: true,
+            drag: Drag::default(),
             mac_virtual_display: false,
             remap: BTreeMap::new(),
             video_mbps: None,
@@ -219,6 +234,23 @@ mod tests {
         );
         assert_eq!(revision_of(Some(b"name = \"desk\"\n")), one);
         assert_ne!(revision_of(Some(b"name = \"desktop\"\n")), one);
+    }
+
+    #[test]
+    fn drag_across_defaults_on_and_an_explicit_drag_table_can_disable_it() {
+        for text in ["", "name = 'legacy'", "[drag]"] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert!(config.drag.across);
+        }
+        let config: Config = toml::from_str("[drag]\nacross = false").unwrap();
+        assert!(!config.drag.across);
+        assert!(
+            !toml::from_str::<Config>(&toml::to_string(&config).unwrap())
+                .unwrap()
+                .drag
+                .across
+        );
+        assert!(toml::from_str::<Config>("[drag]\nunknown = true").is_err());
     }
 
     #[test]

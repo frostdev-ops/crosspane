@@ -24,7 +24,7 @@ use crosspane_protocol::link::{LinkEvent, PeerLink};
 use crosspane_protocol::msg::{
     Capability, ControlMessage, Hello, Placement, Refusal, RevocationNotice,
 };
-use crosspane_protocol::projection::ProjectionMessage;
+use crosspane_protocol::projection::{DRAG_FEATURE, ProjectionMessage, ProxyPlacement};
 use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
 use crosspane_types::audio::AudioKind;
 use crosspane_types::display::DisplayInfo;
@@ -131,6 +131,17 @@ pub enum Event {
     HomeBind,
 }
 
+/// The native host in production; a command recorder in the isolated agent harness.
+trait ProxyCommands: Send {
+    fn send(&self, command: HostCommand) -> Result<(), crosspane_render::proxy::HostError>;
+}
+
+impl ProxyCommands for HostHandle {
+    fn send(&self, command: HostCommand) -> Result<(), crosspane_render::proxy::HostError> {
+        HostHandle::send(self, command)
+    }
+}
+
 /// What the loop knows about a peer.
 #[derive(Debug, Default)]
 struct PeerInfo {
@@ -142,6 +153,7 @@ struct PeerInfo {
     rtt: Option<Duration>,
     /// What the engine was last told about audio with this peer (`Input::AudioPeer`).
     audio: bool,
+    drag: bool,
 }
 
 impl PeerInfo {
@@ -254,6 +266,9 @@ struct PlacementSource {
     visible: BTreeMap<ProjectionKey, bool>,
     /// The last report made for each proxy, so an equal one isn't repeated.
     last: BTreeMap<ProjectionKey, Placed>,
+    native: BTreeMap<ProjectionKey, WindowId>,
+    blocked: BTreeSet<ProjectionKey>,
+    confirmed: BTreeSet<WindowId>,
 }
 
 impl PlacementSource {
@@ -265,6 +280,9 @@ impl PlacementSource {
             proxies: BTreeMap::new(),
             visible: BTreeMap::new(),
             last: BTreeMap::new(),
+            native: BTreeMap::new(),
+            blocked: BTreeSet::new(),
+            confirmed: BTreeSet::new(),
         }
     }
 
@@ -311,6 +329,10 @@ impl PlacementSource {
         self.proxies.remove(&key);
         self.visible.remove(&key);
         self.last.remove(&key);
+        if let Some(window) = self.native.remove(&key) {
+            self.confirmed.remove(&window);
+        }
+        self.blocked.remove(&key);
     }
 
     fn set_visible(&mut self, key: ProjectionKey, visible: bool) {
@@ -334,19 +356,10 @@ impl PlacementSource {
     /// not a point, so the display's origin isn't subtracted from it).
     fn compute(&self, key: &ProjectionKey) -> Placed {
         let nowhere = (None, PointDevice::zero(), PixelSize::new(0, 0));
-        let Some(title) = self.proxies.get(key) else {
-            return nowhere;
-        };
-        if !self.visible.get(key).copied().unwrap_or(false)
-            || self.proxies.values().filter(|t| *t == title).count() != 1
-        {
+        if !self.visible.get(key).copied().unwrap_or(false) || self.blocked.contains(key) {
             return nowhere;
         }
-        let mut mine = self
-            .windows
-            .values()
-            .filter(|w| w.pid == Some(self.pid) && &w.title == title);
-        let (Some(window), None) = (mine.next(), mine.next()) else {
+        let Some(window) = self.window(key) else {
             return nowhere;
         };
         if matches!(window.state, WindowState::Hidden | WindowState::Minimized) {
@@ -368,6 +381,21 @@ impl PlacementSource {
                 scaled(window.frame.size.height),
             ),
         )
+    }
+
+    fn window(&self, key: &ProjectionKey) -> Option<&WindowInfo> {
+        let title = self.proxies.get(key)?;
+        if self.proxies.values().filter(|t| *t == title).count() != 1 {
+            return None;
+        }
+        let mut mine = self
+            .windows
+            .values()
+            .filter(|w| w.pid == Some(self.pid) && &w.title == title);
+        match (mine.next(), mine.next()) {
+            (Some(window), None) => Some(window),
+            _ => None,
+        }
     }
 
     /// Every proxy whose placement differs from what was last reported, with the new placement
@@ -559,7 +587,7 @@ pub struct Agent {
     // E2 data plane and window host.
     source_media: SourceSender,
     dest_media: Sender<DestCmd>,
-    host: Option<HostHandle>,
+    host: Option<Box<dyn ProxyCommands>>,
     proxy_ids: ProxyIds,
     streams: HashMap<StreamId, ProjectionId>,
     projections: BTreeMap<ProjectionKey, String>,
@@ -599,6 +627,8 @@ pub struct Agent {
     /// can move one.
     placement: PlacementSource,
     placement_dirty: bool,
+    drag_places: BTreeMap<ProjectionKey, ProxyPlacement>,
+    drag_label: Option<String>,
     /// Diagnostic only: has this capture produced any local motion for entry corroboration?
     capture_motion_seen: bool,
     /// The display each of this node's projections is captured from (the twin output on
@@ -827,7 +857,7 @@ impl Agent {
             advertising_name: false,
             source_media: e2.source_media,
             dest_media: e2.dest_media,
-            host: e2.host,
+            host: e2.host.map(|h| Box::new(h) as Box<dyn ProxyCommands>),
             proxy_ids: e2.proxy_ids,
             streams: HashMap::new(),
             projections: BTreeMap::new(),
@@ -853,6 +883,8 @@ impl Agent {
             home: HomeAgent::new(),
             placement: PlacementSource::new(std::process::id()),
             placement_dirty: false,
+            drag_places: BTreeMap::new(),
+            drag_label: None,
             capture_motion_seen: false,
             capture_display: BTreeMap::new(),
             #[cfg(target_os = "linux")]
@@ -983,7 +1015,8 @@ impl Agent {
         }
     }
 
-    fn feed(&mut self, input: Input) {
+    fn feed(&mut self, mut input: Input) {
+        self.revalidate_proxy_observation(&mut input);
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_input(&input);
         }
@@ -1011,6 +1044,45 @@ impl Agent {
         self.execute(outputs);
         self.tracker.executed();
         self.flush_placements();
+    }
+
+    /// A worker may have queued geometry before our synchronous move. Read back conflicting
+    /// observations through Hyprland's bounded WindowSource before either consumer sees them.
+    fn revalidate_proxy_observation(&mut self, input: &mut Input) {
+        let Input::Windows(WindowEvent::Added(window) | WindowEvent::Changed(window)) = input
+        else {
+            return;
+        };
+        let Some(cached) = self.placement.windows.get(&window.id) else {
+            return;
+        };
+        let blocked = self
+            .placement
+            .native
+            .iter()
+            .any(|(key, id)| *id == window.id && self.placement.blocked.contains(key));
+        if !self.placement.confirmed.contains(&window.id)
+            || (!blocked && cached.frame == window.frame && cached.display == window.display)
+        {
+            return;
+        }
+        let fresh = self.platform.windows.as_ref().and_then(|source| {
+            source
+                .windows()
+                .ok()?
+                .into_iter()
+                .find(|w| w.id == window.id && w.pid == Some(self.placement.pid))
+        });
+        for (key, id) in &self.placement.native {
+            if *id == window.id {
+                if fresh.is_some() {
+                    self.placement.blocked.remove(key);
+                } else {
+                    self.placement.blocked.insert(*key);
+                }
+            }
+        }
+        *window = fresh.unwrap_or_else(|| cached.clone());
     }
 
     /// Carry out the acknowledgements that keep their ordinary delivery order.
@@ -1090,6 +1162,45 @@ impl Agent {
     fn flush_placements(&mut self) {
         if !std::mem::take(&mut self.placement_dirty) || !HYPRLAND_PLACEMENT {
             return;
+        }
+        let keys: Vec<_> = self.placement.proxies.keys().copied().collect();
+        for key in keys {
+            let Some(mut window) = self.placement.window(&key).cloned() else {
+                continue;
+            };
+            if self.placement.native.insert(key, window.id) != Some(window.id) {
+                self.pending.push_back(Input::ProxyWindow {
+                    key,
+                    window: window.id,
+                });
+            }
+            if let Some(place) = self.drag_places.remove(&key) {
+                let result = self
+                    .platform
+                    .proxy_placement
+                    .as_ref()
+                    .zip(self.local_displays.iter().find(|d| d.id == place.display))
+                    .ok_or(PlatformError::Unsupported(
+                        "no proxy placement backend or display",
+                    ))
+                    .and_then(|(seat, display)| {
+                        seat.place(
+                            &window,
+                            display,
+                            PointDevice::new(f64::from(place.x), f64::from(place.y)),
+                        )
+                    });
+                match result {
+                    Ok(frame) => {
+                        window.frame = frame;
+                        window.display = Some(place.display);
+                        self.placement.confirmed.insert(window.id);
+                        self.placement.windows.insert(window.id, window);
+                        self.placement.blocked.remove(&key);
+                    }
+                    Err(error) => tracing::warn!(%error, "drag proxy placement failed"),
+                }
+            }
         }
         for (key, (on, origin, size), notable) in self.placement.changes() {
             // A proxy's first report, and the one that places it, are worth a line at any log
@@ -1376,6 +1487,10 @@ impl Agent {
                 for key in self.projections.keys().filter(|k| k.source == *peer) {
                     let _ = self.dest_media.send(DestCmd::Forget(*key));
                 }
+                let peer = *peer;
+                self.feed(Input::Link(event));
+                self.sync_drag_peer(peer);
+                return;
             }
             _ => {}
         }
@@ -1414,6 +1529,7 @@ impl Agent {
         self.feed(Input::PeerUp { peer });
         // After `PeerUp`: the engine ignores audio availability for a peer that isn't up.
         self.sync_audio_peer(peer);
+        self.sync_drag_peer(peer);
         self.feed(Input::PeerDisplays {
             peer,
             displays: hello.displays.clone(),
@@ -1474,6 +1590,7 @@ impl Agent {
         }
         self.feed(Input::AudioConnectionReplaced { peer });
         self.sync_audio_peer(peer);
+        self.sync_drag_peer(peer);
         self.peer_features_changed(peer);
         if displays_changed {
             self.feed(Input::PeerDisplays {
@@ -1503,6 +1620,69 @@ impl Agent {
             name,
             available,
         });
+    }
+
+    fn sync_drag_peer(&mut self, peer: NodeId) {
+        let Some(info) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        let has = |features: &[String]| features.iter().any(|f| f == DRAG_FEATURE);
+        let available = info.connected && has(&self.features) && has(&info.features);
+        if info.drag != available {
+            info.drag = available;
+            self.feed(Input::DragPeer { peer, available });
+        }
+    }
+
+    fn arm_drag(&mut self, key: ProjectionKey, token: u32, until: crosspane_types::time::MonoTime) {
+        let left =
+            Duration::from_nanos(until.as_nanos().saturating_sub(platform::now().as_nanos()));
+        let deadline = Instant::now().checked_add(left);
+        let (done, ack) = std::sync::mpsc::sync_channel(1);
+        let sent = !left.is_zero()
+            && deadline.is_some()
+            && self
+                .host
+                .as_ref()
+                .zip(self.proxy_ids.id(key))
+                .is_some_and(|(host, id)| {
+                    host.send(HostCommand::Arm {
+                        id,
+                        until: deadline.unwrap_or_else(Instant::now),
+                        done,
+                    })
+                    .is_ok()
+                });
+        if !sent {
+            self.pending.push_back(Input::DragArmed {
+                key,
+                token,
+                ok: false,
+            });
+            return;
+        }
+        let events = self.events.clone();
+        let deadline = deadline.unwrap_or_else(Instant::now);
+        if std::thread::Builder::new()
+            .name("drag-arm".into())
+            .spawn(move || {
+                let ok = ack
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(false)
+                    && Instant::now() < deadline;
+                let _ = events.send(Event::Input(Input::DragArmed { key, token, ok }));
+            })
+            .is_err()
+        {
+            if let (Some(host), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
+                let _ = host.send(HostCommand::Disarm { id });
+            }
+            self.pending.push_back(Input::DragArmed {
+                key,
+                token,
+                ok: false,
+            });
+        }
     }
 
     fn execute(&mut self, outputs: Vec<Output>) {
@@ -1561,6 +1741,34 @@ impl Agent {
                     self.pending.push_back(begun);
                 }
             }
+            Output::BeginDrag { id, portal, button } => {
+                self.capture_motion_seen = false;
+                #[cfg(target_os = "linux")]
+                let result = self
+                    .platform
+                    .capture
+                    .as_mut()
+                    .ok_or(PlatformError::Unsupported("no capture backend"))
+                    .and_then(|capture| capture.begin_drag(id, portal, button))
+                    .map_err(failure);
+                #[cfg(not(target_os = "linux"))]
+                let result = {
+                    let _ = (portal, button);
+                    Err(failure(PlatformError::Unsupported(
+                        "Mac drag capture awaits WP-2.58m",
+                    )))
+                };
+                // Physical callbacks queued by the capture thread always precede this answer.
+                let _ = self
+                    .events
+                    .send(Event::Input(Input::CaptureBegun { id, result }));
+            }
+            Output::ArmDrag { key, token, until } => self.arm_drag(key, token, until),
+            Output::DisarmDrag { key, .. } => {
+                if let (Some(host), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
+                    let _ = host.send(HostCommand::Disarm { id });
+                }
+            }
             Output::EndCapture { warp_to } => {
                 self.home.capture = None;
                 self.home.e2_twin_injected.clear();
@@ -1613,6 +1821,11 @@ impl Agent {
             // or `Unavailable`, WP-2.42), so a show it refused outright is only logged: the agent
             // never makes up a second outcome. The engine's own HUD deadline covers the wait.
             Output::ShowOverlay { id, overlay } => {
+                if id == crosspane_engine::io::HUD {
+                    self.drag_label = (overlay.text.starts_with("Release to move ")
+                        || overlay.text.starts_with("Moving "))
+                    .then(|| overlay.text.clone());
+                }
                 let shown = match &mut self.platform.overlay {
                     Some(host) => host.show(id, &overlay),
                     None => Err(PlatformError::Unsupported("no overlay backend")),
@@ -1628,6 +1841,9 @@ impl Agent {
                 }
             }
             Output::HideOverlay(id) => {
+                if id == crosspane_engine::io::HUD {
+                    self.drag_label = None;
+                }
                 if id == crosspane_engine::io::TARGET_INDICATOR {
                     self.tracker.indicator_hidden(Instant::now());
                 }
@@ -1682,8 +1898,10 @@ impl Agent {
                     scale,
                 });
             }
-            Output::Restore { window, .. } => {
-                self.parking_submit(crate::parking_worker::Command::Restore { window });
+            Output::Restore { window, place } => {
+                let place =
+                    place.map(|p| (p.display, PointDevice::new(f64::from(p.x), f64::from(p.y))));
+                self.parking_submit(crate::parking_worker::Command::Restore { window, place });
             }
             Output::ActivateWindow { window } => {
                 if let Some(w) = &mut self.platform.windows
@@ -1855,8 +2073,12 @@ impl Agent {
                 title,
                 app_id: _,
                 size,
-                ..
+                place,
             } => {
+                if HYPRLAND_PLACEMENT && let Some(place) = place {
+                    self.drag_places.insert(key, place);
+                    self.placement.blocked.insert(key);
+                }
                 let id = self.proxy_ids.open(key);
                 let title = self.badged(key.source, &title);
                 self.titles.insert(key, (title.clone(), 0));
@@ -1891,6 +2113,8 @@ impl Agent {
                     self.projections.insert(key, text);
                 } else {
                     self.proxy_ids.close(key);
+                    self.drag_places.remove(&key);
+                    self.placement.blocked.remove(&key);
                     self.pending.push_back(Input::ProxyOpened {
                         key,
                         result: Err(Failure::Other),
@@ -1958,6 +2182,7 @@ impl Agent {
                 let _ = waiter.reply.send(response);
             }
             Output::CloseProxy { key } => {
+                self.drag_places.remove(&key);
                 self.projections.remove(&key);
                 self.titles.remove(&key);
                 self.placement.closed(key);
@@ -4191,6 +4416,7 @@ impl Agent {
             "armed": self.engine.armed(),
             "controlling": self.engine.controlling().map(|peer| peer.to_string()),
             "controlled_by": self.engine.controlled_by().map(|peer| peer.to_string()),
+            "drag": self.drag_label,
             "session": format!("{:?}", self.platform.session.state()),
             "backends": format!("{:?}", self.platform).replacen("parking: false", "parking: true", usize::from(self.parking_available)),
             "permissions": self.platform.permissions.required().into_iter().map(|p| {
@@ -4206,6 +4432,7 @@ impl Agent {
                 "link": self.paths.get(node).map(|c| format!("{c:?}")),
                 "displays": info.displays.iter().map(display_json).collect::<Vec<_>>(),
                 "features": info.features,
+                "drag": if info.drag { "on" } else { "off" },
                 "grants": self.trust.with(|t| t.peers().iter().find(|e| e.node == *node).map(|e| {
                     e.granted.iter().filter_map(|c| crate::ctl::capability_name(*c)).collect::<Vec<_>>()
                 }).unwrap_or_default()),
@@ -7376,6 +7603,91 @@ mod audio_tests {
     }
 
     #[test]
+    fn drag_negotiation_requires_both_hellos_and_tracks_refresh_and_loss() {
+        for local in [false, true] {
+            for remote in [false, true] {
+                let mut r = rig(false);
+                if local {
+                    r.agent.features.push(DRAG_FEATURE.into());
+                }
+                let names = if remote {
+                    vec!["e1", DRAG_FEATURE]
+                } else {
+                    vec!["e1"]
+                };
+                r.hello(&names);
+                assert_eq!(
+                    r.agent.status()["peers"][0]["drag"],
+                    if local && remote { "on" } else { "off" }
+                );
+                let inputs = &r.agent.fed;
+                if local && remote {
+                    let up = inputs
+                        .iter()
+                        .position(|i| matches!(i, Input::PeerUp { .. }))
+                        .unwrap();
+                    let drag = inputs
+                        .iter()
+                        .position(|i| {
+                            matches!(
+                                i,
+                                Input::DragPeer {
+                                    available: true,
+                                    ..
+                                }
+                            )
+                        })
+                        .unwrap();
+                    assert!(up < drag);
+                } else {
+                    assert!(!inputs.iter().any(|i| matches!(
+                        i,
+                        Input::DragPeer {
+                            available: true,
+                            ..
+                        }
+                    )));
+                }
+                r.agent.fed.clear();
+                r.refresh(&["e1"]);
+                assert_eq!(r.agent.status()["peers"][0]["drag"], "off");
+                assert_eq!(
+                    r.agent
+                        .fed
+                        .iter()
+                        .filter(|i| matches!(
+                            i,
+                            Input::DragPeer {
+                                available: false,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    usize::from(local && remote)
+                );
+                r.refresh(&["e1", DRAG_FEATURE]);
+                r.agent.fed.clear();
+                r.close();
+                assert_eq!(r.agent.status()["peers"][0]["drag"], "off");
+                assert_eq!(
+                    r.agent
+                        .fed
+                        .iter()
+                        .filter(|i| matches!(
+                            i,
+                            Input::DragPeer {
+                                available: false,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    usize::from(local)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_hello_replaces_what_the_cache_knew_and_reports_changed_displays() {
         let mut info = PeerInfo::default();
         let mut hello = Hello {
@@ -7610,6 +7922,7 @@ mod audio_tests {
             links: None,
             gpu: None,
             home: None,
+            proxy_placement: None,
             startup_recovery: crate::platform::StartupRecovery::None,
         };
         let e2 = E2Wiring {
@@ -8425,6 +8738,8 @@ mod home_tests {
         end_error: Option<fn() -> PlatformError>,
         sets: Vec<Vec<u32>>,
         set_error: Option<fn() -> PlatformError>,
+        drags: Vec<(CaptureId, PortalId, MouseButton)>,
+        drag_error: Option<fn() -> PlatformError>,
     }
 
     struct FakeCapture(Arc<Mutex<CaptureLog>>);
@@ -8493,6 +8808,23 @@ mod home_tests {
                 held_keys: Vec::new(),
                 lock_keys: LockKeys::default(),
             }))
+        }
+
+        fn begin_drag(
+            &mut self,
+            id: CaptureId,
+            portal: PortalId,
+            button: MouseButton,
+        ) -> Result<CaptureStart, PlatformError> {
+            let error = {
+                let mut log = self.0.lock().unwrap();
+                log.drags.push((id, portal, button));
+                log.drag_error
+            };
+            match error {
+                Some(error) => Err(error()),
+                None => self.begin(id, portal),
+            }
         }
 
         fn end(&mut self, warp_to: Option<(DisplayId, PointDevice)>) -> Result<(), PlatformError> {
@@ -8969,6 +9301,200 @@ mod home_tests {
             injected,
             held,
             gate,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn begin_drag_routes_button_and_preserves_pointer_button_held_after_physical_callbacks() {
+        for error in [
+            None,
+            Some((|| PlatformError::PointerButtonHeld) as fn() -> PlatformError),
+            Some((|| PlatformError::Locked) as fn() -> PlatformError),
+        ] {
+            let mut h = home();
+            h.capture.lock().unwrap().drag_error = error;
+            if error.is_none() {
+                h.capture.lock().unwrap().during_begin = activation();
+            }
+            h.rig.agent.execute_one(Output::BeginDrag {
+                id: CaptureId(7),
+                portal: PortalId(9),
+                button: MouseButton::PRIMARY,
+            });
+            assert_eq!(
+                h.capture.lock().unwrap().drags,
+                [(CaptureId(7), PortalId(9), MouseButton::PRIMARY)]
+            );
+            assert!(h.rig.agent.pending.is_empty());
+            let mut physical = 0;
+            loop {
+                match h.rig.events.recv_timeout(Duration::from_secs(1)).unwrap() {
+                    Event::Input(Input::Capture(_)) => physical += 1,
+                    Event::Input(Input::CaptureBegun { id, result }) => {
+                        assert_eq!(id, CaptureId(7));
+                        match error.map(|e| failure(e())) {
+                            None => {
+                                assert!(result.is_ok());
+                                assert_eq!(physical, activation().len());
+                            }
+                            Some(expected) => {
+                                assert_eq!(result, Err(expected));
+                                assert_eq!(physical, 0);
+                            }
+                        }
+                        break;
+                    }
+                    _ => panic!("unexpected fixture event"),
+                }
+            }
+        }
+        let mut h = home();
+        h.rig.agent.platform.capture = None;
+        h.rig.agent.execute_one(Output::BeginDrag {
+            id: CaptureId(8),
+            portal: PortalId(9),
+            button: MouseButton::PRIMARY,
+        });
+        assert!(matches!(
+            h.rig.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Event::Input(Input::CaptureBegun {
+                result: Err(Failure::Other),
+                ..
+            })
+        ));
+    }
+
+    struct CommandHost {
+        commands: Arc<Mutex<Vec<HostCommand>>>,
+        ack: Option<bool>,
+    }
+
+    impl ProxyCommands for CommandHost {
+        fn send(&self, command: HostCommand) -> Result<(), crosspane_render::proxy::HostError> {
+            if let (HostCommand::Arm { done, .. }, Some(ok)) = (&command, self.ack) {
+                done.try_send(ok).unwrap();
+            }
+            self.commands.lock().unwrap().push(command);
+            Ok(())
+        }
+    }
+
+    fn command_host(h: &mut Home, ack: Option<bool>) -> Arc<Mutex<Vec<HostCommand>>> {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        h.rig.agent.host = Some(Box::new(CommandHost {
+            commands: commands.clone(),
+            ack,
+        }));
+        commands
+    }
+
+    #[test]
+    fn drag_arm_true_false_timeout_and_disarm_use_the_correlated_bounded_host_channel() {
+        for answer in [Some(true), Some(false), None] {
+            let mut h = home();
+            let key = proxy_key(3);
+            let id = h.rig.agent.proxy_ids.open(key);
+            let commands = command_host(&mut h, answer);
+            h.rig.agent.execute_one(Output::ArmDrag {
+                key,
+                token: 41,
+                until: platform::now().saturating_add(Duration::from_millis(100)),
+            });
+            let Event::Input(Input::DragArmed {
+                key: seen,
+                token,
+                ok,
+            }) = h.rig.events.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("arm answer")
+            };
+            assert_eq!((seen, token, ok), (key, 41, answer.unwrap_or(false)));
+            h.rig
+                .agent
+                .execute_one(Output::DisarmDrag { key, token: 41 });
+            let commands = commands.lock().unwrap();
+            assert!(matches!(&commands[0], HostCommand::Arm { id: seen, .. } if *seen == id));
+            assert!(matches!(&commands[1], HostCommand::Disarm { id: seen } if *seen == id));
+        }
+        let mut h = home();
+        let key = proxy_key(3);
+        h.rig.agent.execute_one(Output::ArmDrag {
+            key,
+            token: 9,
+            until: platform::now(),
+        });
+        assert!(matches!(
+            h.rig.agent.pending.pop_back(),
+            Some(Input::DragArmed {
+                token: 9,
+                ok: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn drag_status_keeps_the_engine_hud_label_and_clears_it_when_hidden() {
+        let mut h = home();
+        for text in [
+            "Release to move Editor to peer",
+            "Moving Editor to peer — release to cancel",
+        ] {
+            let overlay = Overlay {
+                display: DisplayId(1),
+                anchor: OverlayAnchor::TopCenter,
+                text: text.into(),
+                accent: Rgb8 { r: 1, g: 2, b: 3 },
+            };
+            h.rig.agent.execute_one(Output::ShowOverlay {
+                id: crosspane_engine::io::HUD,
+                overlay,
+            });
+            assert_eq!(h.rig.agent.status()["drag"], text);
+        }
+        h.rig
+            .agent
+            .execute_one(Output::HideOverlay(crosspane_engine::io::HUD));
+        assert!(h.rig.agent.status()["drag"].is_null());
+    }
+
+    #[test]
+    fn restore_placement_is_forwarded_through_the_serial_worker_only_when_present() {
+        for place in [
+            None,
+            Some(ProxyPlacement {
+                display: DisplayId(2),
+                x: -31,
+                y: 44,
+                drag: false,
+            }),
+        ] {
+            let mut h = home();
+            let (backend, controls) = crate::parking_worker::tests::fake(None);
+            h.rig.agent.platform.parking = Some(Box::new(backend));
+            h.rig.agent.parking_start();
+            h.rig.agent.execute_one(Output::Restore {
+                window: WindowId(11),
+                place,
+            });
+            assert_eq!(
+                controls
+                    .observed
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap(),
+                (crate::parking_worker::tests::Kind::Restore, WindowId(11), 0)
+            );
+            assert_eq!(
+                *controls.restored_at.lock().unwrap(),
+                [place.map(|p| (p.display, PointDevice::new(f64::from(p.x), f64::from(p.y))))]
+            );
+            h.rig
+                .agent
+                .parking
+                .take()
+                .unwrap()
+                .shutdown(crate::parking_worker::SHUTDOWN_WAIT);
         }
     }
 
@@ -13006,6 +13532,330 @@ mod home_tests {
     }
 
     const NOWHERE: Placed = (None, PointDevice::new(0.0, 0.0), PixelSize::new(0, 0));
+
+    #[cfg(target_os = "linux")]
+    struct ConfirmPlacement {
+        calls: Arc<Mutex<Vec<PointDevice>>>,
+        fail: bool,
+        queued: Option<Sender<Event>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl crate::platform::ProxyPlacementSeat for ConfirmPlacement {
+        fn place(
+            &self,
+            window: &WindowInfo,
+            display: &DisplayInfo,
+            at: PointDevice,
+        ) -> Result<RectLogical, PlatformError> {
+            self.calls.lock().unwrap().push(at);
+            if let Some(events) = &self.queued {
+                events
+                    .send(Event::Input(Input::Windows(WindowEvent::Changed(
+                        window.clone(),
+                    ))))
+                    .unwrap();
+            }
+            if self.fail {
+                return Err(PlatformError::Timeout);
+            }
+            let mut frame = window.frame;
+            frame.origin = display
+                .geometry
+                .device_to_logical(PointDevice::new(200.0, 100.0));
+            Ok(frame)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drag_proxy_reports_its_stable_id_and_waits_for_placement_confirmation_or_stays_nowhere() {
+        for fail in [false, true] {
+            let mut h = home();
+            command_host(&mut h, None);
+            let key = proxy_key(1);
+            let wanted = ProxyPlacement {
+                display: DisplayId(1),
+                x: 9999,
+                y: -9999,
+                drag: true,
+            };
+            h.rig.agent.execute_one(Output::OpenProxy {
+                key,
+                title: "one".into(),
+                app_id: "app".into(),
+                size: PixelSize::new(800, 600),
+                place: Some(wanted),
+            });
+            let title = h.rig.agent.titles[&key].0.clone();
+            h.rig.agent.placement = PlacementSource::new(PID);
+            h.rig.agent.placement.blocked.insert(key);
+            h.rig.agent.placement.opened(key, &title);
+            h.rig.agent.local_displays = vec![display(1, 2.0, (10.0, 20.0), (3000, 2000))];
+            h.rig
+                .agent
+                .placement
+                .set_displays(&h.rig.agent.local_displays);
+            h.rig.agent.placement.set_visible(key, true);
+            h.rig.agent.placement_dirty = true;
+            h.rig.agent.flush_placements();
+            assert!(h.rig.agent.pending.iter().all(|i| !matches!(
+                i,
+                Input::Proxy {
+                    event: ProxyEvent::Placed {
+                        display: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            )));
+            h.rig.agent.pending.clear();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            h.rig.agent.platform.proxy_placement = Some(Box::new(ConfirmPlacement {
+                calls: calls.clone(),
+                fail,
+                queued: None,
+            }));
+            h.rig
+                .agent
+                .placement
+                .window_event(&WindowEvent::Added(window(
+                    0x123,
+                    &title,
+                    PID,
+                    Some(1),
+                    (500.0, 300.0, 400.0, 300.0),
+                    WindowState::Normal,
+                )));
+            h.rig.agent.placement_dirty = true;
+            h.rig.agent.flush_placements();
+            assert_eq!(*calls.lock().unwrap(), [PointDevice::new(9999.0, -9999.0)]);
+            assert!(h.rig.agent.pending.iter().any(
+                |i| matches!(i, Input::ProxyWindow { key: k, window: WindowId(0x123) } if *k == key)
+            ));
+            let placed: Vec<_> = h
+                .rig
+                .agent
+                .pending
+                .iter()
+                .filter_map(|i| match i {
+                    Input::Proxy {
+                        event:
+                            ProxyEvent::Placed {
+                                display: Some(on),
+                                origin,
+                                ..
+                            },
+                        ..
+                    } => Some((*on, *origin)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                placed,
+                if fail {
+                    vec![]
+                } else {
+                    vec![(DisplayId(1), PointDevice::new(200.0, 100.0))]
+                }
+            );
+            h.rig.agent.pending.clear();
+            h.rig.agent.placement_dirty = true;
+            h.rig.agent.flush_placements();
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                1,
+                "no placement retry after failure"
+            );
+            assert!(
+                h.rig.agent.pending.is_empty(),
+                "no duplicate native ID or placement"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FreshProxy(Arc<Mutex<Option<WindowInfo>>>);
+
+    #[cfg(target_os = "linux")]
+    impl crosspane_platform::WindowSource for FreshProxy {
+        fn windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+            self.0
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|w| vec![w])
+                .ok_or(PlatformError::Timeout)
+        }
+        fn focused(&self) -> Result<Option<WindowId>, PlatformError> {
+            unreachable!()
+        }
+        fn activate(&mut self, _: WindowId) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+        fn subscribe(
+            &mut self,
+            _: Arc<dyn crosspane_platform::EventSink<WindowEvent>>,
+        ) -> Result<(), PlatformError> {
+            unreachable!()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_pre_move_geometry_is_revalidated_before_placement_and_engine_observation() {
+        let mut h = home();
+        let key = proxy_key(1);
+        let mut source = placed_source();
+        let stale = source.windows[&WindowId(1)].clone();
+        source.windows.get_mut(&WindowId(1)).unwrap().frame.origin =
+            PointLogical::new(500.0, 300.0);
+        let queued = source.windows[&WindowId(1)].clone();
+        let fresh = Arc::new(Mutex::new(Some(stale.clone())));
+        h.rig.agent.platform.windows = Some(Box::new(FreshProxy(fresh.clone())));
+        h.rig.agent.platform.proxy_placement = Some(Box::new(ConfirmPlacement {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+            queued: Some(h.rig.agent.events.clone()),
+        }));
+        h.rig.agent.local_displays = source.displays.clone();
+        h.rig.agent.placement = source;
+        h.rig.agent.drag_places.insert(
+            key,
+            ProxyPlacement {
+                display: DisplayId(1),
+                x: 200,
+                y: 100,
+                drag: true,
+            },
+        );
+        h.rig.agent.placement.blocked.insert(key);
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_placements();
+        h.rig.agent.pending.clear();
+        let event = h.rig.events.try_recv().unwrap();
+        assert!(
+            matches!(&event, Event::Input(Input::Windows(WindowEvent::Changed(w))) if w.frame == queued.frame)
+        );
+        h.rig.agent.on_event(event);
+        assert_eq!(
+            h.rig.agent.placement.windows[&WindowId(1)].frame,
+            stale.frame
+        );
+        assert!(h.rig.agent.fed.iter().any(
+            |i| matches!(i, Input::Windows(WindowEvent::Changed(w)) if w.frame == stale.frame)
+        ));
+        assert_eq!(
+            h.rig.agent.placement.compute(&key).1,
+            PointDevice::new(200.0, 100.0)
+        );
+        *fresh.lock().unwrap() = None;
+        h.rig
+            .agent
+            .feed(Input::Windows(WindowEvent::Changed(queued)));
+        assert_eq!(
+            h.rig.agent.placement.compute(&key),
+            NOWHERE,
+            "a failed read cannot publish queued geometry"
+        );
+        *fresh.lock().unwrap() = Some(stale.clone());
+        h.rig
+            .agent
+            .feed(Input::Windows(WindowEvent::Changed(stale)));
+        assert!(!h.rig.agent.placement.blocked.contains(&key));
+        assert_eq!(
+            h.rig.agent.placement.compute(&key).1,
+            PointDevice::new(200.0, 100.0),
+            "healthy identical geometry clears the failed-read block"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mid_drag_link_loss_precedes_feature_removal_and_preserves_lost_connection_notice() {
+        let mut h = bare_scenario();
+        let peer = h.rig.peer;
+        h.rig.agent.features.push(DRAG_FEATURE.into());
+        h.rig
+            .agent
+            .peers
+            .get_mut(&peer)
+            .unwrap()
+            .features
+            .push(DRAG_FEATURE.into());
+        h.rig.agent.sync_drag_peer(peer);
+        let portal = h
+            .rig
+            .agent
+            .emitted
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Output::SetPortals(ps) => {
+                    ps.iter().find(|p| p.display == DisplayId(1)).map(|p| p.id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        for now in [0, 250] {
+            h.rig.agent.test_now = Some(ms(now));
+            step(
+                &mut h,
+                Input::Capture(CaptureEvent::DragAtEdge {
+                    portal,
+                    position: 0.5,
+                    window: WindowId(10),
+                    grab: PointDevice::new(20.0, 10.0),
+                    at: ms(now),
+                }),
+            );
+        }
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::HUD,
+            )),
+        );
+        assert!(
+            !h.capture.lock().unwrap().drags.is_empty(),
+            "a real engine drag reached BeginDrag"
+        );
+        h.rig.agent.fed.clear();
+        h.rig.agent.emitted.clear();
+        h.rig.agent.on_link(LinkEvent::Closed {
+            peer,
+            error: crosspane_protocol::link::LinkError::Closed,
+        });
+        assert!(
+            h.rig
+                .agent
+                .emitted
+                .contains(&Output::Notice(Notice::LostConnection(peer)))
+        );
+        let close = h
+            .rig
+            .agent
+            .fed
+            .iter()
+            .position(|i| matches!(i, Input::Link(LinkEvent::Closed { .. })))
+            .unwrap();
+        let removal = h
+            .rig
+            .agent
+            .fed
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    Input::DragPeer {
+                        available: false,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(close < removal);
+    }
 
     #[test]
     fn a_proxy_is_placed_in_device_pixels_of_its_display() {
