@@ -611,3 +611,305 @@ fn bounded_result<T: Send + 'static>(
         }
     }
 }
+
+/// Only the process returned by a tutorial spawner may be signalled/reaped. Pipe operations,
+/// preparation and exit polling are nonblocking; retirement sends at most one owned-child kill.
+pub trait TutorialProcess: Send {
+    fn pid(&self) -> u32;
+    fn prepare_pipes(&mut self) -> NativeResult<()>;
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize>;
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize>;
+    fn reaped(&mut self) -> NativeResult<bool>;
+    fn retire(&mut self);
+}
+/// Injection is admitted only for explicit scratch targets; production uses the native spawner.
+pub trait TutorialSpawner: Send + Sync {
+    fn spawn(&self, command: &CommandSpec) -> NativeResult<Box<dyn TutorialProcess>>;
+}
+struct SystemTutorialSpawner;
+struct SystemTutorialProcess(std::process::Child);
+impl TutorialSpawner for SystemTutorialSpawner {
+    fn spawn(&self, command: &CommandSpec) -> NativeResult<Box<dyn TutorialProcess>> {
+        Ok(Box::new(SystemTutorialProcess(native(
+            Command::new(command.program())
+                .args(command.args())
+                .env_clear()
+                .envs(command.environment())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn(),
+        )?)))
+    }
+}
+impl TutorialProcess for SystemTutorialProcess {
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+    fn prepare_pipes(&mut self) -> NativeResult<()> {
+        let input = self.0.stdin.as_ref().ok_or(NativeError::Unavailable)?;
+        let output = self.0.stdout.as_ref().ok_or(NativeError::Unavailable)?;
+        for fd in [input.as_fd(), output.as_fd()] {
+            if rfs::FileType::from_raw_mode(native(rfs::fstat(fd))?.st_mode) != rfs::FileType::Fifo
+            {
+                return Err(NativeError::Foreign);
+            }
+            let flags = native(rfs::fcntl_getfl(fd))?;
+            native(rfs::fcntl_setfl(fd, flags | OFlags::NONBLOCK))?;
+        }
+        Ok(())
+    }
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.0
+            .stdout
+            .as_mut()
+            .ok_or(std::io::ErrorKind::BrokenPipe)?
+            .read(bytes)
+    }
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .stdin
+            .as_mut()
+            .ok_or(std::io::ErrorKind::BrokenPipe)?
+            .write(bytes)
+    }
+    fn reaped(&mut self) -> NativeResult<bool> {
+        Ok(native(self.0.try_wait())?.is_some())
+    }
+    fn retire(&mut self) {
+        self.0.stdin.take();
+        // Child::kill first checks its owned/reaped process; no caller-supplied PID is signalled.
+        let _ = self.0.kill();
+    }
+}
+static TUTORIAL_LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TUTORIAL_CHILDREN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The launch lease survives cancellation/Drop until this owned child is actually reaped.
+/// Identity is admitted separately from the agent; inherited pipe bytes cannot prove ownership.
+pub struct AdmittedTutorialChild {
+    process: Option<Box<dyn TutorialProcess>>,
+    cleanup: mpsc::SyncSender<Box<dyn TutorialProcess>>,
+    identity: ProcessIdentity,
+    source: ObservationSource,
+}
+opaque_debug!(AdmittedTutorialChild);
+impl AdmittedTutorialChild {
+    pub fn identity(&self) -> &ProcessIdentity {
+        &self.identity
+    }
+    pub fn source(&self) -> ObservationSource {
+        self.source
+    }
+    pub fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.process
+            .as_mut()
+            .ok_or(std::io::ErrorKind::BrokenPipe)?
+            .read(bytes)
+    }
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.process
+            .as_mut()
+            .ok_or(std::io::ErrorKind::BrokenPipe)?
+            .write(bytes)
+    }
+    pub fn reaped(&mut self) -> NativeResult<bool> {
+        self.process.as_mut().ok_or(NativeError::Refused)?.reaped()
+    }
+    pub fn retire(&mut self) {
+        if let Some(process) = self.process.take() {
+            // Exactly one message, to the receiver created before any child was started.
+            let _ = self.cleanup.try_send(process);
+        }
+    }
+}
+impl Drop for AdmittedTutorialChild {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+impl MacNativeIo {
+    pub fn launch_tutorial(
+        self: &Arc<Self>,
+        proof: &SupportProof,
+        signature: &SignatureProof,
+        font: &Path,
+        deadline: &Deadline,
+    ) -> NativeResult<AdmittedTutorialChild> {
+        self.launch_tutorial_inner(
+            proof,
+            signature,
+            font,
+            deadline,
+            Arc::new(SystemTutorialSpawner),
+        )
+    }
+    /// Fake launch admission cannot authorize a selected production target.
+    pub fn launch_tutorial_with(
+        self: &Arc<Self>,
+        proof: &SupportProof,
+        signature: &SignatureProof,
+        font: &Path,
+        deadline: &Deadline,
+        spawner: Arc<dyn TutorialSpawner>,
+    ) -> NativeResult<AdmittedTutorialChild> {
+        if !self.target.scratch {
+            return Err(NativeError::Refused);
+        }
+        self.launch_tutorial_inner(proof, signature, font, deadline, spawner)
+    }
+    fn launch_tutorial_inner(
+        self: &Arc<Self>,
+        proof: &SupportProof,
+        signature: &SignatureProof,
+        font: &Path,
+        deadline: &Deadline,
+        spawner: Arc<dyn TutorialSpawner>,
+    ) -> NativeResult<AdmittedTutorialChild> {
+        if signature.requirement.role != ArtifactRole::Tutorial
+            || signature.path
+                != self
+                    .target
+                    .app_path()
+                    .join("Contents/MacOS/crosspane-tutorial")
+        {
+            return Err(NativeError::Foreign);
+        }
+        // The existing Mac SystemFont candidates only; no review/user-font launch capability.
+        if !matches!(
+            font.to_str(),
+            Some("/System/Library/Fonts/SFNS.ttf" | "/System/Library/Fonts/Helvetica.ttc")
+        ) {
+            return Err(NativeError::Foreign);
+        }
+        let font = font.to_owned();
+        let (io, proof, signature, limit) = (
+            self.clone(),
+            proof.clone(),
+            signature.clone(),
+            deadline.clone(),
+        );
+        bounded_result(&TUTORIAL_LAUNCHES, deadline, move || {
+            proof.check(&io, &limit)?;
+            signature.revalidate(&io)?;
+            let command = CommandSpec::new(
+                &io.target,
+                NativeOperation::ControlledChild {
+                    signature: Box::new(signature.clone()),
+                    args: vec![
+                        "--controlled".into(),
+                        "--font".into(),
+                        font.to_string_lossy().into_owned(),
+                    ],
+                },
+            )?;
+            TUTORIAL_CHILDREN
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < 4).then_some(n + 1)
+                })
+                .map_err(|_| NativeError::Busy)?;
+            let lease = ProbeSlot(&TUTORIAL_CHILDREN);
+            let (cleanup, receive) = mpsc::sync_channel::<Box<dyn TutorialProcess>>(1);
+            thread::Builder::new()
+                .name("tutorial-owned-reaper".into())
+                .spawn(move || {
+                    if let Ok(mut child) = receive.recv() {
+                        child.retire();
+                        let mut discard = [0; 4096];
+                        while child.reaped() != Ok(true) {
+                            // Bounded drain/discard prevents a surviving child blocking on its pipe.
+                            let _ = child.read(&mut discard);
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        drop(lease); // Release after reap, before an injected child's Drop notification.
+                    }
+                })
+                .map_err(|_| NativeError::Unavailable)?;
+            proof.check(&io, &limit)?;
+            signature.revalidate(&io)?;
+            limit.check()?;
+            io.tutorial_proof_current(&proof)?;
+            let process = spawner.spawn(&command)?;
+            let mut child = AdmittedTutorialChild {
+                identity: ProcessIdentity {
+                    pid: process.pid(),
+                    uid: io.target.paths.uid,
+                    executable: signature.path.clone(),
+                    started_unix_ms: 0,
+                },
+                source: io.target.source(),
+                process: Some(process),
+                cleanup,
+            };
+            child
+                .process
+                .as_mut()
+                .ok_or(NativeError::Unavailable)?
+                .prepare_pipes()?;
+            child.identity = io.tutorial_identity(child.identity.pid, &signature, &limit)?;
+            proof.check(&io, &limit)?;
+            signature.revalidate(&io)?;
+            limit.check()?;
+            io.tutorial_proof_current(&proof)?;
+            Ok(child)
+        })
+    }
+    // No I/O: a slow support observation must not authorize a now-invalid proof.
+    fn tutorial_proof_current(&self, proof: &SupportProof) -> NativeResult<()> {
+        let age = self.clock.now_ms().checked_sub(proof.issued);
+        if !proof.valid.load(Ordering::Acquire)
+            || age.is_none_or(|age| age > SUPPORT_LIFETIME_MS)
+            || proof.wall.elapsed() > Duration::from_millis(SUPPORT_LIFETIME_MS)
+        {
+            return Err(NativeError::Unsupported);
+        }
+        Ok(())
+    }
+    fn tutorial_identity(
+        &self,
+        pid: u32,
+        signature: &SignatureProof,
+        deadline: &Deadline,
+    ) -> NativeResult<ProcessIdentity> {
+        let capture = || -> NativeResult<ProcessIdentity> {
+            let mut replies = Vec::new();
+            for field in [PsField::Uid, PsField::Started, PsField::Executable] {
+                let spec = CommandSpec::new(&self.target, NativeOperation::Process { pid, field })?;
+                let reply = self.execute(&spec, None, deadline)?;
+                if reply.code != Some(0) || !reply.stderr.is_empty() {
+                    return Err(NativeError::Unavailable);
+                }
+                replies.push(reply.stdout);
+            }
+            let line = |bytes: &[u8]| -> NativeResult<String> {
+                let text = std::str::from_utf8(bytes).map_err(|_| NativeError::Invalid)?;
+                let text = text.strip_suffix('\n').unwrap_or(text).trim_matches(' ');
+                if text.is_empty() || text.chars().any(char::is_control) {
+                    return Err(NativeError::Invalid);
+                }
+                Ok(text.to_owned())
+            };
+            let uid = line(&replies[0])?;
+            if !uid.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(NativeError::Invalid);
+            }
+            let uid = uid.parse::<u32>().map_err(|_| NativeError::Invalid)?;
+            let executable = admitted_spelling(Path::new(&line(&replies[2])?))?;
+            if uid != self.target.paths.uid || executable != signature.path {
+                return Err(NativeError::Foreign);
+            }
+            Ok(ProcessIdentity {
+                pid,
+                uid,
+                executable,
+                started_unix_ms: parse_ps_start(&replies[1])?,
+            })
+        };
+        let first = capture()?;
+        if capture()? != first {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()?;
+        Ok(first)
+    }
+}

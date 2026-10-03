@@ -702,7 +702,7 @@ fn platform_native(font: &std::path::Path) -> Box<dyn TutorialNative> {
     #[cfg(target_os = "macos")]
     {
         let _ = font;
-        Box::new(UnavailableTutorial)
+        Box::new(crate::platform::macos::tutorial::MacTutorial::new())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

@@ -31,6 +31,14 @@ png.workspace = true
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix.workspace = true
 
+# WP-4.16 (macOS tutorial adapter): own-window observation and CoreAudio output through objc2.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-foundation.workspace = true
+
 # WP-4.8b/c (Linux detection): logind/Secret Service/PipeWire names over the admitted buses, and a
 # registry-only Wayland read, both on streams from native_io's pinned connections.
 [target.'cfg(target_os = "linux")'.dependencies]
