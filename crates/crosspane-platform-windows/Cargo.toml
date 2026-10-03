@@ -1,0 +1,20 @@
+[package]
+name = "crosspane-platform-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crosspane-platform.workspace = true
+crosspane-types.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-sys.workspace = true

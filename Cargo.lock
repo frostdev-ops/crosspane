@@ -972,6 +972,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crosspane-platform-windows"
+version = "0.0.0"
+dependencies = [
+ "crosspane-platform",
+ "crosspane-types",
+ "windows",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "crosspane-protocol"
 version = "0.0.0"
 dependencies = [

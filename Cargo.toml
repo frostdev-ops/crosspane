@@ -24,6 +24,7 @@ crosspane-render = { path = "crates/crosspane-render" }
 crosspane-testkit = { path = "crates/crosspane-testkit" }
 crosspane-platform-linux = { path = "crates/crosspane-platform-linux" }
 crosspane-platform-macos = { path = "crates/crosspane-platform-macos" }
+crosspane-platform-windows = { path = "crates/crosspane-platform-windows" }
 crosspane-installer-core = { path = "crates/crosspane-installer-core" }
 crosspane-ui-kit = { path = "crates/crosspane-ui-kit" }
 
@@ -99,6 +100,10 @@ ash = "0.38.0"
 libloading = "0.8.9"
 objc2-screen-capture-kit = "0.3.2"
 security-framework = "3.7.0"
+
+# Windows bindings (Phase 3 Lane W); runtime claims require a real Windows machine.
+windows = "0.62.2"
+windows-sys = "0.61.2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
