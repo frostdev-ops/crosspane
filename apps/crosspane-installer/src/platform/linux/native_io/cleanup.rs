@@ -1,6 +1,10 @@
 //! Read-only ledger authority never implies readiness or clean exit.
 //! A lost original process watch remains NotClean; recovery material and identity are retained.
+mod delete;
+mod intent;
 mod ledger;
+mod manager;
+mod mutation;
 mod snapshot;
 use super::*;
 use crate::platform::linux::payload::{
@@ -9,6 +13,8 @@ use crate::platform::linux::payload::{
 use crosspane_installer_core::{
     InstallReceipt, MutationOutcome, ResourceObservation, ResourceOwnership,
 };
+pub(super) use mutation::Binding;
+pub use mutation::CleanupLease;
 use snapshot::Snapshot;
 use std::sync::Mutex;
 

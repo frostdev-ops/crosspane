@@ -46,6 +46,9 @@ struct Runner {
     service_properties: Mutex<Option<BTreeMap<String, String>>>,
     service_cat: Mutex<Vec<u8>>,
     service_delay_ms: AtomicU64,
+    disable_block: AtomicBool,
+    disable_entered: AtomicBool,
+    disable_finished: AtomicBool,
 }
 impl CommandRunner for Runner {
     fn run(&self, c: &CommandSpec, d: &Deadline) -> Result<CommandOutput, NativeError> {
@@ -71,6 +74,21 @@ impl CommandRunner for Runner {
             ));
             if let Some(p) = self.service_properties.lock().unwrap().as_ref() {
                 let (code, stdout) = match c.argv()[1].as_str() {
+                    "disable" => {
+                        assert_eq!(c.argv(), ["--user", "disable", "crosspane-agent.service"]);
+                        assert!(
+                            !c.environment()
+                                .values()
+                                .contains_key("DBUS_SYSTEM_BUS_ADDRESS")
+                        );
+                        self.disable_entered.store(true, Ordering::Release);
+                        while self.disable_block.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        self.disable_finished.store(true, Ordering::Release);
+                        d.check()?;
+                        (0, b"disabled progress only\n".to_vec())
+                    }
                     "show" => (
                         0,
                         p.iter()
@@ -256,6 +274,7 @@ impl Fixture {
             AtomicBool::new(false),
         ));
         let runner = Arc::new(Runner { calls: Mutex::default(), stall: Mutex::new(false), service_properties: Mutex::new(None), service_cat: Mutex::default(), service_delay_ms: AtomicU64::new(0),
+            disable_block: AtomicBool::new(false), disable_entered: AtomicBool::new(false), disable_finished: AtomicBool::new(false),
             output: Mutex::new(Ok((Some(0),br#"{"schema_version":1,"result":"removed","reason":null,"key":"removed","trust":"removed"}"#.to_vec(), vec![]))) });
         // Exclusive mkdir: collision is an error. No helper initializes a pre-existing root.
         let io = Arc::new(LinuxNativeIo::scratch(&root, runner.clone(), probe.clone()).unwrap());
@@ -388,6 +407,13 @@ impl Fixture {
                 .atomic_write(&self.proof, &record.target, &record.bytes)
                 .unwrap();
         }
+        self.observed_service(package, main_pid)
+    }
+    fn observed_service(&self, package: &Package, main_pid: u32) -> LinuxService {
+        let resources = PayloadInstaller::new(self.io.clone())
+            .unwrap()
+            .rendered_resources(package)
+            .unwrap();
         let unit = &resources[0];
         let mut cat = format!("# {}\n", unit.target.display()).into_bytes();
         cat.extend(&unit.bytes);
@@ -502,8 +528,14 @@ impl Fixture {
             .collect::<Vec<_>>()
             .join(" "),
         );
-        p.insert("ActiveState".into(), "active".into());
-        p.insert("SubState".into(), "running".into());
+        p.insert(
+            "ActiveState".into(),
+            if main_pid == 0 { "inactive" } else { "active" }.into(),
+        );
+        p.insert(
+            "SubState".into(),
+            if main_pid == 0 { "dead" } else { "running" }.into(),
+        );
         p.insert("MainPID".into(), main_pid.to_string());
         *self.runner.service_properties.lock().unwrap() = Some(p);
         self.service(package)
@@ -559,8 +591,145 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        self.runner.disable_block.store(false, Ordering::Release);
         fs::remove_dir_all(&self.root).unwrap();
     }
+}
+fn installed_cleanup(f: &Fixture, p: &Package) -> CleanupProof {
+    let installer = PayloadInstaller::new(f.io.clone()).unwrap();
+    let plan = installer
+        .plan(&f.proof, p, OperationId(47), MatchingFiles::Preserve)
+        .unwrap();
+    installer.apply(&f.proof, p, plan, &deadline()).unwrap();
+    f.bootstrap(9);
+    installer
+        .verify(&f.proof, p, 19, 100, &f.reply(), &deadline())
+        .unwrap();
+    f.io.admit_cleanup(&deadline()).unwrap()
+}
+fn disable_count(f: &Fixture) -> usize {
+    f.runner
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, a)| a == &["--user", "disable", "crosspane-agent.service"])
+        .count()
+}
+#[test]
+fn cleanup_disable_dispatches_only_exact_owned_unit_in_selected_manager_environment() {
+    let f = Fixture::new(false);
+    let p = package();
+    let proof = installed_cleanup(&f, &p);
+    let service = Arc::new(f.observed_service(&p, 0));
+    service.observe(&deadline()).unwrap();
+    f.runner.calls.lock().unwrap().clear();
+    let lease = proof.lease(&deadline()).unwrap();
+    let result = lease.disable(service, &deadline());
+    assert_eq!(result.result.unwrap().stdout, b"disabled progress only\n");
+    assert!(result.pending.is_none());
+    assert_eq!(disable_count(&f), 1);
+    let calls = f.runner.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .all(|(exe, a)| exe == Path::new("/usr/bin/systemctl") && a[0] == "--user")
+    );
+    drop(calls);
+    proof.revalidate(&deadline()).unwrap();
+    assert!(
+        PayloadInstaller::new(f.io.clone())
+            .unwrap()
+            .targets()
+            .iter()
+            .all(|p| p.is_file())
+    );
+}
+#[test]
+fn cleanup_disable_refuses_unowned_unit_or_effective_dropin_without_mutation() {
+    for unowned in [false, true] {
+        let f = Fixture::new(false);
+        let p = package();
+        installed_cleanup(&f, &p);
+        if unowned {
+            let installer = PayloadInstaller::new(f.io.clone()).unwrap();
+            let plan = installer
+                .plan(&f.proof, &p, OperationId(48), MatchingFiles::Preserve)
+                .unwrap();
+            installer.apply(&f.proof, &p, plan, &deadline()).unwrap();
+            installer
+                .verify(&f.proof, &p, 19, 100, &f.reply(), &deadline())
+                .unwrap();
+        }
+        let service = Arc::new(f.observed_service(&p, 0));
+        if !unowned {
+            f.runner
+                .service_properties
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .insert("DropInPaths".into(), "/injected/unowned.conf".into());
+        }
+        let proof = f.io.admit_cleanup(&deadline()).unwrap();
+        assert_eq!(proof.owned(5).unwrap(), !unowned);
+        let lease = proof.lease(&deadline()).unwrap();
+        assert_eq!(
+            lease.disable(service, &deadline()).result.unwrap_err(),
+            NativeError::Foreign
+        );
+        assert_eq!(disable_count(&f), 0);
+        proof.revalidate(&deadline()).unwrap();
+        assert!(
+            !f.io
+                .target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/cleanup-intent.json")
+                .exists()
+        );
+    }
+}
+#[test]
+fn cleanup_disable_cancellation_retains_worker_flock_and_never_reissues() {
+    let f = Fixture::new(false);
+    let p = package();
+    let proof = installed_cleanup(&f, &p);
+    let service = Arc::new(f.observed_service(&p, 0));
+    let lease = proof.lease(&deadline()).unwrap();
+    f.runner.disable_block.store(true, Ordering::Release);
+    let cancel = Cancellation::default();
+    let d = Deadline::new(5000, cancel.clone()).unwrap();
+    let result = thread::scope(|s| {
+        let call = s.spawn(|| lease.disable(service.clone(), &d));
+        let end = std::time::Instant::now() + Duration::from_secs(2);
+        while !f.runner.disable_entered.load(Ordering::Acquire) && std::time::Instant::now() < end {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(f.runner.disable_entered.load(Ordering::Acquire));
+        cancel.cancel();
+        call.join().unwrap()
+    });
+    assert_eq!(result.result.unwrap_err(), NativeError::OutcomeUnknown);
+    let pending = result.pending.unwrap();
+    assert!(!pending.completed());
+    assert_eq!(disable_count(&f), 1);
+    assert_eq!(
+        lease.disable(service, &deadline()).result.unwrap_err(),
+        NativeError::Busy
+    );
+    assert!(matches!(proof.lease(&deadline()), Err(NativeError::Busy)));
+    drop(lease);
+    assert!(matches!(proof.lease(&deadline()), Err(NativeError::Busy)));
+    f.runner.disable_block.store(false, Ordering::Release);
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while !pending.completed() && std::time::Instant::now() < end {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(pending.completed());
+    assert!(f.runner.disable_finished.load(Ordering::Acquire));
+    assert_eq!(disable_count(&f), 1);
+    assert!(proof.lease(&deadline()).is_ok());
 }
 fn package() -> Package {
     let mut elf = vec![0; 64];

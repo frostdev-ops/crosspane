@@ -113,6 +113,7 @@ impl CommandSpec {
                 lease: None,
                 spawn_attempt: None,
                 agent: Some(Arc::new(agent)),
+                cleanup: None,
             })
         })
     }

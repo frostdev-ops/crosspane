@@ -1,5 +1,6 @@
 //! Native observations do not imply readiness. Scratch authority stays inside its own target.
 mod cleanup;
+pub use cleanup::CleanupLease;
 pub use cleanup::CleanupProof;
 mod removal;
 use crate::agent_contract::{BootstrapV1, InstanceStatus, ObservationSource, parse_bootstrap};
@@ -942,6 +943,7 @@ pub struct CommandSpec {
     lease: Option<Arc<LeaseGuard>>,
     spawn_attempt: Option<Arc<AtomicBool>>,
     agent: Option<Arc<removal::InstalledExecutable>>,
+    cleanup: Option<Arc<cleanup::Binding>>,
 }
 impl Clone for CommandSpec {
     fn clone(&self) -> Self {
@@ -954,6 +956,7 @@ impl Clone for CommandSpec {
             lease: None,
             spawn_attempt: self.spawn_attempt.clone(),
             agent: self.agent.clone(),
+            cleanup: self.cleanup.clone(),
         }
     }
 }
@@ -1001,6 +1004,7 @@ impl CommandSpec {
             lease: None,
             spawn_attempt: None,
             agent: None,
+            cleanup: None,
         })
     }
     pub fn executable(&self) -> &Path {
@@ -1499,6 +1503,7 @@ impl Cleanup for Child {
 struct ManagerChild<T: Cleanup> {
     child: T,
     _lease: Option<Arc<LeaseGuard>>,
+    _cleanup: Option<Arc<cleanup::Binding>>,
 }
 impl<T: Cleanup> Cleanup for ManagerChild<T> {
     fn terminate(&mut self) {
@@ -1595,6 +1600,7 @@ fn system_command(spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutp
     deadline.check()?;
     let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
     child_environment(&mut command, &spec.environment);
+    cleanup_dispatch_check(target, spec, deadline)?;
     if let Some(attempt) = &spec.spawn_attempt {
         attempt.store(true, Ordering::Release);
     }
@@ -1639,6 +1645,7 @@ fn system_command(spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutp
         let _ = cleanup.try_send(ManagerChild {
             child,
             _lease: spec.lease.clone(),
+            _cleanup: spec.cleanup.clone(),
         });
     }
     result
@@ -1679,12 +1686,23 @@ impl ProcessProbe for ProcProbe {
     }
 }
 
+fn cleanup_dispatch_check(target: &LinuxTarget, spec: &CommandSpec, d: &Deadline) -> Result<()> {
+    if let Some(cleanup) = &spec.cleanup {
+        cleanup.check(d)?;
+        if let Some(manager) = &spec.environment.manager {
+            manager.revalidate(target)?;
+        }
+        d.check()?;
+    }
+    Ok(())
+}
 enum FileOperation<'a> {
     Mkdir(&'a OwnedFd, &'a std::ffi::OsStr),
     Write(&'a mut File, &'a [u8]),
     FileSync(&'a File),
     Rename(&'a OwnedFd, &'a str, &'a str),
     ParentSync(&'a OwnedFd),
+    IntentRename(&'a OwnedFd, &'a str, &'a str),
 }
 trait FileIo: Send + Sync {
     fn apply(&self, operation: FileOperation<'_>) -> Result<()>;
@@ -1693,6 +1711,10 @@ struct NativeFiles;
 impl FileIo for NativeFiles {
     fn apply(&self, operation: FileOperation<'_>) -> Result<()> {
         match operation {
+            FileOperation::IntentRename(dir, from, to) => {
+                rfs::renameat_with(dir, from, dir, to, rfs::RenameFlags::NOREPLACE)
+                    .map_err(|_| NativeError::OutcomeUnknown)
+            }
             FileOperation::Mkdir(dir, name) => native(rfs::mkdirat(dir, name, Mode::RWXU)),
             FileOperation::Write(file, bytes) => native(file.write_all(bytes)),
             FileOperation::FileSync(file) => native(file.sync_all()),
@@ -2450,6 +2472,7 @@ impl LinuxNativeIo {
                     proof.check_target(&target)?;
                 }
             }
+            cleanup_dispatch_check(&target, &admitted, &worker_deadline)?;
             worker_started.store(true, Ordering::Release);
             let result = runner.run(&admitted, &worker_deadline);
             let drift = if let Some(manager) = &admitted.environment.manager {
@@ -3853,6 +3876,7 @@ mod tests {
             cleanup
                 .try_send(ManagerChild {
                     child: FakeChild(reaped.clone()),
+                    _cleanup: None,
                     _lease: Some(Arc::new(LeaseGuard {
                         lease: Some(io.install_lease(&proof).unwrap()),
                         finished: pending.0.clone(),
@@ -3912,6 +3936,7 @@ mod tests {
                 FileOperation::Write(..) => FileStep::Write,
                 FileOperation::FileSync(..) => FileStep::FileSync,
                 FileOperation::Rename(..) => FileStep::Rename,
+                FileOperation::IntentRename(..) => FileStep::Rename,
                 FileOperation::ParentSync(..) => FileStep::ParentSync,
             };
             let mut fault = self.0.lock().unwrap();

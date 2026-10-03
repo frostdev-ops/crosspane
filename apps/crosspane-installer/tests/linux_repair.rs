@@ -834,6 +834,31 @@ fn cleanup_accepts_genuine_completed_repeat_without_replacement_provenance() {
 }
 
 #[test]
+fn cleanup_mutations_never_delete_genuine_repeat_resources_without_replacement_provenance() {
+    let f = Fixture::new(false);
+    let p = package();
+    installed(&f, &p);
+    let installer = PayloadInstaller::new(f.io.clone()).unwrap();
+    let plan = installer
+        .plan(&f.proof, &p, OperationId(48), MatchingFiles::Preserve)
+        .unwrap();
+    installer.apply(&f.proof, &p, plan, &deadline()).unwrap();
+    installer
+        .verify(&f.proof, &p, 19, 100, &f.reply(), &deadline())
+        .unwrap();
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    let lease = proof.lease(&deadline()).unwrap();
+    let previous_calls = f.runner.calls.lock().unwrap().len();
+    for (index, path) in installer.targets().iter().enumerate() {
+        let bytes = fs::read(path).unwrap();
+        assert!(!proof.owned(index).unwrap());
+        assert_eq!(lease.delete(index, &deadline()), Ok(false));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(f.runner.calls.lock().unwrap().len(), previous_calls);
+}
+
+#[test]
 fn cleanup_accepts_genuine_completed_minimal_repair_with_only_one_owned_replacement() {
     completed_cleanup_repair(true);
 }
@@ -864,6 +889,90 @@ fn cleanup_member_mode_boundary_is_pinned_to_frozen_payload_inventory() {
         name.starts_with("resources/")
     }));
     proof.revalidate(&deadline()).unwrap();
+}
+
+#[test]
+fn cleanup_mutation_lease_locks_writes_only_intent_and_tracks_its_exact_removals() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    let lease = proof.lease(&deadline()).unwrap();
+    assert!(matches!(proof.lease(&deadline()), Err(NativeError::Busy)));
+    let intent =
+        f.io.target()
+            .paths()
+            .state_home
+            .join("crosspane/installer/cleanup-intent.json");
+    lease
+        .write_intent(b"private first intent", &deadline())
+        .unwrap();
+    lease
+        .write_intent(b"private replacement intent", &deadline())
+        .unwrap();
+    assert_eq!(fs::read(&intent).unwrap(), b"private replacement intent");
+    let first = PathBuf::from(&proof.receipt().resources[8].resolved_path);
+    let second = PathBuf::from(&proof.receipt().resources[9].resolved_path);
+    assert!(lease.delete(8, &deadline()).unwrap());
+    assert!(!lease.delete(8, &deadline()).unwrap());
+    assert!(lease.delete(9, &deadline()).unwrap());
+    assert!(!first.exists() && !second.exists());
+    assert_eq!(proof.revalidate(&deadline()), Err(NativeError::Foreign));
+    lease
+        .write_intent(b"private completed mutations", &deadline())
+        .unwrap();
+    assert!(f.io.target().agent_path().is_file());
+    drop(lease);
+    let renewed =
+        f.io.admit_cleanup(&deadline())
+            .unwrap()
+            .lease(&deadline())
+            .unwrap();
+    assert!(!renewed.delete(8, &deadline()).unwrap());
+}
+
+#[test]
+fn cleanup_delete_revalidates_admitted_identity_and_retains_foreign_replacements() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    let lease = proof.lease(&deadline()).unwrap();
+    let path = PathBuf::from(&proof.receipt().resources[8].resolved_path);
+    let bytes = fs::read(&path).unwrap();
+    use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
+    let parent = rfs::open(
+        path.parent().unwrap(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .unwrap();
+    let mut file = fs::File::from(
+        rfs::openat(
+            &parent,
+            ".owned-test-replacement",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap(),
+    );
+    file.write_all(&bytes).unwrap();
+    rfs::fchmod(&file, Mode::from_bits_truncate(0o644)).unwrap();
+    rfs::renameat(
+        &parent,
+        ".owned-test-replacement",
+        &parent,
+        path.file_name().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        rfs::statat(
+            &parent,
+            path.file_name().unwrap(),
+            AtFlags::SYMLINK_NOFOLLOW
+        )
+        .is_ok()
+    );
+    assert_eq!(lease.delete(8, &deadline()), Err(NativeError::Foreign));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
 }
 #[test]
 fn matching_repeat_is_noop_and_missing_file_is_the_exact_minimal_delta() {
