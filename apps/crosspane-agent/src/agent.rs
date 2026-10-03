@@ -3889,13 +3889,19 @@ impl Agent {
         arrange::merge(&mut self.placements, &fresh)
     }
 
-    /// Put `peer` on `side` of this node (user action): new versions win on every peer.
+    /// Put `peer` on `side` of the whole remaining layout: new versions win on every peer.
     fn place_peer(&mut self, peer: NodeId, side: Side) -> Result<(), String> {
         let info = self.peers.get(&peer).ok_or("unknown peer")?;
         if info.displays.is_empty() {
             return Err("the peer has reported no displays yet".into());
         }
-        let nodes = vec![(self.node, self.local_displays.clone())];
+        let mut nodes = vec![(self.node, self.local_displays.clone())];
+        nodes.extend(
+            self.peers
+                .iter()
+                .filter(|(node, _)| **node != peer)
+                .map(|(node, info)| (*node, info.displays.clone())),
+        );
         let ours = arrange::placed(&self.placements, &nodes);
         let theirs: Vec<(DisplayInfo, crosspane_types::geom::PointMm)> =
             arrange::arrange_node(&info.displays)
@@ -3925,10 +3931,10 @@ impl Agent {
                 version,
             })
             .collect();
-        arrange::merge(&mut self.placements, &fresh);
+        let mut next = self.placements.clone();
+        arrange::merge(&mut next, &fresh);
         // Pin this node's own displays explicitly too, so the relation survives reconnects.
-        let own: Vec<Placement> = self
-            .placements
+        let own: Vec<Placement> = next
             .iter()
             .filter(|p| p.node == self.node)
             .map(|p| Placement {
@@ -3936,7 +3942,9 @@ impl Agent {
                 ..*p
             })
             .collect();
-        arrange::merge(&mut self.placements, &own);
+        arrange::merge(&mut next, &own);
+        self.check_layout_overlap(&next)?;
+        self.placements = next;
         self.tracker.layout_changed();
         self.feed(Input::Layout(self.placements.clone()));
         self.broadcast(&ControlMessage::Layout(self.explicit()));
@@ -3990,6 +3998,18 @@ impl Agent {
         // The layout as it would be, checked for overlaps before anything changes.
         let mut next = self.placements.clone();
         arrange::merge(&mut next, &fresh);
+        self.check_layout_overlap(&next)?;
+        self.placements = next;
+        self.tracker.layout_changed();
+        // Explicit side choices from the tray no longer describe the layout.
+        self.tray.sides.clear();
+        self.feed(Input::Layout(self.placements.clone()));
+        self.broadcast(&ControlMessage::Layout(self.explicit()));
+        Ok(())
+    }
+
+    /// Admit a complete candidate layout before placement state or its observers change.
+    fn check_layout_overlap(&self, next: &[Placement]) -> Result<(), String> {
         let size = |p: &Placement| {
             let displays = if p.node == self.node {
                 Some(&self.local_displays)
@@ -4022,12 +4042,6 @@ impl Agent {
                 }
             }
         }
-        self.placements = next;
-        self.tracker.layout_changed();
-        // Explicit side choices from the tray no longer describe the layout.
-        self.tray.sides.clear();
-        self.feed(Input::Layout(self.placements.clone()));
-        self.broadcast(&ControlMessage::Layout(self.explicit()));
         Ok(())
     }
 
@@ -17227,6 +17241,231 @@ mod home_tests {
         assert!(forgotten.ok, "{forgotten:?}");
         assert_eq!(epoch(&h, "grants"), start + 3);
         assert_eq!(status_installer(&h)["peers"], json!([]));
+    }
+
+    struct LayoutLink {
+        peer: NodeId,
+        sent: Arc<Mutex<Vec<ControlMessage>>>,
+    }
+
+    impl PeerLink for LayoutLink {
+        fn peer(&self) -> NodeId {
+            self.peer
+        }
+
+        fn send_input(
+            &mut self,
+            _: &crosspane_protocol::msg::InputMessage,
+        ) -> Result<(), crosspane_protocol::link::LinkError> {
+            panic!("idle placement must not send input")
+        }
+
+        fn send_motion(
+            &mut self,
+            _: &crosspane_protocol::msg::PointerMessage,
+        ) -> Result<(), crosspane_protocol::link::LinkError> {
+            panic!("idle placement must not send motion")
+        }
+
+        fn send_control(
+            &mut self,
+            msg: &ControlMessage,
+        ) -> Result<(), crosspane_protocol::link::LinkError> {
+            self.sent.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+
+        fn rtt(&self) -> Option<Duration> {
+            None
+        }
+
+        fn close(&mut self, _: &str) {}
+    }
+
+    fn record_layout_broadcasts(h: &mut Home) -> Arc<Mutex<Vec<ControlMessage>>> {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        h.rig.agent.links.insert(
+            h.rig.peer,
+            Box::new(LayoutLink {
+                peer: h.rig.peer,
+                sent: sent.clone(),
+            }),
+        );
+        sent
+    }
+
+    #[test]
+    fn side_placement_puts_c_right_of_b_without_three_node_overlap() {
+        use crosspane_input::layout::{Layout, LayoutOptions};
+        use crosspane_types::geom::PointMm;
+        let mut h = bare_scenario();
+        let (a, b, c) = (h.rig.local, h.rig.peer, NodeId([0x57; 32]));
+        let displays = h.rig.agent.local_displays.clone();
+        h.rig.agent.peers.insert(
+            c,
+            PeerInfo {
+                name: "C".into(),
+                displays: displays.clone(),
+                ..PeerInfo::default()
+            },
+        );
+        h.rig.agent.feed(Input::PeerDisplays {
+            peer: c,
+            displays: displays.clone(),
+        });
+        h.rig.agent.placements = vec![Placement {
+            node: a,
+            display: DisplayId(1),
+            origin: PointMm::zero(),
+            version: 1,
+        }];
+        let sent = record_layout_broadcasts(&mut h);
+        for peer in ["peer-name", "C"] {
+            let response = h.rig.agent.on_ctl(Request::Layout {
+                peer: peer.into(),
+                side: Side::Right,
+            });
+            assert!(response.ok, "{response:?}");
+        }
+        let origin = |node| {
+            h.rig
+                .agent
+                .placements
+                .iter()
+                .find(|p| p.node == node)
+                .unwrap()
+                .origin
+        };
+        assert_eq!(origin(b), PointMm::new(100.0, 0.0));
+        assert_eq!(origin(c), PointMm::new(200.0, 0.0));
+        let nodes = [(a, displays.clone()), (b, displays.clone()), (c, displays)];
+        let layout = Layout::new(
+            arrange::placed(&h.rig.agent.placements, &nodes),
+            LayoutOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(layout.portals().len(), 4, "A-B and B-C both stay adjacent");
+        assert_eq!(h.rig.agent.tray.sides[&b], Side::Right);
+        assert_eq!(h.rig.agent.tray.sides[&c], Side::Right);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn side_placement_overlap_refusal_preserves_state_engine_feed_and_broadcasts() {
+        let mut h = bare_scenario();
+        let peer = h.rig.peer;
+        let mut second = h.rig.agent.peers[&peer].displays[0].clone();
+        second.id = DisplayId(2);
+        // The third display touches both overlapping OS logical rectangles, keeping all three
+        // in one component. Explicit placement separates them; side arrangement overlaps 1 and 2.
+        let mut third = second.clone();
+        third.id = DisplayId(3);
+        third.geometry.logical_origin = PointLogical::new(1000.0, 0.0);
+        h.rig
+            .agent
+            .peers
+            .get_mut(&peer)
+            .unwrap()
+            .displays
+            .extend([second, third]);
+        let arranged = arrange::arrange_node(&h.rig.agent.peers[&peer].displays);
+        assert_eq!(
+            arranged[0].1, arranged[1].1,
+            "the candidate really overlaps"
+        );
+        let sent = record_layout_broadcasts(&mut h);
+        let response = h.rig.agent.on_ctl(Request::Place {
+            placements: [
+                ("local", 1, 0.0),
+                ("peer-name", 1, 100.0),
+                ("peer-name", 2, 200.0),
+                ("peer-name", 3, 300.0),
+            ]
+            .into_iter()
+            .map(|(node, display, x)| crate::ctl::PlaceEntry {
+                node: node.into(),
+                display,
+                origin_mm: [x, 0.0],
+            })
+            .collect(),
+        });
+        assert!(response.ok, "{response:?}");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "the recorder sees real broadcasts"
+        );
+        sent.lock().unwrap().clear();
+        h.rig.agent.tray.sides.insert(peer, Side::Above);
+        h.rig.agent.fed.clear();
+        h.rig.agent.emitted.clear();
+        let before = h.rig.agent.placements.clone();
+        let sides = h.rig.agent.tray.sides.clone();
+        let layout_epoch = epoch(&h, "layout");
+        let portal_calls = h.capture.lock().unwrap().sets.clone();
+        let response = h.rig.agent.on_ctl(Request::Layout {
+            peer: "peer-name".into(),
+            side: Side::Right,
+        });
+        assert!(
+            !response.ok,
+            "overlapping candidate must be refused: {response:?}"
+        );
+        assert_eq!(
+            response.error.as_deref(),
+            Some("display 1 of peer-name would overlap display 2 of peer-name")
+        );
+        assert_eq!(h.rig.agent.placements, before, "including every version");
+        assert_eq!(h.rig.agent.tray.sides, sides);
+        assert_eq!(epoch(&h, "layout"), layout_epoch);
+        assert!(h.rig.agent.fed.is_empty());
+        assert!(h.rig.agent.emitted.is_empty());
+        assert_eq!(h.capture.lock().unwrap().sets, portal_calls);
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn side_placement_two_node_geometry_is_unchanged_and_repeated_choice_does_not_drift() {
+        for side in [Side::Left, Side::Right, Side::Above, Side::Below] {
+            let mut h = bare_scenario();
+            let peer = h.rig.peer;
+            h.rig
+                .agent
+                .place(&[
+                    crate::ctl::PlaceEntry {
+                        node: "local".into(),
+                        display: 1,
+                        origin_mm: [0.0, 0.0],
+                    },
+                    crate::ctl::PlaceEntry {
+                        node: "peer-name".into(),
+                        display: 1,
+                        origin_mm: [100.0, 0.0],
+                    },
+                ])
+                .unwrap();
+            let nodes = [(h.rig.local, h.rig.agent.local_displays.clone())];
+            let ours = arrange::placed(&h.rig.agent.placements, &nodes);
+            let theirs: Vec<_> = h.rig.agent.peers[&peer]
+                .displays
+                .iter()
+                .cloned()
+                .map(|d| (d, crosspane_types::geom::PointMm::zero()))
+                .collect();
+            let expected = arrange::place_beside(&ours, &theirs, side);
+            for _ in 0..2 {
+                h.rig.agent.place_peer(peer, side).unwrap();
+                let actual: Vec<_> = h
+                    .rig
+                    .agent
+                    .placements
+                    .iter()
+                    .filter(|p| p.node == peer)
+                    .map(|p| p.origin)
+                    .collect();
+                assert_eq!(actual, expected, "{side:?}");
+            }
+        }
     }
 
     #[test]
