@@ -6,6 +6,7 @@
 
 pub mod audio;
 pub mod capture;
+pub mod clipboard;
 pub mod clock;
 pub mod displays;
 pub mod frame_capture;
