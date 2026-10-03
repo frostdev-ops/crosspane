@@ -21,7 +21,7 @@
 //!   `seq` order (streams can complete out of order); a gap that doesn't fill within 300 ms, or a
 //!   frame that fails to apply, asks the source for a key frame through the engine.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -203,6 +203,10 @@ pub enum Shape {
 }
 
 pub enum SourceCmd {
+    /// Payload-free wake: pixels stay in the bounded logical-stream mailbox.
+    FramesReady {
+        stream: StreamId,
+    },
     /// A capture stream started for `projection`, to be sent to `peer`.
     Start {
         stream: StreamId,
@@ -238,6 +242,118 @@ pub enum SourceCmd {
         region: bool,
         cursor: bool,
     },
+}
+
+type SourceFrames = Arc<Mutex<HashMap<StreamId, VecDeque<Frame>>>>;
+
+/// Non-waiting frame enqueue across backend swaps: two queued images per logical stream.
+#[derive(Clone)]
+pub struct SourceSender {
+    commands: Sender<SourceCmd>,
+    frames: Option<SourceFrames>,
+}
+
+impl SourceSender {
+    pub fn send(&self, cmd: SourceCmd) -> Result<(), mpsc::SendError<SourceCmd>> {
+        let Some(frames) = &self.frames else {
+            return self.commands.send(cmd);
+        };
+        match cmd {
+            SourceCmd::Frame { stream, mut frame } => {
+                let Ok(mut mailbox) = frames.lock() else {
+                    return Err(mpsc::SendError(SourceCmd::Frame { stream, frame }));
+                };
+                let queue = mailbox.entry(stream).or_default();
+                let wake = queue.is_empty();
+                let replaced = (queue.len() == 2).then(|| queue.pop_back()).flatten();
+                if let Some(old) = &replaced {
+                    merge_frame_damage(&mut frame, old);
+                }
+                queue.push_back(frame);
+                drop(mailbox);
+                drop(replaced); // Driver/lease release never runs under the mailbox lock.
+                if !wake {
+                    return Ok(());
+                }
+                let result = self.commands.send(SourceCmd::FramesReady { stream });
+                if result.is_err() {
+                    let retired = frames
+                        .lock()
+                        .ok()
+                        .and_then(|mut frames| frames.remove(&stream));
+                    drop(retired);
+                }
+                result
+            }
+            SourceCmd::Stop { stream } => {
+                let retired = frames
+                    .lock()
+                    .ok()
+                    .and_then(|mut frames| frames.remove(&stream));
+                drop(retired);
+                self.commands.send(SourceCmd::Stop { stream })
+            }
+            other => self.commands.send(other),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_frame(&self, stream: StreamId) -> Option<Frame> {
+        take_source_frame(self.frames.as_ref()?, stream)
+    }
+}
+
+#[cfg(test)]
+impl From<Sender<SourceCmd>> for SourceSender {
+    fn from(commands: Sender<SourceCmd>) -> Self {
+        Self {
+            commands,
+            frames: None,
+        }
+    }
+}
+
+pub(crate) fn source_channel() -> (SourceSender, Receiver<SourceCmd>) {
+    let (commands, receiver) = mpsc::channel();
+    (
+        SourceSender {
+            commands,
+            frames: Some(Arc::new(Mutex::new(HashMap::new()))),
+        },
+        receiver,
+    )
+}
+
+fn take_source_frame(frames: &SourceFrames, stream: StreamId) -> Option<Frame> {
+    let mut queue = frames.lock().ok()?.remove(&stream)?;
+    let mut newest = queue.pop_back()?;
+    if let Some(older) = queue.pop_front() {
+        merge_frame_damage(&mut newest, &older);
+    }
+    Some(newest)
+}
+
+/// Bounding union is conservative. Unknown/changed-size/invalid damage means FULL frame.
+fn merge_frame_damage(new: &mut Frame, old: &Frame) {
+    let damage = new.damage.take();
+    let Some((old_damage, new_damage)) = old.damage.as_ref().zip(damage) else {
+        return;
+    };
+    let Some(size) = new.size.try_cast() else {
+        return;
+    };
+    if new.size != old.size {
+        return;
+    }
+    let bounds = PixelRect::from_size(size);
+    let mut union: Option<PixelRect> = None;
+    for rect in old_damage.iter().chain(&new_damage) {
+        if bounds.intersection(rect) != Some(*rect) {
+            return;
+        }
+        union = Some(union.map_or(*rect, |union| union.union(rect)));
+    }
+    new.damage = Some(union.into_iter().collect());
 }
 
 struct Encoding {
@@ -289,12 +405,15 @@ pub struct VideoSetup {
 }
 
 /// Start the encoder thread; capture sinks and the engine loop send it `SourceCmd`s.
-pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> Sender<SourceCmd> {
-    let (tx, rx) = mpsc::channel::<SourceCmd>();
+pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> SourceSender {
+    let (tx, rx) = source_channel();
+    let frames = tx.frames.clone();
     let spawned = std::thread::Builder::new()
         .name("media-encode".into())
         .spawn(move || {
-            crate::exit_on_panic("media encoder", || encode_loop(&rx, &transport, &video))
+            crate::exit_on_panic("media encoder", || {
+                encode_loop(&rx, frames.as_ref(), &transport, &video)
+            })
         });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "could not start the media encoder");
@@ -302,7 +421,12 @@ pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> Sender<Sour
     tx
 }
 
-fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSetup) {
+fn encode_loop(
+    rx: &Receiver<SourceCmd>,
+    frames: Option<&SourceFrames>,
+    transport: &Transport,
+    video: &VideoSetup,
+) {
     let mut streams: HashMap<StreamId, Encoding> = HashMap::new();
     // Cursors reported before the stream's Start arrived (the capture thread may be first).
     let mut early_cursors: HashMap<StreamId, (Shape, Instant)> = HashMap::new();
@@ -319,110 +443,135 @@ fn encode_loop(rx: &Receiver<SourceCmd>, transport: &Transport, video: &VideoSet
         };
         // Only the newest frame of each stream matters: drain what queued up meanwhile.
         let mut latest: BTreeMap<StreamId, Frame> = BTreeMap::new();
-        let mut handle = |cmd: SourceCmd, streams: &mut HashMap<StreamId, Encoding>| match cmd {
-            SourceCmd::Start {
-                stream,
-                projection,
-                peer,
-                video: peer_video,
-                region: peer_region,
-                cursor: peer_cursor,
-                bits_per_second,
-            } => {
-                let cursor = early_cursors.remove(&stream).map(|(shape, _)| shape);
-                if let Some((frame, _)) = early_frames.remove(&stream) {
-                    latest.entry(stream).or_insert(frame);
+        let mut handle = |cmd: SourceCmd, streams: &mut HashMap<StreamId, Encoding>| {
+            let cmd = if let SourceCmd::FramesReady { stream } = cmd {
+                let Some(frame) = frames.and_then(|frames| take_source_frame(frames, stream))
+                else {
+                    return;
+                };
+                // A stale wake must not erase the idle-refinement image. A real replacement
+                // retires it before any encoding work, leaving one consumer-held image.
+                if let Some(enc) = streams.get_mut(&stream) {
+                    enc.last = None;
                 }
-                streams.insert(
+                SourceCmd::Frame { stream, frame }
+            } else {
+                cmd
+            };
+            match cmd {
+                SourceCmd::FramesReady { .. } => (),
+                SourceCmd::Start {
                     stream,
-                    Encoding {
-                        projection,
-                        peer,
-                        encoder: TileEncoder::new(),
-                        seq: 0,
-                        scheduler: HybridScheduler::new(HybridConfig::default()),
-                        peer_video,
-                        peer_region,
-                        regions: RegionScheduler::new(RegionConfig::default()),
-                        gpu: None,
-                        video: None,
-                        video_key: true,
-                        last: None,
-                        last_at: Instant::now(),
-                        peer_cursor,
-                        bits_per_second,
-                        cursor_dirty: cursor.is_some(),
-                        cursor,
-                        cursor_seq: 0,
-                        refresh_due: false,
-                        last_key_request: None,
-                    },
-                );
-            }
-            SourceCmd::Frame { stream, frame } => {
-                if streams.contains_key(&stream) {
-                    latest.insert(stream, frame);
-                } else {
-                    early_frames.retain(|_, (_, at)| at.elapsed() < EARLY_TTL);
-                    if early_frames.len() < 8 {
-                        early_frames.insert(stream, (frame, Instant::now()));
+                    projection,
+                    peer,
+                    video: peer_video,
+                    region: peer_region,
+                    cursor: peer_cursor,
+                    bits_per_second,
+                } => {
+                    let cursor = early_cursors.remove(&stream).map(|(shape, _)| shape);
+                    if let Some((frame, _)) = early_frames.remove(&stream) {
+                        latest.entry(stream).or_insert(frame);
+                    }
+                    streams.insert(
+                        stream,
+                        Encoding {
+                            projection,
+                            peer,
+                            encoder: TileEncoder::new(),
+                            seq: 0,
+                            scheduler: HybridScheduler::new(HybridConfig::default()),
+                            peer_video,
+                            peer_region,
+                            regions: RegionScheduler::new(RegionConfig::default()),
+                            gpu: None,
+                            video: None,
+                            video_key: true,
+                            last: None,
+                            last_at: Instant::now(),
+                            peer_cursor,
+                            bits_per_second,
+                            cursor_dirty: cursor.is_some(),
+                            cursor,
+                            cursor_seq: 0,
+                            refresh_due: false,
+                            last_key_request: None,
+                        },
+                    );
+                }
+                SourceCmd::Frame { stream, frame } => {
+                    if streams.contains_key(&stream) {
+                        let mut frame = frame;
+                        if let Some(old) = latest.remove(&stream) {
+                            merge_frame_damage(&mut frame, &old);
+                        }
+                        latest.insert(stream, frame);
+                    } else {
+                        early_frames.retain(|_, (_, at)| at.elapsed() < EARLY_TTL);
+                        if early_frames.contains_key(&stream) || early_frames.len() < 8 {
+                            let mut frame = frame;
+                            if let Some((old, _)) = early_frames.remove(&stream) {
+                                merge_frame_damage(&mut frame, &old);
+                            }
+                            early_frames.insert(stream, (frame, Instant::now()));
+                        }
                     }
                 }
-            }
-            SourceCmd::Cursor { stream, cursor } => match streams.get_mut(&stream) {
-                Some(e) => {
-                    e.cursor = Some(cursor);
-                    e.cursor_dirty = true;
-                }
-                None => {
-                    early_cursors.retain(|_, (_, at)| at.elapsed() < EARLY_TTL);
-                    if early_cursors.len() < 64 {
-                        early_cursors.insert(stream, (cursor, Instant::now()));
+                SourceCmd::Cursor { stream, cursor } => match streams.get_mut(&stream) {
+                    Some(e) => {
+                        e.cursor = Some(cursor);
+                        e.cursor_dirty = true;
                     }
-                }
-            },
-            SourceCmd::Stop { stream } => {
-                streams.remove(&stream);
-                latest.remove(&stream);
-                early_cursors.remove(&stream);
-                early_frames.remove(&stream);
-            }
-            SourceCmd::RequestKey { projection } => {
-                for e in streams.values_mut().filter(|e| e.projection == projection) {
-                    if e.last_key_request
-                        .is_some_and(|at| at.elapsed() < KEY_REQUEST_GAP)
-                    {
-                        continue;
+                    None => {
+                        early_cursors.retain(|_, (_, at)| at.elapsed() < EARLY_TTL);
+                        if early_cursors.len() < 64 {
+                            early_cursors.insert(stream, (cursor, Instant::now()));
+                        }
                     }
-                    e.last_key_request = Some(Instant::now());
-                    e.encoder.request_key();
-                    e.video_key = true;
-                    e.cursor_dirty = e.cursor.is_some();
-                    e.refresh_due = true;
+                },
+                SourceCmd::Stop { stream } => {
+                    streams.remove(&stream);
+                    latest.remove(&stream);
+                    early_cursors.remove(&stream);
+                    early_frames.remove(&stream);
                 }
-            }
-            SourceCmd::PeerFeatures {
-                peer,
-                video,
-                region,
-                cursor,
-            } => {
-                for e in streams.values_mut().filter(|e| e.peer == peer) {
-                    let changed = e.peer_video != video || e.peer_region != region;
-                    e.peer_video = video;
-                    e.peer_region = region;
-                    if changed {
-                        // Start over in a known state: lossless key frame, fresh schedulers.
-                        e.scheduler = HybridScheduler::new(HybridConfig::default());
-                        e.regions = RegionScheduler::new(RegionConfig::default());
+                SourceCmd::RequestKey { projection } => {
+                    for e in streams.values_mut().filter(|e| e.projection == projection) {
+                        if e.last_key_request
+                            .is_some_and(|at| at.elapsed() < KEY_REQUEST_GAP)
+                        {
+                            continue;
+                        }
+                        e.last_key_request = Some(Instant::now());
                         e.encoder.request_key();
                         e.video_key = true;
+                        e.cursor_dirty = e.cursor.is_some();
                         e.refresh_due = true;
                     }
-                    if cursor && !e.peer_cursor {
-                        e.cursor_dirty = e.cursor.is_some();
+                }
+                SourceCmd::PeerFeatures {
+                    peer,
+                    video,
+                    region,
+                    cursor,
+                } => {
+                    for e in streams.values_mut().filter(|e| e.peer == peer) {
+                        let changed = e.peer_video != video || e.peer_region != region;
+                        e.peer_video = video;
+                        e.peer_region = region;
+                        if changed {
+                            // Start over in a known state: lossless key frame, fresh schedulers.
+                            e.scheduler = HybridScheduler::new(HybridConfig::default());
+                            e.regions = RegionScheduler::new(RegionConfig::default());
+                            e.encoder.request_key();
+                            e.video_key = true;
+                            e.refresh_due = true;
+                        }
+                        if cursor && !e.peer_cursor {
+                            e.cursor_dirty = e.cursor.is_some();
+                        }
+                        e.peer_cursor = cursor;
                     }
-                    e.peer_cursor = cursor;
                 }
             }
         };
@@ -1475,5 +1624,255 @@ mod presented_tests {
         assert_eq!(ids.presented_from(first.source), Some(u64::MAX));
         ids.close(third);
         assert_eq!(ids.presented_from(first.source), Some(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod source_queue_tests {
+    use super::*;
+    use crosspane_platform::{FrameImage, NativeImage, PlatformError};
+    use crosspane_types::time::MonoTime;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    pub(crate) struct RetainedImages {
+        live: AtomicUsize,
+        peak: AtomicUsize,
+        dropped: Mutex<Vec<u64>>,
+    }
+    impl RetainedImages {
+        pub(crate) fn live(&self) -> usize {
+            self.live.load(Ordering::SeqCst)
+        }
+        pub(crate) fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+    }
+    #[derive(Debug)]
+    struct CountedImage {
+        id: u64,
+        size: PixelSize,
+        retained: Arc<RetainedImages>,
+    }
+    impl Drop for CountedImage {
+        fn drop(&mut self) {
+            self.retained.live.fetch_sub(1, Ordering::SeqCst);
+            self.retained.dropped.lock().unwrap().push(self.id);
+        }
+    }
+    impl NativeImage for CountedImage {
+        fn size(&self) -> PixelSize {
+            self.size
+        }
+        fn read(&self, _: &mut dyn FnMut(&[u8], u32)) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("counted test image"))
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    pub(crate) fn counted_frame(
+        retained: &Arc<RetainedImages>,
+        id: u64,
+        size: PixelSize,
+        damage: Option<Vec<PixelRect>>,
+    ) -> Frame {
+        let live = retained.live.fetch_add(1, Ordering::SeqCst) + 1;
+        retained.peak.fetch_max(live, Ordering::SeqCst);
+        Frame {
+            size,
+            image: FrameImage::Native(Arc::new(CountedImage {
+                id,
+                size,
+                retained: retained.clone(),
+            })),
+            damage,
+            at: MonoTime::ZERO,
+        }
+    }
+    fn rect(x: i32, y: i32) -> PixelRect {
+        PixelRect::new(point2(x, y), point2(x + 1, y + 1))
+    }
+    fn id(frame: &Frame) -> u64 {
+        frame
+            .native()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<CountedImage>()
+            .unwrap()
+            .id
+    }
+    fn enqueue(
+        sender: &SourceSender,
+        retained: &Arc<RetainedImages>,
+        id: u64,
+        damage: Option<Vec<PixelRect>>,
+    ) {
+        sender
+            .send(SourceCmd::Frame {
+                stream: StreamId(1),
+                frame: counted_frame(retained, id, PixelSize::new(8, 8), damage),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn stalled_encoder_keeps_two_waiting_images_and_drops_replaced_newest_immediately() {
+        let (sender, receiver) = source_channel();
+        let retained = Arc::new(RetainedImages::default());
+        enqueue(&sender, &retained, 1, Some(vec![rect(0, 0)]));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SourceCmd::FramesReady {
+                stream: StreamId(1)
+            }
+        ));
+        let encoding = sender.take_frame(StreamId(1)).unwrap();
+        let producer = sender.clone();
+        let counted = retained.clone();
+        let (finished, done) = mpsc::sync_channel(1);
+        let join = std::thread::spawn(move || {
+            for frame in 2..=22 {
+                enqueue(
+                    &producer,
+                    &counted,
+                    frame,
+                    Some(vec![rect((frame % 8) as i32, 1)]),
+                );
+                assert!(
+                    counted.live() <= 3,
+                    "two queued plus the stalled encoding image"
+                );
+            }
+            finished.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+        assert_eq!(
+            receiver.try_iter().count(),
+            1,
+            "one wake for the whole queued burst"
+        );
+        let queued = sender.frames.as_ref().unwrap().lock().unwrap();
+        let queue = &queued[&StreamId(1)];
+        assert_eq!(queue.iter().map(id).collect::<Vec<_>>(), vec![2, 22]);
+        drop(queued);
+        assert_eq!(
+            *retained.dropped.lock().unwrap(),
+            (3..22).collect::<Vec<_>>()
+        );
+        let newest = sender.take_frame(StreamId(1)).unwrap();
+        assert_eq!(id(&newest), 22);
+        assert_eq!(
+            newest.damage,
+            Some(vec![PixelRect::new(point2(0, 1), point2(8, 2))])
+        );
+        assert_eq!(retained.live(), 2);
+        assert_eq!(
+            retained.peak(),
+            4,
+            "one transient incoming image is immediately replaced"
+        );
+        drop((encoding, newest));
+        assert_eq!(retained.live(), 0);
+    }
+
+    #[test]
+    fn replaced_damage_is_unioned_or_full_when_unknown_invalid_or_size_changes() {
+        let retained = Arc::new(RetainedImages::default());
+        for (first, second, expected) in [
+            (
+                Some(vec![rect(1, 2)]),
+                Some(vec![rect(5, 6)]),
+                Some(vec![PixelRect::new(point2(1, 2), point2(6, 7))]),
+            ),
+            (None, Some(vec![rect(5, 6)]), None),
+            (Some(vec![rect(1, 2)]), None, None),
+            (Some(vec![rect(-1, 2)]), Some(vec![rect(5, 6)]), None),
+            (Some(vec![]), Some(vec![]), Some(vec![])),
+        ] {
+            let (sender, _receiver) = source_channel();
+            enqueue(&sender, &retained, 1, first);
+            enqueue(&sender, &retained, 2, second);
+            assert_eq!(sender.take_frame(StreamId(1)).unwrap().damage, expected);
+        }
+        let mut smaller = counted_frame(&retained, 1, PixelSize::new(8, 8), Some(vec![rect(1, 1)]));
+        let larger = counted_frame(&retained, 2, PixelSize::new(9, 8), Some(vec![rect(2, 2)]));
+        merge_frame_damage(&mut smaller, &larger);
+        assert_eq!(smaller.damage, None);
+        drop((smaller, larger));
+        assert_eq!(retained.live(), 0);
+    }
+
+    #[test]
+    fn normal_flow_preserves_frame_and_control_order_and_stop_releases_queue() {
+        let (sender, receiver) = source_channel();
+        let retained = Arc::new(RetainedImages::default());
+        sender
+            .send(SourceCmd::Start {
+                stream: StreamId(1),
+                projection: ProjectionId(3),
+                peer: NodeId([1; 32]),
+                video: false,
+                region: false,
+                cursor: false,
+                bits_per_second: 1,
+            })
+            .unwrap();
+        enqueue(&sender, &retained, 1, Some(vec![rect(1, 2)]));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SourceCmd::Start {
+                stream: StreamId(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SourceCmd::FramesReady {
+                stream: StreamId(1)
+            }
+        ));
+        let frame = sender.take_frame(StreamId(1)).unwrap();
+        assert_eq!(id(&frame), 1);
+        assert_eq!(frame.damage, Some(vec![rect(1, 2)]));
+        assert!(sender.take_frame(StreamId(1)).is_none());
+        drop(frame);
+        enqueue(&sender, &retained, 2, None);
+        sender
+            .send(SourceCmd::Cursor {
+                stream: StreamId(1),
+                cursor: Shape::Default,
+            })
+            .unwrap();
+        sender
+            .send(SourceCmd::Stop {
+                stream: StreamId(1),
+            })
+            .unwrap();
+        assert_eq!(retained.live(), 0);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SourceCmd::FramesReady { .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SourceCmd::Cursor { .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SourceCmd::Stop { .. }
+        ));
+        assert!(sender.take_frame(StreamId(1)).is_none());
+        drop(receiver);
+        assert!(
+            sender
+                .send(SourceCmd::Frame {
+                    stream: StreamId(1),
+                    frame: counted_frame(&retained, 3, PixelSize::new(8, 8), None)
+                })
+                .is_err()
+        );
+        assert_eq!(retained.live(), 0);
     }
 }

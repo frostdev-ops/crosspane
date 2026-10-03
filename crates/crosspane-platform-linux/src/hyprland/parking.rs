@@ -139,21 +139,11 @@ impl HyprlandParking {
     }
 
     fn client(&self, window: WindowId) -> Result<Option<Value>, PlatformError> {
-        let clients = self.ipc.json("clients")?;
-        Ok(clients.as_array().and_then(|list| {
-            list.iter()
-                .find(|c| stable_id(c) == Some(window.0))
-                .cloned()
-        }))
+        client_snapshot(&self.ipc, window)
     }
 
     fn monitor(&self, name: &str) -> Result<Option<Value>, PlatformError> {
-        let monitors = self.ipc.json("monitors")?;
-        Ok(monitors.as_array().and_then(|list| {
-            list.iter()
-                .find(|m| m.get("name").and_then(Value::as_str) == Some(name))
-                .cloned()
-        }))
+        monitor_snapshot(&self.ipc, name)
     }
 
     fn next_slot(&self) -> i64 {
@@ -903,7 +893,7 @@ fn inside(extent: &PixelRect, content: &PixelRect) -> bool {
 }
 
 /// The twin output's current mode as a rectangle from its origin, in device pixels.
-fn output_extent(monitor: &Value) -> Result<PixelRect, PlatformError> {
+pub(crate) fn output_extent(monitor: &Value) -> Result<PixelRect, PlatformError> {
     let dim = |key: &str| {
         monitor
             .get(key)
@@ -944,7 +934,28 @@ fn device_size((w, h): (f64, f64), scale: f64) -> Option<(i32, i32)> {
 }
 
 /// The parked window's content in device pixels of its twin output.
-fn parked_from(window: WindowId, client: &Value, monitor: &Value) -> Result<Parked, PlatformError> {
+pub(crate) fn parked_from(
+    window: WindowId,
+    client: &Value,
+    monitor: &Value,
+) -> Result<Parked, PlatformError> {
+    let scale = sane_scale(monitor.get("scale").and_then(Value::as_f64).unwrap_or(0.0));
+    let id = monitor
+        .get("id")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| backend("twin output without an id".into()))?;
+    Ok(Parked {
+        window,
+        kind: ParkingKind::Twin,
+        display: DisplayId(id),
+        content: window_rect(client, monitor, scale),
+    })
+}
+
+/// Shared coordinate conversion. Parking keeps its integer v0 scale; capture passes the actual
+/// monitor scale so Window-buffer coordinates do not inherit that parking approximation.
+pub(crate) fn window_rect(client: &Value, monitor: &Value, scale: f64) -> PixelRect {
     let num = |v: &Value, key: &str| v.get(key).and_then(Value::as_f64).unwrap_or(0.0);
     let pair = |key: &str| -> (f64, f64) {
         let a = client.get(key).and_then(Value::as_array);
@@ -955,26 +966,36 @@ fn parked_from(window: WindowId, client: &Value, monitor: &Value) -> Result<Park
         };
         (at(0), at(1))
     };
-    let scale = sane_scale(num(monitor, "scale"));
     let (mx, my) = (num(monitor, "x"), num(monitor, "y"));
     let (x, y) = pair("at");
     let (w, h) = pair("size");
     let to_px = |v: f64| (v * scale).round() as i32;
     let min = (to_px(x - mx), to_px(y - my));
-    let id = monitor
-        .get("id")
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or_else(|| backend("twin output without an id".into()))?;
-    Ok(Parked {
-        window,
-        kind: ParkingKind::Twin,
-        display: DisplayId(id),
-        content: PixelRect::new(
-            crosspane_types::geom::euclid::point2(min.0, min.1),
-            crosspane_types::geom::euclid::point2(min.0 + to_px(w), min.1 + to_px(h)),
-        ),
-    })
+    PixelRect::new(
+        crosspane_types::geom::euclid::point2(min.0, min.1),
+        crosspane_types::geom::euclid::point2(min.0 + to_px(w), min.1 + to_px(h)),
+    )
+}
+
+pub(crate) fn client_snapshot(
+    ipc: &HyprIpc,
+    window: WindowId,
+) -> Result<Option<Value>, PlatformError> {
+    let clients = ipc.json("clients")?;
+    Ok(clients.as_array().and_then(|list| {
+        list.iter()
+            .find(|c| stable_id(c) == Some(window.0))
+            .cloned()
+    }))
+}
+
+pub(crate) fn monitor_snapshot(ipc: &HyprIpc, name: &str) -> Result<Option<Value>, PlatformError> {
+    let monitors = ipc.json("monitors")?;
+    Ok(monitors.as_array().and_then(|list| {
+        list.iter()
+            .find(|m| m.get("name").and_then(Value::as_str) == Some(name))
+            .cloned()
+    }))
 }
 
 fn stable_id(client: &Value) -> Option<u64> {

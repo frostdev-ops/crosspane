@@ -5,6 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -26,6 +28,8 @@ use crosspane_protocol::projection::ProjectionMessage;
 use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
 use crosspane_types::audio::AudioKind;
 use crosspane_types::display::DisplayInfo;
+#[cfg(target_os = "linux")]
+use crosspane_types::geom::PixelRect;
 use crosspane_types::geom::{PixelSize, PointDevice};
 use crosspane_types::id::NodeId;
 use crosspane_types::id::{DisplayId, ProjectionId, WindowId};
@@ -33,11 +37,70 @@ use serde_json::{Value, json};
 
 use crate::audio::{AudioWorker, WorkerEvent, WorkerStats};
 use crate::ctl::{Request, Response};
-use crate::media::{DestCmd, ProxyIds, Shape, SourceCmd};
+use crate::media::{DestCmd, ProxyIds, Shape, SourceCmd, SourceSender};
 use crate::net::Net;
 use crate::platform::{self, Platform};
 use crate::tray::{self, PairingView, PeerView, RemoteWindows, TrayAction, TrayView};
 use crate::trust::SharedTrust;
+#[cfg(target_os = "linux")]
+use crosspane_platform_linux::hyprland::frame_capture::{TWIN_INCOHERENT, TwinGeometry};
+
+#[cfg(target_os = "linux")]
+struct TwinVideo {
+    window: WindowId,
+    display: DisplayId,
+    crop: Option<PixelRect>,
+    /// Zero holds delivery, MAX is terminal; otherwise width:height, independent of Q's origin.
+    delivery: Arc<AtomicU64>,
+    waiting: Option<Instant>,
+    retry: Instant,
+    timer: Option<tokio::task::JoinHandle<()>>,
+    backend: StreamId,
+    output: bool,
+    wanted_output: bool,
+    max_fps: u32,
+    active: Arc<AtomicU64>,
+    fence: Arc<std::sync::Mutex<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl TwinVideo {
+    /// Called only after R/Q verification. Home's output route is intentional, never fallback.
+    fn request(&self, output: bool, q: PixelRect) -> (CaptureTarget, Option<PixelRect>) {
+        if output {
+            (CaptureTarget::Display(self.display), self.crop)
+        } else {
+            (CaptureTarget::Window(self.window), Some(q))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct TwinLink {
+    active: Arc<AtomicU64>,
+    fence: Arc<std::sync::Mutex<()>>,
+    logical: Option<StreamId>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct TwinFirstFrame {
+    pending: bool,
+    size: u64,
+    full: bool,
+    frame: Option<(StreamId, crosspane_platform::Frame)>,
+    #[cfg(test)]
+    before_replay: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+}
+
+#[cfg(target_os = "linux")]
+fn video_size(size: PixelSize) -> u64 {
+    (u64::from(size.width) << 32) | u64::from(size.height)
+}
 
 /// Everything the engine loop reacts to.
 pub enum Event {
@@ -494,7 +557,7 @@ pub struct Agent {
     /// The device name is in the advertisement (a pairing window is open).
     advertising_name: bool,
     // E2 data plane and window host.
-    source_media: Sender<SourceCmd>,
+    source_media: SourceSender,
     dest_media: Sender<DestCmd>,
     host: Option<HostHandle>,
     proxy_ids: ProxyIds,
@@ -541,6 +604,13 @@ pub struct Agent {
     /// The display each of this node's projections is captured from (the twin output on
     /// Hyprland), to name the projected window in notices.
     capture_display: BTreeMap<ProjectionId, DisplayId>,
+    #[cfg(target_os = "linux")]
+    twin_video: HashMap<StreamId, TwinVideo>,
+    /// Failed stops remain owned after their logical stream has gone away.
+    #[cfg(target_os = "linux")]
+    retired_twin_video: BTreeMap<StreamId, Instant>,
+    #[cfg(all(test, target_os = "linux"))]
+    twin_geometry: Option<BTreeMap<WindowId, TwinGeometry>>,
     /// What the agent learned about its own process at startup (WP-4.5).
     startup: installer::StartupFacts,
     /// The actual on-disk config and journals for this run; absent in isolated fixtures.
@@ -558,7 +628,7 @@ pub struct Agent {
 
 /// The E2 pieces the agent wires in (`media.rs`, the proxy host).
 pub struct E2Wiring {
-    pub source_media: Sender<SourceCmd>,
+    pub source_media: SourceSender,
     pub dest_media: Sender<DestCmd>,
     pub host: Option<HostHandle>,
     pub proxy_ids: ProxyIds,
@@ -785,6 +855,12 @@ impl Agent {
             placement_dirty: false,
             capture_motion_seen: false,
             capture_display: BTreeMap::new(),
+            #[cfg(target_os = "linux")]
+            twin_video: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            retired_twin_video: BTreeMap::new(),
+            #[cfg(all(test, target_os = "linux"))]
+            twin_geometry: None,
             startup: installer::StartupFacts::unknown(node),
             lifecycle_paths: None,
             tracker: installer::Tracker::new(),
@@ -882,6 +958,18 @@ impl Agent {
                 Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
             })
             .min(HOUSEKEEPING);
+        #[cfg(target_os = "linux")]
+        let timeout = self
+            .twin_video
+            .values()
+            .filter(|r| r.waiting.is_some())
+            .fold(timeout, |wait, r| {
+                wait.min(r.retry.saturating_duration_since(clock_now))
+            });
+        #[cfg(target_os = "linux")]
+        let timeout = self.retired_twin_video.values().fold(timeout, |wait, at| {
+            wait.min(at.saturating_duration_since(clock_now))
+        });
         if self.home_watchdog_needed() {
             let deadline = self
                 .home
@@ -1611,34 +1699,65 @@ impl Agent {
                 crop,
                 max_fps,
             } => {
-                let result = match &mut self.platform.frames {
-                    Some(frames) => {
-                        let media = self.source_media.clone();
-                        let events = self.events.clone();
-                        let sink: Arc<dyn EventSink<FrameEvent>> =
-                            Arc::new(move |ev: FrameEvent| match ev {
-                                FrameEvent::Frame { stream, frame } => {
-                                    let _ = media.send(SourceCmd::Frame { stream, frame });
-                                }
-                                FrameEvent::Cursor { stream, cursor } => {
-                                    let cursor = cursor.map_or(Shape::Hidden, Shape::Image);
-                                    let _ = media.send(SourceCmd::Cursor { stream, cursor });
-                                }
-                                FrameEvent::CursorDefault { stream } => {
-                                    let cursor = Shape::Default;
-                                    let _ = media.send(SourceCmd::Cursor { stream, cursor });
-                                }
-                                FrameEvent::Ended { stream, reason } => {
-                                    let _ = events
-                                        .send(Event::Input(Input::CaptureEnded { stream, reason }));
-                                }
-                                _ => {}
-                            });
-                        frames.start(target, crop, max_fps, sink).map_err(failure)
-                    }
-                    None => Err(Failure::Other),
-                };
+                #[cfg(target_os = "linux")]
+                let mut route = self.twin_video_route(target, crop);
+                #[cfg(target_os = "linux")]
+                if let Some(route) = &mut route {
+                    route.max_fps = max_fps;
+                }
+                // Window video is position independent when Q and buffer dimensions agree.
+                // Parking geometry updates refresh the engine's R for E2 input separately.
+                #[cfg(target_os = "linux")]
+                let mapped = route.as_ref().map_or(Ok((target, crop)), |route| {
+                    self.twin_video_crop(route)
+                        .map(|q| route.request(route.output, q))
+                });
+                #[cfg(target_os = "linux")]
+                let first = route.as_ref().map(|_| {
+                    Arc::new(std::sync::Mutex::new(TwinFirstFrame {
+                        pending: true,
+                        size: crop.map_or(0, |r| video_size(r.size().cast())),
+                        full: true,
+                        frame: None,
+                        #[cfg(test)]
+                        before_replay: None,
+                    }))
+                });
+                #[cfg(not(target_os = "linux"))]
+                let mapped = Ok::<_, PlatformError>((target, crop));
+                let sink = self.video_sink(
+                    #[cfg(target_os = "linux")]
+                    route.as_ref().map(|r| r.delivery.clone()),
+                    #[cfg(target_os = "linux")]
+                    first.clone(),
+                    #[cfg(target_os = "linux")]
+                    route.as_ref().map(|r| TwinLink {
+                        active: r.active.clone(),
+                        fence: r.fence.clone(),
+                        logical: None,
+                    }),
+                );
+                let result =
+                    match mapped.and_then(|(target, crop)| match &mut self.platform.frames {
+                        Some(frames) => frames.start(target, crop, max_fps, sink),
+                        None => Err(PlatformError::Unsupported("no frame capture")),
+                    }) {
+                        Ok(stream) => Ok(stream),
+                        Err(error) => {
+                            #[cfg(target_os = "linux")]
+                            if route.is_some() {
+                                tracing::warn!(%error, "Twin Window capture start failed");
+                            }
+                            Err(failure(error))
+                        }
+                    };
                 if let Ok(stream) = result {
+                    #[cfg(target_os = "linux")]
+                    if let Some(mut route) = route {
+                        route.backend = stream;
+                        route.active.store(stream.0, AtomicOrdering::Release);
+                        self.twin_video.insert(stream, route);
+                    }
                     self.streams.insert(stream, projection);
                     if let CaptureTarget::Display(display) = target {
                         self.capture_display.insert(projection, display);
@@ -1657,11 +1776,30 @@ impl Agent {
                         cursor: has("cursor"),
                         bits_per_second: self.video_bits(peer),
                     });
+                    #[cfg(target_os = "linux")]
+                    if let Some(first) = &first {
+                        self.twin_video_replay(stream, stream, first);
+                    }
+                } else {
+                    #[cfg(target_os = "linux")]
+                    if let Some(first) = first
+                        && let Ok(mut first) = first.lock()
+                    {
+                        first.pending = false;
+                        first.frame = None;
+                    }
                 }
                 self.pending
                     .push_back(Input::CaptureStarted { projection, result });
             }
             Output::SetCaptureCrop { stream, crop } => {
+                #[cfg(target_os = "linux")]
+                if let Some(route) = self.twin_video.get_mut(&stream) {
+                    route.crop = crop;
+                    self.twin_video_hold(stream);
+                    self.twin_video_retry(stream);
+                    return;
+                }
                 if let Some(frames) = &mut self.platform.frames
                     && let Err(e) = frames.set_crop(stream, crop)
                 {
@@ -1669,13 +1807,45 @@ impl Agent {
                 }
             }
             Output::StopCapture { stream } => {
+                #[cfg(target_os = "linux")]
+                let mut backend = stream;
+                #[cfg(target_os = "linux")]
+                let mut closed = None;
+                #[cfg(not(target_os = "linux"))]
+                let backend = stream;
+                #[cfg(target_os = "linux")]
+                if let Some(mut route) = self.twin_video.remove(&stream) {
+                    // Finish any accepted enqueue before Stop clears the logical-stream mailbox.
+                    let fence = route.fence.lock().ok();
+                    route.delivery.store(u64::MAX, AtomicOrdering::Release);
+                    drop(fence);
+                    closed = Some(route.active.clone());
+                    if let Some(timer) = route.timer.take() {
+                        timer.abort();
+                        let _ = self.net.runtime().block_on(timer);
+                    }
+                    backend = route.backend;
+                }
                 if let Some(projection) = self.streams.remove(&stream) {
                     self.capture_display.remove(&projection);
                 }
                 let _ = self.source_media.send(SourceCmd::Stop { stream });
-                if let Some(frames) = &mut self.platform.frames {
-                    let _ = frames.stop(stream);
+                #[cfg(target_os = "linux")]
+                if closed.is_some() {
+                    self.twin_video_stop_backend(backend);
+                } else if let Some(frames) = &mut self.platform.frames {
+                    let _ = frames.stop(backend);
                 }
+                #[cfg(not(target_os = "linux"))]
+                if let Some(frames) = &mut self.platform.frames {
+                    let _ = frames.stop(backend);
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(closed) = closed {
+                    closed.store(0, AtomicOrdering::Release);
+                }
+                #[cfg(target_os = "linux")]
+                self.twin_video_cleanup(true);
             }
             Output::RequestKeyFrame { projection } => {
                 let _ = self.source_media.send(SourceCmd::RequestKey { projection });
@@ -2626,7 +2796,490 @@ impl Agent {
         }
     }
 
+    fn video_sink(
+        &self,
+        #[cfg(target_os = "linux")] delivery: Option<Arc<AtomicU64>>,
+        #[cfg(target_os = "linux")] first: Option<Arc<std::sync::Mutex<TwinFirstFrame>>>,
+        #[cfg(target_os = "linux")] link: Option<TwinLink>,
+    ) -> Arc<dyn EventSink<FrameEvent>> {
+        let media = self.source_media.clone();
+        let events = self.events.clone();
+        Arc::new(move |ev: FrameEvent| {
+            #[cfg(target_os = "linux")]
+            let _fence = match &link {
+                Some(link) => match link.fence.lock() {
+                    Ok(guard) => Some(guard),
+                    Err(_) => return,
+                },
+                None => None,
+            };
+            #[cfg(target_os = "linux")]
+            let ev = if let Some(link) = &link {
+                let backend = match &ev {
+                    FrameEvent::Frame { stream, .. }
+                    | FrameEvent::Cursor { stream, .. }
+                    | FrameEvent::CursorDefault { stream }
+                    | FrameEvent::Ended { stream, .. } => *stream,
+                    _ => return,
+                };
+                let active = link.active.load(AtomicOrdering::Acquire) == backend.0;
+                let logical = link.logical.unwrap_or(backend);
+                let starting = first
+                    .as_ref()
+                    .is_some_and(|first| first.lock().is_ok_and(|first| first.pending));
+                match ev {
+                    FrameEvent::Frame { stream, mut frame } => {
+                        if let Some(first) = &first {
+                            let Ok(mut first) = first.lock() else {
+                                return;
+                            };
+                            if first.pending {
+                                if video_size(frame.size) == first.size
+                                    && delivery
+                                        .as_ref()
+                                        .is_none_or(|d| d.load(AtomicOrdering::Acquire) != u64::MAX)
+                                {
+                                    // The newest verified image covers every earlier startup change.
+                                    frame.damage = None;
+                                    let replaced = first.frame.replace((stream, frame));
+                                    drop(first);
+                                    drop(replaced);
+                                }
+                                return;
+                            }
+                            if active
+                                && first.full
+                                && delivery.as_ref().is_some_and(|d| {
+                                    d.load(AtomicOrdering::Acquire) == video_size(frame.size)
+                                })
+                            {
+                                frame.damage = None;
+                                first.full = false;
+                            }
+                        }
+                        if !active {
+                            return;
+                        }
+                        FrameEvent::Frame {
+                            stream: logical,
+                            frame,
+                        }
+                    }
+                    // Failed-reply rollback of an uncommitted start is attempt cleanup only.
+                    FrameEvent::Ended {
+                        reason: crosspane_platform::StreamEndReason::Requested,
+                        ..
+                    } if starting => return,
+                    FrameEvent::Ended { reason, .. } if active || starting => FrameEvent::Ended {
+                        stream: logical,
+                        reason,
+                    },
+                    FrameEvent::Cursor { cursor, .. } if active || starting => FrameEvent::Cursor {
+                        stream: logical,
+                        cursor,
+                    },
+                    FrameEvent::CursorDefault { .. } if active || starting => {
+                        FrameEvent::CursorDefault { stream: logical }
+                    }
+                    _ => return,
+                }
+            } else {
+                ev
+            };
+            match ev {
+                FrameEvent::Frame { stream, frame } => {
+                    #[cfg(target_os = "linux")]
+                    if delivery
+                        .as_ref()
+                        .is_some_and(|d| d.load(AtomicOrdering::Acquire) != video_size(frame.size))
+                    {
+                        return;
+                    }
+                    let _ = media.send(SourceCmd::Frame { stream, frame });
+                }
+                FrameEvent::Cursor { stream, cursor } => {
+                    let cursor = cursor.map_or(Shape::Hidden, Shape::Image);
+                    let _ = media.send(SourceCmd::Cursor { stream, cursor });
+                }
+                FrameEvent::CursorDefault { stream } => {
+                    let _ = media.send(SourceCmd::Cursor {
+                        stream,
+                        cursor: Shape::Default,
+                    });
+                }
+                FrameEvent::Ended { stream, reason } => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(delivery) = &delivery
+                        && delivery.swap(u64::MAX, AtomicOrdering::AcqRel) != u64::MAX
+                        && reason != crosspane_platform::StreamEndReason::Requested
+                    {
+                        tracing::warn!(stream = stream.0, ?reason, "Twin Window capture ended");
+                    }
+                    let _ = events.send(Event::Input(Input::CaptureEnded { stream, reason }));
+                }
+                _ => {}
+            }
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_route(
+        &self,
+        target: CaptureTarget,
+        crop: Option<PixelRect>,
+    ) -> Option<TwinVideo> {
+        #[cfg(test)]
+        if self.twin_geometry.is_none() && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none()
+        {
+            return None;
+        }
+        let CaptureTarget::Display(display) = target else {
+            return None;
+        };
+        if crop.is_none() || self.platform.home.is_none() {
+            return None;
+        }
+        let (&window, _) = self.home.twins.iter().find(|(_, twin)| **twin == display)?;
+        Some(TwinVideo {
+            window,
+            display,
+            crop,
+            delivery: Arc::new(AtomicU64::new(0)),
+            waiting: None,
+            retry: Instant::now(),
+            timer: None,
+            backend: StreamId(0),
+            output: self.home.active,
+            wanted_output: self.home.active,
+            max_fps: 0,
+            active: Arc::new(AtomicU64::new(0)),
+            fence: Arc::new(std::sync::Mutex::new(())),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_crop(&self, route: &TwinVideo) -> Result<PixelRect, PlatformError> {
+        #[cfg(test)]
+        let geometry = if let Some(geometries) = &self.twin_geometry {
+            geometries
+                .get(&route.window)
+                .cloned()
+                .ok_or(PlatformError::NotFound)?
+        } else {
+            TwinGeometry::from_env(route.window, route.display)?
+        };
+        #[cfg(not(test))]
+        let geometry = TwinGeometry::from_env(route.window, route.display)?;
+        geometry.map_crop(
+            route
+                .crop
+                .ok_or_else(|| PlatformError::Backend("missing Twin content crop".into()))?,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_hold(&mut self, stream: StreamId) {
+        let Some(route) = self.twin_video.get_mut(&stream) else {
+            return;
+        };
+        if route
+            .delivery
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |v| {
+                (v != u64::MAX).then_some(0)
+            })
+            .is_err()
+        {
+            return;
+        }
+        let since = *route.waiting.get_or_insert(Instant::now());
+        if route.timer.is_none() {
+            let delivery = route.delivery.clone();
+            let events = self.events.clone();
+            route.timer = Some(self.net.runtime().spawn(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(since + TWIN_INCOHERENT))
+                    .await;
+                if delivery
+                    .compare_exchange(0, u64::MAX, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                    .is_ok()
+                {
+                    tracing::warn!(stream = stream.0, "Twin crop stayed incoherent for 1800 ms");
+                    let _ = events.send(Event::Input(Input::CaptureEnded {
+                        stream,
+                        reason: crosspane_platform::StreamEndReason::Failed,
+                    }));
+                }
+            }));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_retry(&mut self, stream: StreamId) {
+        // Ordinary crop recovery honors retired-stop backoff, even after route removal.
+        self.twin_video_cleanup(false);
+        let Some(route) = self.twin_video.get_mut(&stream) else {
+            return;
+        };
+        route.retry = Instant::now() + Duration::from_millis(100);
+        if route.delivery.load(AtomicOrdering::Acquire) == u64::MAX {
+            return;
+        }
+        let backend = route.backend;
+        if let Some(deadline) = self.retired_twin_video.get(&backend) {
+            route.retry = route.retry.max(*deadline);
+            return;
+        }
+        let route = &self.twin_video[&stream];
+        let crop = self
+            .twin_video_crop(route)
+            .map(|q| route.request(route.output, q).1);
+        let result = crop.and_then(|crop| {
+            if backend.0 == 0 {
+                return Ok(());
+            }
+            self.platform
+                .frames
+                .as_mut()
+                .ok_or(PlatformError::NotFound)?
+                .set_crop(backend, crop)
+        });
+        if let Some(route) = self.twin_video.get_mut(&stream) {
+            route.retry = Instant::now() + Duration::from_millis(100);
+            if result.is_ok() {
+                if let Some(r) = route.crop {
+                    let _ = route.delivery.fetch_update(
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
+                        |v| (v != u64::MAX).then_some(video_size(r.size().cast())),
+                    );
+                }
+                route.waiting = None;
+                if let Some(timer) = route.timer.take() {
+                    timer.abort();
+                    let _ = self.net.runtime().block_on(timer);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_replay(
+        &self,
+        stream: StreamId,
+        backend: StreamId,
+        first: &Arc<std::sync::Mutex<TwinFirstFrame>>,
+    ) {
+        #[cfg(test)]
+        if let Some((observed, release)) = first
+            .lock()
+            .ok()
+            .and_then(|mut first| first.before_replay.take())
+            && (observed.send(()).is_err() || release.recv_timeout(Duration::from_secs(4)).is_err())
+        {
+            return;
+        }
+        let Some(route) = self.twin_video.get(&stream) else {
+            return;
+        };
+        let Ok(_fence) = route.fence.lock() else {
+            return;
+        };
+        let Ok(mut first) = first.lock() else {
+            return;
+        };
+        first.pending = false;
+        let buffered = first.frame.take();
+        let size = route.crop.map_or(0, |r| video_size(r.size().cast()));
+        // Terminal callbacks use this same fence. Never reopen or replay after they won.
+        if route.delivery.load(AtomicOrdering::Acquire) == u64::MAX {
+            drop(first);
+            drop(_fence);
+            drop(buffered);
+            return;
+        }
+        route.delivery.store(size, AtomicOrdering::Release);
+        route.active.store(backend.0, AtomicOrdering::Release);
+        if let Some((id, mut frame)) = buffered
+            && id == backend
+            && video_size(frame.size) == size
+        {
+            frame.damage = None;
+            first.full = false;
+            drop(first);
+            let _ = self.source_media.send(SourceCmd::Frame { stream, frame });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_stop_backend(&mut self, backend: StreamId) {
+        if backend.0 == 0 {
+            return;
+        }
+        self.retired_twin_video
+            .entry(backend)
+            .or_insert(Instant::now());
+        self.twin_video_cleanup(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_cleanup(&mut self, force: bool) {
+        let now = Instant::now();
+        let due: Vec<_> = self
+            .retired_twin_video
+            .iter()
+            .filter(|(_, at)| force || now >= **at)
+            .map(|(&id, _)| id)
+            .collect();
+        for backend in due {
+            let result = self
+                .platform
+                .frames
+                .as_mut()
+                .ok_or(PlatformError::Unsupported("no frame capture"))
+                .and_then(|frames| frames.stop(backend));
+            if matches!(result, Ok(()) | Err(PlatformError::NotFound)) {
+                self.retired_twin_video.remove(&backend);
+                for route in self.twin_video.values_mut() {
+                    if route.backend == backend && route.active.load(AtomicOrdering::Acquire) == 0 {
+                        route.backend = StreamId(0);
+                    }
+                }
+            } else {
+                self.retired_twin_video
+                    .insert(backend, Instant::now() + Duration::from_millis(100));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_start_backend(
+        &mut self,
+        stream: StreamId,
+        output: bool,
+    ) -> Result<(), PlatformError> {
+        let route = &self.twin_video[&stream];
+        let (target, crop) = self
+            .twin_video_crop(route)
+            .map(|q| route.request(output, q))?;
+        let first = Arc::new(std::sync::Mutex::new(TwinFirstFrame {
+            pending: true,
+            full: true,
+            size: route.crop.map_or(0, |r| video_size(r.size().cast())),
+            ..Default::default()
+        }));
+        let sink = self.video_sink(
+            Some(route.delivery.clone()),
+            Some(first.clone()),
+            Some(TwinLink {
+                active: route.active.clone(),
+                fence: route.fence.clone(),
+                logical: Some(stream),
+            }),
+        );
+        let max_fps = route.max_fps;
+        let result = self
+            .platform
+            .frames
+            .as_mut()
+            .ok_or(PlatformError::NotFound)?
+            .start(target, crop, max_fps, sink);
+        match result {
+            Ok(backend) => {
+                if let Some(route) = self.twin_video.get_mut(&stream) {
+                    route.backend = backend;
+                    route.output = output;
+                }
+                self.twin_video_replay(stream, backend, &first);
+                Ok(())
+            }
+            Err(error) => {
+                let retired = first.lock().ok().and_then(|mut first| {
+                    first.pending = false;
+                    first.frame.take()
+                });
+                drop(retired);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn twin_video_home(&mut self) {
+        // Entering/Home is global. All Twins intentionally use output video while active.
+        // Break-before-make leaves the destination's last frame visible during the gap.
+        self.twin_video_cleanup(false);
+        let output = self.home.active;
+        let streams: Vec<_> = self
+            .twin_video
+            .iter()
+            .filter(|(_, r)| {
+                r.wanted_output != output || r.active.load(AtomicOrdering::Acquire) == 0
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for stream in streams {
+            let route = &self.twin_video[&stream];
+            if matches!(route.delivery.load(AtomicOrdering::Acquire), 0 | u64::MAX) {
+                continue;
+            }
+            if route.output == output && route.active.load(AtomicOrdering::Acquire) != 0 {
+                if let Some(route) = self.twin_video.get_mut(&stream) {
+                    route.wanted_output = output;
+                }
+                continue;
+            }
+            let previous = route.output;
+            let backend = route.backend;
+            if route.active.load(AtomicOrdering::Acquire) != 0 {
+                let Ok(_fence) = route.fence.lock() else {
+                    continue;
+                };
+                route.active.store(0, AtomicOrdering::Release);
+            }
+            self.twin_video_stop_backend(backend);
+            if self.retired_twin_video.contains_key(&backend) {
+                continue;
+            }
+            if let Some(route) = self.twin_video.get_mut(&stream) {
+                route.backend = StreamId(0);
+                route.wanted_output = output;
+            }
+            if let Err(error) = self.twin_video_start_backend(stream, output) {
+                // Retry only the previous route once. Never turn an ordinary Window failure
+                // into an output fallback; this is the explicit Home route transition.
+                let fallback = self.twin_video_start_backend(stream, previous);
+                tracing::warn!(stream = stream.0, %error, fallback = ?fallback, "Twin home video restart failed");
+                if fallback.is_err()
+                    && let Some(route) = self.twin_video.get(&stream)
+                {
+                    let Ok(_fence) = route.fence.lock() else {
+                        continue;
+                    };
+                    if route.delivery.swap(u64::MAX, AtomicOrdering::AcqRel) != u64::MAX {
+                        self.pending.push_back(Input::CaptureEnded {
+                            stream,
+                            reason: crosspane_platform::StreamEndReason::Failed,
+                        });
+                    }
+                }
+            }
+            // A queued Home transition is applied by the next engine event/housekeeping pass;
+            // synchronous start is never interrupted or stacked.
+        }
+    }
+
     fn housekeeping(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.twin_video_home();
+        #[cfg(target_os = "linux")]
+        for stream in self
+            .twin_video
+            .iter()
+            .filter(|(_, r)| r.waiting.is_some() && Instant::now() >= r.retry)
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>()
+        {
+            self.twin_video_retry(stream);
+        }
         self.home_housekeeping();
         self.discovery_housekeeping();
         // Known limit (WP-4.5): a backend that flips and flips back within one tick is missed.
@@ -5479,6 +6132,1150 @@ mod installer {
 
 pub use installer::StartupFacts;
 
+#[cfg(all(test, target_os = "linux"))]
+mod twin_video_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crosspane_platform::{Frame, FrameCapture, FrameImage, StreamEndReason};
+    use crosspane_types::geom::euclid::point2;
+    use crosspane_types::time::MonoTime;
+    use std::sync::{Mutex, mpsc};
+
+    #[derive(Default)]
+    struct Recorded {
+        emit_first: bool,
+        fail_next: bool,
+        fail_starts: usize,
+        rollback_requested: bool,
+        stop_failures: usize,
+        stop_attempts: Vec<StreamId>,
+        startup_frames: VecDeque<Frame>,
+        start_hook: Option<Box<dyn FnOnce() + Send>>,
+        starts: Vec<(CaptureTarget, Option<PixelRect>)>,
+        crops: Vec<Option<PixelRect>>,
+        crop_streams: Vec<StreamId>,
+        stops: usize,
+        stopped: Vec<StreamId>,
+        sink: Option<Arc<dyn EventSink<FrameEvent>>>,
+        sinks: BTreeMap<StreamId, Arc<dyn EventSink<FrameEvent>>>,
+    }
+    struct Frames {
+        recorded: Arc<Mutex<Recorded>>,
+        fail_start: bool,
+        blocked: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+    }
+    impl FrameCapture for Frames {
+        fn start(
+            &mut self,
+            target: CaptureTarget,
+            crop: Option<PixelRect>,
+            _: u32,
+            sink: Arc<dyn EventSink<FrameEvent>>,
+        ) -> Result<StreamId, PlatformError> {
+            let mut log = self.recorded.lock().unwrap();
+            log.starts.push((target, crop));
+            let stream = StreamId(100 + log.starts.len() as u64);
+            log.sink = Some(sink.clone());
+            log.sinks.insert(stream, sink.clone());
+            let emit_first = log.emit_first;
+            let startup = std::mem::take(&mut log.startup_frames);
+            let hook = log.start_hook.take();
+            let failed =
+                self.fail_start || std::mem::take(&mut log.fail_next) || log.fail_starts > 0;
+            let rollback_requested = log.rollback_requested;
+            log.fail_starts = log.fail_starts.saturating_sub(1);
+            if failed {
+                log.sinks.remove(&stream);
+            }
+            drop(log);
+            if let Some(hook) = hook {
+                hook();
+            }
+            if emit_first {
+                sink.send(frame_on(stream, geometry().size));
+            }
+            for frame in startup {
+                sink.send(FrameEvent::Frame { stream, frame });
+            }
+            if failed {
+                if rollback_requested {
+                    sink.send(FrameEvent::Ended {
+                        stream,
+                        reason: StreamEndReason::Requested,
+                    });
+                }
+                Err(PlatformError::Unsupported("fake Window capture failure"))
+            } else {
+                Ok(stream)
+            }
+        }
+        fn set_crop(
+            &mut self,
+            stream: StreamId,
+            crop: Option<PixelRect>,
+        ) -> Result<(), PlatformError> {
+            let mut log = self.recorded.lock().unwrap();
+            log.crops.push(crop);
+            log.crop_streams.push(stream);
+            drop(log);
+            if let Some((observed, release)) = &self.blocked {
+                observed.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(4)).unwrap();
+            }
+            Ok(())
+        }
+        fn stop(&mut self, stream: StreamId) -> Result<(), PlatformError> {
+            let mut log = self.recorded.lock().unwrap();
+            log.stop_attempts.push(stream);
+            if log.stop_failures > 0 {
+                log.stop_failures -= 1;
+                return Err(PlatformError::Timeout);
+            }
+            let Some(sink) = log.sinks.remove(&stream) else {
+                return Err(PlatformError::NotFound);
+            };
+            log.stops += 1;
+            log.stopped.push(stream);
+            drop(log);
+            sink.send(FrameEvent::Ended {
+                stream,
+                reason: StreamEndReason::Requested,
+            });
+            Ok(())
+        }
+    }
+    struct Seat;
+    impl platform::HomeSeat for Seat {
+        fn keys(&self) -> String {
+            "fake".into()
+        }
+        fn install(&self) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn remove(&self) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn installed(&self) -> Result<bool, PlatformError> {
+            Ok(false)
+        }
+        fn cursor(&self) -> Result<(DisplayId, PointDevice), PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn watch_reload(&mut self, _: Box<dyn Fn() + Send>) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+    fn geometry() -> TwinGeometry {
+        TwinGeometry {
+            window: WindowId(10),
+            display: DisplayId(2),
+            origin: (20, 40),
+            size: PixelSize::new(300, 200),
+            extent: PixelSize::new(640, 480),
+            content: PixelRect::new(point2(20, 40), point2(320, 240)),
+        }
+    }
+    fn rect(geometry: &TwinGeometry) -> PixelRect {
+        let full = PixelRect::from_origin_and_size(
+            point2(geometry.origin.0, geometry.origin.1),
+            geometry.size.cast(),
+        );
+        full.intersection(&PixelRect::new(
+            point2(0, 0),
+            point2(geometry.extent.width as i32, geometry.extent.height as i32),
+        ))
+        .unwrap()
+    }
+    fn fixture() -> (
+        audio_tests::Rig,
+        Arc<Mutex<Recorded>>,
+        mpsc::Receiver<SourceCmd>,
+    ) {
+        let mut rig = audio_tests::rig(false);
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        rig.agent.platform.frames = Some(Box::new(Frames {
+            recorded: recorded.clone(),
+            fail_start: false,
+            blocked: None,
+        }));
+        rig.agent.platform.home = Some(Box::new(Seat));
+        rig.agent.home.twins.insert(WindowId(10), DisplayId(2));
+        rig.agent.twin_geometry = Some(BTreeMap::from([(WindowId(10), geometry())]));
+        let (send, source) = mpsc::channel();
+        rig.agent.source_media = send.into();
+        (rig, recorded, source)
+    }
+    fn start(agent: &mut Agent, peer: NodeId, target: CaptureTarget, crop: Option<PixelRect>) {
+        agent.execute_one(Output::StartCapture {
+            projection: ProjectionId(1),
+            peer,
+            target,
+            crop,
+            max_fps: 30,
+        });
+    }
+    fn frame(size: PixelSize) -> FrameEvent {
+        frame_on(StreamId(101), size)
+    }
+    fn frame_on(stream: StreamId, size: PixelSize) -> FrameEvent {
+        FrameEvent::Frame {
+            stream,
+            frame: Frame {
+                size,
+                image: FrameImage::Cpu {
+                    stride: size.width * 4,
+                    pixels: vec![0; size.width as usize * size.height as usize * 4].into(),
+                },
+                damage: None,
+                at: MonoTime::ZERO,
+            },
+        }
+    }
+
+    #[test]
+    fn newest_verified_startup_frame_is_replayed_full_after_media_start() {
+        let (mut rig, log, source) = fixture();
+        log.lock().unwrap().startup_frames = VecDeque::from([
+            colored_frame(1, 1),
+            colored_frame(2, 9),
+            Frame::cpu(
+                PixelSize::new(1, 1),
+                4,
+                vec![3; 4].into(),
+                None,
+                MonoTime::ZERO,
+            ),
+        ]);
+        let peer = rig.peer;
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        assert!(matches!(
+            source.try_recv().unwrap(),
+            SourceCmd::Start {
+                stream: StreamId(101),
+                ..
+            }
+        ));
+        let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+            panic!("first frame lost");
+        };
+        assert_eq!(stream, StreamId(101));
+        assert_eq!(frame.size, geometry().size);
+        assert_eq!(frame.cpu_pixels().unwrap().0[0], 2);
+        assert_eq!(
+            frame.damage, None,
+            "all startup edits are covered without another capture"
+        );
+        assert!(source.try_recv().is_err()); // Backend emits nothing after returning.
+        rig.agent.execute_one(Output::StopCapture { stream });
+    }
+
+    fn sink_for(log: &Arc<Mutex<Recorded>>, stream: StreamId) -> Arc<dyn EventSink<FrameEvent>> {
+        log.lock().unwrap().sinks[&stream].clone()
+    }
+
+    #[test]
+    fn entering_global_home_starts_every_twin_on_output_and_leaving_keeps_logical_ids() {
+        let (mut rig, log, source) = fixture();
+        rig.agent.home.active = true; // Entering: no HomeNow/key has been inferred.
+        assert!(rig.agent.home.now.is_none());
+        let mut second = geometry();
+        second.window = WindowId(11);
+        second.display = DisplayId(3);
+        rig.agent.home.twins.insert(second.window, second.display);
+        rig.agent
+            .twin_geometry
+            .as_mut()
+            .unwrap()
+            .insert(second.window, second.clone());
+        log.lock().unwrap().emit_first = true;
+        let peer = rig.peer;
+        for display in [DisplayId(2), DisplayId(3)] {
+            start(
+                &mut rig.agent,
+                peer,
+                CaptureTarget::Display(display),
+                Some(rect(&geometry())),
+            );
+        }
+        assert_eq!(
+            log.lock().unwrap().starts,
+            vec![
+                (
+                    CaptureTarget::Display(DisplayId(2)),
+                    Some(rect(&geometry()))
+                ),
+                (
+                    CaptureTarget::Display(DisplayId(3)),
+                    Some(rect(&geometry()))
+                ),
+            ]
+        );
+        while source.try_recv().is_ok() {}
+        rig.agent.home.active = false;
+        rig.agent.twin_video_home();
+        for stream in [StreamId(101), StreamId(102)] {
+            let SourceCmd::Frame {
+                stream: logical, ..
+            } = source.try_recv().unwrap()
+            else {
+                panic!("handoff first frame missing");
+            };
+            assert!([StreamId(101), StreamId(102)].contains(&logical));
+            assert!(!rig.agent.twin_video[&stream].output);
+        }
+        assert!(source.try_recv().is_err());
+        assert_eq!(rig.agent.twin_video.len(), 2);
+        for stream in [StreamId(101), StreamId(102)] {
+            rig.agent.execute_one(Output::StopCapture { stream });
+        }
+    }
+
+    fn colored_frame(value: u8, x: i32) -> Frame {
+        let size = geometry().size;
+        Frame::cpu(
+            size,
+            size.width * 4,
+            vec![value; size.width as usize * size.height as usize * 4].into(),
+            Some(vec![PixelRect::new(point2(x, 1), point2(x + 1, 2))]),
+            MonoTime::ZERO,
+        )
+    }
+
+    #[test]
+    fn home_break_before_make_keeps_logical_id_and_first_new_frame_is_full() {
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        assert!(matches!(
+            source.try_recv().unwrap(),
+            SourceCmd::Start {
+                stream: StreamId(101),
+                ..
+            }
+        ));
+        let old = sink_for(&log, StreamId(101));
+        rig.agent.home.active = true;
+        rig.agent.twin_video_home();
+        assert_eq!(log.lock().unwrap().stopped, vec![StreamId(101)]);
+        assert_eq!(log.lock().unwrap().sinks.len(), 1);
+        assert_eq!(
+            log.lock().unwrap().starts[1],
+            (
+                CaptureTarget::Display(DisplayId(2)),
+                Some(rect(&geometry()))
+            )
+        );
+        assert!(source.try_recv().is_err()); // Gap leaves the last destination frame visible.
+        old.send(frame(geometry().size));
+        assert!(source.try_recv().is_err());
+        for (value, expected) in [(1, None), (2, colored_frame(2, 4).damage)] {
+            sink_for(&log, StreamId(102)).send(FrameEvent::Frame {
+                stream: StreamId(102),
+                frame: colored_frame(value, 4),
+            });
+            let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+                panic!("new video missing");
+            };
+            assert_eq!(stream, StreamId(101));
+            assert_eq!(frame.damage, expected);
+        }
+        rig.agent.execute_one(Output::SetCaptureCrop {
+            stream: StreamId(101),
+            crop: Some(rect(&geometry())),
+        });
+        assert_eq!(
+            log.lock().unwrap().crop_streams.last(),
+            Some(&StreamId(102))
+        );
+        rig.agent.home.active = false;
+        rig.agent.twin_video_home();
+        assert_eq!(
+            log.lock().unwrap().stopped,
+            vec![StreamId(101), StreamId(102)]
+        );
+        assert_eq!(
+            log.lock().unwrap().starts[2],
+            (
+                CaptureTarget::Window(WindowId(10)),
+                Some(PixelRect::from_size(geometry().size.cast()))
+            )
+        );
+        sink_for(&log, StreamId(103)).send(FrameEvent::Frame {
+            stream: StreamId(103),
+            frame: colored_frame(3, 12),
+        });
+        let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+            panic!("Window restart missing");
+        };
+        assert_eq!(stream, StreamId(101));
+        assert_eq!(frame.damage, None);
+        assert_eq!(rig.agent.streams[&stream], ProjectionId(1));
+        rig.agent.execute_one(Output::StopCapture { stream });
+        assert!(rig.agent.retired_twin_video.is_empty());
+        assert_eq!(
+            log.lock().unwrap().stopped,
+            vec![StreamId(101), StreamId(102), StreamId(103)]
+        );
+    }
+
+    #[test]
+    fn rapid_home_restarts_without_dispatching_events_bound_images_and_leave_one_backend() {
+        use crate::media::source_queue_tests::{RetainedImages, counted_frame};
+        let (mut rig, log, _) = fixture();
+        let (sender, commands) = crate::media::source_channel();
+        rig.agent.source_media = sender.clone();
+        let retained = Arc::new(RetainedImages::default());
+        let logical = StreamId(101);
+        let peer = rig.peer;
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SourceCmd::Start { .. }
+        ));
+        let emit = |backend, id| {
+            sink_for(&log, backend).send(FrameEvent::Frame {
+                stream: backend,
+                frame: counted_frame(
+                    &retained,
+                    id,
+                    geometry().size,
+                    Some(vec![PixelRect::new(
+                        point2(id as i32, 1),
+                        point2(id as i32 + 1, 2),
+                    )]),
+                ),
+            })
+        };
+        emit(logical, 1);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SourceCmd::FramesReady { .. }
+        ));
+        let encoding = sender.take_frame(logical).unwrap();
+        emit(logical, 2);
+        emit(logical, 3);
+        for iteration in 0..20 {
+            let old = sink_for(&log, rig.agent.twin_video[&logical].backend);
+            rig.agent.home.active = !rig.agent.home.active;
+            rig.agent.twin_video_home();
+            let backend = rig.agent.twin_video[&logical].backend;
+            old.send(frame(geometry().size)); // Retired sinks cannot enqueue image events.
+            emit(backend, 4 + iteration);
+            assert_eq!(
+                retained.live(),
+                3,
+                "two waiting plus the stalled encoder, independent of restarts"
+            );
+            assert!(
+                rig.events.try_recv().is_err(),
+                "no candidate Image event exists"
+            );
+            assert_eq!(log.lock().unwrap().sinks.len(), 1);
+            assert_eq!(rig.agent.streams.len(), 1);
+            assert!(rig.agent.retired_twin_video.is_empty());
+            rig.agent.twin_video_home();
+            assert_eq!(log.lock().unwrap().starts.len(), 2 + iteration as usize);
+        }
+        assert_eq!(
+            retained.peak(),
+            4,
+            "only the transient incoming frame exceeds stable retention"
+        );
+        assert_eq!(
+            commands.try_iter().count(),
+            1,
+            "one wake and no logical encoder restart"
+        );
+        let newest = sender.take_frame(logical).unwrap();
+        assert_eq!(
+            newest.damage, None,
+            "each new route's first image refreshes the full destination"
+        );
+        drop((newest, encoding));
+        assert_eq!(retained.live(), 0);
+        rig.agent
+            .execute_one(Output::StopCapture { stream: logical });
+        assert_eq!(log.lock().unwrap().stopped.len(), 21);
+    }
+
+    #[test]
+    fn a_home_toggle_queued_during_start_is_applied_after_that_start_finishes_once() {
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        while source.try_recv().is_ok() {}
+        let (observed, started) = mpsc::sync_channel(1);
+        let (release, resumed) = mpsc::sync_channel(1);
+        log.lock().unwrap().start_hook = Some(Box::new(move || {
+            observed.send(()).unwrap();
+            resumed.recv_timeout(Duration::from_secs(4)).unwrap();
+        }));
+        rig.agent.home.active = true;
+        let join = std::thread::spawn(move || {
+            rig.agent.twin_video_home();
+            rig
+        });
+        started.recv_timeout(Duration::from_secs(4)).unwrap();
+        // The engine owns HomeAgent exclusively: a toggle received during synchronous start
+        // waits in its input channel, then changes global state on the next loop pass.
+        assert_eq!(log.lock().unwrap().starts.len(), 2);
+        assert_eq!(log.lock().unwrap().sinks.len(), 1);
+        release.send(()).unwrap();
+        let mut rig = join.join().unwrap();
+        assert!(rig.agent.twin_video[&StreamId(101)].output);
+        rig.agent.home.active = false;
+        rig.agent.twin_video_home();
+        rig.agent.twin_video_home();
+        assert_eq!(log.lock().unwrap().starts.len(), 3);
+        assert_eq!(rig.agent.twin_video[&StreamId(101)].backend, StreamId(103));
+        assert!(!rig.agent.twin_video[&StreamId(101)].output);
+        assert_eq!(log.lock().unwrap().sinks.len(), 1);
+        rig.agent.execute_one(Output::StopCapture {
+            stream: StreamId(101),
+        });
+    }
+
+    #[test]
+    fn stop_timeout_blocks_replacement_and_retired_ids_survive_stop_and_recovery() {
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        let logical = StreamId(101);
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        while source.try_recv().is_ok() {}
+        let old = sink_for(&log, logical);
+        log.lock().unwrap().stop_failures = 1;
+        rig.agent.home.active = true;
+        rig.agent.twin_video_home();
+        assert!(rig.agent.retired_twin_video.contains_key(&logical));
+        assert_eq!(log.lock().unwrap().starts.len(), 1);
+        old.send(frame(geometry().size));
+        assert!(source.try_recv().is_err());
+        rig.agent.home.active = false; // Latest state wins even while stop is unresolved.
+        rig.agent.retired_twin_video.insert(logical, Instant::now());
+        rig.agent.twin_video_home();
+        assert_eq!(log.lock().unwrap().starts.len(), 2);
+        assert!(!rig.agent.twin_video[&logical].output);
+        assert!(rig.agent.retired_twin_video.is_empty());
+        let backend = rig.agent.twin_video[&logical].backend;
+        log.lock().unwrap().stop_failures = 4;
+        rig.agent
+            .execute_one(Output::StopCapture { stream: logical });
+        assert!(rig.agent.twin_video.is_empty());
+        assert!(rig.agent.retired_twin_video.contains_key(&backend));
+        rig.agent.retired_twin_video.insert(backend, Instant::now());
+        rig.agent.twin_video_retry(logical); // Recovery cleanup runs before looking up a removed route.
+        assert!(rig.agent.retired_twin_video.contains_key(&backend));
+        log.lock().unwrap().stop_failures = 0;
+        rig.agent.retired_twin_video.insert(backend, Instant::now());
+        rig.agent.twin_video_retry(logical);
+        assert!(rig.agent.retired_twin_video.is_empty());
+        assert!(log.lock().unwrap().sinks.is_empty());
+        assert!(
+            log.lock()
+                .unwrap()
+                .stop_attempts
+                .iter()
+                .filter(|&&id| id == backend)
+                .count()
+                >= 4
+        );
+        // A late timeout response may mean stop executed already: NotFound confirms absence.
+        rig.agent.retired_twin_video.insert(backend, Instant::now());
+        rig.agent.twin_video_cleanup(true);
+        assert!(rig.agent.retired_twin_video.is_empty());
+    }
+
+    #[test]
+    fn home_start_failure_retries_previous_route_once_then_ends_with_one_warning() {
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for failures in [1, 2] {
+                let (mut rig, log, source) = fixture();
+                let peer = rig.peer;
+                start(
+                    &mut rig.agent,
+                    peer,
+                    CaptureTarget::Display(DisplayId(2)),
+                    Some(rect(&geometry())),
+                );
+                while source.try_recv().is_ok() {}
+                log.lock().unwrap().fail_starts = failures;
+                rig.agent.home.active = true;
+                rig.agent.twin_video_home();
+                assert_eq!(log.lock().unwrap().starts.len(), 3);
+                assert_eq!(
+                    log.lock().unwrap().starts[2].0,
+                    CaptureTarget::Window(WindowId(10))
+                );
+                for _ in 0..10 {
+                    rig.agent.twin_video_home();
+                }
+                assert_eq!(
+                    log.lock().unwrap().starts.len(),
+                    3,
+                    "one previous-route retry only"
+                );
+                if failures == 1 {
+                    assert_eq!(rig.agent.twin_video[&StreamId(101)].backend, StreamId(103));
+                    sink_for(&log, StreamId(103)).send(FrameEvent::Frame {
+                        stream: StreamId(103),
+                        frame: colored_frame(4, 8),
+                    });
+                    let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+                        panic!("previous route missing");
+                    };
+                    assert_eq!(stream, StreamId(101));
+                    assert_eq!(frame.damage, None);
+                    assert_eq!(log.lock().unwrap().sinks.len(), 1);
+                } else {
+                    assert_eq!(
+                        rig.agent.twin_video[&StreamId(101)]
+                            .delivery
+                            .load(AtomicOrdering::Acquire),
+                        u64::MAX
+                    );
+                    assert_eq!(
+                        rig.agent
+                            .pending
+                            .iter()
+                            .filter(|input| matches!(
+                                input,
+                                Input::CaptureEnded {
+                                    stream: StreamId(101),
+                                    reason: StreamEndReason::Failed
+                                }
+                            ))
+                            .count(),
+                        1
+                    );
+                    assert!(log.lock().unwrap().sinks.is_empty());
+                }
+                rig.agent.execute_one(Output::StopCapture {
+                    stream: StreamId(101),
+                });
+                assert!(rig.agent.retired_twin_video.is_empty());
+            }
+        });
+        assert_eq!(
+            String::from_utf8(bytes.lock().unwrap().clone())
+                .unwrap()
+                .matches("Twin home video restart failed")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn requested_rollback_of_uncommitted_start_keeps_fallback_live_or_reports_one_failed_end() {
+        for failures in [1, 2] {
+            let (mut rig, log, source) = fixture();
+            let peer = rig.peer;
+            let logical = StreamId(101);
+            start(
+                &mut rig.agent,
+                peer,
+                CaptureTarget::Display(DisplayId(2)),
+                Some(rect(&geometry())),
+            );
+            while source.try_recv().is_ok() {}
+            {
+                let mut log = log.lock().unwrap();
+                log.fail_starts = failures;
+                log.rollback_requested = true;
+                log.emit_first = true; // Includes a cached frame before failed-reply cleanup.
+            }
+            rig.agent.home.active = true;
+            rig.agent.twin_video_home();
+            assert_eq!(log.lock().unwrap().starts.len(), 3);
+            assert!(
+                rig.events.try_recv().is_err(),
+                "uncommitted Requested is not a logical terminal event"
+            );
+            let failed = rig
+                .agent
+                .pending
+                .iter()
+                .filter(|input| {
+                    matches!(
+                        input,
+                        Input::CaptureEnded {
+                            stream: StreamId(101),
+                            reason: StreamEndReason::Failed
+                        }
+                    )
+                })
+                .count();
+            if failures == 1 {
+                assert_eq!(failed, 0);
+                assert_eq!(
+                    rig.agent.twin_video[&logical]
+                        .active
+                        .load(AtomicOrdering::Acquire),
+                    103
+                );
+                assert_eq!(
+                    rig.agent.twin_video[&logical]
+                        .delivery
+                        .load(AtomicOrdering::Acquire),
+                    video_size(geometry().size)
+                );
+                let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+                    panic!("fallback replay missing");
+                };
+                assert_eq!(stream, logical);
+                assert_eq!(frame.damage, None);
+                sink_for(&log, StreamId(103)).send(FrameEvent::Frame {
+                    stream: StreamId(103),
+                    frame: colored_frame(7, 11),
+                });
+                let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+                    panic!("fallback not live");
+                };
+                assert_eq!(stream, logical);
+                assert_eq!(frame.cpu_pixels().unwrap().0[0], 7);
+            } else {
+                assert_eq!(failed, 1);
+                assert_eq!(
+                    rig.agent.twin_video[&logical]
+                        .delivery
+                        .load(AtomicOrdering::Acquire),
+                    u64::MAX
+                );
+                assert!(source.try_recv().is_err());
+                assert!(log.lock().unwrap().sinks.is_empty());
+            }
+            assert!(!rig.agent.pending.iter().any(|input| matches!(
+                input,
+                Input::CaptureEnded {
+                    reason: StreamEndReason::Requested,
+                    ..
+                }
+            )));
+            rig.agent
+                .execute_one(Output::StopCapture { stream: logical });
+        }
+    }
+
+    #[test]
+    fn fast_failed_retired_stops_and_crop_retries_honor_deadlines_without_zero_timeout_spin() {
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        let logical = StreamId(101);
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        while source.try_recv().is_ok() {}
+        log.lock().unwrap().stop_failures = 1000; // Errors return immediately, no scheduling sleeps.
+        rig.agent.home.active = true;
+        rig.agent.twin_video_home();
+        assert_eq!(log.lock().unwrap().stop_attempts.len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        rig.agent.retired_twin_video.insert(logical, deadline);
+        rig.agent.execute_one(Output::SetCaptureCrop {
+            stream: logical,
+            crop: Some(rect(&geometry())),
+        });
+        assert!(rig.agent.twin_video[&logical].retry >= deadline);
+        for _ in 0..100 {
+            rig.agent.twin_video_retry(logical);
+            rig.agent.twin_video_home();
+            assert!(rig.agent.receive_timeout(platform::now(), Instant::now()) > Duration::ZERO);
+        }
+        assert_eq!(
+            log.lock().unwrap().stop_attempts.len(),
+            1,
+            "ordinary retries cannot force pending stop deadlines"
+        );
+        rig.agent.retired_twin_video.insert(logical, Instant::now());
+        rig.agent.twin_video_retry(logical);
+        assert_eq!(
+            log.lock().unwrap().stop_attempts.len(),
+            2,
+            "one due attempt advances both deadlines"
+        );
+        let next = rig.agent.retired_twin_video[&logical];
+        assert!(next > Instant::now());
+        assert!(rig.agent.twin_video[&logical].retry >= next);
+        log.lock().unwrap().stop_failures = 0;
+        rig.agent
+            .execute_one(Output::StopCapture { stream: logical }); // Explicit cleanup may force.
+        assert!(rig.agent.retired_twin_video.is_empty());
+    }
+
+    #[test]
+    fn terminal_callback_winning_before_startup_replay_cannot_reopen_or_enqueue() {
+        use crate::media::source_queue_tests::{RetainedImages, counted_frame};
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        let stream = StreamId(101);
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        while source.try_recv().is_ok() {}
+        let route = &rig.agent.twin_video[&stream];
+        let (observed, paused) = mpsc::sync_channel(1);
+        let (release, resumed) = mpsc::sync_channel(1);
+        let first = Arc::new(Mutex::new(TwinFirstFrame {
+            pending: true,
+            full: true,
+            size: video_size(geometry().size),
+            before_replay: Some((observed, resumed)),
+            ..Default::default()
+        }));
+        let startup = rig.agent.video_sink(
+            Some(route.delivery.clone()),
+            Some(first.clone()),
+            Some(TwinLink {
+                active: route.active.clone(),
+                fence: route.fence.clone(),
+                logical: Some(stream),
+            }),
+        );
+        let retained = Arc::new(RetainedImages::default());
+        startup.send(FrameEvent::Frame {
+            stream,
+            frame: counted_frame(&retained, 1, geometry().size, None),
+        });
+        assert_eq!(retained.live(), 1);
+        let replay = first.clone();
+        let join = std::thread::spawn(move || {
+            rig.agent.twin_video_replay(stream, stream, &replay);
+            rig
+        });
+        paused.recv_timeout(Duration::from_secs(4)).unwrap();
+        sink_for(&log, stream).send(FrameEvent::Ended {
+            stream,
+            reason: StreamEndReason::Failed,
+        });
+        release.send(()).unwrap();
+        let mut rig = join.join().unwrap();
+        assert_eq!(
+            rig.agent.twin_video[&stream]
+                .delivery
+                .load(AtomicOrdering::Acquire),
+            u64::MAX
+        );
+        assert!(source.try_recv().is_err());
+        assert_eq!(retained.live(), 0);
+        assert!(matches!(
+            rig.events.try_recv().unwrap(),
+            Event::Input(Input::CaptureEnded {
+                stream: StreamId(101),
+                reason: StreamEndReason::Failed
+            })
+        ));
+        startup.send(frame(geometry().size));
+        assert!(source.try_recv().is_err());
+        rig.agent.execute_one(Output::StopCapture { stream });
+    }
+
+    #[test]
+    fn twin_start_and_every_crop_update_use_window_coordinates_and_keep_wire_display() {
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        let initial = geometry();
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(initial.display),
+            Some(rect(&initial)),
+        );
+        assert_eq!(
+            log.lock().unwrap().starts,
+            vec![(
+                CaptureTarget::Window(initial.window),
+                Some(PixelRect::new(point2(0, 0), point2(300, 200)))
+            )]
+        );
+        assert_eq!(
+            rig.agent.capture_display.get(&ProjectionId(1)),
+            Some(&initial.display)
+        );
+        while source.try_recv().is_ok() {}
+        let sink = log.lock().unwrap().sink.clone().unwrap();
+        sink.send(frame(PixelSize::new(1, 1)));
+        assert!(source.try_recv().is_err());
+        sink.send(frame(initial.size));
+        assert!(matches!(
+            source.try_recv().unwrap(),
+            SourceCmd::Frame { .. }
+        ));
+        for origin in [(-20, 40), (60, 30), (-20, -30)] {
+            let mut next = initial.clone();
+            next.origin = origin;
+            next.size = PixelSize::new(360, 240);
+            next.content = rect(&next);
+            rig.agent
+                .twin_geometry
+                .as_mut()
+                .unwrap()
+                .insert(next.window, next.clone());
+            let r = rect(&next);
+            rig.agent.execute_one(Output::SetCaptureCrop {
+                stream: StreamId(101),
+                crop: Some(r),
+            });
+            assert_eq!(
+                *log.lock().unwrap().crops.last().unwrap(),
+                Some(next.map_crop(r).unwrap())
+            );
+            assert_eq!(
+                rig.agent.twin_video[&StreamId(101)]
+                    .delivery
+                    .load(AtomicOrdering::Acquire),
+                video_size(r.size().cast())
+            );
+            assert!(rig.agent.twin_video[&StreamId(101)].timer.is_none());
+        }
+        rig.agent.execute_one(Output::StopCapture {
+            stream: StreamId(101),
+        });
+        assert!(rig.agent.twin_video.is_empty());
+        assert_eq!(log.lock().unwrap().stops, 1);
+    }
+
+    #[test]
+    fn mirror_physical_and_uncropped_display_requests_keep_their_original_target() {
+        let (mut rig, log, _) = fixture();
+        let peer = rig.peer;
+        let crop = Some(rect(&geometry()));
+        for (target, crop) in [
+            (CaptureTarget::Window(WindowId(55)), None),
+            (CaptureTarget::Display(DisplayId(1)), crop),
+            (CaptureTarget::Display(DisplayId(2)), None),
+        ] {
+            start(&mut rig.agent, peer, target, crop);
+            assert_eq!(
+                log.lock().unwrap().starts.last().copied(),
+                Some((target, crop))
+            );
+            assert!(rig.agent.twin_video.is_empty());
+        }
+    }
+
+    #[test]
+    fn twin_window_start_failure_and_unknown_snapshot_never_fall_back_to_output() {
+        let (mut rig, log, _) = fixture();
+        let peer = rig.peer;
+        rig.agent.platform.frames = Some(Box::new(Frames {
+            recorded: log.clone(),
+            fail_start: true,
+            blocked: None,
+        }));
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        assert_eq!(log.lock().unwrap().starts.len(), 1);
+        assert_eq!(
+            log.lock().unwrap().starts[0].0,
+            CaptureTarget::Window(WindowId(10))
+        );
+        assert!(matches!(
+            rig.agent.pending.back(),
+            Some(Input::CaptureStarted { result: Err(_), .. })
+        ));
+        rig.agent.twin_geometry.as_mut().unwrap().clear();
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        assert_eq!(log.lock().unwrap().starts.len(), 1);
+        assert!(rig.agent.twin_video.is_empty());
+    }
+
+    #[test]
+    fn midstream_window_protocol_failure_notifies_engine_without_output_restart() {
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        while source.try_recv().is_ok() {}
+        let sink = log.lock().unwrap().sink.clone().unwrap();
+        sink.send(FrameEvent::Ended {
+            stream: StreamId(101),
+            reason: StreamEndReason::Failed,
+        });
+        assert!(matches!(
+            rig.events.try_recv().unwrap(),
+            Event::Input(Input::CaptureEnded {
+                stream: StreamId(101),
+                reason: StreamEndReason::Failed,
+            })
+        ));
+        sink.send(frame(geometry().size));
+        assert!(source.try_recv().is_err());
+        assert_eq!(log.lock().unwrap().starts.len(), 1);
+        assert_eq!(
+            log.lock().unwrap().starts[0].0,
+            CaptureTarget::Window(WindowId(10))
+        );
+        rig.agent.execute_one(Output::StopCapture {
+            stream: StreamId(101),
+        });
+        assert_eq!(log.lock().unwrap().stops, 1);
+    }
+
+    #[test]
+    fn unknown_or_arbitrary_crop_holds_video_and_recovery_cancels_and_joins_timer() {
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        while source.try_recv().is_ok() {}
+        rig.agent.twin_geometry.as_mut().unwrap().clear();
+        rig.agent.execute_one(Output::SetCaptureCrop {
+            stream: StreamId(101),
+            crop: Some(rect(&geometry())),
+        });
+        let sink = log.lock().unwrap().sink.clone().unwrap();
+        sink.send(frame(geometry().size));
+        assert!(source.try_recv().is_err());
+        assert!(log.lock().unwrap().crops.is_empty());
+        rig.agent
+            .twin_geometry
+            .as_mut()
+            .unwrap()
+            .insert(WindowId(10), geometry());
+        rig.agent.twin_video_retry(StreamId(101));
+        assert!(rig.agent.twin_video[&StreamId(101)].waiting.is_none());
+        assert!(rig.agent.twin_video[&StreamId(101)].timer.is_none());
+        sink.send(frame(geometry().size));
+        assert!(matches!(
+            source.try_recv().unwrap(),
+            SourceCmd::Frame { .. }
+        ));
+        rig.agent.execute_one(Output::SetCaptureCrop {
+            stream: StreamId(101),
+            crop: Some(PixelRect::new(point2(0, 0), point2(10, 10))),
+        });
+        assert_eq!(log.lock().unwrap().crops.len(), 1);
+        sink.send(frame(PixelSize::new(10, 10)));
+        assert!(source.try_recv().is_err());
+        rig.agent.execute_one(Output::StopCapture {
+            stream: StreamId(101),
+        });
+        assert!(rig.agent.twin_video.is_empty());
+    }
+
+    #[test]
+    fn hold_closes_delivery_within_two_seconds_while_synchronous_crop_is_blocked() {
+        assert_eq!(TWIN_INCOHERENT, Duration::from_millis(1800));
+        let (mut rig, log, source) = fixture();
+        let peer = rig.peer;
+        start(
+            &mut rig.agent,
+            peer,
+            CaptureTarget::Display(DisplayId(2)),
+            Some(rect(&geometry())),
+        );
+        while source.try_recv().is_ok() {}
+        let sink = log.lock().unwrap().sink.clone().unwrap();
+        let (observed, entered) = mpsc::sync_channel(1);
+        let (release, blocked) = mpsc::sync_channel(1);
+        rig.agent.platform.frames = Some(Box::new(Frames {
+            recorded: log.clone(),
+            fail_start: false,
+            blocked: Some((observed, blocked)),
+        }));
+        let events = rig.events;
+        let at = Instant::now();
+        let worker = std::thread::spawn(move || {
+            rig.agent.execute_one(Output::SetCaptureCrop {
+                stream: StreamId(101),
+                crop: Some(rect(&geometry())),
+            });
+            rig.agent
+        });
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Input(Input::CaptureEnded {
+                stream: StreamId(101),
+                reason: StreamEndReason::Failed
+            })
+        ));
+        let elapsed = at.elapsed();
+        eprintln!("Twin hold closure observed at {elapsed:?}; configured {TWIN_INCOHERENT:?}");
+        assert!(elapsed < Duration::from_secs(2));
+        sink.send(frame(geometry().size));
+        assert!(source.try_recv().is_err());
+        release.send(()).unwrap();
+        let mut agent = worker.join().unwrap();
+        assert_eq!(
+            agent.twin_video[&StreamId(101)]
+                .delivery
+                .load(AtomicOrdering::Acquire),
+            u64::MAX
+        );
+        agent.execute_one(Output::StopCapture {
+            stream: StreamId(101),
+        });
+        assert!(agent.twin_video.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5809,7 +7606,7 @@ mod audio_tests {
             startup_recovery: crate::platform::StartupRecovery::None,
         };
         let e2 = E2Wiring {
-            source_media: source_tx,
+            source_media: source_tx.into(),
             dest_media: dest_tx,
             host: None,
             proxy_ids: ProxyIds::default(),

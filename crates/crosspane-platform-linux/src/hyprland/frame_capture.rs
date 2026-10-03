@@ -28,11 +28,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{
-    CaptureTarget, CursorImage, EventSink, Frame, FrameCapture, FrameEvent, IoGate, PlatformError,
-    StreamEndReason, StreamId,
+    CaptureTarget, CursorImage, EventSink, Frame, FrameCapture, FrameEvent, FrameImage, IoGate,
+    PlatformError, StreamEndReason, StreamId,
 };
 use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
-use crosspane_types::id::WindowId;
+use crosspane_types::id::{DisplayId, WindowId};
 use crosspane_types::time::MonoTime;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use wayland_client::protocol::{
@@ -75,6 +75,108 @@ use super::ipc::HyprIpc;
 const CALL_TIMEOUT: Duration = Duration::from_millis(1800);
 const GATE_POLL: Duration = Duration::from_millis(10);
 const CURSOR_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_u64.div_ceil(30));
+/// Unknown/stale Twin geometry never supplies video; stop if it cannot converge in this bound.
+// Leave 200 ms for runtime scheduling and event delivery within the two-second hold budget.
+pub const TWIN_INCOHERENT: Duration = Duration::from_millis(1800);
+
+/// A bounded IPC snapshot of the *unclipped* window in its own Twin output. IPC reports layout
+/// goals; frame constraints must agree before those goals can be used for video.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TwinGeometry {
+    pub window: WindowId,
+    pub display: DisplayId,
+    pub origin: (i32, i32),
+    pub size: PixelSize,
+    pub extent: PixelSize,
+    pub content: PixelRect,
+}
+
+impl TwinGeometry {
+    pub fn from_env(window: WindowId, display: DisplayId) -> Result<Self, PlatformError> {
+        let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").map_err(backend)?;
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or(PlatformError::NotFound)?;
+        let ipc = HyprIpc::new(
+            &signature,
+            std::path::Path::new(&runtime),
+            Duration::from_millis(50),
+        );
+        let geometry = Self::read(&ipc, window)?;
+        if geometry.display != display {
+            return Err(PlatformError::NotFound);
+        }
+        Ok(geometry)
+    }
+
+    fn read(ipc: &HyprIpc, window: WindowId) -> Result<Self, PlatformError> {
+        let client =
+            super::parking::client_snapshot(ipc, window)?.ok_or(PlatformError::NotFound)?;
+        let name = format!("{}{:x}", super::parking::OUTPUT_PREFIX, window.0);
+        let monitor =
+            super::parking::monitor_snapshot(ipc, &name)?.ok_or(PlatformError::NotFound)?;
+        if client["mapped"].as_bool() != Some(true)
+            || client["monitor"] != monitor["id"]
+            || client
+                .pointer("/workspace/name")
+                .and_then(serde_json::Value::as_str)
+                != Some(format!("{}{:x}", super::parking::WORKSPACE_PREFIX, window.0).as_str())
+        {
+            return Err(backend("unverified Twin binding"));
+        }
+        // Reuse parking's conversion, but reject unknown/overflowing values instead of its
+        // layout defaults. Bound inputs so subtraction, scaling and rectangle addition are safe.
+        let fields = [
+            &client["at"][0],
+            &client["at"][1],
+            &client["size"][0],
+            &client["size"][1],
+            &monitor["x"],
+            &monitor["y"],
+            &monitor["scale"],
+        ];
+        if fields.iter().any(|v| {
+            !v.as_f64()
+                .is_some_and(|n| n.is_finite() && n.abs() < f64::from(i32::MAX) / 32.0)
+        }) || !monitor["scale"]
+            .as_f64()
+            .is_some_and(|s| (0.25..=8.0).contains(&s))
+        {
+            return Err(backend("unknown Twin geometry"));
+        }
+        let parked = super::parking::parked_from(window, &client, &monitor)?;
+        let extent = super::parking::output_extent(&monitor)?;
+        let actual = super::parking::window_rect(
+            &client,
+            &monitor,
+            monitor["scale"].as_f64().ok_or(PlatformError::NotFound)?,
+        );
+        Ok(Self {
+            window,
+            display: parked.display,
+            origin: (actual.min.x, actual.min.y),
+            size: actual
+                .size()
+                .try_cast()
+                .ok_or_else(|| backend("invalid Twin size"))?,
+            extent: extent.size().cast(),
+            content: parked
+                .content
+                .intersection(&extent)
+                .ok_or(PlatformError::NotFound)?,
+        })
+    }
+
+    /// Only the exact clipped Parked.content may be routed. R stays in the engine; Q is local
+    /// to the Window buffer, including negative-origin clipping and output padding/bars.
+    pub fn map_crop(&self, r: PixelRect) -> Result<PixelRect, PlatformError> {
+        if self.content != r {
+            return Err(backend("incoherent Twin content crop"));
+        }
+        Ok(r.translate(crosspane_types::geom::euclid::vec2(
+            -self.origin.0,
+            -self.origin.1,
+        )))
+    }
+}
 
 /// Bounded command handle for all output and window capture streams on one Wayland connection.
 #[derive(Debug)]
@@ -90,12 +192,14 @@ pub struct HyprlandFrameCapture {
     next_id: u64,
     gate: Arc<IoGate>,
     cursors: Arc<AtomicBool>,
+    twins: HashMap<StreamId, WindowId>,
 }
 
 struct Lookup {
     target: CaptureTarget,
+    strict_twin: bool,
     deadline: Instant,
-    reply: mpsc::Sender<Result<ResolvedTarget, PlatformError>>,
+    reply: mpsc::SyncSender<Result<ResolvedTarget, PlatformError>>,
 }
 
 enum ResolvedTarget {
@@ -104,7 +208,47 @@ enum ResolvedTarget {
         id: WindowId,
         app_id: String,
         title: String,
+        twin: Option<TwinGeometry>,
     },
+}
+
+fn resolve_window(
+    ipc: &HyprIpc,
+    id: WindowId,
+    strict_twin: bool,
+) -> Result<ResolvedTarget, PlatformError> {
+    let clients = ipc.json("clients")?;
+    let client = clients
+        .as_array()
+        .and_then(|clients| {
+            clients.iter().find(|client| {
+                client["stableId"].as_str().and_then(parse_identifier) == Some(id.0)
+                    && client["mapped"].as_bool() == Some(true)
+            })
+        })
+        .ok_or(PlatformError::NotFound)?;
+    let title = client["title"]
+        .as_str()
+        .ok_or_else(|| backend("missing client title"))?;
+    let class = client["class"]
+        .as_str()
+        .ok_or_else(|| backend("missing client class"))?;
+    Ok(ResolvedTarget::Window {
+        id,
+        title: title.into(),
+        app_id: if class.is_empty() {
+            client["initialClass"].as_str().unwrap_or(class)
+        } else {
+            class
+        }
+        .into(),
+        // Ordinary Window(None) needs no Twin output or workspace, even during restoration.
+        twin: if strict_twin {
+            Some(TwinGeometry::read(ipc, id)?)
+        } else {
+            None
+        },
+    })
 }
 
 enum Request {
@@ -115,7 +259,7 @@ enum Request {
         max_fps: u32,
         sink: Arc<dyn EventSink<FrameEvent>>,
     },
-    Crop(StreamId, Option<PixelRect>),
+    Crop(StreamId, Option<PixelRect>, Option<TwinGeometry>),
     Stop(StreamId),
 }
 
@@ -137,6 +281,8 @@ impl HyprlandFrameCapture {
         #[cfg(feature = "gpu")]
         let worker_main_device = main_device.clone();
         let (commands, receiver) = mpsc::channel();
+        let (lookups, work) = mpsc::channel::<Lookup>();
+        let worker_lookups = lookups.clone();
         let (ready, result) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
@@ -149,6 +295,7 @@ impl HyprlandFrameCapture {
                 let mut worker = match Worker::new(
                     worker_gate,
                     worker_cursors,
+                    worker_lookups,
                     &worker_shutdown,
                     #[cfg(feature = "gpu")]
                     worker_gpu,
@@ -195,7 +342,6 @@ impl HyprlandFrameCapture {
 
         // IPC may have an arbitrarily long configured timeout. Keep it off the capture thread
         // and bound the caller's wait independently, so it cannot delay gate enforcement.
-        let (lookups, work) = mpsc::channel::<Lookup>();
         if let Err(error) = std::thread::Builder::new()
             .name("hypr-frame-ids".into())
             .spawn(move || {
@@ -213,34 +359,9 @@ impl HyprlandFrameCapture {
                                         .ok_or(PlatformError::NotFound)
                                 })
                             }
-                            CaptureTarget::Window(id) => ipc.json("clients").and_then(|clients| {
-                                let client = clients
-                                    .as_array()
-                                    .and_then(|clients| {
-                                        clients.iter().find(|client| {
-                                            client["stableId"].as_str().and_then(parse_identifier)
-                                                == Some(id.0)
-                                                && client["mapped"].as_bool() == Some(true)
-                                        })
-                                    })
-                                    .ok_or(PlatformError::NotFound)?;
-                                let title = client["title"]
-                                    .as_str()
-                                    .ok_or_else(|| backend("missing client title"))?;
-                                let class = client["class"]
-                                    .as_str()
-                                    .ok_or_else(|| backend("missing client class"))?;
-                                let app_id = if class.is_empty() {
-                                    client["initialClass"].as_str().unwrap_or(class)
-                                } else {
-                                    class
-                                };
-                                Ok(ResolvedTarget::Window {
-                                    id,
-                                    app_id: app_id.into(),
-                                    title: title.into(),
-                                })
-                            }),
+                            CaptureTarget::Window(id) => {
+                                resolve_window(&ipc, id, lookup.strict_twin)
+                            }
                             _ => Err(PlatformError::Unsupported("capture target")),
                         }
                     };
@@ -264,6 +385,7 @@ impl HyprlandFrameCapture {
             next_id: 1,
             gate,
             cursors,
+            twins: HashMap::new(),
         })
     }
 
@@ -321,15 +443,22 @@ impl FrameCapture for HyprlandFrameCapture {
             return Err(backend("max_fps must be positive"));
         }
         let deadline = Instant::now() + CALL_TIMEOUT;
-        let (reply, result) = mpsc::channel();
+        let (reply, result) = mpsc::sync_channel(1);
         self.lookups
             .send(Lookup {
                 target,
+                strict_twin: matches!(target, CaptureTarget::Window(_)) && crop.is_some(),
                 deadline,
                 reply,
             })
             .map_err(|_| backend("monitor lookup unavailable"))?;
         let target = receive(&result, deadline)??;
+        let twin = match &target {
+            ResolvedTarget::Window {
+                twin: Some(twin), ..
+            } if crop.is_some() => Some(twin.window),
+            _ => None,
+        };
         let id = StreamId(self.next_id);
         self.next_id = self
             .next_id
@@ -345,14 +474,38 @@ impl FrameCapture for HyprlandFrameCapture {
             },
             deadline,
         )?;
+        if let Some(window) = twin {
+            self.twins.insert(id, window);
+        }
         Ok(id)
     }
 
     fn set_crop(&mut self, stream: StreamId, crop: Option<PixelRect>) -> Result<(), PlatformError> {
-        self.call(Request::Crop(stream, crop), Instant::now() + CALL_TIMEOUT)
+        let deadline = Instant::now() + CALL_TIMEOUT;
+        let twin = if let Some(&window) = self.twins.get(&stream) {
+            let (reply, result) = mpsc::sync_channel(1);
+            self.lookups
+                .send(Lookup {
+                    target: CaptureTarget::Window(window),
+                    strict_twin: true,
+                    deadline,
+                    reply,
+                })
+                .map_err(backend)?;
+            match receive(&result, deadline)?? {
+                ResolvedTarget::Window {
+                    twin: Some(twin), ..
+                } => Some(twin),
+                _ => return Err(PlatformError::NotFound),
+            }
+        } else {
+            None
+        };
+        self.call(Request::Crop(stream, crop, twin), deadline)
     }
 
     fn stop(&mut self, stream: StreamId) -> Result<(), PlatformError> {
+        self.twins.remove(&stream);
         self.call(Request::Stop(stream), Instant::now() + CALL_TIMEOUT)
     }
 }
@@ -925,6 +1078,8 @@ fn cursor_image(
 
 struct Stream {
     #[cfg(feature = "gpu")]
+    padding: PaddingPool,
+    #[cfg(feature = "gpu")]
     gpu: Option<Gpu>,
     #[cfg(feature = "gpu")]
     ring: Option<Ring>,
@@ -933,6 +1088,8 @@ struct Stream {
     #[cfg(feature = "gpu")]
     gpu_ready: bool,
     output: Option<u32>,
+    twin: Option<TwinCheck>,
+    cursor_source: Option<ExtImageCaptureSourceV1>,
     toplevel: Option<ExtForeignToplevelHandleV1>,
     source: ExtImageCaptureSourceV1,
     session: ExtImageCopyCaptureSessionV1,
@@ -969,8 +1126,278 @@ impl Stream {
         }
         self.session.destroy();
         self.source.destroy();
+        if let Some(source) = self.cursor_source.take() {
+            source.destroy();
+        }
         self.buffer.take();
     }
+}
+
+struct TwinCheck {
+    geometry: TwinGeometry,
+    checking: Option<mpsc::Receiver<Result<ResolvedTarget, PlatformError>>>,
+    bad_since: Option<Instant>,
+    padding_reported: bool,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+struct PaddingPool {
+    // Never discard a busy slot on resize: retained frames still count against this bound.
+    slots: Vec<(wgpu::Texture, Arc<AtomicBool>)>,
+}
+
+#[cfg(feature = "gpu")]
+impl PaddingPool {
+    fn acquire(
+        &mut self,
+        device: &wgpu::Device,
+        size: PixelSize,
+    ) -> Option<(wgpu::Texture, Arc<AtomicBool>)> {
+        // Image::drop marks its lease free only after consumption and submitted GPU reads.
+        let index = self
+            .slots
+            .iter()
+            .position(|(_, free)| free.load(Ordering::Acquire));
+        let index = match index {
+            Some(index) => index,
+            None if self.slots.len() < 4 => {
+                self.slots.push((
+                    padding_texture(device, size),
+                    Arc::new(AtomicBool::new(true)),
+                ));
+                self.slots.len() - 1
+            }
+            None => return None,
+        };
+        let (texture, free) = &mut self.slots[index];
+        if texture.width() != size.width || texture.height() != size.height {
+            *texture = padding_texture(device, size);
+        }
+        free.store(false, Ordering::Release);
+        Some((texture.clone(), free.clone()))
+    }
+}
+
+impl TwinCheck {
+    fn ready(
+        &mut self,
+        lookups: &mpsc::Sender<Lookup>,
+        size: PixelSize,
+        crop: Option<PixelRect>,
+        now: Instant,
+    ) -> Result<bool, PlatformError> {
+        let since = *self.bad_since.get_or_insert(now);
+        if now.duration_since(since) >= TWIN_INCOHERENT {
+            return Err(backend("Twin geometry stayed incoherent for 1800 ms"));
+        }
+        if let Some(checking) = &self.checking {
+            match checking.try_recv() {
+                Ok(Ok(ResolvedTarget::Window {
+                    twin: Some(current),
+                    ..
+                })) => {
+                    self.checking = None;
+                    if current == self.geometry && twin_roi(&current, size, crop).is_some() {
+                        self.bad_since = None;
+                        return Ok(true);
+                    }
+                }
+                Ok(Err(PlatformError::NotFound)) => {
+                    return Err(PlatformError::NotFound);
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(false),
+                _ => self.checking = None,
+            }
+        }
+        let (reply, result) = mpsc::sync_channel(1);
+        lookups
+            .send(Lookup {
+                target: CaptureTarget::Window(self.geometry.window),
+                strict_twin: true,
+                deadline: now + CALL_TIMEOUT,
+                reply,
+            })
+            .map_err(backend)?;
+        self.checking = Some(result);
+        Ok(false)
+    }
+}
+
+/// Keep the existing R rectangle, including parking's integer-scale approximation. Q may
+/// extend on any side of the Window buffer. Buffer constraints must first agree with the
+/// actual-scale IPC dimensions within one rounding pixel; padding cannot mask a stale resize.
+fn twin_roi(
+    geometry: &TwinGeometry,
+    size: PixelSize,
+    crop: Option<PixelRect>,
+) -> Option<(PixelRect, PixelRect)> {
+    let expected = geometry.map_crop(geometry.content).ok()?;
+    let wanted = crop?;
+    if wanted != expected
+        || size.width.abs_diff(geometry.size.width) > 1
+        || size.height.abs_diff(geometry.size.height) > 1
+    {
+        return None;
+    }
+    let actual = wanted.intersection(&PixelRect::from_size(size.cast()))?;
+    Some((wanted, actual))
+}
+
+/// Apply one geometric padding rule to SHM and native video: Q intersect Window supplies pixels,
+/// placed at intersection.min-Q.min; every other R pixel is opaque black, on all four sides.
+/// Native padding stays on the same GPU;
+/// the source ROI is Q, and its ring slot is released only after the copy submission completes.
+fn pad_twin_image(
+    size: PixelSize,
+    image: FrameImage,
+    wanted: PixelRect,
+    actual: PixelRect,
+    #[cfg(feature = "gpu")] pool: &mut PaddingPool,
+) -> Result<Option<(PixelSize, FrameImage)>, PlatformError> {
+    let offset = (actual.min.x - wanted.min.x, actual.min.y - wanted.min.y);
+    let wanted: PixelSize = wanted
+        .size()
+        .try_cast()
+        .ok_or_else(|| backend("invalid Twin padding size"))?;
+    if size == wanted && offset == (0, 0) {
+        return Ok(Some((size, image)));
+    }
+    if offset.0 < 0
+        || offset.1 < 0
+        || offset.0 as u64 + u64::from(size.width) > u64::from(wanted.width)
+        || offset.1 as u64 + u64::from(size.height) > u64::from(wanted.height)
+    {
+        return Err(backend("invalid Twin padding intersection"));
+    }
+    let image = match image {
+        FrameImage::Cpu { stride, pixels } => {
+            let length = (wanted.width as usize)
+                .checked_mul(wanted.height as usize)
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| backend("Twin padding overflow"))?;
+            let mut padded = Vec::new();
+            padded.try_reserve_exact(length).map_err(backend)?;
+            padded.resize(length, 0);
+            for alpha in padded.iter_mut().skip(3).step_by(4) {
+                *alpha = 255;
+            }
+            for y in 0..size.height as usize {
+                let from = y * stride as usize;
+                let to = ((y + offset.1 as usize) * wanted.width as usize + offset.0 as usize) * 4;
+                padded[to..to + size.width as usize * 4]
+                    .copy_from_slice(&pixels[from..from + size.width as usize * 4]);
+            }
+            FrameImage::Cpu {
+                stride: wanted.width * 4,
+                pixels: padded.into(),
+            }
+        }
+        #[cfg(feature = "gpu")]
+        FrameImage::Native(native) => {
+            let source = native
+                .as_any()
+                .downcast_ref::<Image>()
+                .ok_or_else(|| backend("unknown Twin native image"))?;
+            let _ = source.gpu.device.poll(wgpu::PollType::Poll);
+            let Some((texture, free)) = pool.acquire(&source.gpu.device, wanted) else {
+                return Ok(None); // Skip; retained native frames already occupy all four leases.
+            };
+            pad_twin_texture(
+                &source.gpu.device,
+                &source.gpu.queue,
+                &source.texture,
+                source.origin,
+                size,
+                offset,
+                &texture,
+            );
+            FrameImage::Native(Arc::new(Image {
+                texture,
+                gpu: source.gpu.clone(),
+                size: wanted,
+                origin: (0, 0),
+                free,
+                modifier: 0,
+            }))
+        }
+        #[cfg(not(feature = "gpu"))]
+        FrameImage::Native(_) => {
+            return Err(backend("native Twin padding unavailable"));
+        }
+    };
+    Ok(Some((wanted, image)))
+}
+
+#[cfg(feature = "gpu")]
+fn padding_texture(device: &wgpu::Device, wanted: PixelSize) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Twin geometric padding"),
+        size: wgpu::Extent3d {
+            width: wanted.width,
+            height: wanted.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    })
+}
+
+#[cfg(feature = "gpu")]
+fn pad_twin_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Texture,
+    origin: (u32, u32),
+    size: PixelSize,
+    offset: (i32, i32),
+    texture: &wgpu::Texture,
+) {
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let view = texture.create_view(&Default::default());
+    drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    }));
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            origin: wgpu::Origin3d {
+                x: origin.0,
+                y: origin.1,
+                z: 0,
+            },
+            ..source.as_image_copy()
+        },
+        wgpu::TexelCopyTextureInfo {
+            origin: wgpu::Origin3d {
+                x: offset.0 as u32,
+                y: offset.1 as u32,
+                z: 0,
+            },
+            ..texture.as_image_copy()
+        },
+        wgpu::Extent3d {
+            width: size.width,
+            height: size.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
 }
 
 struct Output {
@@ -1077,6 +1504,9 @@ impl State {
 
     fn end(&mut self, id: StreamId, reason: StreamEndReason) {
         if let Some(mut stream) = self.streams.remove(&id) {
+            if stream.twin.is_some() && reason != StreamEndReason::Requested {
+                tracing::debug!(stream = id.0, ?reason, "Twin Window capture ended");
+            }
             let reason = if self.gate.is_open() {
                 reason
             } else {
@@ -1119,6 +1549,9 @@ impl State {
             return;
         }
         if let Some(mut stream) = self.streams.remove(&id) {
+            if stream.twin.is_some() {
+                tracing::debug!(stream = id.0, %error, "Twin Window capture failed");
+            }
             if let Some(pending) = stream.pending.take() {
                 let _ = pending.reply.send(Err(error));
             } else {
@@ -1172,12 +1605,14 @@ struct Worker {
     queue: EventQueue<State>,
     qh: QueueHandle<State>,
     state: State,
+    lookups: mpsc::Sender<Lookup>,
 }
 
 impl Worker {
     fn new(
         gate: Arc<IoGate>,
         cursors: Arc<AtomicBool>,
+        lookups: mpsc::Sender<Lookup>,
         shutdown: &AtomicBool,
         #[cfg(feature = "gpu")] gpu: Arc<Mutex<Option<Gpu>>>,
         #[cfg(feature = "gpu")] main_device: Arc<Mutex<Option<u64>>>,
@@ -1190,6 +1625,7 @@ impl Worker {
             connection,
             queue,
             qh,
+            lookups,
             state: State {
                 #[cfg(feature = "gpu")]
                 gpu,
@@ -1258,7 +1694,11 @@ impl Worker {
             for id in ids {
                 self.state.check_gate();
                 if let Err(error) = self.advance(id) {
-                    self.state.start_failed(id, error);
+                    if matches!(error, PlatformError::NotFound) {
+                        self.state.end(id, StreamEndReason::TargetGone);
+                    } else {
+                        self.state.start_failed(id, error);
+                    }
                 }
                 self.state.check_gate();
                 if let Err(error) = self.advance_cursor(id) {
@@ -1311,20 +1751,41 @@ impl Worker {
                     }
                     result
                 }
-                Request::Crop(id, crop) => self
+                Request::Crop(id, crop, twin) => self
                     .state
                     .streams
                     .get_mut(&id)
                     .ok_or(PlatformError::NotFound)
                     .and_then(|stream| {
+                        if stream.toplevel.is_some() && stream.twin.is_none() && crop.is_some() {
+                            return Err(backend(
+                                "cropped Window capture requires a verified Twin binding",
+                            ));
+                        }
                         // Validated against the buffer at use (clamped): the output may be
                         // resizing right now, so the current constraints can be stale.
                         if crop.is_some_and(|c| {
-                            c.max.x <= c.min.x || c.max.y <= c.min.y || c.min.x < 0 || c.min.y < 0
+                            c.max.x <= c.min.x
+                                || c.max.y <= c.min.y
+                                || (stream.twin.is_none() && (c.min.x < 0 || c.min.y < 0))
                         }) {
                             return Err(backend("crop must be nonempty and non-negative"));
                         }
                         stream.held = None;
+                        if let Some(check) = &mut stream.twin {
+                            check.geometry = twin.ok_or(PlatformError::NotFound)?;
+                            check.checking = None;
+                            if stream
+                                .constraints
+                                .as_ref()
+                                .and_then(|c| c.size)
+                                .is_some_and(|size| twin_roi(&check.geometry, size, crop).is_some())
+                            {
+                                check.bad_since = None;
+                            } else {
+                                check.bad_since.get_or_insert(Instant::now());
+                            }
+                        }
                         stream.crop = crop;
                         stream.full_damage = true;
                         Ok(())
@@ -1353,7 +1814,32 @@ impl Worker {
         if !self.state.gate.is_open() {
             return Err(PlatformError::Locked);
         }
-        let (output, toplevel, source) = match target {
+        // Cropped Window requests are the explicit Twin route. A binding disappearing between
+        // the agent's snapshot and this lookup must fail, never become an ordinary Window crop.
+        let twin = match target {
+            ResolvedTarget::Window { id, twin, .. } if crop.is_some() => Some(
+                twin.as_ref()
+                    .filter(|t| t.window == *id)
+                    .ok_or_else(|| {
+                        backend("cropped Window capture requires a verified Twin binding")
+                    })?
+                    .clone(),
+            ),
+            _ => None,
+        };
+        let bound_output = twin
+            .as_ref()
+            .map(|twin| {
+                let name = format!("CROSSPANE-{:x}", twin.window.0);
+                self.state
+                    .outputs
+                    .iter()
+                    .find(|(_, o)| o.name == name)
+                    .map(|(&id, native)| (id, native.proxy.clone()))
+                    .ok_or(PlatformError::NotFound)
+            })
+            .transpose()?;
+        let (mut output, toplevel, source) = match target {
             ResolvedTarget::Output(name) => {
                 let (&output, native) = self
                     .state
@@ -1369,7 +1855,9 @@ impl Worker {
                     .create_source(&native.proxy, &self.qh, ());
                 (Some(output), None, source)
             }
-            ResolvedTarget::Window { id, app_id, title } => {
+            ResolvedTarget::Window {
+                id, app_id, title, ..
+            } => {
                 let manager =
                     self.state
                         .window_sources
@@ -1385,6 +1873,9 @@ impl Worker {
                 });
                 let native = if let Some(native) = direct {
                     native
+                } else if twin.is_some() {
+                    // Twin identity is exact; a title/app match cannot prove this parked Window.
+                    return Err(PlatformError::NotFound);
                 } else {
                     let mut matches = self.state.toplevels.iter().filter(|toplevel| {
                         toplevel
@@ -1402,6 +1893,18 @@ impl Worker {
                 (None, Some(native.proxy.clone()), source)
             }
         };
+        let cursor_source = if let Some((id, native)) = bound_output {
+            output = Some(id);
+            Some(
+                self.state
+                    .sources
+                    .as_ref()
+                    .ok_or(PlatformError::Unsupported("output cursor source required"))?
+                    .create_source(&native, &self.qh, ()),
+            )
+        } else {
+            None
+        };
         let manager = self
             .state
             .manager
@@ -1412,6 +1915,8 @@ impl Worker {
             id,
             Stream {
                 #[cfg(feature = "gpu")]
+                padding: PaddingPool::default(),
+                #[cfg(feature = "gpu")]
                 gpu: self.state.gpu.lock().map_err(backend)?.clone(),
                 #[cfg(feature = "gpu")]
                 ring: None,
@@ -1420,6 +1925,13 @@ impl Worker {
                 #[cfg(feature = "gpu")]
                 gpu_ready: false,
                 output,
+                twin: twin.map(|geometry| TwinCheck {
+                    geometry,
+                    checking: None,
+                    bad_since: None,
+                    padding_reported: false,
+                }),
+                cursor_source,
                 toplevel,
                 source,
                 session,
@@ -1450,7 +1962,8 @@ impl Worker {
         };
         // The output's constraints and first buffer must be ready before adding its cursor
         // session. An unavailable cursor path is attempted only once per stream.
-        if stream.pending.is_some() || stream.toplevel.is_some() {
+        if stream.pending.is_some() || (stream.toplevel.is_some() && stream.cursor_source.is_none())
+        {
             return Ok(());
         }
         if !stream.cursor_started {
@@ -1460,7 +1973,7 @@ impl Worker {
                 (Some(manager), Some(pointer)) => {
                     stream.cursor = Some(CursorCapture::new(
                         manager,
-                        &stream.source,
+                        stream.cursor_source.as_ref().unwrap_or(&stream.source),
                         pointer,
                         &self.qh,
                         id,
@@ -1502,7 +2015,27 @@ impl Worker {
         {
             return Err(PlatformError::Timeout);
         }
+        if stream.twin.as_ref().is_some_and(|t| {
+            t.bad_since
+                .is_some_and(|at| at.elapsed() >= TWIN_INCOHERENT)
+        }) {
+            return Err(backend("Twin geometry stayed incoherent for 1800 ms"));
+        }
         if stream.capture.as_ref().is_some_and(|capture| capture.ready) {
+            let roi = if let Some(twin) = &mut stream.twin {
+                let size = stream
+                    .constraints
+                    .as_ref()
+                    .and_then(|c| c.size)
+                    .ok_or_else(|| backend("missing Twin constraints"))?;
+                if !twin.ready(&self.lookups, size, stream.crop, Instant::now())? {
+                    stream.held = None;
+                    return Ok(());
+                }
+                twin_roi(&twin.geometry, size, stream.crop)
+            } else {
+                None
+            };
             stream.unknown_failures = 0;
             let capture = stream
                 .capture
@@ -1522,7 +2055,10 @@ impl Worker {
             #[cfg(feature = "gpu")]
             let native = if let (Some(ring), Some(slot)) = (&mut stream.ring, capture.slot) {
                 stream.gpu_ready = true;
-                if let Some(rect) = clamped_crop(ring.size, stream.crop) {
+                if let Some(rect) = roi
+                    .map(|(_, actual)| actual)
+                    .or_else(|| clamped_crop(ring.size, stream.crop))
+                {
                     Some(ring.image(slot, rect)?)
                 } else {
                     ring.release(slot);
@@ -1545,7 +2081,10 @@ impl Worker {
                     .buffer
                     .as_ref()
                     .ok_or_else(|| backend("missing frame buffer"))?;
-                let Some(rect) = clamped_crop(buffer.size, stream.crop) else {
+                let Some(rect) = roi
+                    .map(|(_, actual)| actual)
+                    .or_else(|| clamped_crop(buffer.size, stream.crop))
+                else {
                     return Ok(());
                 };
                 let (size, pixels) = buffer.copy(Some(rect))?;
@@ -1557,6 +2096,38 @@ impl Worker {
                     },
                     rect,
                 )
+            };
+            let (size, image) = if let Some((wanted, actual)) = roi {
+                if wanted != actual {
+                    stream.full_damage = true;
+                    let padding = (actual.min.x - wanted.min.x)
+                        .max(actual.min.y - wanted.min.y)
+                        .max(wanted.max.x - actual.max.x)
+                        .max(wanted.max.y - actual.max.y);
+                    if let Some(twin) = &mut stream.twin
+                        && padding > 1
+                        && !twin.padding_reported
+                    {
+                        tracing::info!(
+                            "twin crop extends beyond the window buffer by {padding} px"
+                        );
+                        twin.padding_reported = true;
+                    }
+                }
+                let Some(padded) = pad_twin_image(
+                    size,
+                    image,
+                    wanted,
+                    actual,
+                    #[cfg(feature = "gpu")]
+                    &mut stream.padding,
+                )?
+                else {
+                    return Ok(());
+                };
+                padded
+            } else {
+                (size, image)
             };
             let at = capture.at.map(Ok).unwrap_or_else(now)?;
             let damage = if matches!(image, crosspane_platform::FrameImage::Native(_)) {
@@ -2300,8 +2871,1191 @@ delegate_noop!(State: ignore ExtImageCaptureSourceV1);
 mod tests {
     use super::*;
 
+    // Client-side proxies over an owned socket pair exercise real source/session selection
+    // without a compositor, global environment changes, or a physical pointer.
+    fn fake_worker() -> (Worker, std::os::unix::net::UnixStream) {
+        let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let queue = connection.new_event_queue();
+        let qh = queue.handle();
+        let registry = connection.display().get_registry(&qh, ());
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let (lookups, _) = mpsc::channel();
+        let toplevel = registry.bind::<ExtForeignToplevelHandleV1, _, _>(8, 1, &qh, ());
+        let state = State {
+            #[cfg(feature = "gpu")]
+            gpu: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "gpu")]
+            main_device: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "gpu")]
+            dmabuf: None,
+            #[cfg(feature = "gpu")]
+            feedback: None,
+            #[cfg(feature = "gpu")]
+            retired: HashMap::new(),
+            gate,
+            cursors: Arc::new(AtomicBool::new(false)),
+            manager: Some(registry.bind(1, 1, &qh, ())),
+            sources: Some(registry.bind(2, 1, &qh, ())),
+            window_sources: Some(registry.bind(3, 1, &qh, ())),
+            shm: Some(registry.bind(4, 1, &qh, ())),
+            pointer: Some(registry.bind(5, 1, &qh, ())),
+            seat: None,
+            seat_name: None,
+            toplevel_list: None,
+            toplevels: vec![Toplevel {
+                proxy: toplevel,
+                current: Some(ToplevelProperties {
+                    identifier: "a".to_owned(),
+                    app_id: "fixture".to_owned(),
+                    title: "fixture".to_owned(),
+                }),
+                pending: ToplevelProperties::default(),
+            }],
+            outputs: HashMap::from([(
+                7,
+                Output {
+                    proxy: registry.bind(7, 4, &qh, 7),
+                    name: "CROSSPANE-a".to_owned(),
+                },
+            )]),
+            streams: HashMap::new(),
+            synced: true,
+        };
+        (
+            Worker {
+                connection,
+                queue,
+                qh,
+                state,
+                lookups,
+            },
+            peer,
+        )
+    }
+
+    #[test]
+    fn twin_video_uses_window_source_and_opt_in_separate_output_cursor() {
+        use wayland_client::Proxy;
+        let (mut worker, _peer) = fake_worker();
+        let geometry = twin((20, 40), PixelSize::new(300, 200), PixelSize::new(640, 480));
+        let target = ResolvedTarget::Window {
+            id: geometry.window,
+            app_id: "fixture".to_owned(),
+            title: "fixture".to_owned(),
+            twin: Some(geometry),
+        };
+        let crop = Some(PixelRect::new(point2(0, 0), point2(300, 200)));
+        let sink: Arc<dyn EventSink<FrameEvent>> = Arc::new(|_| {});
+        worker
+            .begin(StreamId(1), &target, crop, 60, sink.clone())
+            .unwrap();
+        let stream = &worker.state.streams[&StreamId(1)];
+        assert!(stream.toplevel.is_some());
+        assert_eq!(stream.output, Some(7));
+        assert_ne!(
+            stream.source.id(),
+            stream.cursor_source.as_ref().unwrap().id()
+        );
+        worker.advance_cursor(StreamId(1)).unwrap();
+        assert!(worker.state.streams[&StreamId(1)].cursor.is_none());
+        worker.state.cursors.store(true, Ordering::Release);
+        worker
+            .begin(StreamId(2), &target, crop, 60, sink.clone())
+            .unwrap();
+        worker.advance_cursor(StreamId(2)).unwrap();
+        assert!(worker.state.streams[&StreamId(2)].cursor.is_some());
+        worker.begin(StreamId(3), &target, None, 60, sink).unwrap();
+        worker.advance_cursor(StreamId(3)).unwrap();
+        assert!(worker.state.streams[&StreamId(3)].cursor.is_none());
+        assert!(worker.state.streams[&StreamId(3)].output.is_none());
+        worker.state.end_all(StreamEndReason::Requested);
+    }
+
+    fn fake_twin_target(size: PixelSize) -> ResolvedTarget {
+        ResolvedTarget::Window {
+            id: WindowId(10),
+            app_id: "fixture".into(),
+            title: "fixture".into(),
+            twin: Some(twin((0, 0), size, PixelSize::new(640, 480))),
+        }
+    }
+
+    fn video_constraints(worker: &mut Worker, id: StreamId, size: PixelSize) {
+        let session = worker.state.streams[&id].session.clone();
+        for event in [
+            session_protocol::Event::BufferSize {
+                width: size.width,
+                height: size.height,
+            },
+            session_protocol::Event::ShmFormat {
+                format: WEnum::Value(wl_shm::Format::Argb8888),
+            },
+            session_protocol::Event::Done,
+        ] {
+            <State as Dispatch<ExtImageCopyCaptureSessionV1, StreamId>>::event(
+                &mut worker.state,
+                &session,
+                event,
+                &id,
+                &worker.connection,
+                &worker.qh,
+            );
+        }
+        worker.advance(id).unwrap();
+    }
+
+    fn deliver_fake_window(worker: &mut Worker, id: StreamId, pixels: &[u8]) {
+        let stream = worker.state.streams.get_mut(&id).unwrap();
+        stream
+            .buffer
+            .as_ref()
+            .unwrap()
+            .file
+            .write_all_at(pixels, 0)
+            .unwrap();
+        let capture = stream.capture.as_ref().unwrap().proxy.clone();
+        let geometry = stream.twin.as_ref().unwrap().geometry.clone();
+        let (send, checking) = mpsc::sync_channel(1);
+        send.send(Ok(ResolvedTarget::Window {
+            id: geometry.window,
+            app_id: "fixture".into(),
+            title: "fixture".into(),
+            twin: Some(geometry),
+        }))
+        .unwrap();
+        stream.twin.as_mut().unwrap().checking = Some(checking);
+        stream.next_slot = Instant::now() - Duration::from_secs(1);
+        <State as Dispatch<ExtImageCopyCaptureFrameV1, StreamId>>::event(
+            &mut worker.state,
+            &capture,
+            frame_protocol::Event::Ready,
+            &id,
+            &worker.connection,
+            &worker.qh,
+        );
+        worker.advance(id).unwrap();
+    }
+
+    #[test]
+    fn window_protocol_start_pending_and_midstream_failures_clean_up_without_output_fallback() {
+        for pending in [true, false] {
+            let (mut worker, _peer) = fake_worker();
+            let size = PixelSize::new(3, 2);
+            let (send, events) = mpsc::channel();
+            let (reply, result) = mpsc::channel();
+            worker.command(Command {
+                request: Request::Start {
+                    id: StreamId(1),
+                    target: fake_twin_target(size),
+                    crop: Some(PixelRect::from_size(size.cast())),
+                    max_fps: 60,
+                    sink: Arc::new(move |e| {
+                        let _ = send.send(e);
+                    }),
+                },
+                deadline: Instant::now() + CALL_TIMEOUT,
+                reply,
+            });
+            assert!(result.try_recv().is_err());
+            assert!(worker.state.streams[&StreamId(1)].toplevel.is_some());
+            if pending {
+                let session = worker.state.streams[&StreamId(1)].session.clone();
+                <State as Dispatch<ExtImageCopyCaptureSessionV1, StreamId>>::event(
+                    &mut worker.state,
+                    &session,
+                    session_protocol::Event::Stopped,
+                    &StreamId(1),
+                    &worker.connection,
+                    &worker.qh,
+                );
+                assert!(result.try_recv().unwrap().is_err());
+                assert!(events.try_recv().is_err());
+            } else {
+                video_constraints(&mut worker, StreamId(1), size);
+                assert!(result.try_recv().unwrap().is_ok());
+                for failure in 0..MAX_UNKNOWN_FAILURES {
+                    let capture = worker.state.streams[&StreamId(1)]
+                        .capture
+                        .as_ref()
+                        .unwrap()
+                        .proxy
+                        .clone();
+                    <State as Dispatch<ExtImageCopyCaptureFrameV1, StreamId>>::event(
+                        &mut worker.state,
+                        &capture,
+                        frame_protocol::Event::Failed {
+                            reason: WEnum::Value(frame_protocol::FailureReason::Unknown),
+                        },
+                        &StreamId(1),
+                        &worker.connection,
+                        &worker.qh,
+                    );
+                    if failure + 1 < MAX_UNKNOWN_FAILURES {
+                        worker.advance(StreamId(1)).unwrap();
+                    }
+                }
+                assert!(matches!(
+                    events.try_recv().unwrap(),
+                    FrameEvent::Ended {
+                        stream: StreamId(1),
+                        reason: StreamEndReason::Failed
+                    }
+                ));
+            }
+            assert!(worker.state.streams.is_empty());
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn successful_transparent_and_denial_window_frames_pass_backend_roi_unchanged() {
+        let (mut worker, _peer) = fake_worker();
+        let size = PixelSize::new(3, 2);
+        let (send, events) = mpsc::channel();
+        worker
+            .begin(
+                StreamId(1),
+                &fake_twin_target(size),
+                Some(PixelRect::from_size(size.cast())),
+                60,
+                Arc::new(move |e| {
+                    let _ = send.send(e);
+                }),
+            )
+            .unwrap();
+        video_constraints(&mut worker, StreamId(1), size);
+        for pixels in [vec![0; 24], [37, 91, 201, 255, 190, 60, 22, 255].repeat(3)] {
+            deliver_fake_window(&mut worker, StreamId(1), &pixels);
+            let FrameEvent::Frame { stream, frame } = events.try_recv().unwrap() else {
+                panic!("successful policy frame rejected");
+            };
+            assert_eq!(stream, StreamId(1));
+            assert_eq!(frame.size, size);
+            let FrameImage::Cpu {
+                pixels: actual,
+                stride,
+            } = frame.image
+            else {
+                panic!("not SHM");
+            };
+            assert_eq!((stride, &*actual), (12, &*pixels));
+            assert!(worker.state.streams[&stream].toplevel.is_some());
+            assert!(events.try_recv().is_err());
+        }
+        worker.state.end_all(StreamEndReason::Requested);
+    }
+
+    #[test]
+    fn twin_video_and_output_cursor_deliver_together_and_cursor_failure_only_degrades_cursor() {
+        use std::io::Read;
+        use wayland_client::Proxy;
+        let (mut worker, mut peer) = fake_worker();
+        worker.state.cursors.store(true, Ordering::Release);
+        let size = PixelSize::new(3, 2);
+        let id = StreamId(1);
+        let (send, events) = mpsc::channel();
+        worker
+            .begin(
+                id,
+                &fake_twin_target(size),
+                Some(PixelRect::from_size(size.cast())),
+                60,
+                Arc::new(move |e| {
+                    let _ = send.send(e);
+                }),
+            )
+            .unwrap();
+        video_constraints(&mut worker, id, size);
+        deliver_fake_window(&mut worker, id, &[0; 24]);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            FrameEvent::Frame { .. }
+        ));
+        worker.advance_cursor(id).unwrap();
+        worker.connection.flush().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        loop {
+            let mut bytes = [0; 4096];
+            match peer.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&bytes[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fake protocol peer: {e}"),
+            }
+        }
+        let manager = worker.state.manager.as_ref().unwrap().id().protocol_id();
+        let stream = &worker.state.streams[&id];
+        let mut video_source = None;
+        let mut cursor_source = None;
+        let word = |bytes: &[u8]| u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+        let mut offset = 0;
+        while offset < wire.len() {
+            let header = word(&wire[offset + 4..]);
+            let length = (header >> 16) as usize;
+            assert!(length >= 8 && offset + length <= wire.len());
+            if word(&wire[offset..]) == manager {
+                match header & 0xffff {
+                    0 => video_source = Some(word(&wire[offset + 12..])),
+                    1 => cursor_source = Some(word(&wire[offset + 12..])),
+                    _ => (),
+                }
+            }
+            offset += length;
+        }
+        assert_eq!(video_source, Some(stream.source.id().protocol_id()));
+        assert_eq!(
+            cursor_source,
+            Some(stream.cursor_source.as_ref().unwrap().id().protocol_id())
+        );
+        assert_ne!(video_source, cursor_source);
+        let cursor = worker.state.streams[&id]
+            .cursor
+            .as_ref()
+            .unwrap()
+            .proxy
+            .clone();
+        for event in [
+            cursor_protocol::Event::Enter,
+            cursor_protocol::Event::Hotspot { x: 1, y: 0 },
+        ] {
+            <State as Dispatch<ExtImageCopyCaptureCursorSessionV1, CursorData>>::event(
+                &mut worker.state,
+                &cursor,
+                event,
+                &CursorData(id),
+                &worker.connection,
+                &worker.qh,
+            );
+        }
+        let session = worker.state.streams[&id]
+            .cursor
+            .as_ref()
+            .unwrap()
+            .session
+            .clone();
+        for event in [
+            session_protocol::Event::BufferSize {
+                width: 2,
+                height: 1,
+            },
+            session_protocol::Event::ShmFormat {
+                format: WEnum::Value(wl_shm::Format::Argb8888),
+            },
+            session_protocol::Event::Done,
+        ] {
+            <State as Dispatch<ExtImageCopyCaptureSessionV1, CursorData>>::event(
+                &mut worker.state,
+                &session,
+                event,
+                &CursorData(id),
+                &worker.connection,
+                &worker.qh,
+            );
+        }
+        worker.advance_cursor(id).unwrap();
+        let cursor = worker.state.streams[&id].cursor.as_ref().unwrap();
+        cursor
+            .buffer
+            .as_ref()
+            .unwrap()
+            .file
+            .write_all_at(&[9, 19, 29, 255, 39, 49, 59, 255], 0)
+            .unwrap();
+        let frame = cursor.frame.as_ref().unwrap().proxy.clone();
+        <State as Dispatch<ExtImageCopyCaptureFrameV1, CursorData>>::event(
+            &mut worker.state,
+            &frame,
+            frame_protocol::Event::Ready,
+            &CursorData(id),
+            &worker.connection,
+            &worker.qh,
+        );
+        worker.advance_cursor(id).unwrap();
+        let FrameEvent::Cursor {
+            stream,
+            cursor: Some(shape),
+        } = events.try_recv().unwrap()
+        else {
+            panic!("cursor event absent");
+        };
+        assert_eq!(stream, id);
+        assert_eq!(shape.hotspot, (1, 0));
+        assert_eq!(&*shape.pixels, &[9, 19, 29, 255, 39, 49, 59, 255]);
+        <State as Dispatch<ExtImageCopyCaptureSessionV1, CursorData>>::event(
+            &mut worker.state,
+            &session,
+            session_protocol::Event::Stopped,
+            &CursorData(id),
+            &worker.connection,
+            &worker.qh,
+        );
+        assert!(worker.state.streams[&id].cursor.is_none());
+        deliver_fake_window(&mut worker, id, &[0; 24]);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            FrameEvent::Frame { .. }
+        ));
+        assert!(events.try_recv().is_err());
+        worker.state.end_all(StreamEndReason::Requested);
+    }
+
+    #[test]
+    fn twin_output_and_window_loss_end_without_an_output_fallback() {
+        for output_loss in [true, false] {
+            let (mut worker, _peer) = fake_worker();
+            let geometry = twin((0, 0), PixelSize::new(300, 200), PixelSize::new(640, 480));
+            let target = ResolvedTarget::Window {
+                id: geometry.window,
+                app_id: "fixture".to_owned(),
+                title: "fixture".to_owned(),
+                twin: Some(geometry),
+            };
+            let (send, events) = mpsc::channel();
+            let sink: Arc<dyn EventSink<FrameEvent>> = Arc::new(move |e| {
+                let _ = send.send(e);
+            });
+            worker
+                .begin(
+                    StreamId(1),
+                    &target,
+                    Some(PixelRect::new(point2(0, 0), point2(300, 200))),
+                    60,
+                    sink,
+                )
+                .unwrap();
+            if output_loss {
+                let registry = worker.connection.display().get_registry(&worker.qh, ());
+                <State as Dispatch<wl_registry::WlRegistry, ()>>::event(
+                    &mut worker.state,
+                    &registry,
+                    wl_registry::Event::GlobalRemove { name: 7 },
+                    &(),
+                    &worker.connection,
+                    &worker.qh,
+                );
+            } else {
+                let handle = worker.state.toplevels[0].proxy.clone();
+                <State as Dispatch<ExtForeignToplevelHandleV1, ()>>::event(
+                    &mut worker.state,
+                    &handle,
+                    handle_protocol::Event::Closed,
+                    &(),
+                    &worker.connection,
+                    &worker.qh,
+                );
+            }
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                FrameEvent::Ended {
+                    stream: StreamId(1),
+                    reason: StreamEndReason::TargetGone
+                }
+            ));
+            assert!(worker.state.streams.is_empty());
+        }
+        let (mut worker, _peer) = fake_worker();
+        worker.state.window_sources = None;
+        assert!(matches!(
+            worker.begin(
+                StreamId(1),
+                &ResolvedTarget::Window {
+                    id: WindowId(10),
+                    app_id: "fixture".to_owned(),
+                    title: "fixture".to_owned(),
+                    twin: None,
+                },
+                None,
+                60,
+                Arc::new(|_| {})
+            ),
+            Err(PlatformError::Unsupported(_))
+        ));
+        assert!(worker.state.streams.is_empty());
+    }
+
+    #[test]
+    fn twin_binding_disappearing_between_agent_snapshot_and_lookup_never_starts_unbound() {
+        for lost in ["workspace", "output", "native window"] {
+            let (mut worker, _peer) = fake_worker();
+            // The agent's earlier snapshot was valid and produced this Window-local Q.
+            let geometry = twin((20, 40), PixelSize::new(300, 200), PixelSize::new(640, 480));
+            let q = geometry.map_crop(geometry.content).unwrap();
+            let mut target = ResolvedTarget::Window {
+                id: geometry.window,
+                app_id: "fixture".into(),
+                title: "fixture".into(),
+                twin: Some(geometry),
+            };
+            if lost == "workspace" {
+                // The backend's later client lookup sees the Window outside its Twin workspace.
+                if let ResolvedTarget::Window { twin, .. } = &mut target {
+                    *twin = None;
+                }
+            } else if lost == "output" {
+                // Or the native output disappeared after IPC lookup but before session creation.
+                worker.state.outputs.remove(&7);
+            } else {
+                worker.state.toplevels[0]
+                    .current
+                    .as_mut()
+                    .unwrap()
+                    .identifier = "b".into();
+            }
+            assert!(
+                worker
+                    .begin(StreamId(1), &target, Some(q), 60, Arc::new(|_| {}))
+                    .is_err()
+            );
+            assert!(
+                worker.state.streams.is_empty(),
+                "no unbound session may escape"
+            );
+            // Mirror Window(None) remains an ordinary Window stream in both cases.
+            worker
+                .begin(StreamId(2), &target, None, 60, Arc::new(|_| {}))
+                .unwrap();
+            assert!(worker.state.streams[&StreamId(2)].output.is_none());
+            assert!(worker.state.streams[&StreamId(2)].twin.is_none());
+            let (reply, result) = mpsc::channel();
+            worker.command(Command {
+                request: Request::Crop(StreamId(2), Some(q), None),
+                deadline: Instant::now() + CALL_TIMEOUT,
+                reply,
+            });
+            assert!(result.try_recv().unwrap().is_err());
+            worker.state.end_all(StreamEndReason::Requested);
+        }
+    }
+
+    fn twin(origin: (i32, i32), size: PixelSize, extent: PixelSize) -> TwinGeometry {
+        TwinGeometry {
+            window: WindowId(10),
+            display: DisplayId(2),
+            origin,
+            size,
+            extent,
+            content: PixelRect::from_origin_and_size(point2(origin.0, origin.1), size.cast())
+                .intersection(&PixelRect::from_size(extent.cast()))
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn twin_mapping_offset_bars_padding_and_partial_negative_clipping() {
+        for (origin, size, extent, r, q) in [
+            (
+                (20, 40),
+                (300, 200),
+                (640, 480),
+                (20, 40, 320, 240),
+                (0, 0, 300, 200),
+            ),
+            (
+                (-20, -30),
+                (300, 200),
+                (640, 480),
+                (0, 0, 280, 170),
+                (20, 30, 300, 200),
+            ),
+            (
+                (20, 40),
+                (700, 500),
+                (640, 480),
+                (20, 40, 640, 480),
+                (0, 0, 620, 440),
+            ),
+        ] {
+            let rect = |(x, y, w, h)| PixelRect::new(point2(x, y), point2(w, h));
+            let geometry = twin(
+                origin,
+                PixelSize::new(size.0, size.1),
+                PixelSize::new(extent.0, extent.1),
+            );
+            assert_eq!(geometry.map_crop(rect(r)).unwrap(), rect(q));
+            assert!(geometry.map_crop(rect((r.0 + 1, r.1, r.2, r.3))).is_err());
+        }
+    }
+
+    #[test]
+    fn twin_fractional_snapshot_reuses_parking_geometry_and_rejects_unknown_origin() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("cp-twin-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("hypr/fake")).unwrap();
+        let socket = UnixListener::bind(dir.join("hypr/fake/.socket.sock")).unwrap();
+        let client = serde_json::json!({"stableId":"a","mapped":true,"monitor":2,
+            "workspace":{"name":"crosspane-a"},"at":[1048626,30],"size":[300,200]});
+        let monitor = serde_json::json!({"name":"CROSSPANE-a","id":2,"scale":1.25,
+            "x":1048576,"y":0,"width":640,"height":480});
+        let expected = super::super::parking::parked_from(WindowId(10), &client, &monitor).unwrap();
+        let mut unknown = client.clone();
+        unknown["at"] = serde_json::Value::Null;
+        let server = std::thread::spawn(move || {
+            for (command, reply) in [
+                ("j/clients", serde_json::json!([client])),
+                ("j/monitors", serde_json::json!([monitor.clone()])),
+                ("j/clients", serde_json::json!([unknown])),
+                ("j/monitors", serde_json::json!([monitor])),
+            ] {
+                let (mut stream, _) = socket.accept().unwrap();
+                let mut bytes = [0; 64];
+                let n = stream.read(&mut bytes).unwrap();
+                assert_eq!(&bytes[..n], command.as_bytes());
+                stream.write_all(reply.to_string().as_bytes()).unwrap();
+            }
+        });
+        let ipc = HyprIpc::new("fake", &dir, Duration::from_millis(100));
+        let geometry = TwinGeometry::read(&ipc, WindowId(10)).unwrap();
+        assert_eq!(geometry.origin, (63, 38));
+        assert_eq!(geometry.size, PixelSize::new(375, 250));
+        assert_eq!(
+            geometry.map_crop(expected.content).unwrap(),
+            PixelRect::new(point2(-13, -8), point2(287, 192))
+        );
+        assert!(TwinGeometry::read(&ipc, WindowId(10)).is_err());
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn twin_stale_snapshot_holds_one_bounded_lookup_then_ends_at_two_seconds() {
+        assert_eq!(TWIN_INCOHERENT, Duration::from_millis(1800));
+        let geometry = twin((0, 0), PixelSize::new(300, 200), PixelSize::new(640, 480));
+        let crop = Some(PixelRect::new(point2(0, 0), point2(300, 200)));
+        let mut check = TwinCheck {
+            geometry: geometry.clone(),
+            checking: None,
+            bad_since: None,
+            padding_reported: false,
+        };
+        let (send, requests) = mpsc::channel();
+        let at = Instant::now();
+        assert!(!check.ready(&send, geometry.size, crop, at).unwrap());
+        let request = requests.try_recv().unwrap();
+        for millis in 1..100 {
+            assert!(
+                !check
+                    .ready(
+                        &send,
+                        geometry.size,
+                        crop,
+                        at + Duration::from_millis(millis)
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(requests.try_recv().is_err());
+        let mut stale = geometry.clone();
+        stale.origin.0 = 1;
+        request
+            .reply
+            .send(Ok(ResolvedTarget::Window {
+                id: geometry.window,
+                app_id: String::new(),
+                title: String::new(),
+                twin: Some(stale),
+            }))
+            .unwrap();
+        assert!(
+            !check
+                .ready(&send, geometry.size, crop, at + Duration::from_secs(1))
+                .unwrap()
+        );
+        requests
+            .try_recv()
+            .unwrap()
+            .reply
+            .send(Err(PlatformError::Timeout))
+            .unwrap();
+        assert!(
+            !check
+                .ready(&send, geometry.size, crop, at + Duration::from_millis(1799))
+                .unwrap()
+        );
+        assert!(
+            check
+                .ready(&send, geometry.size, crop, at + Duration::from_millis(1800))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn twin_geometry_recovers_only_with_the_exact_crop_and_constraints() {
+        let geometry = twin((-10, 0), PixelSize::new(300, 200), PixelSize::new(640, 480));
+        let crop = Some(PixelRect::new(point2(10, 0), point2(300, 200)));
+        let mut check = TwinCheck {
+            geometry: geometry.clone(),
+            checking: None,
+            bad_since: None,
+            padding_reported: false,
+        };
+        let (send, requests) = mpsc::channel();
+        let at = Instant::now();
+        let respond = |request: Lookup| {
+            request
+                .reply
+                .send(Ok(ResolvedTarget::Window {
+                    id: geometry.window,
+                    app_id: String::new(),
+                    title: String::new(),
+                    twin: Some(geometry.clone()),
+                }))
+                .unwrap()
+        };
+        assert!(!check.ready(&send, geometry.size, crop, at).unwrap());
+        respond(requests.try_recv().unwrap());
+        assert!(
+            !check
+                .ready(
+                    &send,
+                    geometry.size,
+                    Some(PixelRect::new(point2(0, 0), point2(290, 200))),
+                    at + Duration::from_millis(1)
+                )
+                .unwrap()
+        );
+        respond(requests.try_recv().unwrap());
+        assert!(
+            check
+                .ready(&send, geometry.size, crop, at + Duration::from_millis(2))
+                .unwrap()
+        );
+        assert!(check.bad_since.is_none());
+        assert!(twin_roi(&geometry, geometry.size, None).is_none());
+        assert!(
+            twin_roi(
+                &geometry,
+                geometry.size,
+                Some(PixelRect::new(point2(0, 0), point2(300, 200)))
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_buffer_dimensions_hold_instead_of_becoming_geometric_padding() {
+        let geometry = twin((0, 0), PixelSize::new(600, 400), PixelSize::new(800, 600));
+        let crop = Some(geometry.map_crop(geometry.content).unwrap());
+        for size in [
+            PixelSize::new(300, 200),
+            PixelSize::new(598, 400),
+            PixelSize::new(600, 402),
+        ] {
+            assert!(twin_roi(&geometry, size, crop).is_none());
+        }
+        for size in [
+            geometry.size,
+            PixelSize::new(599, 399),
+            PixelSize::new(601, 401),
+        ] {
+            assert!(twin_roi(&geometry, size, crop).is_some());
+        }
+        let (send, requests) = mpsc::channel();
+        let at = Instant::now();
+        let mut check = TwinCheck {
+            geometry: geometry.clone(),
+            checking: None,
+            bad_since: None,
+            padding_reported: false,
+        };
+        assert!(
+            !check
+                .ready(&send, PixelSize::new(300, 200), crop, at)
+                .unwrap()
+        );
+        requests
+            .try_recv()
+            .unwrap()
+            .reply
+            .send(Ok(ResolvedTarget::Window {
+                id: geometry.window,
+                app_id: String::new(),
+                title: String::new(),
+                twin: Some(geometry),
+            }))
+            .unwrap();
+        assert!(
+            !check
+                .ready(
+                    &send,
+                    PixelSize::new(300, 200),
+                    crop,
+                    at + Duration::from_millis(1799)
+                )
+                .unwrap()
+        );
+        assert!(
+            check
+                .ready(
+                    &send,
+                    PixelSize::new(300, 200),
+                    crop,
+                    at + Duration::from_millis(1800)
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_window_ipc_lookup_ignores_missing_twin_output_but_cropped_lookup_requires_it() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("cp-window-lookup-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("hypr/fake")).unwrap();
+        let socket = UnixListener::bind(dir.join("hypr/fake/.socket.sock")).unwrap();
+        let client = serde_json::json!({"stableId":"a","mapped":true,"monitor":2,
+            "workspace":{"name":"crosspane-a"},"title":"fixture","class":"fixture"});
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = socket.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut bytes = [0; 64];
+                let n = stream.read(&mut bytes).unwrap();
+                let value = if std::str::from_utf8(&bytes[..n])
+                    .unwrap()
+                    .contains("clients")
+                {
+                    serde_json::json!([client])
+                } else {
+                    serde_json::json!([])
+                };
+                stream.write_all(value.to_string().as_bytes()).unwrap();
+            }
+        });
+        let ipc = HyprIpc::new("fake", &dir, Duration::from_millis(50));
+        assert!(matches!(
+            resolve_window(&ipc, WindowId(10), false).unwrap(),
+            ResolvedTarget::Window { twin: None, .. }
+        ));
+        assert!(matches!(
+            resolve_window(&ipc, WindowId(10), true),
+            Err(PlatformError::NotFound)
+        ));
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn twin_unverified_binding_holds_until_the_same_deadline() {
+        let geometry = twin((0, 0), PixelSize::new(300, 200), PixelSize::new(640, 480));
+        let crop = Some(geometry.content);
+        let mut check = TwinCheck {
+            geometry: geometry.clone(),
+            checking: None,
+            bad_since: None,
+            padding_reported: false,
+        };
+        let (send, requests) = mpsc::channel();
+        let at = Instant::now();
+        assert!(!check.ready(&send, geometry.size, crop, at).unwrap());
+        requests
+            .try_recv()
+            .unwrap()
+            .reply
+            .send(Ok(ResolvedTarget::Window {
+                id: geometry.window,
+                app_id: String::new(),
+                title: String::new(),
+                twin: None,
+            }))
+            .unwrap();
+        assert!(
+            !check
+                .ready(&send, geometry.size, crop, at + Duration::from_millis(100))
+                .unwrap()
+        );
+        assert!(
+            check
+                .ready(&send, geometry.size, crop, at + TWIN_INCOHERENT)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn twin_geometric_padding_is_opaque_and_preserves_requested_size_and_damage_origin() {
+        let geometry = twin((20, 40), PixelSize::new(3, 2), PixelSize::new(640, 480));
+        let q = PixelRect::new(point2(0, 0), point2(3, 2));
+        assert_eq!(
+            twin_roi(&geometry, PixelSize::new(2, 1), Some(q))
+                .unwrap()
+                .0,
+            q
+        );
+        assert!(twin_roi(&geometry, PixelSize::new(0, 0), Some(q)).is_none());
+        let (size, image) = pad_twin_image(
+            PixelSize::new(2, 1),
+            FrameImage::Cpu {
+                stride: 8,
+                pixels: Arc::from([1, 2, 3, 4, 5, 6, 7, 8]),
+            },
+            q,
+            PixelRect::new(point2(0, 0), point2(2, 1)),
+            #[cfg(feature = "gpu")]
+            &mut PaddingPool::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(size, geometry.size);
+        let FrameImage::Cpu { stride, pixels } = image else {
+            panic!("not CPU")
+        };
+        assert_eq!(stride, 12);
+        assert_eq!(
+            &*pixels,
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255
+            ]
+        );
+        assert_eq!(
+            translate_damage(
+                &[[10, 0, 5, 5]],
+                PixelRect::new(point2(10, 0), point2(20, 10))
+            ),
+            vec![PixelRect::new(point2(0, 0), point2(5, 5))]
+        );
+        let wanted = PixelRect::new(point2(-13, -8), point2(287, 192));
+        let actual = PixelRect::new(point2(0, 0), point2(287, 192));
+        let (_, image) = pad_twin_image(
+            actual.size().cast(),
+            FrameImage::Cpu {
+                stride: 287 * 4,
+                pixels: Arc::from(vec![7; 287 * 192 * 4]),
+            },
+            wanted,
+            actual,
+            #[cfg(feature = "gpu")]
+            &mut PaddingPool::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let FrameImage::Cpu { pixels, stride } = image else {
+            panic!("not CPU")
+        };
+        for y in 0..200 {
+            for x in 0..300 {
+                let at = y * stride as usize + x * 4;
+                assert_eq!(
+                    &pixels[at..at + 4],
+                    if x < 13 || y < 8 {
+                        &[0, 0, 0, 255]
+                    } else {
+                        &[7; 4]
+                    }
+                );
+            }
+        }
+    }
+
     fn image(size: PixelSize, hotspot: (i32, i32), pixels: &[u8]) -> Option<CursorImage> {
         cursor_image(size, hotspot, pixels, wl_shm::Format::Argb8888).unwrap()
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn twin_gpu_geometric_padding_copies_native_roi_and_clears_opaque_black() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct ThreadWake(std::thread::Thread);
+        impl Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        fn wait<T>(future: impl Future<Output = T>) -> T {
+            let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+            let mut context = Context::from_waker(&waker);
+            let mut future = std::pin::pin!(future);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match future.as_mut().poll(&mut context) {
+                    Poll::Ready(value) => return value,
+                    Poll::Pending => {
+                        assert!(Instant::now() < deadline);
+                        std::thread::park_timeout(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        // Headless Vulkan, no compositor, capture source, DRM import or display surface.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let Ok(adapter) = wait(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            force_fallback_adapter: false,
+            ..Default::default()
+        })) else {
+            eprintln!("skipped: headless Vulkan adapter unavailable");
+            return;
+        };
+        let (device, queue) = wait(adapter.request_device(&Default::default())).unwrap();
+        let source = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 6,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut pixels = Vec::new();
+        for y in 0..6 {
+            for x in 0..8 {
+                pixels.extend([x as u8, y as u8, 99, 255]);
+            }
+        }
+        queue.write_texture(
+            source.as_image_copy(),
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(32),
+                rows_per_image: None,
+            },
+            source.size(),
+        );
+        let geometry = TwinGeometry {
+            window: WindowId(10),
+            display: DisplayId(2),
+            origin: (13, 8),
+            size: PixelSize::new(4, 3),
+            extent: PixelSize::new(100, 100),
+            content: PixelRect::new(point2(0, 0), point2(20, 15)),
+        };
+        let q = geometry.map_crop(geometry.content).unwrap();
+        let (wanted, actual) = twin_roi(&geometry, geometry.size, Some(q)).unwrap();
+        let offset = (actual.min.x - wanted.min.x, actual.min.y - wanted.min.y);
+        let texture = padding_texture(&device, wanted.size().cast());
+        pad_twin_texture(
+            &device,
+            &queue,
+            &source,
+            (2, 1),
+            actual.size().cast(),
+            offset,
+            &texture,
+        );
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256 * 15,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: None,
+                },
+            },
+            texture.size(),
+        );
+        queue.submit([encoder.finish()]);
+        let (send, result) = mpsc::sync_channel(1);
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = send.send(r);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(2)),
+            })
+            .unwrap();
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let mapped = readback.slice(..).get_mapped_range().unwrap();
+        for y in 0..15 {
+            for x in 0..20 {
+                let expected = if (13..17).contains(&x) && (8..11).contains(&y) {
+                    [x - 13 + 2, y - 8 + 1, 99, 255]
+                } else {
+                    [0, 0, 0, 255]
+                };
+                assert_eq!(&mapped[y as usize * 256 + x as usize * 4..][..4], &expected);
+            }
+        }
+        eprintln!("headless Vulkan ROI(2,1) -> R offset(13,8), all four black borders exact");
+
+        #[derive(Debug)]
+        struct RetainedPadding {
+            texture: wgpu::Texture,
+            size: PixelSize,
+            free: Arc<AtomicBool>,
+            queue: wgpu::Queue,
+        }
+        impl crosspane_platform::NativeImage for RetainedPadding {
+            fn size(&self) -> PixelSize {
+                self.size
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn read(&self, _: &mut dyn FnMut(&[u8], u32)) -> Result<(), PlatformError> {
+                Err(PlatformError::Unsupported("lease fixture"))
+            }
+        }
+        impl Drop for RetainedPadding {
+            fn drop(&mut self) {
+                let free = self.free.clone();
+                let texture = self.texture.clone();
+                // Same consumption + completion lease contract as the production Image::drop.
+                self.queue.on_submitted_work_done(move || {
+                    drop(texture);
+                    free.store(true, Ordering::Release);
+                });
+            }
+        }
+        let mut pool = PaddingPool::default();
+        let mut retained = Vec::new();
+        for _ in 0..4 {
+            let (texture, free) = pool.acquire(&device, PixelSize::new(20, 15)).unwrap();
+            retained.push(FrameImage::Native(Arc::new(RetainedPadding {
+                texture,
+                free,
+                queue: queue.clone(),
+                size: PixelSize::new(20, 15),
+            })));
+        }
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(2)),
+            })
+            .unwrap();
+        for _ in 0..100 {
+            assert!(pool.acquire(&device, PixelSize::new(30, 25)).is_none());
+        }
+        assert_eq!(pool.slots.len(), 4); // Even resize cannot allocate around retained frames.
+        drop(retained.pop());
+        // Consumption alone does not recycle: the GPU-completion callback still needs polling.
+        assert!(pool.acquire(&device, PixelSize::new(30, 25)).is_none());
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(2)),
+            })
+            .unwrap();
+        let (texture, free) = pool.acquire(&device, PixelSize::new(30, 25)).unwrap();
+        assert_eq!((texture.width(), texture.height()), (30, 25));
+        assert!(!free.load(Ordering::Acquire));
+        assert_eq!(pool.slots.len(), 4);
     }
 
     #[test]
