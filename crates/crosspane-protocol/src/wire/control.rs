@@ -71,15 +71,20 @@ fn check_clip_kinds(kinds: &[ClipKind]) -> Result<(), WireError> {
     Ok(())
 }
 
-fn clip_kind_to_pb(kind: ClipKind) -> i32 {
+// Keep the original varint until its signed enum range has been checked.
+fn enum_value(value: u64, field: &'static str) -> Result<i32, WireError> {
+    i32::try_from(value).map_err(|_| WireError::BadValue(field))
+}
+
+fn clip_kind_to_pb(kind: ClipKind) -> u64 {
     match kind {
-        ClipKind::Text => pb::ClipKind::Text as i32,
-        ClipKind::Image => pb::ClipKind::Image as i32,
+        ClipKind::Text => pb::ClipKind::Text as u64,
+        ClipKind::Image => pb::ClipKind::Image as u64,
     }
 }
 
-fn clip_kind_from_pb(kind: i32) -> Result<ClipKind, WireError> {
-    match pb::ClipKind::try_from(kind) {
+fn clip_kind_from_pb(kind: u64) -> Result<ClipKind, WireError> {
+    match pb::ClipKind::try_from(enum_value(kind, "clipboard kind")?) {
         Ok(pb::ClipKind::Text) => Ok(ClipKind::Text),
         Ok(pb::ClipKind::Image) => Ok(ClipKind::Image),
         _ => Err(WireError::BadValue("clipboard kind")),
@@ -148,7 +153,7 @@ fn displays_to_pb(displays: &[DisplayInfo]) -> Result<Vec<pb::Display>, WireErro
                 logical_x: geometry.logical_origin.x,
                 logical_y: geometry.logical_origin.y,
                 refresh_millihz: display.refresh_millihz,
-                color_space: color_space as i32,
+                color_space: color_space as u64,
                 hdr: display.hdr,
             })
         })
@@ -160,12 +165,13 @@ fn displays_from_pb(displays: Vec<pb::Display>) -> Result<Vec<DisplayInfo>, Wire
     displays
         .into_iter()
         .map(|display| {
-            let color_space = match pb::ColorSpace::try_from(display.color_space) {
-                Ok(pb::ColorSpace::Srgb) => ColorSpace::Srgb,
-                Ok(pb::ColorSpace::DisplayP3) => ColorSpace::DisplayP3,
-                Ok(pb::ColorSpace::Bt709) => ColorSpace::Bt709,
-                Err(_) => return Err(WireError::BadValue("color space")),
-            };
+            let color_space =
+                match pb::ColorSpace::try_from(enum_value(display.color_space, "color space")?) {
+                    Ok(pb::ColorSpace::Srgb) => ColorSpace::Srgb,
+                    Ok(pb::ColorSpace::DisplayP3) => ColorSpace::DisplayP3,
+                    Ok(pb::ColorSpace::Bt709) => ColorSpace::Bt709,
+                    Err(_) => return Err(WireError::BadValue("color space")),
+                };
             let display = DisplayInfo {
                 id: DisplayId(display.id),
                 name: display.name,
@@ -185,16 +191,16 @@ fn displays_from_pb(displays: Vec<pb::Display>) -> Result<Vec<DisplayInfo>, Wire
         .collect()
 }
 
-fn lock_to_pb(value: Option<bool>) -> i32 {
+fn lock_to_pb(value: Option<bool>) -> u64 {
     (match value {
         None => pb::LockKey::Unknown,
         Some(false) => pb::LockKey::Off,
         Some(true) => pb::LockKey::On,
-    }) as i32
+    }) as u64
 }
 
-fn lock_from_pb(value: i32) -> Result<Option<bool>, WireError> {
-    match pb::LockKey::try_from(value) {
+fn lock_from_pb(value: u64) -> Result<Option<bool>, WireError> {
+    match pb::LockKey::try_from(enum_value(value, "lock key")?) {
         Ok(pb::LockKey::Unknown) => Ok(None),
         Ok(pb::LockKey::Off) => Ok(Some(false)),
         Ok(pb::LockKey::On) => Ok(Some(true)),
@@ -267,7 +273,7 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
             };
             Body::ControlRefused(pb::ControlRefused {
                 session: session.0,
-                reason: reason as i32,
+                reason: reason as u64,
             })
         }
         ControlMessage::EndControl { session, reason } => {
@@ -281,7 +287,7 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
             };
             Body::EndControl(pb::EndControl {
                 session: session.0,
-                reason: reason as i32,
+                reason: reason as u64,
             })
         }
         ControlMessage::Grants(capabilities) => {
@@ -298,7 +304,7 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
                         Capability::AudioMic => pb::Capability::AudioMic,
                         Capability::ClipboardRead => pb::Capability::ClipboardRead,
                         Capability::ClipboardWrite => pb::Capability::ClipboardWrite,
-                    }) as i32
+                    }) as u64
                 })
                 .collect();
             Body::Grants(pb::Grants { capabilities })
@@ -370,7 +376,7 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
                 ClipFailure::NotGranted => pb::ClipFailure::NotGranted,
                 ClipFailure::TooLarge => pb::ClipFailure::TooLarge,
                 ClipFailure::Unavailable => pb::ClipFailure::Unavailable,
-            } as i32,
+            } as u64,
         }),
         ControlMessage::Goodbye { message } => {
             check_len(message.len(), MAX_STRING, "goodbye message")?;
@@ -431,7 +437,7 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
             session: SessionId(started.session),
         },
         Body::ControlRefused(refused) => {
-            let reason = match pb::Refusal::try_from(refused.reason) {
+            let reason = match pb::Refusal::try_from(enum_value(refused.reason, "refusal")?) {
                 Ok(pb::Refusal::Permission) => Refusal::Permission,
                 Ok(pb::Refusal::Locked) => Refusal::Locked,
                 Ok(pb::Refusal::SecureInput) => Refusal::SecureInput,
@@ -445,7 +451,7 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
             }
         }
         Body::EndControl(end) => {
-            let reason = match pb::EndReason::try_from(end.reason) {
+            let reason = match pb::EndReason::try_from(enum_value(end.reason, "end reason")?) {
                 Ok(pb::EndReason::Released) => EndReason::Released,
                 Ok(pb::EndReason::Panic) => EndReason::Panic,
                 Ok(pb::EndReason::TargetLocked) => EndReason::TargetLocked,
@@ -468,16 +474,18 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
             let capabilities = grants
                 .capabilities
                 .into_iter()
-                .map(|capability| match pb::Capability::try_from(capability) {
-                    Ok(pb::Capability::InputAccept) => Ok(Capability::InputAccept),
-                    Ok(pb::Capability::WindowShare) => Ok(Capability::WindowShare),
-                    Ok(pb::Capability::WindowBrowse) => Ok(Capability::WindowBrowse),
-                    Ok(pb::Capability::WindowPresent) => Ok(Capability::WindowPresent),
-                    Ok(pb::Capability::AudioSpeaker) => Ok(Capability::AudioSpeaker),
-                    Ok(pb::Capability::AudioMic) => Ok(Capability::AudioMic),
-                    Ok(pb::Capability::ClipboardRead) => Ok(Capability::ClipboardRead),
-                    Ok(pb::Capability::ClipboardWrite) => Ok(Capability::ClipboardWrite),
-                    _ => Err(WireError::BadValue("capability")),
+                .map(|capability| {
+                    match pb::Capability::try_from(enum_value(capability, "capability")?) {
+                        Ok(pb::Capability::InputAccept) => Ok(Capability::InputAccept),
+                        Ok(pb::Capability::WindowShare) => Ok(Capability::WindowShare),
+                        Ok(pb::Capability::WindowBrowse) => Ok(Capability::WindowBrowse),
+                        Ok(pb::Capability::WindowPresent) => Ok(Capability::WindowPresent),
+                        Ok(pb::Capability::AudioSpeaker) => Ok(Capability::AudioSpeaker),
+                        Ok(pb::Capability::AudioMic) => Ok(Capability::AudioMic),
+                        Ok(pb::Capability::ClipboardRead) => Ok(Capability::ClipboardRead),
+                        Ok(pb::Capability::ClipboardWrite) => Ok(Capability::ClipboardWrite),
+                        _ => Err(WireError::BadValue("capability")),
+                    }
                 })
                 .collect::<Result<_, _>>()?;
             ControlMessage::Grants(capabilities)
@@ -546,7 +554,8 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
         }),
         Body::ClipFetchFailed(failed) => ControlMessage::ClipFetchFailed(ClipFetchFailed {
             fetch: ClipFetchId(failed.fetch),
-            reason: match pb::ClipFailure::try_from(failed.reason) {
+            reason: match pb::ClipFailure::try_from(enum_value(failed.reason, "clipboard failure")?)
+            {
                 Ok(pb::ClipFailure::Expired) => ClipFailure::Expired,
                 Ok(pb::ClipFailure::Locked) => ClipFailure::Locked,
                 Ok(pb::ClipFailure::NotGranted) => ClipFailure::NotGranted,
@@ -1052,8 +1061,8 @@ mod pb {
     pub struct ClipOffer {
         #[prost(uint64, tag = "1")]
         pub offer: u64,
-        #[prost(enumeration = "ClipKind", repeated, tag = "2")]
-        pub kinds: Vec<i32>,
+        #[prost(uint64, repeated, packed = "true", tag = "2")]
+        pub kinds: Vec<u64>,
     }
 
     #[derive(Clone, Copy, PartialEq, prost::Message)]
@@ -1068,16 +1077,16 @@ mod pb {
         pub fetch: u64,
         #[prost(uint64, tag = "2")]
         pub offer: u64,
-        #[prost(enumeration = "ClipKind", tag = "3")]
-        pub kind: i32,
+        #[prost(uint64, tag = "3")]
+        pub kind: u64,
     }
 
     #[derive(Clone, Copy, PartialEq, prost::Message)]
     pub struct ClipFetchFailed {
         #[prost(uint64, tag = "1")]
         pub fetch: u64,
-        #[prost(enumeration = "ClipFailure", tag = "2")]
-        pub reason: i32,
+        #[prost(uint64, tag = "2")]
+        pub reason: u64,
     }
 
     #[derive(Clone, Copy, PartialEq, prost::Message)]
@@ -1481,8 +1490,8 @@ mod pb {
         pub logical_y: f64,
         #[prost(uint32, tag = "10")]
         pub refresh_millihz: u32,
-        #[prost(enumeration = "ColorSpace", tag = "11")]
-        pub color_space: i32,
+        #[prost(uint64, tag = "11")]
+        pub color_space: u64,
         #[prost(bool, tag = "12")]
         pub hdr: bool,
     }
@@ -1523,12 +1532,12 @@ mod pb {
 
     #[derive(Clone, Copy, PartialEq, prost::Message)]
     pub struct LockKeys {
-        #[prost(enumeration = "LockKey", tag = "1")]
-        pub caps: i32,
-        #[prost(enumeration = "LockKey", tag = "2")]
-        pub num: i32,
-        #[prost(enumeration = "LockKey", tag = "3")]
-        pub scroll: i32,
+        #[prost(uint64, tag = "1")]
+        pub caps: u64,
+        #[prost(uint64, tag = "2")]
+        pub num: u64,
+        #[prost(uint64, tag = "3")]
+        pub scroll: u64,
     }
 
     #[derive(Clone, Copy, PartialEq, prost::Message)]
@@ -1566,8 +1575,8 @@ mod pb {
     pub struct ControlRefused {
         #[prost(uint64, tag = "1")]
         pub session: u64,
-        #[prost(enumeration = "Refusal", tag = "2")]
-        pub reason: i32,
+        #[prost(uint64, tag = "2")]
+        pub reason: u64,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -1586,8 +1595,8 @@ mod pb {
     pub struct EndControl {
         #[prost(uint64, tag = "1")]
         pub session: u64,
-        #[prost(enumeration = "EndReason", tag = "2")]
-        pub reason: i32,
+        #[prost(uint64, tag = "2")]
+        pub reason: u64,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -1606,8 +1615,8 @@ mod pb {
 
     #[derive(Clone, PartialEq, prost::Message)]
     pub struct Grants {
-        #[prost(enumeration = "Capability", repeated, tag = "1")]
-        pub capabilities: Vec<i32>,
+        #[prost(uint64, repeated, packed = "true", tag = "1")]
+        pub capabilities: Vec<u64>,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

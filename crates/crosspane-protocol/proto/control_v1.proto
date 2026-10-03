@@ -36,6 +36,7 @@ message Display {
   double physical_w_mm = 3; double physical_h_mm = 4;
   uint32 pixel_w = 5; uint32 pixel_h = 6;
   double scale = 7; double logical_x = 8; double logical_y = 9;
+  // Strict Rust decode: color_space's original varint must be 0..=2147483647 and a known code.
   uint32 refresh_millihz = 10; ColorSpace color_space = 11; bool hdr = 12;
 }
 message Displays { repeated Display displays = 1; }
@@ -44,18 +45,24 @@ message Placement { bytes node = 1; uint32 display = 2; double origin_x_mm = 3; 
 message Layout { repeated Placement placements = 1; }
 
 enum LockKey { LOCK_KEY_UNKNOWN = 0; LOCK_KEY_OFF = 1; LOCK_KEY_ON = 2; }
+// Strict Rust decode: caps' original varint must be 0..=2147483647 and a known code.
+// Strict Rust decode: num's original varint must be 0..=2147483647 and a known code.
+// Strict Rust decode: scroll's original varint must be 0..=2147483647 and a known code.
 message LockKeys { LockKey caps = 1; LockKey num = 2; LockKey scroll = 3; }
 
 message StartControl { uint64 session = 1; uint32 entry_display = 2; double entry_x = 3; double entry_y = 4; LockKeys lock_keys = 5; }
 message ControlStarted { uint64 session = 1; }
 
 enum Refusal { REFUSAL_UNSPECIFIED = 0; REFUSAL_PERMISSION = 1; REFUSAL_LOCKED = 2; REFUSAL_SECURE_INPUT = 3; REFUSAL_BUSY = 4; REFUSAL_INJECTOR_FAILED = 5; }
+// Strict Rust decode: reason's original varint must be 0..=2147483647 and a known nonzero code.
 message ControlRefused { uint64 session = 1; Refusal reason = 2; }
 
 enum EndReason { END_REASON_UNSPECIFIED = 0; END_REASON_RELEASED = 1; END_REASON_PANIC = 2; END_REASON_TARGET_LOCKED = 3; END_REASON_CONTROLLER_LOCKED = 4; END_REASON_LINK_LOST = 5; END_REASON_REVOKED = 6; }
+// Strict Rust decode: reason's original varint must be 0..=2147483647 and a known nonzero code.
 message EndControl { uint64 session = 1; EndReason reason = 2; }
 
 enum Capability { CAPABILITY_UNSPECIFIED = 0; CAPABILITY_INPUT_ACCEPT = 1; CAPABILITY_WINDOW_SHARE = 2; CAPABILITY_WINDOW_BROWSE = 3; CAPABILITY_WINDOW_PRESENT = 4; CAPABILITY_AUDIO_SPEAKER = 5; CAPABILITY_AUDIO_MIC = 6; CAPABILITY_CLIPBOARD_READ = 7; CAPABILITY_CLIPBOARD_WRITE = 8; }
+// Strict Rust decode: each capabilities varint must be 0..=2147483647 and a known nonzero code.
 message Grants { repeated Capability capabilities = 1; }
 
 message Revocation { bytes revoked = 1; bytes issuer = 2; uint64 issued_at_ms = 3; bytes signature = 4; }
@@ -219,7 +226,10 @@ message AudioRefused { uint32 stream = 1; uint32 reason = 2; }
 // CLIP-v0: no content on the control stream; 0/unknown enum codes are rejected.
 enum ClipKind { CLIP_KIND_UNSPECIFIED = 0; CLIP_KIND_TEXT = 1; CLIP_KIND_IMAGE = 2; }
 enum ClipFailure { CLIP_FAILURE_UNSPECIFIED = 0; CLIP_FAILURE_EXPIRED = 1; CLIP_FAILURE_LOCKED = 2; CLIP_FAILURE_NOT_GRANTED = 3; CLIP_FAILURE_TOO_LARGE = 4; CLIP_FAILURE_UNAVAILABLE = 5; }
+// Strict Rust decode: each kinds varint must be 0..=2147483647 and a known nonzero code.
 message ClipOffer { uint64 offer = 1; repeated ClipKind kinds = 2; } // 1..=2 distinct kinds.
 message ClipWithdraw { uint64 offer = 1; }
+// Strict Rust decode: kind's original varint must be 0..=2147483647 and a known nonzero code.
 message ClipFetch { uint64 fetch = 1; uint64 offer = 2; ClipKind kind = 3; }
+// Strict Rust decode: reason's original varint must be 0..=2147483647 and a known nonzero code.
 message ClipFetchFailed { uint64 fetch = 1; ClipFailure reason = 2; }
