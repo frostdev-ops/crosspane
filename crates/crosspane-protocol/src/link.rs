@@ -61,6 +61,14 @@ pub trait PeerLink: Send {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum LinkEvent {
+    /// One expected clipboard stream, with its exact length and FIN verified. No content is
+    /// exposed by this event's `Debug` implementation.
+    ClipData {
+        peer: NodeId,
+        fetch: crate::msg::ClipFetchId,
+        kind: crosspane_types::ClipKind,
+        data: crate::clip::ClipDataBytes,
+    },
     Audio {
         peer: NodeId,
         packet: crate::audio::AudioPacket,

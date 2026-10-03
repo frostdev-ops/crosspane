@@ -387,6 +387,21 @@ impl Raw {
         addr: SocketAddr,
         alpn: &[u8],
     ) -> Result<quinn::Connection, quinn::ConnectionError> {
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(1)));
+        self.connect_with_transport(identity, server, addr, alpn, transport)
+            .await
+    }
+
+    /// Configure flow control for owned-loopback backpressure fixtures only.
+    pub async fn connect_with_transport(
+        &self,
+        identity: &DeviceIdentity,
+        server: &DeviceIdentity,
+        addr: SocketAddr,
+        alpn: &[u8],
+        transport: quinn::TransportConfig,
+    ) -> Result<quinn::Connection, quinn::ConnectionError> {
         let provider = Arc::new(aws_lc_rs::default_provider());
         let verifier = Arc::new(ExpectKey {
             spki: server.spki().to_vec(),
@@ -402,8 +417,6 @@ impl Raw {
         tls.alpn_protocols = vec![alpn.to_vec()];
         let mut config =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
-        let mut transport = quinn::TransportConfig::default();
-        transport.keep_alive_interval(Some(Duration::from_secs(1)));
         config.transport_config(Arc::new(transport));
         timeout(
             WAIT,
@@ -631,6 +644,18 @@ pub struct RawReceiver {
 }
 
 impl RawReceiver {
+    /// Decode one fixture input message independently of a blocked media/clipboard stream.
+    pub async fn next_input(&mut self) -> InputMessage {
+        let mut decoder = FrameDecoder::new(crosspane_protocol::wire::MAX_INPUT_PAYLOAD);
+        loop {
+            if let Some(frame) = decoder.next_frame().unwrap() {
+                return crosspane_protocol::wire::decode_input(&frame).unwrap();
+            }
+            let chunk = self._input.read_chunk(4096, true).await.unwrap().unwrap();
+            decoder.push(&chunk.bytes);
+        }
+    }
+
     /// Accept the node's two streams and return the receiver together with the node's `Hello`.
     pub async fn accept(conn: &quinn::Connection) -> (RawReceiver, Hello) {
         let mut control = None;

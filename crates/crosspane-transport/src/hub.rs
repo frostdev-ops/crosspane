@@ -40,6 +40,7 @@
 //! 2. `peers` is the registry itself. It is released before the sink runs, so a sink may call
 //!    back into [`Transport`](crate::Transport) (`link`, `peers`) without deadlocking.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -58,6 +59,22 @@ use tokio::time::timeout;
 use crate::link::{ConnTx, FLUSH_TIMEOUT, LinkCell, QuicLink};
 use crate::session::{self, AcceptError, Start};
 use crate::{PinStore, TransportError, tls};
+
+thread_local! {
+    static EMITTING: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Tracks the already-held sink order so its own callback may cancel without re-locking it.
+struct Emission<'a> {
+    _order: MutexGuard<'a, ()>,
+    previous: usize,
+}
+
+impl Drop for Emission<'_> {
+    fn drop(&mut self) {
+        EMITTING.with(|active| active.set(self.previous));
+    }
+}
 
 /// How long `connect` may take in total.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -339,6 +356,7 @@ pub(crate) struct Inner {
     events: LinkEventSink,
     hello_frame: Vec<u8>,
     pub(crate) local_audio: bool,
+    pub(crate) local_clip: bool,
     pub(crate) client_config: quinn::ClientConfig,
     next_conn_id: AtomicU64,
     emit: Mutex<()>,
@@ -372,8 +390,9 @@ impl Inner {
         events: LinkEventSink,
         hello_frame: Vec<u8>,
         client_config: quinn::ClientConfig,
-        local_audio: bool,
+        local_features: (bool, bool),
     ) -> Self {
+        let (local_audio, local_clip) = local_features;
         Self {
             endpoint,
             local,
@@ -381,6 +400,7 @@ impl Inner {
             events,
             hello_frame,
             local_audio,
+            local_clip,
             client_config,
             next_conn_id: AtomicU64::new(1),
             emit: Mutex::new(()),
@@ -429,6 +449,18 @@ impl Inner {
             entry.cell.clone()
         };
         cell.send_media(frame)
+    }
+
+    pub(crate) fn clipboard(&self, peer: NodeId) -> Result<ConnTx, LinkError> {
+        let cell = {
+            let peers = lock(&self.peers);
+            let entry = peers.get(&peer).ok_or(LinkError::Closed)?;
+            if !entry.settled || !entry.live() {
+                return Err(LinkError::Closed);
+            }
+            entry.cell.clone()
+        };
+        cell.live()
     }
 
     /// The peer behind an open connection (settled or not) whose remote address is `addr`.
@@ -656,6 +688,7 @@ impl Inner {
         activity.touch();
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let audio_enabled = tx.audio_enabled.clone();
+        let clip = tx.clip.clone();
         let Some(hold) = self.place(peer, conn_id, client, tx, activity.clone()) else {
             conn.close(VarInt::from_u32(CODE_DUPLICATE), b"duplicate");
             tracing::debug!(peer = %peer.short(), ?role, "duplicate connection refused");
@@ -676,6 +709,7 @@ impl Inner {
             role,
             activity,
             audio_enabled,
+            clip,
         });
         if role == Role::Client {
             self.wait_settled(peer, CONNECT_TIMEOUT).await?;
@@ -746,7 +780,7 @@ impl Inner {
         tx: ConnTx,
         activity: Arc<Activity>,
     ) -> Option<bool> {
-        let _order = lock(&self.emit);
+        let _order = self.emission();
         let now = Instant::now();
         // It can lose rule 7 only if its client has the larger NodeId of the pair.
         let other = if client == self.local {
@@ -831,9 +865,57 @@ impl Inner {
 
     // ---- events ------------------------------------------------------------------------------
 
+    fn emission(&self) -> Emission<'_> {
+        let order = lock(&self.emit);
+        let previous = EMITTING.with(|active| active.replace(self as *const Self as usize));
+        Emission {
+            _order: order,
+            previous,
+        }
+    }
+
+    pub(crate) fn cancel_clip(&self, peer: NodeId) {
+        // External cancellation waits for an entered sink call. The same hub's callback has
+        // already entered that call and may retire its generation without recursively locking.
+        let inside_sink = EMITTING.with(|active| active.get() == self as *const Self as usize);
+        let _order = (!inside_sink).then(|| self.emission());
+        // Cancellation also covers a registered connection whose QUIC close beat cleanup.
+        let cell = lock(&self.peers).get(&peer).map(|entry| entry.cell.clone());
+        if let Some(cell) = cell {
+            cell.cancel_clip();
+        }
+    }
+
+    pub(crate) fn deliver_clip(&self, peer: NodeId, conn_id: u64, received: crate::clip::Received) {
+        #[cfg(test)]
+        let barrier = received.publication_barrier();
+        #[cfg(test)]
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+        // This is the existing sink order, not the Plane state lock. Cancellation cannot
+        // return between the final generation check and sink entry. finish releases the
+        // short generation lock before calling the sink, including reentrant cancellation.
+        let _order = self.emission();
+        if let Some(event) = received.finish() {
+            let current = lock(&self.peers)
+                .get(&peer)
+                .is_some_and(|entry| entry.conn_id == conn_id);
+            if current {
+                (self.events)(event);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clipboard_connection_id(&self, peer: NodeId) -> u64 {
+        lock(&self.peers).get(&peer).unwrap().conn_id
+    }
+
     /// Deliver `event` for `peer` if connection `conn_id` still carries the peer's link.
     pub(crate) fn deliver(&self, peer: NodeId, conn_id: u64, event: LinkEvent) {
-        let _order = lock(&self.emit);
+        let _order = self.emission();
         let current = lock(&self.peers)
             .get(&peer)
             .is_some_and(|entry| entry.conn_id == conn_id);
@@ -850,7 +932,7 @@ impl Inner {
     /// connection that is no longer the link's current one (refused, replaced, or closed) delivers
     /// nothing, so a stale connection never produces a refresh.
     pub(crate) fn deliver_hello(&self, peer: NodeId, conn_id: u64, hello: Hello) {
-        let _order = lock(&self.emit);
+        let _order = self.emission();
         let event = match lock(&self.peers).get_mut(&peer) {
             Some(entry) if entry.conn_id == conn_id => {
                 Some(if std::mem::replace(&mut entry.announced, true) {
@@ -884,7 +966,7 @@ impl Inner {
     /// Connection `conn_id` has closed: end the peer's link and tell the engine (if it knew the
     /// link), unless another connection already took the link over.
     pub(crate) fn finish(&self, peer: NodeId, conn_id: u64, error: LinkError) {
-        let _order = lock(&self.emit);
+        let _order = self.emission();
         let ended = {
             let mut peers = lock(&self.peers);
             match peers.get(&peer) {
