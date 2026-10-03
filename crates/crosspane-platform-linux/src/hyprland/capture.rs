@@ -40,6 +40,7 @@
 //! on `false`, on drop and when the compositor goes away, and never reads while monitoring is off.
 //! **Keyboard-only local input is not detected**: best effort, pointer only. See the
 //! `local_activity` module below for the exact rules.
+mod drag;
 mod events;
 mod wayland;
 use wayland::Refresh;
@@ -505,6 +506,7 @@ enum Operation {
     Portals(Vec<CapturePortal>, PortalsTestHooks),
     Subscribe(Arc<dyn EventSink<CaptureEvent>>),
     Begin(CaptureId, PortalId),
+    BeginDrag(PortalId, crosspane_types::hid::MouseButton),
     End(Option<(DisplayId, PointDevice)>),
     InjectWorkerError,
     /// Nested tests: why this connection ended captures.
@@ -719,6 +721,24 @@ impl InputCapture for HyprlandCapture {
             Reply::Done | Reply::Causes(_) => Err(backend("invalid capture response")),
         }
     }
+    fn begin_drag(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        button: crosspane_types::hid::MouseButton,
+    ) -> Result<CaptureStart, PlatformError> {
+        // Hyprland filters the original up on a new wl_pointer resource. Refuse immediately;
+        // the worker only arms a watch, leaving the native move and its release intact.
+        let _ = id;
+        let (reply, _) = mpsc::channel();
+        let _ = self.commands.send(Command {
+            operation: Operation::BeginDrag(portal, button),
+            deadline: Instant::now() + CALL_BUDGET,
+            epoch: self.abort.epoch.load(Ordering::Acquire),
+            reply,
+        });
+        Err(PlatformError::PointerButtonHeld)
+    }
     fn end(&mut self, warp: Option<(DisplayId, PointDevice)>) -> Result<(), PlatformError> {
         self.call(Operation::End(warp)).map(|_| ())
     }
@@ -912,6 +932,12 @@ fn worker(
             if matches!(command.operation, Operation::Begin(..)) && !gate.is_open() {
                 return Err(PlatformError::Locked);
             }
+            if let Operation::BeginDrag(portal, button) = &command.operation {
+                if subscribed && let Some(c) = client.as_mut() {
+                    c.refuse_drag(*portal, *button);
+                }
+                return Err(PlatformError::PointerButtonHeld);
+            }
             if client.is_none() {
                 let mut fresh = wayland::Client::new(
                     gate.clone(),
@@ -973,6 +999,7 @@ fn worker(
                     }
                     c.begin(id, portal, command.deadline).map(Reply::Started)
                 }
+                Operation::BeginDrag(..) => Err(PlatformError::PointerButtonHeld),
                 Operation::End(warp) => c.end(warp, command.deadline).map(|_| Reply::Done),
                 Operation::InjectWorkerError => {
                     c.inject_worker_error();
@@ -2897,6 +2924,32 @@ mod tests {
             monitor_source: None,
         };
         (capture, requests)
+    }
+
+    #[test]
+    fn begin_drag_refuses_immediately_without_waiting_for_or_starting_capture() {
+        let (mut capture, requests) = detached(None);
+        for button in [
+            crosspane_types::hid::MouseButton::PRIMARY,
+            crosspane_types::hid::MouseButton::SECONDARY,
+        ] {
+            let started = Instant::now();
+            assert!(matches!(
+                capture.begin_drag(CaptureId(9), PortalId(17), button),
+                Err(PlatformError::PointerButtonHeld)
+            ));
+            assert!(started.elapsed() < CALL_BUDGET);
+            let command = requests.try_recv().unwrap();
+            assert!(
+                matches!(command.operation, Operation::BeginDrag(PortalId(17), b) if b == button)
+            );
+            assert!(
+                command.reply.send(Ok(Reply::Done)).is_err(),
+                "refusal waited for a worker reply"
+            );
+            assert_eq!(capture.abort.next_capture.load(Ordering::Acquire), 0);
+            assert_eq!(capture.abort.epoch.load(Ordering::Acquire), 0);
+        }
     }
 
     /// Every public hook, called; each must refuse and none may reach the worker.

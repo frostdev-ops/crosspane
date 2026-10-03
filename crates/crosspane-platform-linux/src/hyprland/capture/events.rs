@@ -1,9 +1,9 @@
 //! Private in-process datagrams: no allocator or shared queue locks on the abort delivery path.
 use crosspane_platform::{CaptureEvent, CaptureId, EndReason, MotionKind, PortalId};
 use crosspane_types::{
-    geom::VectorLogical,
+    geom::{PointDevice, VectorLogical},
     hid::{HidUsage, MouseButton},
-    id::DisplayId,
+    id::{DisplayId, WindowId},
     input::{LockKeys, ScrollDelta, ScrollPhase},
     time::MonoTime,
 };
@@ -137,6 +137,32 @@ pub(super) fn encode(epoch: u64, generation: u64, event: &CaptureEvent) -> Optio
             w[0] = 10;
             w[3] = at.as_nanos();
         }
+        CaptureEvent::DragAtEdge {
+            portal,
+            position,
+            window,
+            grab,
+            at,
+        }
+        | CaptureEvent::DragDroppedAtEdge {
+            portal,
+            position,
+            window,
+            grab,
+            at,
+        } => {
+            w[0] = if matches!(event, CaptureEvent::DragDroppedAtEdge { .. }) {
+                13
+            } else {
+                12
+            };
+            w[3] = u64::from(portal.0);
+            w[4] = position.to_bits();
+            w[5] = window.0;
+            w[6] = grab.x.to_bits();
+            w[7] = grab.y.to_bits();
+            w[8] = at.as_nanos();
+        }
         _ => return None,
     }
     Some(bytes(w))
@@ -225,6 +251,20 @@ pub(super) fn decode(b: &[u8; SIZE]) -> Option<Packet> {
         9 => CaptureEvent::KeyboardBlinded(w[3] != 0),
         10 => CaptureEvent::LocalActivity { at: at(3) },
         11 => return Some(Packet::Barrier(w[1])),
+        12 => CaptureEvent::DragAtEdge {
+            portal: PortalId(w[3] as u32),
+            position: f(4),
+            window: WindowId(w[5]),
+            grab: PointDevice::new(f(6), f(7)),
+            at: at(8),
+        },
+        13 => CaptureEvent::DragDroppedAtEdge {
+            portal: PortalId(w[3] as u32),
+            position: f(4),
+            window: WindowId(w[5]),
+            grab: PointDevice::new(f(6), f(7)),
+            at: at(8),
+        },
         _ => return None,
     };
     Some(Packet::Event {
@@ -232,4 +272,38 @@ pub(super) fn decode(b: &[u8; SIZE]) -> Option<Packet> {
         generation: w[2],
         event,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_drag_packet_keeps_epoch_generation_window_and_device_grab() {
+        let event = CaptureEvent::DragAtEdge {
+            portal: PortalId(17),
+            position: 0.375,
+            window: WindowId(u64::MAX),
+            grab: PointDevice::new(120.5, 45.25),
+            at: MonoTime::from_nanos(12345),
+        };
+        let dropped = CaptureEvent::DragDroppedAtEdge {
+            portal: PortalId(17),
+            position: 0.375,
+            window: WindowId(u64::MAX),
+            grab: PointDevice::new(120.5, 45.25),
+            at: MonoTime::from_nanos(12345),
+        };
+        for event in [event, dropped] {
+            let Packet::Event {
+                epoch,
+                generation,
+                event: decoded,
+            } = decode(&encode(5, 9, &event).unwrap()).unwrap()
+            else {
+                panic!("wrong packet");
+            };
+            assert_eq!((epoch, generation, decoded), (5, 9, event));
+        }
+    }
 }

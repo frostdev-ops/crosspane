@@ -469,6 +469,111 @@ impl WindowParking for HyprlandParking {
         self.undo(window.0)
     }
 
+    fn restore_at(
+        &mut self,
+        window: WindowId,
+        display: DisplayId,
+        origin: crosspane_types::geom::PointDevice,
+    ) -> Result<(), PlatformError> {
+        self.restore(window)?;
+        let place = (|| {
+            if !origin.x.is_finite() || !origin.y.is_finite() {
+                return Err(backend("invalid restored-window origin".into()));
+            }
+            let client = self.client(window)?.ok_or(PlatformError::NotFound)?;
+            if client.get("floating").and_then(Value::as_bool) != Some(true) {
+                return Ok(());
+            }
+            let monitors = self.ipc.json("monitors")?;
+            let monitor = monitors
+                .as_array()
+                .and_then(|list| {
+                    list.iter()
+                        .find(|m| m.get("id").and_then(Value::as_u64) == Some(u64::from(display.0)))
+                })
+                .ok_or(PlatformError::NotFound)?;
+            let workspace = if monitor["specialWorkspace"]["id"]
+                .as_i64()
+                .is_some_and(|id| id != 0)
+            {
+                &monitor["specialWorkspace"]
+            } else {
+                &monitor["activeWorkspace"]
+            };
+            let name = workspace["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or(PlatformError::NotFound)?;
+            let address = client["address"].as_str().ok_or(PlatformError::NotFound)?;
+            if client["monitor"].as_u64() != Some(u64::from(display.0))
+                || client["workspace"]["name"].as_str() != Some(name)
+            {
+                let workspace = if name.starts_with("special:") {
+                    name.to_owned()
+                } else {
+                    format!("name:{name}")
+                };
+                self.ipc.dispatch(&format!(
+                    "hl.dsp.window.move({{ window = \"address:{}\", workspace = \"{}\", follow = false }})",
+                    lua_escape(address), lua_escape(&workspace)
+                ))?;
+            }
+            // Workspace assignment can change geometry/rules. Read it back before placement;
+            // an absolute coordinate move alone does not change Hyprland monitor membership.
+            let client = self.client(window)?.ok_or(PlatformError::NotFound)?;
+            if client["floating"].as_bool() != Some(true) {
+                return Ok(());
+            }
+            let number = |key: &str| {
+                monitor
+                    .get(key)
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| backend("invalid placement monitor".into()))
+            };
+            let (mut width, mut height) = (number("width")?, number("height")?);
+            let scale = number("scale")?;
+            if width <= 0.0 || height <= 0.0 || scale <= 0.0 {
+                return Err(backend("invalid placement monitor extent".into()));
+            }
+            if monitor
+                .get("transform")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                % 2
+                == 1
+            {
+                std::mem::swap(&mut width, &mut height);
+            }
+            let size = client_size(&client)
+                .filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
+                .ok_or(PlatformError::NotFound)?;
+            let reserved = reserved_from(monitor);
+            let x = number("x")?
+                + (origin.x / scale).clamp(
+                    f64::from(reserved[0]),
+                    (width / scale - f64::from(reserved[2]) - size.0).max(f64::from(reserved[0])),
+                );
+            let y = number("y")?
+                + (origin.y / scale).clamp(
+                    f64::from(reserved[1]),
+                    (height / scale - f64::from(reserved[3]) - size.1).max(f64::from(reserved[1])),
+                );
+            let address = client
+                .get("address")
+                .and_then(Value::as_str)
+                .ok_or(PlatformError::NotFound)?;
+            self.ipc.dispatch(&format!(
+                "hl.dsp.window.move({{ window = \"address:{}\", x = {x}, y = {y}, relative = false }})",
+                lua_escape(address)
+            ))
+        })();
+        if let Err(error) = place {
+            tracing::debug!(%error, window = window.0, "could not place a restored window");
+        }
+        Ok(())
+    }
+
     fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
         let windows: Vec<u64> = self.entries.keys().copied().collect();
         let mut restored = Vec::new();
@@ -1916,6 +2021,13 @@ mod tests {
         pending_clamp: Option<([i64; 2], u32)>,
         last_clamp: Option<[i64; 2]>,
         after_fit_drift: Option<[i64; 2]>,
+        home_monitor: Value,
+        second_monitor: Option<Value>,
+        home_workspace: String,
+        home_monitor_id: u32,
+        focused_monitor: u32,
+        placement_workspace_moves: usize,
+        geometry_workspace: Option<String>,
         journal: PathBuf,
     }
 
@@ -1967,10 +2079,8 @@ mod tests {
                     self.bar = bar;
                     self.tile();
                 }
-                let mut monitors = vec![serde_json::json!({
-                    "name": "DP-1", "id": 0, "x": 0, "y": 0,
-                    "width": 1920, "height": 1080, "scale": 1.0, "reserved": [0, 0, 0, 0],
-                })];
+                let mut monitors = vec![self.home_monitor.clone()];
+                monitors.extend(self.second_monitor.clone());
                 if self.output {
                     monitors.push(serde_json::json!({
                         "name": "CROSSPANE-1", "id": 7, "x": PARK_ORIGIN_X, "y": 0,
@@ -1992,7 +2102,8 @@ mod tests {
                 return serde_json::json!([{
                     "address": "0xabc", "stableId": "1", "floating": self.floating,
                     "fullscreen": self.fullscreen, "at": self.at, "size": self.size,
-                    "workspace": {"name": if self.on_twin {"crosspane-1"} else {"1"}},
+                    "monitor": if self.on_twin {7} else {self.home_monitor_id},
+                    "workspace": {"name": if self.on_twin {"crosspane-1"} else {&self.home_workspace}},
                 }])
                 .to_string();
             }
@@ -2078,17 +2189,47 @@ mod tests {
                 self.resizes += 1;
             } else if request.starts_with("/dispatch hl.dsp.window.move(") {
                 if let Some(workspace) = quoted("workspace") {
+                    if !self.output && self.fail_home_geometry == Some("workspace") {
+                        self.fail_home_geometry = None;
+                        return "scripted workspace placement failure".into();
+                    }
                     self.on_twin = workspace == "name:crosspane-1";
+                    if !self.on_twin {
+                        self.home_workspace =
+                            workspace.strip_prefix("name:").unwrap_or(workspace).into();
+                        self.home_monitor_id = self
+                            .second_monitor
+                            .as_ref()
+                            .filter(|m| {
+                                m["activeWorkspace"]["name"] == self.home_workspace
+                                    || m["specialWorkspace"]["name"] == self.home_workspace
+                            })
+                            .map_or(0, |m| m["id"].as_u64().unwrap() as u32);
+                    }
+                    if request.contains("follow = false") {
+                        self.placement_workspace_moves += 1;
+                    } else {
+                        self.focused_monitor = if self.on_twin {
+                            7
+                        } else {
+                            self.home_monitor_id
+                        };
+                    }
                     self.tile();
                 } else {
                     if self.fullscreen != 0 {
                         return "fullscreen window refuses move".into();
+                    }
+                    if !self.output && self.fail_home_geometry == Some("placement") {
+                        self.fail_home_geometry = None;
+                        return "scripted placement failure".into();
                     }
                     if !self.on_twin && self.fail_home_geometry == Some("move") {
                         self.fail_home_geometry = None;
                         return "scripted restore interruption".into();
                     }
                     self.at = [number("x") as i64, number("y") as i64];
+                    self.geometry_workspace = Some(self.home_workspace.clone());
                     self.moves += 1;
                 }
             }
@@ -2146,6 +2287,17 @@ mod tests {
                 pending_clamp: None,
                 last_clamp: None,
                 after_fit_drift: None,
+                home_monitor: serde_json::json!({
+                    "name": "DP-1", "id": 0, "x": 0, "y": 0,
+                    "width": 1920, "height": 1080, "scale": 1.0, "reserved": [0, 0, 0, 0],
+                    "activeWorkspace":{"id":1,"name":"1"}, "specialWorkspace":{"id":0,"name":""},
+                }),
+                second_monitor: None,
+                home_workspace: "1".into(),
+                home_monitor_id: 0,
+                focused_monitor: 0,
+                placement_workspace_moves: 0,
+                geometry_workspace: None,
                 journal: dir.join("parking.json"),
             }));
             let stop = Arc::new(AtomicBool::new(false));
@@ -2400,6 +2552,39 @@ mod tests {
     }
 
     #[test]
+    fn restore_at_clamps_floating_content_in_device_pixels_to_the_rotated_work_area() {
+        for (origin, expected) in [
+            ((-500.0, -500.0), [-940, 126]),
+            ((120.0, 180.0), [-870, 220]),
+            ((9999.0, 9999.0), [-156, 1486]),
+        ] {
+            let fake = BarFixture::new(true, [0; 4], None);
+            fake.world.lock().unwrap().home_monitor = serde_json::json!({
+                "name":"DP-1", "id":0, "x":-950, "y":100, "width":3000, "height":2400,
+                "scale":1.5, "transform":1, "reserved":[10,26,6,14],
+                "activeWorkspace":{"id":1,"name":"1"},
+            });
+            let mut parking = fake.parking();
+            parking
+                .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+                .unwrap();
+            parking
+                .restore_at(
+                    WindowId(1),
+                    DisplayId(0),
+                    crosspane_types::geom::PointDevice::new(origin.0, origin.1),
+                )
+                .unwrap();
+            let world = fake.world.lock().unwrap();
+            assert!(world.floating);
+            assert_eq!(world.size, [800, 600]);
+            assert_eq!(world.at, expected);
+            assert!(!world.output);
+            assert!(parking.entries.is_empty());
+        }
+    }
+
+    #[test]
     fn fake_float_rejects_implicit_actions_and_models_their_toggle() {
         let fake = BarFixture::new(false, [0; 4], None);
         let mut parking = fake.parking();
@@ -2421,6 +2606,127 @@ mod tests {
                 assert!(error.to_string().contains("invalid float action"));
                 assert_eq!(fake.world.lock().unwrap().floating, !initially_floating);
             }
+        }
+    }
+
+    #[test]
+    fn restore_at_leaves_tiles_to_layout_and_placement_failure_does_not_undo_restore() {
+        for floating in [false, true] {
+            let fake = BarFixture::new(floating, [0; 4], None);
+            let mut parking = fake.parking();
+            parking
+                .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+                .unwrap();
+            fake.world.lock().unwrap().fail_home_geometry = Some("placement");
+            parking
+                .restore_at(
+                    WindowId(1),
+                    DisplayId(0),
+                    crosspane_types::geom::PointDevice::new(900.0, 400.0),
+                )
+                .unwrap();
+            let world = fake.world.lock().unwrap();
+            assert_eq!(world.floating, floating);
+            assert!(!world.output);
+            assert!(!world.on_twin);
+            assert_eq!(world.fail_home_geometry.is_none(), floating);
+            assert!(parking.entries.is_empty());
+            assert_eq!(std::fs::read_to_string(&parking.journal).unwrap(), "[]");
+        }
+    }
+
+    #[test]
+    fn restore_at_assigns_the_visible_target_workspace_before_geometry_without_following() {
+        for special in [false, true] {
+            let fake = BarFixture::new(true, [0; 4], None);
+            fake.world.lock().unwrap().second_monitor = Some(serde_json::json!({
+                "name":"DP-2", "id":2, "x":1920, "y":0, "width":1920, "height":1080,
+                "scale":1.0, "reserved":[0,0,0,0], "activeWorkspace":{"id":9,"name":"9"},
+                "specialWorkspace":{"id":if special {-99} else {0}, "name":if special {"special:drop"} else {""}},
+            }));
+            let mut parking = fake.parking();
+            parking
+                .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+                .unwrap();
+            parking
+                .restore_at(
+                    WindowId(1),
+                    DisplayId(2),
+                    crosspane_types::geom::PointDevice::new(100.0, 100.0),
+                )
+                .unwrap();
+            let mut world = fake.world.lock().unwrap();
+            let workspace = if special { "special:drop" } else { "9" };
+            assert_eq!(world.home_monitor_id, 2);
+            assert_eq!(world.home_workspace, workspace);
+            assert_eq!(world.geometry_workspace.as_deref(), Some(workspace));
+            assert_eq!(world.placement_workspace_moves, 1);
+            assert_eq!(world.focused_monitor, 0); // restore returns home; placement never follows B.
+            assert_eq!(world.at, [2020, 100]);
+            assert_eq!(world.size, [800, 600]);
+            assert!(world.floating);
+            assert!(!world.output);
+            assert!(parking.entries.is_empty());
+            world.home_monitor["activeWorkspace"] = serde_json::json!({"id":2,"name":"2"});
+            let b = world.second_monitor.as_ref().unwrap();
+            assert!(
+                world.home_workspace == b["activeWorkspace"]["name"]
+                    || world.home_workspace == b["specialWorkspace"]["name"]
+            );
+            assert_ne!(
+                world.home_workspace,
+                world.home_monitor["activeWorkspace"]["name"]
+            );
+            assert_eq!(world.home_monitor_id, 2); // switching A does not hide the window on B.
+        }
+    }
+    #[test]
+    fn restore_at_workspace_placement_failure_keeps_the_successful_restore() {
+        let fake = BarFixture::new(true, [0; 4], None);
+        fake.world.lock().unwrap().second_monitor = Some(serde_json::json!({
+            "id":2,"activeWorkspace":{"id":9,"name":"9"},
+        }));
+        let mut parking = fake.parking();
+        parking
+            .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+            .unwrap();
+        fake.world.lock().unwrap().fail_home_geometry = Some("workspace");
+        parking
+            .restore_at(
+                WindowId(1),
+                DisplayId(2),
+                crosspane_types::geom::PointDevice::new(100.0, 100.0),
+            )
+            .unwrap();
+        let world = fake.world.lock().unwrap();
+        assert_eq!(world.home_monitor_id, 0);
+        assert_eq!(world.home_workspace, "1");
+        assert_eq!(world.at, [100, 100]);
+        assert_eq!(world.size, [800, 600]);
+        assert!(world.floating);
+        assert!(!world.output);
+        assert!(parking.entries.is_empty());
+        assert_eq!(std::fs::read_to_string(&parking.journal).unwrap(), "[]");
+    }
+    #[test]
+    fn restore_at_preserves_restore_errors_and_ignores_bad_placement_targets() {
+        for fail_restore in [false, true] {
+            let fake = BarFixture::new(true, [0; 4], None);
+            let mut parking = fake.parking();
+            parking
+                .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+                .unwrap();
+            if fail_restore {
+                fake.world.lock().unwrap().fail_home_geometry = Some("resize");
+            }
+            let result = parking.restore_at(
+                WindowId(1),
+                DisplayId(999),
+                crosspane_types::geom::PointDevice::new(0.0, 0.0),
+            );
+            assert_eq!(result.is_err(), fail_restore);
+            assert_eq!(parking.entries.is_empty(), !fail_restore);
+            assert_eq!(fake.world.lock().unwrap().output, fail_restore);
         }
     }
 

@@ -1,4 +1,6 @@
-use super::{Abort, Delivery, Socket, SocketGuard, Source, backend, events, rejected, unmark};
+use super::{
+    Abort, Delivery, Socket, SocketGuard, Source, backend, drag, events, rejected, unmark,
+};
 use crosspane_platform::{
     CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, Edge, EndReason, IoGate,
     MotionKind, PlatformError, PortalId,
@@ -155,13 +157,14 @@ struct Globals {
     inhibit: ZwpKeyboardShortcutsInhibitManagerV1,
     virtual_pointer: ZwlrVirtualPointerManagerV1,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Monitor {
-    id: DisplayId,
-    name: String,
-    width: u32,
-    height: u32,
-    scale: f64,
+    pub(super) id: DisplayId,
+    pub(super) name: String,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) scale: f64,
+    pub(super) origin: [f64; 2],
 }
 struct Output {
     global: u32,
@@ -256,6 +259,8 @@ struct State {
     buttons: BTreeSet<u32>,
     keys: BTreeSet<u32>,
     capture: Option<Capture>,
+    gesture: drag::Gesture,
+    drag: drag::Poller,
     generation: u64,
     cursor: Option<WpCursorShapeDeviceV1>,
     xkb: Option<xkb::State>,
@@ -281,7 +286,7 @@ struct AxisFrame {
     present: bool,
 }
 
-fn now() -> MonoTime {
+pub(super) fn now() -> MonoTime {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     MonoTime::from_nanos(
         (t.tv_sec.max(0) as u64)
@@ -371,8 +376,8 @@ impl Client {
         let mut state = State {
             connection: conn.clone(),
             socket,
-            gate,
-            abort,
+            gate: gate.clone(),
+            abort: abort.clone(),
             epoch,
             advertised: Vec::new(),
             outputs: Vec::new(),
@@ -393,6 +398,8 @@ impl Client {
             buttons: BTreeSet::new(),
             keys: BTreeSet::new(),
             capture: None,
+            gesture: drag::Gesture::default(),
+            drag: drag::Poller::new(source.clone(), gate, abort, epoch)?,
             generation: 0,
             cursor: None,
             xkb: None,
@@ -487,14 +494,62 @@ impl Client {
     pub(super) fn pump(&mut self, timeout: Duration) -> Result<(), PlatformError> {
         self.state.check_gate();
         self.state.check_epoch()?;
+        self.state.drag.configure(
+            self.state
+                .strips
+                .values()
+                .filter(|p| p.mapped)
+                .map(|p| p.portal)
+                .collect(),
+            self.state.monitors.clone(),
+            self.state.capture.is_some() || !self.state.gate.is_open(),
+        );
         if let Some(error) = self.state.error.take() {
             return Err(error);
         }
+        self.state.poll_drag(); // Process ready cancellation before any queued strip enter.
         pump(&self.conn, &mut self.queue, &mut self.state, timeout)?;
         self.state.release_deferred(false);
         self.state.check_epoch()?;
+        self.state.poll_drag();
         if let Some(error) = self.state.error.take() {
             return Err(error);
+        }
+        // The ruled R3 nudge is confined to a live watch, never ordinary idle/capture traffic.
+        if self.state.capture.is_none() && self.state.gate.is_open() {
+            let _ = self.nudge_watch();
+        }
+        Ok(())
+    }
+    fn nudge_watch(&mut self) -> Result<(), PlatformError> {
+        let portals: Vec<_> = self
+            .state
+            .strips
+            .values()
+            .filter(|p| p.mapped)
+            .map(|p| p.portal)
+            .collect();
+        let Some(watch) = self.state.gesture.watch.as_mut() else {
+            return Ok(());
+        };
+        if !watch.valid(
+            Some(&watch.hit.sample),
+            &portals,
+            &self.state.monitors,
+            Instant::now(),
+        ) {
+            self.state.gesture = drag::Gesture::default();
+            return Ok(());
+        }
+        if !watch.nudge(Instant::now()) {
+            return Ok(());
+        }
+        let ipc = self.source.ipc(Duration::from_millis(8))?;
+        self.state.check_epoch()?;
+        if self.state.gate.is_open() {
+            // Atomic public Lua query keeps fractional coordinates and cannot overwrite motion
+            // that occurred after a separate IPC read (j/cursorpos also floors its coordinates).
+            ipc.eval("local p = hl.get_cursor_pos() if p then hl.dispatch(hl.dsp.cursor.move({x = p.x, y = p.y})) end")?;
         }
         Ok(())
     }
@@ -632,6 +687,16 @@ impl Client {
                     width,
                     height,
                     scale,
+                    origin: [
+                        m["x"]
+                            .as_f64()
+                            .filter(|x| x.is_finite())
+                            .ok_or_else(|| backend("invalid monitor origin"))?,
+                        m["y"]
+                            .as_f64()
+                            .filter(|y| y.is_finite())
+                            .ok_or_else(|| backend("invalid monitor origin"))?,
+                    ],
                 })
             })
             .collect::<Result<_, PlatformError>>()
@@ -1018,6 +1083,15 @@ impl Client {
         self.conn.flush().map_err(backend)?;
         Ok(())
     }
+    pub(super) fn refuse_drag(&mut self, portal: PortalId, button: MouseButton) {
+        self.state.poll_drag();
+        if self.state.gate.is_open()
+            && self.state.capture.is_none()
+            && self.state.portals.contains_key(&portal)
+        {
+            self.state.gesture.refuse(portal, button, Instant::now());
+        }
+    }
     pub(super) fn begin(
         &mut self,
         id: CaptureId,
@@ -1025,6 +1099,8 @@ impl Client {
         deadline: Instant,
     ) -> Result<CaptureStart, PlatformError> {
         self.pump(Duration::ZERO)?;
+        self.state.drag.pause(deadline)?;
+        self.state.gesture = drag::Gesture::default();
         if !self.state.gate.is_open() {
             return Err(PlatformError::Locked);
         }
@@ -1355,6 +1431,38 @@ fn pump(
     Ok(())
 }
 impl State {
+    fn poll_drag(&mut self) {
+        if self.capture.is_some() || !self.gate.is_open() || self.check_epoch().is_err() {
+            return;
+        }
+        let samples = self.drag.take();
+        if samples.is_empty() {
+            return;
+        }
+        let portals: Vec<_> = self
+            .strips
+            .values()
+            .filter(|p| p.mapped)
+            .map(|p| p.portal)
+            .collect();
+        for sample in samples {
+            let (released, hit) =
+                self.gesture
+                    .observe(sample, &portals, &self.monitors, Instant::now());
+            if let Some(portal) = released {
+                self.emit(CaptureEvent::EdgeReleased { portal, at: now() });
+            }
+            if let Some(hit) = hit {
+                self.emit(CaptureEvent::DragAtEdge {
+                    portal: hit.portal,
+                    position: hit.position,
+                    window: hit.sample.window,
+                    grab: hit.grab,
+                    at: hit.sample.at,
+                });
+            }
+        }
+    }
     fn check_epoch(&self) -> Result<(), PlatformError> {
         if self.epoch != self.abort.epoch.load(Ordering::Acquire) {
             Err(backend("capture cancelled"))
@@ -1371,6 +1479,9 @@ impl State {
         }
     }
     fn check_gate(&mut self) {
+        if !self.gate.is_open() {
+            self.gesture = drag::Gesture::default();
+        }
         if !self.gate.is_open() && self.capture.is_some() {
             self.finish(EndReason::Lost, Cause::GateClosed);
         }
@@ -1512,7 +1623,8 @@ impl State {
         }
     }
     fn pressed(&mut self, tag: u64, x: f64, y: f64, at: MonoTime) {
-        if self.capture.is_some() {
+        self.check_gate();
+        if self.capture.is_some() || !self.gate.is_open() || self.check_epoch().is_err() {
             return;
         }
         let Some(strip) = self.strips.get(&tag).filter(|p| p.mapped) else {
@@ -1536,6 +1648,25 @@ impl State {
             return;
         }
         self.pressing = Some(portal);
+        let portals: Vec<_> = self
+            .strips
+            .values()
+            .filter(|p| p.mapped)
+            .map(|p| p.portal)
+            .collect();
+        let hit = self.drag.fence(|sample| {
+            self.gesture
+                .pressed(sample, portal, &portals, &self.monitors, Instant::now())
+        });
+        if let Some(hit) = hit.filter(|_| self.gate.is_open() && self.check_epoch().is_ok()) {
+            self.emit(CaptureEvent::DragDroppedAtEdge {
+                portal,
+                position: hit.position,
+                window: hit.sample.window,
+                grab: hit.grab,
+                at,
+            });
+        }
         self.emit(CaptureEvent::EdgePressed {
             portal,
             position,
@@ -2185,6 +2316,7 @@ mod tests {
             width: 100,
             height: 100,
             scale: 1.0,
+            origin: [0.0, 0.0],
         }
     }
 

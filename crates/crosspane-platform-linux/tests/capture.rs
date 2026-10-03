@@ -13,7 +13,12 @@ use crosspane_platform_linux::hyprland::{
     cursor_position,
     ipc::HyprIpc,
 };
-use crosspane_types::{geom::PointDevice, hid::HidUsage, id::DisplayId, input::ScrollPhase};
+use crosspane_types::{
+    geom::PointDevice,
+    hid::{HidUsage, MouseButton},
+    id::DisplayId,
+    input::ScrollPhase,
+};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use std::{
     fs::{File, OpenOptions},
@@ -2753,6 +2758,9 @@ struct ToplevelState {
     keys: u32,
     motions: u32,
     buttons: u32,
+    move_on_primary: bool,
+    seat: Option<wl_seat::WlSeat>,
+    toplevel: Option<XdgToplevel>,
 }
 struct Toplevel {
     conn: Connection,
@@ -2783,7 +2791,11 @@ impl Toplevel {
         toplevel.set_title("crosspane-capture-test-toplevel".into());
         toplevel.set_app_id("crosspane-capture-test-toplevel".into());
         surface.commit();
-        let mut state = ToplevelState::default();
+        let mut state = ToplevelState {
+            seat: Some(seat),
+            toplevel: Some(toplevel.clone()),
+            ..Default::default()
+        };
         let deadline = Instant::now() + Duration::from_secs(3);
         while !state.acked {
             driver_pump(&conn, &mut queue, &mut state);
@@ -2859,6 +2871,571 @@ impl Toplevel {
         self.sync();
         (self.state.keys, self.state.motions, self.state.buttons)
     }
+}
+
+/// Opt-in prerequisite for R3. The parent has no compositor endpoints; it creates one fresh
+/// script-owned nest and gives only its verified endpoints to the measurement child.
+fn owned_drag_test(test: &str) -> bool {
+    if std::env::var("CROSSPANE_WP255_DROP_PROBE").as_deref() != Ok("1") {
+        return false;
+    }
+    if std::env::var("CROSSPANE_CAPTURE_CHILD").as_deref() != Ok(test) {
+        let _exclusive = lock_file(
+            "crosspane-capture-topology.lock",
+            rustix::fs::FlockOperation::LockExclusive,
+        );
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let wrapper = root.join("scripts/lead/impl-env.sh");
+        let script = root.join("scripts/hypr-nested.sh");
+        let name = format!("wp255-drop-probe-{}", std::process::id());
+        let state = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+            .join(format!("crosspane-hypr-{name}"));
+        assert!(!state.exists(), "refusing a pre-existing nest state");
+        struct Stop {
+            wrapper: PathBuf,
+            script: PathBuf,
+            name: String,
+        }
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                // The script rechecks its recorded PID/start before any signal.
+                let _ = Command::new(&self.wrapper)
+                    .arg(&self.script)
+                    .args(["stop", "--name", &self.name])
+                    .status();
+            }
+        }
+        let _stop = Stop {
+            wrapper: wrapper.clone(),
+            script: script.clone(),
+            name: name.clone(),
+        };
+        assert!(
+            Command::new(&wrapper)
+                .arg(&script)
+                .args(["start", "--name", &name])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let exports = Command::new(&wrapper)
+            .arg(&script)
+            .args(["env", "--name", &name])
+            .output()
+            .unwrap();
+        assert!(exports.status.success());
+        let mut child = Command::new(&wrapper);
+        child.arg("env");
+        for line in String::from_utf8(exports.stdout).unwrap().lines() {
+            if line == "unset WAYLAND_SOCKET" {
+                continue;
+            }
+            let (key, value) = line
+                .strip_prefix("export ")
+                .unwrap()
+                .split_once('=')
+                .unwrap();
+            assert!(matches!(
+                key,
+                "WAYLAND_DISPLAY" | "HYPRLAND_INSTANCE_SIGNATURE" | "CROSSPANE_NESTED_HYPR"
+            ));
+            assert!(
+                value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            );
+            child.arg(format!("{key}={value}"));
+        }
+        let result = child
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("CROSSPANE_CAPTURE_CHILD", test)
+            .output()
+            .unwrap();
+        eprint!("{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{test} failed:\n{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        return false;
+    }
+    assert!(nested()); // PID/start, lock PID/display and both sockets, before any connection.
+    settle_outputs(&ipc());
+    true
+}
+
+#[test]
+fn native_atomic_nudge_preserves_fractional_position_and_intervening_motion() {
+    if !owned_drag_test("native_atomic_nudge_preserves_fractional_position_and_intervening_motion")
+    {
+        return;
+    }
+    let _guard = serialize();
+    let ipc = ipc();
+    let mut driver = Driver::new();
+    fn unrounded(ipc: &HyprIpc) -> [f64; 2] {
+        // eval normally returns only "ok". A deliberate test-only error exposes the public
+        // query's two unrounded numbers without adding compositor state or a new binding.
+        let reply = ipc.request("eval local p = hl.get_cursor_pos() error(string.format('WP255_POSITION %.17g %.17g', p.x, p.y))").unwrap();
+        let values: Vec<_> = reply
+            .split_once("WP255_POSITION ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .take(2)
+            .map(|v| v.parse::<f64>().unwrap())
+            .collect();
+        [values[0], values[1]]
+    }
+    const NUDGE: &str = "local p = hl.get_cursor_pos() if p then hl.dispatch(hl.dsp.cursor.move({x = p.x, y = p.y})) end";
+    for (x, y) in [(100.25, 100.75), (200.125, 300.875), (500.5, 400.25)] {
+        ipc.eval(&format!("hl.dispatch(hl.dsp.cursor.move({{x={x},y={y}}}))"))
+            .unwrap();
+        let before = unrounded(&ipc);
+        assert_eq!(before, [x, y]);
+        let rounded = ipc.json("cursorpos").unwrap();
+        assert_ne!(rounded["x"].as_f64().unwrap(), before[0]);
+        ipc.eval(NUDGE).unwrap();
+        let after = unrounded(&ipc);
+        assert_eq!(after, before);
+        // A sample read before this motion is now stale; the atomic nudge must use the new
+        // compositor position, preserving both the fractional remainder and actual travel.
+        driver.motion(2.5, 1.25);
+        let moved = unrounded(&ipc);
+        assert_ne!(moved, before);
+        ipc.eval(NUDGE).unwrap();
+        let nudged = unrounded(&ipc);
+        assert_eq!(nudged, moved);
+        eprintln!(
+            "atomic nudge: before {before:?}, rounded {rounded}, after {after:?}; intervening motion {moved:?}, after nudge {nudged:?}"
+        );
+    }
+}
+
+#[test]
+fn native_drag_drop_nudge_waits_for_release_without_stopping_native_move() {
+    if !owned_drag_test("native_drag_drop_nudge_waits_for_release_without_stopping_native_move") {
+        return;
+    }
+    let _guard = serialize();
+    let ipc = ipc();
+    ipc.eval("hl.bind(\"SUPER + mouse:272\", hl.dsp.window.drag(), { mouse = true })")
+        .unwrap();
+    fn edge(f: &Fixture, budget: Duration) -> Option<CaptureEvent> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match f
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(event @ CaptureEvent::EdgePressed { .. }) => return Some(event),
+                Ok(_) => (),
+                Err(_) => return None,
+            }
+        }
+    }
+    for path in ["bindm", "xdg"] {
+        let driver = Driver::bare();
+        let mut window = Toplevel::new();
+        let mut f = Fixture::with_driver(driver, Arc::new(|_| {}));
+        let client = ipc.json("activewindow").unwrap();
+        let address = client["address"].as_str().unwrap();
+        assert!(
+            address
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() || ch == 'x')
+        );
+        ipc.eval(&format!(
+            "hl.dispatch(hl.dsp.window.float({{window=\"address:{address}\",action=\"enable\"}}))"
+        ))
+        .unwrap();
+        ipc.eval(&format!("hl.dispatch(hl.dsp.window.move({{window=\"address:{address}\",x=200,y=100,relative=false}}))")).unwrap();
+        f.driver.absolute_at(280, 180);
+        let normal_before = window.received().2;
+        f.driver.button(true);
+        f.driver.button(false);
+        assert!(
+            window.wait(|state| state.buttons >= normal_before + 2),
+            "{path}: ordinary pre-drag fixture click missing"
+        );
+        let before = ipc.json("activewindow").unwrap();
+        let cursor_before = ipc.json("cursorpos").unwrap();
+        if path == "bindm" {
+            f.driver.keyboard.key(f.driver.time(), 125, 1);
+            f.driver.keyboard.modifiers(64, 0, 0, 0);
+            f.driver.sync();
+        } else {
+            window.state.move_on_primary = true;
+        }
+        f.driver.button(true);
+        if path == "xdg" {
+            assert!(window.wait(|state| !state.move_on_primary));
+            window.sync();
+        }
+        f.driver.absolute_at(320, 200);
+        let moving = ipc.json("activewindow").unwrap();
+        let cursor_moving = ipc.json("cursorpos").unwrap();
+        assert_eq!(moving["address"], before["address"]);
+        assert_eq!(moving["size"], before["size"]);
+        for (axis, key) in ["x", "y"].into_iter().enumerate() {
+            let delta = cursor_moving[key].as_f64().unwrap() - cursor_before[key].as_f64().unwrap();
+            let window_delta =
+                moving["at"][axis].as_f64().unwrap() - before["at"][axis].as_f64().unwrap();
+            assert!(
+                delta.abs() >= 4.0 && (delta - window_delta).abs() <= 1.0,
+                "{path}: no coherent native drag"
+            );
+        }
+        eprintln!(
+            "R2 refusal probe {path}: window {} -> {}, cursor {} -> {}, size {}",
+            before["at"], moving["at"], cursor_before, cursor_moving, moving["size"]
+        );
+        f.driver.absolute(Edge::Right, true);
+        assert!(
+            edge(&f, Duration::from_millis(50)).is_none(),
+            "{path}: strip entered before nudges"
+        );
+        let cursor = ipc.json("cursorpos").unwrap();
+        let nudge = "local p = hl.get_cursor_pos() if p then hl.dispatch(hl.dsp.cursor.move({x = p.x, y = p.y})) end";
+        for count in 1..=10 {
+            let started = Instant::now();
+            ipc.eval(nudge).unwrap();
+            let event = edge(
+                &f,
+                Duration::from_millis(50).saturating_sub(started.elapsed()),
+            );
+            eprintln!(
+                "R2 refusal {path} held nudge {count}/10: /eval {nudge}; event {event:?}; elapsed {:?}",
+                started.elapsed()
+            );
+            assert!(
+                event.is_none(),
+                "{path}: held nudge incorrectly entered strip"
+            );
+            assert_eq!(ipc.json("cursorpos").unwrap(), cursor);
+        }
+        let released = Instant::now();
+        f.driver.button(false); // Native drag ends by its own release; no drag() IPC anywhere here.
+        let cursor = ipc.json("cursorpos").unwrap();
+        let nudged = Instant::now();
+        ipc.eval(nudge).unwrap();
+        let event = edge(&f, Duration::from_millis(150));
+        eprintln!(
+            "R2 refusal {path} released nudges1 event {event:?}, release elapsed {:?}, nudge elapsed {:?}, drop at {} size {} floating {}",
+            released.elapsed(),
+            nudged.elapsed(),
+            ipc.json("activewindow").unwrap()["at"],
+            ipc.json("activewindow").unwrap()["size"],
+            ipc.json("activewindow").unwrap()["floating"]
+        );
+        assert!(
+            matches!(event, Some(CaptureEvent::EdgePressed { portal, .. }) if portal == f.portal.id),
+            "{path}: release did not enter within one nudge"
+        );
+        assert_eq!(ipc.json("cursorpos").unwrap(), cursor);
+        if path == "bindm" {
+            f.driver.keyboard.key(f.driver.time(), 125, 0);
+            f.driver.keyboard.modifiers(0, 0, 0, 0);
+            f.driver.sync();
+        }
+    }
+}
+
+#[test]
+fn native_refused_drags_publish_one_drop_for_bindm_xdg_float_and_tile() {
+    if !owned_drag_test("native_refused_drags_publish_one_drop_for_bindm_xdg_float_and_tile") {
+        return;
+    }
+    let _guard = serialize();
+    let ipc = ipc();
+    ipc.eval("hl.bind(\"SUPER + mouse:272\", hl.dsp.window.drag(), { mouse = true })")
+        .unwrap();
+    for path in ["bindm", "xdg"] {
+        for floating in [true, false] {
+            let driver = Driver::bare();
+            let mut window = Toplevel::new();
+            let mut f = Fixture::with_driver(driver, Arc::new(|_| {}));
+            let client = ipc.json("activewindow").unwrap();
+            let address = client["address"].as_str().unwrap();
+            assert!(
+                address
+                    .chars()
+                    .all(|ch| ch.is_ascii_hexdigit() || ch == 'x')
+            );
+            let action = if floating { "enable" } else { "disable" };
+            ipc.eval(&format!(
+                "hl.dispatch(hl.dsp.window.float({{window=\"address:{address}\",action=\"{action}\"}}))"
+            ))
+            .unwrap();
+            if floating {
+                ipc.eval(&format!("hl.dispatch(hl.dsp.window.move({{window=\"address:{address}\",x=200,y=100,relative=false}}))")).unwrap();
+            }
+            assert_eq!(ipc.json("activewindow").unwrap()["floating"], floating);
+            f.driver.absolute_at(300, 190);
+            f.driver.absolute_at(280, 180);
+            let clicks = window.received().2;
+            f.driver.button(true);
+            f.driver.button(false);
+            assert!(
+                window.wait(|state| state.buttons >= clicks + 2),
+                "{path}/{floating}: initial focus/click control failed"
+            );
+            if path == "bindm" {
+                f.driver.keyboard.key(f.driver.time(), 125, 1);
+                f.driver.keyboard.modifiers(64, 0, 0, 0);
+                f.driver.sync();
+            } else {
+                window.state.move_on_primary = true;
+            }
+            f.driver.button(true);
+            if path == "xdg" {
+                assert!(window.wait(|state| !state.move_on_primary));
+                window.sync();
+            }
+            // The first motion floats a native tile and changes its size: reset that sample.
+            f.driver.absolute_at(320, 200);
+            std::thread::sleep(Duration::from_millis(500));
+            let before = ipc.json("activewindow").unwrap();
+            let cursor_before = ipc.json("cursorpos").unwrap();
+            f.driver.absolute_at(360, 220);
+            let moving = ipc.json("activewindow").unwrap();
+            let cursor = ipc.json("cursorpos").unwrap();
+            assert_eq!(moving["address"], before["address"]);
+            assert_eq!(moving["size"], before["size"]);
+            for (axis, key) in ["x", "y"].into_iter().enumerate() {
+                let delta = cursor[key].as_f64().unwrap() - cursor_before[key].as_f64().unwrap();
+                let moved =
+                    moving["at"][axis].as_f64().unwrap() - before["at"][axis].as_f64().unwrap();
+                assert!(delta.abs() >= 4.0 && (delta - moved).abs() <= 1.0);
+            }
+            std::thread::sleep(Duration::from_millis(120));
+            f.driver.absolute(Edge::Right, true);
+            let detected = f.wait(|e| matches!(e, CaptureEvent::DragAtEdge { .. }));
+            let CaptureEvent::DragAtEdge {
+                portal,
+                position,
+                window: id,
+                grab,
+                ..
+            } = detected
+            else {
+                unreachable!();
+            };
+            assert_eq!(portal, f.portal.id);
+            let started = Instant::now();
+            assert!(matches!(
+                f.capture
+                    .begin_drag(CaptureId(99), portal, MouseButton::PRIMARY),
+                Err(PlatformError::PointerButtonHeld)
+            ));
+            assert!(started.elapsed() < Duration::from_millis(40));
+            let refused = started.elapsed();
+            // Refusal must leave the native move running, with no lock or fabricated press.
+            let before = ipc.json("activewindow").unwrap();
+            f.driver.motion(0.0, 4.0);
+            let moving = ipc.json("activewindow").unwrap();
+            assert!(
+                (moving["at"][1].as_f64().unwrap() - before["at"][1].as_f64().unwrap() - 4.0).abs()
+                    <= 1.0
+            );
+            let held = Instant::now();
+            while held.elapsed() < Duration::from_millis(550) {
+                if let Ok(event) = f.events.recv_timeout(Duration::from_millis(20)) {
+                    assert!(
+                        !matches!(
+                            event,
+                            CaptureEvent::DragDroppedAtEdge { .. }
+                                | CaptureEvent::Started { .. }
+                                | CaptureEvent::Button { .. }
+                        ),
+                        "{path}/{floating}: held event {event:?}"
+                    );
+                }
+            }
+            let released = Instant::now();
+            f.driver.button(false);
+            let dropped = f.wait(|e| matches!(e, CaptureEvent::DragDroppedAtEdge { .. }));
+            assert!(released.elapsed() < Duration::from_millis(150));
+            let drop_latency = released.elapsed();
+            assert!(
+                matches!(dropped, CaptureEvent::DragDroppedAtEdge { portal: p, position: s, window: w, grab: g, .. } if p == portal && s == position && w == id && g == grab)
+            );
+            let until = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < until {
+                if let Ok(event) = f
+                    .events
+                    .recv_timeout(until.saturating_duration_since(Instant::now()))
+                {
+                    assert!(
+                        !matches!(
+                            event,
+                            CaptureEvent::DragDroppedAtEdge { .. }
+                                | CaptureEvent::Started { .. }
+                                | CaptureEvent::Button { .. }
+                        ),
+                        "{path}/{floating}: repeated/active event {event:?}"
+                    );
+                }
+            }
+            if path == "bindm" {
+                f.driver.keyboard.key(f.driver.time(), 125, 0);
+                f.driver.keyboard.modifiers(0, 0, 0, 0);
+                f.driver.sync();
+            }
+            let post = ipc.json("activewindow").unwrap();
+            eprintln!(
+                "native watch {path}/{floating}: refused {:?}; one drop {:?} after release {:?}; post at {} size {} floating {}",
+                refused, dropped, drop_latency, post["at"], post["size"], post["floating"]
+            );
+            let clicks = window.received().2;
+            f.driver.absolute_at(280, 180);
+            f.driver.button(true);
+            f.driver.button(false);
+            window.sync();
+            eprintln!(
+                "native watch {path}/{floating}: later click buttons {} -> {}, pointer focus {}, actual client {}",
+                clicks,
+                window.received().2,
+                window.state.pointer_focus,
+                ipc.json("activewindow").unwrap()["at"]
+            );
+        }
+    }
+}
+
+#[test]
+fn native_worker_cancellation_and_repeated_refusals_preserve_watch_bounds() {
+    if !owned_drag_test("native_worker_cancellation_and_repeated_refusals_preserve_watch_bounds") {
+        return;
+    }
+    let _guard = serialize();
+    let ipc = ipc();
+    ipc.eval("hl.bind(\"SUPER + mouse:272\", hl.dsp.window.drag(), { mouse = true })")
+        .unwrap();
+    let driver = Driver::bare();
+    let mut window = Toplevel::new();
+    let mut f = Fixture::with_driver(driver, Arc::new(|_| {}));
+    let client = ipc.json("activewindow").unwrap();
+    let address = client["address"].as_str().unwrap();
+    assert!(
+        address
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || ch == 'x')
+    );
+    ipc.eval(&format!(
+        "hl.dispatch(hl.dsp.window.float({{window=\"address:{address}\",action=\"enable\"}}))"
+    ))
+    .unwrap();
+    ipc.eval(&format!("hl.dispatch(hl.dsp.window.move({{window=\"address:{address}\",x=200,y=100,relative=false}}))")).unwrap();
+    f.driver.absolute_at(280, 180);
+    f.driver.button(true);
+    f.driver.button(false);
+    assert!(window.wait(|state| state.buttons >= 2));
+    f.driver.keyboard.key(f.driver.time(), 125, 1);
+    f.driver.keyboard.modifiers(64, 0, 0, 0);
+    f.driver.sync();
+    f.driver.button(true);
+    std::thread::sleep(Duration::from_millis(120));
+    f.driver.absolute_at(320, 200);
+    std::thread::sleep(Duration::from_millis(120));
+    f.driver.absolute(Edge::Right, true);
+    f.wait(|e| matches!(e, CaptureEvent::DragAtEdge { .. }));
+    // This owned nest's public Lua function counts actual production nudge requests. No new
+    // backend hook or fake worker: refusals travel through HyprlandCapture's real command queue.
+    ipc.eval("WP255_NUDGES = 0 WP255_QUERY = hl.get_cursor_pos hl.get_cursor_pos = function() WP255_NUDGES = WP255_NUDGES + 1 return WP255_QUERY() end").unwrap();
+    fn count(ipc: &HyprIpc) -> u64 {
+        let reply = ipc
+            .request("eval error('WP255_COUNT ' .. tostring(WP255_NUDGES))")
+            .unwrap();
+        reply
+            .rsplit_once("WP255_COUNT ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let refuse = |f: &mut Fixture| {
+        assert!(matches!(
+            f.capture
+                .begin_drag(CaptureId(99), f.portal.id, MouseButton::PRIMARY),
+            Err(PlatformError::PointerButtonHeld)
+        ));
+    };
+    refuse(&mut f);
+    f.driver
+        .absolute_at(f.driver.state.width - 12, f.driver.state.height / 2);
+    std::thread::sleep(Duration::from_millis(65));
+    let cancelled = count(&ipc);
+    for _ in 0..3 {
+        refuse(&mut f);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    f.capture.set_portals(&[f.portal]).unwrap(); // FIFO barrier through the real worker.
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(
+        count(&ipc),
+        cancelled,
+        "delayed refusals rearmed a cancelled hit"
+    );
+    assert!(
+        !f.events
+            .try_iter()
+            .any(|e| matches!(e, CaptureEvent::DragDroppedAtEdge { .. }))
+    );
+    f.driver.absolute(Edge::Right, true);
+    f.wait(|e| matches!(e, CaptureEvent::DragAtEdge { .. }));
+    ipc.eval("WP255_NUDGES = 0").unwrap();
+    let armed = Instant::now();
+    refuse(&mut f);
+    for _ in 0..10 {
+        refuse(&mut f);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    f.capture.set_portals(&[f.portal]).unwrap();
+    let elapsed = armed.elapsed();
+    let nudges = count(&ipc);
+    assert!(
+        nudges > 0 && nudges <= 1 + elapsed.as_millis() as u64 / 50,
+        "{nudges} nudges in {elapsed:?}"
+    );
+    std::thread::sleep(Duration::from_millis(10060).saturating_sub(armed.elapsed()));
+    let expired = count(&ipc);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        count(&ipc),
+        expired,
+        "duplicate refusals extended the ten-second watch"
+    );
+    f.driver.button(false);
+    ipc.eval("local p = hl.get_cursor_pos() if p then hl.dispatch(hl.dsp.cursor.move({x = p.x, y = p.y})) end").unwrap();
+    f.wait(|e| matches!(e, CaptureEvent::EdgePressed { .. }));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!f.events.try_iter().any(|e| matches!(
+        e,
+        CaptureEvent::DragDroppedAtEdge { .. } | CaptureEvent::Started { .. }
+    )));
+    f.driver.keyboard.key(f.driver.time(), 125, 0);
+    f.driver.keyboard.modifiers(0, 0, 0, 0);
+    f.driver.sync();
+    eprintln!(
+        "real worker: cancelled nudge count {cancelled} unchanged after 3 delayed refusals; 10 duplicate refusals produced {nudges} nudges in {elapsed:?}; watch stopped at {expired} nudges by {:?}, no drop after expiry/release",
+        armed.elapsed()
+    );
+}
+
+#[test]
+fn native_drag_plain_capture_and_rollback_remain_unchanged() {
+    if !owned_drag_test("native_drag_plain_capture_and_rollback_remain_unchanged") {
+        return;
+    }
+    hundred_crossings();
+    closed_gate_and_button_guard();
+    abort_from_another_thread();
+    portal_replacement_is_atomic();
 }
 
 #[test]
@@ -3041,7 +3618,24 @@ impl Dispatch<wl_pointer::WlPointer, ()> for ToplevelState {
             wl_pointer::Event::Enter { .. } => s.pointer_focus = true,
             wl_pointer::Event::Leave { .. } => s.pointer_focus = false,
             wl_pointer::Event::Motion { .. } => s.motions += 1,
-            wl_pointer::Event::Button { .. } => s.buttons += 1,
+            wl_pointer::Event::Button {
+                serial,
+                button,
+                state,
+                ..
+            } => {
+                s.buttons += 1;
+                if s.move_on_primary
+                    && button == 0x110
+                    && state == WEnum::Value(wl_pointer::ButtonState::Pressed)
+                {
+                    s.move_on_primary = false;
+                    s.toplevel
+                        .as_ref()
+                        .unwrap()
+                        ._move(s.seat.as_ref().unwrap(), serial);
+                }
+            }
             _ => (),
         }
     }
