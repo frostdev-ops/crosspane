@@ -45,6 +45,40 @@ pub fn unavailable_window() -> WindowObservation {
     Err(FixtureError::Unavailable)
 }
 
+/// OS-owned operations, polled without waiting on a GUI frame. None means pending; repeated
+/// polls of the same call/tone never restart work. Observations must be fresh for each call and
+/// identify only this child's primary surface with the exact controlled title. Successful tone
+/// replies confirm only the fixture stream, never remote audio activity or human hearing.
+/// Stop disables output immediately, releases it within 50 ms, and Drop must also stop output.
+pub trait TutorialNative {
+    fn observe_window(&mut self, call_id: u64, title: &str) -> Option<WindowObservation>;
+    fn play_tone(&mut self, tone: ToneId, output: &SpeakersSelection) -> Option<Result<()>>;
+    fn stop_tone(&mut self, tone: ToneId) -> Option<Result<()>>;
+    fn tone_state(&self) -> OwnToneState;
+}
+#[derive(Debug, Default)]
+pub struct UnavailableTutorial;
+impl TutorialNative for UnavailableTutorial {
+    fn observe_window(&mut self, _: u64, _: &str) -> Option<WindowObservation> {
+        Some(unavailable_window())
+    }
+    fn play_tone(&mut self, _: ToneId, _: &SpeakersSelection) -> Option<Result<()>> {
+        Some(Err(FixtureError::Unavailable))
+    }
+    fn stop_tone(&mut self, _: ToneId) -> Option<Result<()>> {
+        Some(Err(FixtureError::Unavailable))
+    }
+    fn tone_state(&self) -> OwnToneState {
+        OwnToneState::Stopped
+    }
+}
+struct Native(Box<dyn TutorialNative>);
+impl Default for Native {
+    fn default() -> Self {
+        Self(Box::new(UnavailableTutorial))
+    }
+}
+
 #[derive(Default)]
 pub struct Practice {
     attempt: Option<AttemptId>,
@@ -64,6 +98,14 @@ pub struct Practice {
     stopped: bool,
     close_reply: Option<u64>,
     editor_context: Option<egui::Context>,
+    native: Native,
+    pending: Option<ReceivedCall>,
+    opening: Option<u64>,
+    running_tone: Option<ToneId>,
+    requested_tone: Option<ToneId>,
+    tone_cancelled: bool,
+    pending_event: Option<(FixtureMessage, u64)>,
+    close_at: Option<u64>,
 }
 impl std::fmt::Debug for Practice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,6 +113,11 @@ impl std::fmt::Debug for Practice {
     }
 }
 impl Practice {
+    pub fn with_native(native: Box<dyn TutorialNative>) -> Self {
+        let mut practice = Self::default();
+        practice.native = Native(native);
+        practice
+    }
     pub fn text_is_empty(&self) -> bool {
         self.text.is_empty()
     }
@@ -95,11 +142,7 @@ impl Practice {
             result,
         })
     }
-    pub fn handle(
-        &mut self,
-        call: FixtureCall,
-        observation: WindowObservation,
-    ) -> Result<FixtureMessage> {
+    fn validate_call(&self, call: &FixtureCall) -> Result<()> {
         encode_control(&FixtureControlPacket {
             schema_version: 1,
             call: call.clone(),
@@ -124,6 +167,14 @@ impl Practice {
         if !owned {
             return Err(FixtureError::NotOwned);
         }
+        Ok(())
+    }
+    pub fn handle(
+        &mut self,
+        call: FixtureCall,
+        observation: WindowObservation,
+    ) -> Result<FixtureMessage> {
+        self.validate_call(&call)?;
         let fixture = self.fixture.unwrap_or(FixtureId(call.id));
         let result = match call.command {
             FixtureCommand::Open { machine_label } => {
@@ -162,13 +213,38 @@ impl Practice {
                         pattern_ticks: self.pattern_ticks,
                         target_clicks: self.target_clicks,
                         window_facts: facts,
-                        tone: OwnToneState::Stopped,
+                        tone: self.native.0.tone_state(),
                     },
                 })
             }),
-            FixtureCommand::PlayTone { .. } | FixtureCommand::StopTone { .. } => {
+            FixtureCommand::PlayTone { .. } if self.tone_cancelled => {
                 Err(FixtureError::Unavailable)
             }
+            FixtureCommand::PlayTone { output, .. } => {
+                self.requested_tone = Some(ToneId(call.id));
+                self.native
+                    .0
+                    .play_tone(ToneId(call.id), &output)
+                    .ok_or(FixtureError::Busy)?
+                    .map(|()| {
+                        self.running_tone = Some(ToneId(call.id));
+                        FixtureEvent::ToneStarted {
+                            fixture,
+                            tone: ToneId(call.id),
+                        }
+                    })
+            }
+            FixtureCommand::StopTone { tone, .. } => self
+                .native
+                .0
+                .stop_tone(tone)
+                .ok_or(FixtureError::Busy)?
+                .map(|()| {
+                    if self.running_tone == Some(tone) {
+                        self.running_tone = None;
+                    }
+                    FixtureEvent::ToneStopped { fixture, tone }
+                }),
             FixtureCommand::Close { .. } => {
                 self.stop();
                 Ok(FixtureEvent::CloseRequested { fixture })
@@ -179,16 +255,44 @@ impl Practice {
         self.message(Some(call.id), result)
     }
     pub fn close_requested(&mut self) -> Result<Option<FixtureMessage>> {
+        self.tone_cancelled = true;
         self.clear_text();
         self.press_phase = None;
+        self.stop_output();
         self.fixture
             .map(|fixture| self.message(None, Ok(FixtureEvent::CloseRequested { fixture })))
             .transpose()
     }
     pub fn stop(&mut self) {
+        self.tone_cancelled = true;
         self.clear_text();
         self.press_phase = None;
+        self.stop_output();
         self.stopped = true;
+    }
+    fn stop_output(&mut self) {
+        let tone = match self.native.0.tone_state() {
+            OwnToneState::Running { tone } | OwnToneState::StopUnconfirmed { tone } => Some(tone),
+            OwnToneState::Stopped => self.requested_tone,
+        };
+        if let Some(tone) = tone {
+            let _ = self.native.0.stop_tone(tone);
+        }
+    }
+    fn send_lifecycle(
+        &mut self,
+        channel: &ChildChannel,
+        message: FixtureMessage,
+        at: u64,
+    ) -> Result<bool> {
+        match channel.send(message.clone(), at) {
+            Ok(()) => Ok(true),
+            Err(FixtureError::Busy) => {
+                self.pending_event = Some((message, at));
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
     /// Shared dispatch: `close` is a native close request; true permits viewport shutdown.
     pub fn process(&mut self, channel: &ChildChannel, now_ms: u64, close: bool) -> Result<bool> {
@@ -196,22 +300,97 @@ impl Practice {
             if let Some(error) = channel.failure() {
                 return Err(error);
             }
-            for received in channel.poll() {
+            if close {
+                self.clear_text();
+                self.press_phase = None;
+                self.tone_cancelled = true;
+                self.close_at.get_or_insert(now_ms);
+                self.stop_output();
+            }
+            if let Some((message, at)) = self.pending_event.take() {
+                if now_ms >= at.saturating_add(RESPONSE_MS) {
+                    return Err(FixtureError::TimedOut);
+                }
+                if !self.send_lifecycle(channel, message, at)? {
+                    return Ok(false);
+                }
+            }
+            for _ in 0..MAX_QUEUE {
+                if close
+                    && self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| matches!(p.call.command, FixtureCommand::PlayTone { .. }))
+                {
+                    break; // Deliver native CloseRequested before the pending play's refusal.
+                }
+                let Some(received) = self
+                    .pending
+                    .take()
+                    .or_else(|| channel.calls.try_recv().ok())
+                else {
+                    break;
+                };
                 if now_ms >= received.received_at_ms.saturating_add(RESPONSE_MS) {
                     return Err(FixtureError::TimedOut);
                 }
+                self.validate_call(&received.call)?;
                 let id = received.call.id;
-                let message = self.handle(received.call, unavailable_window())?;
+                if let FixtureCommand::Open { machine_label } = &received.call.command
+                    && self.opening != Some(id)
+                {
+                    self.title =
+                        practice_title(machine_label, received.call.attempt, FixtureId(id))?;
+                    self.opening = Some(id);
+                    self.pending = Some(received);
+                    break; // Yield so the viewport applies the title before observation.
+                }
+                let observation = match received.call.command {
+                    FixtureCommand::Open { .. } | FixtureCommand::ObserveWindow { .. } => {
+                        self.native.0.observe_window(id, &self.title)
+                    }
+                    _ => Some(unavailable_window()),
+                };
+                let Some(observation) = observation.filter(|o| {
+                    !matches!(received.call.command, FixtureCommand::Open { .. })
+                        || matches!(o, Ok((window, facts)) if window.0 != 0 && *facts != OwnWindowFacts::Missing)
+                }) else {
+                    self.pending = Some(received);
+                    break;
+                };
+                let message = match self.handle(received.call.clone(), observation) {
+                    Err(FixtureError::Busy) => {
+                        self.pending = Some(received);
+                        break;
+                    }
+                    result => result?,
+                };
                 channel.send(message, received.received_at_ms)?;
                 if self.stopped {
                     self.close_reply = Some(id);
                 }
             }
-            if close
-                && !self.stopped
-                && let Some(message) = self.close_requested()?
+            let pending_stop = self.pending.as_ref().is_some_and(|p| {
+                matches!(p.call.command, FixtureCommand::StopTone { tone, .. } if Some(tone) == self.running_tone)
+            });
+            if !pending_stop
+                && self.running_tone.is_some()
+                && self.native.0.tone_state() == OwnToneState::Stopped
             {
-                channel.send(message, now_ms)?;
+                let tone = self.running_tone.take().ok_or(FixtureError::NotOwned)?;
+                let fixture = self.fixture.ok_or(FixtureError::NotOwned)?;
+                let message =
+                    self.message(None, Ok(FixtureEvent::ToneStopped { fixture, tone }))?;
+                if !self.send_lifecycle(channel, message, now_ms)? {
+                    return Ok(false);
+                }
+            }
+            if !self.stopped
+                && let Some(at) = self.close_at.take()
+                && let Some(message) = self.close_requested()?
+                && !self.send_lifecycle(channel, message, at)?
+            {
+                return Ok(false);
             }
             Ok(self.stopped && self.close_reply.is_none_or(|id| channel.written(id)))
         })();
@@ -225,6 +404,9 @@ impl Practice {
     pub fn viewport(&mut self, ctx: &egui::Context, channel: &ChildChannel, now_ms: u64) {
         let close = ctx.input(|i| i.viewport().close_requested());
         let result = self.process(channel, now_ms, close);
+        if self.pending.is_some() || self.pending_event.is_some() || self.close_at.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         if close && matches!(result, Ok(false)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -319,6 +501,11 @@ impl Practice {
             ));
         }
         Ok((target, text))
+    }
+}
+impl Drop for Practice {
+    fn drop(&mut self) {
+        self.stop_output();
     }
 }
 #[derive(Debug)]
@@ -506,6 +693,23 @@ impl eframe::App for PracticeApp {
         }
     }
 }
+fn platform_native(font: &std::path::Path) -> Box<dyn TutorialNative> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = font;
+        Box::new(UnavailableTutorial)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = font;
+        Box::new(UnavailableTutorial)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = font;
+        Box::new(UnavailableTutorial)
+    }
+}
 pub fn run(options: TutorialOptions) -> Result<()> {
     let path = options.validate()?;
     // The parent supplies its admitted system font. Bound and parse it before opening a viewport.
@@ -529,6 +733,7 @@ pub fn run(options: TutorialOptions) -> Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
         ..Default::default()
     };
+    let tutorial_native = platform_native(path);
     eframe::run_native(
         "Crosspane practice",
         native,
@@ -544,7 +749,7 @@ pub fn run(options: TutorialOptions) -> Result<()> {
                 Arc::new(move || ctx.request_repaint()),
             )?;
             Ok(Box::new(PracticeApp {
-                practice: Practice::default(),
+                practice: Practice::with_native(tutorial_native),
                 channel,
                 clock,
             }))

@@ -60,7 +60,15 @@ fn font() -> PathBuf {
     ];
     if let Some(path) = std::env::var_os("CROSSPANE_TEST_FONT") {
         let path = PathBuf::from(path);
-        assert!(path.starts_with("/usr/share/fonts") || path.starts_with("/System/Library/Fonts"));
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fonts/LiberationSans-Regular.ttf");
+        assert!(
+            path.starts_with("/usr/share/fonts")
+                || path.starts_with("/System/Library/Fonts")
+                || path
+                    .canonicalize()
+                    .is_ok_and(|p| fixture.canonicalize().is_ok_and(|f| p == f))
+        );
         return path;
     }
     candidates
@@ -1346,4 +1354,880 @@ fn controlled_only_cli_help_and_usage_never_open_viewport_or_echo_input() {
         valid.validate().unwrap(),
         std::path::Path::new("/usr/share/fonts/example.ttf")
     );
+}
+
+#[derive(Debug)]
+struct NativeFacts {
+    window: Option<WindowObservation>,
+    observations: Vec<(u64, String)>,
+    tone: OwnToneState,
+    plays: Vec<(ToneId, SpeakersSelection)>,
+    stops: Vec<ToneId>,
+    play_pending: bool,
+    stop_pending: bool,
+}
+impl Default for NativeFacts {
+    fn default() -> Self {
+        Self {
+            window: None,
+            observations: Vec::new(),
+            tone: OwnToneState::Stopped,
+            plays: Vec::new(),
+            stops: Vec::new(),
+            play_pending: false,
+            stop_pending: false,
+        }
+    }
+}
+struct NativeFake(Arc<Mutex<NativeFacts>>);
+impl TutorialNative for NativeFake {
+    fn observe_window(&mut self, call_id: u64, title: &str) -> Option<WindowObservation> {
+        let mut facts = self.0.lock().unwrap();
+        facts.observations.push((call_id, title.into()));
+        facts.window.clone()
+    }
+    fn play_tone(
+        &mut self,
+        tone: ToneId,
+        output: &SpeakersSelection,
+    ) -> Option<Result<(), FixtureError>> {
+        let mut facts = self.0.lock().unwrap();
+        facts.plays.push((tone, output.clone()));
+        if facts.stops.contains(&tone) {
+            return Some(Err(FixtureError::Unavailable));
+        }
+        facts.tone = OwnToneState::Running { tone };
+        (!facts.play_pending).then_some(Ok(()))
+    }
+    fn stop_tone(&mut self, tone: ToneId) -> Option<Result<(), FixtureError>> {
+        let mut facts = self.0.lock().unwrap();
+        facts.stops.push(tone);
+        if facts.stop_pending {
+            facts.tone = OwnToneState::StopUnconfirmed { tone };
+            None
+        } else {
+            facts.tone = OwnToneState::Stopped;
+            Some(Ok(()))
+        }
+    }
+    fn tone_state(&self) -> OwnToneState {
+        self.0.lock().unwrap().tone.clone()
+    }
+}
+fn native_practice() -> (Practice, Arc<Mutex<NativeFacts>>) {
+    let facts = Arc::new(Mutex::new(NativeFacts::default()));
+    (
+        Practice::with_native(Box::new(NativeFake(facts.clone()))),
+        facts,
+    )
+}
+fn tone_call(id: u64) -> FixtureCall {
+    call(
+        id,
+        FixtureCommand::PlayTone {
+            fixture: FixtureId(1),
+            output: SpeakersSelection {
+                peer: NodeId([7; 32]),
+                device_key: format!("crosspane.{}.speaker", NodeId([7; 32])),
+            },
+        },
+    )
+}
+fn native_messages(h: &PipeHarness, n: usize) -> Vec<FixtureMessage> {
+    until(|| {
+        h.state
+            .lock()
+            .unwrap()
+            .output
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+            == n
+    });
+    h.state
+        .lock()
+        .unwrap()
+        .output
+        .split_inclusive(|b| *b == b'\n')
+        .map(|b| decode_event(b).unwrap().message)
+        .collect()
+}
+
+#[test]
+fn deferred_open_applies_title_before_observation_and_holds_later_calls() {
+    let mut h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    h.input(packet(open()));
+    h.input(packet(call(
+        2,
+        FixtureCommand::ArmTarget {
+            fixture: FixtureId(1),
+            phase: PhaseId(1),
+        },
+    )));
+    until(|| h.wakes.load(Ordering::SeqCst) == 2);
+    let ctx = egui::Context::default();
+    let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+        practice.viewport(ui.ctx(), h.channel(), 10)
+    });
+    frame.textures_delta.clear(); // CPU-only frame: no native renderer consumes textures.
+    let title = practice_title("Test machine", AttemptId(7), FixtureId(1)).unwrap();
+    assert!(
+        frame
+            .viewport_output
+            .values()
+            .flat_map(|v| &v.commands)
+            .any(|c| matches!(c, egui::ViewportCommand::Title(t) if t.as_str() == title.as_str()))
+    );
+    assert!(
+        frame.viewport_output[&egui::ViewportId::ROOT].repaint_delay <= Duration::from_millis(16)
+    );
+    assert!(facts.lock().unwrap().observations.is_empty());
+    for now in [11, 500, 1000] {
+        assert_eq!(practice.process(h.channel(), now, false), Ok(false));
+        assert!(h.state.lock().unwrap().output.is_empty());
+    }
+    facts.lock().unwrap().window = Some(observe());
+    assert_eq!(practice.process(h.channel(), 1500, false), Ok(false));
+    let messages = native_messages(&h, 2);
+    assert_eq!(messages[0].call_id, Some(1));
+    assert!(matches!(
+        messages[0].result,
+        Ok(FixtureEvent::Opened { window: WINDOW, .. })
+    ));
+    assert_eq!(
+        messages[1].result,
+        Ok(FixtureEvent::TargetArmed {
+            fixture: FixtureId(1),
+            phase: PhaseId(1)
+        })
+    );
+    assert!(
+        facts
+            .lock()
+            .unwrap()
+            .observations
+            .iter()
+            .all(|(id, t)| *id == 1 && t == &title)
+    );
+    h.finish();
+}
+
+#[test]
+fn deferred_open_rejects_missing_zero_and_errors_until_matching_observation() {
+    let mut h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    h.input(packet(open()));
+    until(|| h.wakes.load(Ordering::SeqCst) == 1);
+    practice.process(h.channel(), 10, false).unwrap();
+    for observation in [
+        Err(FixtureError::UnknownWindow),
+        Ok((WindowId(0), OwnWindowFacts::Unknown)),
+        Ok((WINDOW, OwnWindowFacts::Missing)),
+    ] {
+        facts.lock().unwrap().window = Some(observation);
+        practice.process(h.channel(), 11, false).unwrap();
+        assert!(h.state.lock().unwrap().output.is_empty());
+    }
+    facts.lock().unwrap().window = Some(observe());
+    practice.process(h.channel(), 12, false).unwrap();
+    assert!(matches!(
+        native_messages(&h, 1)[0].result,
+        Ok(FixtureEvent::Opened { .. })
+    ));
+    h.finish();
+}
+
+#[test]
+fn deferred_open_no_observation_expires_aborts_and_never_sends_late_opened() {
+    let h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    h.input(packet(open()));
+    until(|| h.wakes.load(Ordering::SeqCst) == 1);
+    practice.process(h.channel(), 10, false).unwrap();
+    practice.process(h.channel(), 2009, false).unwrap();
+    h.clock.store(2010, Ordering::SeqCst);
+    h.failure(FixtureError::TimedOut);
+    facts.lock().unwrap().window = Some(observe());
+    assert_eq!(
+        practice.process(h.channel(), 2010, false),
+        Err(FixtureError::TimedOut)
+    );
+    assert!(h.state.lock().unwrap().output.is_empty());
+    assert_eq!(facts.lock().unwrap().observations.len(), 1);
+}
+
+#[test]
+fn observe_window_polls_fresh_call_and_snapshot_uses_native_tone_state() {
+    let mut h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    practice.handle(open(), observe()).unwrap();
+    h.input(packet(call(
+        2,
+        FixtureCommand::ObserveWindow {
+            fixture: FixtureId(1),
+        },
+    )));
+    until(|| h.wakes.load(Ordering::SeqCst) == 1);
+    practice.process(h.channel(), 10, false).unwrap();
+    assert!(h.state.lock().unwrap().output.is_empty());
+    facts.lock().unwrap().window = Some(Ok((
+        WINDOW,
+        OwnWindowFacts::Present {
+            visible_on_user_workspace: None,
+            on_initial_display: Some(false),
+        },
+    )));
+    facts.lock().unwrap().tone = OwnToneState::StopUnconfirmed { tone: ToneId(99) };
+    practice.process(h.channel(), 11, false).unwrap();
+    let messages = native_messages(&h, 1);
+    let Ok(FixtureEvent::Snapshot { snapshot }) = &messages[0].result else {
+        panic!("snapshot")
+    };
+    assert_eq!(
+        snapshot.tone,
+        OwnToneState::StopUnconfirmed { tone: ToneId(99) }
+    );
+    assert_eq!(
+        snapshot.window_facts,
+        OwnWindowFacts::Present {
+            visible_on_user_workspace: None,
+            on_initial_display: Some(false),
+        }
+    );
+    facts.lock().unwrap().window = Some(Err(FixtureError::UnknownWindow));
+    h.input(packet(call(
+        3,
+        FixtureCommand::ObserveWindow {
+            fixture: FixtureId(1),
+        },
+    )));
+    until(|| h.wakes.load(Ordering::SeqCst) >= 3); // First input, reply write, then fresh input.
+    practice.process(h.channel(), 12, false).unwrap();
+    assert_eq!(
+        native_messages(&h, 2)[1].result,
+        Err(FixtureError::UnknownWindow)
+    );
+    assert_eq!(
+        facts
+            .lock()
+            .unwrap()
+            .observations
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        [2, 2, 3]
+    );
+    h.finish();
+}
+
+#[test]
+fn pending_play_reuses_tone_id_and_later_native_stop_emits_once_uncorrelated() {
+    let mut h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    practice.handle(open(), observe()).unwrap();
+    facts.lock().unwrap().play_pending = true;
+    h.input(packet(tone_call(2)));
+    until(|| h.wakes.load(Ordering::SeqCst) == 1);
+    for now in [10, 11] {
+        practice.process(h.channel(), now, false).unwrap();
+    }
+    assert!(h.state.lock().unwrap().output.is_empty());
+    facts.lock().unwrap().play_pending = false;
+    practice.process(h.channel(), 12, false).unwrap();
+    assert_eq!(
+        native_messages(&h, 1)[0].result,
+        Ok(FixtureEvent::ToneStarted {
+            fixture: FixtureId(1),
+            tone: ToneId(2)
+        })
+    );
+    assert!(
+        facts
+            .lock()
+            .unwrap()
+            .plays
+            .iter()
+            .all(|(tone, output)| *tone == ToneId(2)
+                && output.device_key == format!("crosspane.{}.speaker", output.peer))
+    );
+    facts.lock().unwrap().tone = OwnToneState::StopUnconfirmed { tone: ToneId(2) };
+    practice.process(h.channel(), 13, false).unwrap();
+    assert_eq!(
+        h.state
+            .lock()
+            .unwrap()
+            .output
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count(),
+        1
+    );
+    facts.lock().unwrap().tone = OwnToneState::Stopped;
+    practice.process(h.channel(), 14, false).unwrap();
+    let messages = native_messages(&h, 2);
+    assert_eq!(messages[1].call_id, None);
+    assert_eq!(
+        messages[1].result,
+        Ok(FixtureEvent::ToneStopped {
+            fixture: FixtureId(1),
+            tone: ToneId(2)
+        })
+    );
+    practice.process(h.channel(), 15, false).unwrap();
+    assert_eq!(
+        h.state
+            .lock()
+            .unwrap()
+            .output
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count(),
+        2
+    );
+    h.finish();
+}
+
+#[test]
+fn explicit_stop_waits_for_native_confirmation_and_has_no_duplicate_transition() {
+    let mut h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    practice.handle(open(), observe()).unwrap();
+    practice.handle(tone_call(2), observe()).unwrap();
+    facts.lock().unwrap().stop_pending = true;
+    h.input(packet(call(
+        3,
+        FixtureCommand::StopTone {
+            fixture: FixtureId(1),
+            tone: ToneId(2),
+        },
+    )));
+    until(|| h.wakes.load(Ordering::SeqCst) == 1);
+    practice.process(h.channel(), 10, false).unwrap();
+    assert_eq!(
+        facts.lock().unwrap().tone,
+        OwnToneState::StopUnconfirmed { tone: ToneId(2) }
+    );
+    assert!(h.state.lock().unwrap().output.is_empty());
+    facts.lock().unwrap().stop_pending = false;
+    facts.lock().unwrap().tone = OwnToneState::Stopped; // Worker completed between frames.
+    practice.process(h.channel(), 11, false).unwrap();
+    let messages = native_messages(&h, 1);
+    assert_eq!(messages[0].call_id, Some(3));
+    assert_eq!(
+        messages[0].result,
+        Ok(FixtureEvent::ToneStopped {
+            fixture: FixtureId(1),
+            tone: ToneId(2)
+        })
+    );
+    practice.process(h.channel(), 12, false).unwrap();
+    assert_eq!(
+        h.state
+            .lock()
+            .unwrap()
+            .output
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count(),
+        1
+    );
+    h.finish();
+}
+
+#[test]
+fn native_tone_is_stopped_on_close_cancel_drop_and_pending_play_timeout() {
+    for lifecycle in 0..4 {
+        let (mut practice, facts) = native_practice();
+        practice.handle(open(), observe()).unwrap();
+        practice.handle(tone_call(2), observe()).unwrap();
+        match lifecycle {
+            0 => {
+                practice.close_requested().unwrap();
+            }
+            1 => {
+                practice.stop();
+            }
+            2 => {
+                practice
+                    .handle(
+                        call(
+                            3,
+                            FixtureCommand::Close {
+                                fixture: FixtureId(1),
+                            },
+                        ),
+                        observe(),
+                    )
+                    .unwrap();
+            }
+            _ => {
+                drop(practice);
+            }
+        }
+        assert_eq!(facts.lock().unwrap().tone, OwnToneState::Stopped);
+        assert!(facts.lock().unwrap().stops.contains(&ToneId(2)));
+    }
+    let h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    practice.handle(open(), observe()).unwrap();
+    facts.lock().unwrap().play_pending = true;
+    h.input(packet(tone_call(2)));
+    until(|| h.wakes.load(Ordering::SeqCst) == 1);
+    practice.process(h.channel(), 10, false).unwrap();
+    assert_eq!(
+        facts.lock().unwrap().tone,
+        OwnToneState::Running { tone: ToneId(2) }
+    );
+    h.clock.store(2010, Ordering::SeqCst);
+    h.failure(FixtureError::TimedOut);
+    assert_eq!(
+        practice.process(h.channel(), 2010, false),
+        Err(FixtureError::TimedOut)
+    );
+    assert_eq!(facts.lock().unwrap().tone, OwnToneState::Stopped);
+    assert!(h.state.lock().unwrap().output.is_empty());
+}
+
+#[test]
+fn wrong_attempt_or_fixture_never_reaches_native_tone_and_unavailable_stays_explicit() {
+    let (mut practice, facts) = native_practice();
+    practice.handle(open(), observe()).unwrap();
+    let mut foreign = tone_call(2);
+    foreign.attempt = AttemptId(8);
+    assert_eq!(
+        practice.handle(foreign, observe()),
+        Err(FixtureError::InvalidMessage)
+    );
+    let mut foreign = tone_call(2);
+    let FixtureCommand::PlayTone { fixture, .. } = &mut foreign.command else {
+        unreachable!()
+    };
+    *fixture = FixtureId(2);
+    assert_eq!(
+        practice.handle(foreign, observe()),
+        Err(FixtureError::NotOwned)
+    );
+    assert!(facts.lock().unwrap().plays.is_empty());
+    let mut unavailable = UnavailableTutorial;
+    assert_eq!(
+        unavailable.observe_window(1, "owned-only"),
+        Some(Err(FixtureError::Unavailable))
+    );
+    assert_eq!(
+        unavailable.play_tone(
+            ToneId(2),
+            &SpeakersSelection {
+                peer: NodeId([7; 32]),
+                device_key: format!("crosspane.{}.speaker", NodeId([7; 32]))
+            }
+        ),
+        Some(Err(FixtureError::Unavailable))
+    );
+    assert_eq!(
+        unavailable.stop_tone(ToneId(2)),
+        Some(Err(FixtureError::Unavailable))
+    );
+    assert_eq!(unavailable.tone_state(), OwnToneState::Stopped);
+}
+
+#[test]
+fn native_close_during_pending_tone_disables_output_and_same_tone_never_restarts() {
+    let mut h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    practice.handle(open(), observe()).unwrap();
+    facts.lock().unwrap().play_pending = true;
+    h.input(packet(tone_call(2)));
+    until(|| h.wakes.load(Ordering::SeqCst) == 1);
+    practice.process(h.channel(), 10, false).unwrap();
+    practice.process(h.channel(), 11, true).unwrap();
+    assert_eq!(facts.lock().unwrap().tone, OwnToneState::Stopped);
+    assert_eq!(
+        native_messages(&h, 1)[0].result,
+        Ok(FixtureEvent::CloseRequested {
+            fixture: FixtureId(1)
+        })
+    );
+    facts.lock().unwrap().play_pending = false;
+    practice.process(h.channel(), 12, false).unwrap();
+    let messages = native_messages(&h, 2);
+    assert_eq!(messages[1].call_id, Some(2));
+    assert_eq!(messages[1].result, Err(FixtureError::Unavailable));
+    assert_eq!(facts.lock().unwrap().tone, OwnToneState::Stopped);
+    assert!(
+        !messages
+            .iter()
+            .any(|m| matches!(m.result, Ok(FixtureEvent::ToneStarted { .. })))
+    );
+    h.finish();
+}
+
+#[test]
+fn review_native_close_cancels_plays_queued_behind_pending_observation() {
+    let mut h = PipeHarness::new();
+    let (mut practice, facts) = native_practice();
+    practice.handle(open(), observe()).unwrap();
+    h.input(packet(call(
+        2,
+        FixtureCommand::ObserveWindow {
+            fixture: FixtureId(1),
+        },
+    )));
+    h.input(packet(tone_call(3)));
+    h.input(packet(tone_call(4)));
+    until(|| h.wakes.load(Ordering::SeqCst) == 3);
+    practice.process(h.channel(), 10, false).unwrap();
+    practice.process(h.channel(), 11, true).unwrap();
+    assert_eq!(
+        native_messages(&h, 1)[0].result,
+        Ok(FixtureEvent::CloseRequested {
+            fixture: FixtureId(1)
+        })
+    );
+    facts.lock().unwrap().window = Some(observe());
+    practice.process(h.channel(), 12, false).unwrap();
+    assert!(
+        facts.lock().unwrap().plays.is_empty(),
+        "native Close permanently cancels queued starts"
+    );
+    let messages = native_messages(&h, 4);
+    assert!(matches!(
+        messages[1].result,
+        Ok(FixtureEvent::Snapshot { .. })
+    ));
+    assert_eq!(messages[2].result, Err(FixtureError::Unavailable));
+    assert_eq!(messages[3].result, Err(FixtureError::Unavailable));
+    h.finish();
+}
+
+#[test]
+fn review_invalid_pending_observe_aborts_before_seam_and_before_blocked_reply_escapes() {
+    for kind in 0..3 {
+        let h = PipeHarness::new();
+        let (mut practice, facts) = native_practice();
+        practice.handle(open(), observe()).unwrap();
+        practice.handle(tone_call(2), observe()).unwrap();
+        h.state.lock().unwrap().blocked = true;
+        h.input(packet(call(
+            3,
+            FixtureCommand::ArmTarget {
+                fixture: FixtureId(1),
+                phase: PhaseId(1),
+            },
+        )));
+        until(|| h.wakes.load(Ordering::SeqCst) == 1);
+        practice.process(h.channel(), 10, false).unwrap();
+        until(|| h.state.lock().unwrap().writes > 0);
+        let mut rejected = call(
+            4,
+            FixtureCommand::ObserveWindow {
+                fixture: FixtureId(1),
+            },
+        );
+        let expected = match kind {
+            0 => {
+                rejected.attempt = AttemptId(8);
+                FixtureError::InvalidMessage
+            }
+            1 => {
+                rejected.command = FixtureCommand::ObserveWindow {
+                    fixture: FixtureId(9),
+                };
+                FixtureError::NotOwned
+            }
+            _ => {
+                rejected.id = 2;
+                FixtureError::InvalidMessage
+            }
+        };
+        h.input(packet(rejected));
+        until(|| h.wakes.load(Ordering::SeqCst) >= 2);
+        assert_eq!(practice.process(h.channel(), 11, false), Err(expected));
+        assert!(facts.lock().unwrap().observations.is_empty());
+        assert_eq!(facts.lock().unwrap().tone, OwnToneState::Stopped);
+        h.state.lock().unwrap().blocked = false;
+        until(|| h.released.load(Ordering::SeqCst) == 2);
+        assert!(h.state.lock().unwrap().output.is_empty());
+    }
+}
+
+#[derive(Default)]
+struct PauseState {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+struct PausedReader {
+    reader: Reader,
+    pause: Arc<Mutex<PauseState>>,
+}
+impl Read for PausedReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let paused = {
+            let mut pause = self.pause.lock().unwrap();
+            if pause.armed {
+                pause.armed = false;
+                pause.entered = true;
+                true
+            } else {
+                false
+            }
+        };
+        if paused {
+            until(|| self.pause.lock().unwrap().released); // Bounded fake-only pump pause.
+        }
+        self.reader.read(bytes)
+    }
+}
+struct ReleasePump(Arc<Mutex<PauseState>>);
+impl Drop for ReleasePump {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().released = true;
+    }
+}
+fn pausable_harness() -> (PipeHarness, ReleasePump) {
+    let state = Arc::new(Mutex::new(PipeState::default()));
+    let clock = Arc::new(AtomicU64::new(10));
+    let released = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let pause = Arc::new(Mutex::new(PauseState::default()));
+    let now = clock.clone();
+    let wake = wakes.clone();
+    let channel = ChildChannel::new(
+        PausedReader {
+            reader: Reader {
+                state: state.clone(),
+                clock: clock.clone(),
+                released: released.clone(),
+            },
+            pause: pause.clone(),
+        },
+        Writer {
+            state: state.clone(),
+            clock: clock.clone(),
+            released: released.clone(),
+        },
+        Arc::new(move || now.load(Ordering::SeqCst)),
+        Arc::new(move || {
+            wake.fetch_add(1, Ordering::SeqCst);
+        }),
+    )
+    .unwrap();
+    (
+        PipeHarness {
+            channel: Some(channel),
+            state,
+            clock,
+            released,
+            wakes,
+        },
+        ReleasePump(pause),
+    )
+}
+
+#[test]
+fn review_saturated_ordinary_replies_retain_auto_stop_sequence_and_original_deadline() {
+    for expires in [false, true] {
+        let (mut h, release) = pausable_harness();
+        let (mut practice, facts) = native_practice();
+        practice.handle(open(), observe()).unwrap();
+        practice.handle(tone_call(2), observe()).unwrap();
+        for id in 3..35 {
+            h.input(packet(call(
+                id,
+                FixtureCommand::ArmTarget {
+                    fixture: FixtureId(1),
+                    phase: PhaseId(id),
+                },
+            )));
+        }
+        until(|| h.wakes.load(Ordering::SeqCst) == 32);
+        release.0.lock().unwrap().armed = true;
+        until(|| release.0.lock().unwrap().entered);
+        facts.lock().unwrap().tone = OwnToneState::Stopped;
+        assert_eq!(practice.process(h.channel(), 10, false), Ok(false));
+        assert!(h.state.lock().unwrap().output.is_empty());
+        assert_eq!(h.channel().failure(), None);
+        // A retry while the pump is still paused must neither increment nor reorder sequence.
+        assert_eq!(practice.process(h.channel(), 2009, false), Ok(false));
+        drop(release);
+        native_messages(&h, 32);
+        until(|| h.channel().written(34)); // Ordinary deadlines cannot mask the retained event.
+        if expires {
+            h.clock.store(2010, Ordering::SeqCst);
+            assert_eq!(h.channel().failure(), None);
+            assert_eq!(
+                practice.process(h.channel(), 2010, false),
+                Err(FixtureError::TimedOut)
+            );
+            until(|| h.released.load(Ordering::SeqCst) == 2);
+            assert_eq!(native_messages(&h, 32).last().unwrap().sequence, 34);
+            h.finish();
+        } else {
+            practice.process(h.channel(), 2009, false).unwrap();
+            let messages = native_messages(&h, 33);
+            assert_eq!(
+                messages.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+                (3..36).collect::<Vec<_>>()
+            );
+            assert_eq!(messages[32].call_id, None);
+            assert_eq!(
+                messages[32].result,
+                Ok(FixtureEvent::ToneStopped {
+                    fixture: FixtureId(1),
+                    tone: ToneId(2)
+                })
+            );
+            assert_eq!(h.channel().failure(), None);
+            h.finish();
+        }
+    }
+}
+
+struct RacingStopNative(NativeFake);
+impl TutorialNative for RacingStopNative {
+    fn observe_window(&mut self, id: u64, title: &str) -> Option<WindowObservation> {
+        self.0.observe_window(id, title)
+    }
+    fn play_tone(
+        &mut self,
+        tone: ToneId,
+        output: &SpeakersSelection,
+    ) -> Option<Result<(), FixtureError>> {
+        self.0.play_tone(tone, output)
+    }
+    fn stop_tone(&mut self, tone: ToneId) -> Option<Result<(), FixtureError>> {
+        let result = self.0.stop_tone(tone);
+        if result.is_none() {
+            let mut facts = self.0.0.lock().unwrap();
+            facts.stop_pending = false;
+            facts.tone = OwnToneState::Stopped; // Worker completes immediately after returning None.
+        }
+        result
+    }
+    fn tone_state(&self) -> OwnToneState {
+        self.0.tone_state()
+    }
+}
+
+#[test]
+fn review_stop_completion_between_none_and_state_read_emits_one_correlated_stop() {
+    let mut h = PipeHarness::new();
+    let facts = Arc::new(Mutex::new(NativeFacts::default()));
+    let mut practice = Practice::with_native(Box::new(RacingStopNative(NativeFake(facts.clone()))));
+    practice.handle(open(), observe()).unwrap();
+    practice.handle(tone_call(2), observe()).unwrap();
+    facts.lock().unwrap().stop_pending = true;
+    h.input(packet(call(
+        3,
+        FixtureCommand::StopTone {
+            fixture: FixtureId(1),
+            tone: ToneId(2),
+        },
+    )));
+    until(|| h.wakes.load(Ordering::SeqCst) == 1);
+    practice.process(h.channel(), 10, false).unwrap();
+    assert_eq!(facts.lock().unwrap().tone, OwnToneState::Stopped);
+    assert!(
+        h.state.lock().unwrap().output.is_empty(),
+        "pending Stop owns the notification"
+    );
+    practice.process(h.channel(), 11, false).unwrap();
+    let messages = native_messages(&h, 1);
+    assert_eq!(messages[0].call_id, Some(3));
+    assert_eq!(
+        messages[0].result,
+        Ok(FixtureEvent::ToneStopped {
+            fixture: FixtureId(1),
+            tone: ToneId(2)
+        })
+    );
+    practice.process(h.channel(), 12, false).unwrap();
+    assert_eq!(
+        h.state
+            .lock()
+            .unwrap()
+            .output
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count(),
+        1
+    );
+    h.finish();
+}
+
+#[test]
+fn verify_native_close_clears_text_undo_and_press_before_saturated_lifecycle_retry() {
+    let (mut pipes, release) = pausable_harness();
+    let mut ui = UiHarness::new();
+    let (mut practice, facts) = native_practice();
+    practice.handle(open(), observe()).unwrap();
+    ui.practice = practice;
+    ui.frame(0, vec![]).unwrap();
+    ui.type_text("PRIVATE_SATURATED_CLOSE_SENTINEL");
+    ui.frame(2000, vec![]).unwrap(); // Establish an undo checkpoint before Close.
+    ui.practice.handle(tone_call(2), observe()).unwrap();
+    pipes.clock.store(3000, Ordering::SeqCst);
+    for id in 3..35 {
+        pipes.input(packet(call(
+            id,
+            FixtureCommand::ArmTarget {
+                fixture: FixtureId(1),
+                phase: PhaseId(id),
+            },
+        )));
+    }
+    until(|| pipes.wakes.load(Ordering::SeqCst) == 32);
+    release.0.lock().unwrap().armed = true;
+    until(|| release.0.lock().unwrap().entered);
+    facts.lock().unwrap().tone = OwnToneState::Stopped;
+    assert_eq!(ui.practice.process(pipes.channel(), 3000, false), Ok(false));
+    ui.frame(3000, vec![]).unwrap();
+    ui.pointer(3001, ui.widgets.0.center(), PointerButton::Primary, true);
+    assert!(!ui.practice.text_is_empty());
+    assert!(egui::TextEdit::load_state(&ui.ctx, ui.editor).is_some());
+    assert_eq!(ui.practice.process(pipes.channel(), 3002, true), Ok(false));
+    assert!(
+        ui.practice.text_is_empty(),
+        "native Close clears before Busy retry"
+    );
+    assert!(egui::TextEdit::load_state(&ui.ctx, ui.editor).is_none());
+    ui.pointer(3003, ui.widgets.0.center(), PointerButton::Primary, false);
+    ui.click(3004, ui.widgets.1.center());
+    ui.frame(3006, vec![key(egui::Key::Z, Modifiers::COMMAND)])
+        .unwrap();
+    ui.frame(3007, vec![]).unwrap();
+    assert!(ui.practice.text_is_empty());
+    assert!(
+        ui.labels()
+            .iter()
+            .all(|label| !label.contains("PRIVATE_SATURATED_CLOSE_SENTINEL"))
+    );
+    assert_eq!(pipes.channel().failure(), None);
+    drop(release);
+    native_messages(&pipes, 32);
+    until(|| pipes.channel().written(34));
+    pipes.clock.store(3008, Ordering::SeqCst);
+    ui.practice.process(pipes.channel(), 3008, false).unwrap();
+    let messages = native_messages(&pipes, 34);
+    assert_eq!(
+        messages[32].result,
+        Ok(FixtureEvent::ToneStopped {
+            fixture: FixtureId(1),
+            tone: ToneId(2)
+        })
+    );
+    assert_eq!(
+        messages[33].result,
+        Ok(FixtureEvent::CloseRequested {
+            fixture: FixtureId(1)
+        })
+    );
+    ui.next = 35;
+    assert_eq!(
+        ui.snapshot().target_clicks,
+        0,
+        "the pre-close primary press cannot count"
+    );
+    pipes.finish();
 }

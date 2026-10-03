@@ -9,7 +9,7 @@ use std::{
     io,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -1435,6 +1435,271 @@ fn ids_and_sequence_never_wrap_and_time_overflow_invalidates() {
 }
 
 #[test]
+fn exhausted_call_id_precedes_full_queue_and_held_state() {
+    let shared = Arc::new(Mutex::new(Fake {
+        auto_open: true,
+        ..Fake::default()
+    }));
+    let clock = Arc::new(AtomicU64::new(10));
+    let pause = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let caller = thread::current().id();
+    let (now, pause_worker, state_held, release_worker) =
+        (clock.clone(), pause.clone(), held.clone(), release.clone());
+    // Private fake-clock seam: worker check/write clocks run while holding State.
+    // The caller never waits on that mutex and releases the worker before assertions.
+    let port = PipeFixturePort::new(
+        Box::new(Child {
+            shared: shared.clone(),
+            clock: clock.clone(),
+            pid: PID,
+        }),
+        Arc::new(move || {
+            if thread::current().id() != caller && pause_worker.swap(false, Ordering::SeqCst) {
+                state_held.store(true, Ordering::SeqCst);
+                until(|| release_worker.load(Ordering::SeqCst));
+                state_held.store(false, Ordering::SeqCst);
+            }
+            now.load(Ordering::SeqCst)
+        }),
+    )
+    .unwrap();
+    let mut h = Harness {
+        port,
+        shared,
+        clock,
+    };
+    h.opened();
+    for id in 2..=32 {
+        h.submit(call(
+            id,
+            FixtureCommand::ObserveWindow {
+                fixture: FixtureId(1),
+            },
+        ));
+    }
+    h.submit(call(
+        u64::MAX,
+        FixtureCommand::ObserveWindow {
+            fixture: FixtureId(1),
+        },
+    ));
+    h.sent(u64::MAX);
+    pause.store(true, Ordering::SeqCst);
+    until(|| held.load(Ordering::SeqCst));
+    let result = h.port.submit(call(
+        u64::MAX,
+        FixtureCommand::Close {
+            fixture: FixtureId(1),
+        },
+    ));
+    release.store(true, Ordering::SeqCst);
+    until(|| !held.load(Ordering::SeqCst));
+    assert_eq!(result, Err(FixtureError::CounterExhausted));
+    let receipts = h.receipts(32);
+    assert!(
+        receipts
+            .iter()
+            .all(|r| r.message.result == Err(FixtureError::CounterExhausted))
+    );
+    h.retired();
+    let mut h = Harness::new(true);
+    h.opened();
+    h.send(event(None, u64::MAX, Ok(snapshot(None, 0, 0))));
+    assert_eq!(
+        h.receipts(1)[0].message.result,
+        Err(FixtureError::CounterExhausted)
+    );
+    assert_eq!(
+        h.port.submit(call(
+            2,
+            FixtureCommand::ObserveWindow {
+                fixture: FixtureId(1)
+            }
+        )),
+        Err(FixtureError::CounterExhausted)
+    );
+    h.retired();
+}
+
+// Private clock control holds the worker's State guard without native or child I/O.
+struct HeldState {
+    pause: Arc<AtomicBool>,
+    held: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+impl HeldState {
+    fn harness() -> (Harness, Self) {
+        let shared = Arc::new(Mutex::new(Fake {
+            auto_open: true,
+            ..Fake::default()
+        }));
+        let clock = Arc::new(AtomicU64::new(10));
+        let gate = Self {
+            pause: Arc::new(AtomicBool::new(false)),
+            held: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(AtomicBool::new(false)),
+        };
+        let caller = thread::current().id();
+        let (now, pause, held, release) = (
+            clock.clone(),
+            gate.pause.clone(),
+            gate.held.clone(),
+            gate.release.clone(),
+        );
+        let port = PipeFixturePort::new(
+            Box::new(Child {
+                shared: shared.clone(),
+                clock: clock.clone(),
+                pid: PID,
+            }),
+            Arc::new(move || {
+                if thread::current().id() != caller && pause.swap(false, Ordering::SeqCst) {
+                    held.store(true, Ordering::SeqCst);
+                    until(|| release.load(Ordering::SeqCst));
+                    held.store(false, Ordering::SeqCst);
+                }
+                now.load(Ordering::SeqCst)
+            }),
+        )
+        .unwrap();
+        (
+            Harness {
+                port,
+                shared,
+                clock,
+            },
+            gate,
+        )
+    }
+    fn invoke(
+        &self,
+        port: &mut PipeFixturePort,
+        operation: impl FnOnce(&mut PipeFixturePort) -> Result<(), FixtureError> + Send,
+    ) -> Result<(), FixtureError> {
+        self.release.store(false, Ordering::SeqCst);
+        self.pause.store(true, Ordering::SeqCst);
+        until(|| self.held.load(Ordering::SeqCst));
+        let started = AtomicBool::new(false);
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let result = thread::scope(|scope| {
+            scope.spawn(|| {
+                started.store(true, Ordering::SeqCst);
+                send.send(operation(port)).unwrap();
+            });
+            until(|| started.load(Ordering::SeqCst));
+            // Observe an immediate old Busy, or let a lock() caller wait until we release.
+            let early = receive.recv_timeout(Duration::from_millis(25));
+            let was_held = self.held.load(Ordering::SeqCst);
+            self.release.store(true, Ordering::SeqCst);
+            let result = match early {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    receive.recv_timeout(Duration::from_secs(2)).unwrap()
+                }
+                Err(error) => panic!("fake submission channel: {error}"),
+            };
+            assert!(
+                was_held,
+                "State guard must remain held until explicit release"
+            );
+            result
+        });
+        until(|| !self.held.load(Ordering::SeqCst));
+        result
+    }
+}
+
+#[test]
+fn submit_state_contention_preserves_ownership_shape_and_capacity_validation() {
+    let (mut h, gate) = HeldState::harness();
+    h.opened();
+    assert_eq!(
+        gate.invoke(&mut h.port, |port| port.submit(call(
+            2,
+            FixtureCommand::ObserveWindow {
+                fixture: FixtureId(2)
+            },
+        ))),
+        Err(FixtureError::NotOwned)
+    );
+    assert_eq!(
+        gate.invoke(&mut h.port, |port| port.submit(call(
+            1,
+            FixtureCommand::ObserveWindow {
+                fixture: FixtureId(1)
+            },
+        ))),
+        Err(FixtureError::BadCall)
+    );
+    assert_eq!(
+        gate.invoke(&mut h.port, |port| port.submit(call(
+            2,
+            FixtureCommand::ArmTarget {
+                fixture: FixtureId(1),
+                phase: PhaseId(0)
+            },
+        ))),
+        Err(FixtureError::BadCall)
+    );
+    for id in 2..=33 {
+        h.submit(call(
+            id,
+            FixtureCommand::ObserveWindow {
+                fixture: FixtureId(1),
+            },
+        ));
+    }
+    h.sent(33);
+    assert_eq!(
+        gate.invoke(&mut h.port, |port| port.submit(call(
+            34,
+            FixtureCommand::ObserveWindow {
+                fixture: FixtureId(1)
+            },
+        ))),
+        Err(FixtureError::Busy)
+    );
+    h.port.cancel();
+    h.retired();
+}
+
+#[test]
+fn complete_closed_state_contention_preserves_ownership_and_queued_confirmation() {
+    let (mut h, gate) = HeldState::harness();
+    h.opened();
+    h.submit(call(
+        2,
+        FixtureCommand::Close {
+            fixture: FixtureId(1),
+        },
+    ));
+    h.sent(2);
+    assert_eq!(
+        gate.invoke(&mut h.port, |port| port
+            .complete_closed(AttemptId(8), FixtureId(1))),
+        Err(FixtureError::NotOwned)
+    );
+    assert_eq!(
+        gate.invoke(&mut h.port, |port| port
+            .complete_closed(AttemptId(7), FixtureId(1))),
+        Ok(())
+    );
+    assert_eq!(
+        gate.invoke(&mut h.port, |port| port
+            .complete_closed(AttemptId(7), FixtureId(1))),
+        Err(FixtureError::BadCall)
+    );
+    assert!(
+        h.port.poll().is_empty(),
+        "queued confirmation cannot prove cleanup"
+    );
+    h.port.cancel();
+    h.retired();
+}
+
+#[test]
 fn owned_child_retired_once_on_drop_invalid_pid_and_write_failure() {
     let shared = Arc::new(Mutex::new(Fake::default()));
     let clock = Arc::new(AtomicU64::new(0));
@@ -1892,4 +2157,352 @@ fn buffered_old_phase_snapshot_survives_requested_arm_before_write_and_acknowled
     let new = snapshot(Some(PhaseId(11)), 9, 3);
     h.send(event(None, 5, Ok(new.clone())));
     assert_eq!(h.receipts(1)[0].message.result, Ok(new));
+}
+
+#[derive(Default)]
+struct CleanupEvidence {
+    reaped: bool,
+    fresh_absent: bool,
+    probes: usize,
+}
+struct EvidenceChild {
+    inner: Child,
+    evidence: Arc<Mutex<CleanupEvidence>>,
+}
+impl InheritedFixtureChild for EvidenceChild {
+    fn pid(&self) -> u32 {
+        self.inner.pid()
+    }
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(bytes)
+    }
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner.write(bytes)
+    }
+    fn retire(&mut self) {
+        self.inner.retire();
+    }
+    fn cleanup_confirmed(&mut self) -> Result<bool, FixtureError> {
+        // Injected proof model only: neither a real process nor a native window is touched.
+        let mut evidence = self.evidence.lock().unwrap();
+        evidence.probes += 1;
+        Ok(evidence.reaped && evidence.fresh_absent)
+    }
+}
+fn evidence_harness() -> (Harness, Arc<Mutex<CleanupEvidence>>) {
+    let shared = Arc::new(Mutex::new(Fake {
+        auto_open: true,
+        ..Fake::default()
+    }));
+    let clock = Arc::new(AtomicU64::new(10));
+    let now = clock.clone();
+    let evidence = Arc::new(Mutex::new(CleanupEvidence::default()));
+    let port = PipeFixturePort::new(
+        Box::new(EvidenceChild {
+            inner: Child {
+                shared: shared.clone(),
+                clock: clock.clone(),
+                pid: PID,
+            },
+            evidence: evidence.clone(),
+        }),
+        Arc::new(move || now.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    (
+        Harness {
+            port,
+            shared,
+            clock,
+        },
+        evidence,
+    )
+}
+fn complete(h: &mut Harness, attempt: AttemptId, fixture: FixtureId) -> Result<(), FixtureError> {
+    let mut result = Err(FixtureError::Busy);
+    until(|| {
+        result = h.port.complete_closed(attempt, fixture);
+        result != Err(FixtureError::Busy)
+    });
+    result
+}
+fn request_close(h: &mut Harness, reply: bool) {
+    h.submit(call(
+        2,
+        FixtureCommand::Close {
+            fixture: FixtureId(1),
+        },
+    ));
+    h.sent(2);
+    if reply {
+        h.send(event(
+            Some(2),
+            2,
+            Ok(FixtureEvent::CloseRequested {
+                fixture: FixtureId(1),
+            }),
+        ));
+        assert_eq!(
+            h.receipts(1)[0].message.result,
+            Ok(FixtureEvent::CloseRequested {
+                fixture: FixtureId(1)
+            })
+        );
+    }
+}
+fn no_cleanup_receipt(h: &mut Harness, evidence: &Arc<Mutex<CleanupEvidence>>) {
+    let start = evidence.lock().unwrap().probes;
+    until(|| evidence.lock().unwrap().probes >= start + 2);
+    assert!(h.port.poll_receipts().is_empty());
+}
+
+#[test]
+fn complete_closed_refuses_pre_close_wrong_attempt_and_wrong_fixture() {
+    let (mut h, evidence) = evidence_harness();
+    h.opened();
+    assert_eq!(
+        complete(&mut h, AttemptId(8), FixtureId(1)),
+        Err(FixtureError::NotOwned)
+    );
+    assert_eq!(
+        complete(&mut h, AttemptId(7), FixtureId(2)),
+        Err(FixtureError::NotOwned)
+    );
+    assert_eq!(
+        complete(&mut h, AttemptId(7), FixtureId(1)),
+        Err(FixtureError::BadCall)
+    );
+    {
+        let mut e = evidence.lock().unwrap();
+        e.reaped = true;
+        e.fresh_absent = true;
+    }
+    request_close(&mut h, false);
+    assert_eq!(
+        complete(&mut h, AttemptId(8), FixtureId(1)),
+        Err(FixtureError::NotOwned)
+    );
+    assert_eq!(
+        complete(&mut h, AttemptId(7), FixtureId(2)),
+        Err(FixtureError::NotOwned)
+    );
+    assert_eq!(complete(&mut h, AttemptId(7), FixtureId(1)), Ok(()));
+    let closed = h.receipts(1);
+    assert_eq!(closed[0].message.call_id, Some(2));
+    assert_eq!(closed[0].message.sequence, 2);
+    assert_eq!(
+        closed[0].message.result,
+        Ok(FixtureEvent::Closed {
+            fixture: FixtureId(1)
+        })
+    );
+    h.retired();
+}
+
+#[test]
+fn complete_closed_ok_only_queues_and_requires_both_fresh_absence_and_reaping() {
+    let (mut h, evidence) = evidence_harness();
+    h.opened();
+    request_close(&mut h, true);
+    assert_eq!(complete(&mut h, AttemptId(7), FixtureId(1)), Ok(()));
+    assert_eq!(
+        complete(&mut h, AttemptId(7), FixtureId(1)),
+        Err(FixtureError::BadCall)
+    );
+    no_cleanup_receipt(&mut h, &evidence);
+    evidence.lock().unwrap().reaped = true;
+    no_cleanup_receipt(&mut h, &evidence);
+    {
+        let mut e = evidence.lock().unwrap();
+        e.reaped = false;
+        e.fresh_absent = true;
+    }
+    no_cleanup_receipt(&mut h, &evidence);
+    evidence.lock().unwrap().reaped = true;
+    let closed = h.receipts(1);
+    assert_eq!(closed[0].received_at_ms, 10);
+    assert_eq!(closed[0].message.call_id, Some(2));
+    assert_eq!(closed[0].message.sequence, 3);
+    assert_eq!(
+        closed[0].message.result,
+        Ok(FixtureEvent::Closed {
+            fixture: FixtureId(1)
+        })
+    );
+    h.retired();
+    assert_eq!(
+        complete(&mut h, AttemptId(7), FixtureId(1)),
+        Err(FixtureError::ChannelClosed)
+    );
+    assert!(h.port.poll_receipts().is_empty());
+}
+
+#[test]
+fn complete_closed_after_native_close_requested_is_uncorrelated_and_at_most_once() {
+    let (mut h, evidence) = evidence_harness();
+    h.opened();
+    h.send(event(
+        None,
+        2,
+        Ok(FixtureEvent::CloseRequested {
+            fixture: FixtureId(1),
+        }),
+    ));
+    assert_eq!(h.receipts(1)[0].message.call_id, None);
+    assert_eq!(complete(&mut h, AttemptId(7), FixtureId(1)), Ok(()));
+    no_cleanup_receipt(&mut h, &evidence);
+    {
+        let mut e = evidence.lock().unwrap();
+        e.reaped = true;
+        e.fresh_absent = true;
+    }
+    let closed = h.receipts(1);
+    assert_eq!(closed[0].message.call_id, None);
+    assert_eq!(closed[0].message.sequence, 3);
+    assert_eq!(
+        closed[0].message.result,
+        Ok(FixtureEvent::Closed {
+            fixture: FixtureId(1)
+        })
+    );
+    h.retired();
+    assert_eq!(
+        complete(&mut h, AttemptId(7), FixtureId(1)),
+        Err(FixtureError::ChannelClosed)
+    );
+    assert!(h.port.poll_receipts().is_empty());
+}
+
+#[test]
+fn complete_closed_without_cleanup_keeps_original_deadline_and_never_emits_closed() {
+    let (mut h, evidence) = evidence_harness();
+    h.opened();
+    request_close(&mut h, true);
+    assert_eq!(complete(&mut h, AttemptId(7), FixtureId(1)), Ok(()));
+    no_cleanup_receipt(&mut h, &evidence);
+    h.clock.store(2010, Ordering::SeqCst);
+    h.retired();
+    let failed = h.receipts(1);
+    assert_eq!(failed[0].message.call_id, Some(2));
+    assert_eq!(failed[0].message.result, Err(FixtureError::TimedOut));
+    {
+        let mut e = evidence.lock().unwrap();
+        e.reaped = true;
+        e.fresh_absent = true;
+    }
+    assert_eq!(
+        complete(&mut h, AttemptId(7), FixtureId(1)),
+        Err(FixtureError::ChannelClosed)
+    );
+    assert!(h.port.poll_receipts().is_empty());
+}
+
+#[test]
+fn complete_closed_cancellation_retains_existing_retirement_rules() {
+    let (mut h, evidence) = evidence_harness();
+    h.opened();
+    request_close(&mut h, true);
+    assert_eq!(complete(&mut h, AttemptId(7), FixtureId(1)), Ok(()));
+    no_cleanup_receipt(&mut h, &evidence);
+    h.port.cancel();
+    h.retired();
+    assert_eq!(
+        complete(&mut h, AttemptId(7), FixtureId(1)),
+        Err(FixtureError::ChannelClosed)
+    );
+    let failed = h.receipts(1);
+    assert_eq!(failed[0].message.result, Err(FixtureError::ChannelClosed));
+    assert!(
+        !failed
+            .iter()
+            .any(|r| matches!(r.message.result, Ok(FixtureEvent::Closed { .. })))
+    );
+}
+
+struct ExitBetweenProbeAndRead {
+    child: EvidenceChild,
+    absent: bool,
+    expires: bool,
+}
+impl InheritedFixtureChild for ExitBetweenProbeAndRead {
+    fn pid(&self) -> u32 {
+        self.child.pid()
+    }
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.child.write(bytes)
+    }
+    fn retire(&mut self) {
+        self.child.retire();
+    }
+    fn cleanup_confirmed(&mut self) -> Result<bool, FixtureError> {
+        self.child.cleanup_confirmed()
+    }
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.child.evidence.lock().unwrap().probes > 0 {
+            let mut evidence = self.child.evidence.lock().unwrap();
+            evidence.reaped = true;
+            evidence.fresh_absent = self.absent;
+            if self.expires {
+                self.child.inner.clock.store(2010, Ordering::SeqCst);
+            }
+            return Ok(0); // Owned fake exits after first false probe, before its pipe read.
+        }
+        self.child.read(bytes)
+    }
+}
+
+#[test]
+fn review_eof_after_false_cleanup_probe_rechecks_fresh_proof_without_hiding_unconfirmed_exit() {
+    for (absent, expires) in [(true, false), (false, false), (true, true)] {
+        let shared = Arc::new(Mutex::new(Fake {
+            auto_open: true,
+            ..Fake::default()
+        }));
+        let clock = Arc::new(AtomicU64::new(10));
+        let now = clock.clone();
+        let evidence = Arc::new(Mutex::new(CleanupEvidence::default()));
+        let port = PipeFixturePort::new(
+            Box::new(ExitBetweenProbeAndRead {
+                child: EvidenceChild {
+                    inner: Child {
+                        shared: shared.clone(),
+                        clock: clock.clone(),
+                        pid: PID,
+                    },
+                    evidence: evidence.clone(),
+                },
+                absent,
+                expires,
+            }),
+            Arc::new(move || now.load(Ordering::SeqCst)),
+        )
+        .unwrap();
+        let mut h = Harness {
+            port,
+            shared,
+            clock,
+        };
+        h.opened();
+        request_close(&mut h, false);
+        assert_eq!(complete(&mut h, AttemptId(7), FixtureId(1)), Ok(()));
+        let receipts = h.receipts(1);
+        assert_eq!(receipts[0].message.call_id, Some(2));
+        assert_eq!(
+            receipts[0].message.result,
+            if expires {
+                Err(FixtureError::TimedOut)
+            } else if absent {
+                Ok(FixtureEvent::Closed {
+                    fixture: FixtureId(1),
+                })
+            } else {
+                Err(FixtureError::ChildExited)
+            }
+        );
+        if absent && !expires {
+            assert_eq!(evidence.lock().unwrap().probes, 2);
+        }
+        h.retired();
+        assert!(h.port.poll_receipts().is_empty());
+    }
 }

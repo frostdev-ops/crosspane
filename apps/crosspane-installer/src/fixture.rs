@@ -379,7 +379,13 @@ fn lifecycle(m: &FixtureMessage) -> bool {
     )
 }
 #[derive(Default)]
+struct Exhaustion {
+    reached: AtomicBool,
+    retire_requested: AtomicBool,
+}
+#[derive(Default)]
 struct State {
+    exhaustion: Arc<Exhaustion>,
     last_call: u64,
     sequence: u64,
     attempt: Option<AttemptId>,
@@ -394,6 +400,8 @@ struct State {
     output: VecDeque<FixtureReceipt>,
     failure: Option<(FixtureError, u64)>,
     retired: bool,
+    close_requested: bool,
+    close_confirmation: bool,
 }
 impl State {
     fn enqueue(&mut self, call: FixtureCall, at: u64) -> Result<Vec<u8>, FixtureError> {
@@ -441,6 +449,9 @@ impl State {
             call: call.clone(),
         })?;
         self.last_call = call.id;
+        if call.id == u64::MAX {
+            self.exhaustion.reached.store(true, Ordering::Release);
+        }
         self.attempt = Some(call.attempt);
         if let FixtureCommand::ArmTarget { phase, .. } = call.command {
             self.requested_phase = Some(phase);
@@ -453,6 +464,7 @@ impl State {
             return Ok(());
         }
         if m.sequence == u64::MAX {
+            self.exhaustion.reached.store(true, Ordering::Release);
             return Err(FixtureError::CounterExhausted);
         }
         if self.attempt != Some(m.attempt) || m.sequence <= self.sequence {
@@ -576,6 +588,7 @@ impl State {
             return Err(FixtureError::Busy);
         }
         self.sequence = m.sequence;
+        self.close_requested |= retained_close;
         self.fixture = new_fixture;
         self.phase = new_phase;
         self.tone = new_tone;
@@ -659,6 +672,7 @@ impl State {
 /// 32 ordinary ready messages plus one complete line and four reserved lifecycle entries are
 /// bounded separately. Retirement preserves accepted receipts; each poll returns at most 32.
 pub struct PipeFixturePort {
+    exhaustion: Arc<Exhaustion>,
     state: Arc<Mutex<State>>,
     writes: std::sync::mpsc::SyncSender<(u64, Vec<u8>)>,
     stop: Arc<AtomicBool>,
@@ -678,7 +692,9 @@ impl PipeFixturePort {
         if child.0.pid() == 0 {
             return Err(FixtureError::NotOwned);
         }
-        let state = Arc::new(Mutex::new(State::default()));
+        let initial = State::default();
+        let exhaustion = initial.exhaustion.clone();
+        let state = Arc::new(Mutex::new(initial));
         let stop = Arc::new(AtomicBool::new(false));
         let (writes, receive) = std::sync::mpsc::sync_channel(MAX_QUEUE);
         let s = state.clone();
@@ -691,6 +707,7 @@ impl PipeFixturePort {
             })
             .map_err(|_| FixtureError::Unavailable)?;
         Ok(Self {
+            exhaustion,
             state,
             writes,
             stop,
@@ -699,6 +716,37 @@ impl PipeFixturePort {
     }
     pub fn cancel(&mut self) {
         self.stop.store(true, Ordering::Release);
+    }
+    /// Queue native cleanup confirmation for this attempt/fixture after its Close call or
+    /// CloseRequested. Ok means queued ONLY, not that cleanup is proved. The owned-child worker
+    /// calls cleanup_confirmed (reaped child AND a fresh absent-window observation) before emitting
+    /// at most one Closed through the existing receipt/correlation/deadline rules. No timer alone
+    /// completes cleanup; cancellation and retirement still refuse further confirmation.
+    pub fn complete_closed(
+        &mut self,
+        attempt: AttemptId,
+        fixture: FixtureId,
+    ) -> Result<(), FixtureError> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(FixtureError::ChannelClosed);
+        }
+        let mut state = self.state.lock().map_err(|_| FixtureError::ChannelClosed)?;
+        if state.retired {
+            return Err(FixtureError::ChannelClosed);
+        }
+        if state.attempt != Some(attempt) || state.fixture != Some(fixture) {
+            return Err(FixtureError::NotOwned);
+        }
+        if state.close_confirmation
+            || !(state.close_requested
+                || state.pending.values().any(
+                    |p| matches!(p.0.command, FixtureCommand::Close { fixture: f } if f == fixture),
+                ))
+        {
+            return Err(FixtureError::BadCall);
+        }
+        state.close_confirmation = true;
+        Ok(())
     }
     pub fn poll_receipts(&mut self) -> Vec<FixtureReceipt> {
         self.state
@@ -712,7 +760,13 @@ impl FixturePort for PipeFixturePort {
         if self.stop.load(Ordering::Acquire) {
             return Err(FixtureError::ChannelClosed);
         }
-        let mut state = self.state.try_lock().map_err(|_| FixtureError::Busy)?;
+        if self.exhaustion.reached.load(Ordering::Acquire) {
+            self.exhaustion
+                .retire_requested
+                .store(true, Ordering::Release);
+            return Err(FixtureError::CounterExhausted);
+        }
+        let mut state = self.state.lock().map_err(|_| FixtureError::ChannelClosed)?;
         let at = (self.clock)();
         let id = call.id;
         let bytes = match state.enqueue(call, at) {
@@ -768,6 +822,9 @@ fn worker(
             let check = || -> Result<(), FixtureError> {
                 let mut s = state.lock().map_err(|_| FixtureError::ChannelClosed)?;
                 let at = clock();
+                if s.exhaustion.retire_requested.load(Ordering::Acquire) {
+                    s.fail(FixtureError::CounterExhausted, at);
+                }
                 if stop.load(Ordering::Acquire) {
                     s.fail(FixtureError::ChannelClosed, at);
                 }
@@ -794,6 +851,38 @@ fn worker(
                 }
             };
             check()?;
+            let complete = |child: &mut ChildGuard| -> Result<bool, FixtureError> {
+                check()?;
+                let queued = state
+                    .lock()
+                    .map_err(|_| FixtureError::ChannelClosed)?
+                    .close_confirmation;
+                if !queued || !child.0.cleanup_confirmed()? {
+                    return Ok(false);
+                }
+                check()?;
+                let mut s = state.lock().map_err(|_| FixtureError::ChannelClosed)?;
+                let fixture = s.fixture.ok_or(FixtureError::NotOwned)?;
+                let call_id = s.pending.iter().rev().find_map(|(id, p)| {
+                    (p.2.is_some() && matches!(p.0.command, FixtureCommand::Close { .. }))
+                        .then_some(*id)
+                });
+                let message = FixtureMessage {
+                    call_id,
+                    attempt: s.attempt.ok_or(FixtureError::NotOwned)?,
+                    sequence: s
+                        .sequence
+                        .checked_add(1)
+                        .filter(|n| *n < u64::MAX)
+                        .ok_or(FixtureError::CounterExhausted)?,
+                    result: Ok(FixtureEvent::Closed { fixture }),
+                };
+                s.accept(message, clock(), child.0.pid())?;
+                Ok(true)
+            };
+            if held.is_none() && bytes.is_empty() && write.is_none() && complete(&mut child)? {
+                return Ok(true);
+            }
             let mut progress = false;
             if write.is_none() {
                 write = receive.try_recv().ok().map(|(id, b)| (id, b, 0));
@@ -819,6 +908,9 @@ fn worker(
                 let mut byte = [0];
                 if let Some(n) = pipe_progress(child.0.read(&mut byte))? {
                     if n == 0 {
+                        if bytes.is_empty() && write.is_none() && complete(&mut child)? {
+                            return Ok(true);
+                        }
                         return Err(FixtureError::ChildExited);
                     }
                     if n != 1 {
