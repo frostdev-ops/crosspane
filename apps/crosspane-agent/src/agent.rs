@@ -1682,7 +1682,7 @@ impl Agent {
                     scale,
                 });
             }
-            Output::Restore { window } => {
+            Output::Restore { window, .. } => {
                 self.parking_submit(crate::parking_worker::Command::Restore { window });
             }
             Output::ActivateWindow { window } => {
@@ -1855,6 +1855,7 @@ impl Agent {
                 title,
                 app_id: _,
                 size,
+                ..
             } => {
                 let id = self.proxy_ids.open(key);
                 let title = self.badged(key.source, &title);
@@ -1865,6 +1866,7 @@ impl Agent {
                         title,
                         size,
                         accent: node_accent(key.source),
+                        place: None,
                     })
                     .is_ok()
                 });
@@ -2424,7 +2426,11 @@ impl Agent {
                 return;
             }
             TrayAction::Project { window, to } => {
-                self.feed(Input::Command(Command::Project { window, to }));
+                self.feed(Input::Command(Command::Project {
+                    window,
+                    to,
+                    place: None,
+                }));
                 return;
             }
             TrayAction::Pull { peer, window } => {
@@ -4052,6 +4058,7 @@ impl Agent {
                     self.feed(Input::Command(Command::Project {
                         window: WindowId(window),
                         to,
+                        place: None,
                     }));
                     Response::ok(json!("projection offered"))
                 }
@@ -9290,6 +9297,7 @@ mod home_tests {
             Input::Command(Command::Project {
                 window: WindowId(10),
                 to: peer,
+                place: None,
             }),
         );
         assert!(
@@ -10201,6 +10209,7 @@ mod home_tests {
         h.rig.agent.execute(vec![
             Output::Restore {
                 window: WindowId(10),
+                place: None,
             },
             Output::Park {
                 window: WindowId(10),
@@ -10276,6 +10285,7 @@ mod home_tests {
         h.rig.agent.feed(Input::Command(Command::Project {
             window: WindowId(10),
             to: peer,
+            place: None,
         }));
         h.rig.agent.feed(accept(1));
         assert_eq!(
@@ -10301,6 +10311,7 @@ mod home_tests {
         h.rig.agent.feed(Input::Command(Command::Project {
             window: WindowId(10),
             to: peer,
+            place: None,
         }));
         h.rig.agent.feed(accept(2));
         let new = h.rig.agent.parking_latest[&WindowId(10)];
@@ -11030,6 +11041,7 @@ mod home_tests {
         );
         h.rig.agent.execute(vec![Output::Restore {
             window: WindowId(10),
+            place: None,
         }]);
         process_events(&mut h);
         assert_eq!(h.compositor.lock().unwrap().restores, 1);
@@ -11990,7 +12002,8 @@ mod home_tests {
         assert!(out.iter().any(|output| matches!(
             output,
             Output::Restore {
-                window: WindowId(10)
+                window: WindowId(10),
+                place: None,
             }
         )));
         assert!(h.rig.agent.home.twins.is_empty());
@@ -13752,6 +13765,7 @@ mod home_tests {
             Input::Command(Command::Project {
                 window: WindowId(10),
                 to: peer,
+                place: None,
             }),
         );
         step(
@@ -14789,6 +14803,7 @@ mod home_tests {
             Input::Command(Command::Project {
                 window: WindowId(10),
                 to: peer,
+                place: None,
             }),
         );
         step(
@@ -14891,6 +14906,7 @@ mod home_tests {
             Input::Command(Command::Project {
                 window: WindowId(10),
                 to: peer,
+                place: None,
             }),
         );
         h.rig.agent.feed(projection_input(

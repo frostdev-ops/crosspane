@@ -105,7 +105,11 @@ impl Fixture {
             parent: None,
         })));
         self.handle(Input::Windows(WindowEvent::Focused(Some(window))));
-        self.handle(Input::Command(Command::Project { window, to: peer }));
+        self.handle(Input::Command(Command::Project {
+            window,
+            to: peer,
+            place: None,
+        }));
         self.handle(Input::Link(LinkEvent::Control {
             peer,
             msg: ControlMessage::Projection(ProjectionMessage::Accepted {

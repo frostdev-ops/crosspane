@@ -222,7 +222,7 @@ impl E2 {
                 WindowEvent::Focused(window) => self.focused = *window,
                 _ => {}
             },
-            Input::Command(Command::Project { window, to }) => {
+            Input::Command(Command::Project { window, to, .. }) => {
                 let _ = self.project(*window, *to, now, out);
             }
             Input::Command(command @ (Command::Browse { .. } | Command::Pull { .. })) => {

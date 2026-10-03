@@ -188,10 +188,12 @@ fn browse_round_trip_filters_sorts_caps_and_trims_windows() {
     source.handle(Input::Command(Command::Project {
         window: WindowId(3),
         to: C,
+        place: None,
     }));
     source.handle(Input::Command(Command::Project {
         window: WindowId(4),
         to: B,
+        place: None,
     }));
     source.handle(control(
         B,
@@ -359,6 +361,7 @@ fn pull_refusals_preserve_projection_notices() {
     source.handle(Input::Command(Command::Project {
         window: WINDOW,
         to: B,
+        place: None,
     }));
     assert_eq!(source.handle(pull.clone()), expected); // already projected
     source.handle(control(
@@ -493,7 +496,8 @@ fn pull_runs_the_same_projection_path_and_checks_window_present() {
         offer,
         local.handle(Input::Command(Command::Project {
             window: WINDOW,
-            to: B
+            to: B,
+            place: None,
         }))
     );
     assert_eq!(
@@ -516,7 +520,8 @@ fn pull_runs_the_same_projection_path_and_checks_window_present() {
             key: key(),
             title: "fixture".into(),
             app_id: "test".into(),
-            size: size()
+            size: size(),
+            place: None,
         }]
     );
     let accepted = destination.handle(Input::ProxyOpened {
@@ -612,7 +617,10 @@ fn pull_runs_the_same_projection_path_and_checks_window_present() {
     assert!(ended.contains(&Output::StopCapture {
         stream: StreamId(1)
     }));
-    assert!(ended.contains(&Output::Restore { window: WINDOW }));
+    assert!(ended.contains(&Output::Restore {
+        window: WINDOW,
+        place: None
+    }));
     assert!(ended.contains(&Output::Notice(Notice::ProjectionEnded {
         key: key(),
         reason: Reason::Returned
@@ -666,7 +674,10 @@ fn revoking_window_share_ends_a_pulled_projection() {
             Output::StopCapture {
                 stream: StreamId(1)
             },
-            Output::Restore { window: WINDOW },
+            Output::Restore {
+                window: WINDOW,
+                place: None
+            },
             sent(
                 B,
                 Message::End {

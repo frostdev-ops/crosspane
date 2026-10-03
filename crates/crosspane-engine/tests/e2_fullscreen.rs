@@ -194,6 +194,7 @@ impl Src {
             Input::Command(Command::Project {
                 window: WINDOW,
                 to: DST,
+                place: None,
             }),
             0,
         );
@@ -264,6 +265,7 @@ impl Src {
             Input::Command(Command::Project {
                 window: WINDOW,
                 to: DST,
+                place: None,
             }),
             0,
         );

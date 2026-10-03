@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crosspane_types::geom::PointDevice;
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::DisplayId;
+use crosspane_types::id::{DisplayId, WindowId};
 use crosspane_types::input::{LockKeys, ScrollDelta};
 use crosspane_types::time::MonoTime;
 
@@ -78,6 +78,18 @@ pub enum CaptureEvent {
     EdgePressed {
         portal: PortalId,
         position: f64,
+        at: MonoTime,
+    },
+    /// While not capturing: a local window move (DRAG-v0 D-2) is pressing against `portal`.
+    /// `position` runs from 0.0 at the portal's `from` to 1.0 at its `to`. `window` is the moved
+    /// window: a `WindowSource` id, or the proxy's own window id when a proxy is moved. `grab` is the
+    /// pointer's offset inside that window's content, in device pixels of the display it is on.
+    /// Repeats while the pointer keeps pushing; `EdgeReleased` ends it.
+    DragAtEdge {
+        portal: PortalId,
+        position: f64,
+        window: WindowId,
+        grab: PointDevice,
         at: MonoTime,
     },
     /// The pointer stopped pressing against a portal: it moved away, left the stretch, or the portal
@@ -165,6 +177,26 @@ pub trait InputCapture: Send {
     ///   keyboard becomes blinded, or any required piece stops working.
     fn begin(&mut self, id: CaptureId, portal: PortalId) -> Result<CaptureStart, PlatformError>;
 
+    /// Like [`InputCapture::begin`], for a window drag across `portal` while `button` is held
+    /// (DRAG-v0 D-4). First ends the local native window move and settles the local OS's view of
+    /// `button` (macOS: a synthetic up; Hyprland: per P8a), then captures as `begin` does. `button`
+    /// must be the only pointer button held, else [`PlatformError::PointerButtonHeld`]. While the
+    /// capture runs, the physical release of `button` is delivered exactly once as
+    /// `Button { button, down: false }`. If the capture ends first, nothing follows `Ended`, and the
+    /// backend keeps suppressing that button's physical tail where the OS would otherwise act on it,
+    /// as for suppressed downs. Once the local settlement has happened, that tail suppression also
+    /// survives a failed activation and an abort before `Started`: it is excluded from `begin`'s
+    /// rollback, so the seat's one down never gets a second up. Every other rule of `begin` applies.
+    fn begin_drag(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        button: MouseButton,
+    ) -> Result<CaptureStart, PlatformError> {
+        let _ = (id, portal, button);
+        Err(PlatformError::Unsupported("begin_drag"))
+    }
+
     /// End the current capture and give input back to this node, placing the local pointer at
     /// `warp_to` first if given. Emits `Ended { reason: Requested }`. Must succeed, or fail without
     /// leaving input suppressed.
@@ -176,4 +208,43 @@ pub trait InputCapture: Send {
     /// Turn local-activity monitoring on or off. Best effort: may return
     /// [`PlatformError::Unsupported`].
     fn set_monitor_local_activity(&mut self, on: bool) -> Result<(), PlatformError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Capture;
+    struct Abort;
+    impl CaptureAbort for Abort {
+        fn abort(&self) {}
+    }
+    impl InputCapture for Capture {
+        fn set_portals(&mut self, _: &[CapturePortal]) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn subscribe(&mut self, _: Arc<dyn EventSink<CaptureEvent>>) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn begin(&mut self, _: CaptureId, _: PortalId) -> Result<CaptureStart, PlatformError> {
+            panic!("begin_drag must not call begin")
+        }
+        fn end(&mut self, _: Option<(DisplayId, PointDevice)>) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn abort_handle(&self) -> Arc<dyn CaptureAbort> {
+            Arc::new(Abort)
+        }
+        fn set_monitor_local_activity(&mut self, _: bool) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn begin_drag_defaults_to_unsupported() {
+        assert!(matches!(
+            Capture.begin_drag(CaptureId(1), PortalId(2), MouseButton::PRIMARY),
+            Err(PlatformError::Unsupported("begin_drag"))
+        ));
+    }
 }

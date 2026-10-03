@@ -14,6 +14,14 @@ mod cursor;
 mod gpu;
 mod input;
 
+/// Where to put a new proxy's content (DRAG-v0 §4): its top-left in the desktop's global logical
+/// coordinates, computed by the agent from the display's origin and scale. macOS places the
+/// frame so that the content lands there; Wayland hosts ignore it (the agent places by IPC).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HostPlace {
+    pub content: winit::dpi::LogicalPosition<f64>,
+}
+
 /// Commands to the host, sent from any thread through `HostHandle`.
 pub enum HostCommand {
     /// Open a proxy with roughly `size` device pixels of content. `accent` is the source node's
@@ -24,6 +32,20 @@ pub enum HostCommand {
         title: String,
         size: PixelSize,
         accent: [u8; 3],
+        place: Option<HostPlace>,
+    },
+    /// Consume the next primary press on proxy `id` before `until` as the start of a native move
+    /// (`Window::drag_window`), without reporting it (DRAG-v0 D-5). One press only. `done` is answered
+    /// once the arm is installed on the host thread (`true`), or can't be (`false`); the target never
+    /// injects the press before `true`.
+    Arm {
+        id: u64,
+        until: std::time::Instant,
+        done: std::sync::mpsc::SyncSender<bool>,
+    },
+    /// End an `Arm` that wasn't used.
+    Disarm {
+        id: u64,
     },
     Close {
         id: u64,
@@ -93,6 +115,7 @@ impl fmt::Debug for HostCommand {
                 title,
                 size,
                 accent,
+                ..
             } => f
                 .debug_struct("Open")
                 .field("id", id)
@@ -100,6 +123,12 @@ impl fmt::Debug for HostCommand {
                 .field("size", size)
                 .field("accent", accent)
                 .finish(),
+            Self::Arm { id, until, .. } => f
+                .debug_struct("Arm")
+                .field("id", id)
+                .field("until", until)
+                .finish(),
+            Self::Disarm { id } => f.debug_struct("Disarm").field("id", id).finish(),
             Self::Close { id } => f.debug_struct("Close").field("id", id).finish(),
             Self::SetTitle { id, title } => f
                 .debug_struct("SetTitle")
@@ -421,6 +450,7 @@ fn check(handle: &HostHandle, events: &Receiver<HostEvent>) {
             title: "WP-2.43c placement".into(),
             size: PixelSize::new(640, 480),
             accent: [10, 20, 30],
+            place: None,
         })
         .expect("open");
     let HostEvent::Opened { size: opened, scale, .. } =

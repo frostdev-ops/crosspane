@@ -540,6 +540,7 @@ impl E2 {
                 title: window.title.clone(),
                 app_id: window.app_id.clone(),
                 size: *size,
+                place: None,
             });
             return;
         }

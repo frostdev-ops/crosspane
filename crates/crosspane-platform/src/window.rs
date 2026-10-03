@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crosspane_types::geom::{PixelRect, PixelSize, RectLogical};
+use crosspane_types::geom::{PixelRect, PixelSize, PointDevice, RectLogical};
 use crosspane_types::id::{DisplayId, WindowId};
 
 use crate::{EventSink, PlatformError};
@@ -125,8 +125,70 @@ pub trait WindowParking: Send {
     /// since closed.
     fn restore(&mut self, window: WindowId) -> Result<(), PlatformError>;
 
+    /// Like [`WindowParking::restore`], then place the window's content top-left at `origin` device
+    /// pixels on `display`, clamped to that display's work area (DRAG-v0 D-6). The placement is best
+    /// effort: a placement failure after a successful restore is `Ok`. Default: `restore`.
+    fn restore_at(
+        &mut self,
+        window: WindowId,
+        display: DisplayId,
+        origin: PointDevice,
+    ) -> Result<(), PlatformError> {
+        let _ = (display, origin);
+        self.restore(window)
+    }
+
     /// Undo everything a previous run left parked, from the journal, and remove leftover twin
     /// displays. The agent calls this at startup before anything else. Returns the windows
     /// restored.
     fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Parking {
+        restored: Vec<WindowId>,
+        fail: bool,
+    }
+    impl WindowParking for Parking {
+        fn park(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError> {
+            unreachable!()
+        }
+        fn resize(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError> {
+            unreachable!()
+        }
+        fn geometry(&self, _: WindowId) -> Result<Parked, PlatformError> {
+            unreachable!()
+        }
+        fn restore(&mut self, window: WindowId) -> Result<(), PlatformError> {
+            self.restored.push(window);
+            if self.fail {
+                Err(PlatformError::NotFound)
+            } else {
+                Ok(())
+            }
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn restore_at_defaults_to_restore_and_preserves_its_result() {
+        let mut parking = Parking::default();
+        assert!(
+            parking
+                .restore_at(WindowId(1), DisplayId(7), PointDevice::new(-20.0, 30.0))
+                .is_ok()
+        );
+        parking.fail = true;
+        assert!(matches!(
+            parking.restore_at(WindowId(2), DisplayId(9), PointDevice::new(0.0, 0.0)),
+            Err(PlatformError::NotFound)
+        ));
+        assert_eq!(parking.restored, vec![WindowId(1), WindowId(2)]);
+    }
 }

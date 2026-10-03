@@ -921,7 +921,11 @@ impl H {
         content: PixelRect,
         kind: PlatformParking,
     ) {
-        let out = self.feed(Input::Command(Command::Project { window, to: peer }));
+        let out = self.feed(Input::Command(Command::Project {
+            window,
+            to: peer,
+            place: None,
+        }));
         assert!(
             out.iter().any(|o| matches!(
                 o,
@@ -5327,7 +5331,11 @@ fn reconnect_requires_fresh_placement() {
 #[test]
 fn placement_before_live_is_kept() {
     let mut h = H::bare();
-    h.feed(Input::Command(Command::Project { window: W1, to: B }));
+    h.feed(Input::Command(Command::Project {
+        window: W1,
+        to: B,
+        place: None,
+    }));
     h.feed(projection_msg(
         B,
         Message::Accepted {

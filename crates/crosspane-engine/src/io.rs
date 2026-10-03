@@ -12,7 +12,9 @@ use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{
     Capability, ControlMessage, InputMessage, Placement, PointerMessage, Refusal,
 };
-use crosspane_protocol::projection::{BrowsableWindow, ParkingKind, ProjectionEndReason};
+use crosspane_protocol::projection::{
+    BrowsableWindow, ParkingKind, ProjectionEndReason, ProxyPlacement,
+};
 use crosspane_types::audio::{AudioKind, AudioStreamId};
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{PixelRect, PixelSize, PointDevice};
@@ -119,9 +121,15 @@ pub enum Command {
     /// Re-arm crossing after a release or panic.
     Rearm,
     /// E2: project this node's `window` to `to` (docs/wp/E2-v0.md).
-    Project { window: WindowId, to: NodeId },
+    Project {
+        window: WindowId,
+        to: NodeId,
+        place: Option<ProxyPlacement>,
+    },
     /// E2: end a projection (either role) and return the window to its source.
     Return(ProjectionKey),
+    /// Return a projection, placing the restored content on its source's display.
+    ReturnAt(ProjectionKey, ProxyPlacement),
     /// E2 (WP-2.13): ask `peer` for the windows this node may pull. The answer comes back as
     /// `Output::BrowseResult` with the same `request` (the caller's correlation number).
     Browse { peer: NodeId, request: u32 },
@@ -234,6 +242,17 @@ pub enum Input {
     /// A peer link is up (authenticated, `Hello` exchanged).
     PeerUp {
         peer: NodeId,
+    },
+    /// After `PeerUp`, only when both `Hello`s carry `DRAG_FEATURE`; false removes it on link
+    /// loss or a `HelloRefresh` without the feature.
+    DragPeer {
+        peer: NodeId,
+        available: bool,
+    },
+    /// The native window id of an open proxy, so a moved proxy can be recognised.
+    ProxyWindow {
+        key: ProjectionKey,
+        window: WindowId,
     },
     /// A fresh round-trip estimate for a peer.
     PeerRtt {
@@ -442,6 +461,8 @@ pub enum Output {
     /// `WindowParking::restore`.
     Restore {
         window: WindowId,
+        /// `Some` means `WindowParking::restore_at`.
+        place: Option<ProxyPlacement>,
     },
     /// `WindowSource::activate` (focus guard before keys, 03 §4.5).
     ActivateWindow {
@@ -475,6 +496,7 @@ pub enum Output {
         title: String,
         app_id: String,
         size: PixelSize,
+        place: Option<ProxyPlacement>,
     },
     /// The source's actual content size and parking (resize the proxy to it if it differs:
     /// the app refused a size).

@@ -15,6 +15,16 @@ use crosspane_types::input::{LockKeys, ScrollDelta};
 /// session in one increasing sequence, starting at 1; the target acknowledges with [`Self::Ack`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputMessage {
+    /// Controller → target: `button` down at `position` on `display` (DRAG-v0 D-5). The target moves
+    /// its pointer there, then handles it exactly as `Button { button, down: true }` (lease, journal,
+    /// heartbeat); its up is an ordinary `Button` up. Sent only when `DRAG_FEATURE` was negotiated.
+    PressAt {
+        session: SessionId,
+        seq: u32,
+        button: MouseButton,
+        display: DisplayId,
+        position: PointDevice,
+    },
     /// Controller → target: a physical key changed state.
     Key {
         session: SessionId,

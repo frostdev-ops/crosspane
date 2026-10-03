@@ -3,7 +3,7 @@
 use crosspane_protocol::msg::{InputMessage, MAX_HELD_KEYS, PointerMessage, Refusal, TargetStatus};
 use crosspane_protocol::wire::{
     Frame, FrameDecoder, HEADER_LEN, KIND_ACK, KIND_BUTTON, KIND_KEY, KIND_LOCK_KEYS, KIND_POINTER,
-    KIND_PROJ_HELD, KIND_SCROLL, KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION,
+    KIND_PRESS_AT, KIND_SCROLL, KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION,
     WireError, decode_input, decode_pointer, encode_input, encode_pointer,
 };
 use crosspane_types::geom::{PointDevice, VectorLogical};
@@ -85,6 +85,118 @@ fn golden_ack() {
     encode_input(&msg, &mut out).unwrap();
     assert_eq!(out, expected);
     assert_eq!(decode_input(&one_frame(&expected)), Ok(msg));
+}
+
+proptest! {
+    #[test]
+    fn round_trip_press_at(session in any::<u64>(), seq in any::<u32>(), button in 1u8..=255,
+        display in any::<u32>(), x in any::<f64>().prop_filter("finite", |v| v.is_finite()),
+        y in any::<f64>().prop_filter("finite", |v| v.is_finite())) {
+        let message = InputMessage::PressAt { session: SessionId(session), seq,
+            button: MouseButton(button), display: DisplayId(display), position: PointDevice::new(x, y) };
+        let mut bytes = Vec::new();
+        encode_input(&message, &mut bytes).unwrap();
+        prop_assert_eq!(decode_input(&one_frame(&bytes)), Ok(message));
+    }
+}
+
+#[test]
+fn golden_press_at() {
+    let message = InputMessage::PressAt {
+        session: SessionId(1),
+        seq: 2,
+        button: MouseButton::PRIMARY,
+        display: DisplayId(u32::MAX),
+        position: PointDevice::new(1.25, -2.5),
+    };
+    let expected = [
+        header(0x0D, 33),
+        1u64.to_le_bytes().to_vec(),
+        2u32.to_le_bytes().to_vec(),
+        vec![1],
+        u32::MAX.to_le_bytes().to_vec(),
+        1.25f64.to_le_bytes().to_vec(),
+        (-2.5f64).to_le_bytes().to_vec(),
+    ]
+    .concat();
+    let mut bytes = Vec::new();
+    encode_input(&message, &mut bytes).unwrap();
+    assert_eq!(bytes, expected);
+    let mut decoder = FrameDecoder::new(MAX_INPUT_PAYLOAD);
+    for byte in &bytes[..bytes.len() - 1] {
+        decoder.push(&[*byte]);
+        assert_eq!(decoder.next_frame(), Ok(None));
+    }
+    decoder.push(&bytes[bytes.len() - 1..]);
+    assert_eq!(
+        decode_input(&decoder.next_frame().unwrap().unwrap()),
+        Ok(message)
+    );
+    assert_eq!(decoder.next_frame(), Ok(None));
+}
+
+#[test]
+fn press_at_rejects_invalid_button_coordinates_and_length() {
+    let message = InputMessage::PressAt {
+        session: SessionId(1),
+        seq: 2,
+        button: MouseButton::PRIMARY,
+        display: DisplayId(0),
+        position: PointDevice::new(1.0, 2.0),
+    };
+    let mut bytes = Vec::new();
+    encode_input(&message, &mut bytes).unwrap();
+    let good = one_frame(&bytes);
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for offset in [17, 25] {
+            let mut bad = good.clone();
+            bad.payload[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            assert_bad_value(decode_input(&bad));
+            let position = if offset == 17 {
+                PointDevice::new(value, 0.0)
+            } else {
+                PointDevice::new(0.0, value)
+            };
+            assert!(
+                encode_input(
+                    &InputMessage::PressAt {
+                        session: SessionId(1),
+                        seq: 2,
+                        button: MouseButton::PRIMARY,
+                        display: DisplayId(0),
+                        position
+                    },
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
+        }
+    }
+    let mut bad = good.clone();
+    bad.payload[12] = 0;
+    assert_bad_value(decode_input(&bad));
+    assert!(
+        encode_input(
+            &InputMessage::PressAt {
+                session: SessionId(1),
+                seq: 2,
+                button: MouseButton(0),
+                display: DisplayId(0),
+                position: PointDevice::new(1.0, 2.0)
+            },
+            &mut Vec::new()
+        )
+        .is_err()
+    );
+    for len in [0, 12, 32, 34] {
+        assert_eq!(
+            decode_input(&frame(KIND_PRESS_AT, len)),
+            Err(WireError::BadLength {
+                kind: KIND_PRESS_AT,
+                len
+            })
+        );
+    }
 }
 
 #[test]
@@ -349,7 +461,7 @@ fn rejects_reserved_bytes() {
 #[test]
 fn rejects_unknown_kind() {
     for kind in 0u8..=255 {
-        if !(KIND_KEY..=KIND_PROJ_HELD).contains(&kind) {
+        if !(KIND_KEY..=KIND_PRESS_AT).contains(&kind) {
             let bytes = header(kind, 0);
             let frame = one_frame(&bytes);
             assert_eq!(decode_input(&frame), Err(WireError::BadKind(kind)));

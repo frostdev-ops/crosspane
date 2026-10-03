@@ -77,6 +77,10 @@ message Projection {
     ProjectionPull pull = 13;
     ProjectionBrowseRefused browse_refused = 14;
     ProjectionProxyPlaced proxy_placed = 15; // Destination -> source: where the proxy's content is (WP-2.43).
+    ProjectionStartAt start_at = 16;
+    ProjectionReturnAt return_at = 17;
+    ProjectionDragReady drag_ready = 18;
+    ProjectionDragCancel drag_cancel = 19;
   }
 }
 
@@ -92,6 +96,22 @@ message ProjectionStart {
   uint32 pixel_w = 4;
   uint32 pixel_h = 5;
 }
+
+// DRAG-v0: placement uses device pixels on the receiver's display. Continuation token/anchor
+// are ignored unless drag is true; ReturnAt requires drag = false.
+message ProjectionStartAt {
+  uint64 projection = 1; string title = 2; string app_id = 3;
+  uint32 pixel_w = 4; uint32 pixel_h = 5; uint32 display = 6;
+  sint32 x = 7; sint32 y = 8; bool drag = 9; uint32 token = 10;
+  sint32 anchor_x = 11; sint32 anchor_y = 12;
+}
+message ProjectionReturnAt {
+  uint64 projection = 1; uint32 display = 2; sint32 x = 3; sint32 y = 4; bool drag = 5;
+}
+message ProjectionDragReady {
+  uint64 projection = 1; uint32 token = 2; uint32 display = 3; double x = 4; double y = 5;
+}
+message ProjectionDragCancel { uint64 projection = 1; uint32 token = 2; }
 
 message ProjectionAccepted {
   uint64 projection = 1;

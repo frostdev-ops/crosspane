@@ -16,7 +16,7 @@ use crate::msg::{
 };
 use crate::projection::{
     BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjectionEndReason, ProjectionMessage,
-    WindowSummary,
+    ProxyPlacement, WindowSummary,
 };
 
 const MAX_STRING: usize = 256;
@@ -523,6 +523,64 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
     use pb::projection::Body;
 
     let body = match message {
+        ProjectionMessage::StartAt {
+            projection,
+            window,
+            size,
+            place,
+            token,
+            anchor,
+        } => {
+            check_projection_string(&window.title)?;
+            check_projection_string(&window.app_id)?;
+            Body::StartAt(pb::ProjectionStartAt {
+                projection: projection.0,
+                title: window.title.clone(),
+                app_id: window.app_id.clone(),
+                pixel_w: size.width,
+                pixel_h: size.height,
+                display: place.display.0,
+                x: place.x,
+                y: place.y,
+                drag: place.drag,
+                token: *token,
+                anchor_x: anchor.0,
+                anchor_y: anchor.1,
+            })
+        }
+        ProjectionMessage::ReturnAt { projection, place } => {
+            if place.drag {
+                return Err(WireError::BadValue("return placement drag"));
+            }
+            Body::ReturnAt(pb::ProjectionReturnAt {
+                projection: projection.0,
+                display: place.display.0,
+                x: place.x,
+                y: place.y,
+                drag: place.drag,
+            })
+        }
+        ProjectionMessage::DragReady {
+            projection,
+            token,
+            display,
+            position,
+        } => {
+            check_finite(&[position.x, position.y])?;
+            Body::DragReady(pb::ProjectionDragReady {
+                projection: projection.0,
+                token: *token,
+                display: display.0,
+                x: position.x,
+                y: position.y,
+            })
+        }
+        ProjectionMessage::DragCancel { projection, token } => {
+            Body::DragCancel(pb::ProjectionDragCancel {
+                projection: projection.0,
+                token: *token,
+            })
+        }
         ProjectionMessage::Start {
             projection,
             window,
@@ -696,6 +754,53 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
     use pb::projection::Body;
 
     Ok(match projection.body.ok_or(WireError::UnknownControl)? {
+        Body::StartAt(start) => {
+            check_projection_string(&start.title)?;
+            check_projection_string(&start.app_id)?;
+            ProjectionMessage::StartAt {
+                projection: ProjectionId(start.projection),
+                window: WindowSummary {
+                    title: start.title,
+                    app_id: start.app_id,
+                },
+                size: PixelSize::new(start.pixel_w, start.pixel_h),
+                place: ProxyPlacement {
+                    display: DisplayId(start.display),
+                    x: start.x,
+                    y: start.y,
+                    drag: start.drag,
+                },
+                token: start.token,
+                anchor: (start.anchor_x, start.anchor_y),
+            }
+        }
+        Body::ReturnAt(returned) => {
+            if returned.drag {
+                return Err(WireError::BadValue("return placement drag"));
+            }
+            ProjectionMessage::ReturnAt {
+                projection: ProjectionId(returned.projection),
+                place: ProxyPlacement {
+                    display: DisplayId(returned.display),
+                    x: returned.x,
+                    y: returned.y,
+                    drag: returned.drag,
+                },
+            }
+        }
+        Body::DragReady(ready) => {
+            check_finite(&[ready.x, ready.y])?;
+            ProjectionMessage::DragReady {
+                projection: ProjectionId(ready.projection),
+                token: ready.token,
+                display: DisplayId(ready.display),
+                position: PointDevice::new(ready.x, ready.y),
+            }
+        }
+        Body::DragCancel(cancel) => ProjectionMessage::DragCancel {
+            projection: ProjectionId(cancel.projection),
+            token: cancel.token,
+        },
         Body::Start(start) => {
             check_projection_string(&start.title)?;
             check_projection_string(&start.app_id)?;
@@ -864,7 +969,7 @@ mod pb {
     pub struct Projection {
         #[prost(
             oneof = "projection::Body",
-            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
         )]
         pub body: Option<projection::Body>,
     }
@@ -902,7 +1007,79 @@ mod pb {
             BrowseRefused(super::ProjectionBrowseRefused),
             #[prost(message, tag = "15")]
             ProxyPlaced(super::ProjectionProxyPlaced),
+            #[prost(message, tag = "16")]
+            StartAt(super::ProjectionStartAt),
+            #[prost(message, tag = "17")]
+            ReturnAt(super::ProjectionReturnAt),
+            #[prost(message, tag = "18")]
+            DragReady(super::ProjectionDragReady),
+            #[prost(message, tag = "19")]
+            DragCancel(super::ProjectionDragCancel),
         }
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct ProjectionStartAt {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(string, tag = "2")]
+        pub title: String,
+        #[prost(string, tag = "3")]
+        pub app_id: String,
+        #[prost(uint32, tag = "4")]
+        pub pixel_w: u32,
+        #[prost(uint32, tag = "5")]
+        pub pixel_h: u32,
+        #[prost(uint32, tag = "6")]
+        pub display: u32,
+        #[prost(sint32, tag = "7")]
+        pub x: i32,
+        #[prost(sint32, tag = "8")]
+        pub y: i32,
+        #[prost(bool, tag = "9")]
+        pub drag: bool,
+        #[prost(uint32, tag = "10")]
+        pub token: u32,
+        #[prost(sint32, tag = "11")]
+        pub anchor_x: i32,
+        #[prost(sint32, tag = "12")]
+        pub anchor_y: i32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionReturnAt {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub display: u32,
+        #[prost(sint32, tag = "3")]
+        pub x: i32,
+        #[prost(sint32, tag = "4")]
+        pub y: i32,
+        #[prost(bool, tag = "5")]
+        pub drag: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionDragReady {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub token: u32,
+        #[prost(uint32, tag = "3")]
+        pub display: u32,
+        #[prost(double, tag = "4")]
+        pub x: f64,
+        #[prost(double, tag = "5")]
+        pub y: f64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionDragCancel {
+        #[prost(uint64, tag = "1")]
+        pub projection: u64,
+        #[prost(uint32, tag = "2")]
+        pub token: u32,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

@@ -16,6 +16,21 @@ use crosspane_types::input::ScrollDelta;
 
 use crate::msg::Refusal;
 
+/// Where a proxy's content, or a returned window's content, goes (DRAG-v0 D-9): its top-left at
+/// (`x`, `y`) device pixels on the receiver's `display`. `drag`: a continuation follows (DRAG-v0
+/// D-5); always `false` in `ReturnAt`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProxyPlacement {
+    pub display: DisplayId,
+    pub x: i32,
+    pub y: i32,
+    pub drag: bool,
+}
+
+/// The protocol feature that enables the messages below (DRAG-v0 D-8). Neither side sends them
+/// unless both `Hello`s carry it.
+pub const DRAG_FEATURE: &str = "drag/0";
+
 /// What the destination needs to know about the window being projected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowSummary {
@@ -69,6 +84,37 @@ pub enum ProjectionEndReason {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ProjectionMessage {
+    /// Source → destination: `Start`, with a placement for the proxy and, with `place.drag`, the
+    /// continuation `token` and `anchor`: the press point relative to the content's top-left, in the
+    /// destination's device pixels, always inside the content (the grab point clamped into the content
+    /// inset by 8 px; DRAG-v0 §3). If the destination clamps the placement, the anchor moves with the
+    /// content. Without `place.drag`, `token` and `anchor` are ignored.
+    StartAt {
+        projection: ProjectionId,
+        window: WindowSummary,
+        size: PixelSize,
+        place: ProxyPlacement,
+        token: u32,
+        anchor: (i32, i32),
+    },
+    /// Destination → source: `Close { reason: Returned }`, restoring the window at `place`.
+    ReturnAt {
+        projection: ProjectionId,
+        place: ProxyPlacement,
+    },
+    /// Destination → source: the proxy for `token` is placed on `display`, and `position` (device
+    /// pixels on that display) is its placed content origin plus `anchor`: the continuation press point.
+    DragReady {
+        projection: ProjectionId,
+        token: u32,
+        display: DisplayId,
+        position: PointDevice,
+    },
+    /// Source → destination: continuation `token` is dropped; disarm, and ignore it from now on.
+    DragCancel {
+        projection: ProjectionId,
+        token: u32,
+    },
     /// Source → destination: offer to show a window. `size` is the window's current content size in
     /// the source's device pixels, as a starting point for the proxy.
     Start {

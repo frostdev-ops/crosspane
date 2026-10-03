@@ -2,8 +2,8 @@
 
 use crosspane_protocol::msg::{ControlMessage, InputMessage, MAX_HELD_KEYS, Refusal};
 use crosspane_protocol::projection::{
-    BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjInput, ProjectionEndReason,
-    ProjectionMessage, WindowSummary,
+    BrowsableWindow, DRAG_FEATURE, MAX_BROWSE_WINDOWS, ParkingKind, ProjInput, ProjectionEndReason,
+    ProjectionMessage, ProxyPlacement, WindowSummary,
 };
 use crosspane_protocol::wire::{
     Frame, FrameDecoder, HEADER_LEN, KIND_CONTROL, KIND_PROJ_BUTTON, KIND_PROJ_HELD, KIND_PROJ_KEY,
@@ -1017,8 +1017,8 @@ fn proxy_placed_unplaced_ignores_a_stale_display_field() {
 
 #[test]
 fn unknown_projection_variant_is_unknown_control() {
-    // 15 is `proxy_placed` since WP-2.43.
-    for variant in [16, 99, 536_870_911] {
+    // 16..=19 are the DRAG-v0 messages; future bodies are still unknown.
+    for variant in [20, 99, 536_870_911] {
         assert_eq!(
             decode_control(&projection_frame(variant, &[])),
             Err(WireError::UnknownControl)
@@ -1034,5 +1034,200 @@ fn unknown_projection_variant_is_unknown_control() {
     assert_eq!(
         decode_control(&projection_frame(1, &[0xff])),
         Err(WireError::BadControl)
+    );
+}
+
+proptest! {
+    #[test]
+    fn round_trip_drag_projection_messages(p in any::<u64>(), token in any::<u32>(),
+        display in any::<u32>(), x in any::<i32>(), y in any::<i32>(), drag in any::<bool>(),
+        anchor in (any::<i32>(), any::<i32>()), position in position(), title in text(), app_id in text()) {
+        let projection = ProjectionId(p);
+        let place = ProxyPlacement { display: DisplayId(display), x, y, drag };
+        round_trip_control(ProjectionMessage::StartAt {
+            projection, window: WindowSummary { title, app_id }, size: PixelSize::new(640, 480),
+            place, token, anchor,
+        });
+        round_trip_control(ProjectionMessage::ReturnAt { projection, place: ProxyPlacement { drag: false, ..place } });
+        round_trip_control(ProjectionMessage::DragReady { projection, token, display: place.display, position });
+        round_trip_control(ProjectionMessage::DragCancel { projection, token });
+    }
+}
+
+#[test]
+fn drag_projection_tags_and_fields_match_freeze() {
+    assert_eq!(DRAG_FEATURE, "drag/0");
+    let projection = ProjectionId(9);
+    let place = ProxyPlacement {
+        display: DisplayId(7),
+        x: -20,
+        y: 30,
+        drag: true,
+    };
+    let start = ProjectionMessage::StartAt {
+        projection,
+        window: WindowSummary {
+            title: "title".into(),
+            app_id: "app".into(),
+        },
+        size: PixelSize::new(640, 480),
+        place,
+        token: 77,
+        anchor: (8, 9),
+    };
+    let fields = [
+        number(1, 9),
+        bytes_field(2, b"title"),
+        bytes_field(3, b"app"),
+        number(4, 640),
+        number(5, 480),
+        number(6, 7),
+        number(7, 39),
+        number(8, 60),
+        number(9, 1),
+        number(10, 77),
+        number(11, 16),
+        number(12, 18),
+    ]
+    .concat();
+    assert_eq!(control_frame(&start), projection_frame(16, &fields));
+    assert_eq!(
+        decode_control(&projection_frame(16, &fields)),
+        Ok(ControlMessage::Projection(start))
+    );
+    let returned = ProjectionMessage::ReturnAt {
+        projection,
+        place: ProxyPlacement {
+            drag: false,
+            ..place
+        },
+    };
+    let fields = [number(1, 9), number(2, 7), number(3, 39), number(4, 60)].concat();
+    assert_eq!(control_frame(&returned), projection_frame(17, &fields));
+    assert_eq!(
+        decode_control(&projection_frame(17, &fields)),
+        Ok(ControlMessage::Projection(returned))
+    );
+    let ready = ProjectionMessage::DragReady {
+        projection,
+        token: 77,
+        display: place.display,
+        position: PointDevice::new(1.25, -2.5),
+    };
+    let fields = [
+        number(1, 9),
+        number(2, 77),
+        number(3, 7),
+        double(4, 1.25),
+        double(5, -2.5),
+    ]
+    .concat();
+    assert_eq!(control_frame(&ready), projection_frame(18, &fields));
+    assert_eq!(
+        decode_control(&projection_frame(18, &fields)),
+        Ok(ControlMessage::Projection(ready))
+    );
+    let cancel = ProjectionMessage::DragCancel {
+        projection,
+        token: 77,
+    };
+    let fields = [number(1, 9), number(2, 77)].concat();
+    assert_eq!(control_frame(&cancel), projection_frame(19, &fields));
+    assert_eq!(
+        decode_control(&projection_frame(19, &fields)),
+        Ok(ControlMessage::Projection(cancel))
+    );
+}
+
+#[test]
+fn drag_start_rejects_overlong_strings() {
+    for value in ["a".repeat(1025), "é".repeat(513)] {
+        for field in [2, 3] {
+            assert_eq!(
+                decode_control(&projection_frame(16, &bytes_field(field, value.as_bytes()))),
+                Err(WireError::BadValue("projection string"))
+            );
+            let window = WindowSummary {
+                title: if field == 2 {
+                    value.clone()
+                } else {
+                    String::new()
+                },
+                app_id: if field == 3 {
+                    value.clone()
+                } else {
+                    String::new()
+                },
+            };
+            assert_bad_control(ProjectionMessage::StartAt {
+                projection: ProjectionId(1),
+                window,
+                size: PixelSize::new(640, 480),
+                place: ProxyPlacement {
+                    display: DisplayId(0),
+                    x: 0,
+                    y: 0,
+                    drag: false,
+                },
+                token: 0,
+                anchor: (0, 0),
+            });
+        }
+    }
+    for value in ["a".repeat(1024), "é".repeat(512)] {
+        round_trip_control(ProjectionMessage::StartAt {
+            projection: ProjectionId(0),
+            window: WindowSummary {
+                title: value.clone(),
+                app_id: value,
+            },
+            size: PixelSize::new(0, u32::MAX),
+            place: ProxyPlacement {
+                display: DisplayId(u32::MAX),
+                x: i32::MIN,
+                y: i32::MAX,
+                drag: false,
+            },
+            token: u32::MAX,
+            anchor: (i32::MIN, i32::MAX),
+        });
+    }
+}
+
+#[test]
+fn drag_ready_rejects_nonfinite_positions() {
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for (position, tag) in [
+            (PointDevice::new(value, 0.0), 4),
+            (PointDevice::new(0.0, value), 5),
+        ] {
+            assert_bad_control(ProjectionMessage::DragReady {
+                projection: ProjectionId(1),
+                token: 1,
+                display: DisplayId(0),
+                position,
+            });
+            assert_eq!(
+                decode_control(&projection_frame(18, &double(tag, value))),
+                Err(WireError::BadValue("non-finite coordinate"))
+            );
+        }
+    }
+}
+
+#[test]
+fn return_at_rejects_a_continuation() {
+    assert_bad_control(ProjectionMessage::ReturnAt {
+        projection: ProjectionId(1),
+        place: ProxyPlacement {
+            display: DisplayId(0),
+            x: 0,
+            y: 0,
+            drag: true,
+        },
+    });
+    assert_eq!(
+        decode_control(&projection_frame(17, &number(5, 1))),
+        Err(WireError::BadValue("return placement drag"))
     );
 }

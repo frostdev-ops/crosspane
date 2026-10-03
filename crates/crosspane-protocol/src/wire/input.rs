@@ -8,8 +8,9 @@ use crosspane_types::input::{LockKeys, ScrollDelta, ScrollPhase};
 use super::frame::decode_header;
 use super::{
     Frame, HEADER_LEN, KIND_ACK, KIND_BUTTON, KIND_KEY, KIND_LOCK_KEYS, KIND_POINTER,
-    KIND_PROJ_BUTTON, KIND_PROJ_HELD, KIND_PROJ_KEY, KIND_PROJ_MOTION, KIND_PROJ_SCROLL,
-    KIND_SCROLL, KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION, WireError,
+    KIND_PRESS_AT, KIND_PROJ_BUTTON, KIND_PROJ_HELD, KIND_PROJ_KEY, KIND_PROJ_MOTION,
+    KIND_PROJ_SCROLL, KIND_SCROLL, KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION,
+    WireError,
 };
 use crate::msg::{InputMessage, MAX_HELD_KEYS, PointerMessage, Refusal, TargetStatus};
 use crate::projection::ProjInput;
@@ -18,6 +19,21 @@ use crate::projection::ProjInput;
 pub fn encode_input(msg: &InputMessage, out: &mut Vec<u8>) -> Result<(), WireError> {
     match msg {
         InputMessage::Proj(input) => encode_projection_input(input, out)?,
+        InputMessage::PressAt {
+            session,
+            seq,
+            button,
+            display,
+            position,
+        } => {
+            check_button(*button)?;
+            check_position(*position)?;
+            // session u64, seq u32, button u8, display u32, x/y f64 (little endian).
+            input_prefix(out, KIND_PRESS_AT, 33, *session, *seq);
+            out.push(button.0);
+            out.extend_from_slice(&display.0.to_le_bytes());
+            append_position(out, *position);
+        }
         InputMessage::Key {
             session,
             seq,
@@ -131,6 +147,7 @@ pub fn decode_input(frame: &Frame) -> Result<InputMessage, WireError> {
     let expected = match frame.kind {
         KIND_KEY => 17,
         KIND_BUTTON => 14,
+        KIND_PRESS_AT => 33,
         KIND_SCROLL => 30,
         KIND_LOCK_KEYS => 15,
         KIND_STATE if len >= 15 => len,
@@ -155,6 +172,17 @@ pub fn decode_input(frame: &Frame) -> Result<InputMessage, WireError> {
     }
     let seq = u32::from_le_bytes(reader.take()?);
     match frame.kind {
+        KIND_PRESS_AT => {
+            let button = MouseButton(reader.byte()?);
+            check_button(button)?;
+            Ok(InputMessage::PressAt {
+                session,
+                seq,
+                button,
+                display: DisplayId(u32::from_le_bytes(reader.take()?)),
+                position: reader.position()?,
+            })
+        }
         KIND_KEY => Ok(InputMessage::Key {
             session,
             seq,

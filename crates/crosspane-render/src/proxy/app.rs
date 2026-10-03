@@ -241,11 +241,13 @@ impl App {
     fn command(&mut self, event_loop: &ActiveEventLoop, command: HostCommand) {
         self.check_gpu();
         match command {
+            HostCommand::Arm { .. } | HostCommand::Disarm { .. } => {}
             HostCommand::Open {
                 id,
                 title,
                 size,
                 accent,
+                ..
             } => {
                 if let Err(error) = self.open(event_loop, id, title, size, accent) {
                     (self.events)(HostEvent::OpenFailed { id, error });

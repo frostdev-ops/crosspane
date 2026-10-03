@@ -302,6 +302,7 @@ fn nested_proxy_lifecycle() -> Result<()> {
         title: title.clone(),
         size,
         accent: [211, 45, 137],
+        place: None,
     })?;
     let opened = wait_event(&event_receiver, |event| {
         matches!(event, HostEvent::Opened { id: 26, .. })
@@ -424,6 +425,7 @@ fn nested_proxy_reports_only_new_content() -> Result<()> {
         title: format!("WP-4.5a proxy {}", std::process::id()),
         size,
         accent: [211, 45, 137],
+        place: None,
     })?;
     wait_event(&event_receiver, |event| {
         matches!(event, HostEvent::Opened { id: 45, .. })

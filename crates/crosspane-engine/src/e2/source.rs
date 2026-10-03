@@ -485,7 +485,10 @@ impl E2 {
         out: &mut Vec<Output>,
     ) {
         if self.pending_parks.remove(&window).is_some() {
-            out.push(Output::Restore { window });
+            out.push(Output::Restore {
+                window,
+                place: None,
+            });
             return;
         }
         let current = self.windows.get(&window).map(|w| (w.frame, w.state));
@@ -953,6 +956,7 @@ impl E2 {
         if !matches!(source.stage, Stage::Offered(_)) {
             out.push(Output::Restore {
                 window: source.window,
+                place: None,
             });
         }
         if matches!(source.stage, Stage::Parking(_)) || source.resizing {
@@ -1005,7 +1009,10 @@ impl E2 {
             .collect();
         for window in windows {
             self.pending_parks.remove(&window);
-            out.push(Output::Restore { window });
+            out.push(Output::Restore {
+                window,
+                place: None,
+            });
         }
         // Re-parks that a change had to wait for (a park in flight, or the gap): the gap has
         // ended, so look at the window again. Whatever it finds, the flag is spent.

@@ -375,7 +375,10 @@ impl TargetE1 {
             | InputMessage::LockKeys { session, seq, .. }
             | InputMessage::State { session, seq, .. } => (*session, *seq),
             // E2 projection input is handled by the e2 role (WP-2.5), never by E1.
-            InputMessage::Ack { .. } | InputMessage::Status { .. } | InputMessage::Proj(_) => {
+            InputMessage::Ack { .. }
+            | InputMessage::Status { .. }
+            | InputMessage::Proj(_)
+            | InputMessage::PressAt { .. } => {
                 return;
             }
         };

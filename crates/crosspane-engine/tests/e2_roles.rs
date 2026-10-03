@@ -264,6 +264,7 @@ impl Fixture {
             Input::Command(Command::Project {
                 window: WINDOW,
                 to: B,
+                place: None,
             }),
             0,
         );
@@ -379,6 +380,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
         Input::Command(Command::Project {
             window: WINDOW,
             to: B,
+            place: None,
         }),
         0,
     );
@@ -577,7 +579,10 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
             Output::StopCapture {
                 stream: StreamId(7)
             },
-            Output::Restore { window: WINDOW },
+            Output::Restore {
+                window: WINDOW,
+                place: None
+            },
             Output::Notice(Notice::ProjectionEnded {
                 key: key(A),
                 reason: Reason::Returned
@@ -595,6 +600,7 @@ fn source_refusals_and_offer_timeout() {
     let project = Input::Command(Command::Project {
         window: WINDOW,
         to: B,
+        place: None,
     });
     assert_eq!(
         f.handle(project.clone(), 0),
@@ -759,6 +765,7 @@ fn twin_and_mirror_mapping_clamping_focus_and_sequences() {
         Input::Command(Command::Project {
             window: WINDOW,
             to: B,
+            place: None,
         }),
         0,
     );
@@ -847,6 +854,7 @@ fn shared_journal_keeps_other_projection_and_retries_journal_errors() {
         Input::Command(Command::Project {
             window: second_window,
             to: B,
+            place: None,
         }),
         0,
     );
@@ -923,7 +931,10 @@ fn shared_journal_keeps_other_projection_and_retries_journal_errors() {
             }
         ]
     );
-    assert!(out.contains(&Output::Restore { window: WINDOW }));
+    assert!(out.contains(&Output::Restore {
+        window: WINDOW,
+        place: None
+    }));
     f.confirm(&out, true, 1);
     assert!(f.held().is_empty());
 
@@ -932,7 +943,10 @@ fn shared_journal_keeps_other_projection_and_retries_journal_errors() {
     let out = f.handle(input(B, press(2, false)), 1);
     f.journal.0.lock().unwrap().fail_up = true;
     let ended = f.confirm(&out, true, 2);
-    assert!(ended.contains(&Output::Restore { window: WINDOW }));
+    assert!(ended.contains(&Output::Restore {
+        window: WINDOW,
+        place: None
+    }));
     assert!(f.confirm(&out, true, 2).is_empty());
     f.journal.0.lock().unwrap().fail_up = false;
     let retry = f.handle(Input::Tick, 52);
@@ -1085,7 +1099,13 @@ fn source_end_paths_release_stop_restore_and_ignore_unrelated_peers() {
                 stream: StreamId(1)
             }
         );
-        assert_eq!(out[2], Output::Restore { window: WINDOW });
+        assert_eq!(
+            out[2],
+            Output::Restore {
+                window: WINDOW,
+                place: None
+            }
+        );
         assert_eq!(messages(&out).len(), usize::from(sent));
         assert_eq!(
             out.last(),
@@ -1108,6 +1128,7 @@ fn parking_capture_failures_and_late_results_are_cleaned_up() {
             Input::Command(Command::Project {
                 window: WINDOW,
                 to: B,
+                place: None,
             }),
             0,
         );
@@ -1136,7 +1157,10 @@ fn parking_capture_failures_and_late_results_are_cleaned_up() {
                 1,
             )
         };
-        assert!(out.contains(&Output::Restore { window: WINDOW }));
+        assert!(out.contains(&Output::Restore {
+            window: WINDOW,
+            place: None
+        }));
         assert_eq!(
             messages(&out),
             vec![Message::End {
@@ -1148,7 +1172,8 @@ fn parking_capture_failures_and_late_results_are_cleaned_up() {
             messages(&f.handle(
                 Input::Command(Command::Project {
                     window: WINDOW,
-                    to: B
+                    to: B,
+                    place: None,
                 }),
                 2
             ))
@@ -1164,6 +1189,7 @@ fn parking_capture_failures_and_late_results_are_cleaned_up() {
         Input::Command(Command::Project {
             window: WINDOW,
             to: B,
+            place: None,
         }),
         0,
     );
@@ -1177,7 +1203,10 @@ fn parking_capture_failures_and_late_results_are_cleaned_up() {
             },
             2
         ),
-        vec![Output::Restore { window: WINDOW }]
+        vec![Output::Restore {
+            window: WINDOW,
+            place: None
+        }]
     );
     assert_eq!(
         f.handle(
@@ -1222,7 +1251,8 @@ fn destination_grants_open_accept_refusal_and_geometry() {
             key: key(A),
             title: "fixture".into(),
             app_id: "test".into(),
-            size: size()
+            size: size(),
+            place: None,
         }]
     );
     assert!(f.handle(control(A, start()), 0).is_empty());
@@ -1702,6 +1732,7 @@ fn reciprocal_id_one_projections_end_independently_and_ignore_wrong_direction() 
         Input::Command(Command::Project {
             window: WINDOW,
             to: A,
+            place: None,
         }),
         0,
     );
@@ -1750,7 +1781,10 @@ fn reciprocal_id_one_projections_end_independently_and_ignore_wrong_direction() 
     b.confirm(&out, true, 1);
     let out = a.handle(control(B, messages(&out)[0].clone()), 1);
     assert!(out.contains(&Output::CloseProxy { key: key(B) }));
-    assert!(!out.contains(&Output::Restore { window: WINDOW }));
+    assert!(!out.contains(&Output::Restore {
+        window: WINDOW,
+        place: None
+    }));
     assert_eq!(a.held(), vec![Held::Key(KEY)]);
     assert!(
         a.handle(
@@ -1778,7 +1812,10 @@ fn reciprocal_id_one_projections_end_independently_and_ignore_wrong_direction() 
     assert!(out.contains(&Output::StopCapture {
         stream: StreamId(1)
     }));
-    assert!(out.contains(&Output::Restore { window: WINDOW }));
+    assert!(out.contains(&Output::Restore {
+        window: WINDOW,
+        place: None
+    }));
     assert!(!out.contains(&Output::CloseProxy { key: key(B) }));
     a.confirm(&out, true, 2);
     assert!(a.held().is_empty());
@@ -1818,6 +1855,7 @@ fn offered() -> Fixture {
         Input::Command(Command::Project {
             window: WINDOW,
             to: B,
+            place: None,
         }),
         0,
     );
@@ -1870,7 +1908,10 @@ fn late_parking_and_resize_results_always_restore_even_on_failure() {
                 );
             }
             let ended = f.handle(Input::Command(Command::Return(key(A))), 50);
-            assert!(ended.contains(&Output::Restore { window: WINDOW }));
+            assert!(ended.contains(&Output::Restore {
+                window: WINDOW,
+                place: None
+            }));
             assert_eq!(f.e2.next_deadline(), Some(ms(5050)));
             let result = if ok {
                 Ok(parked(WINDOW, PlatformParking::Twin, size()))
@@ -1885,14 +1926,18 @@ fn late_parking_and_resize_results_always_restore_even_on_failure() {
                     },
                     60
                 ),
-                vec![Output::Restore { window: WINDOW }]
+                vec![Output::Restore {
+                    window: WINDOW,
+                    place: None
+                }]
             );
             assert_eq!(f.e2.next_deadline(), None);
             assert!(matches!(
                 messages(&f.handle(
                     Input::Command(Command::Project {
                         window: WINDOW,
-                        to: B
+                        to: B,
+                        place: None,
                     }),
                     61
                 ))
@@ -1926,6 +1971,7 @@ fn unanswered_parking_expires_and_removed_windows_clear_pending_cleanup() {
             Input::Command(Command::Project {
                 window: WINDOW,
                 to: B,
+                place: None,
             }),
             5049,
         );
@@ -1939,14 +1985,18 @@ fn unanswered_parking_expires_and_removed_windows_clear_pending_cleanup() {
         assert!(f.handle(Input::Tick, 5049).is_empty());
         assert_eq!(
             f.handle(Input::Tick, 5050),
-            vec![Output::Restore { window: WINDOW }]
+            vec![Output::Restore {
+                window: WINDOW,
+                place: None
+            }]
         );
         assert_eq!(f.e2.next_deadline(), None);
         assert!(matches!(
             messages(&f.handle(
                 Input::Command(Command::Project {
                     window: WINDOW,
-                    to: B
+                    to: B,
+                    place: None,
                 }),
                 5051
             ))
@@ -1977,7 +2027,8 @@ fn unanswered_parking_expires_and_removed_windows_clear_pending_cleanup() {
             messages(&f.handle(
                 Input::Command(Command::Project {
                     window: WINDOW,
-                    to: B
+                    to: B,
+                    place: None,
                 }),
                 10000
             ))
@@ -2400,7 +2451,10 @@ fn startup_liveness_timeouts_fail_at_the_exact_deadline_and_clean_late_results()
                 reason: Reason::Failed
             }]
         );
-        assert!(out.contains(&Output::Restore { window: WINDOW }));
+        assert!(out.contains(&Output::Restore {
+            window: WINDOW,
+            place: None
+        }));
         if stage == 1 {
             assert_eq!(f.e2.next_deadline(), Some(ms(15010)));
             assert_eq!(
@@ -2411,7 +2465,10 @@ fn startup_liveness_timeouts_fail_at_the_exact_deadline_and_clean_late_results()
                     },
                     10011
                 ),
-                vec![Output::Restore { window: WINDOW }]
+                vec![Output::Restore {
+                    window: WINDOW,
+                    place: None
+                }]
             );
         } else {
             assert_eq!(
@@ -2514,6 +2571,7 @@ fn outgoing_window_text_is_truncated_on_utf8_boundaries() {
         Input::Command(Command::Project {
             window: WINDOW,
             to: B,
+            place: None,
         }),
         0,
     );
@@ -2895,7 +2953,7 @@ impl Simulation {
                     };
                     self.response(node, Input::Parked { window, result });
                 }
-                Output::Restore { window } => {
+                Output::Restore { window, .. } => {
                     assert!(
                         self.platform[node].ever_parked.contains(&window),
                         "Restore for a never-parked window"
@@ -3064,7 +3122,7 @@ proptest! {
         // Every case starts two windows in both directions; random events can interrupt startup
         // phase, delay responses, and fail platform operations independently of network delivery.
         for node in 0..2 {
-            for window in [WINDOW, WINDOW2] { sim.step(node, Input::Command(Command::Project { window, to: [B, A][node] })); }
+            for window in [WINDOW, WINDOW2] { sim.step(node, Input::Command(Command::Project { window, to: [B, A][node], place: None })); }
         }
         sim.drain(1_000);
         for node in 0..2 {
@@ -3084,7 +3142,7 @@ proptest! {
             let chosen_window = if arg & 1 == 0 { WINDOW } else { WINDOW2 };
             let usage = HidUsage::keyboard(4 + u16::from(arg % 4));
             let event = match kind {
-                0 => Input::Command(Command::Project { window: chosen_window, to: [B, A][node] }),
+                0 => Input::Command(Command::Project { window: chosen_window, to: [B, A][node], place: None }),
                 1 => locked(),
                 2 => Input::Session(SessionEvent::State(OPEN)),
                 3 => Input::Session(SessionEvent::WillSleep),
@@ -3131,7 +3189,7 @@ proptest! {
         let mut sim = Simulation::new();
         for node in 0..2 {
             for window in [WINDOW, WINDOW2] {
-                sim.step(node, Input::Command(Command::Project { window, to: [B, A][node] }));
+                sim.step(node, Input::Command(Command::Project { window, to: [B, A][node], place: None }));
             }
         }
         sim.drain(1_000);
@@ -3456,7 +3514,10 @@ fn grace_expires_at_exact_deadline_with_the_original_link_lost_cleanup() {
     assert_eq!(
         source.handle(Input::Tick, 20_100),
         vec![
-            Output::Restore { window: WINDOW },
+            Output::Restore {
+                window: WINDOW,
+                place: None
+            },
             Output::Notice(Notice::ProjectionEnded {
                 key: key(A),
                 reason: Reason::LinkLost
@@ -3510,7 +3571,10 @@ fn grace_only_applies_after_offered_and_all_later_startup_stages_suspend() {
         assert_eq!(
             end,
             vec![
-                Output::Restore { window: WINDOW },
+                Output::Restore {
+                    window: WINDOW,
+                    place: None
+                },
                 Output::Notice(Notice::ProjectionEnded {
                     key: key(A),
                     reason: Reason::LinkLost
@@ -3528,7 +3592,10 @@ fn grace_only_applies_after_offered_and_all_later_startup_stages_suspend() {
                     },
                     20_101
                 ),
-                vec![Output::Restore { window: WINDOW }]
+                vec![Output::Restore {
+                    window: WINDOW,
+                    place: None
+                }]
             );
         }
         if stage == 2 {
@@ -3567,7 +3634,10 @@ fn grace_source_return_window_close_lock_sleep_panic_and_revocation_end_locally(
         assert_eq!(
             f.handle(event, 101),
             vec![
-                Output::Restore { window: WINDOW },
+                Output::Restore {
+                    window: WINDOW,
+                    place: None
+                },
                 Output::Notice(Notice::ProjectionEnded {
                     key: key(A),
                     reason
@@ -3769,7 +3839,13 @@ fn grace_resume_refusal_or_offer_timeout_restores_with_link_lost() {
             assert!(f.handle(Input::Tick, 10_199).is_empty());
             f.handle(Input::Tick, 10_200)
         };
-        assert_eq!(out[0], Output::Restore { window: WINDOW });
+        assert_eq!(
+            out[0],
+            Output::Restore {
+                window: WINDOW,
+                place: None
+            }
+        );
         assert_eq!(
             out.last(),
             Some(&Output::Notice(Notice::ProjectionEnded {
@@ -4088,7 +4164,10 @@ fn grace_expired_projections_cannot_resume_without_a_tick() {
     assert_eq!(
         source.handle(Input::PeerUp { peer: B }, 20_100),
         vec![
-            Output::Restore { window: WINDOW },
+            Output::Restore {
+                window: WINDOW,
+                place: None
+            },
             Output::Notice(Notice::ProjectionEnded {
                 key: key(A),
                 reason: Reason::LinkLost
