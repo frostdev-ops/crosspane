@@ -271,16 +271,18 @@ impl HyprlandParking {
             }
             if entry.floated_by_crosspane && floating {
                 self.ipc.dispatch(&format!(
-                    "hl.dsp.window.float({{ window = \"address:{address}\", action = \"unset\" }})"
+                    "hl.dsp.window.float({{ window = \"address:{address}\", action = \"disable\" }})"
                 ))?;
             }
             if on_twin {
                 self.move_window(&address, &workspace_selector(&o.workspace))?;
             }
             if changed && o.floating {
-                self.ipc.dispatch(&format!(
-                    "hl.dsp.window.float({{ window = \"address:{address}\", action = \"set\" }})"
-                ))?;
+                if !floating {
+                    self.ipc.dispatch(&format!(
+                        "hl.dsp.window.float({{ window = \"address:{address}\", action = \"enable\" }})"
+                    ))?;
+                }
                 self.ipc.dispatch(&format!(
                     "hl.dsp.window.resize({{ window = \"address:{address}\", x = {}, y = {}, relative = false }})",
                     o.size[0], o.size[1]
@@ -511,7 +513,7 @@ impl HyprlandParking {
             self.save()?;
         }
         self.ipc.dispatch(&format!(
-            "hl.dsp.window.float({{ window = \"address:{}\", action = \"set\" }})",
+            "hl.dsp.window.float({{ window = \"address:{}\", action = \"enable\" }})",
             entry.address
         ))
     }
@@ -627,7 +629,7 @@ impl HyprlandParking {
             if on_twin && placed != Some(applied_padding) {
                 let client = if placed.is_none() {
                     self.float_on_twin(&entry, &client)?;
-                    // Toggling float can restore the remembered floating size/position.
+                    // Enabling float can restore the remembered floating size/position.
                     self.client(window)?.ok_or(PlatformError::NotFound)?
                 } else {
                     client
@@ -2035,7 +2037,14 @@ mod tests {
                     1
                 };
             } else if request.starts_with("/dispatch hl.dsp.window.float(") {
-                if quoted("action") == Some("set") {
+                let action = quoted("action");
+                let explicit = matches!(action, Some("enable" | "disable"));
+                let enable = match action {
+                    Some("enable") => true,
+                    Some("disable") => false,
+                    _ => !self.floating,
+                };
+                if enable {
                     let entries: Vec<Entry> =
                         serde_json::from_str(&std::fs::read_to_string(&self.journal).unwrap())
                             .unwrap();
@@ -2051,6 +2060,9 @@ mod tests {
                     self.floating = false;
                     self.float_unsets += 1;
                     self.tile();
+                }
+                if !explicit {
+                    return "invalid float action: expected enable/disable".into();
                 }
             } else if request.starts_with("/dispatch hl.dsp.window.resize(") {
                 if self.fullscreen != 0 {
@@ -2320,6 +2332,94 @@ mod tests {
                     assert_eq!(world.at, [100, 100]);
                     assert_eq!(world.size, [800, 600]);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn originally_floating_park_keeps_exact_content_without_float_dispatch() {
+        let fake = BarFixture::new(true, [10, 26, 6, 14], None);
+        let mut parking = fake.parking();
+        let parked = parking
+            .park(WindowId(1), PixelSize::new(1200, 900), 2.0)
+            .unwrap();
+        assert_eq!(parked.content, rect(20, 52, 1220, 952));
+        let world = fake.world.lock().unwrap();
+        assert!(world.on_twin);
+        assert!(world.floating);
+        assert_eq!(world.size, [600, 450]);
+        assert_eq!(world.at, [PARK_ORIGIN_X + 10, 26]);
+        assert_eq!((world.float_sets, world.float_unsets), (0, 0));
+        assert!(!parking.entries[&1].floated_by_crosspane);
+    }
+
+    #[test]
+    fn restore_and_recovery_use_current_floating_state_on_the_twin() {
+        for recover in [false, true] {
+            for originally_floating in [false, true] {
+                for currently_floating in [false, true] {
+                    let fake = BarFixture::new(originally_floating, [0, 26, 0, 0], None);
+                    let mut parking = fake.parking();
+                    parking
+                        .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+                        .unwrap();
+                    let counts = {
+                        let mut world = fake.world.lock().unwrap();
+                        world.floating = currently_floating;
+                        world.tile();
+                        (world.float_sets, world.float_unsets)
+                    };
+                    if recover {
+                        drop(parking);
+                        parking = fake.parking();
+                        assert_eq!(parking.recover().unwrap(), [WindowId(1)]);
+                    } else {
+                        parking.restore(WindowId(1)).unwrap();
+                    }
+                    let world = fake.world.lock().unwrap();
+                    assert_eq!(world.floating, originally_floating);
+                    assert!(!world.on_twin);
+                    assert!(!world.output);
+                    assert_eq!(
+                        world.float_sets,
+                        counts.0 + usize::from(originally_floating && !currently_floating)
+                    );
+                    assert_eq!(
+                        world.float_unsets,
+                        counts.1 + usize::from(!originally_floating && currently_floating)
+                    );
+                    if originally_floating {
+                        assert_eq!(world.size, [800, 600]);
+                        assert_eq!(world.at, [100, 100]);
+                    }
+                    assert!(parking.entries.is_empty());
+                    assert_eq!(std::fs::read_to_string(&parking.journal).unwrap(), "[]");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fake_float_rejects_implicit_actions_and_models_their_toggle() {
+        let fake = BarFixture::new(false, [0; 4], None);
+        let mut parking = fake.parking();
+        parking
+            .park(WindowId(1), PixelSize::new(531, 935), 1.0)
+            .unwrap();
+        for initially_floating in [false, true] {
+            for action in [Some("set"), Some("unset"), Some("toggle"), None] {
+                fake.world.lock().unwrap().floating = initially_floating;
+                let action = action
+                    .map(|action| format!(", action = \"{action}\""))
+                    .unwrap_or_default();
+                let error = parking
+                    .ipc
+                    .dispatch(&format!(
+                        "hl.dsp.window.float({{ window = \"address:0xabc\"{action} }})"
+                    ))
+                    .unwrap_err();
+                assert!(error.to_string().contains("invalid float action"));
+                assert_eq!(fake.world.lock().unwrap().floating, !initially_floating);
             }
         }
     }

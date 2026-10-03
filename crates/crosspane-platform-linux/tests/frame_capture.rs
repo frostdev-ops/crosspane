@@ -484,7 +484,7 @@ impl TwinFixture {
         ))
         .unwrap();
         ipc.dispatch(&format!(
-            r#"hl.dsp.window.float({{window="address:{}",action="set"}})"#,
+            r#"hl.dsp.window.float({{window="address:{}",action="enable"}})"#,
             fixture.address
         ))
         .unwrap();
