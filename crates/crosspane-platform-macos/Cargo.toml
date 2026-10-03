@@ -63,3 +63,7 @@ harness = false
 [[test]]
 name = "tray_gui"
 harness = false
+
+[[test]]
+name = "clipboard_gui"
+harness = false

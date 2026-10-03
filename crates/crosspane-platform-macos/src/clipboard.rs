@@ -1,14 +1,19 @@
 //! Metadata-only pasteboard observation and admitted text reads (WP-C3a, CLIP-v0 §5).
 //! Native objects stay on the main thread. `on_main` bounds scheduling, but cannot preempt
-//! a native pasteboard call already executing there. Content is never cached or formatted.
-//! Promise/provider methods and the `ClipboardHost` implementation arrive in WP-C3b.
+//! a native pasteboard call already executing there. Read content is never cached or formatted.
+//! Lazy promises retain native items/providers on the main thread until AppKit releases them.
+//! Withdrawal disables unsupplied representations and cancels pending pastes without clearing
+//! the pasteboard. Already supplied data may remain locally until the next copy; revocation
+//! stops future transfer rather than recalling bytes delivered under a valid grant.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crosspane_platform::{ClipKinds, ClipboardEvent, EventSink, IoGate, PlatformError};
+use crosspane_platform::{
+    ClipKinds, ClipboardEvent, ClipboardHost, EventSink, IoGate, LocalPasteId, PlatformError,
+};
 use crosspane_types::ClipKind;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::NSPasteboard;
@@ -17,8 +22,12 @@ use zeroize::Zeroizing;
 
 use crate::main_thread::on_main;
 
+mod paste;
+mod provider;
+
 const POLL: Duration = Duration::from_millis(250);
 const MAIN_WAIT: Duration = Duration::from_millis(500);
+const CONSTRUCTION_WAIT: Duration = Duration::from_secs(10);
 const TEXT: &str = "public.utf8-plain-text";
 const LEGACY_TEXT: &str = "NSStringPboardType";
 const PNG: &str = "public.png";
@@ -79,6 +88,15 @@ struct State {
 }
 
 impl State {
+    fn installed(&mut self, owner: (u64, isize), next: Snapshot, after: isize) -> bool {
+        if owner.1 != next.count || after != next.count || !next.marker {
+            return false;
+        }
+        self.own = Some(owner);
+        self.observed = next;
+        true
+    }
+
     fn observe(&mut self, next: Snapshot) -> Vec<ClipboardEvent> {
         let mut events = Vec::new();
         if self.observed.count != next.count {
@@ -99,11 +117,61 @@ impl State {
 
 struct Shared {
     state: Mutex<State>,
+    pastes: Mutex<paste::Pastes>,
     wake: Condvar,
     alive: AtomicBool,
 }
 
-/// A sendable watch/read façade. WP-C3b adds the full frozen `ClipboardHost` implementation.
+impl Shared {
+    fn begin_paste(&self, epoch: u64) -> Option<LocalPasteId> {
+        let mut pastes = self.pastes.lock().ok()?;
+        if !self.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        pastes.begin(Instant::now(), epoch)
+    }
+
+    fn poll_paste(&self, id: LocalPasteId, gate: &IoGate) -> Option<Option<Zeroizing<Vec<u8>>>> {
+        self.pastes.lock().ok()?.poll(
+            id,
+            Instant::now(),
+            gate.epoch(),
+            gate.is_open() && self.alive.load(Ordering::Acquire),
+        )
+    }
+
+    fn prepare_withdraw(&self, offer: u64) -> Result<Option<(u64, isize)>, PlatformError> {
+        let state = self.state.lock().map_err(|_| poisoned())?;
+        let owner = state.own.filter(|owner| owner.0 == offer);
+        if owner.is_some() {
+            self.cancel();
+        }
+        Ok(owner)
+    }
+
+    fn cancel(&self) {
+        if let Ok(mut pastes) = self.pastes.lock() {
+            pastes.cancel();
+        }
+    }
+
+    fn lost(&self, owner: (u64, isize), notify: bool) {
+        if let Ok(mut state) = self.state.lock()
+            && state.own == Some(owner)
+        {
+            state.own = None;
+            self.cancel();
+            if notify
+                && self.alive.load(Ordering::Acquire)
+                && let Some(sink) = &state.sink
+            {
+                sink.send(ClipboardEvent::PromiseLost { offer: owner.0 });
+            }
+        }
+    }
+}
+
+/// A sendable clipboard façade; retained native objects never cross threads.
 pub struct MacClipboard {
     gate: Arc<IoGate>,
     name: PasteboardName,
@@ -119,9 +187,11 @@ impl std::fmt::Debug for MacClipboard {
 }
 
 impl MacClipboard {
+    /// Wait up to 10 s for AppKit startup off-main; steady-state I/O uses 500 ms.
+    /// The main thread must run its loop, or call this constructor directly.
     pub fn new(gate: Arc<IoGate>, pasteboard: PasteboardName) -> Result<Self, PlatformError> {
         let name = pasteboard.clone();
-        let (marker, observed) = on_main(MAIN_WAIT, move |_| {
+        let (marker, observed) = on_main(CONSTRUCTION_WAIT, move |_| {
             autoreleasepool(|_| {
                 let marker = format!(
                     "{MARKER}{}",
@@ -145,6 +215,7 @@ impl MacClipboard {
                     own: None,
                     sink: None,
                 }),
+                pastes: Mutex::new(paste::Pastes::default()),
                 wake: Condvar::new(),
                 alive: AtomicBool::new(true),
             }),
@@ -250,9 +321,58 @@ impl MacClipboard {
     }
 }
 
+impl ClipboardHost for MacClipboard {
+    fn subscribe(&mut self, sink: Arc<dyn EventSink<ClipboardEvent>>) -> Result<(), PlatformError> {
+        Self::subscribe(self, sink)
+    }
+    fn kinds(&self) -> Result<ClipKinds, PlatformError> {
+        Self::kinds(self)
+    }
+    fn read(&mut self, kind: ClipKind, max_bytes: usize) -> Result<Vec<u8>, PlatformError> {
+        Self::read(self, kind, max_bytes)
+    }
+
+    fn promise(&mut self, offer: u64, kinds: ClipKinds) -> Result<(), PlatformError> {
+        let epoch = self.gate.epoch();
+        let deadline = Instant::now() + MAIN_WAIT;
+        check_read(&self.gate, epoch, deadline)?;
+        if !kinds.text && !kinds.image {
+            return Err(PlatformError::Backend("empty clipboard promise".into()));
+        }
+        let context = provider::Context::new(self, offer, kinds);
+        let task = Arc::clone(&context);
+        let result = provider::on_default(move |_| task.install(epoch, deadline)).and_then(|r| r);
+        if result.is_err() {
+            context.abandoned.store(true, Ordering::Release);
+        }
+        deliver_install(&self.gate, epoch, result, || context.rollback())
+    }
+
+    fn fulfil(&mut self, paste: LocalPasteId, data: Option<Vec<u8>>) {
+        let data = data.map(Zeroizing::new);
+        if let Ok(mut pastes) = self.shared.pastes.lock() {
+            pastes.answer(
+                paste,
+                data,
+                Instant::now(),
+                self.gate.epoch(),
+                self.gate.is_open() && self.shared.alive.load(Ordering::Acquire),
+            );
+        }
+    }
+
+    fn withdraw(&mut self, offer: u64) -> Result<(), PlatformError> {
+        let Some(owner) = self.shared.prepare_withdraw(offer)? else {
+            return Ok(());
+        };
+        provider::withdraw(self.marker.clone(), Arc::clone(&self.shared), owner)
+    }
+}
+
 impl Drop for MacClipboard {
     fn drop(&mut self) {
         self.shared.alive.store(false, Ordering::Release);
+        self.shared.cancel();
         // Use the wait mutex so the stop notification cannot be lost before the worker sleeps.
         if let Ok(_state) = self.shared.state.lock() {
             self.shared.wake.notify_all();
@@ -268,14 +388,15 @@ fn watch(shared: Arc<Shared>, name: PasteboardName, marker: String) {
     let Ok(state) = shared.state.lock() else {
         return;
     };
-    let initial = state.observed.kinds;
-    let sink = state.sink.clone();
-    drop(state);
     if shared.alive.load(Ordering::Acquire)
-        && let Some(sink) = sink
+        && state.own.is_none()
+        && let Some(sink) = &state.sink
     {
-        sink.send(ClipboardEvent::Changed { kinds: initial });
+        sink.send(ClipboardEvent::Changed {
+            kinds: state.observed.kinds,
+        });
     }
+    drop(state);
     let mut next_poll = Instant::now() + POLL;
     loop {
         let Ok(state) = shared.state.lock() else {
@@ -299,30 +420,31 @@ fn watch(shared: Arc<Shared>, name: PasteboardName, marker: String) {
         let alive = Arc::clone(&shared);
         let board_name = name.clone();
         let marker_type = marker.clone();
-        let next = on_main(MAIN_WAIT, move |_| {
+        let _ = on_main(MAIN_WAIT, move |_| {
             autoreleasepool(|_| {
                 if !alive.alive.load(Ordering::Acquire) {
-                    return None;
+                    return;
                 }
-                Some(snapshot(&board_name.board(), &marker_type, Some(previous)))
+                // Observe and publish on main, so promise writes cannot race the snapshot.
+                let next = snapshot(&board_name.board(), &marker_type, Some(previous));
+                if let Ok(mut state) = alive.state.lock()
+                    && alive.alive.load(Ordering::Acquire)
+                {
+                    let events = state.observe(next);
+                    if events
+                        .iter()
+                        .any(|event| matches!(event, ClipboardEvent::PromiseLost { .. }))
+                    {
+                        alive.cancel();
+                    }
+                    if let Some(sink) = &state.sink {
+                        for event in events {
+                            sink.send(event);
+                        }
+                    }
+                }
             })
         });
-        if let Ok(Some(next)) = next {
-            let Ok(mut state) = shared.state.lock() else {
-                return;
-            };
-            if !shared.alive.load(Ordering::Acquire) {
-                return;
-            }
-            let events = state.observe(next);
-            let sink = state.sink.clone();
-            drop(state);
-            if let Some(sink) = sink {
-                for event in events {
-                    sink.send(event);
-                }
-            }
-        }
     }
 }
 
@@ -391,6 +513,22 @@ fn poisoned() -> PlatformError {
     PlatformError::Backend("clipboard state unavailable".into())
 }
 
+fn deliver_install(
+    gate: &IoGate,
+    epoch: u64,
+    result: Result<(), PlatformError>,
+    cleanup: impl FnOnce(),
+) -> Result<(), PlatformError> {
+    if !gate.is_open() || gate.epoch() != epoch {
+        cleanup();
+        return Err(PlatformError::Locked);
+    }
+    if result.is_err() {
+        cleanup();
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,13 +555,14 @@ mod tests {
     }
 
     // No native constructor, run loop or pasteboard is used by headless unit tests.
-    fn fixture(gate: Arc<IoGate>) -> MacClipboard {
+    pub(super) fn fixture(gate: Arc<IoGate>) -> MacClipboard {
         MacClipboard {
             gate,
             name: PasteboardName::Private("io.frostdev.crosspane.c3a.unit-unused".into()),
             marker: format!("{MARKER}00000000000000000000000000000000"),
             shared: Arc::new(Shared {
                 state: Mutex::new(state()),
+                pastes: Mutex::new(paste::Pastes::default()),
                 wake: Condvar::new(),
                 alive: AtomicBool::new(true),
             }),
@@ -703,5 +842,299 @@ mod tests {
         let shared = Arc::clone(&host.shared);
         drop(host);
         assert!(!shared.alive.load(Ordering::Acquire));
+    }
+
+    pub(super) fn open_gate() -> Arc<IoGate> {
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        gate
+    }
+
+    #[test]
+    fn full_trait_is_send_and_empty_promise_mapping_is_exact() {
+        fn frozen_host<T: ClipboardHost + Send>() {}
+        frozen_host::<MacClipboard>();
+        let mut host = fixture(open_gate());
+        assert!(matches!(host.promise(1, ClipKinds::default()),
+            Err(PlatformError::Backend(message)) if message == "empty clipboard promise"));
+        host.gate.set_engine_permits(false);
+        assert!(matches!(
+            host.promise(1, ClipKinds::default()),
+            Err(PlatformError::Locked)
+        ));
+    }
+
+    #[test]
+    fn lost_notification_matches_written_generation_and_is_delivered_once() {
+        let host = fixture(open_gate());
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut state = host.shared.state.lock().unwrap();
+            state.own = Some((7, 11));
+            state.sink = Some(Arc::new(move |event| {
+                tx.send(event).unwrap();
+            }));
+        }
+        host.shared.lost((7, 10), true);
+        assert!(rx.try_recv().is_err());
+        host.shared.lost((7, 11), true);
+        host.shared.lost((7, 11), true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ClipboardEvent::PromiseLost { offer: 7 }
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(host.shared.state.lock().unwrap().own.is_none());
+    }
+
+    #[test]
+    fn fulfil_from_another_thread_is_consumable_once() {
+        let mut host = fixture(open_gate());
+        let shared = Arc::clone(&host.shared);
+        let epoch = host.gate.epoch();
+        let id = shared
+            .pastes
+            .lock()
+            .unwrap()
+            .begin(Instant::now(), epoch)
+            .unwrap();
+        let _host = thread::spawn(move || {
+            host.fulfil(id, Some(b"private unit fixture".to_vec()));
+            host.fulfil(id, Some(b"duplicate unit fixture".to_vec()));
+            host
+        })
+        .join()
+        .unwrap();
+        let bytes = shared
+            .pastes
+            .lock()
+            .unwrap()
+            .poll(id, Instant::now(), epoch, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*bytes, b"private unit fixture");
+        assert_eq!(
+            shared
+                .pastes
+                .lock()
+                .unwrap()
+                .poll(id, Instant::now(), epoch, true),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn lost_and_drop_cancel_ready_pastes_without_resurrecting_native_content() {
+        for drop_host in [false, true] {
+            let mut host = fixture(open_gate());
+            let shared = Arc::clone(&host.shared);
+            let epoch = host.gate.epoch();
+            let id = shared
+                .pastes
+                .lock()
+                .unwrap()
+                .begin(Instant::now(), epoch)
+                .unwrap();
+            host.shared.state.lock().unwrap().own = Some((9, 3));
+            host.fulfil(id, Some(b"cancelled unit fixture".to_vec()));
+            if drop_host {
+                drop(host);
+            } else {
+                shared.lost((9, 3), true);
+            }
+            assert_eq!(
+                shared
+                    .pastes
+                    .lock()
+                    .unwrap()
+                    .poll(id, Instant::now(), epoch, true),
+                Some(None)
+            );
+        }
+    }
+
+    #[test]
+    fn fulfil_after_gate_close_reopen_or_for_unknown_id_is_empty() {
+        let mut host = fixture(open_gate());
+        let epoch = host.gate.epoch();
+        let id = host
+            .shared
+            .pastes
+            .lock()
+            .unwrap()
+            .begin(Instant::now(), epoch)
+            .unwrap();
+        host.fulfil(
+            LocalPasteId(id.0 + 1),
+            Some(b"unknown unit fixture".to_vec()),
+        );
+        host.gate.set_engine_permits(false);
+        host.gate.set_engine_permits(true);
+        host.fulfil(id, Some(b"stale unit fixture".to_vec()));
+        assert_eq!(
+            host.shared
+                .pastes
+                .lock()
+                .unwrap()
+                .poll(id, Instant::now(), host.gate.epoch(), true),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn external_copy_between_write_and_snapshot_never_publishes_ownership() {
+        let mut state = state();
+        let written = (7, 101); // clearContents returned THIS write's generation.
+        let copied = snapshot_fixture(102, false); // Another app copied after writeObjects.
+        assert!(!state.installed(written, copied, 102));
+        assert!(state.own.is_none());
+        assert_eq!(
+            state.observed.count, 1,
+            "rejected metadata must remain observable to watch"
+        );
+    }
+
+    #[test]
+    fn own_marker_on_a_different_generation_is_not_our_write() {
+        let mut state = state();
+        assert!(!state.installed((7, 101), snapshot_fixture(102, true), 102));
+        assert!(state.own.is_none());
+    }
+
+    #[test]
+    fn copy_during_metadata_snapshot_prevents_ownership_publication() {
+        let mut state = state();
+        assert!(!state.installed((7, 101), snapshot_fixture(101, true), 102));
+        assert!(state.own.is_none());
+    }
+
+    #[test]
+    fn matching_withdraw_cancels_rust_slot_before_native_work_is_awaited() {
+        let host = fixture(open_gate());
+        host.shared.state.lock().unwrap().own = Some((7, 101));
+        let id = host.shared.begin_paste(host.gate.epoch()).unwrap();
+        assert_eq!(host.shared.prepare_withdraw(7).unwrap(), Some((7, 101)));
+        assert_eq!(host.shared.poll_paste(id, &host.gate), Some(None));
+    }
+
+    #[test]
+    fn unrelated_withdraw_does_not_cancel_the_current_paste() {
+        let host = fixture(open_gate());
+        host.shared.state.lock().unwrap().own = Some((7, 101));
+        let id = host.shared.begin_paste(host.gate.epoch()).unwrap();
+        assert_eq!(host.shared.prepare_withdraw(8).unwrap(), None);
+        assert!(host.shared.poll_paste(id, &host.gate).is_none());
+    }
+
+    #[test]
+    fn drop_between_admission_and_slot_lock_cannot_allocate_a_paste() {
+        let host = fixture(open_gate());
+        let mut slots = host.shared.pastes.lock().unwrap();
+        let shared = Arc::clone(&host.shared);
+        let epoch = host.gate.epoch();
+        let (ready, admitted) = mpsc::channel();
+        let request = thread::spawn(move || {
+            assert!(shared.alive.load(Ordering::Acquire));
+            ready.send(()).unwrap();
+            shared.begin_paste(epoch)
+        });
+        admitted.recv().unwrap();
+        // Drop wins while request is blocked at the paste mutex; it cancels an empty slot.
+        host.shared.alive.store(false, Ordering::Release);
+        slots.cancel();
+        drop(slots);
+        assert!(request.join().unwrap().is_none());
+    }
+
+    #[test]
+    fn polling_after_drop_answers_empty_even_before_cancellation_acquires_the_slot() {
+        let host = fixture(open_gate());
+        let id = host.shared.begin_paste(host.gate.epoch()).unwrap();
+        host.shared.alive.store(false, Ordering::Release);
+        assert_eq!(host.shared.poll_paste(id, &host.gate), Some(None));
+    }
+
+    #[test]
+    fn gate_change_during_native_install_rolls_back_the_owned_generation() {
+        for reopen in [false, true] {
+            let host = fixture(open_gate());
+            let epoch = host.gate.epoch();
+            assert!(host.shared.state.lock().unwrap().installed(
+                (7, 101),
+                snapshot_fixture(101, true),
+                101
+            ));
+            host.gate.set_engine_permits(false);
+            if reopen {
+                host.gate.set_engine_permits(true);
+            }
+            let cleaned = AtomicBool::new(false);
+            let result = deliver_install(&host.gate, epoch, Ok(()), || {
+                assert_eq!(host.shared.prepare_withdraw(7).unwrap(), Some((7, 101)));
+                host.shared.lost((7, 101), true);
+                cleaned.store(true, Ordering::Release);
+            });
+            assert!(matches!(result, Err(PlatformError::Locked)));
+            assert!(cleaned.load(Ordering::Acquire));
+            assert!(host.shared.state.lock().unwrap().own.is_none());
+        }
+    }
+
+    #[test]
+    fn close_reopen_after_install_completion_before_delivery_is_locked_and_cleans_up() {
+        let host = fixture(open_gate());
+        let epoch = host.gate.epoch();
+        host.shared.state.lock().unwrap().own = Some((7, 101));
+        let completed = Ok(());
+        host.gate.set_engine_permits(false);
+        host.gate.set_engine_permits(true);
+        let cleaned = AtomicBool::new(false);
+        let result = deliver_install(&host.gate, epoch, completed, || {
+            host.shared.lost((7, 101), true);
+            cleaned.store(true, Ordering::Release);
+        });
+        assert!(matches!(result, Err(PlatformError::Locked)));
+        assert!(cleaned.load(Ordering::Acquire));
+        assert!(host.shared.state.lock().unwrap().own.is_none());
+    }
+
+    #[test]
+    fn withdrawal_disables_unfulfilled_generation_without_false_loss_notice() {
+        let mut host = fixture(open_gate());
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut state = host.shared.state.lock().unwrap();
+            state.own = Some((7, 101));
+            state.sink = Some(Arc::new(move |event| tx.send(event).unwrap()));
+        }
+        let id = host.shared.begin_paste(host.gate.epoch()).unwrap();
+        host.shared.lost((7, 101), false); // Synchronous disable, before native release.
+        host.fulfil(id, Some(b"revoked private fixture".to_vec()));
+        assert!(host.shared.state.lock().unwrap().own.is_none());
+        assert_eq!(host.shared.poll_paste(id, &host.gate), Some(None));
+        assert!(
+            rx.try_recv().is_err(),
+            "withdrawal did not change the native generation"
+        );
+    }
+
+    #[test]
+    fn external_copy_after_validation_survives_generation_disable() {
+        let host = fixture(open_gate());
+        host.shared.state.lock().unwrap().own = Some((7, 101));
+        let owner = host.shared.prepare_withdraw(7).unwrap().unwrap();
+        // A copy after validation is independent of our Rust ownership/cache identity.
+        let clipboard = Mutex::new((102, b"newer private local copy".to_vec()));
+        host.shared.lost(owner, false);
+        assert_eq!(
+            *clipboard.lock().unwrap(),
+            (102, b"newer private local copy".to_vec())
+        );
+        assert!(host.shared.state.lock().unwrap().own.is_none());
+        // A late old disable must also preserve a newer promise's obligation.
+        host.shared.state.lock().unwrap().own = Some((8, 103));
+        host.shared.lost(owner, false);
+        assert_eq!(host.shared.state.lock().unwrap().own, Some((8, 103)));
     }
 }
