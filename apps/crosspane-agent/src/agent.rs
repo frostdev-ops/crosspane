@@ -655,6 +655,8 @@ pub struct Agent {
     /// can move one.
     placement: PlacementSource,
     placement_dirty: bool,
+    /// Native IDs currently admitted to the engine's external-window catalog.
+    projectable_windows: BTreeSet<WindowId>,
     drag_places: BTreeMap<ProjectionKey, ProxyPlacement>,
     drag_label: Option<String>,
     /// Diagnostic only: has this capture produced any local motion for entry corroboration?
@@ -911,6 +913,7 @@ impl Agent {
             home: HomeAgent::new(),
             placement: PlacementSource::new(std::process::id()),
             placement_dirty: false,
+            projectable_windows: BTreeSet::new(),
             drag_places: BTreeMap::new(),
             drag_label: None,
             capture_motion_seen: false,
@@ -1052,6 +1055,10 @@ impl Agent {
         }
     }
 
+    fn projectable_window(&self, window: &WindowInfo) -> bool {
+        window.pid.is_some_and(|pid| pid != self.placement.pid)
+    }
+
     fn feed(&mut self, mut input: Input) {
         self.revalidate_proxy_observation(&mut input);
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1060,6 +1067,23 @@ impl Agent {
         #[cfg(test)]
         self.fed.push(input.clone());
         self.observe(&input);
+        // Native correlation keeps the raw observation; E2 exposes only external windows.
+        match &input {
+            Input::Windows(WindowEvent::Added(window) | WindowEvent::Changed(window)) => {
+                if self.projectable_window(window) {
+                    self.projectable_windows.insert(window.id);
+                } else if self.projectable_windows.remove(&window.id) {
+                    input = Input::Windows(WindowEvent::Removed(window.id));
+                } else {
+                    self.flush_placements();
+                    return;
+                }
+            }
+            Input::Windows(WindowEvent::Removed(window)) => {
+                self.projectable_windows.remove(window);
+            }
+            _ => {}
+        }
         let now = platform::now();
         #[cfg(test)]
         let now = self.test_now.unwrap_or(now);
@@ -2689,7 +2713,8 @@ impl Agent {
                     .iter()
                     .filter(|w| {
                         // Untitled windows are mostly helpers (tray proxies, splash screens).
-                        !w.title.trim().is_empty()
+                        self.projectable_window(w)
+                            && !w.title.trim().is_empty()
                             && matches!(
                                 w.role,
                                 crosspane_platform::WindowRole::Toplevel
@@ -4438,6 +4463,7 @@ impl Agent {
                 Some(w) => match w.windows() {
                     Ok(list) => Response::ok(json!(
                         list.iter()
+                            .filter(|w| self.projectable_window(w))
                             .map(|w| json!({
                                 "id": w.id.0,
                                 "app": w.app_id,
@@ -13673,6 +13699,628 @@ mod home_tests {
     }
 
     const PID: u32 = 4242;
+
+    struct CatalogWindows(Vec<WindowInfo>);
+
+    impl crosspane_platform::WindowSource for CatalogWindows {
+        fn windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+            Ok(self.0.clone())
+        }
+        fn focused(&self) -> Result<Option<WindowId>, PlatformError> {
+            Ok(None)
+        }
+        fn activate(&mut self, _: WindowId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn subscribe(
+            &mut self,
+            _: Arc<dyn crosspane_platform::EventSink<WindowEvent>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    fn drag_portal(h: &mut Home) -> PortalId {
+        let peer = h.rig.peer;
+        step(
+            h,
+            Input::DragPeer {
+                peer,
+                available: true,
+            },
+        );
+        h.rig
+            .agent
+            .emitted
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Output::SetPortals(portals) => portals.first().map(|p| p.id),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn drag_window(h: &mut Home, portal: PortalId, window: WindowId, now: u64) -> Vec<Output> {
+        h.rig.agent.test_now = Some(ms(now));
+        step(
+            h,
+            Input::Capture(CaptureEvent::DragAtEdge {
+                portal,
+                position: 0.5,
+                window,
+                grab: PointDevice::new(20.0, 10.0),
+                at: ms(now),
+            }),
+        )
+    }
+
+    #[test]
+    fn own_and_unknown_pid_windows_are_not_projectable_by_drag_command_browse_or_pull() {
+        let mut h = bare_scenario();
+        h.rig.agent.placement.pid = PID;
+        let peer = h.rig.peer;
+        step(
+            &mut h,
+            Input::Grants(
+                [(
+                    peer,
+                    [
+                        Capability::InputAccept,
+                        Capability::WindowShare,
+                        Capability::WindowPresent,
+                        Capability::WindowBrowse,
+                    ]
+                    .into(),
+                )]
+                .into(),
+            ),
+        );
+        let portal = drag_portal(&mut h);
+        let mut list = vec![window(
+            10,
+            "fixture",
+            42,
+            Some(1),
+            (0.0, 0.0, 320.0, 240.0),
+            WindowState::Normal,
+        )];
+        for (id, pid) in [(101, Some(PID)), (102, None)] {
+            let mut w = window(
+                id,
+                "same title",
+                PID,
+                Some(1),
+                (0.0, 0.0, 320.0, 240.0),
+                WindowState::Normal,
+            );
+            w.pid = pid;
+            list.push(w.clone());
+            step(&mut h, Input::Windows(WindowEvent::Added(w.clone())));
+            w.frame.size.width = 400.0;
+            step(&mut h, Input::Windows(WindowEvent::Changed(w.clone())));
+            assert_eq!(
+                h.rig.agent.placement.windows[&w.id], w,
+                "raw observation retained"
+            );
+            for now in [0, 250] {
+                let out = drag_window(&mut h, portal, w.id, now);
+                assert!(
+                    !out.iter().any(|o| matches!(
+                        o,
+                        Output::BeginDrag { .. }
+                            | Output::BeginCapture { .. }
+                            | Output::ShowOverlay { .. }
+                    )),
+                    "{out:?}"
+                );
+            }
+            let out = step(
+                &mut h,
+                Input::Command(Command::Project {
+                    window: w.id,
+                    to: peer,
+                    place: None,
+                }),
+            );
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    Output::Notice(Notice::ProjectionRefused {
+                        reason: crosspane_protocol::msg::Refusal::Busy,
+                        ..
+                    })
+                )),
+                "{out:?}"
+            );
+            let out = step(
+                &mut h,
+                projection_input(
+                    peer,
+                    ProjectionMessage::Pull {
+                        request: id as u32,
+                        window: w.id,
+                    },
+                ),
+            );
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    Output::SendControl {
+                        msg: ControlMessage::Projection(ProjectionMessage::BrowseRefused {
+                            reason: crosspane_protocol::msg::Refusal::Busy,
+                            ..
+                        }),
+                        ..
+                    }
+                )),
+                "{out:?}"
+            );
+            assert!(!out.iter().any(|o| matches!(
+                o,
+                Output::Park { .. }
+                    | Output::SendControl {
+                        msg: ControlMessage::Projection(
+                            ProjectionMessage::Start { .. } | ProjectionMessage::StartAt { .. }
+                        ),
+                        ..
+                    }
+            )));
+        }
+        // An initially unknown owner becoming our PID never entered the engine catalog.
+        let mut recognized = list[2].clone();
+        recognized.pid = Some(PID);
+        step(&mut h, Input::Windows(WindowEvent::Changed(recognized)));
+        let out = step(
+            &mut h,
+            projection_input(peer, ProjectionMessage::ListWindows { request: 7 }),
+        );
+        assert!(out.iter().any(|o| matches!(o, Output::SendControl { msg: ControlMessage::Projection(ProjectionMessage::WindowList { windows, .. }), .. } if windows.iter().map(|w| w.window).collect::<Vec<_>>() == [WindowId(10)])), "{out:?}");
+        h.rig.agent.platform.windows = Some(Box::new(CatalogWindows(list)));
+        assert_eq!(
+            h.rig
+                .agent
+                .on_ctl(Request::Windows)
+                .result
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [10]
+        );
+        h.rig.agent.platform.tray = Some(Box::new(FakeTray));
+        h.rig.agent.tray.last_update = Instant::now() - TRAY_UPDATE;
+        h.rig.agent.tray.last_local_windows = None;
+        h.rig.agent.update_tray();
+        assert_eq!(
+            h.rig
+                .agent
+                .tray
+                .local_windows
+                .iter()
+                .map(|w| w.0)
+                .collect::<Vec<_>>(),
+            [WindowId(10)]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_titled_own_proxies_only_the_registered_window_drags_back() {
+        let mut h = bare_scenario();
+        h.rig.agent.placement.pid = PID;
+        h.capture.lock().unwrap().drag_error = Some(|| PlatformError::PointerButtonHeld);
+        command_host(&mut h, None);
+        let peer = h.rig.peer;
+        step(
+            &mut h,
+            Input::Grants(
+                [(
+                    peer,
+                    [
+                        Capability::InputAccept,
+                        Capability::WindowShare,
+                        Capability::WindowPresent,
+                        Capability::WindowBrowse,
+                    ]
+                    .into(),
+                )]
+                .into(),
+            ),
+        );
+        let portal = drag_portal(&mut h);
+        let key = |n| ProjectionKey {
+            source: peer,
+            projection: ProjectionId(n),
+        };
+        for n in [1, 2] {
+            step(
+                &mut h,
+                projection_input(
+                    peer,
+                    ProjectionMessage::Start {
+                        projection: ProjectionId(n),
+                        window: crosspane_protocol::projection::WindowSummary {
+                            title: "duplicate".into(),
+                            app_id: "app".into(),
+                        },
+                        size: PixelSize::new(320, 240),
+                    },
+                ),
+            );
+            step(
+                &mut h,
+                Input::ProxyOpened {
+                    key: key(n),
+                    result: Ok((PixelSize::new(320, 240), 1.0)),
+                },
+            );
+            let title = h.rig.agent.titles[&key(n)].0.clone();
+            step(
+                &mut h,
+                Input::Windows(WindowEvent::Added(window(
+                    100 + n,
+                    &title,
+                    PID,
+                    Some(1),
+                    (0.0, 0.0, 320.0, 240.0),
+                    WindowState::Normal,
+                ))),
+            );
+        }
+        assert_eq!(h.rig.agent.titles[&key(1)].0, h.rig.agent.titles[&key(2)].0);
+        assert_eq!(
+            h.rig.agent.placement.native.get(&key(1)),
+            Some(&WindowId(101))
+        );
+        assert!(!h.rig.agent.placement.native.contains_key(&key(2)));
+        assert!(h.rig.agent.placement.windows.contains_key(&WindowId(102)));
+        for window in [WindowId(101), WindowId(102)] {
+            let out = step(
+                &mut h,
+                Input::Command(Command::Project {
+                    window,
+                    to: peer,
+                    place: None,
+                }),
+            );
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    Output::Notice(Notice::ProjectionRefused {
+                        reason: crosspane_protocol::msg::Refusal::Busy,
+                        ..
+                    })
+                )),
+                "{out:?}"
+            );
+            let out = step(
+                &mut h,
+                projection_input(peer, ProjectionMessage::Pull { request: 8, window }),
+            );
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    Output::SendControl {
+                        msg: ControlMessage::Projection(ProjectionMessage::BrowseRefused {
+                            reason: crosspane_protocol::msg::Refusal::Busy,
+                            ..
+                        }),
+                        ..
+                    }
+                )),
+                "{out:?}"
+            );
+        }
+        let out = step(
+            &mut h,
+            projection_input(peer, ProjectionMessage::ListWindows { request: 9 }),
+        );
+        assert!(out.iter().any(|o| matches!(o, Output::SendControl { msg: ControlMessage::Projection(ProjectionMessage::WindowList { windows, .. }), .. } if windows.iter().map(|w| w.window).collect::<Vec<_>>() == [WindowId(10)])), "{out:?}");
+        for now in [0, 250] {
+            let out = drag_window(&mut h, portal, WindowId(102), now);
+            assert!(
+                !out.iter()
+                    .any(|o| matches!(o, Output::BeginDrag { .. } | Output::ShowOverlay { .. })),
+                "{out:?}"
+            );
+        }
+        for now in [300, 550] {
+            drag_window(&mut h, portal, WindowId(101), now);
+        }
+        step(
+            &mut h,
+            Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                crosspane_engine::io::HUD,
+            )),
+        );
+        assert_eq!(h.capture.lock().unwrap().drags.len(), 1);
+        let out = step(
+            &mut h,
+            Input::Capture(CaptureEvent::DragDroppedAtEdge {
+                portal,
+                position: 0.5,
+                window: WindowId(101),
+                grab: PointDevice::new(20.0, 10.0),
+                at: ms(600),
+            }),
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|o| matches!(
+                    o,
+                    Output::SendControl {
+                        msg: ControlMessage::Projection(ProjectionMessage::ReturnAt {
+                            projection: ProjectionId(1),
+                            ..
+                        }),
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|o| matches!(
+            o,
+            Output::Park { .. }
+                | Output::SendControl {
+                    msg: ControlMessage::Projection(
+                        ProjectionMessage::Start { .. } | ProjectionMessage::StartAt { .. }
+                    ),
+                    ..
+                }
+        )));
+    }
+
+    #[test]
+    fn admitted_foreign_window_becoming_own_or_unknown_is_evicted_from_every_project_path() {
+        for pid in [Some(PID), None] {
+            let mut h = bare_scenario();
+            h.rig.agent.placement.pid = PID;
+            let peer = h.rig.peer;
+            step(
+                &mut h,
+                Input::Grants(
+                    [(
+                        peer,
+                        [
+                            Capability::InputAccept,
+                            Capability::WindowShare,
+                            Capability::WindowPresent,
+                            Capability::WindowBrowse,
+                        ]
+                        .into(),
+                    )]
+                    .into(),
+                ),
+            );
+            let portal = drag_portal(&mut h);
+            assert!(h.rig.agent.projectable_windows.contains(&WindowId(10)));
+            let before = step(
+                &mut h,
+                projection_input(peer, ProjectionMessage::ListWindows { request: 1 }),
+            );
+            assert!(before.iter().any(|o| matches!(o, Output::SendControl { msg: ControlMessage::Projection(ProjectionMessage::WindowList { windows, .. }), .. } if windows.iter().any(|w| w.window == WindowId(10)))));
+            let mut changed = h.rig.agent.placement.windows[&WindowId(10)].clone();
+            changed.pid = pid;
+            step(
+                &mut h,
+                Input::Windows(WindowEvent::Changed(changed.clone())),
+            );
+            assert_eq!(h.rig.agent.placement.windows[&WindowId(10)], changed);
+            assert!(!h.rig.agent.projectable_windows.contains(&WindowId(10)));
+            for now in [0, 250] {
+                let out = drag_window(&mut h, portal, WindowId(10), now);
+                assert!(
+                    !out.iter().any(|o| matches!(
+                        o,
+                        Output::BeginDrag { .. }
+                            | Output::BeginCapture { .. }
+                            | Output::ShowOverlay { .. }
+                    )),
+                    "{out:?}"
+                );
+            }
+            let out = step(
+                &mut h,
+                Input::Command(Command::Project {
+                    window: WindowId(10),
+                    to: peer,
+                    place: None,
+                }),
+            );
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    Output::Notice(Notice::ProjectionRefused {
+                        reason: crosspane_protocol::msg::Refusal::Busy,
+                        ..
+                    })
+                )),
+                "{out:?}"
+            );
+            let out = step(
+                &mut h,
+                projection_input(
+                    peer,
+                    ProjectionMessage::Pull {
+                        request: 2,
+                        window: WindowId(10),
+                    },
+                ),
+            );
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    Output::SendControl {
+                        msg: ControlMessage::Projection(ProjectionMessage::BrowseRefused {
+                            reason: crosspane_protocol::msg::Refusal::Busy,
+                            ..
+                        }),
+                        ..
+                    }
+                )),
+                "{out:?}"
+            );
+            let out = step(
+                &mut h,
+                projection_input(peer, ProjectionMessage::ListWindows { request: 3 }),
+            );
+            assert!(out.iter().any(|o| matches!(o, Output::SendControl { msg: ControlMessage::Projection(ProjectionMessage::WindowList { windows, .. }), .. } if windows.is_empty())), "{out:?}");
+            h.rig.agent.platform.windows = Some(Box::new(CatalogWindows(vec![changed])));
+            assert_eq!(h.rig.agent.on_ctl(Request::Windows).result, json!([]));
+            h.rig.agent.platform.tray = Some(Box::new(FakeTray));
+            h.rig.agent.tray.last_update = Instant::now() - TRAY_UPDATE;
+            h.rig.agent.tray.last_local_windows = None;
+            h.rig.agent.update_tray();
+            assert!(h.rig.agent.tray.local_windows.is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evicting_an_admitted_registered_proxy_preserves_back_for_own_and_unknown_pid() {
+        for pid in [Some(PID), None] {
+            let mut h = bare_scenario();
+            h.rig.agent.placement.pid = PID;
+            h.capture.lock().unwrap().drag_error = Some(|| PlatformError::PointerButtonHeld);
+            command_host(&mut h, None);
+            let peer = h.rig.peer;
+            let portal = drag_portal(&mut h);
+            let key = ProjectionKey {
+                source: peer,
+                projection: ProjectionId(1),
+            };
+            step(
+                &mut h,
+                projection_input(
+                    peer,
+                    ProjectionMessage::Start {
+                        projection: key.projection,
+                        window: crosspane_protocol::projection::WindowSummary {
+                            title: "proxy".into(),
+                            app_id: "app".into(),
+                        },
+                        size: PixelSize::new(320, 240),
+                    },
+                ),
+            );
+            step(
+                &mut h,
+                Input::ProxyOpened {
+                    key,
+                    result: Ok((PixelSize::new(320, 240), 1.0)),
+                },
+            );
+            let mut native = window(
+                101,
+                "native proxy",
+                42,
+                Some(1),
+                (0.0, 0.0, 320.0, 240.0),
+                WindowState::Normal,
+            );
+            step(&mut h, Input::Windows(WindowEvent::Added(native.clone())));
+            step(
+                &mut h,
+                Input::ProxyWindow {
+                    key,
+                    window: native.id,
+                },
+            );
+            assert!(h.rig.agent.projectable_windows.contains(&native.id));
+            native.pid = pid;
+            step(&mut h, Input::Windows(WindowEvent::Changed(native.clone())));
+            assert_eq!(h.rig.agent.placement.windows[&native.id], native);
+            assert!(!h.rig.agent.projectable_windows.contains(&native.id));
+            for now in [0, 250] {
+                drag_window(&mut h, portal, native.id, now);
+            }
+            step(
+                &mut h,
+                Input::Overlay(crosspane_platform::OverlayEvent::Visible(
+                    crosspane_engine::io::HUD,
+                )),
+            );
+            assert_eq!(h.capture.lock().unwrap().drags.len(), 1);
+            let out = step(
+                &mut h,
+                Input::Capture(CaptureEvent::DragDroppedAtEdge {
+                    portal,
+                    position: 0.5,
+                    window: native.id,
+                    grab: PointDevice::new(20.0, 10.0),
+                    at: ms(300),
+                }),
+            );
+            assert_eq!(
+                out.iter()
+                    .filter(|o| matches!(
+                        o,
+                        Output::SendControl {
+                            msg: ControlMessage::Projection(ProjectionMessage::ReturnAt {
+                                projection: ProjectionId(1),
+                                ..
+                            }),
+                            ..
+                        }
+                    ))
+                    .count(),
+                1,
+                "{out:?}"
+            );
+            assert!(!out.iter().any(|o| matches!(
+                o,
+                Output::Park { .. }
+                    | Output::SendControl {
+                        msg: ControlMessage::Projection(
+                            ProjectionMessage::Start { .. } | ProjectionMessage::StartAt { .. }
+                        ),
+                        ..
+                    }
+            )));
+        }
+    }
+
+    #[test]
+    fn ownership_eviction_ends_an_existing_source_and_restores_once_without_losing_raw_geometry() {
+        for pid in [Some(PID), None] {
+            let mut h = projected_scenario();
+            h.rig.agent.placement.pid = PID;
+            let mut changed = h.rig.agent.placement.windows[&WindowId(10)].clone();
+            changed.pid = pid;
+            changed.frame.size.width = 500.0;
+            let out = step(
+                &mut h,
+                Input::Windows(WindowEvent::Changed(changed.clone())),
+            );
+            assert!(
+                out.iter().any(|o| matches!(o, Output::StopCapture { .. })),
+                "{out:?}"
+            );
+            assert_eq!(
+                out.iter()
+                    .filter(|o| matches!(
+                        o,
+                        Output::Restore {
+                            window: WindowId(10),
+                            ..
+                        }
+                    ))
+                    .count(),
+                1,
+                "{out:?}"
+            );
+            assert_eq!(h.rig.agent.placement.windows[&WindowId(10)], changed);
+            let out = step(&mut h, Input::Windows(WindowEvent::Changed(changed)));
+            assert!(
+                !out.iter()
+                    .any(|o| matches!(o, Output::Restore { .. } | Output::StopCapture { .. }))
+            );
+        }
+    }
 
     fn proxy_key(n: u64) -> ProjectionKey {
         ProjectionKey {

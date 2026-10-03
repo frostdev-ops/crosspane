@@ -22,6 +22,13 @@ pub(crate) struct Offer {
     pub scale: f64,
 }
 
+impl Offer {
+    /// Retiling changes placement geometry, not which gesture is being accepted.
+    pub(crate) fn same_gesture(self, other: Self) -> bool {
+        self.window == other.window && self.kind == other.kind && self.peer == other.peer
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Stage {
     Pending,
@@ -144,6 +151,40 @@ mod tests {
             pixel_size: PixelSize::new(1200, 900),
             scale: 1.5,
             logical_origin: PointLogical::zero(),
+        }
+    }
+    #[test]
+    fn gesture_identity_excludes_geometry_but_includes_window_kind_and_peer() {
+        let offer = Offer {
+            window: WindowId(1),
+            kind: Kind::Out(WindowId(1)),
+            peer: NodeId([2; 32]),
+            size: PixelSize::new(320, 200),
+            scale: 1.0,
+        };
+        assert!(offer.same_gesture(Offer {
+            size: PixelSize::new(600, 700),
+            scale: 2.0,
+            ..offer
+        }));
+        for changed in [
+            Offer {
+                window: WindowId(2),
+                ..offer
+            },
+            Offer {
+                kind: Kind::Back(ProjectionKey {
+                    source: offer.peer,
+                    projection: crosspane_types::id::ProjectionId(1),
+                }),
+                ..offer
+            },
+            Offer {
+                peer: NodeId([3; 32]),
+                ..offer
+            },
+        ] {
+            assert!(!offer.same_gesture(changed));
         }
     }
     #[test]

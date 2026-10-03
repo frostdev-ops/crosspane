@@ -586,10 +586,9 @@ impl ControllerE1 {
         let offer = self
             .drag_offer
             .filter(|o| self.drag_peer(portal, position) == Some(o.peer));
-        if self
-            .drag
-            .is_some_and(|d| d.portal != portal || Some(d.offer) != offer)
-            && self.drag_activating()
+        if self.drag.is_some_and(|d| {
+            d.portal != portal || offer.is_none_or(|offer| !d.offer.same_gesture(offer))
+        }) && self.drag_activating()
         {
             self.return_home(EndReason::Released, None, false, true, now, out);
             return;
@@ -601,8 +600,13 @@ impl ControllerE1 {
             }
             return;
         };
+        if self.drag_activating()
+            && let Some(drag) = &mut self.drag
+        {
+            drag.offer = offer;
+        }
         if let Some((drag, _)) = self.drag_drop {
-            if drag.portal != portal || drag.offer != offer {
+            if drag.portal != portal || !drag.offer.same_gesture(offer) {
                 self.drag_drop = None;
                 self.hide_hud(now, out);
             }
@@ -619,7 +623,7 @@ impl ControllerE1 {
             return;
         }
         let push = match self.drag_push {
-            Some((push, previous, _)) if push.portal == portal && previous == offer => {
+            Some((push, previous, _)) if push.portal == portal && previous.same_gesture(offer) => {
                 Push { position, ..push }
             }
             Some(_) => {
@@ -1642,7 +1646,9 @@ impl ControllerE1 {
                     if now < until
                         && drag.portal == *portal
                         && drag.offer.window == *window
-                        && self.drag_offer == Some(drag.offer)
+                        && let Some(offer) = self
+                            .drag_offer
+                            .filter(|offer| offer.same_gesture(drag.offer))
                         && let Some((_, entry, point)) = self.portal_entry(*portal, *position)
                         && let Some(geometry) = self
                             .layout
@@ -1652,6 +1658,7 @@ impl ControllerE1 {
                     {
                         let mut commit = drag::placement(
                             Drag {
+                                offer,
                                 grab: *grab,
                                 entry,
                                 ..drag
@@ -1668,7 +1675,7 @@ impl ControllerE1 {
                                 position: *position,
                                 since: now,
                             },
-                            drag.offer,
+                            offer,
                             *grab,
                         ));
                     } else {

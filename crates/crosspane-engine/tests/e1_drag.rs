@@ -106,6 +106,7 @@ struct Harness {
     pending_moves: Vec<(usize, crosspane_engine::InjectId)>,
     pending_arms: Vec<(usize, ProjectionKey, u32)>,
     opened: Option<(usize, ProjectionKey, PixelSize, ProxyPlacement)>,
+    parked_size: Option<PixelSize>,
 }
 impl Harness {
     fn new(enabled: bool, feature: bool, width: u32, scale: f64) -> Self {
@@ -158,6 +159,7 @@ impl Harness {
             pending_moves: vec![],
             pending_arms: vec![],
             opened: None,
+            parked_size: None,
         };
         for index in 0..2 {
             let peer = [B, A][index];
@@ -368,6 +370,7 @@ impl Harness {
                     }
                 }
                 Output::Park { window, size, .. } | Output::ResizeParked { window, size, .. } => {
+                    let size = self.parked_size.unwrap_or(size);
                     callbacks.push((
                         index,
                         Input::Parked {
@@ -1251,6 +1254,142 @@ fn drop_at_edge_back_returns_without_press() {
     assert_eq!(h.seat.presses, 0);
     assert_eq!(h.engines[0].control_established(), Some(B));
     h.finish();
+}
+
+#[test]
+fn retile_before_drop_keeps_the_gesture_and_places_using_fresh_size_and_scale() {
+    let mut h = Harness::new(true, true, 1000, 1.0);
+    h.begin(Some(Failure::PointerButtonHeld));
+    h.feed(0, Input::LocalDisplays(vec![display(1000, 2.0)]));
+    let mut retiled = window(10);
+    retiled.frame.size = SizeLogical::new(600.0, 700.0);
+    h.feed(0, Input::Windows(WindowEvent::Changed(retiled)));
+    // The backend can report another edge sample while waiting for release.
+    h.drag_at();
+    h.dropped();
+    assert_eq!(h.commits(), 1);
+    assert!(h.trace.iter().any(|(node, output)| matches!(
+        (node, output),
+        (0, Output::SendControl {
+            msg: ControlMessage::Projection(Message::StartAt { size, place, .. }), ..
+        }) if *size == PixelSize::new(600, 700) && place.y == 300 && !place.drag
+    )));
+    h.emit_drop();
+    assert_eq!(h.commits(), 1, "a replay cannot create another projection");
+    assert_eq!(h.seat.presses, 0);
+    h.finish();
+}
+
+#[test]
+fn retile_after_drop_projects_once_and_actual_parked_geometry_still_updates() {
+    let mut h = Harness::new(true, true, 1000, 1.0);
+    h.begin(Some(Failure::PointerButtonHeld));
+    h.dropped();
+    let initial = h
+        .trace
+        .iter()
+        .find_map(|(node, output)| match (node, output) {
+            (
+                0,
+                Output::SendControl {
+                    msg: ControlMessage::Projection(Message::StartAt { size, place, .. }),
+                    ..
+                },
+            ) => Some((*size, *place)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(initial.0, PixelSize::new(320, 200));
+    assert_eq!(initial.1.y, 492, "latest geometry available at commit");
+    let actual = PixelSize::new(600, 700);
+    h.parked_size = Some(actual);
+    let mut retiled = window(10);
+    retiled.frame.size = SizeLogical::new(600.0, 700.0);
+    h.feed(0, Input::Windows(WindowEvent::Changed(retiled)));
+    assert!(h.trace.iter().any(|(node, output)| matches!(
+        (node, output),
+        (0, Output::SendControl {
+            msg: ControlMessage::Projection(Message::Geometry { size, .. }), ..
+        }) if *size == actual
+    )));
+    h.emit_drop();
+    assert_eq!(h.commits(), 1);
+    assert_eq!(h.seat.presses, 0);
+    h.finish();
+}
+
+#[test]
+fn awaiting_drop_rejects_changed_window_kind_and_portal() {
+    for case in 0..3 {
+        let mut h = Harness::new(true, true, 1000, 1.0);
+        h.begin(Some(Failure::PointerButtonHeld));
+        match case {
+            0 => {
+                h.feed(0, Input::Windows(WindowEvent::Added(window(11))));
+                h.window = WindowId(11);
+            }
+            1 => {
+                h.proxy_from_b();
+                h.window = WindowId(10);
+                h.feed(
+                    0,
+                    Input::ProxyWindow {
+                        key: ProjectionKey {
+                            source: B,
+                            projection: ProjectionId(1),
+                        },
+                        window: h.window,
+                    },
+                );
+                h.effect_start = h.trace.len();
+            }
+            _ => h.portal = crosspane_platform::PortalId(u32::MAX),
+        }
+        h.dropped();
+        assert_eq!(h.commits(), 0, "case {case}");
+        assert_eq!(h.seat.presses, 0);
+        assert!(!h.hud_visible);
+        h.finish();
+    }
+}
+
+#[test]
+fn retile_during_hud_or_capture_activation_refreshes_successful_drag_geometry() {
+    for before_hud in [true, false] {
+        let mut h = Harness::new(true, true, 1000, 1.0);
+        h.hud_ack = !before_hud;
+        h.start_push();
+        assert_eq!(h.capture.is_none(), before_hud);
+        h.feed(0, Input::LocalDisplays(vec![display(1000, 2.0)]));
+        let mut retiled = window(10);
+        retiled.frame.size = SizeLogical::new(600.0, 700.0);
+        h.feed(0, Input::Windows(WindowEvent::Changed(retiled)));
+        h.drag_at();
+        if before_hud {
+            h.feed(
+                0,
+                Input::Overlay(OverlayEvent::Visible(crosspane_engine::io::HUD)),
+            );
+        }
+        h.complete_begin(None);
+        h.motion(50.0, 0.0);
+        assert_eq!(h.commits(), 1);
+        assert!(
+            h.trace.iter().any(|(node, output)| matches!(
+                (node, output),
+                (0, Output::SendControl {
+                    msg: ControlMessage::Projection(Message::StartAt { size, place, .. }), ..
+                }) if *size == PixelSize::new(600, 700) && place.y == 300 && place.drag
+            )),
+            "{:#?}",
+            h.trace
+        );
+        assert!(h.trace.iter().any(|(node, output)| matches!(
+            (node, output), (0, Output::Park { size, scale, .. })
+            if *size == PixelSize::new(600, 700) && *scale == 1.0
+        )));
+        h.finish();
+    }
 }
 #[test]
 fn awaiting_drop_edge_release_timeout_classification_and_refusal_cancel() {
