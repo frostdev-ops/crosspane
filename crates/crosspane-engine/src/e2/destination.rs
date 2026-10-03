@@ -31,6 +31,17 @@ const KEYFRAME_SLOT: Duration = Duration::from_millis(200);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_CAP: usize = 16;
 
+/// A host reported the requested proxy size even after the source answered with another size
+/// and we commanded that answer. One observation still permits WP-2.34's genuine renewed
+/// request; the same exchange twice records that the host keeps its size instead.
+#[derive(Clone, Copy)]
+struct HostRefusal {
+    asked: PixelSize,
+    scale: f64,
+    answered: PixelSize,
+    settled: bool,
+}
+
 pub(super) struct Destination {
     open: bool,
     open_due: Option<MonoTime>,
@@ -66,6 +77,8 @@ pub(super) struct Destination {
     /// same event as the user's, so matching is a heuristic only: correctness rests on request
     /// numbers, and either misreading is restored by one more request.
     commanded: Option<(PixelSize, f64, MonoTime)>,
+    /// An explicit, known difference between host and source, not an outstanding resize.
+    refusal: Option<HostRefusal>,
     /// The parking kind of the last `ProxyGeometry` emitted (none before the first).
     parking: Option<ParkingKind>,
     /// The user counts as resizing until this time (extended by every user `Resized`).
@@ -253,7 +266,10 @@ impl Destination {
         // What the proxy is, or is about to be: a size already asked for and not yet confirmed
         // counts (whatever its age), or an answer that returns to the old size would never be
         // sent.
-        let expected = self.commanded.map_or(current, |(asked, _, _)| asked);
+        let expected = self.refusal.filter(|r| r.settled).map_or_else(
+            || self.commanded.map_or(current, |(asked, _, _)| asked),
+            |r| r.answered,
+        );
         let resizes = expected != size;
         if !resizes && self.parking == Some(parking) {
             return;
@@ -294,7 +310,42 @@ impl Destination {
         }
         self.current = Some((size, scale));
         self.commanded = None;
+        self.refusal = None;
         true
+    }
+
+    /// A callback contradicting a command is ambiguous once (M5). Repeating the exact refused
+    /// exchange settles it: the newest request is answered, the host stays where it reported,
+    /// and later identical reports/answers need no more traffic. No TTL can manufacture intent.
+    fn host_refused(&mut self, size: PixelSize, scale: f64) -> bool {
+        let Some((answered, at, _)) = self.commanded else {
+            return false;
+        };
+        if at != scale
+            || answered == size
+            || self.last_sent != Some((size, scale))
+            || self.acknowledged != Some(answered)
+        {
+            return false;
+        }
+        let settled = self
+            .refusal
+            .is_some_and(|r| r.asked == size && r.scale == scale && r.answered == answered);
+        self.refusal = Some(HostRefusal {
+            asked: size,
+            scale,
+            answered,
+            settled,
+        });
+        if settled {
+            self.current = Some((size, scale));
+            self.commanded = None;
+            self.resize = None;
+            self.resize_due = None;
+            self.held_geometry = None;
+            self.active_until = None;
+        }
+        settled
     }
 
     fn ups(&mut self, key: ProjectionKey, out: &mut Vec<Output>) {
@@ -401,6 +452,7 @@ impl E2 {
                         return;
                     }
                     destination.suspended = None;
+                    destination.refusal = None;
                     if let Some((size, scale)) = destination.current.filter(|_| destination.open) {
                         destination.last_sent = Some((size, scale));
                         destination.acknowledged = None;
@@ -471,6 +523,7 @@ impl E2 {
                     request: 0,
                     acknowledged: None,
                     commanded: None,
+                    refusal: None,
                     parking: None,
                     active_until: None,
                     held_geometry: None,
@@ -505,6 +558,11 @@ impl E2 {
                 // as it was before that request: a newer answer will come, and no timer
                 // promotes this one.
                 if *answers == destination.request {
+                    if destination.refusal.is_some_and(|r| r.answered != *size) {
+                        // A different current source geometry begins a fresh exchange, including
+                        // a source-initiated resize carrying the last answered request number.
+                        destination.refusal = None;
+                    }
                     destination.acknowledged = Some(*size);
                     if destination.user_active(now) {
                         // Keep only the current answer, until the user is quiet.
@@ -623,12 +681,22 @@ impl E2 {
             return;
         }
         if let ProxyEvent::Resized { size, scale } = event {
+            if destination
+                .refusal
+                .is_some_and(|r| r.asked != *size || r.scale != *scale)
+            {
+                // Observable new user intent (floating/dragging or changing display scale).
+                destination.refusal = None;
+            }
             if destination.unchanged(*size, *scale) {
                 // Nothing changed (the host can report one change twice).
                 return;
             }
             if destination.suspended.is_none() && destination.programmatic(*size, *scale, now) {
                 // The completion of a size this side asked the host for: not the user's.
+                return;
+            }
+            if destination.suspended.is_none() && destination.host_refused(*size, *scale) {
                 return;
             }
             // The user's: it supersedes the outstanding host resize, whose late callback is then
@@ -823,6 +891,7 @@ impl E2 {
             destination.last_resize = None;
             destination.acknowledged = None;
             destination.commanded = None;
+            destination.refusal = None;
             destination.active_until = None;
             destination.held_geometry = None;
             destination.heartbeat_due = None;
@@ -1076,6 +1145,54 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn settled_refusal_records_the_difference_without_an_outstanding_request() {
+        let (mut e2, _) = destination();
+        let tile = PixelSize::new(300, 200);
+        let minimum = PixelSize::new(400, 300);
+        let d = e2.destinations.get_mut(&key()).unwrap();
+        d.current = Some((tile, 1.0));
+        d.last_sent = Some((tile, 1.0));
+        d.acknowledged = Some(minimum);
+        d.parking = Some(ParkingKind::Twin);
+        d.commanded = Some((minimum, 1.0, MonoTime::ZERO));
+        assert!(
+            !d.host_refused(tile, 1.0),
+            "first refusal retains M5's renewed request"
+        );
+        assert!(!d.refusal.unwrap().settled);
+        d.request = 2;
+        assert!(d.host_refused(tile, 1.0));
+        let refusal = d.refusal.unwrap();
+        assert!(refusal.settled);
+        assert_eq!(
+            (refusal.asked, refusal.scale, refusal.answered),
+            (tile, 1.0, minimum)
+        );
+        assert_eq!(d.current, Some((tile, 1.0)));
+        assert_eq!(d.acknowledged, Some(minimum));
+        assert!(d.commanded.is_none() && d.resize.is_none() && d.held_geometry.is_none());
+        let mut out = Vec::new();
+        d.apply_geometry(key(), minimum, ParkingKind::Twin, MonoTime::ZERO, &mut out);
+        assert!(out.is_empty(), "the known difference is not a new command");
+        e2.proxy_event(
+            key(),
+            &ProxyEvent::Resized {
+                size: PixelSize::new(500, 400),
+                scale: 1.0,
+            },
+            MonoTime::ZERO,
+            &mut out,
+        );
+        let d = e2.destinations.get(&key()).unwrap();
+        assert!(d.refusal.is_none());
+        assert_eq!(d.request, 3);
+        assert!(
+            d.acknowledged.is_none(),
+            "a genuine new request is outstanding"
+        );
     }
 
     #[test]

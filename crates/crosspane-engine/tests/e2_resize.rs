@@ -720,6 +720,8 @@ struct World {
     actual: PixelSize,
     /// The proxy window's native size.
     native: PixelSize,
+    /// A tiled host keeps this size despite geometry commands; `None` preserves the old model.
+    keeps: Option<PixelSize>,
     /// What the window system adds to a size it is asked for.
     adjust: (u32, u32),
     /// Parking operations the platform hasn't finished: the size asked for, and when.
@@ -744,15 +746,20 @@ struct World {
 
 impl World {
     fn new(min: PixelSize) -> Self {
+        Self::open_at(min, open_size(), None)
+    }
+
+    fn open_at(min: PixelSize, opened: PixelSize, keeps: Option<PixelSize>) -> Self {
         let mut world = Self {
             src: node(SRC, DST),
             dst: Dst {
                 e2: node(DST, SRC),
                 last: 0,
             },
-            min: px(1, 1),
+            min: if keeps.is_some() { min } else { px(1, 1) },
             actual: open_size(),
-            native: open_size(),
+            native: opened,
+            keeps,
             adjust: (0, 0),
             parks: VecDeque::new(),
             self_resize: None,
@@ -790,14 +797,14 @@ impl World {
         let accepted = world.dst.at(
             Input::ProxyOpened {
                 key: proxy_key(),
-                result: Ok((open_size(), SCALE)),
+                result: Ok((opened, SCALE)),
             },
             0,
         );
         world.pump_dst(accepted, 0);
         world.complete_parks(0);
         world.start_captures(0);
-        assert_eq!(world.answers, vec![(0, open_size())]);
+        assert_eq!(world.answers, vec![(0, world.actual)]);
         // The app's minimum only bites on later resizes: it opened at its own size.
         world.min = min;
         world
@@ -834,7 +841,9 @@ impl World {
                 // The host resizes the window (the window system may adjust the size), and
                 // reports it, later. A command for the size it already has changes nothing.
                 Output::ProxyGeometry { size, .. } if size != self.native => {
-                    self.native = px(size.width + self.adjust.0, size.height + self.adjust.1);
+                    self.native = self.keeps.unwrap_or_else(|| {
+                        px(size.width + self.adjust.0, size.height + self.adjust.1)
+                    });
                     self.commands.push(size);
                     self.callbacks_due.push_back(now);
                 }
@@ -1083,14 +1092,25 @@ impl World {
         panic!("the exchange never settled");
     }
 
-    /// The invariant, after everything outstanding has finished: the proxy's native window, the
-    /// source's window and the last answer the source really sent are the same size, that
-    /// answer is to the newest request, and nothing more is ever sent.
+    /// Once all work has finished, sizes agree or the host stays at the newest request's size
+    /// while the source answers with its actual size. The newest request is answered and the
+    /// exchange stays quiet for five seconds in either case.
     fn assert_converged(&mut self) {
         self.drain();
         let newest = self.requests.last().map_or(0, |(request, _, _)| *request);
         let last = *self.answers.last().expect("the source has answered");
-        assert_eq!(self.native, self.actual, "native window vs source window");
+        let settled_refusal = self.requests.last().is_some_and(|(request, size, _)| {
+            self.native == *size
+                && last.0 == *request
+                && last.1 == self.actual
+                && last.1 != self.native
+        });
+        assert!(
+            self.native == self.actual || settled_refusal,
+            "native window vs source window: {:?} vs {:?}",
+            self.native,
+            self.actual
+        );
         assert_eq!(last.1, self.actual, "last answer vs source window");
         assert_eq!(last.0, newest, "last answer vs newest request");
         let counts = (self.requests.len(), self.commands.len(), self.answers.len());
@@ -1101,6 +1121,32 @@ impl World {
             (self.requests.len(), self.commands.len(), self.answers.len()),
             "traffic after convergence"
         );
+    }
+
+    /// A refusing host and a constrained app may stay apart, but their difference is settled:
+    /// the latest request is answered, all work is done, and repeated callbacks stay quiet.
+    fn assert_keeping_converged(&mut self, size: PixelSize, actual: PixelSize) {
+        self.drain();
+        assert_eq!(self.native, size);
+        assert_eq!(self.actual, actual);
+        let newest = self.requests.last().map_or(0, |(request, _, _)| *request);
+        assert_eq!(self.answers.last(), Some(&(newest, actual)));
+        assert!(self.parks.is_empty() && self.captures.is_empty());
+        assert!(self.callbacks_due.is_empty());
+        let counts = (self.requests.len(), self.commands.len(), self.answers.len());
+        for step in 1..=50 {
+            self.run_to(self.now + 100);
+            self.host_callback(self.now);
+            assert!(
+                self.parks.is_empty() && self.captures.is_empty(),
+                "step {step}"
+            );
+            assert_eq!(
+                counts,
+                (self.requests.len(), self.commands.len(), self.answers.len()),
+                "traffic after refusal at step {step}"
+            );
+        }
     }
 }
 
@@ -1684,6 +1730,214 @@ fn source_answers_a_refused_size_queued_before_it_is_live() {
 
 // ---- The invariant, over arbitrary interleavings ----
 
+#[test]
+fn a_host_that_keeps_its_tile_size_converges() {
+    let (tile, minimum) = (px(530, 1886), px(800, 1886));
+    let mut world = World::new(minimum);
+    world.keeps = Some(tile);
+    world.user_drag(tile, 0);
+    assert_eq!(world.requests, [(1, tile, SCALE)]);
+    world.complete_parks(20);
+    world.run_to(250);
+    assert_eq!(world.commands, [minimum]);
+    assert_eq!(world.native, tile);
+    world.host_overdue(251, 0);
+    assert_eq!(world.requests, [(1, tile, SCALE), (2, tile, SCALE)]);
+    world.complete_parks(260);
+    world.run_to(501);
+    assert_eq!(world.commands, [minimum, minimum]);
+    world.host_overdue(502, 0);
+    world.assert_keeping_converged(tile, minimum);
+    assert_eq!(world.requests.len(), 2);
+    assert_eq!(world.commands.len(), 2);
+}
+
+#[test]
+fn a_tile_smaller_than_the_window_at_open_converges() {
+    let (tile, minimum) = (px(530, 1886), px(800, 1886));
+    let mut world = World::open_at(minimum, tile, Some(tile));
+    assert_eq!(world.native, tile);
+    assert_eq!(world.actual, minimum);
+    assert_eq!(world.commands, [minimum]);
+    world.assert_keeping_converged(tile, minimum);
+    assert_eq!(
+        world.requests,
+        [(1, tile, SCALE)],
+        "first Resize asks for the tile, not the answer"
+    );
+    assert_eq!(world.commands.len(), 2);
+}
+
+fn keeping_world() -> World {
+    let (tile, minimum) = (px(530, 1886), px(800, 1886));
+    let mut world = World::new(minimum);
+    world.keeps = Some(tile);
+    world.user_drag(tile, 0);
+    world.assert_keeping_converged(tile, minimum);
+    world
+}
+
+#[test]
+fn after_a_refusal_a_new_user_size_resumes_normal_exchange() {
+    let mut world = keeping_world();
+    let before = world.requests.len();
+    let floated = px(900, 1950);
+    world.keeps = None;
+    world.user_drag(floated, world.now + 1);
+    assert_eq!(world.requests.len(), before + 1);
+    assert_eq!(world.requests.last(), Some(&(3, floated, SCALE)));
+    world.assert_converged();
+    assert_eq!(world.native, floated);
+}
+
+#[test]
+fn after_a_refusal_a_source_resize_is_applied() {
+    for obeys in [false, true] {
+        let mut world = keeping_world();
+        if obeys {
+            world.keeps = None;
+        }
+        let changed = px(900, 2000);
+        let before = (world.requests.len(), world.commands.len());
+        assert!(world.app_resizes_itself(changed, world.now + 1));
+        world.complete_parks(world.now + 1);
+        assert_eq!(
+            &world.commands[before.1..],
+            &[changed],
+            "source change is commanded immediately once"
+        );
+        if obeys {
+            world.assert_converged();
+            assert_eq!(world.native, changed);
+            assert_eq!(world.requests.len(), before.0);
+        } else {
+            world.assert_keeping_converged(px(530, 1886), px(800, 1886));
+            assert!(world.requests.len() - before.0 <= 2);
+        }
+        assert_eq!(
+            world.commands[before.1..]
+                .iter()
+                .filter(|size| **size == changed)
+                .count(),
+            1
+        );
+    }
+}
+
+fn settled_destination_refusal() -> Dst {
+    let (tile, minimum) = (px(530, 1886), px(800, 1886));
+    let mut dst = Dst::new();
+    assert_eq!(
+        messages(&dst.resized(tile, SCALE, 0)),
+        [resize(1, tile, SCALE)]
+    );
+    assert!(dst.geometry(minimum, 1, 10).is_empty());
+    assert_eq!(proxy_geometries(&dst.tick(250)), [minimum]);
+    assert_eq!(
+        messages(&dst.resized(tile, SCALE, 251)),
+        [resize(2, tile, SCALE)]
+    );
+    assert!(dst.geometry(minimum, 2, 260).is_empty());
+    assert_eq!(proxy_geometries(&dst.tick(501)), [minimum]);
+    assert!(dst.resized(tile, SCALE, 502).is_empty());
+    dst
+}
+
+#[test]
+fn after_a_refusal_a_scale_change_starts_a_fresh_exchange() {
+    let (tile, minimum) = (px(530, 1886), px(800, 1886));
+    for obeys in [false, true] {
+        let mut dst = settled_destination_refusal();
+        assert_eq!(
+            messages(&dst.resized(tile, 1.0, 600)),
+            [resize(3, tile, 1.0)]
+        );
+        assert!(dst.geometry(minimum, 3, 610).is_empty());
+        assert_eq!(proxy_geometries(&dst.tick(850)), [minimum]);
+        if obeys {
+            assert!(dst.resized(minimum, 1.0, 851).is_empty());
+        } else {
+            assert_eq!(
+                messages(&dst.resized(tile, 1.0, 851)),
+                [resize(4, tile, 1.0)]
+            );
+            assert!(dst.geometry(minimum, 4, 860).is_empty());
+            assert_eq!(proxy_geometries(&dst.tick(1101)), [minimum]);
+            assert!(dst.resized(tile, 1.0, 1102).is_empty());
+        }
+        assert!(dst.run(dst.last, dst.last + 5_000).is_empty());
+    }
+}
+
+#[test]
+fn after_a_refusal_suspend_and_resume_restore_normal_exchange() {
+    let mut world = keeping_world();
+    let before = (world.requests.len(), world.commands.len());
+    let now = world.now + 1;
+    world.drop_link(now);
+    world.keeps = None;
+    world.resume_link(now + 10);
+    assert_eq!(world.requests.len(), before.0 + 1);
+    assert_eq!(world.requests.last(), Some(&(3, px(530, 1886), SCALE)));
+    world.assert_converged();
+    assert_eq!(world.native, px(800, 1886));
+    assert_eq!(world.commands.len(), before.1 + 1);
+}
+
+#[test]
+fn repeated_and_stale_geometry_do_not_restart_a_settled_refusal() {
+    let mut dst = settled_destination_refusal();
+    assert!(traffic(&dst.geometry(px(900, 2000), 1, 600)).is_empty());
+    assert!(traffic(&dst.geometry(px(800, 1886), 2, 610)).is_empty());
+    assert!(dst.run(610, 5_610).is_empty());
+    assert!(dst.resized(px(530, 1886), SCALE, 5_611).is_empty());
+}
+
+#[test]
+fn repeated_drags_before_host_callbacks_settle_refusal_and_new_size_resumes_exchange() {
+    let late = 4_000;
+    let ops = [(0, 0, 1), (4, 0, 89), (0, 0, 161), (4, 0, 9), (0, 0, 241)];
+    let refused = px(200, 150);
+    let minimum = px(400, 300);
+    let mut world = World::new(minimum);
+    let mut now = 0;
+    for (kind, _arg, dt) in ops {
+        now += dt;
+        world.run_to(now);
+        world.host_overdue(now, late);
+        world.platform_overdue(now, 3_000);
+        match kind {
+            0 => world.user_drag(refused, now),
+            4 => {
+                world.complete_one_park(now);
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(world.keeps, None);
+    assert_eq!(world.native, refused);
+    assert_eq!(world.actual, minimum);
+    assert_eq!(
+        world.requests,
+        vec![(1, refused, SCALE), (2, refused, SCALE)]
+    );
+    assert_eq!(world.answers.last(), Some(&(2, minimum)));
+    assert_eq!(world.commands, vec![minimum, minimum]);
+    world.assert_converged();
+    assert_eq!(world.native, refused);
+    assert_eq!(world.actual, minimum);
+    assert_eq!(world.requests.len(), 2);
+    assert_eq!(world.commands.len(), 2);
+
+    let next = px(777, 433);
+    world.user_drag(next, world.now + 1);
+    assert_eq!(world.requests.last(), Some(&(3, next, SCALE)));
+    world.assert_converged();
+    assert_eq!(world.native, next);
+    assert_eq!(world.actual, next);
+    assert_eq!(world.answers.last(), Some(&(3, next)));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 500, failure_persistence: None, ..ProptestConfig::default() })]
 
@@ -1737,5 +1991,47 @@ proptest! {
             world.resume_link(now);
         }
         world.assert_converged();
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 500, failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// Fixed host/source sizes converge even with callbacks beyond the command TTL, repeated
+    /// callbacks, and slow parking completions. The old obeying-host property remains untouched.
+    #[test]
+    fn keeping_host_resize_exchanges_converge_with_bounded_traffic(
+        width in 100u32..800,
+        height in 100u32..2000,
+        extra in 1u32..1000,
+        opened in any::<bool>(),
+        delays in proptest::collection::vec((1u64..2500, any::<bool>(), any::<bool>()), 1..20),
+    ) {
+        let tile = px(width, height);
+        let minimum = px(width + extra, height);
+        let mut world = if opened {
+            World::open_at(minimum, tile, Some(tile))
+        } else {
+            let mut world = World::new(minimum);
+            world.keeps = Some(tile);
+            world.user_drag(tile, 0);
+            world
+        };
+        for (dt, callback, complete) in delays {
+            let now = world.now + dt;
+            world.run_to(now);
+            world.platform_overdue(now, 3_000);
+            if complete {
+                world.complete_parks(now);
+                world.start_captures(now);
+            }
+            if callback {
+                world.host_overdue(now, 0);
+                world.host_callback(now);
+            }
+        }
+        world.assert_keeping_converged(tile, minimum);
+        prop_assert!(world.requests.len() <= 2, "{:?}", world.requests);
+        prop_assert!(world.commands.len() <= 2, "{:?}", world.commands);
     }
 }
