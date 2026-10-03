@@ -142,6 +142,8 @@ message ProjectionResize {
   uint32 pixel_h = 3;
   double scale = 4;
   uint32 request = 5;
+  // The proxy is fullscreen on its display; pixel_w/h are then that display's content size.
+  bool fullscreen = 6;
 }
 
 message ProjectionGeometry {
@@ -150,6 +152,9 @@ message ProjectionGeometry {
   uint32 pixel_h = 3;
   uint32 parking = 4;
   uint32 answers = 5;
+  // 0 unknown (a source that predates this field), 1 windowed, 2 fullscreen: the real window fills
+  // its twin display (Twin) or its screen (Mirror).
+  uint32 fullscreen = 6;
 }
 
 message ProjectionTitle {

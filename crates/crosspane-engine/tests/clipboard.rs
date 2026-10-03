@@ -324,6 +324,7 @@ impl World {
                                     size.height as i32,
                                 ),
                             ),
+                            fullscreen: false,
                         }),
                     },
                 );

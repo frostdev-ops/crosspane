@@ -315,6 +315,10 @@ impl HyprlandParking {
 }
 
 impl WindowParking for HyprlandParking {
+    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    }
+
     fn park(
         &mut self,
         window: WindowId,
@@ -797,7 +801,11 @@ impl HyprlandParking {
                     }
                     // An app may refuse a size; the geometry is what it took.
                     log(rule.as_str(), Some(content));
-                    return Ok(Parked { content, ..parked });
+                    return Ok(Parked {
+                        content,
+                        fullscreen: false,
+                        ..parked
+                    });
                 }
                 Decision::Timeout => {
                     log("timeout", None);
@@ -1021,7 +1029,11 @@ fn clipped(parked: Parked, extent: PixelRect) -> Result<Parked, PlatformError> {
         .content
         .intersection(&extent)
         .ok_or_else(|| backend("parked window lies outside its twin output".into()))?;
-    Ok(Parked { content, ..parked })
+    Ok(Parked {
+        content,
+        fullscreen: false,
+        ..parked
+    })
 }
 
 /// A client's `size` (logical pixels), if it reports one.
@@ -1053,6 +1065,7 @@ pub(crate) fn parked_from(
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| backend("twin output without an id".into()))?;
     Ok(Parked {
+        fullscreen: false,
         window,
         kind: ParkingKind::Twin,
         display: DisplayId(id),
@@ -1928,6 +1941,7 @@ mod tests {
             ));
         }
         let parked = |content| Parked {
+            fullscreen: false,
             window: WindowId(1),
             kind: ParkingKind::Twin,
             display: DisplayId(7),

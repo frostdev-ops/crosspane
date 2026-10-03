@@ -65,6 +65,7 @@ fn sent(peer: NodeId, msg: Message) -> Output {
 }
 fn geometry(size: PixelSize, answers: u32) -> Message {
     Message::Geometry {
+        fullscreen: None,
         projection: ID,
         size,
         parking: ParkingKind::Twin,
@@ -73,6 +74,7 @@ fn geometry(size: PixelSize, answers: u32) -> Message {
 }
 fn resize_parked(size: PixelSize, scale: f64) -> Output {
     Output::ResizeParked {
+        fullscreen: false,
         window: WINDOW,
         size,
         scale,
@@ -133,6 +135,7 @@ fn window() -> WindowInfo {
 }
 fn parked(size: PixelSize) -> Parked {
     Parked {
+        fullscreen: false,
         window: WINDOW,
         kind: PlatformParking::Twin,
         display: DISPLAY,
@@ -247,6 +250,7 @@ impl Src {
             control(
                 DST,
                 Message::Resize {
+                    fullscreen: false,
                     projection: ID,
                     request,
                     size,

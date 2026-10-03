@@ -424,6 +424,7 @@ impl Mesh {
                     Input::Parked {
                         window: *window,
                         result: Ok(Parked {
+                            fullscreen: false,
                             window: *window,
                             kind: ParkingKind::Twin,
                             display: TWIN,

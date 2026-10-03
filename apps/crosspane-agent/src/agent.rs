@@ -2068,6 +2068,7 @@ impl Agent {
                 });
             }
             Output::ResizeParked {
+                fullscreen: _,
                 window,
                 size,
                 scale,
@@ -2315,6 +2316,9 @@ impl Agent {
                         result: Err(Failure::Other),
                     });
                 }
+            }
+            Output::ProxyFullscreen { key, fullscreen } => {
+                tracing::debug!(?key, fullscreen, "proxy fullscreen is not implemented");
             }
             Output::ProxyGeometry {
                 key,
@@ -4245,6 +4249,10 @@ impl Agent {
                 (id, Box::new(|key| proxy(key, ProxyEvent::CloseRequested)))
             }
             HostEvent::Lost { id } => (id, Box::new(|key| proxy(key, ProxyEvent::Lost))),
+            HostEvent::Fullscreen { id, fullscreen } => {
+                tracing::debug!(id, fullscreen, "proxy fullscreen event is not implemented");
+                return;
+            }
             HostEvent::Presented { id, frames } => {
                 if let Some(key) = self.proxy_ids.key(id) {
                     self.proxy_ids.presented(key, frames);
@@ -9174,6 +9182,10 @@ mod home_tests {
 
     struct FakeParking;
     impl crosspane_platform::WindowParking for FakeParking {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+
         fn park(
             &mut self,
             window: WindowId,
@@ -9181,6 +9193,7 @@ mod home_tests {
             _scale: f64,
         ) -> Result<crosspane_platform::Parked, PlatformError> {
             Ok(crosspane_platform::Parked {
+                fullscreen: false,
                 window,
                 kind: crosspane_platform::ParkingKind::Twin,
                 display: DisplayId(7),
@@ -9216,6 +9229,10 @@ mod home_tests {
     struct ShutdownParking(Result<Vec<WindowId>, PlatformError>);
 
     impl crosspane_platform::WindowParking for ShutdownParking {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+
         fn park(
             &mut self,
             window: WindowId,
@@ -9415,6 +9432,10 @@ mod home_tests {
     /// successful final journal recovery that returns the cursor to a physical output.
     struct RestoreFailureParking(Shared);
     impl crosspane_platform::WindowParking for RestoreFailureParking {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+
         fn park(
             &mut self,
             window: WindowId,
@@ -10766,6 +10787,7 @@ mod home_tests {
             projection_input(
                 peer,
                 ProjectionMessage::Resize {
+                    fullscreen: false,
                     projection: ProjectionId(1),
                     request,
                     size: PixelSize::new(width, 300),
@@ -11159,6 +11181,7 @@ mod home_tests {
         let (backend, controls) = fake(Some(Kind::Resize));
         replace_parking(&mut h.rig.agent, Box::new(backend));
         h.rig.agent.execute(vec![Output::ResizeParked {
+            fullscreen: false,
             window: WindowId(10),
             size: PixelSize::new(400, 300),
             scale: 1.0,
@@ -11209,6 +11232,7 @@ mod home_tests {
         let (backend, controls) = fake(Some(Kind::Resize));
         replace_parking(&mut h.rig.agent, Box::new(backend));
         h.rig.agent.execute(vec![Output::ResizeParked {
+            fullscreen: false,
             window: WindowId(10),
             size: PixelSize::new(400, 300),
             scale: 1.0,
@@ -15538,6 +15562,10 @@ mod home_tests {
     }
 
     impl crosspane_platform::WindowParking for Parking {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+
         fn park(
             &mut self,
             window: WindowId,

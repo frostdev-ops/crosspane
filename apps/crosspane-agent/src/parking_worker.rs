@@ -601,6 +601,7 @@ pub(crate) mod tests {
                 return Err(PlatformError::NotFound);
             }
             Ok(Parked {
+                fullscreen: false,
                 window,
                 kind: ParkingKind::Twin,
                 display: self.display,
@@ -613,6 +614,10 @@ pub(crate) mod tests {
     }
 
     impl WindowParking for Fake {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+
         fn park(
             &mut self,
             window: WindowId,

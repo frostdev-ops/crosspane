@@ -141,6 +141,7 @@ pub enum ProjectionMessage {
         request: u32,
         size: PixelSize,
         scale: f64,
+        fullscreen: bool,
     },
     /// Source → destination: the window's actual content size and parking, after start or a
     /// resize. Frames carry their own size too. `answers` is the `request` of the newest Resize
@@ -150,6 +151,7 @@ pub enum ProjectionMessage {
         size: PixelSize,
         parking: ParkingKind,
         answers: u32,
+        fullscreen: Option<bool>,
     },
     /// Source → destination: the window's title changed.
     Title {

@@ -24,6 +24,11 @@ pub struct HostPlace {
 
 /// Commands to the host, sent from any thread through `HostHandle`.
 pub enum HostCommand {
+    /// `Window::set_fullscreen(Some(Fullscreen::Borderless(None)))` or `None`. Never `Exclusive`.
+    SetFullscreen {
+        id: u64,
+        fullscreen: bool,
+    },
     /// Open a proxy with roughly `size` device pixels of content. `accent` is the source node's
     /// colour (sRGB bytes): the proxy always shows it as a band around its content (04 §5), so a
     /// remote window can't pass as a local one.
@@ -136,6 +141,11 @@ impl fmt::Debug for HostCommand {
                 .field("id", id)
                 .field("title", title)
                 .finish(),
+            Self::SetFullscreen { id, fullscreen } => f
+                .debug_struct("SetFullscreen")
+                .field("id", id)
+                .field("fullscreen", fullscreen)
+                .finish(),
             Self::SetContentSize { id, size } => f
                 .debug_struct("SetContentSize")
                 .field("id", id)
@@ -183,6 +193,11 @@ impl fmt::Debug for HostCommand {
 /// What the host reports. Positions are device pixels of the content area, origin top-left.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostEvent {
+    /// `Window::fullscreen().is_some()` changed; sent before the `Resized` of the same change.
+    Fullscreen {
+        id: u64,
+        fullscreen: bool,
+    },
     Opened {
         id: u64,
         size: PixelSize,

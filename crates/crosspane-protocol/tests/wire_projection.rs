@@ -193,7 +193,7 @@ proptest! {
     #[test]
     fn round_trip_resize(p in any::<u64>(), request in any::<u32>(), size in size(),
         scale in finite().prop_filter("positive", |v| *v > 0.0)) {
-        let message = ProjectionMessage::Resize { projection: ProjectionId(p), request, size, scale };
+        let message = ProjectionMessage::Resize { fullscreen: false, projection: ProjectionId(p), request, size, scale };
         // Field 5 carries the request number, independently of the codec's private pb types.
         let mut fields = [
             if p == 0 { Vec::new() } else { number(1, p) },
@@ -212,7 +212,7 @@ proptest! {
     #[test]
     fn round_trip_geometry(p in any::<u64>(), size in size(), answers in any::<u32>(),
         parking in proptest::sample::select(vec![ParkingKind::Twin, ParkingKind::Mirror])) {
-        let message = ProjectionMessage::Geometry { projection: ProjectionId(p), size, parking, answers };
+        let message = ProjectionMessage::Geometry { fullscreen: None, projection: ProjectionId(p), size, parking, answers };
         let code = if parking == ParkingKind::Twin { 1 } else { 2 };
         let mut fields = [
             if p == 0 { Vec::new() } else { number(1, p) },
@@ -778,12 +778,14 @@ fn rejects_unknown_browse_refusal_codes() {
 fn request_and_answers_round_trip_at_the_extremes() {
     for value in [0, 1, 2, u32::MAX - 1, u32::MAX] {
         round_trip_control(ProjectionMessage::Resize {
+            fullscreen: false,
             projection: ProjectionId(u64::MAX),
             request: value,
             size: PixelSize::new(777, 433),
             scale: 2.0,
         });
         round_trip_control(ProjectionMessage::Geometry {
+            fullscreen: None,
             projection: ProjectionId(u64::MAX),
             size: PixelSize::new(777, 433),
             parking: ParkingKind::Twin,
@@ -793,12 +795,121 @@ fn request_and_answers_round_trip_at_the_extremes() {
 }
 
 #[test]
+fn fullscreen_resize_wire_round_trip() {
+    for fullscreen in [false, true] {
+        let mut fields = [
+            number(1, 9),
+            number(2, 777),
+            number(3, 433),
+            double(4, 2.0),
+            number(5, 7),
+        ]
+        .concat();
+        if fullscreen {
+            fields.extend(number(6, 1));
+        }
+        let frame = projection_frame(4, &fields);
+        let decoded = decode_control(&frame).unwrap();
+        let ControlMessage::Projection(message) = decoded else {
+            panic!("not a projection")
+        };
+        assert!(
+            matches!(&message, ProjectionMessage::Resize { fullscreen: observed, .. } if *observed == fullscreen)
+        );
+        assert_eq!(control_frame(&message), frame);
+    }
+}
+
+#[test]
+fn fullscreen_geometry_wire_round_trip() {
+    for fullscreen in [0, 1, 2] {
+        let mut fields = [
+            number(1, 9),
+            number(2, 777),
+            number(3, 433),
+            number(4, 1),
+            number(5, 7),
+        ]
+        .concat();
+        if fullscreen != 0 {
+            fields.extend(number(6, fullscreen));
+        }
+        let frame = projection_frame(5, &fields);
+        let decoded = decode_control(&frame).unwrap();
+        let ControlMessage::Projection(message) = decoded else {
+            panic!("not a projection")
+        };
+        let expected = match fullscreen {
+            0 => None,
+            1 => Some(false),
+            2 => Some(true),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(&message, ProjectionMessage::Geometry { fullscreen: observed, .. } if *observed == expected)
+        );
+        assert_eq!(control_frame(&message), frame);
+    }
+}
+
+#[test]
+fn fullscreen_geometry_rejects_unknown_state() {
+    for fullscreen in [3, u64::from(u32::MAX)] {
+        let fields = [number(4, 1), number(6, fullscreen)].concat();
+        assert!(matches!(
+            decode_control(&projection_frame(5, &fields)),
+            Err(WireError::BadValue(_))
+        ));
+    }
+}
+
+#[test]
+fn fullscreen_old_encodings_omit_the_default() {
+    for (variant, fields) in [
+        (4, [number(1, 9), double(4, 2.0), number(5, 7)].concat()),
+        (5, [number(1, 9), number(4, 1), number(5, 7)].concat()),
+    ] {
+        let frame = projection_frame(variant, &fields);
+        let ControlMessage::Projection(message) = decode_control(&frame).unwrap() else {
+            panic!("not a projection")
+        };
+        match &message {
+            ProjectionMessage::Resize { fullscreen, .. } => assert!(!fullscreen),
+            ProjectionMessage::Geometry { fullscreen, .. } => assert_eq!(*fullscreen, None),
+            _ => panic!("wrong projection variant"),
+        }
+        let explicit_default = projection_frame(variant, &[fields, number(6, 0)].concat());
+        assert_eq!(
+            decode_control(&explicit_default),
+            Ok(ControlMessage::Projection(message.clone()))
+        );
+        assert_eq!(control_frame(&message), frame);
+    }
+}
+
+#[test]
+fn fullscreen_windowed_resize_keeps_golden_bytes() {
+    let golden = Frame {
+        kind: KIND_CONTROL,
+        payload: vec![
+            0x6a, 0x15, 0x22, 0x13, 0x08, 0x09, 0x10, 0x89, 0x06, 0x18, 0xb1, 0x03, 0x21, 0, 0, 0,
+            0, 0, 0, 0, 0x40, 0x28, 0x07,
+        ],
+    };
+    let ControlMessage::Projection(message) = decode_control(&golden).unwrap() else {
+        panic!("not a projection")
+    };
+    assert_eq!(control_frame(&message), golden);
+}
+
+#[test]
 fn encodings_without_field_five_decode_as_zero() {
     // A peer that predates request numbers omits field 5; proto3 reads it as 0.
     let resize = [number(1, 9), number(2, 777), number(3, 433), double(4, 2.0)].concat();
     assert_eq!(
         decode_control(&projection_frame(4, &resize)),
         Ok(ControlMessage::Projection(ProjectionMessage::Resize {
+            fullscreen: false,
             projection: ProjectionId(9),
             request: 0,
             size: PixelSize::new(777, 433),
@@ -809,6 +920,7 @@ fn encodings_without_field_five_decode_as_zero() {
     assert_eq!(
         decode_control(&projection_frame(5, &geometry)),
         Ok(ControlMessage::Projection(ProjectionMessage::Geometry {
+            fullscreen: None,
             projection: ProjectionId(9),
             size: PixelSize::new(777, 433),
             parking: ParkingKind::Mirror,
@@ -820,6 +932,7 @@ fn encodings_without_field_five_decode_as_zero() {
     assert_eq!(
         decode_control(&projection_frame(4, &resize)),
         Ok(ControlMessage::Projection(ProjectionMessage::Resize {
+            fullscreen: false,
             projection: ProjectionId(9),
             request: u32::MAX,
             size: PixelSize::new(777, 433),
@@ -830,6 +943,7 @@ fn encodings_without_field_five_decode_as_zero() {
     assert_eq!(
         decode_control(&projection_frame(5, &geometry)),
         Ok(ControlMessage::Projection(ProjectionMessage::Geometry {
+            fullscreen: None,
             projection: ProjectionId(9),
             size: PixelSize::new(777, 433),
             parking: ParkingKind::Mirror,
@@ -862,6 +976,7 @@ fn rejects_nonfinite_or_nonpositive_scale() {
                 scale,
             },
             ProjectionMessage::Resize {
+                fullscreen: false,
                 projection: ProjectionId(1),
                 request: 1,
                 size: PixelSize::new(1, 1),

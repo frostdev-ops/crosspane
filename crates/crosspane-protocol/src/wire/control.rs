@@ -712,6 +712,7 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
             request,
             size,
             scale,
+            fullscreen,
         } => {
             check_projection_scale(*scale)?;
             Body::Resize(pb::ProjectionResize {
@@ -720,6 +721,7 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 pixel_h: size.height,
                 scale: *scale,
                 request: *request,
+                fullscreen: *fullscreen,
             })
         }
         ProjectionMessage::Geometry {
@@ -727,6 +729,7 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
             size,
             parking,
             answers,
+            fullscreen,
         } => {
             let parking = match parking {
                 ParkingKind::Twin => 1,
@@ -738,6 +741,11 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 pixel_h: size.height,
                 parking,
                 answers: *answers,
+                fullscreen: match fullscreen {
+                    None => 0,
+                    Some(false) => 1,
+                    Some(true) => 2,
+                },
             })
         }
         ProjectionMessage::Title { projection, title } => {
@@ -926,6 +934,7 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
                 request: resize.request,
                 size: PixelSize::new(resize.pixel_w, resize.pixel_h),
                 scale: resize.scale,
+                fullscreen: resize.fullscreen,
             }
         }
         Body::Geometry(geometry) => {
@@ -939,6 +948,12 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
                 size: PixelSize::new(geometry.pixel_w, geometry.pixel_h),
                 parking,
                 answers: geometry.answers,
+                fullscreen: match geometry.fullscreen {
+                    0 => None,
+                    1 => Some(false),
+                    2 => Some(true),
+                    _ => return Err(WireError::BadValue("projection fullscreen")),
+                },
             }
         }
         Body::Title(title) => {
@@ -1273,6 +1288,8 @@ mod pb {
         pub scale: f64,
         #[prost(uint32, tag = "5")]
         pub request: u32,
+        #[prost(bool, tag = "6")]
+        pub fullscreen: bool,
     }
 
     #[derive(Clone, Copy, PartialEq, prost::Message)]
@@ -1287,6 +1304,8 @@ mod pb {
         pub parking: u32,
         #[prost(uint32, tag = "5")]
         pub answers: u32,
+        #[prost(uint32, tag = "6")]
+        pub fullscreen: u32,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

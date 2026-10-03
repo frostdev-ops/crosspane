@@ -184,6 +184,9 @@ pub enum AudioEndpoint {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ProxyEvent {
+    /// The proxy entered (`true`) or left fullscreen on its display. Reported before the `Resized`
+    /// of the same change, whether the host did it (`Output::ProxyFullscreen`) or the user did.
+    Fullscreen(bool),
     /// The content area changed: `size` device pixels at `scale` device pixels per logical unit.
     Resized {
         size: PixelSize,
@@ -538,11 +541,18 @@ pub enum Output {
         size: PixelSize,
         scale: f64,
     },
-    /// `WindowParking::resize` (from `Resize`); answer with `Input::Parked`.
+    /// `WindowParking::set_fullscreen(window, fullscreen)` then `WindowParking::resize(window,
+    /// size, scale)`; one answer, `Input::Parked`, with the real state in `Parked::fullscreen`.
     ResizeParked {
         window: WindowId,
         size: PixelSize,
         scale: f64,
+        fullscreen: bool,
+    },
+    /// Put the proxy into, or take it out of, fullscreen on its current display.
+    ProxyFullscreen {
+        key: ProjectionKey,
+        fullscreen: bool,
     },
     /// `WindowParking::restore`.
     Restore {

@@ -40,6 +40,10 @@ pub struct WindowInfo {
     pub display: Option<DisplayId>,
     /// Frame in the node's logical desktop coordinates (03 §5).
     pub frame: RectLogical,
+    /// macOS reports `Fullscreen` for an on-screen layer-0 window whose bounds equal its display's
+    /// bounds, and `Hidden` for a window that is listed but not on screen (`kCGWindowIsOnscreen`
+    /// absent); Hyprland reports `Fullscreen` when `fullscreen > 0 || fullscreenClient > 0`. A window
+    /// leaves the list only when it closes.
     pub state: WindowState,
     pub role: WindowRole,
     pub parent: Option<WindowId>,
@@ -91,6 +95,9 @@ pub struct Parked {
     /// The window's content on `display`, in device pixels. Capture crops to it; projected input at
     /// content position `p` is injected at `content.min + p` on `display`.
     pub content: PixelRect,
+    /// The window is fullscreen on `display`: `content` is the whole display under `Twin`, the
+    /// window's fullscreen frame under `Mirror`.
+    pub fullscreen: bool,
 }
 
 /// Keeps projected windows out of the source user's way (D2), and gives them back (04 §8
@@ -117,6 +124,13 @@ pub trait WindowParking: Send {
         size: PixelSize,
         scale: f64,
     ) -> Result<Parked, PlatformError>;
+
+    /// Make the parked window fullscreen on its display, or ordinary again. "Ensure" semantics: a
+    /// window already in that state is left alone. Returns once the window reports the state (at
+    /// most 2 s), `Timeout` if it never does, `Unsupported` where the platform can't (e.g. a
+    /// title-less fullscreen window). Never ends the parking; the next `resize` or `geometry`
+    /// reports the real state in `Parked::fullscreen`.
+    fn set_fullscreen(&mut self, window: WindowId, fullscreen: bool) -> Result<(), PlatformError>;
 
     /// The current geometry of a parked window (it may have moved or resized itself).
     fn geometry(&self, window: WindowId) -> Result<Parked, PlatformError>;
@@ -154,6 +168,10 @@ mod tests {
         fail: bool,
     }
     impl WindowParking for Parking {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+
         fn park(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError> {
             unreachable!()
         }

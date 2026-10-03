@@ -140,6 +140,7 @@ fn parked(
     content: PixelRect,
 ) -> Parked {
     Parked {
+        fullscreen: false,
         window,
         kind,
         display,
@@ -4500,6 +4501,7 @@ fn fullscreen_resize_while_home_leaves_home() {
     let out = h.feed(projection_msg(
         B,
         Message::Resize {
+            fullscreen: false,
             projection: P1,
             request: 1,
             size: PixelSize::new(1000, 1000),
@@ -4577,6 +4579,7 @@ fn strips_rebuilt_on_resize() {
     h.feed(projection_msg(
         B,
         Message::Resize {
+            fullscreen: false,
             projection: P1,
             request: 1,
             size: PixelSize::new(500, 350),

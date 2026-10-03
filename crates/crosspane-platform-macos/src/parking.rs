@@ -285,6 +285,10 @@ impl ParkingState {
 }
 
 impl WindowParking for MacMirrorParking {
+    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    }
+
     fn park(
         &mut self,
         window: WindowId,
@@ -357,6 +361,7 @@ fn parked(window: WindowId, frame: RectLogical) -> Result<Parked, PlatformError>
     let display = display_for_frame(frame)?;
     let (bounds, scale) = display_metrics(display)?;
     Ok(Parked {
+        fullscreen: false,
         window,
         kind: ParkingKind::Mirror,
         display,

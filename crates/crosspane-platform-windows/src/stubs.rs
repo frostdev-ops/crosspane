@@ -168,6 +168,7 @@ impl WindowSource for UnsupportedWindows {
 
 impl WindowParking for UnsupportedWindows {
     unsupported! {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError>;
         fn park(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError>;
         fn resize(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError>;
         fn geometry(&self, _: WindowId) -> Result<Parked, PlatformError>;

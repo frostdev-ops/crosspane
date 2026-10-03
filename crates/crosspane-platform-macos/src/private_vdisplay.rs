@@ -1146,6 +1146,7 @@ impl TwinState {
     fn whole_display(&self, window: WindowId) -> Result<Parked, PlatformError> {
         let (display, bounds, pixels) = self.twin_metrics(window)?;
         Ok(Parked {
+            fullscreen: false,
             window,
             kind: ParkingKind::Twin,
             display,
@@ -1164,6 +1165,7 @@ impl TwinState {
         let frame = self.last.get(&window).copied().or(hint);
         let (display, bounds, pixels) = self.twin_metrics(window)?;
         Ok(Parked {
+            fullscreen: false,
             window,
             kind: ParkingKind::Twin,
             display,
@@ -1176,6 +1178,7 @@ impl TwinState {
         let (display, bounds, pixels) = self.twin_metrics(window)?;
         self.last.insert(window, frame);
         Ok(Parked {
+            fullscreen: false,
             window,
             kind: ParkingKind::Twin,
             display,
@@ -1564,6 +1567,10 @@ impl TwinState {
 }
 
 impl WindowParking for MacTwinParking {
+    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    }
+
     fn park(
         &mut self,
         window: WindowId,

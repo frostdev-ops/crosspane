@@ -376,6 +376,7 @@ impl Harness {
                         Input::Parked {
                             window,
                             result: Ok(Parked {
+                                fullscreen: false,
                                 window,
                                 kind: ParkingKind::Mirror,
                                 display: DisplayId(1),

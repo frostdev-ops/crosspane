@@ -121,6 +121,7 @@ impl Fixture {
         self.handle(Input::Parked {
             window,
             result: Ok(Parked {
+                fullscreen: false,
                 window,
                 kind: ParkingKind::Twin,
                 display,

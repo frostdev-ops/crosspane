@@ -307,6 +307,9 @@ impl App {
                     window.window.set_title(&title);
                 }
             }
+            HostCommand::SetFullscreen { id, fullscreen } => {
+                tracing::debug!(id, fullscreen, "proxy fullscreen is not implemented");
+            }
             HostCommand::SetContentSize { id, size } => {
                 if size.width == 0 || size.height == 0 {
                     return;

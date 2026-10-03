@@ -99,6 +99,7 @@ fn resume_messages(size: PixelSize, scale: f64, request: u32) -> Vec<Message> {
             scale,
         },
         Message::Resize {
+            fullscreen: false,
             projection: ID,
             request,
             size,
@@ -170,6 +171,7 @@ fn window(id: WindowId) -> WindowInfo {
 
 fn parked(window: WindowId, kind: PlatformParking, size: PixelSize) -> Parked {
     Parked {
+        fullscreen: false,
         window,
         kind,
         display: DISPLAY,
@@ -343,6 +345,7 @@ fn sent_geometry(size: PixelSize, answers: u32) -> Output {
     Output::SendControl {
         peer: B,
         msg: ControlMessage::Projection(Message::Geometry {
+            fullscreen: None,
             projection: ID,
             size,
             parking: ParkingKind::Twin,
@@ -417,6 +420,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
     assert_eq!(
         messages(&out),
         vec![Message::Geometry {
+            fullscreen: None,
             projection: ID,
             size: size(),
             parking: ParkingKind::Twin,
@@ -482,6 +486,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
             control(
                 B,
                 Message::Resize {
+                    fullscreen: false,
                     projection: ID,
                     request: 1,
                     size: resized,
@@ -491,6 +496,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
             4
         ),
         vec![Output::ResizeParked {
+            fullscreen: false,
             window: WINDOW,
             size: resized,
             scale: 1.5
@@ -500,6 +506,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
         control(
             B,
             Message::Resize {
+                fullscreen: false,
                 projection: ID,
                 request: 2,
                 size: size(),
@@ -512,6 +519,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
         control(
             B,
             Message::Resize {
+                fullscreen: false,
                 projection: ID,
                 request: 3,
                 size: PixelSize::new(900, 700),
@@ -539,6 +547,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
         messages(&out),
         // It answers the request that was running (1), not the newer one queued behind it (3).
         vec![Message::Geometry {
+            fullscreen: None,
             projection: ID,
             size: resized,
             parking: ParkingKind::Twin,
@@ -548,6 +557,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
     assert_eq!(
         out.last(),
         Some(&Output::ResizeParked {
+            fullscreen: false,
             window: WINDOW,
             size: PixelSize::new(900, 700),
             scale: 1.0
@@ -1282,6 +1292,7 @@ fn destination_grants_open_accept_refusal_and_geometry() {
             control(
                 A,
                 Message::Geometry {
+                    fullscreen: None,
                     projection: ID,
                     size: size(),
                     parking: ParkingKind::Twin,
@@ -1304,6 +1315,7 @@ fn destination_grants_open_accept_refusal_and_geometry() {
             control(
                 A,
                 Message::Geometry {
+                    fullscreen: None,
                     projection: ID,
                     size: content,
                     parking: ParkingKind::Twin,
@@ -1339,6 +1351,7 @@ fn destination_grants_open_accept_refusal_and_geometry() {
         // The source is at a different size than it was asked for, so the user's size is a
         // genuine request, not a repeat.
         vec![Message::Resize {
+            fullscreen: false,
             projection: ID,
             request: 1,
             size: size(),
@@ -1603,6 +1616,7 @@ fn heartbeat_resize_and_keyframe_cadences_use_exact_deadlines() {
     assert_eq!(
         messages(&f.handle(Input::Tick, 601)),
         vec![Message::Resize {
+            fullscreen: false,
             projection: ID,
             request: 2,
             size: PixelSize::new(900, 480),
@@ -1898,6 +1912,7 @@ fn late_parking_and_resize_results_always_restore_even_on_failure() {
                     control(
                         B,
                         Message::Resize {
+                            fullscreen: false,
                             projection: ID,
                             request: 1,
                             size: PixelSize::new(800, 600),
@@ -1957,6 +1972,7 @@ fn unanswered_parking_expires_and_removed_windows_clear_pending_cleanup() {
                 control(
                     B,
                     Message::Resize {
+                        fullscreen: false,
                         projection: ID,
                         request: 1,
                         size: size(),
@@ -2056,6 +2072,7 @@ fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
                         control(
                             B,
                             Message::Resize {
+                                fullscreen: false,
                                 projection: ID,
                                 request: request as u32 + 1,
                                 size,
@@ -2090,6 +2107,7 @@ fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
                 out,
                 if expected {
                     vec![Output::ResizeParked {
+                        fullscreen: false,
                         window: WINDOW,
                         size: wanted,
                         scale,
@@ -2107,6 +2125,7 @@ fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
         control(
             B,
             Message::Resize {
+                fullscreen: false,
                 projection: ID,
                 request: 1,
                 size: size(),
@@ -2135,6 +2154,7 @@ fn startup_resizes_keep_latest_size_and_scale_until_capture_is_live() {
             60
         ),
         vec![Output::ResizeParked {
+            fullscreen: false,
             window: WINDOW,
             size: size(),
             scale: 2.0
@@ -2181,6 +2201,7 @@ fn source_refuses_invalid_sizes_without_parking_but_answers_them() {
                 control(
                     B,
                     Message::Resize {
+                        fullscreen: false,
                         projection: ID,
                         request: 1,
                         size: bad,
@@ -2223,6 +2244,7 @@ fn source_refuses_invalid_sizes_without_parking_but_answers_them() {
                     control(
                         B,
                         Message::Resize {
+                            fullscreen: false,
                             projection: ID,
                             request: 1,
                             size: PixelSize::new(800, 600),
@@ -2238,6 +2260,7 @@ fn source_refuses_invalid_sizes_without_parking_but_answers_them() {
                     control(
                         B,
                         Message::Resize {
+                            fullscreen: false,
                             projection: ID,
                             request: 2,
                             size: PixelSize::new(800, 600),
@@ -2247,6 +2270,7 @@ fn source_refuses_invalid_sizes_without_parking_but_answers_them() {
                     61,
                 ),
                 vec![Output::ResizeParked {
+                    fullscreen: false,
                     window: WINDOW,
                     size: PixelSize::new(800, 600),
                     scale: 1.0
@@ -2280,6 +2304,7 @@ fn source_refuses_invalid_sizes_without_parking_but_answers_them() {
         control(
             B,
             Message::Resize {
+                fullscreen: false,
                 projection: ID,
                 request: 1,
                 size: size(),
@@ -2292,6 +2317,7 @@ fn source_refuses_invalid_sizes_without_parking_but_answers_them() {
         control(
             B,
             Message::Resize {
+                fullscreen: false,
                 projection: ID,
                 request: 2,
                 size: PixelSize::new(0, 0),
@@ -2763,6 +2789,7 @@ fn pending_proxy_ignores_geometry_and_title_but_honours_close_and_lost() {
                 control(
                     A,
                     Message::Geometry {
+                        fullscreen: None,
                         projection: ID,
                         size: size(),
                         parking: ParkingKind::Twin,
@@ -3242,6 +3269,7 @@ fn a_parked_window_that_moves_by_itself_is_parked_again_at_the_wanted_size() {
     assert_eq!(
         out,
         vec![Output::ResizeParked {
+            fullscreen: false,
             window: WINDOW,
             size: size(),
             scale: 2.0,
@@ -3453,6 +3481,7 @@ fn grace_round_trip_keeps_parking_and_proxy_and_resumes_input() {
                 Output::SendControl {
                     peer: B,
                     msg: ControlMessage::Projection(Message::Geometry {
+                        fullscreen: None,
                         projection: ID,
                         size: size(),
                         parking,
@@ -3769,6 +3798,7 @@ fn grace_resume_resizes_changed_size_or_scale_before_capture() {
                     201
                 ),
                 vec![Output::ResizeParked {
+                    fullscreen: false,
                     window: WINDOW,
                     size: new_size,
                     scale
@@ -3785,6 +3815,7 @@ fn grace_resume_resizes_changed_size_or_scale_before_capture() {
             assert_eq!(
                 messages(&out),
                 vec![Message::Geometry {
+                    fullscreen: None,
                     projection: ID,
                     size: new_size,
                     parking: if kind == PlatformParking::Twin {
@@ -3984,6 +4015,7 @@ fn grace_resume_waits_for_old_parking_and_capture_results_and_drops_queued_resiz
                 control(
                     B,
                     Message::Resize {
+                        fullscreen: false,
                         projection: ID,
                         request: 1,
                         size: PixelSize::new(700, 500),
@@ -3996,6 +4028,7 @@ fn grace_resume_waits_for_old_parking_and_capture_results_and_drops_queued_resiz
                 control(
                     B,
                     Message::Resize {
+                        fullscreen: false,
                         projection: ID,
                         request: 2,
                         size: PixelSize::new(900, 700),
@@ -4043,6 +4076,7 @@ fn grace_resume_waits_for_old_parking_and_capture_results_and_drops_queued_resiz
                 assert_eq!(
                     out,
                     vec![Output::ResizeParked {
+                        fullscreen: false,
                         window: WINDOW,
                         size: size(),
                         scale: 2.0

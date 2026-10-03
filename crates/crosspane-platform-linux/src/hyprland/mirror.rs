@@ -149,6 +149,10 @@ impl HyprlandMirrorParking {
 }
 
 impl WindowParking for HyprlandMirrorParking {
+    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    }
+
     fn park(
         &mut self,
         window: WindowId,
@@ -295,6 +299,7 @@ fn parked_from(window: WindowId, client: &Value, monitor: &Value) -> Result<Park
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| backend("invalid monitor id"))?;
     Ok(Parked {
+        fullscreen: false,
         window,
         kind: ParkingKind::Mirror,
         display: DisplayId(id),

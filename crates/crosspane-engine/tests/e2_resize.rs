@@ -62,6 +62,7 @@ fn control(peer: NodeId, msg: Message) -> Input {
 }
 fn resize(request: u32, size: PixelSize, scale: f64) -> Message {
     Message::Resize {
+        fullscreen: false,
         projection: ID,
         request,
         size,
@@ -70,6 +71,7 @@ fn resize(request: u32, size: PixelSize, scale: f64) -> Message {
 }
 fn geometry(size: PixelSize, answers: u32) -> Message {
     Message::Geometry {
+        fullscreen: None,
         projection: ID,
         size,
         parking: ParkingKind::Twin,
@@ -123,6 +125,7 @@ fn window() -> WindowInfo {
 }
 fn parked(size: PixelSize) -> Parked {
     Parked {
+        fullscreen: false,
         window: WINDOW,
         kind: PlatformParking::Twin,
         display: DISPLAY,
@@ -520,6 +523,7 @@ fn a_parking_change_at_an_unchanged_size_is_forwarded_without_a_command() {
         control(
             SRC,
             Message::Geometry {
+                fullscreen: None,
                 projection: ID,
                 size: a,
                 parking: ParkingKind::Mirror,
@@ -1470,6 +1474,7 @@ impl Src {
 
 fn resize_parked(size: PixelSize, scale: f64) -> Output {
     Output::ResizeParked {
+        fullscreen: false,
         window: WINDOW,
         size,
         scale,

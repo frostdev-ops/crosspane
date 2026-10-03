@@ -247,6 +247,7 @@ impl Destination {
         send(
             key.source,
             Message::Resize {
+                fullscreen: false,
                 projection: key.projection,
                 request,
                 size,
@@ -912,6 +913,7 @@ impl E2 {
             }
             // Forwarded as `ProxyPlaced` before this match (WP-2.43b).
             ProxyEvent::Placed { .. } => {}
+            ProxyEvent::Fullscreen(_) => {}
         }
         if !sent {
             self.end_destination(key, Reason::Failed, false, false, out);

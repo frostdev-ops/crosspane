@@ -35,6 +35,10 @@ impl TwinOrMirror {
 }
 
 impl WindowParking for TwinOrMirror {
+    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    }
+
     fn park(
         &mut self,
         window: WindowId,
@@ -137,6 +141,7 @@ mod tests {
     impl Fake {
         fn parked(&self, window: WindowId) -> Parked {
             Parked {
+                fullscreen: false,
                 window,
                 kind: if self.name == "twin" {
                     ParkingKind::Twin
@@ -156,6 +161,10 @@ mod tests {
     }
 
     impl WindowParking for Fake {
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Err(PlatformError::Unsupported("fullscreen is not implemented"))
+        }
+
         fn park(&mut self, w: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError> {
             self.log("park", w);
             if self.unsupported {

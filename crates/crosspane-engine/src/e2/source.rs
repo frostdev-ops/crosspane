@@ -683,6 +683,7 @@ impl E2 {
             send(
                 source.peer,
                 Message::Geometry {
+                    fullscreen: None,
                     projection,
                     size,
                     parking,
@@ -1286,6 +1287,7 @@ impl Source {
         self.last_repark = Some(now);
         self.mark_issued();
         out.push(Output::ResizeParked {
+            fullscreen: false,
             window: self.window,
             size,
             scale: self.parked_scale,
@@ -1336,6 +1338,7 @@ impl Source {
             self.parked_scale = scale;
             self.mark_issued();
             out.push(Output::ResizeParked {
+                fullscreen: false,
                 window: self.window,
                 size: wanted,
                 scale,
@@ -1371,6 +1374,7 @@ impl Source {
         send(
             self.peer,
             Message::Geometry {
+                fullscreen: None,
                 projection,
                 size,
                 parking,
@@ -1445,6 +1449,7 @@ impl Source {
         self.inflight = Some(request);
         self.mark_issued();
         out.push(Output::ResizeParked {
+            fullscreen: false,
             window: self.window,
             size,
             scale,
@@ -1458,6 +1463,7 @@ impl Source {
             send(
                 self.peer,
                 Message::Geometry {
+                    fullscreen: None,
                     projection,
                     size,
                     parking,

@@ -511,5 +511,6 @@ pub fn parked_geometry(
             point2(edges[0] as i32, edges[1] as i32),
             point2(edges[2] as i32, edges[3] as i32),
         ),
+        fullscreen: false,
     })
 }
