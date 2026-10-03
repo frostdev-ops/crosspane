@@ -13,7 +13,7 @@ use crosspane_protocol::projection::{
     BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjInput, ProjectionEndReason as Reason,
     ProjectionMessage as Message, ProxyPlacement, WindowSummary,
 };
-use crosspane_types::geom::{PixelSize, PointDevice, RectLogical};
+use crosspane_types::geom::{PixelRect, PixelSize, PointDevice, RectLogical};
 use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
 use crosspane_types::time::MonoTime;
 
@@ -93,10 +93,20 @@ pub(super) struct Source {
     parked: Option<Parked>,
     stream: Option<StreamId>,
     capture_pending: bool,
+    /// This target belongs to the active stream, never to an unconfirmed replacement.
+    capture_target: Option<CaptureTarget>,
+    pending_capture_target: Option<CaptureTarget>,
+    pending_capture_crop: Option<PixelRect>,
+    capture_switch: Option<MonoTime>,
+    fullscreen: bool,
+    wanted_fullscreen: bool,
+    latest_state: Option<bool>,
+    stand_in: Option<WindowId>,
+    hidden_since: Option<MonoTime>,
     resizing: bool,
     resume_geometry: Option<(PixelSize, f64)>,
     /// The newest resize request received but not started (latest value wins), with its number.
-    latest_resize: Option<(PixelSize, f64, u32)>,
+    latest_resize: Option<(PixelSize, f64, u32, bool)>,
     /// The newest `Resize` request number received (0 before any): a request that isn't newer is
     /// a duplicate or arrived out of order.
     received: u32,
@@ -331,6 +341,15 @@ impl E2 {
                 parked: None,
                 stream: None,
                 capture_pending: false,
+                capture_target: None,
+                pending_capture_target: None,
+                pending_capture_crop: None,
+                capture_switch: None,
+                fullscreen: false,
+                wanted_fullscreen: false,
+                latest_state: None,
+                stand_in: None,
+                hidden_since: None,
                 resizing: false,
                 resume_geometry: None,
                 latest_resize: None,
@@ -571,8 +590,9 @@ impl E2 {
                 request,
                 size,
                 scale,
+                fullscreen,
                 ..
-            } => source.on_resize(projection, *request, *size, *scale, out),
+            } => source.on_resize(projection, *request, *size, *scale, *fullscreen, out),
             // Where the proxy's content is: kept in every stage the projection can have a proxy
             // on this connection, live or not (WP-2.43 §4).
             Message::ProxyPlaced {
@@ -629,8 +649,6 @@ impl E2 {
             });
             return;
         }
-        let current = self.windows.get(&window).map(|w| (w.frame, w.state));
-        let frame = current.map(|(frame, _)| frame);
         let Some((&projection, source)) = self.sources.iter_mut().find(|(_, s)| {
             s.window == window && (matches!(s.stage, Stage::Parking(_)) || s.resizing)
         }) else {
@@ -656,7 +674,13 @@ impl E2 {
             return;
         };
         source.parked = Some(parked);
-        source.parked_frame = frame;
+        source.fullscreen = parked.fullscreen;
+        source.reconcile_stand_in(&self.windows, now);
+        let current = self
+            .windows
+            .get(&source.stand_in.unwrap_or(window))
+            .map(|w| (w.frame, w.state));
+        source.parked_frame = current.map(|(frame, _)| frame);
         if initial {
             source.start_capture(projection, parked, size, parking, now, out);
             out.push(Output::Notice(Notice::ProjectionStarted {
@@ -672,7 +696,9 @@ impl E2 {
                 self.end_source(projection, Reason::Failed, false, now, out);
             }
         } else if !matches!(source.stage, Stage::Suspended(_) | Stage::Resuming(_)) {
+            source.sync_capture(projection, now, out);
             if parking == ParkingKind::Twin
+                && source.capture_target == Some(CaptureTarget::Display(parked.display))
                 && let Some(stream) = source.stream
             {
                 out.push(Output::SetCaptureCrop {
@@ -683,7 +709,7 @@ impl E2 {
             send(
                 source.peer,
                 Message::Geometry {
-                    fullscreen: None,
+                    fullscreen: Some(source.fullscreen),
                     projection,
                     size,
                     parking,
@@ -715,6 +741,32 @@ impl E2 {
             .filter(|s| s.capture_pending)
         {
             source.capture_pending = false;
+            let target = source.pending_capture_target.take();
+            let crop = source.pending_capture_crop.take();
+            if result.is_err()
+                && matches!(source.stage, Stage::Live | Stage::Capturing(_))
+                && target != source.desired_capture().map(|(target, _)| target)
+            {
+                // A target that vanished or was replaced cannot fail the current projection.
+                source.capture_switch = None;
+                source.stage = Stage::Live;
+                source.resize_latest(projection, out);
+                if let Some(w) = self.windows.get(&source.stand_in.unwrap_or(source.window)) {
+                    source.check_repark(w.frame, w.state, now, out);
+                }
+                source.sync_capture(projection, now, out);
+                return;
+            }
+            if source.capture_switch.take().is_some() && source.stage == Stage::Live {
+                match result {
+                    Ok(stream) => {
+                        source.accept_capture(target, crop, stream, out);
+                        source.sync_capture(projection, now, out);
+                    }
+                    Err(_) => self.end_source(projection, Reason::Failed, false, now, out),
+                }
+                return;
+            }
             if !matches!(source.stage, Stage::Capturing(_)) {
                 if let Ok(stream) = result {
                     out.push(Output::StopCapture { stream });
@@ -728,12 +780,13 @@ impl E2 {
             }
             match result {
                 Ok(stream) => {
-                    source.stream = Some(stream);
+                    source.accept_capture(target, crop, stream, out);
                     source.stage = Stage::Live;
+                    source.sync_capture(projection, now, out);
                     source.resize_latest(projection, out);
                     // Window changes were not acted on before the projection was live: look at
                     // the window as it is now against what the park was based on.
-                    if let Some(w) = self.windows.get(&source.window) {
+                    if let Some(w) = self.windows.get(&source.stand_in.unwrap_or(source.window)) {
                         source.check_repark(w.frame, w.state, now, out);
                     }
                     if source.focus_wanted {
@@ -768,8 +821,18 @@ impl E2 {
             StreamEndReason::TargetGone => Reason::WindowClosed,
             _ => Reason::Failed,
         };
-        if let Some((&projection, _)) = self.sources.iter().find(|(_, s)| s.stream == Some(stream))
+        if let Some((&projection, source)) = self
+            .sources
+            .iter_mut()
+            .find(|(_, s)| s.stream == Some(stream))
         {
+            if reason == Reason::WindowClosed
+                && matches!(source.capture_target, Some(CaptureTarget::Window(id)) if id != source.window || source.window_state == WindowState::Hidden)
+                && self.windows.contains_key(&source.window)
+            {
+                source.stop_capture(out);
+                return;
+            }
             self.end_source(projection, reason, false, now, out);
         }
     }
@@ -1172,7 +1235,7 @@ impl E2 {
             let Some(source) = self.sources.get_mut(&id) else {
                 continue;
             };
-            match self.windows.get(&source.window) {
+            match self.windows.get(&source.stand_in.unwrap_or(source.window)) {
                 Some(w) => source.check_repark(w.frame, w.state, now, out),
                 None => source.repark_due = false,
             }
@@ -1194,56 +1257,234 @@ impl E2 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
-        // A parked window that moved or resized by itself (e.g. a bar appeared on, or left, its
-        // twin display and changed the work area), or whose state changed (it went fullscreen,
-        // was hidden, or came back), gets parked again at the wanted size, so the capture crop
-        // and the destination's geometry follow it. Compared with its frame when the last park
-        // finished and its state when it was issued, and at most every REPARK_GAP: parking
-        // itself moves the window for a moment, and that must not start a loop. A change that
-        // can't be followed yet (a park in flight, or the gap) is not lost: it is looked at again
-        // when the park finishes and when the gap ends.
-        for source in self.sources.values_mut() {
-            if source.window == window.id {
-                source.window_state = window.state;
-                source.check_repark(window.frame, window.state, now, out);
-            }
-        }
-        if self
+        let title_changed = self
             .windows
             .get(&window.id)
-            .is_some_and(|old| old.title != window.title)
-        {
-            for (&projection, source) in &self.sources {
-                if source.window == window.id && !matches!(source.stage, Stage::Suspended(_)) {
-                    send(
-                        source.peer,
-                        Message::Title {
-                            projection,
-                            title: wire_text(&window.title),
-                        },
-                        out,
-                    );
-                }
+            .is_some_and(|old| old.title != window.title);
+        self.windows.insert(window.id, window.clone());
+        for (&projection, source) in &mut self.sources {
+            if title_changed
+                && source.window == window.id
+                && !matches!(source.stage, Stage::Suspended(_))
+            {
+                send(
+                    source.peer,
+                    Message::Title {
+                        projection,
+                        title: wire_text(&window.title),
+                    },
+                    out,
+                );
             }
+            let Some(original) = self.windows.get(&source.window) else {
+                continue;
+            };
+            if window.id == source.window {
+                if original.state == WindowState::Hidden {
+                    if source.window_state != WindowState::Hidden {
+                        source.hidden_since = Some(now);
+                    }
+                } else {
+                    source.hidden_since = None;
+                    source.stand_in = None;
+                }
+                source.window_state = original.state;
+            }
+            let changed_stand_in = source.reconcile_stand_in(&self.windows, now);
+            if window.id == source.window || source.stand_in == Some(window.id) || changed_stand_in
+            {
+                let observed = source
+                    .stand_in
+                    .and_then(|id| self.windows.get(&id))
+                    .unwrap_or(original);
+                if matches!(
+                    observed.state,
+                    WindowState::Normal | WindowState::Fullscreen
+                ) {
+                    let fullscreen = observed.state == WindowState::Fullscreen;
+                    source.latest_state = Some(fullscreen);
+                    if let Some((_, _, _, state)) = source.latest_resize.as_mut() {
+                        *state = fullscreen;
+                    }
+                }
+                source.check_repark(observed.frame, observed.state, now, out);
+                if source.fullscreen || observed.state != WindowState::Normal {
+                    source.parked_frame = Some(observed.frame);
+                }
+                source.sync_capture(projection, now, out);
+            }
+        }
+    }
+    pub(super) fn stand_in_removed(&mut self, window: WindowId, out: &mut Vec<Output>) {
+        for source in self
+            .sources
+            .values_mut()
+            .filter(|s| s.stand_in == Some(window))
+        {
+            source.stand_in = None;
+            source.stop_capture(out);
         }
     }
 }
 
 impl Source {
+    fn reconcile_stand_in(
+        &mut self,
+        windows: &BTreeMap<WindowId, WindowInfo>,
+        now: MonoTime,
+    ) -> bool {
+        let Some(original) = windows.get(&self.window) else {
+            return false;
+        };
+        let previous = self.stand_in;
+        if self.stand_in.is_some_and(|id| {
+            windows.get(&id).is_none_or(|w| {
+                w.state != WindowState::Fullscreen
+                    || w.pid != original.pid
+                    || self.parked.is_none_or(|p| w.display != Some(p.display))
+            })
+        }) {
+            self.stand_in = None;
+        }
+        if original.state == WindowState::Hidden
+            && self.stand_in.is_none()
+            && self
+                .hidden_since
+                .is_some_and(|since| now.saturating_duration_since(since) <= STAND_IN_GRACE)
+            && let Some(parked) = self.parked
+            && original.pid.is_some()
+        {
+            self.stand_in = windows
+                .values()
+                .filter(|w| {
+                    w.id != self.window
+                        && w.pid == original.pid
+                        && w.state == WindowState::Fullscreen
+                        && w.display == Some(parked.display)
+                })
+                .min_by_key(|w| w.id)
+                .map(|w| w.id);
+        }
+        let changed = previous != self.stand_in;
+        if changed && self.stand_in.is_some() {
+            self.latest_state = Some(true);
+            if let Some((_, _, _, state)) = self.latest_resize.as_mut() {
+                *state = true;
+            }
+        }
+        changed
+    }
+
+    fn desired_capture(&self) -> Option<(CaptureTarget, Option<PixelRect>)> {
+        if self.capture_unavailable() {
+            return None;
+        }
+        let parked = self.parked?;
+        let (_, parking) = geometry(parked)?;
+        Some(self.capture_for(parked, parking))
+    }
+
+    fn capture_unavailable(&self) -> bool {
+        // Off-Space without a local stand-in retains the projection but produces no frames.
+        self.window_state == WindowState::Hidden && self.stand_in.is_none()
+    }
+
+    fn stop_capture(&mut self, out: &mut Vec<Output>) {
+        if let Some(stream) = self.stream.take() {
+            out.push(Output::StopCapture { stream });
+        }
+        self.capture_target = None;
+    }
+
+    fn accept_capture(
+        &mut self,
+        target: Option<CaptureTarget>,
+        crop: Option<PixelRect>,
+        stream: StreamId,
+        out: &mut Vec<Output>,
+    ) {
+        self.stop_capture(out);
+        self.stream = Some(stream);
+        self.capture_target = target;
+        if self.capture_unavailable() {
+            self.stop_capture(out);
+        } else if let Some(parked) = self.parked
+            && target == Some(CaptureTarget::Display(parked.display))
+            && crop != Some(parked.content)
+        {
+            out.push(Output::SetCaptureCrop {
+                stream,
+                crop: Some(parked.content),
+            });
+        }
+    }
+
+    fn capture_for(
+        &self,
+        parked: Parked,
+        parking: ParkingKind,
+    ) -> (CaptureTarget, Option<PixelRect>) {
+        match parking {
+            ParkingKind::Twin => (CaptureTarget::Display(parked.display), Some(parked.content)),
+            _ => (
+                CaptureTarget::Window(self.stand_in.unwrap_or(self.window)),
+                None,
+            ),
+        }
+    }
+
+    /// Keep one capture start outstanding: its callback identifies only the projection.
+    /// The old stream remains alive until the replacement has actually started.
+    fn sync_capture(&mut self, projection: ProjectionId, now: MonoTime, out: &mut Vec<Output>) {
+        if self.stage == Stage::Live && self.capture_unavailable() {
+            self.stop_capture(out);
+            return;
+        }
+        if self.stage != Stage::Live || self.capture_pending || self.resizing {
+            return;
+        }
+        let Some((target, crop)) = self.desired_capture() else {
+            return;
+        };
+        if self.capture_target == Some(target) && self.stream.is_some() {
+            return;
+        }
+        self.pending_capture_target = Some(target);
+        self.pending_capture_crop = crop;
+        self.capture_pending = true;
+        self.capture_switch = Some(now.saturating_add(START_TIMEOUT));
+        out.push(Output::StartCapture {
+            projection,
+            peer: self.peer,
+            target,
+            crop,
+            max_fps: 60,
+        });
+    }
     /// Whether a window with this `frame` and `state` no longer matches what the last park was
     /// based on: its state differs, or it moved while that state was `Normal`. A frame means
     /// nothing while the window is fullscreen or hidden (the platform reports the display's, or
     /// an off-screen one), so a move then is not a trigger; the state change out of it is.
     fn reparks_for(&self, frame: RectLogical, state: WindowState) -> bool {
         let state_changed = self.parked_state.is_some_and(|s| s != state);
-        let moved = self.parked_state == Some(WindowState::Normal)
+        let changed_fullscreen = self
+            .latest_state
+            .is_some_and(|state| state != self.fullscreen);
+        let moved = !self.fullscreen
+            && state == WindowState::Normal
+            && self.parked_state == Some(WindowState::Normal)
             && self.parked_frame.is_some_and(|f| !same_frame(f, frame));
-        state_changed || moved
+        state_changed || changed_fullscreen || moved
     }
 
     /// A park or resize is being issued: it is based on the window's state as it is now.
     fn mark_issued(&mut self) {
-        self.parked_state = Some(self.window_state);
+        self.parked_state = Some(if self.stand_in.is_some() {
+            WindowState::Fullscreen
+        } else {
+            self.window_state
+        });
+        self.latest_state = None;
     }
 
     /// Park again if the window, as it is now (`frame`, `state`), no longer matches what the last
@@ -1287,9 +1528,10 @@ impl Source {
         self.resizing = true;
         self.inflight = None;
         self.last_repark = Some(now);
+        self.wanted_fullscreen = self.latest_state.unwrap_or(self.fullscreen);
         self.mark_issued();
         out.push(Output::ResizeParked {
-            fullscreen: false,
+            fullscreen: self.wanted_fullscreen,
             window: self.window,
             size,
             scale: self.parked_scale,
@@ -1316,7 +1558,7 @@ impl Source {
             | Stage::Suspended(deadline)
             | Stage::Resuming(deadline)
             | Stage::Restarting(deadline) => Some(deadline),
-            Stage::Live => None,
+            Stage::Live => self.capture_switch,
         }
     }
 
@@ -1340,7 +1582,7 @@ impl Source {
             self.parked_scale = scale;
             self.mark_issued();
             out.push(Output::ResizeParked {
-                fullscreen: false,
+                fullscreen: self.wanted_fullscreen,
                 window: self.window,
                 size: wanted,
                 scale,
@@ -1360,23 +1602,27 @@ impl Source {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
-        let (target, crop) = match parking {
-            ParkingKind::Twin => (CaptureTarget::Display(parked.display), Some(parked.content)),
-            _ => (CaptureTarget::Window(self.window), None),
-        };
-        self.stage = Stage::Capturing(now.saturating_add(START_TIMEOUT));
-        self.capture_pending = true;
-        out.push(Output::StartCapture {
-            projection,
-            peer: self.peer,
-            target,
-            crop,
-            max_fps: 60,
-        });
+        if self.capture_unavailable() {
+            self.stage = Stage::Live;
+            self.resize_latest(projection, out);
+        } else {
+            let (target, crop) = self.capture_for(parked, parking);
+            self.pending_capture_target = Some(target);
+            self.pending_capture_crop = crop;
+            self.stage = Stage::Capturing(now.saturating_add(START_TIMEOUT));
+            self.capture_pending = true;
+            out.push(Output::StartCapture {
+                projection,
+                peer: self.peer,
+                target,
+                crop,
+                max_fps: 60,
+            });
+        }
         send(
             self.peer,
             Message::Geometry {
-                fullscreen: None,
+                fullscreen: Some(self.fullscreen),
                 projection,
                 size,
                 parking,
@@ -1407,6 +1653,7 @@ impl Source {
         request: u32,
         size: PixelSize,
         scale: f64,
+        fullscreen: bool,
         out: &mut Vec<Output>,
     ) {
         // Request numbers only grow. One that doesn't is a duplicate, or arrived out of order.
@@ -1424,10 +1671,12 @@ impl Source {
         let sane = sane_size(size);
         if sane {
             self.wanted = Some(size);
+            self.wanted_fullscreen = fullscreen;
+            self.latest_state = None;
         }
         if self.stage != Stage::Live || self.resizing {
             // Not now: the newest request wins, and the older one is not answered on its own.
-            self.latest_resize = Some((size, scale, request));
+            self.latest_resize = Some((size, scale, request, fullscreen));
             return;
         }
         if !sane {
@@ -1436,22 +1685,31 @@ impl Source {
         }
         // Satisfied means the window really is this size at this scale. What was asked before
         // doesn't count: an app's minimum size makes the two differ.
-        let satisfied = self.parked_scale == scale
+        let satisfied = self.fullscreen == fullscreen
+            && self.parked_scale == scale
             && self.parked.and_then(geometry).map(|(actual, _)| actual) == Some(size);
         if satisfied {
             self.answer(projection, request, out);
         } else {
-            self.begin_resize(size, scale, request, out);
+            self.begin_resize(size, scale, request, fullscreen, out);
         }
     }
 
-    fn begin_resize(&mut self, size: PixelSize, scale: f64, request: u32, out: &mut Vec<Output>) {
+    fn begin_resize(
+        &mut self,
+        size: PixelSize,
+        scale: f64,
+        request: u32,
+        fullscreen: bool,
+        out: &mut Vec<Output>,
+    ) {
         self.resizing = true;
         self.parked_scale = scale;
         self.inflight = Some(request);
+        self.wanted_fullscreen = fullscreen;
         self.mark_issued();
         out.push(Output::ResizeParked {
-            fullscreen: false,
+            fullscreen,
             window: self.window,
             size,
             scale,
@@ -1465,7 +1723,7 @@ impl Source {
             send(
                 self.peer,
                 Message::Geometry {
-                    fullscreen: None,
+                    fullscreen: Some(self.fullscreen),
                     projection,
                     size,
                     parking,
@@ -1477,14 +1735,16 @@ impl Source {
     }
 
     fn resize_latest(&mut self, projection: ProjectionId, out: &mut Vec<Output>) {
-        let Some((size, scale, request)) = self.latest_resize.take() else {
+        let Some((size, scale, request, fullscreen)) = self.latest_resize.take() else {
             return;
         };
         let actual = self.parked.and_then(geometry).map(|(actual, _)| actual);
-        if !sane_size(size) || (actual == Some(size) && self.parked_scale == scale) {
+        if !sane_size(size)
+            || (actual == Some(size) && self.parked_scale == scale && self.fullscreen == fullscreen)
+        {
             self.answer(projection, request, out);
         } else {
-            self.begin_resize(size, scale, request, out);
+            self.begin_resize(size, scale, request, fullscreen, out);
         }
     }
 }
@@ -1513,6 +1773,7 @@ fn focus_on(
 
 /// The least time between two re-parks of a window that moved or changed state by itself.
 const REPARK_GAP: Duration = Duration::from_secs(2);
+const STAND_IN_GRACE: Duration = Duration::from_secs(1);
 
 /// Frames within half a logical pixel are the same (Hyprland reports whole pixels; float noise).
 fn same_frame(a: RectLogical, b: RectLogical) -> bool {
@@ -1571,5 +1832,116 @@ fn move_to(parked: Parked, p: PointDevice) -> InjectCmd {
             coordinate(parked.content.min.x, parked.content.max.x, p.x),
             coordinate(parked.content.min.y, parked.content.max.y, p.y),
         ),
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_routing_tests {
+    use super::*;
+    use crate::{Command, EngineConfig, Input};
+    use crosspane_input::journal::MemoryJournal;
+    use crosspane_platform::{LockState, SessionEvent, SessionState, WindowEvent};
+    use crosspane_protocol::link::LinkEvent;
+    use crosspane_protocol::msg::ControlMessage;
+    use crosspane_types::geom::{PointLogical, SizeLogical};
+
+    #[test]
+    fn foreign_stand_in_never_changes_input_or_twin_home_routing() {
+        let node = NodeId([1; 32]);
+        let peer = NodeId([2; 32]);
+        let window = WindowId(10);
+        let display = DisplayId(4);
+        let now = MonoTime::from_nanos(0);
+        for kind in [PlatformParking::Twin, PlatformParking::Mirror] {
+            let (mut e2, _) = E2::new(
+                &EngineConfig::new(node),
+                Box::new(MemoryJournal::default()),
+                now,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            let mut info = WindowInfo {
+                id: window,
+                pid: Some(42),
+                display: Some(display),
+                title: "fixture".into(),
+                app_id: "test".into(),
+                role: WindowRole::Toplevel,
+                parent: None,
+                state: WindowState::Normal,
+                frame: RectLogical::new(PointLogical::zero(), SizeLogical::new(320.0, 240.0)),
+            };
+            for input in [
+                Input::Session(SessionEvent::State(SessionState {
+                    lock: LockState::Unlocked,
+                    active: Some(true),
+                })),
+                Input::PeerUp { peer },
+                Input::Grants([(peer, [Capability::WindowShare].into())].into()),
+                Input::Windows(WindowEvent::Added(info.clone())),
+                Input::Command(Command::Project {
+                    window,
+                    to: peer,
+                    place: None,
+                }),
+                Input::Link(LinkEvent::Control {
+                    peer,
+                    msg: ControlMessage::Projection(Message::Accepted {
+                        projection: ProjectionId(1),
+                        size: PixelSize::new(640, 480),
+                        scale: 2.0,
+                    }),
+                }),
+                Input::Parked {
+                    window,
+                    result: Ok(Parked {
+                        window,
+                        display,
+                        kind,
+                        fullscreen: false,
+                        content: PixelRect::new(
+                            crosspane_types::geom::euclid::Point2D::new(20, 30),
+                            crosspane_types::geom::euclid::Point2D::new(660, 510),
+                        ),
+                    }),
+                },
+                Input::CaptureStarted {
+                    projection: ProjectionId(1),
+                    result: Ok(StreamId(1)),
+                },
+            ] {
+                e2.handle(&input, now, &mut out);
+            }
+            let later = MonoTime::from_nanos(3_000_000_000);
+            let mut foreign = info.clone();
+            foreign.id = WindowId(11);
+            foreign.state = WindowState::Fullscreen;
+            foreign.display = Some(DisplayId(8));
+            e2.handle(
+                &Input::Windows(WindowEvent::Added(foreign)),
+                later,
+                &mut out,
+            );
+            info.state = WindowState::Hidden;
+            e2.handle(&Input::Windows(WindowEvent::Changed(info)), later, &mut out);
+            assert!(e2.sources[&ProjectionId(1)].stand_in.is_none());
+            let homes = e2.twin_homes();
+            assert_eq!(homes.len(), usize::from(kind == PlatformParking::Twin));
+            if let Some(home) = homes.first() {
+                assert_eq!(home.display, display);
+            }
+            let motion = ProjInput::Motion {
+                projection: ProjectionId(1),
+                seq: 1,
+                position: PointDevice::new(5.0, 6.0),
+            };
+            assert_eq!(
+                e2.prevalidate_motion(peer, &motion).is_some(),
+                kind == PlatformParking::Twin
+            );
+            out.clear();
+            e2.source_input(peer, &motion, later, &mut out);
+            assert!(out.iter().any(|o| matches!(o, Output::Inject { cmd, .. } if *cmd == InjectCmd::MoveTo { display, position: PointDevice::new(25.0, 36.0) })), "{out:?}");
+        }
     }
 }

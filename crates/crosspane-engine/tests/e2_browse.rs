@@ -563,7 +563,7 @@ fn pull_runs_the_same_projection_path_and_checks_window_present() {
             sent(
                 B,
                 Message::Geometry {
-                    fullscreen: None,
+                    fullscreen: Some(false),
                     projection: ID,
                     size: size(),
                     parking: ParkingKind::Twin,

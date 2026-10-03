@@ -50,6 +50,11 @@ pub(super) struct Destination {
     suspended: Option<MonoTime>,
     /// Latest proxy geometry, including resizes not yet sent over the link.
     current: Option<(PixelSize, f64)>,
+    fullscreen: bool,
+    commanded_fullscreen: Option<(bool, MonoTime)>,
+    fullscreen_pending: bool,
+    last_sent_fullscreen: bool,
+    acknowledged_fullscreen: Option<bool>,
     seq: u32,
     held: BTreeSet<Held>,
     position: PointDevice,
@@ -87,7 +92,7 @@ pub(super) struct Destination {
     active_until: Option<MonoTime>,
     /// The source's answer to the newest request, held while the user is resizing: applied when
     /// the user is quiet. Only ever set while `active_until` is.
-    held_geometry: Option<(PixelSize, ParkingKind)>,
+    held_geometry: Option<(PixelSize, ParkingKind, Option<bool>)>,
     last_heartbeat: MonoTime,
     heartbeat_due: Option<MonoTime>,
     last_keyframe: Option<MonoTime>,
@@ -222,7 +227,12 @@ impl Destination {
     /// last request, and that is still outstanding or was met exactly. If the source answered
     /// with another size (an app's minimum), the user's renewed request is a genuine one.
     fn repeats(&self, size: PixelSize, scale: f64) -> bool {
-        self.last_sent == Some((size, scale))
+        !self.fullscreen_pending
+            && self.last_sent_fullscreen == self.fullscreen
+            && self
+                .acknowledged_fullscreen
+                .is_none_or(|state| state == self.fullscreen)
+            && self.last_sent == Some((size, scale))
             && self.acknowledged.is_none_or(|actual| actual == size)
     }
 
@@ -241,13 +251,16 @@ impl Destination {
         self.request = request;
         self.last_resize = Some(now);
         self.last_sent = Some((size, scale));
+        self.last_sent_fullscreen = self.fullscreen;
+        self.fullscreen_pending = false;
         self.acknowledged = None;
+        self.acknowledged_fullscreen = None;
         // The held answer was to an older request: a newer answer will come.
         self.held_geometry = None;
         send(
             key.source,
             Message::Resize {
-                fullscreen: false,
+                fullscreen: self.fullscreen,
                 projection: key.projection,
                 request,
                 size,
@@ -265,9 +278,25 @@ impl Destination {
         key: ProjectionKey,
         size: PixelSize,
         parking: ParkingKind,
+        fullscreen: Option<bool>,
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        let expected_fullscreen = self
+            .commanded_fullscreen
+            .map_or(self.fullscreen, |(state, _)| state);
+        if let Some(fullscreen) = fullscreen.filter(|f| *f != expected_fullscreen) {
+            self.commanded = None;
+            self.commanded_fullscreen =
+                (fullscreen != self.fullscreen).then_some((fullscreen, now));
+            out.push(Output::ProxyFullscreen { key, fullscreen });
+            if self.commanded_fullscreen.is_some() {
+                return;
+            }
+        }
+        if self.fullscreen || self.commanded_fullscreen.is_some() {
+            return;
+        }
         let Some((current, scale)) = self.current else {
             return;
         };
@@ -522,6 +551,11 @@ impl E2 {
                     open_due: Some(now.saturating_add(OPEN_TIMEOUT)),
                     suspended: None,
                     current: None,
+                    fullscreen: false,
+                    commanded_fullscreen: None,
+                    fullscreen_pending: false,
+                    last_sent_fullscreen: false,
+                    acknowledged_fullscreen: None,
                     seq: 0,
                     held: BTreeSet::new(),
                     position: PointDevice::zero(),
@@ -584,6 +618,7 @@ impl E2 {
                 size,
                 parking,
                 answers,
+                fullscreen,
                 ..
             } if destination.open && destination.suspended.is_none() => {
                 // Only the answer to the newest request can resize the proxy. An older one
@@ -597,14 +632,15 @@ impl E2 {
                         destination.refusal = None;
                     }
                     destination.acknowledged = Some(*size);
+                    destination.acknowledged_fullscreen = *fullscreen;
                     if destination.user_active(now) {
                         // Keep only the current answer, until the user is quiet.
-                        destination.held_geometry = Some((*size, *parking));
+                        destination.held_geometry = Some((*size, *parking, *fullscreen));
                     } else {
                         // This answer is the newest, even if it needs no command: it
                         // supersedes any older one still held for the quiet deadline.
                         destination.held_geometry = None;
-                        destination.apply_geometry(key, *size, *parking, now, out);
+                        destination.apply_geometry(key, *size, *parking, *fullscreen, now, out);
                     }
                 }
             }
@@ -740,7 +776,30 @@ impl E2 {
             }
             return;
         }
+        if let ProxyEvent::Fullscreen(fullscreen) = event {
+            let commanded = destination.commanded_fullscreen.take();
+            let confirmed = commanded.is_some_and(|(state, _)| state == *fullscreen);
+            if confirmed || (commanded.is_none() && destination.fullscreen == *fullscreen) {
+                destination.fullscreen = *fullscreen;
+                return;
+            }
+            destination.fullscreen = *fullscreen;
+            destination.commanded = None;
+            destination.refusal = None;
+            if destination.suspended.is_none() {
+                destination.fullscreen_pending = true;
+                destination.active_until = Some(now.saturating_add(RESIZE_QUIET));
+                destination.resize = destination.current;
+                destination.resize_due = Some(now.saturating_add(RESIZE_SLOT));
+            }
+            return;
+        }
         if let ProxyEvent::Resized { size, scale } = event {
+            // A toggle can be undone before its state callback: even the original size now
+            // renegotiates the actual host state rather than confirming the opposite command.
+            if destination.commanded_fullscreen.take().is_some() {
+                destination.fullscreen_pending = true;
+            }
             if destination
                 .refusal
                 .is_some_and(|r| r.asked != *size || r.scale != *scale)
@@ -748,15 +807,24 @@ impl E2 {
                 // Observable new user intent (floating/dragging or changing display scale).
                 destination.refusal = None;
             }
-            if destination.unchanged(*size, *scale) {
+            if !destination.fullscreen_pending
+                && destination.last_sent_fullscreen == destination.fullscreen
+                && destination.unchanged(*size, *scale)
+            {
                 // Nothing changed (the host can report one change twice).
                 return;
             }
-            if destination.suspended.is_none() && destination.programmatic(*size, *scale, now) {
+            if !destination.fullscreen_pending
+                && destination.suspended.is_none()
+                && destination.programmatic(*size, *scale, now)
+            {
                 // The completion of a size this side asked the host for: not the user's.
                 return;
             }
-            if destination.suspended.is_none() && destination.host_refused(*size, *scale) {
+            if !destination.fullscreen_pending
+                && destination.suspended.is_none()
+                && destination.host_refused(*size, *scale)
+            {
                 return;
             }
             // The user's: it supersedes the outstanding host resize, whose late callback is then
@@ -953,7 +1021,10 @@ impl E2 {
             destination.resize_due = None;
             destination.last_resize = None;
             destination.acknowledged = None;
+            destination.acknowledged_fullscreen = None;
             destination.commanded = None;
+            destination.commanded_fullscreen = None;
+            destination.fullscreen_pending = false;
             destination.refusal = None;
             destination.active_until = None;
             destination.held_geometry = None;
@@ -1033,9 +1104,9 @@ impl E2 {
             // proxy now.
             if destination.resize.is_none()
                 && destination.active_until.is_none_or(|until| until <= now)
-                && let Some((size, parking)) = destination.held_geometry.take()
+                && let Some((size, parking, fullscreen)) = destination.held_geometry.take()
             {
-                destination.apply_geometry(key, size, parking, now, out);
+                destination.apply_geometry(key, size, parking, fullscreen, now, out);
             }
             if destination
                 .heartbeat_due
@@ -1238,7 +1309,14 @@ mod tests {
         assert_eq!(d.acknowledged, Some(minimum));
         assert!(d.commanded.is_none() && d.resize.is_none() && d.held_geometry.is_none());
         let mut out = Vec::new();
-        d.apply_geometry(key(), minimum, ParkingKind::Twin, MonoTime::ZERO, &mut out);
+        d.apply_geometry(
+            key(),
+            minimum,
+            ParkingKind::Twin,
+            None,
+            MonoTime::ZERO,
+            &mut out,
+        );
         assert!(out.is_empty(), "the known difference is not a new command");
         e2.proxy_event(
             key(),

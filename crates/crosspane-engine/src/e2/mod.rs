@@ -248,10 +248,10 @@ impl E2 {
             Input::Windows(event) => match event {
                 WindowEvent::Added(window) | WindowEvent::Changed(window) => {
                     self.window_changed(window, now, out);
-                    self.windows.insert(window.id, window.clone());
                 }
                 WindowEvent::Removed(window) => {
                     self.windows.remove(window);
+                    self.stand_in_removed(*window, out);
                     if self.focused == Some(*window) {
                         self.focused = None;
                     }

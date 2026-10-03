@@ -78,6 +78,13 @@ fn geometry(size: PixelSize, answers: u32) -> Message {
         answers,
     }
 }
+fn actual_geometry(size: PixelSize, answers: u32) -> Message {
+    let mut message = geometry(size, answers);
+    if let Message::Geometry { fullscreen, .. } = &mut message {
+        *fullscreen = Some(false);
+    }
+    message
+}
 fn sent(peer: NodeId, msg: Message) -> Output {
     Output::SendControl {
         peer,
@@ -722,14 +729,19 @@ struct World {
     min: PixelSize,
     /// The window's actual content size on the source.
     actual: PixelSize,
+    actual_fullscreen: bool,
     /// The proxy window's native size.
     native: PixelSize,
+    native_fullscreen: bool,
+    reported_fullscreen: bool,
+    windowed: PixelSize,
+    last_answer_state: Option<(u32, bool)>,
     /// A tiled host keeps this size despite geometry commands; `None` preserves the old model.
     keeps: Option<PixelSize>,
     /// What the window system adds to a size it is asked for.
     adjust: (u32, u32),
     /// Parking operations the platform hasn't finished: the size asked for, and when.
-    parks: VecDeque<(PixelSize, u64)>,
+    parks: VecDeque<(PixelSize, bool, u64)>,
     /// The size the next parking operation ends at, if the app resized itself.
     self_resize: Option<PixelSize>,
     /// Capture starts the platform hasn't finished, and when.
@@ -762,7 +774,12 @@ impl World {
             },
             min: if keeps.is_some() { min } else { px(1, 1) },
             actual: open_size(),
+            actual_fullscreen: false,
             native: opened,
+            native_fullscreen: false,
+            reported_fullscreen: false,
+            windowed: opened,
+            last_answer_state: None,
             keeps,
             adjust: (0, 0),
             parks: VecDeque::new(),
@@ -852,6 +869,12 @@ impl World {
                     self.commands.push(size);
                     self.callbacks_due.push_back(now);
                 }
+                Output::ProxyFullscreen { fullscreen, .. }
+                    if fullscreen != self.native_fullscreen =>
+                {
+                    self.set_native_state(fullscreen);
+                    self.callbacks_due.push_back(now);
+                }
                 _ => {}
             }
         }
@@ -866,15 +889,27 @@ impl World {
                     ..
                 } => {
                     if self.link_up {
-                        if let Message::Geometry { size, answers, .. } = &msg {
+                        if let Message::Geometry {
+                            size,
+                            answers,
+                            fullscreen,
+                            ..
+                        } = &msg
+                        {
                             self.answers.push((*answers, *size));
+                            self.last_answer_state = fullscreen.map(|state| (*answers, state));
                         }
                         let out = self.dst.at(control(SRC, msg), now);
                         self.pump_dst(out, now);
                     }
                 }
-                Output::Park { size, .. } | Output::ResizeParked { size, .. } => {
-                    self.parks.push_back((size, now));
+                Output::Park { size, .. } => {
+                    self.parks.push_back((size, false, now));
+                }
+                Output::ResizeParked {
+                    size, fullscreen, ..
+                } => {
+                    self.parks.push_back((size, fullscreen, now));
                 }
                 Output::StartCapture { projection, .. } => self.captures.push((projection, now)),
                 _ => {}
@@ -892,9 +927,10 @@ impl World {
     /// and at least as large as the app allows (or where the app resized itself to).
     fn complete_one_park(&mut self, now: u64) -> bool {
         self.at(now);
-        let Some((asked, _)) = self.parks.pop_front() else {
+        let Some((asked, fullscreen, _)) = self.parks.pop_front() else {
             return false;
         };
+        self.actual_fullscreen = fullscreen;
         self.actual = self.self_resize.take().unwrap_or_else(|| {
             px(
                 asked.width.max(self.min.width),
@@ -905,7 +941,10 @@ impl World {
         self.src.handle(
             &Input::Parked {
                 window: WINDOW,
-                result: Ok(parked(self.actual)),
+                result: Ok(Parked {
+                    fullscreen,
+                    ..parked(self.actual)
+                }),
             },
             ms(now),
             &mut out,
@@ -934,6 +973,9 @@ impl World {
     fn user_drag(&mut self, size: PixelSize, now: u64) {
         self.at(now);
         self.native = size;
+        if !self.native_fullscreen {
+            self.windowed = size;
+        }
         self.report(now);
     }
 
@@ -945,8 +987,65 @@ impl World {
     }
 
     fn report(&mut self, now: u64) {
+        if self.reported_fullscreen != self.native_fullscreen {
+            self.reported_fullscreen = self.native_fullscreen;
+            let out = self.dst.at(
+                Input::Proxy {
+                    key: proxy_key(),
+                    event: ProxyEvent::Fullscreen(self.native_fullscreen),
+                },
+                now,
+            );
+            self.pump_dst(out, now);
+        }
         let out = self.dst.resized(self.native, SCALE, now);
         self.pump_dst(out, now);
+    }
+
+    fn set_native_state(&mut self, fullscreen: bool) {
+        if fullscreen {
+            self.windowed = self.native;
+            self.native = px(1920, 1080);
+        } else {
+            self.native = self.windowed;
+        }
+        self.native_fullscreen = fullscreen;
+    }
+
+    fn user_toggle(&mut self, fullscreen: bool, now: u64) {
+        self.at(now);
+        if self.native_fullscreen != fullscreen {
+            self.set_native_state(fullscreen);
+            self.report(now);
+        }
+    }
+
+    fn app_toggle(&mut self, fullscreen: bool, now: u64) {
+        self.at(now);
+        if !self.link_up
+            || !self.parks.is_empty()
+            || self.actual_fullscreen == fullscreen
+            || self
+                .last_self_resize
+                .is_some_and(|last| now.saturating_sub(last) < 2_000)
+        {
+            return;
+        }
+        self.actual_fullscreen = fullscreen;
+        let mut changed = window();
+        changed.state = if fullscreen {
+            WindowState::Fullscreen
+        } else {
+            WindowState::Normal
+        };
+        let mut out = Vec::new();
+        self.src.handle(
+            &Input::Windows(WindowEvent::Changed(changed)),
+            ms(now),
+            &mut out,
+        );
+        self.pump_src(out, now);
+        self.last_self_resize = Some(now);
     }
 
     /// The host reports, once, for every resize it was commanded more than `after` ms ago.
@@ -966,7 +1065,7 @@ impl World {
         while self
             .parks
             .front()
-            .is_some_and(|(_, issued)| now.saturating_sub(*issued) >= after)
+            .is_some_and(|(_, _, issued)| now.saturating_sub(*issued) >= after)
         {
             self.complete_one_park(now);
         }
@@ -993,6 +1092,11 @@ impl World {
         }
         self.frames += 1;
         let mut changed = window();
+        changed.state = if self.actual_fullscreen {
+            WindowState::Fullscreen
+        } else {
+            WindowState::Normal
+        };
         changed.frame = RectLogical::new(
             PointLogical::new(0.0, f64::from(self.frames) * 3.0),
             SizeLogical::new(320.25, 240.25),
@@ -1118,6 +1222,15 @@ impl World {
         );
         assert_eq!(last.1, self.actual, "last answer vs source window");
         assert_eq!(last.0, newest, "last answer vs newest request");
+        assert_eq!(
+            self.native_fullscreen, self.actual_fullscreen,
+            "proxy vs source state"
+        );
+        assert_eq!(
+            self.last_answer_state,
+            Some((newest, self.actual_fullscreen)),
+            "last correlated state"
+        );
         let counts = (self.requests.len(), self.commands.len(), self.answers.len());
         self.run_to(self.now + 5_000);
         assert!(self.parks.is_empty() && self.captures.is_empty());
@@ -1514,7 +1627,7 @@ fn source_answers_a_satisfied_request_at_once() {
     let mut src = Src::live();
     // Already this size and scale: no platform work, just the answer.
     let out = src.request(1, open_size(), SCALE, 10);
-    assert_eq!(out, vec![sent(DST, geometry(open_size(), 1))]);
+    assert_eq!(out, vec![sent(DST, actual_geometry(open_size(), 1))]);
     // A different scale is not satisfied.
     assert_eq!(
         src.request(2, open_size(), 1.0, 11),
@@ -1535,7 +1648,7 @@ fn source_compares_the_actual_size_not_what_was_asked_for() {
     // B itself is satisfied, by the actual size.
     assert_eq!(
         src.request(3, b, SCALE, 50),
-        vec![sent(DST, geometry(b, 3))]
+        vec![sent(DST, actual_geometry(b, 3))]
     );
 }
 
@@ -1561,7 +1674,10 @@ fn source_queued_request_that_is_already_satisfied_is_answered_after_the_one_in_
     // The newest queued request asks for the size the window is about to have.
     assert!(src.request(3, a, SCALE, 12).is_empty());
     let out = src.parked(a, 20);
-    assert_eq!(messages(&out), vec![geometry(a, 1), geometry(a, 3)]);
+    assert_eq!(
+        messages(&out),
+        vec![actual_geometry(a, 1), actual_geometry(a, 3)]
+    );
     // No platform work for it, and it can't be answered a second time.
     assert!(!out.iter().any(|o| matches!(o, Output::ResizeParked { .. })));
 }
@@ -1598,20 +1714,20 @@ fn source_request_zero_is_always_newest_and_answered_with_zero() {
     // Satisfied ones are answered with 0 too, and it is not stale however often it repeats.
     assert_eq!(
         src.request(0, b, SCALE, 50),
-        vec![sent(DST, geometry(b, 0))]
+        vec![sent(DST, actual_geometry(b, 0))]
     );
     // Even after numbered requests, 0 isn't stale, and its answer is 0.
     assert_eq!(src.request(4, a, SCALE, 60), vec![resize_parked(a, SCALE)]);
     assert_eq!(answers(&src.parked(a, 70)), vec![(4, a)]);
     assert_eq!(
         src.request(0, a, SCALE, 75),
-        vec![sent(DST, geometry(a, 0))]
+        vec![sent(DST, actual_geometry(a, 0))]
     );
     assert_eq!(src.request(0, b, SCALE, 80), vec![resize_parked(b, SCALE)]);
     assert_eq!(answers(&src.parked(b, 90)), vec![(0, b)]);
     assert_eq!(
         src.request(0, b, SCALE, 100),
-        vec![sent(DST, geometry(b, 0))]
+        vec![sent(DST, actual_geometry(b, 0))]
     );
 }
 
@@ -1646,7 +1762,10 @@ fn source_answers_a_refused_size_only_after_older_work_and_without_platform_work
         // Queued behind request 1: not answered before it completes.
         assert!(src.request(2, refused, SCALE, 11).is_empty());
         let out = src.parked(a, 20);
-        assert_eq!(messages(&out), vec![geometry(a, 1), geometry(a, 2)]);
+        assert_eq!(
+            messages(&out),
+            vec![actual_geometry(a, 1), actual_geometry(a, 2)]
+        );
         assert!(!out.iter().any(|o| matches!(o, Output::ResizeParked { .. })));
         // The watermark moved: 2 again and older ones are stale; the next one is processed.
         assert!(src.request(2, b, SCALE, 30).is_empty());
@@ -1657,7 +1776,7 @@ fn source_answers_a_refused_size_only_after_older_work_and_without_platform_work
     let mut src = Src::live();
     assert_eq!(
         src.request(1, bad, SCALE, 10),
-        vec![sent(DST, geometry(open_size(), 1))]
+        vec![sent(DST, actual_geometry(open_size(), 1))]
     );
     // A refused request replaces a queued valid one (which then does no platform work), and a
     // valid one replaces a queued refused one (which is then never answered).
@@ -1666,27 +1785,30 @@ fn source_answers_a_refused_size_only_after_older_work_and_without_platform_work
     assert!(src.request(2, b, SCALE, 11).is_empty());
     assert!(src.request(3, bad, SCALE, 12).is_empty());
     let out = src.parked(a, 20);
-    assert_eq!(messages(&out), vec![geometry(a, 1), geometry(a, 3)]);
+    assert_eq!(
+        messages(&out),
+        vec![actual_geometry(a, 1), actual_geometry(a, 3)]
+    );
     assert!(!out.iter().any(|o| matches!(o, Output::ResizeParked { .. })));
     let mut src = Src::live();
     src.request(1, a, SCALE, 10);
     assert!(src.request(2, bad, SCALE, 11).is_empty());
     assert!(src.request(3, b, SCALE, 12).is_empty());
     let out = src.parked(a, 20);
-    assert_eq!(messages(&out), vec![geometry(a, 1)]);
+    assert_eq!(messages(&out), vec![actual_geometry(a, 1)]);
     assert_eq!(out.last(), Some(&resize_parked(b, SCALE)));
     // After a refused request 10, request 9 is stale (S3).
     let mut src = Src::live();
     assert_eq!(
         src.request(10, bad, SCALE, 10),
-        vec![sent(DST, geometry(open_size(), 10))]
+        vec![sent(DST, actual_geometry(open_size(), 10))]
     );
     assert!(src.request(9, a, SCALE, 11).is_empty());
     // A destination that predates numbers (0) gets 0 back.
     let mut src = Src::live();
     assert_eq!(
         src.request(0, bad, SCALE, 10),
-        vec![sent(DST, geometry(open_size(), 0))]
+        vec![sent(DST, actual_geometry(open_size(), 0))]
     );
 }
 
@@ -1731,7 +1853,7 @@ fn source_answers_a_refused_size_queued_before_it_is_live() {
             },
             8,
         );
-        assert_eq!(messages(&out), vec![geometry(open_size(), 1)]);
+        assert_eq!(messages(&out), vec![actual_geometry(open_size(), 1)]);
         assert!(!out.iter().any(|o| matches!(o, Output::ResizeParked { .. })));
     }
 }
@@ -1946,6 +2068,30 @@ fn repeated_drags_before_host_callbacks_settle_refusal_and_new_size_resumes_exch
     assert_eq!(world.answers.last(), Some(&(3, next)));
 }
 
+#[test]
+fn user_cancels_app_fullscreen_before_host_confirmation_and_converges() {
+    let mut world = World::new(px(400, 300));
+    world.app_toggle(true, 1);
+    assert_eq!(world.parks.front(), Some(&(open_size(), true, 1)));
+    world.complete_one_park(2);
+    assert!(world.actual_fullscreen && world.native_fullscreen);
+    assert!(!world.reported_fullscreen);
+    world.user_toggle(false, 3);
+    assert!(!world.native_fullscreen);
+    eprintln!(
+        "before drain: requests={:?}, answers={:?}, state={:?}, parks={:?}, native={}, source={}, deadlines={:?}/{:?}",
+        world.requests,
+        world.answers,
+        world.last_answer_state,
+        world.parks,
+        world.native_fullscreen,
+        world.actual_fullscreen,
+        world.src.next_deadline(),
+        world.dst.e2.next_deadline()
+    );
+    world.assert_converged();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 500, failure_persistence: None, ..ProptestConfig::default() })]
 
@@ -1956,7 +2102,7 @@ proptest! {
     /// and nothing more is ever sent.
     #[test]
     fn resize_exchanges_converge_without_oscillation(
-        ops in proptest::collection::vec((0u8..9, 0usize..8, 1u64..400), 1..40),
+        ops in proptest::collection::vec((0u8..11, 0usize..8, 1u64..400), 1..40),
         late in prop_oneof![Just(500u64), Just(1_500), Just(4_000)],
     ) {
         let sizes = [
@@ -1992,6 +2138,8 @@ proptest! {
                 }
                 6 if world.link_up => world.drop_link(now),
                 7 if !world.link_up => world.resume_link(now),
+                9 => world.user_toggle(arg % 2 == 0, now),
+                10 => world.app_toggle(arg % 2 == 0, now),
                 _ => world.start_captures(now),
             }
         }

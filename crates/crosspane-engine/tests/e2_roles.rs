@@ -345,7 +345,7 @@ fn sent_geometry(size: PixelSize, answers: u32) -> Output {
     Output::SendControl {
         peer: B,
         msg: ControlMessage::Projection(Message::Geometry {
-            fullscreen: None,
+            fullscreen: Some(false),
             projection: ID,
             size,
             parking: ParkingKind::Twin,
@@ -420,7 +420,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
     assert_eq!(
         messages(&out),
         vec![Message::Geometry {
-            fullscreen: None,
+            fullscreen: Some(false),
             projection: ID,
             size: size(),
             parking: ParkingKind::Twin,
@@ -547,7 +547,7 @@ fn source_happy_path_resize_coalescing_and_ordered_close() {
         messages(&out),
         // It answers the request that was running (1), not the newer one queued behind it (3).
         vec![Message::Geometry {
-            fullscreen: None,
+            fullscreen: Some(false),
             projection: ID,
             size: resized,
             parking: ParkingKind::Twin,
@@ -3481,7 +3481,7 @@ fn grace_round_trip_keeps_parking_and_proxy_and_resumes_input() {
                 Output::SendControl {
                     peer: B,
                     msg: ControlMessage::Projection(Message::Geometry {
-                        fullscreen: None,
+                        fullscreen: Some(false),
                         projection: ID,
                         size: size(),
                         parking,
@@ -3815,7 +3815,7 @@ fn grace_resume_resizes_changed_size_or_scale_before_capture() {
             assert_eq!(
                 messages(&out),
                 vec![Message::Geometry {
-                    fullscreen: None,
+                    fullscreen: Some(false),
                     projection: ID,
                     size: new_size,
                     parking: if kind == PlatformParking::Twin {
