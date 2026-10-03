@@ -97,8 +97,8 @@ enum TrustAction {
     Remove { peer: String },
 }
 
-/// Set when the agent stops because it can't carry on (its compositor or window host is gone): it
-/// then exits with a failure status, so the service manager starts it again.
+/// Set for a restart-required stop, including an engine restart pending teardown, so a timeout
+/// also exits with failure and lets the service manager start it again.
 static RESTART: AtomicBool = AtomicBool::new(false);
 
 /// The exit status after a clean stop: 75 (`EX_TEMPFAIL`) when [`RESTART`] is set.
@@ -118,6 +118,8 @@ fn stop_for_restart(events: &std::sync::mpsc::Sender<agent::Event>) {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    platform::prepare_exit_diagnostics();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -215,11 +217,22 @@ pub fn exit_on_panic<R>(thread: &str, f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(value) => value,
         Err(_) => {
-            tracing::error!(
-                thread,
-                "thread panicked; exiting so the agent restarts and recovers"
-            );
-            std::process::exit(101);
+            #[cfg(target_os = "linux")]
+            {
+                platform::exit_diagnostic(
+                    thread,
+                    "thread panicked; exiting so the agent restarts and recovers",
+                );
+                platform::exit_without_handlers(101);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tracing::error!(
+                    thread,
+                    "thread panicked; exiting so the agent restarts and recovers"
+                );
+                std::process::exit(101);
+            }
         }
     }
 }
@@ -310,6 +323,8 @@ struct Started {
     tx: std::sync::mpsc::Sender<agent::Event>,
     #[cfg(target_os = "linux")]
     host_shutdown: Option<crosspane_render::proxy::HostHandle>,
+    #[cfg(target_os = "linux")]
+    media_workers: [media::Worker; 2],
     host: Option<crosspane_render::proxy::ProxyHost>,
 }
 
@@ -451,14 +466,18 @@ fn start_agent(
         }
     };
     let proxy_ids = media::ProxyIds::default();
+    let (source_media, source_worker) = media::start_source(net.transport(), video.clone());
+    let (dest_media, dest_worker) = media::start_destination(
+        host.as_ref().map(|(_, handle)| handle.clone()),
+        proxy_ids.clone(),
+        tx.clone(),
+        video,
+    );
+    #[cfg(not(target_os = "linux"))]
+    drop((source_worker, dest_worker)); // Preserve macOS's existing orchestration.
     let e2 = agent::E2Wiring {
-        source_media: media::start_source(net.transport(), video.clone()),
-        dest_media: media::start_destination(
-            host.as_ref().map(|(_, handle)| handle.clone()),
-            proxy_ids.clone(),
-            tx.clone(),
-            video,
-        ),
+        source_media,
+        dest_media,
         host: host.as_ref().map(|(_, handle)| handle.clone()),
         proxy_ids,
         events: tx.clone(),
@@ -494,6 +513,8 @@ fn start_agent(
         tx,
         #[cfg(target_os = "linux")]
         host_shutdown: host.as_ref().map(|(_, handle)| handle.clone()),
+        #[cfg(target_os = "linux")]
+        media_workers: [source_worker, dest_worker],
         host: host.map(|(host, _)| host),
     }))
 }
@@ -624,7 +645,7 @@ fn start_linux_signals(
                 _ = term.recv() => {}
                 _ = int.recv() => {}
             }
-            std::process::exit(1);
+            platform::exit_without_handlers(1);
         });
     }))
     .context("spawn signal thread")?;
@@ -643,8 +664,23 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
         tx,
         #[cfg(target_os = "linux")]
         host_shutdown,
+        #[cfg(target_os = "linux")]
+        media_workers,
         host,
     } = started;
+    #[cfg(target_os = "linux")]
+    let host_done = Arc::new(AtomicBool::new(host.is_none()));
+    #[cfg(target_os = "linux")]
+    let engine_done = Arc::new(AtomicBool::new(false));
+    #[cfg(target_os = "linux")]
+    let owners = media_workers
+        .iter()
+        .map(media::Worker::completion)
+        .chain([
+            ("proxy-host", host_done.clone()),
+            ("engine", engine_done.clone()),
+        ])
+        .collect();
     match host {
         Some(host) => {
             let host_tx = tx.clone();
@@ -657,12 +693,14 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
                         let stopped = exit_on_panic("engine", || agent.run(startup, &rx));
                         drop(tx);
                         let restart = stopped.restart;
-                        lifecycle
-                            .stopped(stopped.outcomes)
-                            .inspect_err(|error| {
-                                tracing::error!(%error, "could not write the exit receipt");
-                            })
-                            .context("could not write the exit receipt")?;
+                        let receipt = lifecycle.stopped(stopped.outcomes);
+                        let deadline =
+                            start_shutdown_watchdog(owners, receipt.is_ok(), true, restart);
+                        let receipt = receipt.inspect_err(|error| {
+                            tracing::error!(%error, "could not write the exit receipt");
+                        });
+                        stop_linux_media(media_workers, deadline);
+                        receipt.context("could not write the exit receipt")?;
                         Ok(restart)
                     },
                     move || {
@@ -674,11 +712,8 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
                     move || {
                         let _ = host_shutdown.send(crosspane_render::proxy::HostCommand::Shutdown);
                     },
-                    move |error| {
-                        tracing::error!(%error, "the proxy window host failed; stopping");
-                        stop_for_restart(&stop_tx);
-                    },
-                    || platform::exit_deadline(std::time::Duration::from_secs(5)),
+                    move |error| host_failed(error, &stop_tx),
+                    [host_done, engine_done],
                 )?;
                 if restart {
                     agent::restart();
@@ -731,7 +766,18 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
             {
                 let stopped = agent.run(startup, &rx);
                 drop(tx);
-                finish_run(lifecycle, stopped)?;
+                let restart = stopped.restart;
+                let receipt = lifecycle.stopped(stopped.outcomes);
+                let deadline = start_shutdown_watchdog(owners, receipt.is_ok(), false, restart);
+                let receipt = receipt.inspect_err(|error| {
+                    tracing::error!(%error, "could not write the exit receipt");
+                });
+                stop_linux_media(media_workers, deadline);
+                engine_done.store(true, Ordering::Release);
+                receipt?;
+                if restart {
+                    agent::restart();
+                }
                 if RESTART.load(Ordering::Acquire) {
                     bail!("stopped to be started again");
                 }
@@ -741,9 +787,15 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn host_failed(error: anyhow::Error, events: &std::sync::mpsc::Sender<agent::Event>) {
+    stop_for_restart(events);
+    tracing::error!(%error, "the proxy window host failed; stopping");
+}
+
 /// The engine completes all shutdown work and attempts its receipt before the host is asked to
 /// stop. Until that handback, SIGTERM relies on the service's stop timeout (or a second signal).
-/// The existing five-second deadline bounds only the remaining host/GPU teardown and thread join;
+/// One three-second observer bounds all remaining owners inside the existing five-second fallback;
 /// compositor-loss deadlines are independently armed as before.
 #[cfg(target_os = "linux")]
 fn run_linux_host(
@@ -751,27 +803,89 @@ fn run_linux_host(
     run_host: impl FnOnce() -> Result<()>,
     stop_host: impl FnOnce() + Send + 'static,
     host_failed: impl FnOnce(anyhow::Error),
-    teardown_deadline: impl FnOnce() + Send + 'static,
+    completed: [Arc<AtomicBool>; 2],
 ) -> Result<bool> {
     let engine = std::thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
             let result = run_engine();
-            // Even a failed receipt write leaves the shutdown body complete. Bound teardown
-            // without treating that failure as proof of a clean stop.
-            teardown_deadline();
             stop_host();
             result
         })
         .context("spawn engine thread")?;
-    if let Err(error) = run_host() {
+    let host_result = run_host();
+    completed[0].store(true, Ordering::Release);
+    if let Err(error) = host_result {
         host_failed(error);
     }
-    engine
-        .join()
-        .map_err(|_| anyhow::anyhow!("engine thread panicked"))?
+    let result = engine.join();
+    completed[1].store(true, Ordering::Release);
+    result.map_err(|_| anyhow::anyhow!("engine thread panicked"))?
 }
 
+/// Only orderly stops reach here: all releases/recovery and the receipt attempt are complete.
+/// The pre-receipt capture joins still rely on the service's outer stop timeout.
+#[cfg(target_os = "linux")]
+fn stop_linux_media(mut workers: [media::Worker; 2], deadline: std::time::Instant) {
+    if !media::stop_workers(&mut workers, deadline).is_empty() {
+        // The observer owns exit/status selection. Never reach normal libc exit with a pending owner.
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// Arm at the receipt attempt, before closure drops, host teardown or engine TLS/join can block.
+#[cfg(target_os = "linux")]
+fn start_shutdown_watchdog(
+    owners: Vec<(&'static str, Arc<AtomicBool>)>,
+    receipt_ok: bool,
+    hosted: bool,
+    restart: bool,
+) -> std::time::Instant {
+    RESTART.fetch_or(restart, Ordering::Release);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    platform::exit_deadline(std::time::Duration::from_secs(5));
+    let spawned = std::thread::Builder::new()
+        .name("shutdown-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+            let mut pending = false;
+            for (owner, completed) in owners {
+                if !completed.load(Ordering::Acquire) {
+                    pending = true;
+                    platform::exit_diagnostic(
+                        owner,
+                        "shutdown owner did not stop in time; exiting without driver exit handlers",
+                    );
+                }
+            }
+            if !pending {
+                platform::exit_diagnostic("main", "shutdown did not reach exit in time");
+            }
+            // Read RESTART now: a host failure during this wait must still trigger restart.
+            platform::exit_without_handlers(media_exit_status(receipt_ok, hosted));
+        });
+    if spawned.is_err() {
+        platform::exit_diagnostic("shutdown-watchdog", "could not start shutdown watchdog");
+        platform::exit_without_handlers(media_exit_status(receipt_ok, hosted));
+    }
+    deadline
+}
+
+/// Hosted restarts exit 75; without a proxy host the existing Result/bail path exits 1.
+#[cfg(target_os = "linux")]
+fn media_exit_status(receipt_ok: bool, has_proxy_host: bool) -> i32 {
+    if !receipt_ok {
+        1
+    } else if has_proxy_host {
+        stop_status()
+    } else {
+        i32::from(RESTART.load(Ordering::Acquire))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn finish_run(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) -> Result<()> {
     lifecycle.stopped(stopped.outcomes)?;
     if stopped.restart {
@@ -1019,6 +1133,357 @@ mod host_exit_tests {
         }
     }
 
+    fn unfinished_host_and_engine() -> [Arc<AtomicBool>; 2] {
+        [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ]
+    }
+
+    fn monotonic_ns() -> u128 {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        u128::try_from(now.tv_sec).unwrap() * 1_000_000_000 + u128::try_from(now.tv_nsec).unwrap()
+    }
+
+    fn register_exit_marker(dir: &std::path::Path) {
+        platform::prepare_exit_diagnostics();
+        static EXIT_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        EXIT_DIR.set(dir.to_owned()).unwrap();
+        extern "C" fn handler() {
+            if let Some(dir) = EXIT_DIR.get() {
+                let _ = std::fs::write(dir.join("exit-handler-ran"), "unexpected");
+            }
+        }
+        // SAFETY: atexit accepts a process-lifetime C callback with no arguments or result.
+        unsafe extern "C" {
+            fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+        }
+        // SAFETY: the static callback has the C ABI and lives until this owned child exits.
+        assert_eq!(unsafe { atexit(handler) }, 0);
+    }
+
+    fn capture_child_stderr(
+        child: &mut std::process::Child,
+        log: &std::path::Path,
+    ) -> std::thread::JoinHandle<()> {
+        let mut stderr = child.stderr.take().unwrap();
+        let mut log = std::fs::File::create(log).unwrap();
+        std::thread::spawn(move || {
+            std::io::copy(&mut stderr, &mut log).unwrap();
+        })
+    }
+
+    #[test]
+    fn media_owners_finish_after_receipt_attempt_before_host_drop() {
+        for fail in [false, true] {
+            let fixture = Fixture::new();
+            let paths = fixture.paths();
+            let marker = paths.state_dir.join("receipt-attempted");
+            let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+            let workers = ["media-encode", "media-decode"].map(|name| {
+                let marker = marker.clone();
+                let trace = trace.clone();
+                media::fake_worker(name, move |stop| {
+                    let _gpu = RecordedDrop(trace, "GPU dropped");
+                    while !stop.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    assert!(
+                        marker.is_file(),
+                        "media stop must follow the receipt attempt"
+                    );
+                })
+            });
+            let joined_trace = trace.clone();
+            let host_trace = trace.clone();
+            let (stop, stopping) = mpsc::channel();
+            let result = run_linux_host(
+                move || {
+                    let mut lifecycle = lifecycle::Lifecycle::start(&paths)?;
+                    lifecycle.phase(lifecycle::Phase::Ready, None)?;
+                    if fail {
+                        std::fs::create_dir(paths.state_dir.join("last_exit.json"))?;
+                    }
+                    let receipt = lifecycle.stopped(lifecycle::Shutdown {
+                        parking: lifecycle::Parking::NothingParked,
+                        input_journals_empty: true,
+                        audio_stopped: true,
+                    });
+                    std::fs::write(marker, "attempted")?;
+                    assert_eq!(receipt.is_ok(), !fail);
+                    let mut workers = workers;
+                    assert!(
+                        media::stop_workers(&mut workers, Instant::now() + Duration::from_secs(2))
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        *joined_trace.lock().unwrap(),
+                        ["GPU dropped", "GPU dropped"]
+                    );
+                    receipt.map(|()| true)
+                },
+                move || {
+                    stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+                    host_trace.lock().unwrap().push("host dropped");
+                    Ok(())
+                },
+                move || stop.send(()).unwrap(),
+                |_| panic!("fake host did not fail"),
+                unfinished_host_and_engine(),
+            );
+            if fail {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap(), "restart request survives media joins");
+            }
+            assert_eq!(
+                *trace.lock().unwrap(),
+                ["GPU dropped", "GPU dropped", "host dropped"]
+            );
+        }
+    }
+
+    #[test]
+    fn media_timeout_preserves_status_and_receipt_without_exit_handlers() {
+        const CHILD: &str = "CROSSPANE_MEDIA_EXIT_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let fail = std::env::var("CROSSPANE_MEDIA_EXIT_TEST_FAIL").unwrap() == "1";
+            let late_restart = std::env::var("CROSSPANE_MEDIA_EXIT_TEST_RESTART").unwrap() == "1";
+            let hosted = std::env::var("CROSSPANE_MEDIA_EXIT_TEST_HOSTED").unwrap() == "1";
+            let engine_restart =
+                std::env::var("CROSSPANE_MEDIA_EXIT_TEST_ENGINE_RESTART").unwrap() == "1";
+            let kind = std::env::var("CROSSPANE_MEDIA_EXIT_TEST_KIND").unwrap();
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .init();
+            register_exit_marker(&dir);
+            let paths = Paths {
+                config_dir: dir.clone(),
+                state_dir: dir.clone(),
+                runtime_dir: dir.clone(),
+            };
+            let mut lifecycle = lifecycle::Lifecycle::start(&paths).unwrap();
+            lifecycle.phase(lifecycle::Phase::Ready, None).unwrap();
+            if fail {
+                std::fs::create_dir(dir.join("last_exit.json")).unwrap();
+            }
+            struct HungOwner(PathBuf);
+            impl Drop for HungOwner {
+                fn drop(&mut self) {
+                    std::fs::write(&self.0, monotonic_ns().to_string()).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            }
+            thread_local! {
+                static HUNG_EXIT_TLS: RefCell<Option<HungOwner>> = const { RefCell::new(None) };
+            }
+            let (ready, started) = mpsc::channel();
+            let workers = ["media-encode", "media-decode"].map(|name| {
+                let marker = dir.join(name);
+                let hangs = kind == "media";
+                let slow = kind.ends_with("-after-media");
+                let ready = ready.clone();
+                media::fake_worker(name, move |stop| {
+                    let _gpu = hangs.then(|| HungOwner(marker));
+                    ready.send(()).unwrap();
+                    while !stop.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    if slow {
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                })
+            });
+            for _ in 0..2 {
+                started.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let completed = unfinished_host_and_engine();
+            completed[0].store(!hosted, Ordering::Release);
+            let owners = workers
+                .iter()
+                .map(media::Worker::completion)
+                .chain([
+                    ("proxy-host", completed[0].clone()),
+                    ("engine", completed[1].clone()),
+                ])
+                .collect();
+            if late_restart {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    while !dir.join("media-encode").is_file() {
+                        std::thread::yield_now();
+                    }
+                    RESTART.store(true, Ordering::Release);
+                    std::fs::write(dir.join("restart-during-wait"), "set").unwrap();
+                });
+            }
+            let engine_dir = dir.clone();
+            let engine_tls = kind.starts_with("engine");
+            let run_engine = move || {
+                if engine_tls {
+                    HUNG_EXIT_TLS
+                        .with(|tls| *tls.borrow_mut() = Some(HungOwner(engine_dir.join("engine"))));
+                }
+                let attempted = monotonic_ns();
+                let result = lifecycle.stopped(lifecycle::Shutdown {
+                    parking: lifecycle::Parking::NothingParked,
+                    input_journals_empty: true,
+                    audio_stopped: true,
+                });
+                assert_eq!(result.is_err(), fail);
+                let deadline =
+                    start_shutdown_watchdog(owners, result.is_ok(), hosted, engine_restart);
+                std::fs::write(engine_dir.join("receipt-clock"), attempted.to_string())?;
+                std::fs::write(
+                    engine_dir.join("receipt-attempted"),
+                    if result.is_ok() { "written" } else { "failed" },
+                )?;
+                stop_linux_media(workers, deadline);
+                result.map(|()| false)
+            };
+            if hosted {
+                let (stop, stopping) = mpsc::channel();
+                let _ = run_linux_host(
+                    run_engine,
+                    move || {
+                        let _host = kind
+                            .starts_with("host")
+                            .then(|| HungOwner(dir.join("proxy-host")));
+                        stopping.recv_timeout(Duration::from_secs(4)).unwrap();
+                        Ok(())
+                    },
+                    move || stop.send(()).unwrap(),
+                    |_| panic!("fake host did not fail"),
+                    completed,
+                );
+            } else {
+                let _ = run_engine();
+            }
+            panic!("hung owner returned");
+        }
+        for (kind, expected, hosted, restart, engine_restart, fail) in [
+            ("media", 0, true, false, false, false),
+            ("media", 75, true, true, false, false),
+            ("media", 1, true, true, false, true),
+            ("media", 1, false, true, false, false),
+            ("media", 75, true, false, true, false),
+            ("media", 1, true, false, true, true),
+            ("media", 1, false, false, true, false),
+            ("host", 0, true, false, false, false),
+            ("host", 1, true, false, false, true),
+            ("engine", 0, true, false, false, false),
+            ("host-after-media", 0, true, false, false, false),
+            ("engine-after-media", 0, true, false, false, false),
+        ] {
+            let fixture = Fixture::new();
+            let log = fixture.0.join("media-exit.log");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host_exit_tests::media_timeout_preserves_status_and_receipt_without_exit_handlers"])
+                .env(CHILD, &fixture.0)
+                .env("CROSSPANE_MEDIA_EXIT_TEST_FAIL", if fail { "1" } else { "0" })
+                .env("CROSSPANE_MEDIA_EXIT_TEST_RESTART", if restart { "1" } else { "0" })
+                .env("CROSSPANE_MEDIA_EXIT_TEST_HOSTED", if hosted { "1" } else { "0" })
+                .env("CROSSPANE_MEDIA_EXIT_TEST_KIND", kind)
+                .env("CROSSPANE_MEDIA_EXIT_TEST_ENGINE_RESTART", if engine_restart { "1" } else { "0" })
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped()).spawn().unwrap();
+            let logging = capture_child_stderr(&mut child, &log);
+            wait_for_child_marker(&mut child, &fixture.0.join("receipt-clock"));
+            let attempted: u128 = std::fs::read_to_string(fixture.0.join("receipt-clock"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if monotonic_ns() - attempted >= 3_500_000_000 {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("owned child missed aggregate shutdown bound ({kind})");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            logging.join().unwrap();
+            let elapsed = Duration::from_nanos(u64::try_from(monotonic_ns() - attempted).unwrap());
+            eprintln!(
+                "{kind} hosted={hosted} late_restart={restart} engine_restart={engine_restart} receipt_failed={fail}: status={status}, receipt-to-exit={elapsed:?}"
+            );
+            assert_eq!(status.code(), Some(expected));
+            assert!(
+                elapsed >= Duration::from_millis(2950) && elapsed < Duration::from_millis(3350),
+                "one aggregate 3 s budget: {elapsed:?}"
+            );
+            if kind == "media" {
+                for owner in ["media-encode", "media-decode"] {
+                    assert!(fixture.0.join(owner).is_file());
+                }
+            } else {
+                assert!(
+                    fixture
+                        .0
+                        .join(if kind.starts_with("host") {
+                            "proxy-host"
+                        } else {
+                            "engine"
+                        })
+                        .is_file()
+                );
+            }
+            if restart {
+                assert!(fixture.0.join("restart-during-wait").is_file());
+            }
+            if kind.ends_with("-after-media") {
+                let owner = if kind.starts_with("host") {
+                    "proxy-host"
+                } else {
+                    "engine"
+                };
+                let blocked: u128 = std::fs::read_to_string(fixture.0.join(owner))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let media_elapsed =
+                    Duration::from_nanos(u64::try_from(blocked - attempted).unwrap());
+                eprintln!("{kind}: media completed before blocked {owner} at {media_elapsed:?}");
+                assert!(
+                    media_elapsed >= Duration::from_millis(950)
+                        && media_elapsed < Duration::from_millis(1500)
+                );
+            }
+            assert!(!fixture.0.join("exit-handler-ran").exists());
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join("receipt-attempted")).unwrap(),
+                if fail { "failed" } else { "written" }
+            );
+            if fail {
+                assert!(fixture.0.join("last_exit.json").is_dir());
+            } else {
+                let receipt: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(fixture.0.join("last_exit.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(receipt["clean"], true);
+            }
+            let log = std::fs::read_to_string(log).unwrap();
+            assert!(log.contains("shutdown owner did not stop in time"));
+            for owner in match kind {
+                "media" => &["media-encode", "media-decode"][..],
+                "host" | "host-after-media" => &["proxy-host"][..],
+                _ => &["engine"][..],
+            } {
+                assert_eq!(
+                    log.matches(owner).count(),
+                    1,
+                    "each unjoined owner is named once: {log}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn signal_thread_spawn_failure_exits_one_before_ready() {
         const CHILD: &str = "CROSSPANE_SIGNAL_SPAWN_FAILURE_TEST_DIR";
@@ -1090,6 +1555,7 @@ mod host_exit_tests {
         const CHILD: &str = "CROSSPANE_SECOND_SIGNAL_TEST_DIR";
         if let Some(dir) = std::env::var_os(CHILD) {
             let dir = PathBuf::from(dir);
+            register_exit_marker(&dir);
             let paths = Paths {
                 config_dir: dir.clone(),
                 state_dir: dir.clone(),
@@ -1123,6 +1589,7 @@ mod host_exit_tests {
                         input_journals_empty: true,
                         audio_stopped: true,
                     });
+                    platform::exit_deadline(Duration::from_secs(5));
                     std::fs::write(
                         paths.state_dir.join("receipt-attempted"),
                         if result.is_ok() { "written" } else { "failed" },
@@ -1138,7 +1605,7 @@ mod host_exit_tests {
                 },
                 move || stop_host.send(()).unwrap(),
                 |_| panic!("fake host did not fail"),
-                || platform::exit_deadline(Duration::from_secs(5)),
+                unfinished_host_and_engine(),
             );
             panic!("blocked teardown unexpectedly returned");
         }
@@ -1183,6 +1650,7 @@ mod host_exit_tests {
                         std::thread::sleep(Duration::from_millis(10));
                     };
                     assert_eq!(status.code(), Some(1), "{first:?} then {second:?}");
+                    assert!(!fixture.0.join("exit-handler-ran").exists());
                     assert!(started.elapsed() < Duration::from_secs(2));
                     let receipt = fixture.0.join("last_exit.json");
                     if fail {
@@ -1195,6 +1663,324 @@ mod host_exit_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn panic_exits_101_without_driver_exit_handlers() {
+        const CHILD: &str = "CROSSPANE_PANIC_EXIT_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            register_exit_marker(&dir);
+            // Keep another owner's destructor blocked while this thread panics.
+            let (entered, dropping) = mpsc::channel();
+            let worker = media::fake_worker("media-decode", move |_| {
+                struct Hung(mpsc::Sender<()>);
+                impl Drop for Hung {
+                    fn drop(&mut self) {
+                        self.0.send(()).unwrap();
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                }
+                let _gpu = Hung(entered);
+            });
+            dropping.recv_timeout(Duration::from_secs(2)).unwrap();
+            std::fs::write(dir.join("destructor-running"), "blocked").unwrap();
+            let _retained = worker;
+            exit_on_panic("owned panic fixture", || panic!("owned test panic"));
+            unreachable!();
+        }
+        let fixture = Fixture::new();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host_exit_tests::panic_exits_101_without_driver_exit_handlers",
+            ])
+            .env(CHILD, &fixture.0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let before = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if before.elapsed() > Duration::from_secs(3) {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("owned panic child did not terminate");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(101));
+        assert!(fixture.0.join("destructor-running").is_file());
+        assert!(!fixture.0.join("exit-handler-ran").exists());
+    }
+
+    #[test]
+    fn blocked_stderr_cannot_delay_shutdown_deadlines() {
+        const CHILD: &str = "CROSSPANE_BLOCKED_STDERR_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            register_exit_marker(&dir);
+            let full = std::env::var("CROSSPANE_BLOCKED_STDERR_FULL").unwrap() == "1";
+            let fallback = std::env::var("CROSSPANE_BLOCKED_STDERR_FALLBACK").unwrap() == "1";
+            if full {
+                let stderr = std::io::stderr();
+                let flags = rustix::fs::fcntl_getfl(&stderr).unwrap();
+                rustix::fs::fcntl_setfl(&stderr, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+                while rustix::io::write(&stderr, &[b'x'; 4096]).is_ok() {}
+                // Restore blocking mode: a tracing/write_all diagnostic would now hang.
+                rustix::fs::fcntl_setfl(&stderr, flags).unwrap();
+            } else {
+                let (ready, locked) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _stdio_lock = std::io::stderr().lock();
+                    ready.send(()).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                });
+                locked.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let paths = Paths {
+                config_dir: dir.clone(),
+                state_dir: dir.clone(),
+                runtime_dir: dir.clone(),
+            };
+            let attempted = monotonic_ns();
+            receipt(&paths).unwrap();
+            if fallback {
+                platform::exit_deadline(Duration::from_millis(100));
+            } else {
+                start_shutdown_watchdog(
+                    vec![("blocked-owner", Arc::new(AtomicBool::new(false)))],
+                    true,
+                    true,
+                    false,
+                );
+            }
+            std::fs::write(dir.join("receipt-clock"), attempted.to_string()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        for full in [false, true] {
+            for fallback in [false, true] {
+                let fixture = Fixture::new();
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "host_exit_tests::blocked_stderr_cannot_delay_shutdown_deadlines",
+                    ])
+                    .env(CHILD, &fixture.0)
+                    .env(
+                        "CROSSPANE_BLOCKED_STDERR_FULL",
+                        if full { "1" } else { "0" },
+                    )
+                    .env(
+                        "CROSSPANE_BLOCKED_STDERR_FALLBACK",
+                        if fallback { "1" } else { "0" },
+                    )
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                // Keep the owned pipe open but unread until exit; do not accidentally clear the block.
+                let _unread = child.stderr.take().unwrap();
+                wait_for_child_marker(&mut child, &fixture.0.join("receipt-clock"));
+                let attempted: u128 = std::fs::read_to_string(fixture.0.join("receipt-clock"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let max = if fallback { 500_000_000 } else { 3_500_000_000 };
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if monotonic_ns() - attempted >= max {
+                        child.kill().unwrap();
+                        let _ = child.wait();
+                        panic!(
+                            "blocked stderr defeated owned child's deadline full={full} fallback={fallback}"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let elapsed =
+                    Duration::from_nanos(u64::try_from(monotonic_ns() - attempted).unwrap());
+                eprintln!(
+                    "blocked stderr full={full} fallback={fallback}: status={status}, receipt-to-exit={elapsed:?}"
+                );
+                if fallback {
+                    assert_eq!(status.signal(), Some(9));
+                } else {
+                    assert_eq!(status.code(), Some(0));
+                    assert!(elapsed < Duration::from_millis(3350));
+                }
+                assert!(!fixture.0.join("exit-handler-ran").exists());
+                assert!(fixture.0.join("last_exit.json").is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn exit_diagnostic_uses_startup_classification_without_rechecking_metadata() {
+        const CHILD: &str = "CROSSPANE_EXIT_CLASSIFICATION_TEST_DIR";
+        if std::env::var_os(CHILD).is_some() {
+            use std::io::Read;
+            use std::os::fd::AsRawFd;
+            // The parent gave only this test child a regular-file stderr: cache unsupported.
+            platform::prepare_exit_diagnostics();
+            let (mut reading, writing) = std::os::unix::net::UnixStream::pair().unwrap();
+            // SAFETY: this declaration matches POSIX dup2's C ABI and integer descriptors.
+            unsafe extern "C" {
+                fn dup2(oldfd: std::ffi::c_int, newfd: std::ffi::c_int) -> std::ffi::c_int;
+            }
+            // SAFETY: writing owns a valid private socket. Only this owned child's fd2 changes;
+            // dup2 retains its own reference, and no owner-process descriptor is accessed.
+            assert_eq!(unsafe { dup2(writing.as_raw_fd(), 2) }, 2);
+            // Calling startup again must not reclassify; termination reads only the cache.
+            platform::prepare_exit_diagnostics();
+            platform::exit_diagnostic("owned-cache-test", "must remain omitted");
+            assert!(
+                !rustix::fs::fcntl_getfl(std::io::stderr())
+                    .unwrap()
+                    .contains(rustix::fs::OFlags::NONBLOCK)
+            );
+            reading.set_nonblocking(true).unwrap();
+            assert_eq!(
+                reading.read(&mut [0; 64]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            return;
+        }
+        let fixture = Fixture::new();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "host_exit_tests::exit_diagnostic_uses_startup_classification_without_rechecking_metadata"])
+            .env(CHILD, &fixture.0)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(fixture.0.join("regular-stderr")).unwrap())
+            .spawn().unwrap();
+        let before = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if before.elapsed() > Duration::from_secs(2) {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("owned cache-classification child did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(0));
+    }
+
+    #[test]
+    fn actual_host_failure_publishes_restart_before_blocked_logging() {
+        const CHILD: &str = "CROSSPANE_HOST_FAILURE_LOG_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            register_exit_marker(&dir);
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .init();
+            let (ready, locked) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _stdio_lock = std::io::stderr().lock();
+                ready.send(()).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            });
+            locked.recv_timeout(Duration::from_secs(2)).unwrap();
+            let completed = unfinished_host_and_engine();
+            let owners = vec![
+                ("proxy-host", completed[0].clone()),
+                ("engine", completed[1].clone()),
+            ];
+            let (events, receiving) = mpsc::channel();
+            let (armed, observer_ready) = mpsc::channel();
+            let engine_dir = dir.clone();
+            let _ = run_linux_host(
+                move || {
+                    let paths = Paths {
+                        config_dir: engine_dir.clone(),
+                        state_dir: engine_dir.clone(),
+                        runtime_dir: engine_dir.clone(),
+                    };
+                    let attempted = monotonic_ns();
+                    receipt(&paths)?;
+                    start_shutdown_watchdog(owners, true, true, false);
+                    std::fs::write(engine_dir.join("receipt-clock"), attempted.to_string())?;
+                    armed.send(()).unwrap();
+                    assert!(matches!(
+                        receiving.recv_timeout(Duration::from_secs(2)).unwrap(),
+                        agent::Event::Shutdown
+                    ));
+                    std::fs::write(engine_dir.join("shutdown-requested"), "requested")?;
+                    loop {
+                        std::thread::park();
+                    }
+                },
+                move || {
+                    observer_ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                    std::fs::write(dir.join("host-failed"), "failed")?;
+                    bail!("owned late host failure")
+                },
+                || {},
+                move |error| host_failed(error, &events),
+                completed,
+            );
+            unreachable!();
+        }
+        let fixture = Fixture::new();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host_exit_tests::actual_host_failure_publishes_restart_before_blocked_logging",
+            ])
+            .env(CHILD, &fixture.0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _unread = child.stderr.take().unwrap();
+        wait_for_child_marker(&mut child, &fixture.0.join("receipt-clock"));
+        let attempted: u128 = std::fs::read_to_string(fixture.0.join("receipt-clock"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if monotonic_ns() - attempted >= 3_500_000_000 {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("owned host-failure child missed its deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let elapsed = Duration::from_nanos(u64::try_from(monotonic_ns() - attempted).unwrap());
+        eprintln!(
+            "actual host failure with blocked logging: status={status}, receipt-to-exit={elapsed:?}"
+        );
+        assert_eq!(status.code(), Some(75));
+        assert!(elapsed >= Duration::from_millis(2950) && elapsed < Duration::from_millis(3350));
+        assert!(fixture.0.join("host-failed").is_file());
+        assert!(fixture.0.join("shutdown-requested").is_file());
+        assert!(!fixture.0.join("exit-handler-ran").exists());
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.0.join("last_exit.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["clean"], true);
     }
 
     #[test]
@@ -1217,6 +2003,8 @@ mod host_exit_tests {
                 drop(agent);
                 receipt(&paths)?;
                 engine_trace.lock().unwrap().push("receipt");
+                assert!(deadline_paths.state_dir.join("last_exit.json").is_file());
+                deadline_trace.lock().unwrap().push("deadline armed");
                 Ok(true)
             },
             move || {
@@ -1227,10 +2015,7 @@ mod host_exit_tests {
             },
             move || stop.send(()).unwrap(),
             |_| panic!("fake host did not fail"),
-            move || {
-                assert!(deadline_paths.state_dir.join("last_exit.json").is_file());
-                deadline_trace.lock().unwrap().push("deadline armed");
-            },
+            unfinished_host_and_engine(),
         )
         .unwrap();
         assert!(
@@ -1265,7 +2050,7 @@ mod host_exit_tests {
                 assert_eq!(error.to_string(), "fake compositor disappeared");
                 stop_engine.send(()).unwrap();
             },
-            || {},
+            unfinished_host_and_engine(),
         )
         .unwrap();
         assert!(!result);
@@ -1279,7 +2064,10 @@ mod host_exit_tests {
         let deadline_trace = trace.clone();
         let (stop, stopping) = mpsc::channel();
         let error = run_linux_host(
-            || bail!("could not write the exit receipt"),
+            move || {
+                deadline_trace.lock().unwrap().push("deadline armed");
+                bail!("could not write the exit receipt")
+            },
             move || {
                 let _host = RecordedDrop(host_trace, "host dropped");
                 stopping.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1287,7 +2075,7 @@ mod host_exit_tests {
             },
             move || stop.send(()).unwrap(),
             |_| panic!("fake host did not fail"),
-            move || deadline_trace.lock().unwrap().push("deadline armed"),
+            unfinished_host_and_engine(),
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "could not write the exit receipt");
@@ -1319,6 +2107,7 @@ mod host_exit_tests {
                         input_journals_empty: true,
                         audio_stopped: true,
                     });
+                    platform::exit_deadline(Duration::from_millis(100));
                     std::fs::write(
                         paths.state_dir.join("receipt-attempted"),
                         if result.is_ok() { "written" } else { "failed" },
@@ -1333,7 +2122,7 @@ mod host_exit_tests {
                 },
                 move || stop.send(()).unwrap(),
                 |_| panic!("fake host did not fail"),
-                || platform::exit_deadline(Duration::from_millis(100)),
+                unfinished_host_and_engine(),
             );
             panic!("hung teardown unexpectedly returned");
         }

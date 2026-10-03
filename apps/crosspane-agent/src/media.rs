@@ -244,7 +244,13 @@ pub enum SourceCmd {
     },
 }
 
-type SourceFrames = Arc<Mutex<HashMap<StreamId, VecDeque<Frame>>>>;
+#[derive(Default)]
+struct FrameMailbox {
+    queues: HashMap<StreamId, VecDeque<Frame>>,
+    closed: bool,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+}
+type SourceFrames = Arc<Mutex<FrameMailbox>>;
 
 /// Non-waiting frame enqueue across backend swaps: two queued images per logical stream.
 #[derive(Clone)]
@@ -263,7 +269,10 @@ impl SourceSender {
                 let Ok(mut mailbox) = frames.lock() else {
                     return Err(mpsc::SendError(SourceCmd::Frame { stream, frame }));
                 };
-                let queue = mailbox.entry(stream).or_default();
+                if mailbox.closed || mailbox.stopping.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(mpsc::SendError(SourceCmd::Frame { stream, frame }));
+                }
+                let queue = mailbox.queues.entry(stream).or_default();
                 let wake = queue.is_empty();
                 let replaced = (queue.len() == 2).then(|| queue.pop_back()).flatten();
                 if let Some(old) = &replaced {
@@ -280,7 +289,7 @@ impl SourceSender {
                     let retired = frames
                         .lock()
                         .ok()
-                        .and_then(|mut frames| frames.remove(&stream));
+                        .and_then(|mut frames| frames.queues.remove(&stream));
                     drop(retired);
                 }
                 result
@@ -289,7 +298,7 @@ impl SourceSender {
                 let retired = frames
                     .lock()
                     .ok()
-                    .and_then(|mut frames| frames.remove(&stream));
+                    .and_then(|mut frames| frames.queues.remove(&stream));
                 drop(retired);
                 self.commands.send(SourceCmd::Stop { stream })
             }
@@ -318,19 +327,29 @@ pub(crate) fn source_channel() -> (SourceSender, Receiver<SourceCmd>) {
     (
         SourceSender {
             commands,
-            frames: Some(Arc::new(Mutex::new(HashMap::new()))),
+            frames: Some(Arc::new(Mutex::new(FrameMailbox::default()))),
         },
         receiver,
     )
 }
 
 fn take_source_frame(frames: &SourceFrames, stream: StreamId) -> Option<Frame> {
-    let mut queue = frames.lock().ok()?.remove(&stream)?;
+    let mut queue = frames.lock().ok()?.queues.remove(&stream)?;
     let mut newest = queue.pop_back()?;
     if let Some(older) = queue.pop_front() {
         merge_frame_damage(&mut newest, &older);
     }
     Some(newest)
+}
+
+/// Serialize closing with enqueue; release every queued native image on the encoder, unlocked.
+fn close_source_frames(frames: &SourceFrames) {
+    let retired = {
+        let mut mailbox = frames.lock().unwrap_or_else(|error| error.into_inner());
+        mailbox.closed = true;
+        std::mem::take(&mut mailbox.queues)
+    };
+    drop(retired);
 }
 
 /// Bounding union is conservative. Unknown/changed-size/invalid damage means FULL frame.
@@ -404,21 +423,122 @@ pub struct VideoSetup {
     pub gpu: Option<crate::platform::GpuDevice>,
 }
 
+/// Kept by Linux's main orchestration until the owner's GPU destructors have finished.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct Worker {
+    name: &'static str,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    joining: bool,
+    joined: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Worker {
+    #[cfg(target_os = "linux")]
+    pub fn completion(&self) -> (&'static str, Arc<std::sync::atomic::AtomicBool>) {
+        (self.name, self.joined.clone())
+    }
+
+    fn spawn(
+        name: &'static str,
+        run: impl FnOnce(&std::sync::atomic::AtomicBool) + Send + 'static,
+    ) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || run(&stopping))
+            .map_err(|error| tracing::error!(%error, worker = name, "could not start media worker"))
+            .ok();
+        Self {
+            name,
+            stop,
+            thread,
+            joining: false,
+            joined: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub fn fake_worker(
+    name: &'static str,
+    run: impl FnOnce(&std::sync::atomic::AtomicBool) + Send + 'static,
+) -> Worker {
+    Worker::spawn(name, run)
+}
+
+/// Stop both owners together and spend one absolute budget, including their destructors.
+#[cfg(target_os = "linux")]
+pub fn stop_workers(workers: &mut [Worker], deadline: Instant) -> Vec<&'static str> {
+    use std::sync::atomic::Ordering;
+    for worker in workers.iter() {
+        worker.stop.store(true, Ordering::Release);
+    }
+    for worker in workers.iter_mut().filter(|worker| !worker.joining) {
+        worker.joining = true;
+        let Some(owner) = worker.thread.take() else {
+            worker.joined.store(true, Ordering::Release);
+            continue;
+        };
+        let completed = worker.joined.clone();
+        let name = worker.name;
+        // is_finished() can precede a blocked OS TLS destructor. Only a completed real join
+        // proves the GPU owner is gone. These two shutdown-only waiters never own GPU objects.
+        worker.thread = std::thread::Builder::new()
+            .name(format!("{name}-join"))
+            .spawn(move || {
+                if owner.join().is_err() {
+                    tracing::error!(worker = name, "media worker panicked during shutdown");
+                }
+                completed.store(true, Ordering::Release);
+            })
+            .map_err(
+                |error| tracing::error!(%error, worker = name, "could not start media join waiter"),
+            )
+            .ok();
+    }
+    loop {
+        let mut remaining = Vec::new();
+        for worker in workers.iter_mut() {
+            if worker.joined.load(Ordering::Acquire) {
+                // The GPU owner has been joined; the CPU waiter's remaining return/TLS work
+                // cannot destroy its objects. Do not introduce another blocking join here.
+                drop(worker.thread.take());
+            } else {
+                remaining.push(worker.name);
+            }
+        }
+        if remaining.is_empty() || Instant::now() >= deadline {
+            return remaining;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
 /// Start the encoder thread; capture sinks and the engine loop send it `SourceCmd`s.
-pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> SourceSender {
+pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> (SourceSender, Worker) {
     let (tx, rx) = source_channel();
     let frames = tx.frames.clone();
-    let spawned = std::thread::Builder::new()
-        .name("media-encode".into())
-        .spawn(move || {
-            crate::exit_on_panic("media encoder", || {
-                encode_loop(&rx, frames.as_ref(), &transport, &video)
-            })
-        });
-    if let Err(e) = spawned {
-        tracing::error!(error = %e, "could not start the media encoder");
+    let worker = Worker::spawn("media-encode", move |stop| {
+        crate::exit_on_panic("media encoder", || {
+            encode_loop(&rx, frames.as_ref(), &transport, &video, stop);
+            if let Some(frames) = &frames {
+                close_source_frames(frames);
+            }
+        })
+    });
+    if let Some(frames) = &tx.frames {
+        frames
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .stopping = worker.stop.clone();
     }
-    tx
+    (tx, worker)
 }
 
 fn encode_loop(
@@ -426,6 +546,7 @@ fn encode_loop(
     frames: Option<&SourceFrames>,
     transport: &Transport,
     video: &VideoSetup,
+    stop: &std::sync::atomic::AtomicBool,
 ) {
     let mut streams: HashMap<StreamId, Encoding> = HashMap::new();
     // Cursors reported before the stream's Start arrived (the capture thread may be first).
@@ -435,7 +556,7 @@ fn encode_loop(
     let mut early_frames: HashMap<StreamId, (Frame, Instant)> = HashMap::new();
     let mut out = Vec::new();
     let epoch = Instant::now();
-    loop {
+    while !stop.load(std::sync::atomic::Ordering::Acquire) {
         let first = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(cmd) => Some(cmd),
             Err(RecvTimeoutError::Timeout) => None,
@@ -1250,19 +1371,14 @@ pub fn start_destination(
     ids: ProxyIds,
     engine: Sender<Event>,
     video: VideoSetup,
-) -> Sender<DestCmd> {
+) -> (Sender<DestCmd>, Worker) {
     let (tx, rx) = mpsc::channel::<DestCmd>();
-    let spawned = std::thread::Builder::new()
-        .name("media-decode".into())
-        .spawn(move || {
-            crate::exit_on_panic("media decoder", || {
-                decode_loop(&rx, host.as_ref(), &ids, &engine, &video)
-            })
-        });
-    if let Err(e) = spawned {
-        tracing::error!(error = %e, "could not start the media decoder");
-    }
-    tx
+    let worker = Worker::spawn("media-decode", move |stop| {
+        crate::exit_on_panic("media decoder", || {
+            decode_loop(&rx, host.as_ref(), &ids, &engine, &video, stop)
+        })
+    });
+    (tx, worker)
 }
 
 fn decode_loop(
@@ -1271,9 +1387,10 @@ fn decode_loop(
     ids: &ProxyIds,
     engine: &Sender<Event>,
     video: &VideoSetup,
+    stop: &std::sync::atomic::AtomicBool,
 ) {
     let mut decoders: HashMap<ProjectionKey, Decoding> = HashMap::new();
-    loop {
+    while !stop.load(std::sync::atomic::Ordering::Acquire) {
         let cmd = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(cmd) => Some(cmd),
             Err(RecvTimeoutError::Timeout) => None,
@@ -1499,6 +1616,246 @@ fn apply_video(
     Ok((header, size, rect))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod worker_exit_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    struct OwnerDrop(Sender<std::thread::ThreadId>);
+    impl Drop for OwnerDrop {
+        fn drop(&mut self) {
+            assert!(self.0.send(std::thread::current().id()).is_ok());
+        }
+    }
+    thread_local! {
+        static OWNER_TLS: std::cell::RefCell<Option<OwnerDrop>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn stop_joins_owner_resources_and_tls_before_return() {
+        let main = std::thread::current().id();
+        let (dropped, drops) = mpsc::channel();
+        let (ready, started) = mpsc::channel();
+        let mut workers = ["media-encode", "media-decode"].map(|name| {
+            let dropped = dropped.clone();
+            let ready = ready.clone();
+            Worker::spawn(name, move |stop| {
+                let _gpu = OwnerDrop(dropped.clone());
+                OWNER_TLS.with(|tls| *tls.borrow_mut() = Some(OwnerDrop(dropped)));
+                ready.send(()).unwrap();
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        });
+        for _ in 0..2 {
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(stop_workers(&mut workers, Instant::now() + Duration::from_secs(2)).is_empty());
+        assert!(workers.iter().all(|worker| worker.thread.is_none()));
+        let owners: Vec<_> = drops.try_iter().collect();
+        assert_eq!(
+            owners.len(),
+            4,
+            "both worker-local and TLS destructors finished before join returned"
+        );
+        assert!(owners.iter().all(|owner| *owner != main));
+    }
+
+    #[test]
+    fn hung_destructors_share_one_deadline_and_keep_handles_until_cleanup() {
+        struct HungDrop {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl Drop for HungDrop {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+        }
+        let (entered, destructors) = mpsc::channel();
+        let (ready, started) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut workers = ["media-encode", "media-decode"].map(|name| {
+            let (release, receiving) = mpsc::channel();
+            releases.push(release);
+            let entered = entered.clone();
+            let ready = ready.clone();
+            Worker::spawn(name, move |stop| {
+                let _gpu = HungDrop {
+                    entered,
+                    release: receiving,
+                };
+                ready.send(()).unwrap();
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            })
+        });
+        for _ in 0..2 {
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        assert_eq!(
+            stop_workers(&mut workers, deadline),
+            ["media-encode", "media-decode"]
+        );
+        assert!(
+            Instant::now() < deadline + Duration::from_millis(100),
+            "two per-owner budgets must not fit this tolerance"
+        );
+        for _ in 0..2 {
+            destructors.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(workers.iter().all(|worker| worker.thread.is_some()));
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        assert!(stop_workers(&mut workers, Instant::now() + Duration::from_secs(2)).is_empty());
+    }
+
+    #[test]
+    fn hung_tls_destructor_cannot_extend_the_join_budget() {
+        struct HungTls {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl Drop for HungTls {
+            fn drop(&mut self) {
+                assert!(self.entered.send(()).is_ok());
+                assert!(self.release.recv().is_ok());
+            }
+        }
+        thread_local! {
+            static HUNG_TLS: std::cell::RefCell<Option<HungTls>> = const { std::cell::RefCell::new(None) };
+        }
+        let (entered, destructor) = mpsc::channel();
+        let (release, receiving) = mpsc::channel();
+        let worker = Worker::spawn("media-encode", move |_| {
+            HUNG_TLS.with(|tls| {
+                *tls.borrow_mut() = Some(HungTls {
+                    entered,
+                    release: receiving,
+                })
+            });
+        });
+        destructor.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done, completed) = mpsc::channel();
+        let stopper = std::thread::spawn(move || {
+            let mut workers = [worker];
+            let remaining = stop_workers(&mut workers, Instant::now() + Duration::from_millis(80));
+            done.send((workers, remaining)).unwrap();
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        // Always unblock/join our own fake threads, including a regression that exceeded budget.
+        release.send(()).unwrap();
+        let in_budget = result.is_ok();
+        let (mut workers, remaining) =
+            result.unwrap_or_else(|_| completed.recv_timeout(Duration::from_secs(2)).unwrap());
+        stopper.join().unwrap();
+        assert!(stop_workers(&mut workers, Instant::now() + Duration::from_secs(2)).is_empty());
+        assert!(
+            in_budget,
+            "OS TLS destruction escaped the absolute join deadline"
+        );
+        assert_eq!(remaining, ["media-encode"]);
+    }
+
+    #[test]
+    fn decoder_stops_even_while_a_command_sender_remains_alive() {
+        let (events, _receiving) = mpsc::channel();
+        let (sender, worker) = start_destination(
+            None,
+            ProxyIds::default(),
+            events,
+            VideoSetup {
+                codecs: None,
+                gpu: None,
+            },
+        );
+        let mut workers = [worker];
+        assert!(stop_workers(&mut workers, Instant::now() + Duration::from_secs(2)).is_empty());
+        assert!(
+            sender
+                .send(DestCmd::Forget(ProjectionKey {
+                    source: NodeId([0; 32]),
+                    projection: ProjectionId(0)
+                }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_sender_mailbox_closes_at_stop_and_native_frames_drop_on_encoder() {
+        use super::source_queue_tests::{RetainedImages, counted_frame};
+        let retained = Arc::new(RetainedImages::default());
+        let (sender, receiver) = source_channel();
+        let frames = sender.frames.as_ref().unwrap().clone();
+        let stream = StreamId(1);
+        for id in 0..2 {
+            sender
+                .send(SourceCmd::Frame {
+                    stream,
+                    frame: counted_frame(&retained, id, PixelSize::new(8, 8), None),
+                })
+                .unwrap();
+        }
+        let (ready, started) = mpsc::channel();
+        let (close, closing) = mpsc::channel();
+        let worker = Worker::spawn("media-encode", move |stop| {
+            let _receiver = receiver;
+            ready.send(std::thread::current().id()).unwrap();
+            while !stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            closing.recv().unwrap();
+            close_source_frames(&frames);
+        });
+        sender.frames.as_ref().unwrap().lock().unwrap().stopping = worker.stop.clone();
+        let encoder = started.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.stop.store(true, Ordering::Release);
+        let rejected = sender
+            .send(SourceCmd::Frame {
+                stream,
+                frame: counted_frame(&retained, 2, PixelSize::new(8, 8), None),
+            })
+            .unwrap_err();
+        assert_eq!(
+            retained.live(),
+            3,
+            "the rejected new image stays in the caller's error"
+        );
+        drop(rejected);
+        assert_eq!(
+            retained.live(),
+            2,
+            "both queued images await owner-thread drainage"
+        );
+        close.send(()).unwrap();
+        let mut workers = [worker];
+        assert!(stop_workers(&mut workers, Instant::now() + Duration::from_secs(2)).is_empty());
+        assert_eq!(
+            retained.live(),
+            0,
+            "a retained sender holds no queued native images after join"
+        );
+        let drops = retained.dropped_on.lock().unwrap();
+        assert_eq!(drops.iter().filter(|thread| **thread == encoder).count(), 2);
+        assert!(sender.frames.as_ref().unwrap().lock().unwrap().closed);
+        assert!(
+            sender
+                .frames
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .queues
+                .is_empty()
+        );
+    }
+}
+
 #[cfg(test)]
 mod presented_tests {
     //! The `presented` hook (WP-4.5): a per-projection counter summed per source peer, `None`
@@ -1639,6 +1996,7 @@ pub(crate) mod source_queue_tests {
         live: AtomicUsize,
         peak: AtomicUsize,
         dropped: Mutex<Vec<u64>>,
+        pub(crate) dropped_on: Mutex<Vec<std::thread::ThreadId>>,
     }
     impl RetainedImages {
         pub(crate) fn live(&self) -> usize {
@@ -1658,6 +2016,11 @@ pub(crate) mod source_queue_tests {
         fn drop(&mut self) {
             self.retained.live.fetch_sub(1, Ordering::SeqCst);
             self.retained.dropped.lock().unwrap().push(self.id);
+            self.retained
+                .dropped_on
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
         }
     }
     impl NativeImage for CountedImage {
@@ -1754,7 +2117,7 @@ pub(crate) mod source_queue_tests {
             "one wake for the whole queued burst"
         );
         let queued = sender.frames.as_ref().unwrap().lock().unwrap();
-        let queue = &queued[&StreamId(1)];
+        let queue = &queued.queues[&StreamId(1)];
         assert_eq!(queue.iter().map(id).collect::<Vec<_>>(), vec![2, 22]);
         drop(queued);
         assert_eq!(

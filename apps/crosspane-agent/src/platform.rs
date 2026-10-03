@@ -317,14 +317,76 @@ pub fn exit_deadline(after: std::time::Duration) {
         .name("exit-deadline".into())
         .spawn(move || {
             std::thread::sleep(after);
+            #[cfg(not(target_os = "linux"))]
             tracing::error!("the agent did not stop in time; killing it");
             #[cfg(target_os = "linux")]
-            let _ = rustix::process::kill_process(
-                rustix::process::getpid(),
-                rustix::process::Signal::KILL,
-            );
+            {
+                exit_diagnostic(
+                    "exit-deadline",
+                    "the agent did not stop in time; killing it",
+                );
+                let _ = rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::KILL,
+                );
+            }
             std::process::abort();
         });
+}
+
+#[cfg(target_os = "linux")]
+static EXIT_STDERR_SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Classify once before GPU startup: filesystem metadata revalidation can block even in fstat.
+#[cfg(target_os = "linux")]
+pub fn prepare_exit_diagnostics() {
+    use rustix::fs::{FileType, fstat};
+    EXIT_STDERR_SAFE.get_or_init(|| {
+        fstat(std::io::stderr()).is_ok_and(|stat| {
+            matches!(
+                FileType::from_raw_mode(stat.st_mode),
+                FileType::Fifo | FileType::Socket
+            )
+        })
+    });
+}
+
+/// Best-effort pipe/socket writes bypass stdio locks; unprepared/unsupported sinks are omitted.
+#[cfg(target_os = "linux")]
+pub fn exit_diagnostic(owner: &str, reason: &str) {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    if EXIT_STDERR_SAFE.get() != Some(&true) {
+        return;
+    }
+    let stderr = std::io::stderr();
+    let Ok(flags) = fcntl_getfl(&stderr) else {
+        return;
+    };
+    if fcntl_setfl(&stderr, flags | OFlags::NONBLOCK).is_err() {
+        return;
+    }
+    // Called only immediately before termination: no buffering, allocation, retry or flag restore.
+    let _ = rustix::io::writev(
+        &stderr,
+        &[
+            std::io::IoSlice::new(owner.as_bytes()),
+            std::io::IoSlice::new(b": "),
+            std::io::IoSlice::new(reason.as_bytes()),
+            std::io::IoSlice::new(b"\n"),
+        ],
+    );
+}
+
+/// A GPU destructor can still be running on timeout, panic or second signal. Skip libc handlers.
+#[cfg(target_os = "linux")]
+pub fn exit_without_handlers(status: i32) -> ! {
+    // SAFETY: the declaration matches Linux libc's non-returning C ABI for _exit.
+    unsafe extern "C" {
+        fn _exit(status: std::ffi::c_int) -> !;
+    }
+    // SAFETY: _exit takes only the exit status, cannot return, and runs no driver/TLS handlers.
+    // These are lead-approved forced exits; ordinary completed joins use normal exit/exec.
+    unsafe { _exit(status) }
 }
 
 /// The border a Hyprland window wears while it is mirrored to another machine (04 §5).
