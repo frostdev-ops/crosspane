@@ -3,4 +3,5 @@ pub mod fonts;
 pub mod launch_agent;
 pub mod native_io;
 pub mod payload;
+pub mod permissions;
 pub mod transport;
