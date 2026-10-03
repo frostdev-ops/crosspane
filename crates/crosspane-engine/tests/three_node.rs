@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crosspane_engine::io::Warp;
+use crosspane_engine::io::{ClipBytes, Warp};
 use crosspane_engine::{
     Command, Engine, EngineConfig, InjectCmd, Input, Notice, Output, ProjectionKey, ProxyEvent,
 };
@@ -12,14 +12,16 @@ use crosspane_input::arrange;
 use crosspane_input::journal::MemoryJournal;
 use crosspane_input::layout::{Layout, Placed};
 use crosspane_platform::{
-    AudioEvent, CaptureEvent, CaptureId, CaptureStart, EndReason, LockState, MotionKind,
-    OverlayEvent, Parked, ParkingKind, PortalId, SessionEvent, SessionState, StreamId, WindowEvent,
-    WindowInfo, WindowRole, WindowState,
+    AudioEvent, CaptureEvent, CaptureId, CaptureStart, ClipKinds, ClipboardEvent, ClipboardHost,
+    EndReason, LocalPasteId, LockState, MotionKind, OverlayEvent, Parked, ParkingKind, PortalId,
+    SessionEvent, SessionState, StreamId, WindowEvent, WindowInfo, WindowRole, WindowState,
 };
 use crosspane_protocol::link::{LinkError, LinkEvent};
 use crosspane_protocol::msg::InputMessage;
-use crosspane_protocol::msg::{Capability, ControlMessage, Placement, Refusal};
+use crosspane_protocol::msg::{Capability, ClipFailure, ControlMessage, Placement, Refusal};
 use crosspane_protocol::projection::{ProjectionEndReason, ProjectionMessage};
+use crosspane_testkit::FakeClipboardHost;
+use crosspane_types::ClipKind;
 use crosspane_types::audio::AudioKind;
 use crosspane_types::color::ColorSpace;
 use crosspane_types::display::DisplayInfo;
@@ -111,6 +113,9 @@ struct Mesh {
     now: u64,
     held: BTreeSet<(NodeId, HidUsage)>,
     buttons: BTreeSet<(NodeId, MouseButton)>,
+    clipboard: BTreeMap<NodeId, FakeClipboardHost>,
+    delayed_clip_reads: Vec<(NodeId, Input)>,
+    delay_clip_reads: bool,
 }
 impl Mesh {
     fn new(split: bool) -> Self {
@@ -144,6 +149,9 @@ impl Mesh {
             now: 0,
             held: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            clipboard: BTreeMap::new(),
+            delayed_clip_reads: Vec::new(),
+            delay_clip_reads: false,
         };
         for (node, output) in startup {
             m.complete(node, &output);
@@ -251,6 +259,72 @@ impl Mesh {
         self.queue.push_back((node, input));
     }
     fn complete(&mut self, node: NodeId, output: &Output) {
+        if self.clipboard.contains_key(&node) {
+            match output {
+                Output::ClipPromise { offer, kinds } => self
+                    .clipboard
+                    .get_mut(&node)
+                    .unwrap()
+                    .promise(*offer, *kinds)
+                    .unwrap(),
+                Output::ClipWithdraw { offer } => self
+                    .clipboard
+                    .get_mut(&node)
+                    .unwrap()
+                    .withdraw(*offer)
+                    .unwrap(),
+                Output::ClipFulfil { paste, data } => self
+                    .clipboard
+                    .get_mut(&node)
+                    .unwrap()
+                    .fulfil(*paste, data.as_ref().map(|d| d.0.clone())),
+                Output::ClipRead {
+                    peer,
+                    fetch,
+                    kind,
+                    max_bytes,
+                } => {
+                    let result = self
+                        .clipboard
+                        .get_mut(&node)
+                        .unwrap()
+                        .read(*kind, *max_bytes)
+                        .map(ClipBytes)
+                        .map_err(|e| match e {
+                            crosspane_platform::PlatformError::Locked => ClipFailure::Locked,
+                            crosspane_platform::PlatformError::TooLarge => ClipFailure::TooLarge,
+                            _ => ClipFailure::Unavailable,
+                        });
+                    let input = Input::ClipReadDone {
+                        peer: *peer,
+                        fetch: *fetch,
+                        result,
+                    };
+                    if self.delay_clip_reads {
+                        self.delayed_clip_reads.push((node, input));
+                    } else {
+                        self.answer(node, input);
+                    }
+                }
+                Output::SendClipData {
+                    peer,
+                    fetch,
+                    kind,
+                    data,
+                } if !self.blocked.contains(&(node, *peer)) => {
+                    self.answer(
+                        *peer,
+                        Input::ClipData {
+                            peer: node,
+                            fetch: *fetch,
+                            kind: *kind,
+                            data: data.clone(),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
         match output {
             Output::Inject {
                 cmd: InjectCmd::Key { usage, down },
@@ -416,6 +490,66 @@ impl Mesh {
         if let Some((node, input)) = response {
             self.answer(node, input);
         }
+    }
+    fn enable_clipboard(&mut self) {
+        for node in NODES {
+            self.clipboard.insert(node, FakeClipboardHost::default());
+            let Input::Grants(mut grants) =
+                grants(&NODES.into_iter().filter(|p| *p != node).collect::<Vec<_>>())
+            else {
+                unreachable!()
+            };
+            for caps in grants.values_mut() {
+                caps.extend([Capability::ClipboardRead, Capability::ClipboardWrite]);
+            }
+            self.feed(node, Input::Grants(grants));
+            for peer in NODES.into_iter().filter(|p| *p != node) {
+                self.feed(
+                    node,
+                    Input::ClipPeer {
+                        peer,
+                        available: true,
+                    },
+                );
+            }
+        }
+    }
+    fn clipboard_copy(&mut self, node: NodeId, text: &[u8]) {
+        self.clipboard
+            .get_mut(&node)
+            .unwrap()
+            .copy(Some(text.to_vec()), None);
+        self.feed(
+            node,
+            Input::Clipboard(ClipboardEvent::Changed {
+                kinds: ClipKinds {
+                    text: true,
+                    image: false,
+                },
+            }),
+        );
+    }
+    fn clipboard_paste(&mut self, node: NodeId, paste: u64) {
+        let host = self.clipboard.get_mut(&node).unwrap();
+        let offer = host.current_promise().unwrap().0;
+        host.paste(LocalPasteId(paste), ClipKind::Text);
+        self.feed(
+            node,
+            Input::Clipboard(ClipboardEvent::PasteRequested {
+                paste: LocalPasteId(paste),
+                offer,
+                kind: ClipKind::Text,
+            }),
+        );
+    }
+    fn clipboard_focus(&mut self, node: NodeId, key: ProjectionKey, focused: bool) {
+        self.feed(
+            node,
+            Input::Proxy {
+                key,
+                event: ProxyEvent::Focus(focused),
+            },
+        );
     }
     fn enter(&mut self, node: NodeId, toward: NodeId, position: f64) {
         // Physical-strip ordering is exposed by installed portals, not manufactured ids.
@@ -1284,4 +1418,186 @@ fn same_window_can_project_to_two_destinations() {
         m.log
     );
     assert_eq!(m.count(B, |o| matches!(o, Output::CloseProxy { .. })), 0);
+}
+
+#[test]
+fn clipboard_c_offer_supersedes_as_promise_on_b_without_relay_or_late_fulfilment() {
+    let mut m = Mesh::new(false);
+    m.enable_clipboard();
+    let a = m.project(A, B, WINDOW);
+    let c = m.project(C, B, WINDOW);
+    assert_eq!(
+        a.projection, c.projection,
+        "connection-local IDs deliberately collide"
+    );
+    m.clipboard_focus(B, a, true);
+    m.clipboard_copy(A, b"A fixture");
+    m.clipboard_focus(B, a, false);
+    assert!(m.clipboard[&B].current_promise().is_some());
+    assert_eq!(m.clipboard[&A].reads, 0);
+    m.delay_clip_reads = true;
+    m.clipboard_paste(B, 400);
+    assert_eq!(m.clipboard[&A].reads, 1);
+    assert!(m.clipboard[&B].answer(LocalPasteId(400)).is_none());
+
+    m.clipboard_focus(B, c, true);
+    m.clipboard_copy(C, b"C fixture");
+    m.clipboard_focus(B, c, false);
+    assert_eq!(m.clipboard[&B].answer(LocalPasteId(400)), Some(&None));
+    assert_eq!(m.clipboard[&C].reads, 0);
+    for (node, input) in std::mem::take(&mut m.delayed_clip_reads) {
+        m.feed(node, input);
+    }
+    assert_eq!(m.clipboard[&B].answer(LocalPasteId(400)), Some(&None));
+    m.delay_clip_reads = false;
+    m.clipboard_paste(B, 401);
+    assert_eq!(
+        m.clipboard[&B].answer(LocalPasteId(401)),
+        Some(&Some(b"C fixture".to_vec()))
+    );
+    assert_eq!(m.clipboard[&A].reads, 1);
+    assert_eq!(m.clipboard[&C].reads, 1);
+    assert_eq!(m.clipboard[&B].reads, 0);
+    assert_eq!(
+        m.count(B, |o| matches!(
+            o,
+            Output::SendControl {
+                msg: ControlMessage::ClipOffer(_),
+                ..
+            }
+        )),
+        0
+    );
+}
+
+#[test]
+fn clipboard_source_focus_epochs_are_per_projection_and_peer() {
+    let mut m = Mesh::new(false);
+    m.enable_clipboard();
+    let b = m.project(A, B, WINDOW);
+    let c = m.project(A, C, WindowId(11));
+    m.clipboard_focus(B, b, true);
+    m.clipboard_copy(A, b"only B was focused");
+    m.clipboard_focus(C, c, false);
+    assert_eq!(
+        m.count(A, |o| matches!(
+            o,
+            Output::SendControl {
+                msg: ControlMessage::ClipOffer(_),
+                ..
+            }
+        )),
+        0
+    );
+    m.clipboard_focus(B, b, false);
+    assert_eq!(
+        m.count(A, |o| matches!(
+            o,
+            Output::SendControl {
+                peer: B,
+                msg: ControlMessage::ClipOffer(_),
+                ..
+            }
+        )),
+        1
+    );
+    assert!(m.clipboard[&C].current_promise().is_none());
+    m.clipboard_focus(C, c, true);
+    m.clipboard_copy(A, b"now C is focused");
+    m.clipboard_focus(C, c, false);
+    assert_eq!(
+        m.count(A, |o| matches!(
+            o,
+            Output::SendControl {
+                peer: C,
+                msg: ControlMessage::ClipOffer(_),
+                ..
+            }
+        )),
+        1
+    );
+    assert!(m.clipboard[&C].current_promise().is_some());
+    assert_eq!(m.clipboard[&A].reads, 0);
+}
+
+#[test]
+fn clipboard_home_guard_ignores_raw_source_focus_loss() {
+    let mut m = Mesh::new(false);
+    m.enable_clipboard();
+    let b = m.project(A, B, WINDOW);
+    m.clipboard_focus(B, b, true);
+    m.feed(
+        B,
+        Input::Proxy {
+            key: b,
+            event: ProxyEvent::Placed {
+                display: Some(DISPLAY),
+                origin: PointDevice::new(200.0, 300.0),
+                size: PixelSize::new(400, 300),
+            },
+        },
+    );
+    m.enter(A, B, 0.5);
+    m.motion(A, 250.0, -100.0);
+    m.feed(
+        B,
+        Input::Proxy {
+            key: b,
+            event: ProxyEvent::Motion {
+                position: PointDevice::new(50.0, 100.0),
+            },
+        },
+    );
+    assert_eq!(
+        m.count(A, |o| matches!(
+            o,
+            Output::Notice(Notice::Home { entered: true, .. })
+        )),
+        1
+    );
+    m.clipboard_copy(A, b"native home copy");
+    m.log.clear();
+    m.feed(
+        A,
+        projection(
+            B,
+            ProjectionMessage::Focus {
+                projection: b.projection,
+                focused: false,
+            },
+        ),
+    );
+    assert_eq!(
+        m.count(A, |o| matches!(
+            o,
+            Output::SendControl {
+                msg: ControlMessage::ClipOffer(_),
+                ..
+            }
+        )),
+        0
+    );
+    m.feed(A, Input::Command(Command::ReleaseControl));
+    m.clipboard_copy(A, b"copy after leaving home");
+    m.feed(
+        A,
+        projection(
+            B,
+            ProjectionMessage::Focus {
+                projection: b.projection,
+                focused: false,
+            },
+        ),
+    );
+    assert_eq!(
+        m.count(A, |o| matches!(
+            o,
+            Output::SendControl {
+                msg: ControlMessage::ClipOffer(_),
+                ..
+            }
+        )),
+        1,
+        "ignored focus loss must not clear the accepted focus epoch"
+    );
 }

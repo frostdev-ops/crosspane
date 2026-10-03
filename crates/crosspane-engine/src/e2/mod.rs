@@ -93,6 +93,21 @@ impl fmt::Debug for E2 {
 }
 
 impl E2 {
+    /// Accepted focus only; pending wishes and ignored raw events never appear here.
+    pub(crate) fn clipboard_source_focus(
+        &self,
+    ) -> impl Iterator<Item = (ProjectionId, NodeId)> + '_ {
+        self.sources
+            .iter()
+            .filter_map(|(id, source)| source.clipboard_focused.then_some((*id, source.peer)))
+    }
+
+    pub(crate) fn clipboard_destination_focus(&self) -> impl Iterator<Item = ProjectionKey> + '_ {
+        self.destinations
+            .iter()
+            .filter_map(|(key, destination)| destination.clipboard_focused.then_some(*key))
+    }
+
     /// Start the E2 roles. `journal` records keys and buttons injected into projected windows
     /// (separate from E1's); the returned outputs are its crash recovery, run first.
     pub fn new(

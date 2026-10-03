@@ -1,7 +1,7 @@
 //! Lazy clipboard admission and metadata only; content is moved straight between I/O values.
 //! Peer promises clear native kinds without advancing the epoch and are never re-offered
 //! onward: B holding A's promise cannot relay it to C; C needs its own offer path with A.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crosspane_platform::{ClipKinds, ClipboardEvent, LocalPasteId, SessionEvent};
@@ -11,9 +11,13 @@ use crosspane_protocol::msg::{
     Capability, ClipFailure, ClipFetch, ClipFetchFailed, ClipFetchId, ClipOffer, ClipOfferId,
     ClipWithdraw, ControlMessage,
 };
-use crosspane_types::{ClipKind, id::NodeId, time::MonoTime};
+use crosspane_types::{
+    ClipKind,
+    id::{NodeId, ProjectionId},
+    time::MonoTime,
+};
 
-use crate::{Input, Output};
+use crate::{Input, Output, ProjectionKey};
 
 #[derive(Debug, Default)]
 struct Peer {
@@ -60,6 +64,8 @@ pub(crate) struct Clip {
     engine_permits: bool,
     controller: Option<NodeId>,
     target: Option<NodeId>,
+    source_focus: BTreeMap<ProjectionId, (NodeId, u64)>,
+    destination_focus: BTreeSet<ProjectionKey>,
 }
 impl Clip {
     pub(crate) fn new() -> Self {
@@ -94,6 +100,7 @@ impl Clip {
         now: MonoTime,
         controller: Option<NodeId>,
         target: Option<NodeId>,
+        e2: &crate::e2::E2,
         out: &mut Vec<Output>,
     ) {
         if let Some(p) = &mut self.promise {
@@ -259,6 +266,31 @@ impl Clip {
         }
         self.controller = controller;
         self.target = target;
+        self.e2_triggers(e2, out);
+    }
+    fn e2_triggers(&mut self, e2: &crate::e2::E2, out: &mut Vec<Output>) {
+        let sources: BTreeMap<_, _> = e2.clipboard_source_focus().collect();
+        for (projection, (peer, epoch)) in std::mem::take(&mut self.source_focus) {
+            if sources.get(&projection) == Some(&peer) {
+                self.source_focus.insert(projection, (peer, epoch));
+            } else if self.epoch != epoch {
+                self.offer(peer, out);
+            }
+        }
+        for (projection, peer) in sources {
+            self.source_focus
+                .entry(projection)
+                .or_insert((peer, self.epoch));
+        }
+        let destinations: BTreeSet<_> = e2.clipboard_destination_focus().collect();
+        let gained: Vec<_> = destinations
+            .difference(&self.destination_focus)
+            .copied()
+            .collect();
+        for key in gained {
+            self.offer(key.source, out);
+        }
+        self.destination_focus = destinations;
     }
     fn offer(&mut self, peer: NodeId, out: &mut Vec<Output>) {
         if !self.admitted(peer) || !self.gate() || (!self.kinds.text && !self.kinds.image) {

@@ -45,6 +45,7 @@ struct HostRefusal {
 pub(super) struct Destination {
     pub(super) title: String,
     open: bool,
+    pub(super) clipboard_focused: bool,
     open_due: Option<MonoTime>,
     suspended: Option<MonoTime>,
     /// Latest proxy geometry, including resizes not yet sent over the link.
@@ -516,6 +517,7 @@ impl E2 {
                 Destination {
                     title: window.title.clone(),
                     open: false,
+                    clipboard_focused: false,
                     open_due: Some(now.saturating_add(OPEN_TIMEOUT)),
                     suspended: None,
                     current: None,
@@ -790,6 +792,7 @@ impl E2 {
                 }
             }
             ProxyEvent::Focus(focused) => {
+                destination.clipboard_focused = *focused;
                 send(
                     key.source,
                     Message::Focus {

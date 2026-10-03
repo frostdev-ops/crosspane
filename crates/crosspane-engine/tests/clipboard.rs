@@ -3,11 +3,12 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crosspane_engine::io::ClipBytes;
-use crosspane_engine::{Command, Engine, EngineConfig, Input, Output};
+use crosspane_engine::{Command, Engine, EngineConfig, Input, Output, ProjectionKey, ProxyEvent};
 use crosspane_input::journal::MemoryJournal;
 use crosspane_platform::{
     CaptureEvent, CaptureStart, ClipKinds, ClipboardEvent, ClipboardHost, Edge, EndReason, IoGate,
-    LockState, OverlayEvent, PortalId, SessionEvent, SessionState,
+    LockState, OverlayEvent, Parked, ParkingKind, PortalId, SessionEvent, SessionState, StreamId,
+    WindowEvent, WindowInfo, WindowRole, WindowState,
 };
 use crosspane_protocol::clip::{MAX_CLIP_IMAGE, MAX_CLIP_TEXT};
 use crosspane_protocol::link::{LinkError, LinkEvent};
@@ -15,13 +16,17 @@ use crosspane_protocol::msg::{
     Capability, ClipFailure, ClipFetch, ClipFetchFailed, ClipFetchId, ClipOffer, ClipOfferId,
     ClipWithdraw, ControlMessage, Placement,
 };
+use crosspane_protocol::projection::{ProjectionMessage, WindowSummary};
 use crosspane_testkit::FakeClipboardHost;
 use crosspane_types::{
     ClipKind,
     color::ColorSpace,
     display::DisplayInfo,
-    geom::{DisplayGeometry, PixelSize, PointLogical, PointMm, SizeMm},
-    id::{DisplayId, NodeId},
+    geom::{
+        DisplayGeometry, PixelRect, PixelSize, PointLogical, PointMm, RectLogical, SizeLogical,
+        SizeMm,
+    },
+    id::{DisplayId, NodeId, ProjectionId, WindowId},
     input::LockKeys,
     time::MonoTime,
 };
@@ -86,6 +91,18 @@ fn grant(read: bool, write: bool) -> Input {
         caps.insert(Capability::ClipboardWrite);
     }
     Input::Grants(NODES.into_iter().map(|p| (p, caps.clone())).collect())
+}
+fn e2_grant(read: bool, write: bool) -> Input {
+    let Input::Grants(mut grants) = grant(read, write) else {
+        unreachable!()
+    };
+    for caps in grants.values_mut() {
+        caps.extend([Capability::WindowShare, Capability::WindowPresent]);
+    }
+    Input::Grants(grants)
+}
+fn projection(peer: NodeId, msg: ProjectionMessage) -> Input {
+    control(peer, ControlMessage::Projection(msg))
 }
 fn prepared() -> Engine {
     let mut e = engine(NODES[1]);
@@ -163,6 +180,8 @@ struct World {
     pending: Arc<Mutex<VecDeque<(usize, Input)>>>,
     delayed: Vec<(usize, Input)>,
     delay_reads: bool,
+    delay_projection_capture: bool,
+    pending_captures: Vec<(usize, Input)>,
     trace: Vec<(usize, Output)>,
     portals: Vec<Vec<crosspane_platform::CapturePortal>>,
     captures: Vec<Option<crosspane_platform::CaptureId>>,
@@ -193,6 +212,8 @@ impl World {
             pending,
             delayed: Vec::new(),
             delay_reads: false,
+            delay_projection_capture: false,
+            pending_captures: Vec::new(),
             trace: Vec::new(),
             portals: vec![Vec::new(); count],
             captures: vec![None; count],
@@ -280,6 +301,47 @@ impl World {
     fn execute(&mut self, n: usize, o: Output) {
         match o {
             Output::EngineGate(permits) => self.gates[n].set_engine_permits(permits),
+            Output::OpenProxy { key, size, .. } => self.queue(
+                n,
+                Input::ProxyOpened {
+                    key,
+                    result: Ok((size, 1.0)),
+                },
+            ),
+            Output::Park { window, size, .. } | Output::ResizeParked { window, size, .. } => {
+                self.queue(
+                    n,
+                    Input::Parked {
+                        window,
+                        result: Ok(Parked {
+                            window,
+                            kind: ParkingKind::Twin,
+                            display: DisplayId(7),
+                            content: PixelRect::new(
+                                crosspane_types::geom::euclid::Point2D::new(0, 0),
+                                crosspane_types::geom::euclid::Point2D::new(
+                                    size.width as i32,
+                                    size.height as i32,
+                                ),
+                            ),
+                        }),
+                    },
+                );
+            }
+            Output::StartCapture { projection, .. } => {
+                let input = Input::CaptureStarted {
+                    projection,
+                    result: Ok(StreamId(projection.0)),
+                };
+                if self.delay_projection_capture {
+                    self.pending_captures.push((n, input));
+                } else {
+                    self.queue(n, input);
+                }
+            }
+            Output::ActivateWindow { window } => {
+                self.queue(n, Input::Windows(WindowEvent::Focused(Some(window))))
+            }
             Output::SetPortals(p) => {
                 let ids = p.iter().map(|p| p.id).collect();
                 self.portals[n] = p;
@@ -412,6 +474,55 @@ impl World {
     fn flush_reads(&mut self) {
         for (n, i) in std::mem::take(&mut self.delayed) {
             self.queue(n, i);
+        }
+        self.pump();
+    }
+    fn project(&mut self, from: usize, to: usize, window: WindowId) -> ProjectionKey {
+        self.feed(from, e2_grant(true, true));
+        self.feed(to, e2_grant(true, true));
+        self.feed(
+            from,
+            Input::Windows(WindowEvent::Added(WindowInfo {
+                id: window,
+                title: "E2 clipboard fixture".into(),
+                app_id: "fixture".into(),
+                pid: Some(123),
+                display: Some(DisplayId(1)),
+                frame: RectLogical::new(PointLogical::zero(), SizeLogical::new(400.0, 300.0)),
+                state: WindowState::Normal,
+                role: WindowRole::Toplevel,
+                parent: None,
+            })),
+        );
+        let first = self.trace.len();
+        self.feed(
+            from,
+            Input::Command(Command::Project {
+                window,
+                to: NODES[to],
+                place: None,
+            }),
+        );
+        self.trace[first..]
+            .iter()
+            .find_map(|(n, o)| match o {
+                Output::OpenProxy { key, .. } if *n == to => Some(*key),
+                _ => None,
+            })
+            .unwrap()
+    }
+    fn focus(&mut self, destination: usize, key: ProjectionKey, focused: bool) {
+        self.feed(
+            destination,
+            Input::Proxy {
+                key,
+                event: ProxyEvent::Focus(focused),
+            },
+        );
+    }
+    fn flush_projection_captures(&mut self) {
+        for (n, input) in std::mem::take(&mut self.pending_captures) {
+            self.queue(n, input);
         }
         self.pump();
     }
@@ -1470,4 +1581,327 @@ fn fake_empty_promise_kinds_returns_exact_backend_failure() {
         if message == "empty clipboard promise"
     ));
     assert!(host.current_promise().is_none());
+}
+
+fn offers(w: &World, from: usize, to: usize) -> usize {
+    w.trace
+        .iter()
+        .filter(|(n, o)| {
+            *n == from
+                && matches!(o,
+        Output::SendControl { peer, msg: ControlMessage::ClipOffer(_), .. }
+        if *peer == NODES[to])
+        })
+        .count()
+}
+
+#[test]
+fn e2_focus_round_trip_is_lazy_and_returns_only_changes_made_while_focused() {
+    let mut w = World::new(2);
+    let key = w.project(0, 1, WindowId(10));
+    w.copy(1, b"destination fixture");
+    w.focus(1, key, true);
+    assert_eq!(offers(&w, 1, 0), 1);
+    assert_eq!(w.hosts[1].reads, 0);
+    w.paste(0, 300);
+    assert_eq!(
+        w.answer(0, 300),
+        Some(&Some(b"destination fixture".to_vec()))
+    );
+    assert_eq!(w.hosts[1].reads, 1);
+    w.copy(0, b"projected app copy");
+    assert_eq!(offers(&w, 0, 1), 0);
+    w.focus(1, key, false);
+    assert_eq!(offers(&w, 0, 1), 1);
+    assert_eq!(w.hosts[0].reads, 0);
+    w.paste(1, 301);
+    assert_eq!(
+        w.answer(1, 301),
+        Some(&Some(b"projected app copy".to_vec()))
+    );
+    assert_eq!(w.hosts[0].reads, 1);
+}
+
+#[test]
+fn e2_projection_end_offers_the_focused_sources_changed_epoch() {
+    for end_on_source in [false, true] {
+        let mut w = World::new(2);
+        let key = w.project(0, 1, WindowId(10));
+        w.focus(1, key, true);
+        w.copy(0, b"copy before return");
+        w.feed(
+            if end_on_source { 0 } else { 1 },
+            Input::Command(Command::Return(key)),
+        );
+        assert_eq!(offers(&w, 0, 1), 1);
+        assert_eq!(w.hosts[0].reads, 0);
+        w.paste(1, 302);
+        assert_eq!(
+            w.answer(1, 302),
+            Some(&Some(b"copy before return".to_vec()))
+        );
+        assert_eq!(w.hosts[0].reads, 1);
+        w.focus(1, key, false);
+        assert_eq!(offers(&w, 0, 1), 1);
+    }
+}
+
+#[test]
+fn e2_unfocused_change_and_unchanged_focus_loss_do_not_offer() {
+    let mut w = World::new(2);
+    let key = w.project(0, 1, WindowId(10));
+    w.copy(0, b"before focus");
+    w.focus(1, key, true);
+    w.focus(1, key, false);
+    assert_eq!(offers(&w, 0, 1), 0);
+    w.copy(0, b"after focus");
+    w.focus(1, key, true);
+    w.focus(1, key, false);
+    assert_eq!(offers(&w, 0, 1), 0);
+    w.feed(0, Input::Command(Command::Return(key)));
+    assert_eq!(offers(&w, 0, 1), 0);
+}
+
+#[test]
+fn e2_repeated_destination_focus_does_not_offer_until_a_real_regain() {
+    let mut w = World::new(2);
+    let key = w.project(0, 1, WindowId(10));
+    w.copy(1, b"first destination fixture");
+    w.focus(1, key, true);
+    w.copy(1, b"second destination fixture");
+    w.focus(1, key, true);
+    assert_eq!(offers(&w, 1, 0), 1);
+    w.focus(1, key, false);
+    w.focus(1, key, true);
+    assert_eq!(offers(&w, 1, 0), 2);
+    assert_eq!(w.hosts[1].reads, 0);
+    w.paste(0, 303);
+    assert_eq!(
+        w.answer(0, 303),
+        Some(&Some(b"second destination fixture".to_vec()))
+    );
+}
+
+#[test]
+fn e2_wrong_peer_and_unknown_projection_focus_cannot_trigger_an_offer() {
+    let mut w = World::new(3);
+    let key = w.project(0, 1, WindowId(10));
+    w.feed(
+        0,
+        projection(
+            NODES[2],
+            ProjectionMessage::Focus {
+                projection: key.projection,
+                focused: true,
+            },
+        ),
+    );
+    w.feed(
+        0,
+        projection(
+            NODES[1],
+            ProjectionMessage::Focus {
+                projection: ProjectionId(999),
+                focused: true,
+            },
+        ),
+    );
+    w.copy(0, b"not accepted focus");
+    w.focus(1, key, false);
+    assert_eq!(offers(&w, 0, 1), 0);
+    assert_eq!(offers(&w, 0, 2), 0);
+    w.copy(1, b"destination fixture");
+    w.focus(
+        1,
+        ProjectionKey {
+            projection: ProjectionId(999),
+            ..key
+        },
+        true,
+    );
+    assert_eq!(offers(&w, 1, 0), 0);
+}
+
+#[test]
+fn e2_unopened_and_suspended_proxy_focus_is_not_accepted() {
+    let mut w = World::new(2);
+    w.feed(1, e2_grant(true, true));
+    w.copy(1, b"destination fixture");
+    let key = ProjectionKey {
+        source: NODES[0],
+        projection: ProjectionId(42),
+    };
+    let out = w.engines[1].handle(
+        projection(
+            NODES[0],
+            ProjectionMessage::Start {
+                projection: key.projection,
+                window: WindowSummary {
+                    title: "fixture".into(),
+                    app_id: "fixture".into(),
+                },
+                size: PixelSize::new(400, 300),
+            },
+        ),
+        ms(0),
+    );
+    assert!(out.iter().any(|o| matches!(o, Output::OpenProxy { .. })));
+    assert!(
+        only(w.engines[1].handle(
+            Input::Proxy {
+                key,
+                event: ProxyEvent::Focus(true)
+            },
+            ms(0)
+        ))
+        .is_empty()
+    );
+
+    let mut w = World::new(2);
+    let key = w.project(0, 1, WindowId(10));
+    for (node, peer) in [(1, NODES[0]), (0, NODES[1])] {
+        w.feed(
+            node,
+            Input::Link(LinkEvent::Closed {
+                peer,
+                error: LinkError::Closed,
+            }),
+        );
+    }
+    w.focus(1, key, true);
+    w.feed(1, Input::PeerUp { peer: NODES[0] });
+    w.feed(
+        1,
+        Input::ClipPeer {
+            peer: NODES[0],
+            available: true,
+        },
+    );
+    w.feed(0, Input::PeerUp { peer: NODES[1] });
+    w.feed(
+        0,
+        Input::ClipPeer {
+            peer: NODES[1],
+            available: true,
+        },
+    );
+    w.copy(1, b"after resume fixture");
+    assert_eq!(offers(&w, 1, 0), 0);
+    w.focus(1, key, true);
+    assert_eq!(offers(&w, 1, 0), 1);
+}
+
+#[test]
+fn e2_deferred_focus_records_its_epoch_only_after_successful_capture() {
+    let mut w = World::new(2);
+    w.delay_projection_capture = true;
+    let key = w.project(0, 1, WindowId(10));
+    w.focus(1, key, true);
+    w.copy(0, b"before capture accepts focus");
+    w.flush_projection_captures();
+    w.focus(1, key, false);
+    assert_eq!(offers(&w, 0, 1), 0);
+    let mut w = World::new(2);
+    w.delay_projection_capture = true;
+    let key = w.project(0, 1, WindowId(10));
+    w.focus(1, key, true);
+    w.copy(0, b"before capture accepts focus");
+    w.flush_projection_captures();
+    w.copy(0, b"after accepted focus");
+    w.focus(1, key, false);
+    assert_eq!(offers(&w, 0, 1), 1);
+
+    let mut w = World::new(2);
+    w.delay_projection_capture = true;
+    let key = w.project(0, 1, WindowId(10));
+    w.focus(1, key, true);
+    w.copy(0, b"copy during pending wish");
+    let (node, input) = w.pending_captures.pop().unwrap();
+    let Input::CaptureStarted { projection, .. } = input else {
+        unreachable!()
+    };
+    w.feed(
+        node,
+        Input::CaptureStarted {
+            projection,
+            result: Err(crosspane_engine::Failure::Other),
+        },
+    );
+    assert_eq!(offers(&w, 0, 1), 0);
+}
+
+#[test]
+fn e2_either_clipboard_grant_off_blocks_each_direction_without_ending_projection() {
+    for (node, read, write) in [(1, false, true), (0, true, false)] {
+        let mut w = World::new(2);
+        let key = w.project(0, 1, WindowId(10));
+        w.feed(node, e2_grant(read, write));
+        w.copy(1, b"destination fixture");
+        w.focus(1, key, true);
+        assert!(w.hosts[0].current_promise().is_none());
+        assert_eq!(w.hosts[1].reads, 0);
+        assert!(
+            !w.trace
+                .iter()
+                .any(|(_, o)| matches!(o, Output::CloseProxy { .. }))
+        );
+    }
+    for (node, read, write) in [(0, false, true), (1, true, false)] {
+        let mut w = World::new(2);
+        let key = w.project(0, 1, WindowId(10));
+        w.feed(node, e2_grant(read, write));
+        w.focus(1, key, true);
+        w.copy(0, b"source fixture");
+        w.focus(1, key, false);
+        assert!(w.hosts[1].current_promise().is_none());
+        assert_eq!(w.hosts[0].reads, 0);
+    }
+}
+
+#[test]
+fn e2_absent_clipboard_feature_blocks_both_focus_triggers() {
+    let mut w = World::new(2);
+    let key = w.project(0, 1, WindowId(10));
+    for (node, peer) in [(0, NODES[1]), (1, NODES[0])] {
+        w.feed(
+            node,
+            Input::ClipPeer {
+                peer,
+                available: false,
+            },
+        );
+    }
+    w.copy(1, b"destination fixture");
+    w.focus(1, key, true);
+    w.copy(0, b"source fixture");
+    w.focus(1, key, false);
+    assert_eq!(offers(&w, 0, 1), 0);
+    assert_eq!(offers(&w, 1, 0), 0);
+    assert!(
+        w.hosts
+            .iter()
+            .all(|h| h.reads == 0 && h.current_promise().is_none())
+    );
+}
+
+#[test]
+fn e2_lock_and_revocation_mid_fetch_answer_empty_and_drop_late_fulfilment() {
+    for (node, stop) in [
+        (0, state(LockState::Locked)),
+        (1, state(LockState::Unknown)),
+        (0, e2_grant(true, false)),
+        (1, e2_grant(false, true)),
+    ] {
+        let mut w = World::new(2);
+        let key = w.project(0, 1, WindowId(10));
+        w.copy(1, b"destination fixture");
+        w.focus(1, key, true);
+        w.delay_reads = true;
+        w.paste(0, 304);
+        assert_eq!(w.hosts[1].reads, 1);
+        w.feed(node, stop);
+        assert_eq!(w.answer(0, 304), Some(&None));
+        w.flush_reads();
+        assert_eq!(w.answer(0, 304), Some(&None));
+    }
 }

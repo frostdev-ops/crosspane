@@ -131,6 +131,7 @@ pub(super) struct Source {
     /// The destination's proxy has focus but the projection isn't live yet: activate the window
     /// when it is.
     focus_wanted: bool,
+    pub(super) clipboard_focused: bool,
 }
 
 impl E2 {
@@ -346,6 +347,7 @@ impl E2 {
                 parked_scale: scale,
                 last_activation: None,
                 focus_wanted: false,
+                clipboard_focused: false,
             },
         );
         Ok(())
@@ -597,6 +599,7 @@ impl E2 {
                 source.focus_wanted = *focused;
             }
             Message::Focus { focused: false, .. } if source.stage == Stage::Live => {
+                source.clipboard_focused = false;
                 if let Some(window) = self.focus_before.take()
                     && self.windows.contains_key(&window)
                     && !self.sources.values().any(|s| s.window == window)
@@ -1055,6 +1058,8 @@ impl E2 {
         let Some(source) = self.sources.get_mut(&projection) else {
             return;
         };
+        // Only reached by accepted live focus, including a deferred wish committed at capture.
+        source.clipboard_focused = true;
         source.focus_wanted = false;
         if source
             .parked
