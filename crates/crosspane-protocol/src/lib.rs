@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 
 pub mod audio;
+pub mod clip;
 pub mod link;
 pub mod msg;
 pub mod negotiate;

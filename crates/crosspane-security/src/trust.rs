@@ -294,6 +294,8 @@ mod grants_serde {
                 Capability::WindowPresent => Ok("WindowPresent"),
                 Capability::AudioSpeaker => Ok("AudioSpeaker"),
                 Capability::AudioMic => Ok("AudioMic"),
+                Capability::ClipboardRead => Ok("ClipboardRead"),
+                Capability::ClipboardWrite => Ok("ClipboardWrite"),
                 _ => Err(serde::ser::Error::custom("unknown capability")),
             })
             .collect();
@@ -313,6 +315,8 @@ mod grants_serde {
                 "WindowPresent" => Ok(Capability::WindowPresent),
                 "AudioSpeaker" => Ok(Capability::AudioSpeaker),
                 "AudioMic" => Ok(Capability::AudioMic),
+                "ClipboardRead" => Ok(Capability::ClipboardRead),
+                "ClipboardWrite" => Ok(Capability::ClipboardWrite),
                 _ => Err(serde::de::Error::custom("unknown capability")),
             })
             .collect()

@@ -46,6 +46,9 @@ pub enum PlatformError {
     /// A bounded wait ran out (e.g. a Hyprland IPC request; R19).
     #[error("timed out")]
     Timeout,
+    /// The requested clipboard content exceeds the caller's byte limit; never a truncation.
+    #[error("clipboard content exceeds the byte limit")]
+    TooLarge,
     /// Any other OS or compositor failure, described for logs. Never include key contents.
     #[error("{0}")]
     Backend(String),

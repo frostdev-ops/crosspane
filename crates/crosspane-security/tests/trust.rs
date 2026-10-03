@@ -28,6 +28,55 @@ fn entry(identity: &DeviceIdentity) -> PeerEntry {
 }
 
 #[test]
+fn clipboard_grants_round_trip_in_trust_files_without_changing_old_files_or_defaults() {
+    let identity = DeviceIdentity::generate().unwrap();
+    let mut store = TrustStore::new();
+    let mut peer = entry(&identity);
+    peer.granted = CAPABILITIES.into_iter().collect();
+    store.pin(peer).unwrap();
+    let old_json = store.to_json();
+    let old: serde_json::Value = serde_json::from_str(&old_json).unwrap();
+    assert_eq!(
+        old["peers"][0]["granted"],
+        serde_json::json!([
+            "InputAccept",
+            "WindowShare",
+            "WindowBrowse",
+            "WindowPresent",
+            "AudioSpeaker",
+            "AudioMic"
+        ])
+    );
+    assert_eq!(
+        TrustStore::from_json(&old_json).unwrap().to_json(),
+        old_json
+    );
+    for capability in [Capability::ClipboardRead, Capability::ClipboardWrite] {
+        assert!(!default_grants().contains(&capability));
+        assert!(!store.allows(identity.node(), capability));
+        store.set_grant(identity.node(), capability, true).unwrap();
+    }
+    let json = store.to_json();
+    let loaded = TrustStore::from_json(&json).unwrap();
+    assert_eq!(loaded, store);
+    assert_eq!(loaded.to_json(), json);
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["peers"][0]["granted"],
+        serde_json::json!([
+            "InputAccept",
+            "WindowShare",
+            "WindowBrowse",
+            "WindowPresent",
+            "AudioSpeaker",
+            "AudioMic",
+            "ClipboardRead",
+            "ClipboardWrite"
+        ])
+    );
+}
+
+#[test]
 fn pin_rejects_mismatched_nodes_and_bad_spkis() {
     let identity = DeviceIdentity::generate().unwrap();
     let peer = entry(&identity);

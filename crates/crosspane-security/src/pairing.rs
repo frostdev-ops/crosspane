@@ -589,6 +589,8 @@ fn capability_code(capability: Capability) -> Option<u8> {
         Capability::WindowPresent => Some(4),
         Capability::AudioSpeaker => Some(5),
         Capability::AudioMic => Some(6),
+        Capability::ClipboardRead => Some(7),
+        Capability::ClipboardWrite => Some(8),
         _ => None,
     }
 }
@@ -601,6 +603,8 @@ fn decode_capability(code: u8) -> Option<Capability> {
         4 => Some(Capability::WindowPresent),
         5 => Some(Capability::AudioSpeaker),
         6 => Some(Capability::AudioMic),
+        7 => Some(Capability::ClipboardRead),
+        8 => Some(Capability::ClipboardWrite),
         _ => None,
     }
 }

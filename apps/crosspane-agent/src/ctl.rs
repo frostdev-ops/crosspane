@@ -19,13 +19,15 @@ use crate::agent::Event;
 
 /// The capabilities `crosspanectl allow` can grant, by the name used on the command line, in the
 /// settings app and in `status`.
-const CAPABILITIES: [(&str, Capability); 6] = [
+const CAPABILITIES: [(&str, Capability); 8] = [
     ("input", Capability::InputAccept),
     ("share", Capability::WindowShare),
     ("browse", Capability::WindowBrowse),
     ("present", Capability::WindowPresent),
     ("speaker", Capability::AudioSpeaker),
     ("mic", Capability::AudioMic),
+    ("clipboard.read", Capability::ClipboardRead),
+    ("clipboard.write", Capability::ClipboardWrite),
 ];
 
 /// The capability a `crosspanectl allow` name stands for.
@@ -290,6 +292,25 @@ mod tests {
         // The names are exact: no plural, no case folding.
         for wrong in ["speakers", "Speaker", "microphone", "audio", ""] {
             assert_eq!(capability_named(wrong), None, "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn clipboard_names_map_only_to_the_explicit_clipboard_capabilities() {
+        for (name, capability) in [
+            ("clipboard.read", Capability::ClipboardRead),
+            ("clipboard.write", Capability::ClipboardWrite),
+        ] {
+            assert_eq!(capability_named(name), Some(capability));
+            assert_eq!(capability_name(capability), Some(name));
+        }
+        for wrong in [
+            "clipboard",
+            "ClipboardRead",
+            "clipboard.Read",
+            "clipboard.write ",
+        ] {
+            assert_eq!(capability_named(wrong), None);
         }
     }
 

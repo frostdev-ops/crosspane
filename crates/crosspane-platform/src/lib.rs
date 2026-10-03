@@ -29,6 +29,7 @@
 
 pub mod audio;
 pub mod capture;
+pub mod clipboard;
 pub mod display;
 pub mod error;
 pub mod frame;
@@ -51,6 +52,7 @@ pub use capture::{
     CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, Edge, EndReason,
     InputCapture, MotionKind, PortalId,
 };
+pub use clipboard::{ClipKinds, ClipboardEvent, ClipboardHost, LocalPasteId};
 pub use display::Displays;
 pub use error::{Permission, PlatformError};
 pub use frame::{

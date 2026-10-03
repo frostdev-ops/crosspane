@@ -1,5 +1,6 @@
 //! The logical message model. Field meanings are frozen; encodings live in [`crate::wire`].
 
+use crosspane_types::ClipKind;
 use crosspane_types::audio::{AudioKind, AudioStreamId};
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{PointDevice, PointMm};
@@ -188,6 +189,10 @@ pub enum ControlMessage {
     AudioClose {
         stream: AudioStreamId,
     },
+    ClipOffer(ClipOffer),
+    ClipWithdraw(ClipWithdraw),
+    ClipFetch(ClipFetch),
+    ClipFetchFailed(ClipFetchFailed),
 }
 
 /// Why an E1 session ended.
@@ -247,6 +252,53 @@ pub enum Capability {
     AudioSpeaker,
     /// The peer may capture this node's default microphone. Default off.
     AudioMic,
+    /// The peer may read this node's clipboard when the user pastes on the peer. Default off.
+    ClipboardRead, // wire 7
+    /// The peer may place clipboard offers (promises) here. Default off.
+    ClipboardWrite, // wire 8
+}
+
+/// Unique per holder, strictly increasing, never reused (CLIP-v0 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClipOfferId(pub u64);
+
+/// Unique per requester, strictly increasing (CLIP-v0 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClipFetchId(pub u64);
+
+/// An offer contains 1..=2 distinct kinds and no clipboard content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipOffer {
+    pub offer: ClipOfferId,
+    pub kinds: Vec<ClipKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipWithdraw {
+    pub offer: ClipOfferId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipFetch {
+    pub fetch: ClipFetchId,
+    pub offer: ClipOfferId,
+    pub kind: ClipKind,
+}
+
+/// Wire codes 1..=5 in declaration order; 0 and unknown codes are rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipFailure {
+    Expired,
+    Locked,
+    NotGranted,
+    TooLarge,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipFetchFailed {
+    pub fetch: ClipFetchId,
+    pub reason: ClipFailure,
 }
 
 /// "Node `issuer` revokes `revoked`" (04 §4), signed by the issuer's device key over

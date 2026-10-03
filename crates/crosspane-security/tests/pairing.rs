@@ -292,6 +292,36 @@ fn happy_path() {
     );
 }
 
+#[test]
+fn explicitly_supplied_clipboard_grants_round_trip_through_pairing_exchange() {
+    let mut li = local(1);
+    li.grants = vec![Capability::ClipboardRead, Capability::ClipboardWrite];
+    let lj = local(2);
+    let (mut i, commit) = Initiator::start(li.clone(), EXPORTER, &mut TestRng(11));
+    let (mut j, opening) = Joiner::start(lj.clone(), EXPORTER, &mut TestRng(22));
+    assert!(opening.is_empty());
+    let reveal_j = j.on_message(sent(&commit));
+    let reveal_i = i.on_message(sent(&reveal_j));
+    let sas = shown(&reveal_i);
+    assert!(offered(&j.on_message(sent(&reveal_i))).contains(&sas));
+    let matched = j.user_picked(sas);
+    assert_eq!(i.on_message(sent(&matched)), vec![Event::AskConfirm]);
+    let confirm_i = i.user_confirmed(true);
+    assert_eq!(
+        sent(&confirm_i).encode(),
+        [vec![4, 6], b"node 1".to_vec(), vec![2, 7, 8]].concat()
+    );
+    let confirm_j = j.on_message(sent(&confirm_i));
+    assert_eq!(
+        confirm_j,
+        vec![Event::Send(confirmed(2)), Event::Paired(peer(&li))]
+    );
+    assert_eq!(
+        i.on_message(sent(&confirm_j)),
+        vec![Event::Paired(peer(&lj))]
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 10_000,
@@ -618,7 +648,7 @@ fn codec_every_rejection_case() {
         payload.push(0);
         reject(&payload);
     }
-    for code in [0, 7, 255] {
+    for code in [0, 9, 255] {
         reject(&[4, 1, b'a', 1, code]);
     }
     for code in 1..=6 {

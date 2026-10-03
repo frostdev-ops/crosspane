@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 pub mod audio;
+pub mod clip;
 pub mod color;
 pub mod display;
 pub mod geom;
@@ -11,3 +12,5 @@ pub mod hid;
 pub mod id;
 pub mod input;
 pub mod time;
+
+pub use clip::ClipKind;

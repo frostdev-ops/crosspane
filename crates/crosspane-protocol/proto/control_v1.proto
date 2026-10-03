@@ -20,6 +20,10 @@ message ControlMessage {
     AudioStream audio_opened = 15;
     AudioRefused audio_refused = 16;
     AudioStream audio_close = 17;
+    ClipOffer clip_offer = 18;
+    ClipWithdraw clip_withdraw = 19;
+    ClipFetch clip_fetch = 20;
+    ClipFetchFailed clip_fetch_failed = 21;
   }
 }
 
@@ -51,7 +55,7 @@ message ControlRefused { uint64 session = 1; Refusal reason = 2; }
 enum EndReason { END_REASON_UNSPECIFIED = 0; END_REASON_RELEASED = 1; END_REASON_PANIC = 2; END_REASON_TARGET_LOCKED = 3; END_REASON_CONTROLLER_LOCKED = 4; END_REASON_LINK_LOST = 5; END_REASON_REVOKED = 6; }
 message EndControl { uint64 session = 1; EndReason reason = 2; }
 
-enum Capability { CAPABILITY_UNSPECIFIED = 0; CAPABILITY_INPUT_ACCEPT = 1; CAPABILITY_WINDOW_SHARE = 2; CAPABILITY_WINDOW_BROWSE = 3; CAPABILITY_WINDOW_PRESENT = 4; CAPABILITY_AUDIO_SPEAKER = 5; CAPABILITY_AUDIO_MIC = 6; }
+enum Capability { CAPABILITY_UNSPECIFIED = 0; CAPABILITY_INPUT_ACCEPT = 1; CAPABILITY_WINDOW_SHARE = 2; CAPABILITY_WINDOW_BROWSE = 3; CAPABILITY_WINDOW_PRESENT = 4; CAPABILITY_AUDIO_SPEAKER = 5; CAPABILITY_AUDIO_MIC = 6; CAPABILITY_CLIPBOARD_READ = 7; CAPABILITY_CLIPBOARD_WRITE = 8; }
 message Grants { repeated Capability capabilities = 1; }
 
 message Revocation { bytes revoked = 1; bytes issuer = 2; uint64 issued_at_ms = 3; bytes signature = 4; }
@@ -211,3 +215,11 @@ message ProjectionProxyPlaced {
 message AudioOpen { uint32 stream = 1; uint32 kind = 2; uint32 channels = 3; }
 message AudioStream { uint32 stream = 1; }
 message AudioRefused { uint32 stream = 1; uint32 reason = 2; }
+
+// CLIP-v0: no content on the control stream; 0/unknown enum codes are rejected.
+enum ClipKind { CLIP_KIND_UNSPECIFIED = 0; CLIP_KIND_TEXT = 1; CLIP_KIND_IMAGE = 2; }
+enum ClipFailure { CLIP_FAILURE_UNSPECIFIED = 0; CLIP_FAILURE_EXPIRED = 1; CLIP_FAILURE_LOCKED = 2; CLIP_FAILURE_NOT_GRANTED = 3; CLIP_FAILURE_TOO_LARGE = 4; CLIP_FAILURE_UNAVAILABLE = 5; }
+message ClipOffer { uint64 offer = 1; repeated ClipKind kinds = 2; } // 1..=2 distinct kinds.
+message ClipWithdraw { uint64 offer = 1; }
+message ClipFetch { uint64 fetch = 1; uint64 offer = 2; ClipKind kind = 3; }
+message ClipFetchFailed { uint64 fetch = 1; ClipFailure reason = 2; }

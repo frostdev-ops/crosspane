@@ -1,5 +1,6 @@
 //! Control-stream encoding (protobuf, schema in docs/wp/WP-1.2.md). Implemented in WP-1.2.
 
+use crosspane_types::ClipKind;
 use crosspane_types::audio::{AudioKind, AudioStreamId};
 use crosspane_types::color::ColorSpace;
 use crosspane_types::display::DisplayInfo;
@@ -12,7 +13,8 @@ use prost::Message;
 
 use super::{Frame, KIND_CONTROL, MAX_CONTROL_PAYLOAD, WIRE_VERSION, WireError};
 use crate::msg::{
-    Capability, ControlMessage, EndReason, Hello, Placement, Refusal, RevocationNotice,
+    Capability, ClipFailure, ClipFetch, ClipFetchFailed, ClipFetchId, ClipOffer, ClipOfferId,
+    ClipWithdraw, ControlMessage, EndReason, Hello, Placement, Refusal, RevocationNotice,
 };
 use crate::projection::{
     BrowsableWindow, MAX_BROWSE_WINDOWS, ParkingKind, ProjectionEndReason, ProjectionMessage,
@@ -60,6 +62,28 @@ fn check_len(len: usize, max: usize, field: &'static str) -> Result<(), WireErro
         return Err(WireError::BadValue(field));
     }
     Ok(())
+}
+
+fn check_clip_kinds(kinds: &[ClipKind]) -> Result<(), WireError> {
+    if !(1..=2).contains(&kinds.len()) || (kinds.len() == 2 && kinds[0] == kinds[1]) {
+        return Err(WireError::BadValue("clipboard kinds"));
+    }
+    Ok(())
+}
+
+fn clip_kind_to_pb(kind: ClipKind) -> i32 {
+    match kind {
+        ClipKind::Text => pb::ClipKind::Text as i32,
+        ClipKind::Image => pb::ClipKind::Image as i32,
+    }
+}
+
+fn clip_kind_from_pb(kind: i32) -> Result<ClipKind, WireError> {
+    match pb::ClipKind::try_from(kind) {
+        Ok(pb::ClipKind::Text) => Ok(ClipKind::Text),
+        Ok(pb::ClipKind::Image) => Ok(ClipKind::Image),
+        _ => Err(WireError::BadValue("clipboard kind")),
+    }
 }
 
 fn check_finite(values: &[f64]) -> Result<(), WireError> {
@@ -272,6 +296,8 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
                         Capability::WindowPresent => pb::Capability::WindowPresent,
                         Capability::AudioSpeaker => pb::Capability::AudioSpeaker,
                         Capability::AudioMic => pb::Capability::AudioMic,
+                        Capability::ClipboardRead => pb::Capability::ClipboardRead,
+                        Capability::ClipboardWrite => pb::Capability::ClipboardWrite,
                     }) as i32
                 })
                 .collect();
@@ -321,6 +347,31 @@ fn to_pb(msg: &ControlMessage) -> Result<pb::ControlMessage, WireError> {
             stream: check_audio_stream(u32::from(stream.0))?.0.into(),
         }),
         ControlMessage::Projection(message) => Body::Projection(projection_to_pb(message)?),
+        ControlMessage::ClipOffer(offer) => {
+            check_clip_kinds(&offer.kinds)?;
+            Body::ClipOffer(pb::ClipOffer {
+                offer: offer.offer.0,
+                kinds: offer.kinds.iter().copied().map(clip_kind_to_pb).collect(),
+            })
+        }
+        ControlMessage::ClipWithdraw(withdraw) => Body::ClipWithdraw(pb::ClipWithdraw {
+            offer: withdraw.offer.0,
+        }),
+        ControlMessage::ClipFetch(fetch) => Body::ClipFetch(pb::ClipFetch {
+            fetch: fetch.fetch.0,
+            offer: fetch.offer.0,
+            kind: clip_kind_to_pb(fetch.kind),
+        }),
+        ControlMessage::ClipFetchFailed(failed) => Body::ClipFetchFailed(pb::ClipFetchFailed {
+            fetch: failed.fetch.0,
+            reason: match failed.reason {
+                ClipFailure::Expired => pb::ClipFailure::Expired,
+                ClipFailure::Locked => pb::ClipFailure::Locked,
+                ClipFailure::NotGranted => pb::ClipFailure::NotGranted,
+                ClipFailure::TooLarge => pb::ClipFailure::TooLarge,
+                ClipFailure::Unavailable => pb::ClipFailure::Unavailable,
+            } as i32,
+        }),
         ControlMessage::Goodbye { message } => {
             check_len(message.len(), MAX_STRING, "goodbye message")?;
             Body::Goodbye(pb::Goodbye {
@@ -424,6 +475,8 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
                     Ok(pb::Capability::WindowPresent) => Ok(Capability::WindowPresent),
                     Ok(pb::Capability::AudioSpeaker) => Ok(Capability::AudioSpeaker),
                     Ok(pb::Capability::AudioMic) => Ok(Capability::AudioMic),
+                    Ok(pb::Capability::ClipboardRead) => Ok(Capability::ClipboardRead),
+                    Ok(pb::Capability::ClipboardWrite) => Ok(Capability::ClipboardWrite),
                     _ => Err(WireError::BadValue("capability")),
                 })
                 .collect::<Result<_, _>>()?;
@@ -470,6 +523,38 @@ fn from_pb(body: pb::control_message::Body) -> Result<ControlMessage, WireError>
             stream: check_audio_stream(close.stream)?,
         },
         Body::Projection(projection) => ControlMessage::Projection(projection_from_pb(projection)?),
+        Body::ClipOffer(offer) => {
+            check_len(offer.kinds.len(), 2, "clipboard kinds")?;
+            let kinds = offer
+                .kinds
+                .into_iter()
+                .map(clip_kind_from_pb)
+                .collect::<Result<Vec<_>, _>>()?;
+            check_clip_kinds(&kinds)?;
+            ControlMessage::ClipOffer(ClipOffer {
+                offer: ClipOfferId(offer.offer),
+                kinds,
+            })
+        }
+        Body::ClipWithdraw(withdraw) => ControlMessage::ClipWithdraw(ClipWithdraw {
+            offer: ClipOfferId(withdraw.offer),
+        }),
+        Body::ClipFetch(fetch) => ControlMessage::ClipFetch(ClipFetch {
+            fetch: ClipFetchId(fetch.fetch),
+            offer: ClipOfferId(fetch.offer),
+            kind: clip_kind_from_pb(fetch.kind)?,
+        }),
+        Body::ClipFetchFailed(failed) => ControlMessage::ClipFetchFailed(ClipFetchFailed {
+            fetch: ClipFetchId(failed.fetch),
+            reason: match pb::ClipFailure::try_from(failed.reason) {
+                Ok(pb::ClipFailure::Expired) => ClipFailure::Expired,
+                Ok(pb::ClipFailure::Locked) => ClipFailure::Locked,
+                Ok(pb::ClipFailure::NotGranted) => ClipFailure::NotGranted,
+                Ok(pb::ClipFailure::TooLarge) => ClipFailure::TooLarge,
+                Ok(pb::ClipFailure::Unavailable) => ClipFailure::Unavailable,
+                _ => return Err(WireError::BadValue("clipboard failure")),
+            },
+        }),
         Body::Goodbye(goodbye) => {
             check_len(goodbye.message.len(), MAX_STRING, "goodbye message")?;
             ControlMessage::Goodbye {
@@ -944,6 +1029,57 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
 
 // Handwritten prost definitions matching proto/control_v1.proto; no protoc/build script.
 mod pb {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+    #[repr(i32)]
+    pub enum ClipKind {
+        Unspecified = 0,
+        Text = 1,
+        Image = 2,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+    #[repr(i32)]
+    pub enum ClipFailure {
+        Unspecified = 0,
+        Expired = 1,
+        Locked = 2,
+        NotGranted = 3,
+        TooLarge = 4,
+        Unavailable = 5,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct ClipOffer {
+        #[prost(uint64, tag = "1")]
+        pub offer: u64,
+        #[prost(enumeration = "ClipKind", repeated, tag = "2")]
+        pub kinds: Vec<i32>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ClipWithdraw {
+        #[prost(uint64, tag = "1")]
+        pub offer: u64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ClipFetch {
+        #[prost(uint64, tag = "1")]
+        pub fetch: u64,
+        #[prost(uint64, tag = "2")]
+        pub offer: u64,
+        #[prost(enumeration = "ClipKind", tag = "3")]
+        pub kind: i32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ClipFetchFailed {
+        #[prost(uint64, tag = "1")]
+        pub fetch: u64,
+        #[prost(enumeration = "ClipFailure", tag = "2")]
+        pub reason: i32,
+    }
+
     #[derive(Clone, Copy, PartialEq, prost::Message)]
     pub struct AudioOpen {
         #[prost(uint32, tag = "1")]
@@ -1250,7 +1386,7 @@ mod pb {
     pub struct ControlMessage {
         #[prost(
             oneof = "control_message::Body",
-            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
+            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
         )]
         pub body: Option<control_message::Body>,
     }
@@ -1292,6 +1428,14 @@ mod pb {
             AudioRefused(super::AudioRefused),
             #[prost(message, tag = "17")]
             AudioClose(super::AudioStream),
+            #[prost(message, tag = "18")]
+            ClipOffer(super::ClipOffer),
+            #[prost(message, tag = "19")]
+            ClipWithdraw(super::ClipWithdraw),
+            #[prost(message, tag = "20")]
+            ClipFetch(super::ClipFetch),
+            #[prost(message, tag = "21")]
+            ClipFetchFailed(super::ClipFetchFailed),
         }
     }
 
@@ -1456,6 +1600,8 @@ mod pb {
         WindowPresent = 4,
         AudioSpeaker = 5,
         AudioMic = 6,
+        ClipboardRead = 7,
+        ClipboardWrite = 8,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]
