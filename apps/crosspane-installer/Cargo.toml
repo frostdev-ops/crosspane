@@ -26,3 +26,9 @@ png.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix.workspace = true
+
+# WP-4.8b/c (Linux detection): logind/Secret Service/PipeWire names over the admitted buses, and a
+# registry-only Wayland read, both on streams from native_io's pinned connections.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+wayland-client.workspace = true
