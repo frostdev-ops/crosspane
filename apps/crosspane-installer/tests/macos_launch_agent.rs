@@ -2016,3 +2016,793 @@ fn existing_log_plist_and_bookkeeping_parents_are_admitted_before_any_payload_mu
         assert_eq!(f.runner.count("bootout"), 0);
     }
 }
+
+#[test]
+fn superseded_waiting_resume_preserves_pending_receipt_and_performs_no_io() {
+    let f = Fixture::new(true);
+    f.runner.behavior.lock().unwrap().bootout = 1;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = events.clone();
+    let io = f.hooked(Arc::new(move |kind, _, identity| {
+        captured.lock().unwrap().push(kind.to_owned());
+        Ok(identity)
+    }));
+    let mut a = MacLaunchAgent::admit(
+        io.clone(),
+        inventory(),
+        Arc::new(ApprovalFixture(Approval::Allowed)),
+        &f.deadline(),
+    )
+    .unwrap();
+    bytes(
+        &launch_plist(&f),
+        &render_plist(f.io.target()).unwrap(),
+        0o600,
+    );
+    let selected = f.selected_on(io);
+    let plan = a
+        .plan(
+            1,
+            1,
+            Some((&selected, &f.reply(&f.status(1), 1))),
+            &f.deadline(),
+        )
+        .unwrap();
+    let consent = plan.consent(1, 1, true, true).unwrap();
+    let mut pending = a.execute(plan, consent, &f.deadline()).unwrap();
+    assert_eq!(pending.phase(), LaunchPhase::WaitingForCleanStop);
+    let _new = a
+        .plan(
+            2,
+            2,
+            Some((&selected, &f.reply(&f.status(1), 2))),
+            &f.deadline(),
+        )
+        .unwrap();
+    f.exit(true, "restored");
+    f.runner.behavior.lock().unwrap().job_pid = 0;
+    let record = f.io.target().installer_dir().join("launch-agent.json");
+    let receipt = read_owned(&record);
+    let identity = owned_stat(&record);
+    let phase = pending.phase();
+    let error = pending.error();
+    let calls = f.runner.native_calls.lock().unwrap().len();
+    let signatures = f.signatures.calls.lock().unwrap().len();
+    events.lock().unwrap().clear();
+    assert!(matches!(
+        a.resume_clean_stop(&mut pending, &f.deadline()),
+        Err(NativeError::Foreign)
+    ));
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(f.runner.native_calls.lock().unwrap().len(), calls);
+    assert_eq!(f.signatures.calls.lock().unwrap().len(), signatures);
+    assert_eq!(pending.phase(), phase);
+    assert_eq!(pending.error(), error);
+    assert!(same_inode(&identity, &owned_stat(&record)));
+    assert_eq!(read_owned(&record), receipt);
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert_eq!(f.runner.count("bootstrap"), 0);
+    assert_eq!(read_owned(&f.io.target().agent_path()), macho(false, 0));
+}
+
+#[test]
+fn six_second_consent_refreshes_admission_without_rebinding_the_plan() {
+    for installed in [false, true] {
+        let f = Fixture::new(installed);
+        let mut a = adapter(&f, Approval::Allowed);
+        let selected = installed.then(|| f.selected());
+        let reply = f.reply(&f.status(1), 1);
+        let plan = a
+            .plan(1, 1, selected.as_ref().map(|s| (s, &reply)), &f.deadline())
+            .unwrap();
+        let consent = plan.consent(1, 1, true, true).unwrap();
+        f.clock.0.store(6000, Ordering::Release);
+        let pending = a.execute(plan, consent, &f.deadline()).unwrap();
+        assert_eq!(pending.phase(), LaunchPhase::BootstrapRequested);
+        assert_eq!(pending.error(), None);
+        assert_eq!(f.runner.count("bootout"), usize::from(installed));
+        assert_eq!(f.runner.count("bootstrap"), 1);
+    }
+}
+
+#[test]
+fn six_second_clean_stop_refreshes_admission_and_uses_one_bootout() {
+    let f = Fixture::new(true);
+    f.runner.behavior.lock().unwrap().bootout = 1;
+    let mut a = adapter(&f, Approval::Allowed);
+    let mut pending = replace_existing(&f, &mut a);
+    f.clock.0.store(6000, Ordering::Release);
+    f.exit(true, "restored");
+    f.runner.behavior.lock().unwrap().job_pid = 0;
+    a.resume_clean_stop(&mut pending, &f.deadline()).unwrap();
+    assert_eq!(pending.phase(), LaunchPhase::BootstrapRequested);
+    assert_eq!(pending.error(), None);
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert_eq!(f.runner.count("bootstrap"), 1);
+}
+
+#[test]
+fn refreshed_signature_identity_drift_is_foreign_before_any_mutation() {
+    for installed in [false, true] {
+        let f = Fixture::new(installed);
+        let mut a = adapter(&f, Approval::Allowed);
+        let selected = installed.then(|| f.selected());
+        let reply = f.reply(&f.status(1), 1);
+        let plan = a
+            .plan(1, 1, selected.as_ref().map(|s| (s, &reply)), &f.deadline())
+            .unwrap();
+        let consent = plan.consent(1, 1, true, true).unwrap();
+        let path = if installed {
+            f.io.target().agent_path()
+        } else {
+            f.source.join("Crosspane.app/Contents/MacOS/Crosspane")
+        };
+        bytes(&path, &macho(false, 2), 0o755);
+        f.clock.0.store(6000, Ordering::Release);
+        assert!(matches!(
+            a.execute(plan, consent, &f.deadline()),
+            Err(NativeError::Foreign)
+        ));
+        assert_eq!(f.runner.count("bootout"), 0);
+        assert_eq!(f.runner.count("bootstrap"), 0);
+        assert!(!f.io.target().installer_dir().exists());
+        assert!(!launch_plist(&f).exists());
+    }
+}
+
+#[test]
+fn unknown_bootout_reconciles_only_original_clean_exit_without_repeating_stop() {
+    for outcome in [0, 1, 2, 3] {
+        let f = Fixture::new(true);
+        f.runner.behavior.lock().unwrap().bootout = 4;
+        let mut a = adapter(&f, Approval::Allowed);
+        let mut pending = replace_existing(&f, &mut a);
+        assert_eq!(pending.phase(), LaunchPhase::Unknown);
+        assert_eq!(pending.error(), Some(NativeError::OutcomeUnknown));
+        let record = f.io.target().installer_dir().join("launch-agent.json");
+        let receipt = read_owned(&record);
+        let persisted: Value = serde_json::from_slice(&receipt).unwrap();
+        assert_eq!(persisted["stop_attempted"], true);
+        if outcome != 1 {
+            f.exit(true, "restored");
+            f.runner.behavior.lock().unwrap().job_pid = 0;
+        }
+        if outcome == 2 {
+            let path = f.io.target().state_dir().join("last_exit.json");
+            let mut value: Value = serde_json::from_slice(&read_owned(&path)).unwrap();
+            value["instance_id"] = json!(9);
+            bytes(&path, &serde_json::to_vec(&value).unwrap(), 0o600);
+        }
+        let deadline = f.deadline();
+        if outcome == 3 {
+            f.clock.0.store(5000, Ordering::Release);
+        }
+        let result = a.resume_clean_stop(&mut pending, &deadline);
+        if outcome == 0 {
+            result.unwrap();
+            assert_eq!(pending.phase(), LaunchPhase::BootstrapRequested);
+            assert_eq!(pending.error(), None);
+            assert_eq!(f.runner.count("bootstrap"), 1);
+            assert!(
+                f.home
+                    .join("Applications/.Crosspane.app.crosspane-previous")
+                    .exists()
+            );
+            assert_eq!(
+                read_owned(pending.retained_prior().unwrap()),
+                render_plist(f.io.target()).unwrap()
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(match outcome {
+                    1 => NativeError::Unavailable,
+                    2 => NativeError::Foreign,
+                    _ => NativeError::Timeout,
+                })
+            );
+            assert_eq!(pending.phase(), LaunchPhase::Unknown);
+            assert_eq!(pending.error(), Some(NativeError::OutcomeUnknown));
+            assert_eq!(read_owned(&record), receipt);
+            assert_eq!(f.runner.count("bootstrap"), 0);
+            assert_eq!(read_owned(&f.io.target().agent_path()), macho(false, 0));
+            assert_eq!(
+                read_owned(&launch_plist(&f)),
+                render_plist(f.io.target()).unwrap()
+            );
+        }
+        assert_eq!(f.runner.count("bootout"), 1);
+    }
+}
+
+#[test]
+fn clean_stop_resume_refuses_changed_original_main_without_mutating_pending_state() {
+    let f = Fixture::new(true);
+    f.runner.behavior.lock().unwrap().bootout = 1;
+    let mut a = adapter(&f, Approval::Allowed);
+    let mut pending = replace_existing(&f, &mut a);
+    f.exit(true, "restored");
+    f.runner.behavior.lock().unwrap().job_pid = 0;
+    bytes(&f.io.target().agent_path(), &macho(false, 2), 0o755);
+    f.clock.0.store(6000, Ordering::Release);
+    let record = f.io.target().installer_dir().join("launch-agent.json");
+    let receipt = read_owned(&record);
+    let calls = f.runner.native_calls.lock().unwrap().len();
+    assert_eq!(
+        a.resume_clean_stop(&mut pending, &f.deadline()),
+        Err(NativeError::Foreign)
+    );
+    assert_eq!(pending.phase(), LaunchPhase::WaitingForCleanStop);
+    assert_eq!(pending.error(), None);
+    assert_eq!(read_owned(&record), receipt);
+    assert_eq!(f.runner.native_calls.lock().unwrap().len(), calls);
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert_eq!(f.runner.count("bootstrap"), 0);
+    assert!(
+        !f.home
+            .join("Applications/.Crosspane.app.crosspane-previous")
+            .exists()
+    );
+}
+
+#[test]
+fn prebootstrap_payload_readmission_refuses_source_drift_and_retains_all_prior_state() {
+    let f = Fixture::new(true);
+    let fired = Arc::new(AtomicBool::new(false));
+    let observed = fired.clone();
+    let source_main = f.source.join("Crosspane.app/Contents/MacOS/Crosspane");
+    let io = f.hooked(Arc::new(move |kind, path, identity| {
+        if kind == "dispatch" && path == Path::new("/usr/bin/plutil") {
+            bytes(&source_main, &macho(false, 2), 0o755);
+            observed.store(true, Ordering::Release);
+        }
+        Ok(identity)
+    }));
+    let mut a = MacLaunchAgent::admit(
+        io.clone(),
+        inventory(),
+        Arc::new(ApprovalFixture(Approval::Allowed)),
+        &f.deadline(),
+    )
+    .unwrap();
+    bytes(
+        &launch_plist(&f),
+        &render_plist(f.io.target()).unwrap(),
+        0o600,
+    );
+    let selected = f.selected_on(io);
+    let plan = a
+        .plan(
+            1,
+            1,
+            Some((&selected, &f.reply(&f.status(1), 1))),
+            &f.deadline(),
+        )
+        .unwrap();
+    let consent = plan.consent(1, 1, true, true).unwrap();
+    let pending = a.execute(plan, consent, &f.deadline()).unwrap();
+    assert!(fired.load(Ordering::Acquire));
+    assert_eq!(pending.phase(), LaunchPhase::Unknown);
+    assert_eq!(pending.error(), Some(NativeError::Foreign));
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert_eq!(f.runner.count("bootstrap"), 0);
+    assert_eq!(
+        read_owned(pending.retained_prior().unwrap()),
+        render_plist(f.io.target()).unwrap()
+    );
+    assert_eq!(
+        read_owned(
+            &f.home
+                .join("Applications/.Crosspane.app.crosspane-previous/Contents/MacOS/Crosspane")
+        ),
+        macho(false, 0)
+    );
+    assert_eq!(
+        read_owned(&f.home.join(".local/bin/.crosspanectl.crosspane-previous")),
+        macho(false, 0)
+    );
+    assert_eq!(read_owned(&f.io.target().agent_path()), macho(false, 1));
+}
+
+fn is_mutation_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "mkdir"
+            | "lock-open"
+            | "create-temp"
+            | "write"
+            | "file-sync"
+            | "publish"
+            | "parent-sync"
+            | "unlink"
+            | "complete"
+    )
+}
+fn traced_native(
+    f: &Fixture,
+    support: Arc<dyn SupportProbe>,
+    signatures: Arc<dyn SignatureProbe>,
+    hook: TestHook,
+) -> Arc<MacNativeIo> {
+    let mut target = f.io.target().clone();
+    target.test_hook = Some(hook);
+    Arc::new(
+        MacNativeIo::new(
+            target,
+            f.runner.clone(),
+            support,
+            signatures,
+            f.clock.clone(),
+        )
+        .unwrap(),
+    )
+}
+struct SwitchingSession {
+    inner: Arc<Support>,
+    armed: Arc<AtomicBool>,
+    observations: AtomicU64,
+    switch_at: u64,
+}
+impl SupportProbe for SwitchingSession {
+    fn observe(&self, deadline: &Deadline) -> NativeResult<SupportObservation> {
+        let mut facts = self.inner.observe(deadline)?;
+        if self.armed.load(Ordering::Acquire)
+            && self.observations.fetch_add(1, Ordering::AcqRel) + 1 >= self.switch_at
+        {
+            facts.gui.console_session = "different-supported-Aqua".into();
+            facts.gui.interactive_session = facts.gui.console_session.clone();
+        }
+        Ok(facts)
+    }
+}
+type SignatureCallback = Arc<dyn Fn(&Path, &mut SignatureObservation) + Send + Sync>;
+struct ObservedSignatures {
+    inner: Arc<Signatures>,
+    callback: SignatureCallback,
+}
+impl SignatureProbe for ObservedSignatures {
+    fn observe(
+        &self,
+        path: &Path,
+        approved: &SigningRequirement,
+        deadline: &Deadline,
+    ) -> NativeResult<SignatureObservation> {
+        let mut observation = self.inner.observe(path, approved, deadline)?;
+        (self.callback)(path, &mut observation);
+        Ok(observation)
+    }
+}
+
+#[test]
+fn refreshed_support_correlates_planned_session_after_admission_before_any_mutation() {
+    for switch_at in [3, 4] {
+        let f = Fixture::new(false);
+        let armed = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(SwitchingSession {
+            inner: f.support.clone(),
+            armed: armed.clone(),
+            observations: AtomicU64::new(0),
+            switch_at,
+        });
+        let mutations = Arc::new(Mutex::new(Vec::new()));
+        let captured = mutations.clone();
+        let io = traced_native(
+            &f,
+            probe.clone(),
+            f.signatures.clone(),
+            Arc::new(move |kind, _, identity| {
+                if is_mutation_boundary(kind) {
+                    captured.lock().unwrap().push(kind.to_owned());
+                }
+                Ok(identity)
+            }),
+        );
+        let mut a = MacLaunchAgent::admit(
+            io,
+            inventory(),
+            Arc::new(ApprovalFixture(Approval::Allowed)),
+            &f.deadline(),
+        )
+        .unwrap();
+        let plan = a.plan(1, 1, None, &f.deadline()).unwrap();
+        let consent = plan.consent(1, 1, false, false).unwrap();
+        armed.store(true, Ordering::Release);
+        assert!(matches!(
+            a.execute(plan, consent, &f.deadline()),
+            Err(NativeError::Foreign | NativeError::Unsupported)
+        ));
+        assert!(probe.observations.load(Ordering::Acquire) >= switch_at);
+        assert!(mutations.lock().unwrap().is_empty());
+        assert!(!f.io.target().installer_dir().exists());
+        assert!(!launch_plist(&f).exists());
+        assert_eq!(f.runner.count("bootout"), 0);
+        assert_eq!(f.runner.count("bootstrap"), 0);
+    }
+}
+
+#[test]
+fn equal_paths_independent_target_nonce_refreshes_original_instance_through_selected_io() {
+    let f = Fixture::new(true);
+    let target = MacTarget::scratch(f.io.target().paths().clone()).unwrap();
+    let selected_io = Arc::new(
+        MacNativeIo::new(
+            target,
+            f.runner.clone(),
+            f.support.clone(),
+            f.signatures.clone(),
+            f.clock.clone(),
+        )
+        .unwrap(),
+    );
+    let selected = f.selected_on(selected_io);
+    assert_eq!(selected.io.target().paths(), f.io.target().paths());
+    let mut a = adapter(&f, Approval::Allowed);
+    bytes(
+        &launch_plist(&f),
+        &render_plist(f.io.target()).unwrap(),
+        0o600,
+    );
+    let plan = a
+        .plan(
+            1,
+            1,
+            Some((&selected, &f.reply(&f.status(1), 1))),
+            &f.deadline(),
+        )
+        .unwrap();
+    let consent = plan.consent(1, 1, true, true).unwrap();
+    f.clock.0.store(6000, Ordering::Release);
+    let mut pending = a.execute(plan, consent, &f.deadline()).unwrap();
+    assert_eq!(pending.phase(), LaunchPhase::BootstrapRequested);
+    assert_eq!(pending.error(), None);
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert_eq!(f.runner.count("bootstrap"), 1);
+    let facts = finish(&f, &a, &mut pending, 2, 1);
+    assert!(facts.payload_verified.is_some());
+}
+
+#[test]
+fn installed_main_appearing_after_absent_plan_is_foreign_without_bookkeeping_mutation() {
+    let f = Fixture::new(false);
+    let mutations = Arc::new(Mutex::new(Vec::new()));
+    let captured = mutations.clone();
+    let io = traced_native(
+        &f,
+        f.support.clone(),
+        f.signatures.clone(),
+        Arc::new(move |kind, _, identity| {
+            if is_mutation_boundary(kind) {
+                captured.lock().unwrap().push(kind.to_owned());
+            }
+            Ok(identity)
+        }),
+    );
+    let mut a = MacLaunchAgent::admit(
+        io,
+        inventory(),
+        Arc::new(ApprovalFixture(Approval::Allowed)),
+        &f.deadline(),
+    )
+    .unwrap();
+    let plan = a.plan(1, 1, None, &f.deadline()).unwrap();
+    let consent = plan.consent(1, 1, false, false).unwrap();
+    bytes(&f.io.target().agent_path(), &macho(false, 0), 0o755);
+    let identity = f.io.metadata(&f.io.target().agent_path()).unwrap();
+    f.clock.0.store(6000, Ordering::Release);
+    assert!(matches!(
+        a.execute(plan, consent, &f.deadline()),
+        Err(NativeError::Foreign)
+    ));
+    assert!(mutations.lock().unwrap().is_empty());
+    assert_eq!(
+        f.io.metadata(&f.io.target().agent_path()).unwrap(),
+        identity
+    );
+    assert!(!f.io.target().installer_dir().exists());
+    assert!(!launch_plist(&f).exists());
+    assert_eq!(f.runner.count("bootout"), 0);
+    assert_eq!(f.runner.count("bootstrap"), 0);
+}
+
+#[test]
+fn prebootstrap_helper_admission_refusal_keeps_latest_durable_receipt_and_writes_nothing_afterward()
+{
+    let f = Fixture::new(false);
+    let source_main = f.source.join("Crosspane.app/Contents/MacOS/Crosspane");
+    let original_main = f.io.metadata(&source_main).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::new(Mutex::new(None));
+    let callback_path = source_main.clone();
+    let record = f.io.target().installer_dir().join("launch-agent.json");
+    let record_snapshot = record.clone();
+    let triggered = armed.clone();
+    let observed = captured.clone();
+    let callback_events = events.clone();
+    let signatures = Arc::new(ObservedSignatures {
+        inner: f.signatures.clone(),
+        callback: Arc::new(move |path, _| {
+            if path == callback_path && triggered.load(Ordering::Acquire) {
+                let bytes = read_owned(&record_snapshot);
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["phase"], "Published");
+                *observed.lock().unwrap() = Some((bytes, callback_events.lock().unwrap().len()));
+            }
+        }),
+    });
+    let source_helper = f.source.join("Crosspane.app/Contents/MacOS/crosspane-ui");
+    let hook_events = events.clone();
+    let triggered = armed.clone();
+    let io = traced_native(
+        &f,
+        f.support.clone(),
+        signatures,
+        Arc::new(move |kind, path, identity| {
+            if is_mutation_boundary(kind) {
+                hook_events.lock().unwrap().push(kind.to_owned());
+            }
+            if kind == "dispatch" && path == Path::new("/usr/bin/plutil") {
+                bytes(&source_helper, &macho(false, 2), 0o755);
+                triggered.store(true, Ordering::Release);
+            }
+            Ok(identity)
+        }),
+    );
+    let mut a = MacLaunchAgent::admit(
+        io,
+        inventory(),
+        Arc::new(ApprovalFixture(Approval::Allowed)),
+        &f.deadline(),
+    )
+    .unwrap();
+    let pending = execute_new(&f, &mut a);
+    assert!(armed.load(Ordering::Acquire));
+    assert_eq!(pending.phase(), LaunchPhase::Unknown);
+    assert_eq!(pending.error(), Some(NativeError::Foreign));
+    let (latest, count) = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(read_owned(&record), latest);
+    assert_eq!(events.lock().unwrap().len(), count);
+    assert_eq!(f.io.metadata(&source_main).unwrap(), original_main);
+    assert_eq!(f.runner.count("bootstrap"), 0);
+    assert_eq!(f.runner.count("bootout"), 0);
+    assert_eq!(read_owned(&f.io.target().agent_path()), macho(false, 1));
+    let payload: Value = serde_json::from_slice(&read_owned(
+        &f.io.target().installer_dir().join("payload.json"),
+    ))
+    .unwrap();
+    assert_eq!(payload["phase"], "Published");
+}
+
+#[test]
+fn valid_refreshed_installed_signature_observation_changes_without_file_drift_are_foreign() {
+    let f = Fixture::new(true);
+    let armed = Arc::new(AtomicBool::new(false));
+    let observed = Arc::new(AtomicBool::new(false));
+    let triggered = armed.clone();
+    let reached = observed.clone();
+    let path = f.io.target().agent_path();
+    let signatures = Arc::new(ObservedSignatures {
+        inner: f.signatures.clone(),
+        callback: Arc::new(move |candidate, value| {
+            if candidate == path && triggered.load(Ordering::Acquire) {
+                value.team_identifier = "OTHER12345".into();
+                assert!(
+                    value.strict_verified
+                        && value.apple_development
+                        && value.hardened_runtime
+                        && !value.ad_hoc
+                );
+                reached.store(true, Ordering::Release);
+            }
+        }),
+    });
+    let mutations = Arc::new(Mutex::new(Vec::new()));
+    let traced = mutations.clone();
+    let io = traced_native(
+        &f,
+        f.support.clone(),
+        signatures,
+        Arc::new(move |kind, _, identity| {
+            if is_mutation_boundary(kind) {
+                traced.lock().unwrap().push(kind.to_owned());
+            }
+            Ok(identity)
+        }),
+    );
+    let selected = f.selected_on(io.clone());
+    let mut a = MacLaunchAgent::admit(
+        io,
+        inventory(),
+        Arc::new(ApprovalFixture(Approval::Allowed)),
+        &f.deadline(),
+    )
+    .unwrap();
+    let plan = a
+        .plan(
+            1,
+            1,
+            Some((&selected, &f.reply(&f.status(1), 1))),
+            &f.deadline(),
+        )
+        .unwrap();
+    let consent = plan.consent(1, 1, true, true).unwrap();
+    let identity = f.io.metadata(&f.io.target().agent_path()).unwrap();
+    armed.store(true, Ordering::Release);
+    assert!(matches!(
+        a.execute(plan, consent, &f.deadline()),
+        Err(NativeError::Foreign)
+    ));
+    assert!(observed.load(Ordering::Acquire));
+    assert!(mutations.lock().unwrap().is_empty());
+    assert_eq!(
+        f.io.metadata(&f.io.target().agent_path()).unwrap(),
+        identity
+    );
+    assert_eq!(read_owned(&f.io.target().agent_path()), macho(false, 0));
+    assert!(!f.io.target().installer_dir().exists());
+    assert_eq!(f.runner.count("bootout"), 0);
+    assert_eq!(f.runner.count("bootstrap"), 0);
+}
+
+#[test]
+fn postinstall_main_admission_session_change_refuses_all_subsequent_mutations() {
+    let f = Fixture::new(false);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::new(Mutex::new(None));
+    let record = f.io.target().installer_dir().join("launch-agent.json");
+    let installed_main = f.io.target().agent_path();
+    let support = f.support.clone();
+    let callback_record = record.clone();
+    let payload_record = f.io.target().installer_dir().join("payload.json");
+    let callback_events = events.clone();
+    let callback_capture = captured.clone();
+    let signatures = Arc::new(ObservedSignatures {
+        inner: f.signatures.clone(),
+        callback: Arc::new(move |path, _| {
+            if path == installed_main && callback_capture.lock().unwrap().is_none() {
+                let payload: Value = serde_json::from_slice(&read_owned(&payload_record)).unwrap();
+                if payload["phase"] != "Published" {
+                    return;
+                }
+                let receipt = read_owned(&callback_record);
+                let value: Value = serde_json::from_slice(&receipt).unwrap();
+                assert_eq!(value["phase"], "Intent");
+                *callback_capture.lock().unwrap() =
+                    Some((receipt, callback_events.lock().unwrap().len()));
+                let mut facts = support.observation.lock().unwrap();
+                facts.gui.console_session = "different-supported-Aqua".into();
+                facts.gui.interactive_session = facts.gui.console_session.clone();
+            }
+        }),
+    });
+    let hook_events = events.clone();
+    let io = traced_native(
+        &f,
+        f.support.clone(),
+        signatures,
+        Arc::new(move |kind, _, identity| {
+            if is_mutation_boundary(kind) {
+                hook_events.lock().unwrap().push(kind.to_owned());
+            }
+            Ok(identity)
+        }),
+    );
+    let mut a = MacLaunchAgent::admit(
+        io,
+        inventory(),
+        Arc::new(ApprovalFixture(Approval::Allowed)),
+        &f.deadline(),
+    )
+    .unwrap();
+    let pending = execute_new(&f, &mut a);
+    let (latest, count) = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(pending.phase(), LaunchPhase::Unknown);
+    assert_eq!(pending.error(), Some(NativeError::Foreign));
+    assert_eq!(events.lock().unwrap().len(), count);
+    assert_eq!(read_owned(&record), latest);
+    assert!(!launch_plist(&f).exists());
+    assert!(!f.home.join("Library/Logs/Crosspane").exists());
+    assert_eq!(f.runner.count("bootout"), 0);
+    assert_eq!(f.runner.count("bootstrap"), 0);
+    assert_eq!(read_owned(&f.io.target().agent_path()), macho(false, 1));
+    let payload: Value = serde_json::from_slice(&read_owned(
+        &f.io.target().installer_dir().join("payload.json"),
+    ))
+    .unwrap();
+    assert_eq!(payload["phase"], "Published");
+}
+
+#[test]
+fn matching_prebootstrap_helper_refusal_preserves_published_receipt_without_any_later_write() {
+    let f = Fixture::new(false);
+    let mut first = adapter(&f, Approval::Allowed);
+    let mut first_pending = execute_new(&f, &mut first);
+    assert!(
+        finish(&f, &first, &mut first_pending, 2, 1)
+            .payload_verified
+            .is_some()
+    );
+    let source_main = f.source.join("Crosspane.app/Contents/MacOS/Crosspane");
+    let original_source = f.io.metadata(&source_main).unwrap();
+    let original_installed = f.io.metadata(&f.io.target().agent_path()).unwrap();
+    let armed = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::new(Mutex::new(None));
+    let record = f.io.target().installer_dir().join("launch-agent.json");
+    let callback_record = record.clone();
+    let callback_main = source_main.clone();
+    let callback_armed = armed.clone();
+    let callback_events = events.clone();
+    let callback_capture = captured.clone();
+    let signatures = Arc::new(ObservedSignatures {
+        inner: f.signatures.clone(),
+        callback: Arc::new(move |path, _| {
+            if path == callback_main && callback_armed.load(Ordering::Acquire) {
+                let receipt = read_owned(&callback_record);
+                let value: Value = serde_json::from_slice(&receipt).unwrap();
+                assert_eq!(value["phase"], "Published");
+                *callback_capture.lock().unwrap() =
+                    Some((receipt, callback_events.lock().unwrap().len()));
+            }
+        }),
+    });
+    let helper = f.source.join("Crosspane.app/Contents/MacOS/crosspane-ui");
+    let hook_events = events.clone();
+    let hook_armed = armed.clone();
+    let io = traced_native(
+        &f,
+        f.support.clone(),
+        signatures,
+        Arc::new(move |kind, path, identity| {
+            if is_mutation_boundary(kind) {
+                hook_events.lock().unwrap().push(kind.to_owned());
+            }
+            if kind == "dispatch" && path == Path::new("/usr/bin/plutil") {
+                bytes(&helper, &macho(false, 2), 0o755);
+                hook_armed.store(true, Ordering::Release);
+            }
+            Ok(identity)
+        }),
+    );
+    let selected = f.selected_on(io.clone());
+    let mut a = MacLaunchAgent::admit(
+        io,
+        inventory(),
+        Arc::new(ApprovalFixture(Approval::Allowed)),
+        &f.deadline(),
+    )
+    .unwrap();
+    let plan = a
+        .plan(
+            2,
+            2,
+            Some((&selected, &f.reply(&f.status(2), 2))),
+            &f.deadline(),
+        )
+        .unwrap();
+    assert_eq!(plan.state(), LaunchState::Owned);
+    let consent = plan.consent(2, 2, false, false).unwrap();
+    let pending = a.execute(plan, consent, &f.deadline()).unwrap();
+    assert!(armed.load(Ordering::Acquire));
+    assert_eq!(pending.phase(), LaunchPhase::Unknown);
+    assert_eq!(pending.error(), Some(NativeError::Foreign));
+    let (latest, count) = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(read_owned(&record), latest);
+    assert_eq!(events.lock().unwrap().len(), count);
+    assert_eq!(f.io.metadata(&source_main).unwrap(), original_source);
+    assert_eq!(
+        f.io.metadata(&f.io.target().agent_path()).unwrap(),
+        original_installed
+    );
+    assert_eq!(
+        read_owned(pending.retained_prior().unwrap()),
+        expected_plist(f.home.to_str().unwrap())
+    );
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert_eq!(f.runner.count("bootstrap"), 1);
+    let payload: Value = serde_json::from_slice(&read_owned(
+        &f.io.target().installer_dir().join("payload.json"),
+    ))
+    .unwrap();
+    assert_eq!(payload["phase"], "Verified");
+}

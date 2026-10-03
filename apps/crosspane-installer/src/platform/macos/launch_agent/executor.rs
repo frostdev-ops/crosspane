@@ -14,9 +14,9 @@ impl MacLaunchAgent {
         {
             return Err(NativeError::Foreign);
         }
-        self.support.check(&self.io, deadline)?;
+        let (payload, support) = self.refreshed(&plan, plan.installed_main.as_ref(), deadline)?;
         self.preflight(deadline)?;
-        self.parents(&self.io.target().installer_dir(), &self.support, deadline)?;
+        self.parents(&self.io.target().installer_dir(), &support, deadline)?;
         let mut pending = PendingLaunch {
             plan,
             consent,
@@ -24,43 +24,74 @@ impl MacLaunchAgent {
             error: None,
             payload: None,
             requested: false,
+            stop_attempted: false,
             requested_at: 0,
+            admission_refused: false,
             health_call: None,
             last_health: 0,
             prior: None,
         };
-        let lock = self.io.lock(&self.support, deadline)?;
-        self.persist(&pending, &self.io, &self.support, deadline)?;
+        let lock = self.io.lock(&support, deadline)?;
+        self.persist(&pending, &self.io, &support, deadline)?;
         drop(lock);
-        self.advance(&mut pending, deadline);
+        self.advance(&mut pending, &payload, &support, deadline);
         Ok(pending)
     }
     /// Rechecks actual original-process exit and the real C1 receipt; never reissues bootout.
-    /// WP-4.12c3 adds read-only reconciliation of an unknown bootout; this path retains prior state.
-    /// WP-4.12c3 rejects superseded pending consent here before reconciliation or advancement.
     pub fn resume_clean_stop(
         &self,
         pending: &mut PendingLaunch,
         deadline: &Deadline,
     ) -> NativeResult<()> {
-        if pending.phase != LaunchPhase::WaitingForCleanStop
+        if (pending.plan.revision, pending.plan.operation) != self.last {
+            return Err(NativeError::Foreign);
+        }
+        if (pending.phase != LaunchPhase::WaitingForCleanStop
+            && !(pending.phase == LaunchPhase::Unknown && pending.stop_attempted))
             || !Arc::ptr_eq(&self.owner, &pending.plan.owner)
         {
             return Err(NativeError::Invalid);
         }
-        self.advance(pending, deadline);
+        let (payload, support) = self.refreshed(
+            &pending.plan,
+            pending.plan.installed_main.as_ref(),
+            deadline,
+        )?;
+        if pending.phase == LaunchPhase::Unknown {
+            let original = pending.plan.original.as_ref().ok_or(NativeError::Invalid)?;
+            if CleanStopGate::observe(original.clone(), deadline)?.is_none() {
+                return Err(NativeError::Unavailable);
+            }
+            pending.phase = LaunchPhase::WaitingForCleanStop;
+        }
+        self.advance(pending, &payload, &support, deadline);
         Ok(())
     }
-    fn advance(&self, pending: &mut PendingLaunch, deadline: &Deadline) {
-        if let Err(error) = self.apply(pending, deadline) {
+    fn advance(
+        &self,
+        pending: &mut PendingLaunch,
+        payload: &MacPayload,
+        support: &SupportProof,
+        deadline: &Deadline,
+    ) {
+        if let Err(error) = self.apply(pending, payload, support, deadline) {
             pending.phase = LaunchPhase::Unknown;
             pending.error = Some(error);
-            let _ = self.persist(pending, &self.io, &self.support, deadline);
+            if !pending.admission_refused {
+                let _ = self.persist(pending, &self.io, support, deadline);
+            }
+        } else {
+            pending.error = None;
         }
     }
-    /// WP-4.12c3 refreshes expired admission proofs; until then a long wait fails closed.
-    fn apply(&self, pending: &mut PendingLaunch, deadline: &Deadline) -> NativeResult<()> {
-        self.support.check(&self.io, deadline)?;
+    fn apply(
+        &self,
+        pending: &mut PendingLaunch,
+        payload: &MacPayload,
+        support: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        support.check(&self.io, deadline)?;
         self.preflight(deadline)?;
         if pending.phase == LaunchPhase::Intent
             && self.snapshot(&self.io, deadline)? != pending.plan.snapshot
@@ -70,20 +101,38 @@ impl MacLaunchAgent {
         if let Some(original) = &pending.plan.original {
             if pending.phase == LaunchPhase::Intent {
                 let selected = pending.plan.selected.as_ref().ok_or(NativeError::Invalid)?;
+                pending.admission_refused = true;
+                let main = selected.io.admit_main_signature(
+                    &selected.io.target().agent_path(),
+                    &self.requirement,
+                    deadline,
+                )?;
+                let expected = pending
+                    .plan
+                    .installed_main
+                    .as_ref()
+                    .ok_or(NativeError::Invalid)?;
+                if main.observation() != expected.observation() {
+                    return Err(NativeError::Foreign);
+                }
+                let selected_support =
+                    Self::bound_support(&selected.io, &main, &pending.plan.session, deadline)?;
                 selected
                     .instance
-                    .revalidate(&selected.io, &selected.support, deadline)?;
+                    .revalidate(&selected.io, &selected_support, deadline)?;
+                pending.admission_refused = false;
+                pending.stop_attempted = true;
                 let output = Self::command(
                     &self.io,
                     NativeOperation::Launchctl(LaunchctlAction::Bootout),
-                    Some(&self.support),
+                    Some(support),
                     deadline,
                 )?;
                 if output.code != Some(0) {
                     return Err(NativeError::Refused);
                 }
                 pending.phase = LaunchPhase::WaitingForCleanStop;
-                self.persist(pending, &self.io, &self.support, deadline)?;
+                self.persist(pending, &self.io, support, deadline)?;
             }
             if CleanStopGate::observe(original.clone(), deadline)?.is_none() {
                 return Ok(());
@@ -96,18 +145,21 @@ impl MacLaunchAgent {
             .map(|o| CleanStopGate::observe(o.clone(), deadline))
             .transpose()?
             .flatten();
-        pending.payload = self.payload.install(
+        pending.stop_attempted = false;
+        pending.payload = payload.install(
             pending.plan.payload.take().ok_or(NativeError::Invalid)?,
             pending.consent.payload.take().ok_or(NativeError::Invalid)?,
             gate.as_ref(),
             deadline,
         )?;
+        pending.admission_refused = true;
         let main = self.io.admit_main_signature(
             &self.io.target().agent_path(),
             &self.requirement,
             deadline,
         )?;
-        let support = self.io.admit_support(&main, deadline)?;
+        let support = Self::bound_support(&self.io, &main, &pending.plan.session, deadline)?;
+        pending.admission_refused = false;
         self.parents(
             Self::plist(&self.io).parent().ok_or(NativeError::Invalid)?,
             &support,
@@ -166,6 +218,7 @@ impl MacLaunchAgent {
         }
         pending.phase = LaunchPhase::Published;
         self.persist(pending, &self.io, &support, deadline)?;
+        pending.admission_refused = true;
         if let Some(payload) = &pending.payload {
             if payload.phase() != PayloadPhase::Published {
                 return Err(NativeError::Refused);
@@ -188,17 +241,13 @@ impl MacLaunchAgent {
             }
         }
         // Genuine C1 Published token belongs to this object's install flow, not a disk receipt.
-        let main = self.io.admit_main_signature(
-            &self.io.target().agent_path(),
-            &self.requirement,
-            deadline,
-        )?;
-        let support = self.io.admit_support(&main, deadline)?;
+        let (_, support) = self.refreshed(&pending.plan, Some(&main), deadline)?;
         if self.io.metadata(&Self::plist(&self.io))? != Some(identity)
             || self.snapshot(&self.io, deadline)?.disabled != Disabled::No
         {
             return Err(NativeError::Foreign);
         }
+        pending.admission_refused = false;
         pending.phase = LaunchPhase::BootstrapRequested;
         pending.requested = true;
         pending.requested_at = self.io.clock().now_ms();

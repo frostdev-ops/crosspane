@@ -86,6 +86,7 @@ pub struct LaunchPlan {
     snapshot: Snapshot,
     original: Option<Arc<OriginalAgent>>,
     selected: Option<SelectedAgent>,
+    installed_main: Option<SignatureProof>,
     payload: Option<PayloadPlan>,
     matching: bool,
     session: String,
@@ -133,6 +134,8 @@ impl LaunchPlan {
 #[derive(Serialize, Deserialize)]
 struct Record {
     phase: LaunchPhase,
+    #[serde(default)]
+    stop_attempted: bool,
     session: String,
     baseline: Option<u64>,
     prior: Option<String>,
@@ -145,7 +148,9 @@ pub struct PendingLaunch {
     error: Option<NativeError>,
     payload: Option<PendingPayload>,
     requested: bool,
+    stop_attempted: bool,
     requested_at: u64,
+    admission_refused: bool,
     health_call: Option<u64>,
     last_health: u64,
     prior: Option<PathBuf>,
@@ -187,6 +192,7 @@ pub struct MacLaunchAgent {
     payload: MacPayload,
     inventory: ApprovedInventory,
     requirement: SigningRequirement,
+    main: SignatureProof,
     support: SupportProof,
     approval: Arc<dyn ApprovalProbe>,
     owner: Arc<()>,

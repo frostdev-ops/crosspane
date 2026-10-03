@@ -89,6 +89,7 @@ impl MacLaunchAgent {
         let applied = pending.requested || pending.phase == LaunchPhase::Published;
         let record = Record {
             phase: pending.phase,
+            stop_attempted: pending.stop_attempted,
             session: pending.plan.session.clone(),
             baseline: pending.plan.baseline,
             prior: pending

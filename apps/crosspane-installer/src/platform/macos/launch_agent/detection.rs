@@ -34,6 +34,7 @@ impl MacLaunchAgent {
             io,
             payload,
             requirement,
+            main,
             support,
             approval,
             owner: Arc::new(()),
@@ -149,6 +150,17 @@ impl MacLaunchAgent {
         let payload = self
             .payload
             .plan(revision, operation, original.clone(), deadline)?;
+        let installed_main = self
+            .io
+            .metadata(&self.io.target().agent_path())?
+            .map(|_| {
+                self.io.admit_main_signature(
+                    &self.io.target().agent_path(),
+                    &self.requirement,
+                    deadline,
+                )
+            })
+            .transpose()?;
         self.last = (revision, operation);
         Ok(LaunchPlan {
             owner: self.owner.clone(),
@@ -159,11 +171,51 @@ impl MacLaunchAgent {
             snapshot,
             original,
             selected,
+            installed_main,
             matching: payload.state() == PayloadState::Matching,
             payload: Some(payload),
             session,
             baseline,
         })
+    }
+    // Always refresh at action boundaries: the frozen proof deliberately exposes no age getter.
+    pub(super) fn refreshed(
+        &self,
+        plan: &LaunchPlan,
+        installed: Option<&SignatureProof>,
+        deadline: &Deadline,
+    ) -> NativeResult<(MacPayload, SupportProof)> {
+        self.main.revalidate(&self.io)?;
+        let expected = installed.unwrap_or(&self.main);
+        expected.revalidate(&self.io)?;
+        let payload = MacPayload::admit(self.io.clone(), self.inventory.clone(), deadline)?;
+        let main =
+            self.io
+                .admit_main_signature(expected.path(), expected.requirement(), deadline)?;
+        if main.observation() != expected.observation()
+            || payload.manifest_sha256() != self.payload.manifest_sha256()
+        {
+            return Err(NativeError::Foreign);
+        }
+        let support = Self::bound_support(&self.io, &main, &plan.session, deadline)?;
+        expected.revalidate(&self.io)?;
+        if installed.is_none() && self.io.metadata(&self.io.target().agent_path())?.is_some() {
+            return Err(NativeError::Foreign);
+        }
+        Ok((payload, support))
+    }
+    pub(super) fn bound_support(
+        io: &MacNativeIo,
+        main: &SignatureProof,
+        session: &str,
+        deadline: &Deadline,
+    ) -> NativeResult<SupportProof> {
+        let support = io.admit_support(main, deadline)?;
+        if io.support_observation(deadline)?.gui.console_session != session {
+            return Err(NativeError::Foreign);
+        }
+        support.check(io, deadline)?;
+        Ok(support)
     }
     fn owned(&self, snapshot: &Snapshot, deadline: &Deadline) -> NativeResult<bool> {
         let path = Self::record(&self.io);
