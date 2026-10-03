@@ -61,6 +61,29 @@ const LOCAL_MOTION_AGE: Duration = Duration::from_millis(500);
 const ENTRY_FRESH: Duration = LOCAL_MOTION_AGE;
 /// The tracker and the peer's report may differ by this many device pixels per axis (§2.3).
 const ENTRY_SLACK: f64 = 96.0;
+/// WP-2.43j: the entry warp lands at least this many device pixels inside the content. A strip is
+/// one logical pixel on the twin output's edge and the content fills the output there, so a point
+/// on the content's outermost pixels is on a strip: the warp itself would press it and bounce the
+/// pointer straight back out (live, 2026-10-02). The width is the Hyprland backend's: a 1x`length`
+/// layer surface per strip (`crosspane-platform-linux` `hyprland/capture/wayland.rs`, the
+/// `layer.set_size(width, height)` of each new strip), that is one logical pixel, so up to the
+/// output scale in device pixels; 8 covers scales up to 8.
+const ENTRY_CLEARANCE: i32 = 8;
+/// WP-2.43j: a strip whose content edge is at most this many device pixels from the entry point is
+/// the entry's own: the entering motion can carry the pointer back onto it.
+const ENTRY_NEAR: i32 = 48;
+/// WP-2.43j: presses on the entry's own strips this soon after the entry are the entering motion,
+/// not an exit. A strip pressed in that time stays ignored until the pointer leaves it
+/// (`EdgeReleased`): the spatial re-arm of WP-1.39, which the controller can't measure on the
+/// twin directly (the pointer is local while home).
+const ENTRY_GUARD: Duration = Duration::from_millis(300);
+/// WP-2.43j: a strip held since the guard counts again after this long from the entry even
+/// without a release: a push that long is meant.
+const ENTRY_HOLD: Duration = Duration::from_secs(1);
+/// WP-2.43j: how long the HUD stays quarantined after a show was abandoned or reported
+/// `Unavailable`: outcomes of that show arriving meanwhile are dropped (the overlay hosts answer
+/// far sooner), and no new show starts.
+const HUD_STALE: Duration = Duration::from_secs(1);
 /// A set of portals that was not installed is offered again this often (§2.8).
 const PORTALS_RETRY: Duration = Duration::from_millis(500);
 /// A pointer left on the twin is warped home again this often, while it can be (§2.7).
@@ -149,6 +172,12 @@ struct Home {
     generation: u32,
     strips_gen: u64,
     state: HomeState,
+    /// WP-2.43j: the content edges (by `edge_index`) within `ENTRY_NEAR` of the entry point...
+    entry_near: [bool; 4],
+    /// ...those of them pressed during the guard, ignored until released (or `ENTRY_HOLD`)...
+    entry_held: [bool; 4],
+    /// ...and when home was committed: the guard runs from there.
+    entered_at: Option<MonoTime>,
 }
 
 /// A1: the home bind was requested and its removal is not yet confirmed. Until it is, the seat
@@ -416,6 +445,30 @@ pub struct ControllerE1 {
     home_fence: Option<(ProjectionId, MonoTime)>,
     // Presses on a strip are ignored until the time (passive).
     exit_retry: BTreeMap<PortalId, MonoTime>,
+    // WP-2.43j: when the newest home warp was answered. An edge press stamped before it was made
+    // where the pointer was before the warp moved it (the agent delivers the answer first, then
+    // the events queued meanwhile): it is stale and starts nothing. The stamp is the time the
+    // engine processes the answer, a little after the warp itself, so a genuine press made in
+    // between is dropped too; that window is a few milliseconds, and Wayland pointer timestamps
+    // are whole milliseconds anyway. The platform repeats `EdgePressed` while the push goes on,
+    // so a dropped press costs one repeat, never the exit.
+    warp_fence: Option<MonoTime>,
+    // WP-2.43j: when the newest home warp was issued. Until its answer (or `END_TIMEOUT`), a
+    // crossing push's dwell never completes: the pointer may already be elsewhere.
+    warp_issued: Option<MonoTime>,
+    // WP-2.43j: when the HUD was last shown, while its outcome (`Visible` or `Unavailable`) is
+    // still owed.
+    hud_shown: Option<MonoTime>,
+    // WP-2.43j: the HUD is quarantined until this time. Its events carry no show attempt (the
+    // frozen `OverlayEvent`, and the frozen `HUD` id), so after a show was abandoned (hidden
+    // before its outcome) or reported `Unavailable`, further outcomes of that show may still come
+    // (the Mac host can send `Unavailable` and later `Visible` for one show). Until the time,
+    // every HUD outcome is dropped and no HUD is shown for a crossing or an exit: a stale
+    // `Visible` must never authorize, nor a stale `Unavailable` cancel, a newer attempt. A HUD
+    // shown while controlling (`switch_target`) isn't blocked; it can't happen during a
+    // quarantine, which only starts from home or from no session, and no exit or crossing starts
+    // during it.
+    hud_stale: Option<MonoTime>,
     next_op: u64,
     warps: Vec<WarpEntry>,
     teardown: Option<Teardown>,
@@ -535,6 +588,10 @@ impl ControllerE1 {
             portals_retry: None,
             home_fence: None,
             exit_retry: BTreeMap::new(),
+            warp_fence: None,
+            warp_issued: None,
+            hud_shown: None,
+            hud_stale: None,
             next_op: 1,
             warps: Vec::new(),
             teardown: None,
@@ -591,7 +648,9 @@ impl ControllerE1 {
             Input::Capture(event) => self.capture_event(event, now, out),
             Input::CaptureBegun { id, result } => self.capture_begun(*id, result, now, out),
             Input::Overlay(OverlayEvent::Visible(id)) if *id == HUD => {
-                if self.exiting_hud() {
+                if !self.hud_outcome(false, now) {
+                    // The outcome of a show that was abandoned (WP-2.43j).
+                } else if self.exiting_hud() {
                     self.exit_hud_visible(now, out);
                 } else if let Phase::Crossing(c) = &self.phase
                     && let Wait::Hud(deadline) = c.wait
@@ -604,7 +663,9 @@ impl ControllerE1 {
                 }
             }
             Input::Overlay(OverlayEvent::Unavailable(id)) if *id == HUD => {
-                self.hud_unavailable(now, out);
+                if self.hud_outcome(true, now) {
+                    self.hud_unavailable(now, out);
+                }
             }
             Input::Link(event) => self.link_event(event, now, out),
             Input::Hotkey(event) => self.hotkey_event(*event, now, out),
@@ -678,15 +739,20 @@ impl ControllerE1 {
             && matches!(self.phase, Phase::Returning { capture, .. } if capture == id)
         {
             // A rolled-back activation cannot emit an Ended fence.
-            self.finish_return(out);
+            self.finish_return(now, out);
         }
     }
 
     pub fn next_deadline(&self) -> Option<MonoTime> {
         let phase = match &self.phase {
-            Phase::Idle => self
-                .push
-                .map(|p| p.since.saturating_add(self.config.push_to_cross)),
+            // A dwell that ends while a warp is unanswered waits for the warp's bound (WP-2.43j).
+            Phase::Idle => self.push.map(|p| {
+                let dwell = p.since.saturating_add(self.config.push_to_cross);
+                match self.warp_pending_until() {
+                    Some(until) => dwell.max(until),
+                    None => dwell,
+                }
+            }),
             Phase::Crossing(c) => match c.wait {
                 Wait::Hud(at) | Wait::Handshake(at) | Wait::Capture(at) => Some(at),
             },
@@ -1023,7 +1089,7 @@ impl ControllerE1 {
         else {
             return;
         };
-        self.show_hud(hud_display, display.node, out);
+        self.show_hud(hud_display, display.node, now, out);
         self.phase = Phase::Crossing(Crossing {
             portal: push.portal,
             hud_display,
@@ -1035,7 +1101,8 @@ impl ControllerE1 {
         });
     }
 
-    fn show_hud(&self, display: DisplayId, peer: NodeId, out: &mut Vec<Output>) {
+    fn show_hud(&mut self, display: DisplayId, peer: NodeId, now: MonoTime, out: &mut Vec<Output>) {
+        self.hud_shown = Some(now);
         out.push(Output::ShowOverlay {
             id: HUD,
             overlay: Overlay {
@@ -1049,6 +1116,55 @@ impl ControllerE1 {
                 },
             },
         });
+    }
+
+    /// Hide the HUD. If its show's outcome hasn't arrived, the HUD is quarantined (WP-2.43j,
+    /// `hud_stale`).
+    fn hide_hud(&mut self, now: MonoTime, out: &mut Vec<Output>) {
+        out.push(Output::HideOverlay(HUD));
+        if self.hud_shown.take().is_some() {
+            self.quarantine_hud(now);
+        }
+    }
+
+    /// WP-2.43j: for `HUD_STALE` from now, every HUD outcome is dropped and no HUD is shown.
+    fn quarantine_hud(&mut self, now: MonoTime) {
+        let until = now.saturating_add(HUD_STALE);
+        self.hud_stale = Some(self.hud_stale.map_or(until, |old| old.max(until)));
+    }
+
+    /// WP-2.43j: a HUD outcome. False while the HUD is quarantined: the outcome belongs to an
+    /// abandoned show, or follows an `Unavailable` of the same show, and is dropped (the
+    /// quarantine stays until it expires, however many such outcomes come). An `Unavailable`
+    /// that counts quarantines the HUD in turn: the Mac host can report a show `Unavailable` and
+    /// later `Visible` (its presence expiring and then observed), and that late `Visible` must
+    /// not stand for a newer show.
+    fn hud_outcome(&mut self, unavailable: bool, now: MonoTime) -> bool {
+        if self.hud_blocked(now) {
+            return false;
+        }
+        self.hud_stale = None;
+        self.hud_shown = None;
+        if unavailable {
+            self.quarantine_hud(now);
+        }
+        true
+    }
+
+    /// WP-2.43j: while a home warp is unanswered (at most `END_TIMEOUT` from its issue), when
+    /// that bound ends. A crossing's dwell doesn't complete before it: the pointer may already be
+    /// elsewhere, and the answer drops the push.
+    fn warp_pending_until(&self) -> Option<MonoTime> {
+        if self.warps.is_empty() {
+            return None;
+        }
+        self.warp_issued.map(|at| at.saturating_add(END_TIMEOUT))
+    }
+
+    /// WP-2.43j: an abandoned show's outcome is still owed: showing the HUD now would let it
+    /// stand for the new show.
+    fn hud_blocked(&self, now: MonoTime) -> bool {
+        self.hud_stale.is_some_and(|until| now < until)
     }
 
     fn start_handshake(&mut self, now: MonoTime, out: &mut Vec<Output>) {
@@ -1128,7 +1244,10 @@ impl ControllerE1 {
                 position,
                 at,
             } if matches!(self.phase, Phase::Idle) => {
-                if self.local_override_until.is_some_and(|until| now < until) {
+                if self.local_override_until.is_some_and(|until| now < until)
+                    || self.warp_fence.is_some_and(|fence| *at < fence)
+                    || self.hud_blocked(now)
+                {
                     return;
                 }
                 if self.is_disarmed(*portal, now) {
@@ -1161,7 +1280,10 @@ impl ControllerE1 {
                         since: *at,
                     },
                 };
-                if at.saturating_duration_since(push.since) >= self.config.push_to_cross {
+                let warp_pending = self.warp_pending_until().is_some_and(|until| now < until);
+                if at.saturating_duration_since(push.since) >= self.config.push_to_cross
+                    && !warp_pending
+                {
                     self.begin_crossing(push, now, out);
                 } else {
                     self.push = Some(push);
@@ -1169,10 +1291,18 @@ impl ControllerE1 {
             }
             // WP-2.43 §2.6: a push against a twin strip while home starts the exit.
             CaptureEvent::EdgePressed {
-                portal, position, ..
-            } if self.home_is_resting() => self.exit_press(*portal, *position, now, out),
+                portal,
+                position,
+                at,
+            } if self.home_is_resting() => {
+                if self.warp_fence.is_none_or(|fence| *at >= fence) {
+                    self.exit_press(*portal, *position, *at, now, out);
+                }
+            }
             CaptureEvent::EdgeReleased { portal, at } => {
                 self.rearm_portal(*portal, *at);
+                self.entry_strip_released(*portal);
+                self.exit_strip_released(*portal, now, out);
                 if self.push.is_some_and(|p| p.portal == *portal) {
                     self.push = None;
                 }
@@ -1186,7 +1316,7 @@ impl ControllerE1 {
                 if self.home_capture_ended(*id, *reason, now, out) {
                     // Expected, or the exit's own capture: handled there.
                 } else if matches!(self.phase, Phase::Returning { capture, .. } if capture == *id) {
-                    self.finish_return(out);
+                    self.finish_return(now, out);
                 } else if self.capture_mut().is_some_and(|c| c.id == *id) {
                     self.return_home(EndReason::Released, None, true, true, now, out);
                 }
@@ -1397,7 +1527,7 @@ impl ControllerE1 {
             });
             self.start_handshake(now, out);
             if matches!(self.phase, Phase::Crossing(_)) {
-                self.show_hud(c.hud_display, entry.0.node, out);
+                self.show_hud(c.hud_display, entry.0.node, now, out);
             }
         } else {
             self.phase = phase;
@@ -1700,7 +1830,7 @@ impl ControllerE1 {
         if live {
             match point {
                 Some(point) if !entry_stranded => {
-                    self.release_and_warp(WarpPurpose::Leave, point, out);
+                    self.release_and_warp(WarpPurpose::Leave, point, now, out);
                 }
                 Some(_) => out.push(Output::EndCapture { warp_to: None }),
                 None => out.push(Output::EndCapture { warp_to }),
@@ -1710,7 +1840,7 @@ impl ControllerE1 {
             && !entry_stranded
         {
             // Nothing to end, but the pointer may be on the invisible twin: a plain warp.
-            self.release_and_warp(WarpPurpose::Leave, point, out);
+            self.release_and_warp(WarpPurpose::Leave, point, now, out);
         }
         if let Some(mut session) = session {
             self.end_session(&mut session, reason, send_end, now, out);
@@ -1722,16 +1852,16 @@ impl ControllerE1 {
                 warp: point,
             };
         } else {
-            self.finish_return(out);
+            self.finish_return(now, out);
         }
     }
 
-    fn finish_return(&mut self, out: &mut Vec<Output>) {
+    fn finish_return(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         self.phase = Phase::Idle;
         self.chord_keys.clear();
         self.capture_buttons.clear();
         self.push = None;
-        out.push(Output::HideOverlay(HUD));
+        self.hide_hud(now, out);
     }
 
     fn disarm(&mut self, now: MonoTime, out: &mut Vec<Output>) {
@@ -1814,9 +1944,20 @@ impl ControllerE1 {
         self.home_tick(now, out);
         match &mut self.phase {
             Phase::Idle => {
+                // WP-2.43j: a push from before the newest warp's answer is stale; while a warp is
+                // unanswered (bounded by `END_TIMEOUT`), the dwell waits for it.
+                if self
+                    .push
+                    .zip(self.warp_fence)
+                    .is_some_and(|(push, fence)| push.since < fence)
+                {
+                    self.push = None;
+                }
+                let warp_pending = self.warp_pending_until().is_some_and(|until| now < until);
                 if let Some(push) = self
                     .push
                     .filter(|p| now >= p.since.saturating_add(self.config.push_to_cross))
+                    .filter(|_| !warp_pending)
                 {
                     self.begin_crossing(push, now, out);
                 }
@@ -1878,11 +2019,11 @@ impl ControllerE1 {
                 // A capture that began on a twin strip, or whose home ended, always warps (§2.7).
                 match *warp {
                     Some(point) => {
-                        self.release_and_warp(WarpPurpose::Leave, point, out);
+                        self.release_and_warp(WarpPurpose::Leave, point, now, out);
                     }
                     None => out.push(Output::EndCapture { warp_to: None }),
                 }
-                self.finish_return(out);
+                self.finish_return(now, out);
             }
             _ => {}
         }
@@ -2358,7 +2499,11 @@ impl ControllerE1 {
         op: HomeOp,
         purpose: WarpPurpose,
         target: (DisplayId, PointDevice),
+        now: MonoTime,
     ) {
+        // WP-2.43j: a push against a portal was made where the pointer was before this warp.
+        self.push = None;
+        self.warp_issued = Some(now);
         self.warps.push(WarpEntry {
             op,
             purpose,
@@ -2379,10 +2524,11 @@ impl ControllerE1 {
         &mut self,
         purpose: WarpPurpose,
         target: (DisplayId, PointDevice),
+        now: MonoTime,
         out: &mut Vec<Output>,
     ) -> HomeOp {
         let op = self.alloc_op();
-        self.register_warp(op, purpose, target);
+        self.register_warp(op, purpose, target, now);
         out.push(Output::ReleaseAndWarp {
             op,
             warp_to: target,
@@ -2514,7 +2660,7 @@ impl ControllerE1 {
             HomeState::Exiting(Exiting::Hud {
                 portal, deadline, ..
             }) if now >= deadline => {
-                out.push(Output::HideOverlay(HUD));
+                self.hide_hud(now, out);
                 self.set_home_state(HomeState::Home);
                 self.exit_retry
                     .insert(portal, now.saturating_add(HOME_RETRY));
@@ -2552,7 +2698,7 @@ impl ControllerE1 {
             attempts: stranded.attempts + 1,
             ..stranded
         });
-        self.release_and_warp(WarpPurpose::Retry, stranded.target, out);
+        self.release_and_warp(WarpPurpose::Retry, stranded.target, now, out);
     }
 
     // ---- portals ----
@@ -2816,6 +2962,9 @@ impl ControllerE1 {
             state: HomeState::Entering(Entering::Draining {
                 deadline: now.saturating_add(DRAIN_TIMEOUT),
             }),
+            entry_near: [false; 4],
+            entry_held: [false; 4],
+            entered_at: None,
         };
         if let Phase::Controlling(c) = &mut self.phase {
             c.home = Some(home);
@@ -2971,13 +3120,23 @@ impl ControllerE1 {
             self.abort_entry(HomeFailure::Gone, now, out);
             return;
         }
-        // The current tracker position, mapped into the placement (A8): never the report's.
-        let x = (position.x - placement.origin.x).clamp(0.0, f64::from(w - 1));
-        let y = (position.y - placement.origin.y).clamp(0.0, f64::from(h - 1));
+        // The current tracker position, mapped into the placement (A8): never the report's. It
+        // lands `ENTRY_CLEARANCE` clear of the content's edges, never on a strip (WP-2.43j).
+        let inset = |len: i32| f64::from(ENTRY_CLEARANCE.min((len - 1) / 2));
+        let (cx, cy) = (inset(w), inset(h));
+        let x = (position.x - placement.origin.x).clamp(cx, f64::from(w - 1) - cx);
+        let y = (position.y - placement.origin.y).clamp(cy, f64::from(h - 1) - cy);
         let target = (
             twin.display,
             PointDevice::new(f64::from(content.min.x) + x, f64::from(content.min.y) + y),
         );
+        let near = f64::from(ENTRY_NEAR);
+        let entry_near = [
+            x <= near,
+            f64::from(w - 1) - x <= near,
+            y <= near,
+            f64::from(h - 1) - y <= near,
+        ];
         // The first half of ending a session: an up for everything held, no `EndControl`.
         let phase = std::mem::replace(&mut self.phase, Phase::Idle);
         if let Phase::Controlling(mut c) = phase {
@@ -2988,7 +3147,7 @@ impl ControllerE1 {
         }
         // The capture is released from here on: it is no longer one this controller retains.
         self.committed_exit = None;
-        self.register_warp(home.op, WarpPurpose::Entry, target);
+        self.register_warp(home.op, WarpPurpose::Entry, target, now);
         out.push(Output::ReleaseAndWarp {
             op: home.op,
             warp_to: target,
@@ -2996,6 +3155,13 @@ impl ControllerE1 {
         self.set_home_state(HomeState::Entering(Entering::Releasing {
             deadline: now.saturating_add(END_TIMEOUT),
         }));
+        if let Phase::Controlling(c) = &mut self.phase
+            && let Some(home) = &mut c.home
+        {
+            home.entry_near = entry_near;
+            home.entry_held = [false; 4];
+            home.entered_at = None;
+        }
     }
 
     /// `Input::CaptureReleased` (§3.2): the answer to one `ReleaseAndWarp`.
@@ -3006,6 +3172,10 @@ impl ControllerE1 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        // Whatever it was for, the pointer may have moved: presses made before are stale, and so
+        // is a push one of them started.
+        self.warp_fence = Some(now);
+        self.push = None;
         // An answer to an operation that isn't outstanding is stale and changes nothing.
         let Some(warp) = self.take_warp(op) else {
             return;
@@ -3055,12 +3225,12 @@ impl ControllerE1 {
         };
         match result {
             Ok(Warp::Done) if now < deadline => {
-                out.push(Output::HideOverlay(HUD));
+                self.hide_hud(now, out);
                 let focused = self
                     .twin_home(home.peer, home.projection)
                     .is_some_and(|t| t.focused);
                 if focused {
-                    self.commit_entry(out);
+                    self.commit_entry(now, out);
                 } else {
                     out.push(Output::ActivateWindow {
                         window: home.window,
@@ -3089,7 +3259,7 @@ impl ControllerE1 {
                     if let Some(stranded) = &mut self.stranded {
                         stranded.attempts = 1;
                     }
-                    self.release_and_warp(WarpPurpose::Retry, home.fallback, out);
+                    self.release_and_warp(WarpPurpose::Retry, home.fallback, now, out);
                 }
             }
             // An error, or an answer after the deadline: a capture may still exist.
@@ -3098,11 +3268,16 @@ impl ControllerE1 {
     }
 
     /// §2.3 step 6.
-    fn commit_entry(&mut self, out: &mut Vec<Output>) {
+    fn commit_entry(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         let Some(home) = self.home_copy() else {
             return;
         };
         self.set_home_state(HomeState::Home);
+        if let Phase::Controlling(c) = &mut self.phase
+            && let Some(home) = &mut c.home
+        {
+            home.entered_at = Some(now);
+        }
         out.push(Output::Notice(Notice::Home {
             key: self.key_of(home.projection),
             entered: true,
@@ -3213,7 +3388,7 @@ impl ControllerE1 {
                     // A focus event that arrives after the deadline is too late, tick or not.
                     self.leave_home(Some(HomeFailure::Focus), now, out);
                 } else if twin.is_some_and(|t| t.focused) {
-                    self.commit_entry(out);
+                    self.commit_entry(now, out);
                 }
             }
             HomeState::Entering(Entering::Releasing { .. }) | HomeState::Home => {
@@ -3229,7 +3404,7 @@ impl ControllerE1 {
                 } else if strips_gen != self.strips_gen {
                     // The strip set changed under the HUD: this exit is over, the next press
                     // starts a fresh one.
-                    out.push(Output::HideOverlay(HUD));
+                    self.hide_hud(now, out);
                     self.set_home_state(HomeState::Home);
                     self.exit_retry
                         .insert(portal, now.saturating_add(HOME_RETRY));
@@ -3396,7 +3571,7 @@ impl ControllerE1 {
             HomeState::Exiting(Exiting::Activating {
                 id: active, portal, ..
             }) if active == id => {
-                out.push(Output::HideOverlay(HUD));
+                self.hide_hud(now, out);
                 self.exit_resolved();
                 self.exit_retry
                     .insert(portal, now.saturating_add(HOME_RETRY));
@@ -3417,6 +3592,7 @@ impl ControllerE1 {
         &mut self,
         portal: PortalId,
         position: f64,
+        at: MonoTime,
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
@@ -3426,6 +3602,10 @@ impl ControllerE1 {
         let Some(home) = c.home.filter(|h| matches!(h.state, HomeState::Home)) else {
             return;
         };
+        let hud_display = c.hud_display;
+        if self.entry_guarded(portal, at, now) || self.hud_blocked(now) {
+            return;
+        }
         if !self.permits_io()
             || !self.portals_installed
             || self
@@ -3437,14 +3617,80 @@ impl ControllerE1 {
         {
             return;
         }
-        let hud_display = c.hud_display;
-        self.show_hud(hud_display, home.peer, out);
+        self.show_hud(hud_display, home.peer, now, out);
         self.set_home_state(HomeState::Exiting(Exiting::Hud {
             portal,
             position,
             strips_gen: self.strips_gen,
             deadline: now.saturating_add(HUD_TIMEOUT),
         }));
+    }
+
+    /// WP-2.43j: a press on one of the entry's own strips made during the guard is the motion
+    /// that carried the pointer in, not an exit; the strip then stays ignored until the pointer
+    /// leaves it (or `ENTRY_HOLD` from the entry, by the current time). Every other strip, and
+    /// every press made later on a strip that was left, exits.
+    fn entry_guarded(&mut self, portal: PortalId, at: MonoTime, now: MonoTime) -> bool {
+        let Some(i) = self.home_strip_edge(portal) else {
+            return false;
+        };
+        let Phase::Controlling(c) = &mut self.phase else {
+            return false;
+        };
+        let Some(home) = &mut c.home else {
+            return false;
+        };
+        let Some(entered) = home.entered_at else {
+            return false;
+        };
+        if !home.entry_near[i] {
+            return false;
+        }
+        // The press is classified by when it happened, which a delayed delivery doesn't change;
+        // the absolute limit runs on the current time.
+        if now.saturating_duration_since(entered) >= ENTRY_HOLD {
+            return false;
+        }
+        if at.saturating_duration_since(entered) < ENTRY_GUARD || home.entry_held[i] {
+            home.entry_held[i] = true;
+            return true;
+        }
+        false
+    }
+
+    /// WP-2.43j: the pointer left one of the entry's own strips: it counts again.
+    fn entry_strip_released(&mut self, portal: PortalId) {
+        let Some(i) = self.home_strip_edge(portal) else {
+            return;
+        };
+        if let Phase::Controlling(c) = &mut self.phase
+            && let Some(home) = &mut c.home
+        {
+            home.entry_held[i] = false;
+        }
+    }
+
+    /// The `edge_index` of `portal` if it is one of the current home's own strips.
+    fn home_strip_edge(&self, portal: PortalId) -> Option<usize> {
+        let home = self.home_copy()?;
+        self.strips_of(home.projection)
+            .iter()
+            .find(|s| s.id == portal)
+            .map(|s| edge_index(s.edge) as usize)
+    }
+
+    /// WP-2.43j: the pointer left the strip whose exit HUD is waiting to become visible. The push
+    /// is over: the HUD goes and home resumes, with no retry fence (nothing failed) and no
+    /// capture (`begin` needs the pointer on the strip and would be refused).
+    fn exit_strip_released(&mut self, portal: PortalId, now: MonoTime, out: &mut Vec<Output>) {
+        if let Some(HomeState::Exiting(Exiting::Hud {
+            portal: pressed, ..
+        })) = self.home_state()
+            && pressed == portal
+        {
+            self.hide_hud(now, out);
+            self.set_home_state(HomeState::Home);
+        }
     }
 
     /// The HUD is visible: only now may the exit capture begin.
@@ -3468,7 +3714,7 @@ impl ControllerE1 {
                 && self.portal_offered(home.projection, portal)
         });
         let Some(id) = id else {
-            out.push(Output::HideOverlay(HUD));
+            self.hide_hud(now, out);
             self.set_home_state(HomeState::Home);
             self.exit_retry
                 .insert(portal, now.saturating_add(HOME_RETRY));
@@ -3503,7 +3749,7 @@ impl ControllerE1 {
     fn hud_unavailable(&mut self, now: MonoTime, out: &mut Vec<Output>) {
         match self.home_state() {
             Some(HomeState::Exiting(Exiting::Hud { portal, .. })) => {
-                out.push(Output::HideOverlay(HUD));
+                self.hide_hud(now, out);
                 self.set_home_state(HomeState::Home);
                 self.exit_retry
                     .insert(portal, now.saturating_add(HOME_RETRY));
@@ -3541,7 +3787,7 @@ impl ControllerE1 {
                     }
                     Err(failure) => {
                         // A rolled-back activation emits no `Ended`.
-                        out.push(Output::HideOverlay(HUD));
+                        self.hide_hud(now, out);
                         self.exit_resolved();
                         self.activation.clear();
                         self.activation_overflow = false;
@@ -3898,7 +4144,7 @@ impl ControllerE1 {
             return;
         }
         out.push(Output::EndCapture { warp_to: None });
-        out.push(Output::HideOverlay(HUD));
+        self.hide_hud(now, out);
         self.begin_cancelled(id, portal, now);
     }
 
@@ -3917,11 +4163,11 @@ impl ControllerE1 {
                 .or(Some(home.fallback))
         });
         if let Some(target) = target {
-            self.release_and_warp(WarpPurpose::Cancel, target, out);
+            self.release_and_warp(WarpPurpose::Cancel, target, now, out);
         } else {
             out.push(Output::EndCapture { warp_to: None });
         }
-        out.push(Output::HideOverlay(HUD));
+        self.hide_hud(now, out);
         self.begin_cancelled(id, portal, now);
     }
 
@@ -4170,6 +4416,9 @@ mod entry_recovery_tests {
                 state: HomeState::Entering(Entering::Releasing {
                     deadline: MonoTime::from_nanos(1_000_000_000),
                 }),
+                entry_near: [false; 4],
+                entry_held: [false; 4],
+                entered_at: None,
             }),
             from_twin: false,
             last_motion: None,

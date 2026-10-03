@@ -82,6 +82,8 @@ const END_TIMEOUT: u64 = 300;
 const HUD_TIMEOUT: u64 = 500;
 const START_TIMEOUT: u64 = 1_000;
 const HOME_RETRY: u64 = 1_000;
+/// WP-2.43j: the HUD's quarantine after an abandoned or unavailable show.
+const HUD_STALE: u64 = 1_000;
 const REENTRY_GUARD: u64 = 150;
 const LOCAL_MOTION_AGE: u64 = 500;
 const PORTALS_RETRY: u64 = 500;
@@ -2910,10 +2912,9 @@ fn exit_hud_unavailable_retry_fence() {
         !has_hud_show(&h.press(Edge::Right, 0.25)),
         "inside the fence"
     );
-    // Other strips are not fenced.
-    assert!(has_hud_show(&h.press(Edge::Left, 0.5)));
-    let out = h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
-    assert!(has_hud_hide(&out));
+    // WP-2.43j: after an `Unavailable` the HUD itself is quarantined for `HUD_STALE` (a later
+    // outcome of the same show may still come): other strips wait too.
+    assert!(!has_hud_show(&h.press(Edge::Left, 0.5)));
     h.now = ms(failed_at + HOME_RETRY);
     assert!(
         has_hud_show(&h.press(Edge::Right, 0.25)),
@@ -3462,6 +3463,20 @@ fn flush_display(
 }
 
 fn fullscreen_host_home_with(displays: &[Placed], reachable: &[NodeId]) -> H {
+    let (mut h, geometry) = fullscreen_host_controlling_with(displays, reachable);
+    let entry = motions(&h.motion(0.0, 0.0))[0].position;
+    let delta = geometry.device_to_mm(point(50.0 - entry.x, 100.0 - entry.y));
+    h.motion(delta.x / 0.1, delta.y / 0.1);
+    h.home_now();
+    h
+}
+
+/// B's window fullscreen on B's display (its proxy flush with every edge), and this node
+/// controlling B; returns B's display geometry.
+fn fullscreen_host_controlling_with(
+    displays: &[Placed],
+    reachable: &[NodeId],
+) -> (H, DisplayGeometry) {
     let mut h = H::bare();
     for node in [A, B, C] {
         let infos: Vec<_> = displays
@@ -3536,11 +3551,7 @@ fn fullscreen_host_home_with(displays: &[Placed], reachable: &[NodeId]) -> H {
         }),
     );
     h.cross();
-    let entry = motions(&h.motion(0.0, 0.0))[0].position;
-    let delta = geometry.device_to_mm(point(50.0 - entry.x, 100.0 - entry.y));
-    h.motion(delta.x / 0.1, delta.y / 0.1);
-    h.home_now();
-    h
+    (h, geometry)
 }
 
 #[test]
@@ -5837,6 +5848,10 @@ fn teardown_fence_refuses_input_and_sessions() {
         },
     ));
     let removal = bind(&out, false).expect("removal");
+    // The pointer is warped back to this node's display (the agent answers that at once; WP-2.43j:
+    // a crossing's dwell never completes while a warp is unanswered).
+    let (leave, _) = warp(&out).expect("the pointer leaves the twin");
+    h.released(leave, Ok(Warp::Done));
     // Peer E2 key-downs during the fence are not injected (nothing can press the bind).
     assert!(!h.probe(P1));
     // An incoming StartControl is refused, though no session is running.
@@ -8208,4 +8223,618 @@ fn exit_activation_snapshot_modifier_in_both_callback_orders() {
         );
         h.quiet();
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// WP-2.43j: the live findings of 2026-10-02. The entry warp landed on the content's outermost
+// pixels, which on the twin are under a strip (a strip is one logical pixel on the twin output's
+// edge, and the content fills the output there): the warp itself pressed the strip, the exit
+// began 10 ms after home and was refused (the pointer had already moved off), or completed and
+// put the pointer back outside the proxy, where the same motion entered again: a loop of
+// "home"/"returned" every few hundred milliseconds. Presses queued before a home warp were
+// delivered after its answer and started crossings from where the pointer no longer was.
+// ---------------------------------------------------------------------------------------------
+
+impl H {
+    /// Controlling B, the pointer steered onto the standard proxy at `tracker` (B's device
+    /// pixels, inside the proxy), the matching report, and the entry up to `ReleaseAndWarp`.
+    /// Returns the entry's operation and the warp's target.
+    fn enter_at(&mut self, tracker: PointDevice) -> (HomeOp, (DisplayId, PointDevice)) {
+        let start = motions(&self.motion(0.0, 0.0))[0].position;
+        self.motion(tracker.x - start.x, tracker.y - start.y);
+        let proxy = Proxy::standard();
+        let out = self.report(
+            P1,
+            point(tracker.x - proxy.origin.x, tracker.y - proxy.origin.y),
+        );
+        let op = bind(&out, true).unwrap_or_else(|| panic!("no entry at {tracker:?}: {out:?}"));
+        self.advance(1);
+        let out = self.bind_set(op, true, true);
+        let (released, target) = warp(&out).expect("ReleaseAndWarp");
+        assert_eq!(released, op);
+        (op, target)
+    }
+
+    /// `enter_at`, and home.
+    fn home_at(tracker: PointDevice) -> (H, (DisplayId, PointDevice)) {
+        let mut h = H::controlling();
+        let (op, target) = h.enter_at(tracker);
+        h.advance(1);
+        h.commit_home(op);
+        (h, target)
+    }
+
+    /// The entry's release is confirmed (and the window focused if it wasn't).
+    fn commit_home(&mut self, op: HomeOp) {
+        let out = self.released(op, Ok(Warp::Done));
+        let entered = Notice::Home {
+            key: key(P1),
+            entered: true,
+        };
+        if !has_notice(&out, &entered) {
+            self.advance(1);
+            let out = self.focus(Some(W1));
+            assert!(has_notice(&out, &entered), "{out:?}");
+        }
+    }
+
+    fn release_strip(&mut self, edge: Edge) -> Vec<Output> {
+        let portal = self.strip(0, edge);
+        self.feed(Input::Capture(CaptureEvent::EdgeReleased {
+            portal,
+            at: self.now,
+        }))
+    }
+}
+
+/// The standard proxy is 400x300 at (200, 300) on B; its content is at (50, 40) on the twin.
+#[test]
+fn an_entry_on_the_proxy_edge_warps_clear_of_the_strips() {
+    for (tracker, want) in [
+        // The left edge (content x = 0): 8 device pixels inside, not on the left strip.
+        (point(200.0, 400.0), point(58.0, 140.0)),
+        // The right edge (content x = 399).
+        (point(599.0, 400.0), point(441.0, 140.0)),
+        // A corner: clear of both strips.
+        (point(200.0, 300.0), point(58.0, 48.0)),
+        (point(599.0, 599.0), point(441.0, 331.0)),
+        // Well inside: unchanged.
+        (point(250.0, 400.0), point(100.0, 140.0)),
+    ] {
+        let (mut h, target) = H::home_at(tracker);
+        assert_eq!(target, (TWIN, want), "entered at {tracker:?}");
+        h.quiet();
+    }
+}
+
+/// Live: the warp pressed the entry's own strip and the exit began at once (refused, or a
+/// bounce straight back out).
+#[test]
+fn the_entering_motion_pressing_its_own_strip_does_not_exit_until_it_leaves_the_strip() {
+    let (mut h, _) = H::home_at(point(200.0, 400.0));
+    // The hand keeps pushing over the left strip: presses repeat while it does.
+    assert!(!has_hud_show(&h.press(Edge::Left, 0.3)));
+    h.advance(150);
+    assert!(!has_hud_show(&h.press(Edge::Left, 0.3)));
+    // Past the guard: a strip pressed during it still needs the pointer to leave it first.
+    h.advance(250);
+    assert!(!has_hud_show(&h.press(Edge::Left, 0.3)));
+    assert_eq!(h.engine.controlling(), Some(B));
+    // Leaving the strip re-arms it: the next push exits.
+    h.release_strip(Edge::Left);
+    h.advance(10);
+    let out = h.press(Edge::Left, 0.3);
+    assert!(
+        has_hud_show(&out),
+        "a push after leaving the strip exits: {out:?}"
+    );
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+}
+
+/// A push kept up on the entry's strip is meant after a while, released or not.
+#[test]
+fn a_push_held_on_the_entry_strip_exits_after_the_hold() {
+    let (mut h, _) = H::home_at(point(599.0, 400.0));
+    let entered = h.now_ms();
+    for t in [0, 100, 299, 500, 999] {
+        h.now = ms(entered + t);
+        assert!(!has_hud_show(&h.press(Edge::Right, 0.5)), "{t} ms");
+    }
+    h.now = ms(entered + 1_000);
+    assert!(has_hud_show(&h.press(Edge::Right, 0.5)));
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+}
+
+/// The entry's strip, untouched during the guard, exits on the first press after it: leaving the
+/// way one came in later is ordinary.
+#[test]
+fn the_entry_strip_counts_on_the_first_press_after_the_guard() {
+    let (mut h, _) = H::home_at(point(599.0, 400.0));
+    h.advance(299);
+    assert!(!has_hud_show(&h.press(Edge::Right, 0.5)));
+    h.release_strip(Edge::Right);
+    let (mut h, _) = H::home_at(point(599.0, 400.0));
+    h.advance(300);
+    let out = h.press(Edge::Right, 0.5);
+    assert!(has_hud_show(&out), "{out:?}");
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+}
+
+/// Only the entry's own strips are guarded: a fast pass straight through the window exits on the
+/// far side at once.
+#[test]
+fn far_strips_exit_at_once_after_an_edge_entry() {
+    let (mut h, _) = H::home_at(point(200.0, 400.0));
+    let out = h.press(Edge::Right, 0.5);
+    assert!(has_hud_show(&out), "{out:?}");
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+    // An entry well inside guards no strip.
+    let (mut h, _) = H::home_at(point(400.0, 450.0));
+    let out = h.press(Edge::Left, 0.5);
+    assert!(has_hud_show(&out), "{out:?}");
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+}
+
+/// Live: the loop. Each exit put the pointer just outside the proxy and the entering motion went
+/// straight back in; with the warp clear of the strip the second entry stays home.
+#[test]
+fn a_reentry_right_after_an_exit_waits_for_the_fence_and_then_stays_home() {
+    let mut h = H::home();
+    let exit = h.exit_through(Edge::Right, 0.25);
+    let exited = h.now_ms();
+    h.confirm_removal(&exit);
+    // Back inside within the fence: no entry.
+    h.now = ms(exited + 20);
+    h.motion(-2.0, 0.0);
+    let out = h.report(P1, point(398.0, 75.0));
+    assert_no_entry(&h, &out);
+    // After the fence it enters, clear of the right strip, and the hand still moving in doesn't
+    // bounce it out.
+    h.now = ms(exited + REENTRY_GUARD + 1);
+    h.motion(-1.0, 0.0);
+    let out = h.report(P1, point(397.0, 75.0));
+    let op = bind(&out, true).expect("entry after the fence");
+    h.advance(1);
+    let out = h.bind_set(op, true, true);
+    assert_eq!(
+        warp(&out).map(|(_, t)| t),
+        Some((TWIN, point(441.0, 115.0)))
+    );
+    h.advance(1);
+    h.commit_home(op);
+    assert!(!has_hud_show(&h.press(Edge::Right, 0.25)));
+    assert_eq!(h.engine.controlling(), Some(B));
+    h.quiet();
+}
+
+/// Live: the agent answers a home warp, then delivers the edge events queued while it ran. A
+/// press made before the warp is where the pointer no longer is.
+#[test]
+fn presses_made_before_a_home_warp_start_nothing() {
+    // Home: a press stamped before the entry's answer is the old position's.
+    let mut h = H::controlling();
+    let (op, _) = h.enter_at(point(400.0, 450.0));
+    h.advance(5);
+    let answered = h.now_ms();
+    h.commit_home(op);
+    let stale = |h: &mut H, portal: PortalId, answered: u64| {
+        h.feed(Input::Capture(CaptureEvent::EdgePressed {
+            portal,
+            position: 0.5,
+            at: ms(answered - 3),
+        }))
+    };
+    let portal = h.strip(0, Edge::Right);
+    assert!(!has_hud_show(&stale(&mut h, portal, answered)));
+    let out = h.press(Edge::Right, 0.5);
+    assert!(has_hud_show(&out), "a press after the warp exits: {out:?}");
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+
+    // A failed entry ends the session and warps the pointer to this node's fallback: a press on
+    // the layout's portal queued before that answer must not cross straight back.
+    let mut h = H::controlling();
+    let (op, _) = h.enter_at(point(400.0, 450.0));
+    h.advance(5);
+    let answered = h.now_ms();
+    let out = h.released(op, Ok(Warp::Skipped));
+    assert!(home_failed(&out, HomeFailure::Warp), "{out:?}");
+    assert_eq!(h.engine.controlling(), None);
+    let portal = h.layout_portal;
+    assert!(
+        !has_hud_show(&stale(&mut h, portal, answered)),
+        "a stale press crossed back"
+    );
+    h.quiet();
+}
+
+/// Live: crossing from the controller straight into a fullscreen proxy entered home at the
+/// crossing point, on the strip back to the controller: the entry exited at once.
+#[test]
+fn a_fullscreen_entry_at_the_crossing_point_lands_clear_of_the_return_strip() {
+    let (mut h, geometry) = fullscreen_host_controlling_with(
+        flush_layout(&[(B, 1, 0.0, 0.0), (A, 1, 100.0, 0.0)]).displays(),
+        &[B, C],
+    );
+    // The crossing lands on B's right edge, inside the proxy (flush with it).
+    let entry = motions(&h.motion(0.0, 0.0))[0].position;
+    let width = f64::from(geometry.pixel_size.width);
+    assert!(entry.x >= width - 1.0, "{entry:?}");
+    let out = h.report(P1, entry);
+    let op = bind(&out, true).expect("entry at the crossing point");
+    h.advance(1);
+    let out = h.bind_set(op, true, true);
+    let (_, (display, at)) = warp(&out).expect("ReleaseAndWarp");
+    assert_eq!(display, TWIN);
+    assert_eq!(at.x, width - 1.0 - 8.0, "clear of the right strip");
+    h.advance(1);
+    h.commit_home(op);
+    // The hand is still moving toward the controller: no bounce back.
+    assert!(!has_hud_show(&h.press(Edge::Right, 0.5)));
+    assert_eq!(h.engine.controlling(), Some(B));
+    // Once it has left the strip, and past the guard, pushing out returns to the controller
+    // (WP-2.43i).
+    h.release_strip(Edge::Right);
+    h.advance(300);
+    let session = h.session.unwrap();
+    let out = h.exit_through(Edge::Right, 0.5);
+    assert_eq!(end_controls(&out), vec![(B, session, EndReason::Released)]);
+    assert!(left_home(&out));
+    let id = h.last_begin();
+    let (warp_op, _) = warp(&out).expect("the return warps");
+    h.confirm_removal(&out);
+    h.released(warp_op, Ok(Warp::Done));
+    h.ended(id, CaptureEnd::Requested);
+    assert_eq!(h.engine.controlling(), None);
+    h.quiet();
+}
+
+/// Live: the pointer touched a strip and moved away before the HUD was visible; the exit capture
+/// still began, was refused (the pointer was no longer on the strip) and fenced the strip for a
+/// second. Leaving the strip now cancels the exit quietly.
+#[test]
+fn leaving_the_strip_before_the_hud_is_visible_cancels_the_exit_without_a_fence() {
+    let mut h = H::home();
+    let out = h.press(Edge::Right, 0.5);
+    assert!(has_hud_show(&out), "{out:?}");
+    h.advance(5);
+    let out = h.release_strip(Edge::Right);
+    assert!(has_hud_hide(&out), "the HUD goes with the push: {out:?}");
+    let hidden = h.now_ms();
+    h.advance(5);
+    let out = h.visible();
+    assert!(
+        begin_capture(&out).is_none(),
+        "no capture after the push ended: {out:?}"
+    );
+    assert_eq!(h.engine.controlling(), Some(B));
+    // The abandoned show's quarantine is the only wait (no retry fence on top): the first push
+    // after it exits.
+    h.now = ms(hidden + HUD_STALE);
+    let out = h.press(Edge::Right, 0.5);
+    assert!(has_hud_show(&out), "{out:?}");
+    // Another strip's release changes nothing.
+    let out = h.release_strip(Edge::Left);
+    assert!(!has_hud_hide(&out), "{out:?}");
+    h.advance(1);
+    let (id, _, _) = begin_capture(&h.visible()).expect("the exit begins");
+    h.advance(1);
+    h.feed(Input::Capture(CaptureEvent::Started { id }));
+    h.advance(1);
+    let out = h.capture_begun(id, vec![]);
+    assert!(left_home(&out) || !motions(&out).is_empty(), "{out:?}");
+    h.quiet();
+}
+
+// ---- WP-2.43j review: stale HUD outcomes, pushes across warps, delayed entering presses ----
+
+impl H {
+    /// A press on the right strip while home shows the HUD; the pointer leaves the strip before
+    /// the HUD is visible, so the exit is abandoned with its outcome still owed. Returns when the
+    /// HUD was hidden: the quarantine runs `HUD_STALE` from there.
+    fn abandon_exit_hud(&mut self) -> u64 {
+        let out = self.press(Edge::Right, 0.5);
+        assert!(has_hud_show(&out), "{out:?}");
+        self.advance(5);
+        let out = self.release_strip(Edge::Right);
+        assert!(has_hud_hide(&out), "{out:?}");
+        let hidden = self.now_ms();
+        self.advance(5);
+        hidden
+    }
+
+    /// An old outcome of the HUD arrives: it changes nothing.
+    fn stale_outcome(&mut self, visible: bool) {
+        let out = if visible {
+            self.visible()
+        } else {
+            self.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)))
+        };
+        assert!(
+            begin_capture(&out).is_none() && !has_hud_hide(&out) && !left_home(&out),
+            "a stale outcome changes nothing: {out:?}"
+        );
+        assert_eq!(self.engine.controlling(), Some(B));
+    }
+
+    /// The exit HUD of a new press becomes visible and its capture begins.
+    fn exit_begins_after_new_show(&mut self) {
+        let out = self.press(Edge::Right, 0.5);
+        assert!(has_hud_show(&out), "a new push shows the HUD: {out:?}");
+        self.advance(1);
+        let out = self.visible();
+        let (id, _, _) = begin_capture(&out).expect("the new show's Visible begins the exit");
+        self.advance(1);
+        self.feed(Input::Capture(CaptureEvent::Started { id }));
+        self.advance(1);
+        let out = self.capture_begun(id, vec![]);
+        assert!(!motions(&out).is_empty(), "{out:?}");
+    }
+}
+
+/// Every ordering of an abandoned show's outcomes around the next push: whichever comes, and
+/// however many (the Mac host can report `Unavailable` and later `Visible` for one show), they
+/// are dropped, no HUD is shown during the quarantine (it would be confused with them), and the
+/// first push after it exits on its own HUD's `Visible`.
+#[test]
+fn stale_hud_outcomes_never_stand_for_a_newer_show() {
+    // (outcomes before the re-press, outcomes after it), true = Visible.
+    let orderings: [(&[bool], &[bool]); 6] = [
+        (&[true], &[]),
+        (&[], &[true]),
+        (&[], &[false]),
+        (&[false], &[true]),
+        (&[false, true], &[]),
+        (&[], &[false, true]),
+    ];
+    for (before, after) in orderings {
+        let mut h = H::home();
+        let hidden = h.abandon_exit_hud();
+        for visible in before {
+            h.stale_outcome(*visible);
+            h.advance(5);
+        }
+        let out = h.press(Edge::Right, 0.5);
+        assert!(
+            !has_hud_show(&out),
+            "{before:?}/{after:?}: no HUD during the quarantine: {out:?}"
+        );
+        h.advance(5);
+        for visible in after {
+            h.stale_outcome(*visible);
+            h.advance(5);
+        }
+        // Still quarantined just before the end, whatever came.
+        h.now = ms(hidden + HUD_STALE - 1);
+        assert!(!has_hud_show(&h.press(Edge::Right, 0.5)));
+        h.now = ms(hidden + HUD_STALE);
+        h.exit_begins_after_new_show();
+        h.quiet();
+    }
+}
+
+/// A show that was not abandoned but reported `Unavailable` can still report `Visible` later (the
+/// Mac host's presence expiring, then observed): that `Visible` must not stand for the next show,
+/// on another strip that isn't fenced.
+#[test]
+fn a_late_visible_after_unavailable_never_stands_for_a_newer_show() {
+    let mut h = H::home();
+    assert!(has_hud_show(&h.press(Edge::Right, 0.5)));
+    h.advance(5);
+    let out = h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    assert!(has_hud_hide(&out));
+    let failed = h.now_ms();
+    h.advance(5);
+    assert!(!has_hud_show(&h.press(Edge::Left, 0.5)), "quarantined");
+    h.advance(5);
+    h.stale_outcome(true);
+    h.now = ms(failed + HUD_STALE);
+    let out = h.press(Edge::Left, 0.5);
+    assert!(has_hud_show(&out), "{out:?}");
+    h.advance(1);
+    let (id, _, _) = begin_capture(&h.visible()).expect("its own Visible begins the exit");
+    h.advance(1);
+    h.feed(Input::Capture(CaptureEvent::Started { id }));
+    h.advance(1);
+    let out = h.capture_begun(id, vec![]);
+    assert!(!motions(&out).is_empty(), "{out:?}");
+    h.quiet();
+}
+
+/// An abandoned show whose outcome never comes quarantines the HUD for `HUD_STALE` from the hide.
+#[test]
+fn a_stale_hud_outcome_that_never_comes_blocks_for_a_second_at_most() {
+    let mut h = H::home();
+    let hidden = h.abandon_exit_hud();
+    h.now = ms(hidden + HUD_STALE - 1);
+    assert!(!has_hud_show(&h.press(Edge::Right, 0.5)));
+    h.now = ms(hidden + HUD_STALE);
+    h.exit_begins_after_new_show();
+    h.quiet();
+}
+
+/// No session, a crossing dwell of 200 ms, and a stranded pointer whose next retry warp is due
+/// at the returned time.
+fn stranded_with_dwell() -> (H, u64) {
+    let mut config = H::config();
+    config.push_to_cross = Duration::from_millis(200);
+    let mut h = H::bare_config(config, &[], &[]);
+    h.project(W1, B, P1, TWIN, content1(), PlatformParking::Twin);
+    h.place(B, P1, 1, Some(Proxy::standard()));
+    // Cross with the dwell, then the usual handshake.
+    h.feed(Input::Capture(CaptureEvent::EdgePressed {
+        portal: h.layout_portal,
+        position: 0.5,
+        at: h.now,
+    }));
+    let start = h.now_ms();
+    let out = h.tick(start + 200);
+    assert!(has_hud_show(&out), "{out:?}");
+    let out = h.visible();
+    let session = out
+        .iter()
+        .find_map(|o| match o {
+            Output::SendControl {
+                msg: ControlMessage::StartControl { session, .. },
+                ..
+            } => Some(*session),
+            _ => None,
+        })
+        .expect("StartControl");
+    h.session = Some(session);
+    let out = h.feed(control(B, ControlMessage::ControlStarted { session }));
+    let (id, _, _) = begin_capture(&out).expect("BeginCapture");
+    h.capture = Some(id);
+    h.feed(Input::Capture(CaptureEvent::Started { id }));
+    h.feed(Input::CaptureBegun {
+        id,
+        result: Ok(CaptureStart {
+            held_keys: vec![],
+            lock_keys: LockKeys::default(),
+        }),
+    });
+    assert_eq!(h.engine.controlling(), Some(B));
+    // A failed entry: the session ends, the pointer is stranded, its retry is due in a second.
+    let (op, _) = h.enter_at(point(400.0, 450.0));
+    h.advance(1);
+    let out = h.released(op, Ok(Warp::Skipped));
+    let (retry, _) = warp(&out).expect("an immediate retry");
+    h.advance(1);
+    h.released(retry, Ok(Warp::Skipped));
+    let stranded = h.now_ms();
+    h.advance(1);
+    h.bind_set(h.last_removal(), false, true);
+    assert_eq!(h.engine.controlling(), None);
+    (h, stranded + STRANDED_RETRY)
+}
+
+impl H {
+    fn press_portal(&mut self) -> Vec<Output> {
+        self.feed(Input::Capture(CaptureEvent::EdgePressed {
+            portal: self.layout_portal,
+            position: 0.5,
+            at: self.now,
+        }))
+    }
+}
+
+/// The live symptom behind the warp fence, for a crossing with a dwell: a push against the
+/// layout's portal is pending when a stranded pointer's retry warp moves the pointer. The push
+/// was made where the pointer no longer is: its dwell never starts a crossing. A push made while
+/// the warp is unanswered completes its dwell (by the tick or by a repeated press) only after the
+/// answer, which drops it.
+#[test]
+fn a_crossing_push_does_not_survive_a_warp() {
+    let (mut h, due) = stranded_with_dwell();
+    // A push 50 ms before the retry is due; the retry warps the pointer away at its deadline.
+    h.now = ms(due - 50);
+    assert!(!has_hud_show(&h.press_portal()));
+    let out = h.tick(due);
+    let (retry, _) = warp(&out).expect("the stranded retry");
+    // The old push's deadline passes while the warp is unanswered: no crossing.
+    let out = h.tick(due + 150);
+    assert!(
+        !has_hud_show(&out),
+        "a push from before the warp crossed: {out:?}"
+    );
+    // A push just after the warp was issued: its dwell ends at +210, inside the warp's 300 ms
+    // bound, and neither the tick nor a repeated press completes it while unanswered...
+    h.now = ms(due + 10);
+    assert!(!has_hud_show(&h.press_portal()));
+    let out = h.tick(due + 210);
+    assert!(
+        !has_hud_show(&out),
+        "the tick completed a dwell during the warp: {out:?}"
+    );
+    assert!(
+        h.engine.next_deadline().is_some_and(|d| d > h.now),
+        "the dwell waits for the warp's bound, without spinning: {:?}",
+        h.engine.next_deadline()
+    );
+    h.now = ms(due + 250);
+    assert!(
+        !has_hud_show(&h.press_portal()),
+        "a repeated press completed a dwell during the warp"
+    );
+    // ...and the answer drops it.
+    h.now = ms(due + 260);
+    h.released(retry, Ok(Warp::Done));
+    let out = h.tick(due + 400);
+    assert!(!has_hud_show(&out), "{out:?}");
+    // A push after the answer crosses after its dwell.
+    h.now = ms(due + 600);
+    assert!(!has_hud_show(&h.press_portal()));
+    let out = h.tick(due + 800);
+    assert!(has_hud_show(&out), "{out:?}");
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+}
+
+/// A warp whose answer never comes holds a crossing's dwell for its bound (`END_TIMEOUT`, 300
+/// ms from the warp) and no longer: a push made during it crosses at the bound.
+#[test]
+fn an_unanswered_warp_holds_a_crossing_dwell_until_its_bound() {
+    let (mut h, due) = stranded_with_dwell();
+    let out = h.tick(due);
+    warp(&out).expect("the stranded retry");
+    h.now = ms(due + 10);
+    assert!(!has_hud_show(&h.press_portal()));
+    let out = h.tick(due + 210);
+    assert!(!has_hud_show(&out), "{out:?}");
+    assert_eq!(h.engine.next_deadline(), Some(ms(due + END_TIMEOUT)));
+    let out = h.tick(due + END_TIMEOUT - 1);
+    assert!(!has_hud_show(&out), "{out:?}");
+    let out = h.tick(due + END_TIMEOUT);
+    assert!(
+        has_hud_show(&out),
+        "the dwell completes at the bound: {out:?}"
+    );
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+}
+
+/// A press on the entry's own strip that happened during the guard but is delivered after it
+/// (queue or IPC delay) is still the entering motion: classified by when it happened. The
+/// absolute limit runs on the current time.
+#[test]
+fn a_delayed_entering_press_is_classified_by_when_it_happened() {
+    let (mut h, _) = H::home_at(point(200.0, 400.0));
+    let entered = h.now_ms();
+    let delayed = |h: &mut H, happened: u64, delivered: u64| {
+        h.now = ms(entered + delivered);
+        let portal = h.strip(0, Edge::Left);
+        h.feed(Input::Capture(CaptureEvent::EdgePressed {
+            portal,
+            position: 0.3,
+            at: ms(entered + happened),
+        }))
+    };
+    // Happened at 50 ms, delivered at 400 ms: guarded, and the strip is now held.
+    assert!(!has_hud_show(&delayed(&mut h, 50, 400)));
+    // The push goes on: still held, until it leaves the strip or the absolute second.
+    assert!(!has_hud_show(&delayed(&mut h, 450, 450)));
+    assert!(!has_hud_show(&delayed(&mut h, 999, 999)));
+    let out = delayed(&mut h, 1_000, 1_000);
+    assert!(has_hud_show(&out), "{out:?}");
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+
+    // Happened during the guard but delivered after the absolute second: the limit wins.
+    let (mut h, _) = H::home_at(point(200.0, 400.0));
+    let entered = h.now_ms();
+    h.now = ms(entered + 1_000);
+    let portal = h.strip(0, Edge::Left);
+    let out = h.feed(Input::Capture(CaptureEvent::EdgePressed {
+        portal,
+        position: 0.3,
+        at: ms(entered + 50),
+    }));
+    assert!(has_hud_show(&out), "{out:?}");
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
 }

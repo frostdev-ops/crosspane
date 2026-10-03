@@ -156,8 +156,13 @@ const E2_TWIN_GRACE: Duration = Duration::from_secs(3);
 /// How often a startup removal that failed is tried again (amendment A1).
 const FENCE_RETRY: Duration = Duration::from_secs(2);
 /// How far, in device pixels per axis, the pointer read back after a warp may be from the point it
-/// was sent to and still count as there (amendment A3).
+/// was sent to and still count as exactly there (amendment A3). Farther on the same display, up to
+/// [`WARP_MOVED_ON`], it moved on after the warp: still `Done`, and logged (WP-2.43j).
 const WARP_TOLERANCE: f64 = 2.0;
+/// How far, in device pixels per axis, the hand can carry the pointer between a warp and its
+/// read-back (WP-2.43j; the worst live case on 2026-10-02 was 119). Farther, the warp didn't
+/// happen and the pointer is wherever it already was on that display: `Skipped`.
+const WARP_MOVED_ON: f64 = 512.0;
 /// How long an injection error stays worth naming in a home notice.
 const INJECT_ERROR_AGE: Duration = Duration::from_secs(10);
 
@@ -3600,8 +3605,16 @@ impl Agent {
     /// read-back (amendment B2): a closed gate is `Skipped` whatever the coordinates say, even
     /// when the gate closed between the warp and the read-back and the engine hasn't heard of the
     /// lock yet. `Done` needs an open gate and a pointer on `warp_to`'s display within
-    /// [`WARP_TOLERANCE`] of its rounded device-pixel point. Hyprland 0.56.2 floors cursorpos
-    /// in logical pixels, so scale 2 can report two device pixels below the rounded warp target.
+    /// [`WARP_MOVED_ON`] of the target (WP-2.43j).
+    ///
+    /// Not within [`WARP_TOLERANCE`]: the owner's hand keeps moving while the capture ends, and
+    /// the motion that arrives between the warp and the read-back moves the pointer on (live,
+    /// 2026-10-02: 5 to 119 device pixels within a few milliseconds, which failed six of nineteen
+    /// home entries and every fallback warp after them). Beyond [`WARP_TOLERANCE`] the distance is
+    /// only logged (Hyprland 0.56.2 floors cursorpos in logical pixels, so scale 2 alone reads
+    /// back up to two device pixels below the target). A warp that didn't happen leaves the
+    /// pointer where it was: on another display, or (when it already was on `warp_to`'s display)
+    /// usually far from the target, which the cap catches.
     /// A read-back that can't be made (or no Hyprland to read from) is an error, never `Done`.
     fn warp_result(&self, warp_to: (DisplayId, PointDevice)) -> Result<Warp, Failure> {
         let seen = self.platform.home.as_ref().map(|seat| seat.cursor());
@@ -3611,20 +3624,29 @@ impl Agent {
         match seen {
             Some(Ok((on, at))) => {
                 let (want_display, want) = warp_to;
-                if on == want_display
-                    && (at.x.round() - want.x.round()).abs() <= WARP_TOLERANCE
-                    && (at.y.round() - want.y.round()).abs() <= WARP_TOLERANCE
-                {
-                    Ok(Warp::Done)
-                } else {
+                if on != want_display {
                     tracing::warn!(
                         ?on,
                         ?at,
                         ?warp_to,
-                        "the pointer isn't where it was warped to"
+                        "the pointer isn't on the display it was warped to"
                     );
-                    Ok(Warp::Skipped)
+                    return Ok(Warp::Skipped);
                 }
+                let (dx, dy) = (at.x.round() - want.x.round(), at.y.round() - want.y.round());
+                if dx.abs() > WARP_MOVED_ON || dy.abs() > WARP_MOVED_ON {
+                    tracing::warn!(
+                        ?on,
+                        ?at,
+                        ?warp_to,
+                        "the pointer is too far from where it was warped to"
+                    );
+                    return Ok(Warp::Skipped);
+                }
+                if dx.abs() > WARP_TOLERANCE || dy.abs() > WARP_TOLERANCE {
+                    tracing::debug!(dx, dy, ?on, "the pointer moved on after the warp");
+                }
+                Ok(Warp::Done)
             }
             Some(Err(e)) => {
                 tracing::warn!(error = %e, "the pointer could not be read back after a warp");
@@ -6457,6 +6479,8 @@ mod home_tests {
 
     const KEYS: &str = "CTRL + SHIFT + ALT + Escape";
     const TARGET: (DisplayId, PointDevice) = (DisplayId(7), PointDevice::new(100.0, 50.0));
+    /// On the twin, but beyond `WARP_MOVED_ON` of any entry target (the content is 400x300).
+    const FAR_ON_TWIN: (DisplayId, PointDevice) = (DisplayId(7), PointDevice::new(2000.0, 2000.0));
 
     // ---- fakes ----
 
@@ -6479,6 +6503,8 @@ mod home_tests {
         recoveries: u32,
         /// What the read-back sees; `None`: the read-back fails.
         cursor: Option<(DisplayId, PointDevice)>,
+        /// The next this many read-backs fail, whatever `cursor` is (an IPC hiccup).
+        failing_reads: u32,
         /// Runs once, during the read-back (a lock arriving in the middle of a warp).
         during_cursor: Option<Box<dyn FnOnce() + Send>>,
         reload: Option<Box<dyn Fn() + Send>>,
@@ -6550,10 +6576,12 @@ mod home_tests {
             if let Some(f) = during {
                 f();
             }
-            self.0
-                .lock()
-                .unwrap()
-                .cursor
+            let mut c = self.0.lock().unwrap();
+            if c.failing_reads > 0 {
+                c.failing_reads -= 1;
+                return Err(PlatformError::Backend("cursor read failed".into()));
+            }
+            c.cursor
                 .ok_or_else(|| PlatformError::Backend("no cursor".into()))
         }
 
@@ -8808,36 +8836,94 @@ mod home_tests {
     }
 
     #[test]
-    fn a_warp_tolerates_two_device_pixels_and_no_more() {
+    fn a_warp_is_done_wherever_the_pointer_moved_on_to_on_the_target_display() {
         let mut h = home();
         let near =
             |dx: f64, dy: f64| Some((TARGET.0, PointDevice::new(TARGET.1.x + dx, TARGET.1.y + dy)));
-        for (dx, dy, want) in [
-            (2.0, 0.0, Ok(Warp::Done)),
-            (0.0, -2.0, Ok(Warp::Done)),
-            (1.5, 1.5, Ok(Warp::Done)),
-            (2.5, 0.0, Ok(Warp::Skipped)),
-            (0.0, 3.0, Ok(Warp::Skipped)),
+        // Within the floor of a scaled read-back, and beyond it up to the cap: the hand kept
+        // moving.
+        for (dx, dy) in [
+            (2.0, 0.0),
+            (0.0, -2.0),
+            (1.5, 1.5),
+            (2.5, 0.0),
+            (0.0, 3.0),
+            (-40.0, -11.0),
+            (512.0, -512.0),
         ] {
             h.compositor.lock().unwrap().cursor = near(dx, dy);
-            assert_eq!(warp(&mut h, TARGET), want, "({dx}, {dy}) off");
+            assert_eq!(warp(&mut h, TARGET), Ok(Warp::Done), "({dx}, {dy}) off");
         }
-        // The right place on the wrong display is not there.
+        // Beyond the cap on either axis, the warp didn't happen: the pointer is where it was.
+        for (dx, dy) in [(513.0, 0.0), (0.0, -513.0), (2000.0, 2000.0)] {
+            h.compositor.lock().unwrap().cursor = near(dx, dy);
+            assert_eq!(warp(&mut h, TARGET), Ok(Warp::Skipped), "({dx}, {dy}) off");
+        }
+        // The right place on the wrong display is not there: the warp didn't happen.
         h.compositor.lock().unwrap().cursor = Some((DisplayId(1), TARGET.1));
         assert_eq!(warp(&mut h, TARGET), Ok(Warp::Skipped));
     }
 
+    /// WP-2.43j, the live read-backs of 2026-10-02: an entry onto the twin read back 17 to 119
+    /// device pixels from its target, and the fallback warp onto a physical display 12 to 38; all
+    /// were `Skipped` and ended home (and the session) for a pointer that was where it belonged.
     #[test]
-    fn the_logged_home_warp_is_within_two_integer_device_pixels() {
+    fn the_logged_home_warps_that_moved_on_are_done() {
         let mut h = home();
-        let to = (
-            DisplayId(3),
-            PointDevice::new(1202.5749006681976, 56.2041219764659),
+        for (to, seen) in [
+            (
+                (
+                    DisplayId(3),
+                    PointDevice::new(1202.5749006681976, 56.2041219764659),
+                ),
+                (DisplayId(3), PointDevice::new(1202.0, 53.0)),
+            ),
+            (
+                (
+                    DisplayId(3),
+                    PointDevice::new(725.9675856052245, 126.47809510289301),
+                ),
+                (DisplayId(3), PointDevice::new(808.0, 212.0)),
+            ),
+            (
+                (
+                    DisplayId(3),
+                    PointDevice::new(3347.4661409583223, 1467.9228240925158),
+                ),
+                (DisplayId(3), PointDevice::new(3330.0, 1468.0)),
+            ),
+            (
+                (
+                    DisplayId(3),
+                    PointDevice::new(1070.3602120732862, 54.61728331622493),
+                ),
+                (DisplayId(3), PointDevice::new(1038.0, 58.0)),
+            ),
+            (
+                (DisplayId(0), PointDevice::new(540.0, 960.0)),
+                (DisplayId(0), PointDevice::new(502.0, 952.0)),
+            ),
+        ] {
+            h.compositor.lock().unwrap().cursor = Some(seen);
+            assert_eq!(
+                warp(&mut h, to),
+                Ok(Warp::Done),
+                "{to:?} read back at {seen:?}"
+            );
+        }
+        // Still on the display it was locked on (the warp never happened): skipped.
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(0), PointDevice::new(0.0, 960.0)));
+        assert_eq!(
+            warp(&mut h, (DisplayId(3), PointDevice::new(3347.0, 1468.0))),
+            Ok(Warp::Skipped)
         );
-        h.compositor.lock().unwrap().cursor = Some((DisplayId(3), PointDevice::new(1202.0, 54.0)));
-        assert_eq!(warp(&mut h, to), Ok(Warp::Done));
-        h.compositor.lock().unwrap().cursor = Some((DisplayId(3), PointDevice::new(1202.0, 53.0)));
-        assert_eq!(warp(&mut h, to), Ok(Warp::Skipped));
+        // A fallback onto the display the pointer was already on, read back where it had been
+        // (the warp never happened): beyond the cap, skipped.
+        h.compositor.lock().unwrap().cursor = Some((DisplayId(0), PointDevice::new(1600.0, 200.0)));
+        assert_eq!(
+            warp(&mut h, (DisplayId(0), PointDevice::new(540.0, 960.0))),
+            Ok(Warp::Skipped)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -9010,9 +9096,27 @@ mod home_tests {
 
     #[test]
     fn a_failed_entry_keeps_its_bind_until_the_watchdog_confirms_a_physical_fallback() {
-        let mut h = aimed_scenario();
-        h.compositor.lock().unwrap().cursor = Some(TARGET);
+        for skipped in [false, true] {
+            failed_entry_keeps_its_bind_until_the_watchdog_confirms_a_physical_fallback(skipped);
+        }
+    }
+
+    /// WP-2.43j: how a failed entry leaves the pointer on the twin. `skipped`: the read-back
+    /// finds it beyond `WARP_MOVED_ON` of the target (the warp didn't happen; `Skipped`). Else the
+    /// read-back fails (`Err`). Both are the same failure to the engine, through different arms.
+    fn fail_entry_on_twin(h: &mut Home, skipped: bool) -> (DisplayId, PointDevice) {
+        let at = if skipped { FAR_ON_TWIN } else { TARGET };
+        h.compositor.lock().unwrap().cursor = Some(at);
         h.capture.lock().unwrap().warp_cursor = None;
+        if !skipped {
+            h.compositor.lock().unwrap().failing_reads = 1;
+        }
+        at
+    }
+
+    fn failed_entry_keeps_its_bind_until_the_watchdog_confirms_a_physical_fallback(skipped: bool) {
+        let mut h = aimed_scenario();
+        let at = fail_entry_on_twin(&mut h, skipped);
         let out = trigger(&mut h);
         assert!(out.iter().any(|o| matches!(
             o,
@@ -9025,7 +9129,11 @@ mod home_tests {
         assert!(h.rig.agent.home.wanted.is_some());
         assert!(h.rig.agent.home.pointer_unsafe);
         assert!(!h.rig.agent.home_capture_active());
-        assert_eq!(h.compositor.lock().unwrap().cursor, Some(TARGET));
+        assert_eq!(
+            h.compositor.lock().unwrap().cursor,
+            Some(at),
+            "skipped: {skipped}"
+        );
         h.capture.lock().unwrap().warp_cursor = Some(h.compositor.clone());
         h.rig.agent.home_housekeeping();
         process_events(&mut h);
@@ -9598,11 +9706,16 @@ mod home_tests {
 
     #[test]
     fn recent_e2_does_not_delay_failed_home_entry_and_unconfirmed_fallback_recovery() {
+        for skipped in [false, true] {
+            recent_e2_does_not_delay_failed_entry_recovery(skipped);
+        }
+    }
+
+    fn recent_e2_does_not_delay_failed_entry_recovery(skipped: bool) {
         let mut h = aimed_scenario();
         let start = Instant::now();
         h.rig.agent.home.watchdog_next = start + HOME_WATCHDOG;
-        h.compositor.lock().unwrap().cursor = Some(TARGET);
-        h.capture.lock().unwrap().warp_cursor = None;
+        fail_entry_on_twin(&mut h, skipped);
         watchdog_injection_at(
             &mut h,
             InjectCmd::MoveTo {
@@ -9989,10 +10102,9 @@ mod home_tests {
 
     #[test]
     fn rescue_uses_current_physical_displays_when_subscription_data_is_empty_or_stale() {
-        for empty in [true, false] {
+        for (empty, skipped) in [(true, false), (false, false), (true, true), (false, true)] {
             let mut h = aimed_scenario();
-            h.compositor.lock().unwrap().cursor = Some(TARGET);
-            h.capture.lock().unwrap().warp_cursor = None;
+            fail_entry_on_twin(&mut h, skipped);
             trigger(&mut h);
             assert!(h.rig.agent.home.pointer_unsafe);
             assert!(h.compositor.lock().unwrap().ours);
