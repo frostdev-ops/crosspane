@@ -406,6 +406,10 @@ pub enum ArtifactRole {
     Tutorial,
     Ctl,
     Installer,
+    /// Code embedded in a bundle (a dylib or framework), such as `Contents/Frameworks`. Admitted
+    /// only by its own approved identifier and designated requirement, with no entitlements; it
+    /// is never launched or used as a controlled child.
+    EmbeddedCode,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Approved role-specific table input, never derived from the payload's own manifest/signature.
@@ -445,6 +449,7 @@ impl SignatureObservation {
             || expected.entitlements.keys().any(|k| !bounded(k, 256))
             || self.entitlements != expected.entitlements
             || (expected.role == ArtifactRole::Agent && expected.identifier != AGENT_LABEL)
+            || (expected.role == ArtifactRole::EmbeddedCode && !expected.entitlements.is_empty())
         {
             return Err(NativeError::Unsupported);
         }
