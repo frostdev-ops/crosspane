@@ -79,16 +79,33 @@ async fn a_second_address_of_a_connected_peer_is_a_quiet_no_op() {
     }
     let ida = identity();
     let idb = identity();
-    let mut a = Node::start_with("a", ida.clone(), Pins::of(&[&idb]), dual_stack(), false);
-    let mut b = Node::start_with("b", idb.clone(), Pins::of(&[&ida]), dual_stack(), false);
+    let (pins_a, audit_a) = audited_pins(&[&idb]);
+    let (pins_b, audit_b) = audited_pins(&[&ida]);
+    let mut a = Node::start_with("a", ida.clone(), pins_a, dual_stack(), false);
+    let mut b = Node::start_with("b", idb.clone(), pins_b, dual_stack(), false);
     let (first, second) = both_loopbacks(b.addr().port());
 
-    assert_eq!(a.transport.connect(first).await.unwrap(), b.id);
+    assert_eq!(
+        audited_connect(&a, first, [&audit_a, &audit_b], "second-address first dial")
+            .await
+            .unwrap(),
+        b.id
+    );
     a.expect_hello(b.id, "b").await;
     b.expect_hello(a.id, "a").await;
     let mut link = a.transport.link(b.id).unwrap();
 
-    assert_eq!(a.transport.connect(second).await.unwrap(), b.id);
+    assert_eq!(
+        audited_connect(
+            &a,
+            second,
+            [&audit_a, &audit_b],
+            "second-address second dial"
+        )
+        .await
+        .unwrap(),
+        b.id
+    );
     a.expect_quiet(Duration::from_millis(500)).await;
     b.expect_quiet(Duration::from_millis(500)).await;
     assert_eq!(a.transport.peers(), vec![b.id]);
@@ -101,6 +118,59 @@ async fn a_second_address_of_a_connected_peer_is_a_quiet_no_op() {
             ..
         }
     ));
+}
+
+/// Characterize dual-stack fixture admission without relying on random ephemeral-port reuse.
+/// Every address below belongs to a node this test starts, including the IPv4 occupant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dual_stack_fixture_first_dial_cannot_reach_an_owned_ipv4_port_occupant() {
+    use std::sync::Arc;
+
+    use crosspane_transport::{Transport, TransportConfig};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    if !dual_stack_available(
+        "a_dual_stack_fixture_first_dial_cannot_reach_an_owned_ipv4_port_occupant",
+    ) {
+        return;
+    }
+    let (ida, idb, idc) = (identity(), identity(), identity());
+    let occupant = Node::start("ipv4 occupant", idc, &[&ida]);
+    let occupied_port = occupant.addr().port();
+    let (send, _events) = unbounded_channel();
+    let (pins_b, audit_b) = audited_pins(&[&ida]);
+    let bound = Transport::bind(
+        TransportConfig {
+            bind: std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, occupied_port)),
+            identity: idb.clone(),
+            pins: pins_b,
+            hello: hello("ipv6 wildcard"),
+        },
+        Arc::new(move |event| {
+            let _ = send.send(event);
+        }),
+    );
+    let wildcard = match bound {
+        Ok(transport) => transport,
+        Err(TransportError::Bind(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("dual-stack fixture refuses an already-owned IPv4 port");
+            return;
+        }
+        Err(error) => panic!("unexpected wildcard fixture bind failure: {error:?}"),
+    };
+    let (pins, audit) = audited_pins(&[&idb]);
+    let a = Node::start_with("a", ida, pins, loopback(), false);
+    let result = audited_connect(
+        &a,
+        both_loopbacks(wildcard.local_addr().port()).0,
+        [&audit, &audit_b],
+        "owned IPv4/IPv6 same-port first dial",
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(peer) if peer == idb.node()),
+        "IPv6 wildcard bound over our IPv4 occupant; first dial result={result:?}"
+    );
 }
 
 /// The NodeId a pin store returns must be the hash of the key it was asked about.

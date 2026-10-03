@@ -129,7 +129,9 @@ async fn a_late_competing_connection_takes_over_or_gives_way_silently() {
     use crosspane_protocol::link::LinkEvent;
     use crosspane_protocol::msg::ControlMessage;
 
-    use crate::common::{Pins, both_loopbacks, dual_stack, dual_stack_available, identity};
+    use crate::common::{
+        audited_connect, audited_pins, both_loopbacks, dual_stack, dual_stack_available, identity,
+    };
 
     if !dual_stack_available("a_late_competing_connection_takes_over_or_gives_way_silently") {
         return;
@@ -141,14 +143,20 @@ async fn a_late_competing_connection_takes_over_or_gives_way_silently() {
         rounds.spawn(async move {
             let (ida, idb) = (identity(), identity());
             // Dual-stack nodes: 127.0.0.1 and [::1] are two addresses of one node.
-            let mut a = Node::start_with("a", ida.clone(), Pins::of(&[&idb]), dual_stack(), false);
-            let mut b = Node::start_with("b", idb.clone(), Pins::of(&[&ida]), dual_stack(), false);
+            let (pins_a, audit_a) = audited_pins(&[&idb]);
+            let (pins_b, audit_b) = audited_pins(&[&ida]);
+            let mut a = Node::start_with("a", ida.clone(), pins_a, dual_stack(), false);
+            let mut b = Node::start_with("b", idb.clone(), pins_b, dual_stack(), false);
 
             // A dials B; both engines are told, and fetch their handles.
-            a.transport
-                .connect(both_loopbacks(b.addr().port()).0)
-                .await
-                .unwrap();
+            audited_connect(
+                &a,
+                both_loopbacks(b.addr().port()).0,
+                [&audit_a, &audit_b],
+                &format!("late-competing round {round} first dial"),
+            )
+            .await
+            .unwrap();
             a.expect_hello(b.id, "b").await;
             b.expect_hello(a.id, "a").await;
             let mut a_link = a.transport.link(b.id).unwrap();
@@ -157,10 +165,14 @@ async fn a_late_competing_connection_takes_over_or_gives_way_silently() {
             // Then B dials A at another address of A: a competing connection in the opposite
             // direction.
             assert_eq!(
-                b.transport
-                    .connect(both_loopbacks(a.addr().port()).1)
-                    .await
-                    .unwrap(),
+                audited_connect(
+                    &b,
+                    both_loopbacks(a.addr().port()).1,
+                    [&audit_b, &audit_a],
+                    &format!("late-competing round {round} competing dial"),
+                )
+                .await
+                .unwrap(),
                 a.id,
                 "round {round}"
             );

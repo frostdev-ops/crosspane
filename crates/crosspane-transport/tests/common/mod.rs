@@ -5,8 +5,9 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crosspane_protocol::ALPN;
 use crosspane_protocol::link::{LinkEvent, LinkEventSink};
@@ -55,6 +56,64 @@ impl PinStore for Pins {
     fn trusted(&self, spki: &[u8]) -> Option<NodeId> {
         self.0.get(spki).copied()
     }
+}
+
+/// Test-only admission evidence. Record counts, never keys, and forward every decision unchanged.
+#[derive(Default)]
+pub struct PinAudit {
+    checks: AtomicUsize,
+    rejections: AtomicUsize,
+}
+
+struct AuditedPins {
+    pins: Arc<Pins>,
+    audit: Arc<PinAudit>,
+}
+
+impl PinStore for AuditedPins {
+    fn trusted(&self, spki: &[u8]) -> Option<NodeId> {
+        let decision = self.pins.trusted(spki);
+        self.audit.checks.fetch_add(1, Ordering::SeqCst);
+        if decision.is_none() {
+            self.audit.rejections.fetch_add(1, Ordering::SeqCst);
+        }
+        decision
+    }
+}
+
+pub fn audited_pins(identities: &[&DeviceIdentity]) -> (Arc<dyn PinStore>, Arc<PinAudit>) {
+    let audit = Arc::new(PinAudit::default());
+    let pins = Arc::new(AuditedPins {
+        pins: Pins::of(identities),
+        audit: audit.clone(),
+    });
+    (pins, audit)
+}
+
+/// Preserve the production result, with enough fixture evidence to distinguish first admission
+/// from duplicate resolution. A failure must remain a failure, with no retry or longer timeout.
+pub async fn audited_connect(
+    node: &Node,
+    addr: SocketAddr,
+    audits: [&PinAudit; 2],
+    phase: &str,
+) -> Result<NodeId, crosspane_transport::TransportError> {
+    let started = Instant::now();
+    let result = node.transport.connect(addr).await;
+    if result.is_err() {
+        let counts = audits.map(|audit| {
+            (
+                audit.checks.load(Ordering::SeqCst),
+                audit.rejections.load(Ordering::SeqCst),
+            )
+        });
+        eprintln!(
+            "{phase}: result={result:?}; elapsed={:?}; pin checks/rejections={counts:?}; registered peers={}",
+            started.elapsed(),
+            node.transport.peers().len()
+        );
+    }
+    result
 }
 
 pub fn identity() -> Arc<DeviceIdentity> {
