@@ -1,0 +1,121 @@
+use super::*;
+use crate::agent_contract::{
+    BootstrapPhase, BootstrapV1, EraseIdentityV1, LastExitV1, parse_bootstrap,
+    parse_erase_identity, parse_last_exit,
+};
+use std::sync::Arc;
+
+pub struct TrackedAgent {
+    io: Arc<LinuxNativeIo>,
+    pub(super) bootstrap: BootstrapV1,
+    watch: ProcessWatch,
+}
+impl std::fmt::Debug for TrackedAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrackedAgent { .. }")
+    }
+}
+impl TrackedAgent {
+    pub fn capture(io: Arc<LinuxNativeIo>, deadline: &Deadline) -> Result<Self> {
+        Self::capture_with(io, None, deadline)
+    }
+    pub fn scratch_capture(
+        io: Arc<LinuxNativeIo>,
+        reader: Arc<dyn ExitReader>,
+        deadline: &Deadline,
+    ) -> Result<Self> {
+        Self::capture_with(io, Some(reader), deadline)
+    }
+    fn capture_with(
+        io: Arc<LinuxNativeIo>,
+        reader: Option<Arc<dyn ExitReader>>,
+        deadline: &Deadline,
+    ) -> Result<Self> {
+        let (bootstrap, watch) = io.track_bootstrap(reader, deadline)?;
+        Ok(Self {
+            io,
+            bootstrap,
+            watch,
+        })
+    }
+    pub fn instance_id(&self) -> u64 {
+        self.bootstrap.instance_id
+    }
+    pub fn original(&self) -> &ProcessIdentity {
+        self.watch.original()
+    }
+    /// No socket, manager result, receipt-only reconstruction or unknown process grants this token.
+    pub fn clean_authority(self: &Arc<Self>, deadline: &Deadline) -> Result<CleanAuthority> {
+        let receipt = self.check(deadline)?;
+        Ok(CleanAuthority {
+            original: self.clone(),
+            receipt,
+        })
+    }
+    fn check(&self, deadline: &Deadline) -> Result<LastExitV1> {
+        deadline.check()?;
+        let (bootstrap_bytes, exit_bytes, observed) =
+            self.watch.exit_observation(&self.io, deadline)?;
+        let bootstrap = parse_bootstrap(&bootstrap_bytes)?;
+        let receipt = parse_last_exit(&exit_bytes)?;
+        if bootstrap.instance_id != self.bootstrap.instance_id
+            || bootstrap.pid != self.bootstrap.pid
+            || bootstrap.started_unix_ms != self.bootstrap.started_unix_ms
+            || bootstrap.runtime_dir != self.bootstrap.runtime_dir
+            || bootstrap.phase_seq < self.bootstrap.phase_seq
+            || bootstrap.phase != BootstrapPhase::Ready
+            || !receipt.clean
+            || receipt.instance_id != self.bootstrap.instance_id
+            || receipt.stopped_unix_ms < self.bootstrap.started_unix_ms
+            || observed != ProcessExit::Exited
+        {
+            return Err(RemovalError::NotClean);
+        }
+        deadline.check()?;
+        Ok(receipt)
+    }
+}
+/// Ephemeral original-process and literal-receipt authority; never serialized or caller-constructed.
+pub struct CleanAuthority {
+    original: Arc<TrackedAgent>,
+    receipt: LastExitV1,
+}
+impl std::fmt::Debug for CleanAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CleanAuthority { .. }")
+    }
+}
+impl CleanAuthority {
+    pub fn receipt(&self) -> &LastExitV1 {
+        &self.receipt
+    }
+    pub fn revalidate(&self, deadline: &Deadline) -> Result<()> {
+        if self.original.check(deadline)? != self.receipt {
+            return Err(RemovalError::Stale);
+        }
+        Ok(())
+    }
+    /// Recheck immediately before dispatch too. The producer's agent.lock still decides races
+    /// with a new process; this token promises no cross-process atomic exclusion.
+    pub fn erase_command(
+        &self,
+        digest: [u8; 32],
+        environment: ChildEnvironment,
+        deadline: &Deadline,
+    ) -> Result<CommandSpec> {
+        self.revalidate(deadline)?;
+        Ok(CommandSpec::erase_identity(
+            &self.original.io,
+            digest,
+            environment,
+            deadline,
+        )?)
+    }
+}
+/// Stdout is semantic truth only: refusal/waiting/failed and kept trust remain literal outcomes.
+pub fn admit_erase_output(output: &CommandOutput) -> Result<EraseIdentityV1> {
+    if output.code != Some(0) || output.stdout.len() + output.stderr.len() > 4096 {
+        return Err(RemovalError::Native(NativeError::Unavailable));
+    }
+    Ok(parse_erase_identity(&output.stdout)?)
+}
