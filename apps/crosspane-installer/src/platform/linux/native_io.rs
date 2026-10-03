@@ -1,4 +1,6 @@
 //! Native observations do not imply readiness. Scratch authority stays inside its own target.
+mod cleanup;
+pub use cleanup::CleanupProof;
 mod removal;
 use crate::agent_contract::{BootstrapV1, InstanceStatus, ObservationSource, parse_bootstrap};
 pub use removal::{ExitReader, ProcessExit, ProcessWatch};

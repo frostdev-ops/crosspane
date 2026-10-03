@@ -421,6 +421,450 @@ fn installed(f: &Fixture, p: &Package) {
         .verify(&f.proof, p, 19, 100, &f.reply(), &deadline())
         .unwrap();
 }
+
+#[test]
+fn cleanup_admits_completed_literal_ledger_with_read_only_exact_snapshots() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let commands = f.runner.calls.lock().unwrap().len();
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    assert_eq!(proof.receipt().resources.len(), 10);
+    assert_eq!(proof.observation(0).unwrap(), ResourceObservation::Matching);
+    assert!(proof.owned(0).unwrap());
+    assert_eq!(proof.observation(10), Err(NativeError::Invalid));
+    assert_eq!(proof.owned(10), Err(NativeError::Invalid));
+    assert_eq!(format!("{proof:?}"), "CleanupProof(..)");
+    let before: Vec<_> = proof
+        .receipt()
+        .resources
+        .iter()
+        .map(|r| fs::read(&r.resolved_path).unwrap())
+        .collect();
+    assert!(
+        f.io.metadata(&f.io.target().agent_path())
+            .unwrap()
+            .is_some()
+    );
+    proof.revalidate(&deadline()).unwrap();
+    let after: Vec<_> = proof
+        .receipt()
+        .resources
+        .iter()
+        .map(|r| fs::read(&r.resolved_path).unwrap())
+        .collect();
+    assert_eq!(before, after);
+    assert!(
+        f.io.metadata(
+            &f.io
+                .target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/removal-intent.json")
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(f.runner.calls.lock().unwrap().len(), commands);
+}
+
+#[test]
+fn cleanup_refuses_changed_ledger_modified_hardlinked_and_foreign_resources() {
+    for mutation in 0..4 {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let proof = f.io.admit_cleanup(&deadline()).unwrap();
+        let path = PathBuf::from(&proof.receipt().resources[8].resolved_path);
+        if mutation == 0 {
+            let ledger =
+                f.io.target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/installer/payload-outcome.json");
+            let mut value: Value =
+                serde_json::from_slice(&f.io.read(&ledger, MAX_RECORD_BYTES, true).unwrap())
+                    .unwrap();
+            value["receipt"]["operation_id"] = json!(999);
+            f.io.atomic_write(&f.proof, &ledger, &serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        } else if mutation == 1 {
+            fs::write(&path, b"administrator modification").unwrap();
+        } else if mutation == 2 {
+            fs::hard_link(&path, f.root.join("outside-inventory-link")).unwrap();
+        } else {
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(f.io.target().agent_path(), &path).unwrap();
+        }
+        assert!(matches!(
+            proof.revalidate(&deadline()),
+            Err(NativeError::Foreign)
+        ));
+        // Captured facts are not silently refreshed by revalidation or clicks.
+        assert_eq!(proof.observation(8).unwrap(), ResourceObservation::Matching);
+        assert!(proof.owned(8).unwrap());
+        assert!(fs::symlink_metadata(path).is_ok());
+    }
+}
+
+#[test]
+fn cleanup_rejects_unfinished_and_malformed_ledger_without_creating_lock_or_intent() {
+    for field in ["phase", "resources", "path", "replacement", "source"] {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let state = f.io.target().paths().state_home.join("crosspane/installer");
+        let ledger = state.join("payload-outcome.json");
+        let mut value: Value =
+            serde_json::from_slice(&f.io.read(&ledger, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+        match field {
+            "phase" => value["phase"] = json!("Applied"),
+            "resources" => value["receipt"]["resources"][0] = json!([]),
+            "path" => {
+                value["receipt"]["resources"][0]["resolved_path"] = json!(f.root.join("unrecorded"))
+            }
+            "replacement" => value["items"][0]["replacement"]["mode"] = json!(0o777),
+            "source" => value["source"] = json!("Live"),
+            _ => unreachable!(),
+        }
+        f.io.atomic_write(&f.proof, &ledger, &serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        assert!(f.io.admit_cleanup(&deadline()).is_err(), "{field}");
+        assert!(
+            f.io.metadata(&state.join("removal-intent.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+fn cleanup_ledger(f: &Fixture) -> (PathBuf, Value) {
+    let path =
+        f.io.target()
+            .paths()
+            .state_home
+            .join("crosspane/installer/payload-outcome.json");
+    let value = serde_json::from_slice(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+    (path, value)
+}
+
+#[test]
+fn cleanup_requires_each_nullable_field_and_strict_nested_objects_and_enums() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let (path, original) = cleanup_ledger(&f);
+    for (pointer, key) in [
+        ("", "previous_instance"),
+        ("", "base_generation"),
+        ("/items/0", "old"),
+        ("/items/0", "replacement"),
+    ] {
+        let mut value = original.clone();
+        value
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        assert!(
+            matches!(f.io.admit_cleanup(&deadline()), Err(NativeError::Foreign)),
+            "{pointer}/{key}"
+        );
+    }
+    for pointer in [
+        "",
+        "/receipt",
+        "/items/0",
+        "/items/0/replacement",
+        "/receipt/resources/0",
+    ] {
+        let mut value = original.clone();
+        *value.pointer_mut(pointer).unwrap() = json!([]);
+        f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        assert!(
+            matches!(f.io.admit_cleanup(&deadline()), Err(NativeError::Foreign)),
+            "{pointer}"
+        );
+    }
+    for pointer in [
+        "/source",
+        "/items/0/ownership",
+        "/receipt/resources/0/ownership",
+        "/receipt/resources/0/before",
+        "/receipt/resources/0/after",
+        "/receipt/resources/0/outcome",
+    ] {
+        let mut value = original.clone();
+        let enum_name = value.pointer(pointer).unwrap().as_str().unwrap().to_owned();
+        *value.pointer_mut(pointer).unwrap() = json!({enum_name: null});
+        f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        assert!(
+            matches!(f.io.admit_cleanup(&deadline()), Err(NativeError::Foreign)),
+            "{pointer}"
+        );
+    }
+}
+
+#[test]
+fn cleanup_rejects_duplicate_unknown_fields_and_incomplete_completion_truth() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let (path, original) = cleanup_ledger(&f);
+    let text = serde_json::to_string(&original).unwrap();
+    for (field, value) in [
+        ("phase", &original["phase"]),
+        (
+            "resource_id",
+            &original["receipt"]["resources"][0]["resource_id"],
+        ),
+        ("ownership", &original["items"][0]["ownership"]),
+        ("hash", &original["items"][0]["replacement"]["hash"]),
+    ] {
+        let member = format!("\"{field}\":{}", serde_json::to_string(value).unwrap());
+        assert!(text.contains(&member));
+        let duplicate = text.replacen(&member, &format!("{member},{member}"), 1);
+        // A permissive parser must accept the duplicate fixture before strict admission rejects it.
+        let _: Value = serde_json::from_str(&duplicate).unwrap();
+        f.io.atomic_write(&f.proof, &path, duplicate.as_bytes())
+            .unwrap();
+        assert!(
+            matches!(f.io.admit_cleanup(&deadline()), Err(NativeError::Foreign)),
+            "duplicate {field}"
+        );
+    }
+    for change in 0..8 {
+        let mut value = original.clone();
+        match change {
+            0 => value["receipt"]["unfinished"] = json!([1]),
+            1 => value["receipt"]["resources"][0]["outcome"] = json!("Unknown"),
+            2 => value["receipt"]["resources"][0]["after"] = json!("Unknown"),
+            3 => value["items"][0]["replacement"] = Value::Null,
+            4 => value["items"][0]["unexpected"] = json!(true),
+            5 => value["items"][0]["replacement"]["file"] = json!([1]),
+            6 => {
+                value["items"][0]["replacement"] = Value::Null;
+                value["items"][0]["old"] = value["items"][0]["new"].clone();
+            }
+            7 => {
+                value["items"][0]["replacement"] = Value::Null;
+                value["receipt"]["resources"][0]["before"] = json!("Matching");
+            }
+            _ => unreachable!(),
+        }
+        f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        assert!(
+            matches!(f.io.admit_cleanup(&deadline()), Err(NativeError::Foreign)),
+            "change {change}"
+        );
+    }
+}
+
+#[test]
+fn cleanup_retains_adopted_foreign_modified_and_same_hash_replaced_resources() {
+    for change in 0..4 {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let (path, mut value) = cleanup_ledger(&f);
+        let resource = PathBuf::from(
+            value["receipt"]["resources"][8]["resolved_path"]
+                .as_str()
+                .unwrap(),
+        );
+        if change < 2 {
+            let ownership = if change == 0 { "Adopted" } else { "Foreign" };
+            value["items"][8]["ownership"] = json!(ownership);
+            value["receipt"]["resources"][8]["ownership"] = json!(ownership);
+            f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        } else if change == 2 {
+            fs::write(&resource, b"retained administrator edit").unwrap();
+        } else {
+            let bytes = fs::read(&resource).unwrap();
+            fs::rename(&resource, f.root.join("retained-previous-icon")).unwrap();
+            fs::write(&resource, bytes).unwrap();
+        }
+        let proof = f.io.admit_cleanup(&deadline()).unwrap();
+        assert!(!proof.owned(8).unwrap());
+        assert_eq!(
+            proof.observation(8).unwrap(),
+            if change == 2 {
+                ResourceObservation::Different
+            } else {
+                ResourceObservation::Matching
+            }
+        );
+        proof.revalidate(&deadline()).unwrap();
+        assert!(resource.is_file());
+    }
+}
+
+#[test]
+fn cleanup_absence_is_fresh_noent_and_parent_replacement_cannot_transfer_authority() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let (_, value) = cleanup_ledger(&f);
+    let path = PathBuf::from(
+        value["receipt"]["resources"][8]["resolved_path"]
+            .as_str()
+            .unwrap(),
+    );
+    fs::remove_file(&path).unwrap();
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    assert_eq!(proof.observation(8).unwrap(), ResourceObservation::Absent);
+    assert!(proof.owned(8).unwrap());
+    proof.revalidate(&deadline()).unwrap();
+    let parent = path.parent().unwrap();
+    fs::rename(parent, f.root.join("retained-parent")).unwrap();
+    std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+        .create(parent)
+        .unwrap();
+    assert!(matches!(
+        proof.revalidate(&deadline()),
+        Err(NativeError::Foreign)
+    ));
+    assert!(!path.exists());
+    let refreshed = f.io.admit_cleanup(&deadline()).unwrap();
+    assert_eq!(
+        refreshed.observation(8).unwrap(),
+        ResourceObservation::Absent
+    );
+    assert!(!refreshed.owned(8).unwrap());
+}
+
+#[test]
+fn cleanup_unfinished_intent_and_deadline_cancellation_never_create_or_dispatch() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    let calls = f.runner.calls.lock().unwrap().len();
+    let cancel = Cancellation::default();
+    let d = Deadline::new(5000, cancel.clone()).unwrap();
+    cancel.cancel();
+    assert!(matches!(
+        f.io.admit_cleanup(&d),
+        Err(NativeError::Cancelled)
+    ));
+    assert_eq!(proof.revalidate(&d), Err(NativeError::Cancelled));
+    let intent =
+        f.io.target()
+            .paths()
+            .state_home
+            .join("crosspane/installer/payload-intent.json");
+    f.io.atomic_write(&f.proof, &intent, b"unfinished payload mutation")
+        .unwrap();
+    assert!(matches!(
+        f.io.admit_cleanup(&deadline()),
+        Err(NativeError::Foreign)
+    ));
+    assert_eq!(proof.revalidate(&deadline()), Err(NativeError::Foreign));
+    assert_eq!(f.runner.calls.lock().unwrap().len(), calls);
+}
+
+#[test]
+fn cleanup_refuses_replaced_ancestor_even_when_final_parent_and_file_are_preserved() {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    let path = PathBuf::from(&proof.receipt().resources[8].resolved_path);
+    let parent = path.parent().unwrap();
+    let final_inode = fs::metadata(parent).unwrap().ino();
+    let ancestor = parent.parent().unwrap();
+    let retained = f.root.join("retained-scalable-ancestor");
+    fs::rename(ancestor, &retained).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(ancestor).unwrap();
+    fs::rename(retained.join("apps"), parent).unwrap();
+    assert_eq!(fs::metadata(parent).unwrap().ino(), final_inode);
+    assert_eq!(proof.revalidate(&deadline()), Err(NativeError::Foreign));
+    assert!(path.is_file());
+}
+
+#[test]
+fn cleanup_refuses_parent_permission_drift_from_0700_to_0755() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    let path = PathBuf::from(&proof.receipt().resources[8].resolved_path);
+    let parent = path.parent().unwrap();
+    assert_eq!(
+        fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(proof.revalidate(&deadline()), Err(NativeError::Foreign));
+    assert!(path.is_file());
+}
+
+fn completed_cleanup_repair(minimal: bool) {
+    let f = Fixture::new(false);
+    let p = package();
+    installed(&f, &p);
+    let installer = PayloadInstaller::new(f.io.clone()).unwrap();
+    if minimal {
+        fs::remove_file(&installer.targets()[8]).unwrap();
+    }
+    let plan = installer
+        .plan(&f.proof, &p, OperationId(48), MatchingFiles::Preserve)
+        .unwrap();
+    installer.apply(&f.proof, &p, plan, &deadline()).unwrap();
+    installer
+        .verify(&f.proof, &p, 19, 100, &f.reply(), &deadline())
+        .unwrap();
+    let (_, ledger) = cleanup_ledger(&f);
+    assert_eq!(ledger["phase"], "Verified");
+    assert_eq!(ledger["items"][0]["ownership"], "Created");
+    assert!(ledger["items"][0]["replacement"].is_null());
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    for index in 0..10 {
+        assert_eq!(
+            proof.observation(index).unwrap(),
+            ResourceObservation::Matching
+        );
+        assert_eq!(proof.owned(index).unwrap(), minimal && index == 8);
+    }
+    proof.revalidate(&deadline()).unwrap();
+}
+
+#[test]
+fn cleanup_accepts_genuine_completed_repeat_without_replacement_provenance() {
+    completed_cleanup_repair(false);
+}
+
+#[test]
+fn cleanup_accepts_genuine_completed_minimal_repair_with_only_one_owned_replacement() {
+    completed_cleanup_repair(true);
+}
+
+#[test]
+fn cleanup_member_mode_boundary_is_pinned_to_frozen_payload_inventory() {
+    assert_eq!(
+        FILES,
+        [
+            "bin/crosspane-agent",
+            "bin/crosspanectl",
+            "bin/crosspane-ui",
+            "bin/crosspane-installer",
+            "bin/crosspane-tutorial",
+            "resources/crosspane-agent.service",
+            "resources/crosspane-settings.desktop",
+            "resources/crosspane-installer.desktop",
+            "resources/crosspane-icon.svg",
+            "resources/LICENSE",
+        ]
+    );
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    assert!(FILES.iter().enumerate().all(|(index, name)| if index < 5 {
+        name.starts_with("bin/")
+    } else {
+        name.starts_with("resources/")
+    }));
+    proof.revalidate(&deadline()).unwrap();
+}
 #[test]
 fn matching_repeat_is_noop_and_missing_file_is_the_exact_minimal_delta() {
     let f = Fixture::new(false);

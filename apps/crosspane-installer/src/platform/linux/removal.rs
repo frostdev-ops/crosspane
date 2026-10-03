@@ -1,6 +1,7 @@
 //! Immutable repair/removal inventory and consent. Execution, durable resume and cleanup-only
 //! admission belong to WP-4.19b. Receipts never grant ownership or recover tutorial readiness.
 mod authority;
+pub mod executor;
 mod inventory;
 mod plan;
 use super::{native_io::*, payload::PayloadError, service::ServiceError};
