@@ -189,6 +189,98 @@ impl Display {
             self.bounds.origin.y + point.y / self.scale,
         ))
     }
+
+    fn pin_point(self, point: CGPoint) -> Result<CGPoint, PlatformError> {
+        let origin = self.bounds.origin;
+        let size = self.bounds.size;
+        if !point.x.is_finite()
+            || !point.y.is_finite()
+            || !origin.x.is_finite()
+            || !origin.y.is_finite()
+            || !size.width.is_finite()
+            || !size.height.is_finite()
+            || size.width <= 0.0
+            || size.height <= 0.0
+            || !self.scale.is_finite()
+            || self.scale <= 0.0
+        {
+            return Err(PlatformError::Backend("invalid cursor pin geometry".into()));
+        }
+        // The far edge is outside the display. Keep the pin at least one device pixel inside it.
+        let max_x = origin.x + (size.width - 1.0 / self.scale).max(0.0);
+        let max_y = origin.y + (size.height - 1.0 / self.scale).max(0.0);
+        Ok(CGPoint::new(
+            point.x.clamp(origin.x, max_x),
+            point.y.clamp(origin.y, max_y),
+        ))
+    }
+}
+
+/// Private cursor seam: tests replace every operation, including release display lookup.
+struct CursorOps {
+    associate: Box<dyn Fn(bool) -> Result<(), PlatformError> + Send + Sync>,
+    hide: Box<dyn Fn() -> Result<(), PlatformError> + Send + Sync>,
+    show: Box<dyn Fn() -> Result<(), PlatformError> + Send + Sync>,
+    warp: Box<dyn Fn(CGPoint) -> Result<(), PlatformError> + Send + Sync>,
+    display: Box<dyn Fn(DisplayId) -> Result<Display, PlatformError> + Send + Sync>,
+}
+
+impl CursorOps {
+    fn native() -> Self {
+        Self {
+            associate: Box::new(|associated| {
+                cg_result(
+                    CGAssociateMouseAndMouseCursorPosition(associated),
+                    if associated {
+                        "associate cursor"
+                    } else {
+                        "detach cursor"
+                    },
+                )
+            }),
+            hide: Box::new(|| cg_result(CGDisplayHideCursor(kCGNullDirectDisplay), "hide cursor")),
+            show: Box::new(|| cg_result(CGDisplayShowCursor(kCGNullDirectDisplay), "show cursor")),
+            warp: Box::new(|point| cg_result(CGWarpMouseCursorPosition(point), "warp cursor")),
+            display: Box::new(Display::read),
+        }
+    }
+}
+
+fn cursor_pin_enabled(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+#[derive(Clone, Copy)]
+struct CursorPin {
+    token: u64,
+    epoch: u64,
+    point: CGPoint,
+}
+
+#[derive(Default)]
+struct PinMetrics {
+    motions: AtomicU64,
+    warps: AtomicU64,
+    last_motion: AtomicU64,
+    longest_gap: AtomicU64,
+}
+
+impl PinMetrics {
+    fn reset(&self) {
+        self.motions.store(0, Ordering::Release);
+        self.warps.store(0, Ordering::Release);
+        self.last_motion.store(0, Ordering::Release);
+        self.longest_gap.store(0, Ordering::Release);
+    }
+
+    fn motion(&self, at: MonoTime) {
+        self.motions.fetch_add(1, Ordering::Relaxed);
+        let last = self.last_motion.swap(at.as_nanos(), Ordering::AcqRel);
+        if last != 0 {
+            self.longest_gap
+                .fetch_max(at.as_nanos().saturating_sub(last), Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -419,6 +511,17 @@ struct Shared {
     active: AtomicU64,
     capturing: AtomicBool,
     epoch: AtomicU64,
+    cursor: CursorOps,
+    pin_enabled: bool,
+    /// Clearing this authorization invalidates the tap-owned coordinates before recovery.
+    pin_token: AtomicU64,
+    pin_metrics: PinMetrics,
+    /// Token whose pin call is in flight; admission covers the final authorization check.
+    pin_inflight: AtomicU64,
+    /// Deferred finish: token in the upper bits, low bit requests the recorded release warp.
+    pin_finish: AtomicU64,
+    release_x: AtomicU64,
+    release_y: AtomicU64,
     detached: AtomicBool,
     hidden: AtomicBool,
     stop: AtomicBool,
@@ -441,6 +544,79 @@ fn restore_flag(
 }
 
 impl Shared {
+    fn capture_active(&self, token: u64, epoch: u64) -> bool {
+        let active = self.active.load(Ordering::SeqCst);
+        active >> 2 == token
+            && matches!(active & 3, PENDING | EFFECTIVE)
+            && self.capturing.load(Ordering::Acquire)
+            && self.epoch.load(Ordering::Acquire) == epoch
+            && self.gate.is_open()
+            && !self.stop.load(Ordering::Acquire)
+            && !self.dead.load(Ordering::Acquire)
+    }
+
+    fn pin_active(&self, pin: CursorPin) -> bool {
+        self.pin_token.load(Ordering::SeqCst) == pin.token
+            && self.capture_active(pin.token, pin.epoch)
+    }
+
+    fn clear_pin(&self, token: u64) {
+        if token != 0
+            && self
+                .pin_token
+                .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            tracing::debug!(
+                token,
+                warp_count = self.pin_metrics.warps.load(Ordering::Acquire),
+                captured_motion_count = self.pin_metrics.motions.load(Ordering::Acquire),
+                longest_motion_gap_ms =
+                    self.pin_metrics.longest_gap.load(Ordering::Acquire) as f64 / 1_000_000.0,
+                "capture cursor pin measurements"
+            );
+        }
+    }
+
+    fn complete_pin_finish(&self, token: u64) -> Result<(), PlatformError> {
+        if self.pin_inflight.load(Ordering::SeqCst) == token {
+            return Ok(());
+        }
+        let pending = self.pin_finish.load(Ordering::SeqCst);
+        if pending == 0
+            || pending >> 1 != token
+            || self
+                .pin_finish
+                .compare_exchange(pending, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Ok(());
+        }
+        // Publication of pin_finish follows these coordinates. RECOVERING excludes a new
+        // token until this final warp and show complete; neither writer nor reader needs a lock.
+        let result = if pending & 1 != 0 {
+            let point = CGPoint::new(
+                f64::from_bits(self.release_x.load(Ordering::Acquire)),
+                f64::from_bits(self.release_y.load(Ordering::Acquire)),
+            );
+            if self.gate.is_open() {
+                (self.cursor.warp)(point)
+            } else {
+                Err(PlatformError::Locked)
+            }
+        } else {
+            Ok(())
+        };
+        let shown = restore_flag(&self.hidden, || (self.cursor.show)());
+        let _ = self.active.compare_exchange(
+            token << 2 | RECOVERING,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        result.and(shown)
+    }
+
     fn available(&self) -> Result<(), PlatformError> {
         if self.dead.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
             Err(PlatformError::Backend("capture worker stopped".into()))
@@ -478,19 +654,13 @@ impl Shared {
     }
 
     fn restore_cursor(&self) -> Result<(), PlatformError> {
-        let associated = restore_flag(&self.detached, || {
-            cg_result(
-                CGAssociateMouseAndMouseCursorPosition(true),
-                "associate cursor",
-            )
-        });
-        let shown = restore_flag(&self.hidden, || {
-            cg_result(CGDisplayShowCursor(kCGNullDirectDisplay), "show cursor")
-        });
+        let associated = restore_flag(&self.detached, || (self.cursor.associate)(true));
+        let shown = restore_flag(&self.hidden, || (self.cursor.show)());
         associated.and(shown)
     }
 
-    /// No application locks or wait for the tap. Also cancels queued activation.
+    /// No application locks or drain wait: an in-flight pin defers the release immediately,
+    /// preserving the total CALL_BUDGET. Abort/watchdog recovery never waits either.
     fn finish(
         &self,
         reason: EndReason,
@@ -514,7 +684,7 @@ impl Shared {
         }
         let claimed = self
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
                 if active & 3 == RECOVERING || expected.is_some_and(|token| active >> 2 != token) {
                     None
                 } else {
@@ -528,6 +698,7 @@ impl Shared {
                 // restores the cursor and delivers its end without waiting for that recovery.
                 if active & 3 == RECOVERING && expected.is_none_or(|token| active >> 2 == token) {
                     self.capturing.store(false, Ordering::Release);
+                    self.clear_pin(active >> 2);
                     let result = self.restore_cursor();
                     let _ = self.queue(Delivery::End(active >> 2, reason));
                     return result;
@@ -539,20 +710,18 @@ impl Shared {
             self.epoch.fetch_add(1, Ordering::AcqRel);
         }
         self.capturing.store(false, Ordering::Release);
-        let mut result = restore_flag(&self.detached, || {
-            cg_result(
-                CGAssociateMouseAndMouseCursorPosition(true),
-                "associate cursor",
-            )
-        });
+        self.clear_pin(active >> 2);
+        let mut result = restore_flag(&self.detached, || (self.cursor.associate)(true));
+        let mut release = None;
         if active != 0
             && let Some((display, point)) = warp
         {
-            let warped = Display::read(display)
+            let warped = (self.cursor.display)(display)
                 .and_then(|display| display.global(point))
                 .and_then(|point| {
                     if self.gate.is_open() {
-                        cg_result(CGWarpMouseCursorPosition(point), "warp cursor")
+                        release = Some(point);
+                        Ok(())
                     } else {
                         Err(PlatformError::Locked)
                     }
@@ -561,9 +730,41 @@ impl Shared {
                 result = warped;
             }
         }
-        let shown = restore_flag(&self.hidden, || {
-            cg_result(CGDisplayShowCursor(kCGNullDirectDisplay), "show cursor")
-        });
+        let token = active >> 2;
+        if token != 0 && self.pin_inflight.load(Ordering::SeqCst) == token {
+            // A blocked native pin cannot be cancelled. Keep RECOVERING until it drains and
+            // hand the final release to the tap; no new capture can overtake either call.
+            // Restore association and visibility before returning, even if the pin never drains.
+            // Deferring immediately reserves the whole call budget for native cleanup.
+            result = result.and(restore_flag(&self.hidden, || (self.cursor.show)()));
+            if active & 3 == EFFECTIVE {
+                let _ = self.queue(Delivery::End(token, reason));
+            }
+            if let Some(point) = release {
+                self.release_x.store(point.x.to_bits(), Ordering::Release);
+                self.release_y.store(point.y.to_bits(), Ordering::Release);
+            }
+            self.pin_finish
+                .store(token << 1 | u64::from(release.is_some()), Ordering::SeqCst);
+            // The pin can drain just before publication. Exactly one of this caller and the
+            // tap claims the deferred finish. SeqCst publication/drain checks prevent both
+            // sides from missing the other's store and leaving recovery unclaimed.
+            let completed = self.complete_pin_finish(token);
+            return result.and(completed).and(if release.is_some() {
+                Err(PlatformError::Timeout)
+            } else {
+                Ok(())
+            });
+        }
+        if let Some(point) = release {
+            let warped = if self.gate.is_open() {
+                (self.cursor.warp)(point)
+            } else {
+                Err(PlatformError::Locked)
+            };
+            result = result.and(warped);
+        }
+        let shown = restore_flag(&self.hidden, || (self.cursor.show)());
         result = result.and(shown);
         if active & 3 == EFFECTIVE {
             let _ = self.queue(Delivery::End(active >> 2, reason));
@@ -779,6 +980,16 @@ impl MacCapture {
             active: AtomicU64::new(0),
             capturing: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            cursor: CursorOps::native(),
+            pin_enabled: cursor_pin_enabled(
+                std::env::var("CROSSPANE_MAC_CURSOR_PIN").ok().as_deref(),
+            ),
+            pin_token: AtomicU64::new(0),
+            pin_metrics: PinMetrics::default(),
+            pin_inflight: AtomicU64::new(0),
+            pin_finish: AtomicU64::new(0),
+            release_x: AtomicU64::new(0),
+            release_y: AtomicU64::new(0),
             detached: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -983,6 +1194,7 @@ struct TapState {
     blinded: bool,
     lock_keys: LockKeys,
     display: Option<Display>,
+    pin: Option<CursorPin>,
     local_keys: [bool; 128],
     suppressed_keys: [u64; 128],
     suppressed_buttons: [u64; 256],
@@ -991,6 +1203,74 @@ struct TapState {
 }
 
 impl TapState {
+    fn start_pin(
+        &mut self,
+        token: u64,
+        epoch: u64,
+        display: Display,
+        location: CGPoint,
+    ) -> Result<(), PlatformError> {
+        self.pin = None;
+        if !self.shared.pin_enabled {
+            return Ok(());
+        }
+        let pin = CursorPin {
+            token,
+            epoch,
+            point: display.pin_point(location)?,
+        };
+        if !self.shared.capture_active(token, epoch) {
+            return Err(PlatformError::Timeout);
+        }
+        self.shared.pin_metrics.reset();
+        self.shared.pin_token.store(token, Ordering::SeqCst);
+        // Abort can overtake setup. Never publish coordinates for its ended generation.
+        if !self.shared.pin_active(pin) {
+            self.shared.clear_pin(token);
+            return Err(PlatformError::Timeout);
+        }
+        self.pin = Some(pin);
+        Ok(())
+    }
+
+    fn pin_motion(&mut self, token: u64, location: CGPoint) {
+        let Some(pin) = self.pin else { return };
+        if pin.token != token || !self.shared.pin_active(pin) {
+            self.pin = None;
+            self.shared.clear_pin(pin.token);
+            return;
+        }
+        // Measure tap arrival gaps, rather than remote deltas or synthetic warp positions.
+        self.shared.pin_metrics.motion(clock::now());
+        if location != pin.point
+            && self
+                .shared
+                .pin_inflight
+                .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            // Recovery either observes this guard and waits/defers its release, or precedes
+            // this final check, in which case no native pin is submitted. Admission, authorization
+            // clearing, and their checks share a SeqCst order, so neither side can miss the other.
+            if self.shared.pin_active(pin) {
+                // Plain public warp, once per swallowed motion. Suppression is measured by the lead.
+                self.shared
+                    .pin_metrics
+                    .warps
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Err(error) = (self.shared.cursor.warp)(pin.point) {
+                    tracing::error!(token, %error, "capture cursor pin disabled after warp failure");
+                    self.shared.clear_pin(token);
+                    self.pin = None;
+                }
+            }
+            self.shared.pin_inflight.store(0, Ordering::SeqCst);
+            if let Err(error) = self.shared.complete_pin_finish(token) {
+                tracing::error!(%error, "capture deferred cursor recovery failed");
+            }
+        }
+    }
+
     fn sync_portals(&mut self) {
         // The callback never waits for a writer. Immutable snapshots keep hit testing fast.
         let portals = match self.shared.portals.try_lock() {
@@ -1143,10 +1423,8 @@ impl TapState {
         if !request.valid(&self.shared) || !self.shared.gate.is_open() {
             return Err(PlatformError::Locked);
         }
-        cg_result(
-            CGAssociateMouseAndMouseCursorPosition(false),
-            "detach cursor",
-        )?;
+        self.start_pin(token, request.epoch, display, location)?;
+        (self.shared.cursor.associate)(false)?;
         self.shared.detached.store(true, Ordering::Release);
         if !request.valid(&self.shared)
             || self.shared.active.load(Ordering::Acquire) != token << 2 | PENDING
@@ -1157,7 +1435,7 @@ impl TapState {
         if !self.shared.gate.is_open() {
             return Err(PlatformError::Locked);
         }
-        cg_result(CGDisplayHideCursor(kCGNullDirectDisplay), "hide cursor")?;
+        (self.shared.cursor.hide)()?;
         self.shared.hidden.store(true, Ordering::Release);
         if !request.valid(&self.shared)
             || self.shared.active.load(Ordering::Acquire) != token << 2 | PENDING
@@ -1165,8 +1443,8 @@ impl TapState {
             let _ = self.shared.finish(EndReason::Lost, None);
             return Err(PlatformError::Timeout);
         }
-        // Public hiding can succeed without hiding a background app's cursor (WP-1.19).
-        // The disassociated cursor at the edge is the specified MVP fallback.
+        // Disassociation and hiding are best-effort foreground behavior (WP-1.19).
+        // Background capture also pins swallowed motion with public warps on this tap thread.
         Ok(CaptureStart {
             held_keys,
             lock_keys: self.lock_keys,
@@ -1446,6 +1724,7 @@ impl TapState {
                             at,
                         },
                     );
+                    self.pin_motion(token, CGEvent::location(Some(event)));
                 }
             } else if self.subscribed {
                 self.sync_portals();
@@ -1768,6 +2047,7 @@ fn run_tap(
         blinded: secure_input(),
         lock_keys: locks(CGEventSource::flags_state(SESSION)),
         display: None,
+        pin: None,
         local_keys: [false; 128],
         suppressed_keys: [0; 128],
         suppressed_buttons: [0; 256],
@@ -1899,28 +2179,152 @@ mod tests {
     use super::*;
     use objc2_core_foundation::CGSize;
 
-    // Pure state fixtures: no native resources were acquired, so finish never calls Quartz.
+    #[derive(Clone, Debug, PartialEq)]
+    enum CursorCall {
+        Associate(bool),
+        Hide,
+        Show,
+        Warp(CGPoint),
+    }
+
+    #[derive(Default)]
+    struct FakeCursor {
+        calls: Mutex<Vec<(CursorCall, u64)>>,
+        owner: Mutex<std::sync::Weak<Shared>>,
+        position: Mutex<Option<CGPoint>>,
+        pause: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+        pause_show: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+        fail_warps: AtomicU64,
+    }
+
+    impl FakeCursor {
+        fn record(&self, call: CursorCall) {
+            let pin_token = self
+                .owner
+                .lock()
+                .unwrap()
+                .upgrade()
+                .map_or(0, |shared| shared.pin_token.load(Ordering::Acquire));
+            self.calls.lock().unwrap().push((call, pin_token));
+        }
+
+        fn operations(self: &Arc<Self>) -> CursorOps {
+            let associate = self.clone();
+            let hide = self.clone();
+            let show = self.clone();
+            let warp = self.clone();
+            CursorOps {
+                associate: Box::new(move |associated| {
+                    associate.record(CursorCall::Associate(associated));
+                    Ok(())
+                }),
+                hide: Box::new(move || {
+                    hide.record(CursorCall::Hide);
+                    Ok(())
+                }),
+                show: Box::new(move || {
+                    show.record(CursorCall::Show);
+                    let pause = show.pause_show.lock().unwrap().take();
+                    if let Some((entered, resume)) = pause {
+                        entered.send(()).unwrap();
+                        let _ = resume.recv();
+                    }
+                    Ok(())
+                }),
+                warp: Box::new(move |point| {
+                    warp.record(CursorCall::Warp(point));
+                    let pause = warp.pause.lock().unwrap().take();
+                    if let Some((entered, resume)) = pause {
+                        entered.send(()).unwrap();
+                        // Dropping the test's sender also drains the fake on an assertion failure.
+                        let _ = resume.recv();
+                    }
+                    if warp
+                        .fail_warps
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            count.checked_sub(1)
+                        })
+                        .is_ok()
+                    {
+                        return Err(PlatformError::Backend("synthetic warp failure".into()));
+                    }
+                    *warp.position.lock().unwrap() = Some(point);
+                    Ok(())
+                }),
+                display: Box::new(|id| {
+                    Ok(Display {
+                        id,
+                        bounds: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(100.0, 100.0)),
+                        scale: 2.0,
+                    })
+                }),
+            }
+        }
+
+        fn warps(&self) -> Vec<CGPoint> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(call, _)| match call {
+                    CursorCall::Warp(point) => Some(*point),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn pause_next_warp(&self) -> (Receiver<()>, Sender<()>) {
+            let (entered, paused) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            *self.pause.lock().unwrap() = Some((entered, resumed));
+            (paused, resume)
+        }
+
+        fn pause_next_show(&self) -> (Receiver<()>, Sender<()>) {
+            let (entered, paused) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            *self.pause_show.lock().unwrap() = Some((entered, resumed));
+            (paused, resume)
+        }
+    }
+
+    // Every fixture uses fake cursor operations, even when testing acquired-resource recovery.
     fn shared_fixture() -> (Arc<Shared>, Receiver<Delivery>) {
+        let (shared, receiver, _) = shared_cursor_fixture(true);
+        (shared, receiver)
+    }
+
+    fn shared_cursor_fixture(
+        pin_enabled: bool,
+    ) -> (Arc<Shared>, Receiver<Delivery>, Arc<FakeCursor>) {
         let gate = IoGate::new();
         gate.set_engine_permits(true);
         gate.set_session_permits(true);
         let (output, receiver) = mpsc::sync_channel(DELIVERY_LIMIT);
-        (
-            Arc::new(Shared {
-                gate,
-                output,
-                active: AtomicU64::new(0),
-                capturing: AtomicBool::new(false),
-                epoch: AtomicU64::new(0),
-                detached: AtomicBool::new(false),
-                hidden: AtomicBool::new(false),
-                stop: AtomicBool::new(false),
-                dead: AtomicBool::new(false),
-                time: AtomicU8::new(UNKNOWN_TIME),
-                portals: Mutex::new(Arc::new(Vec::new())),
-            }),
-            receiver,
-        )
+        let cursor = Arc::new(FakeCursor::default());
+        let shared = Arc::new(Shared {
+            gate,
+            output,
+            active: AtomicU64::new(0),
+            capturing: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+            cursor: cursor.operations(),
+            pin_enabled,
+            pin_token: AtomicU64::new(0),
+            pin_metrics: PinMetrics::default(),
+            pin_inflight: AtomicU64::new(0),
+            pin_finish: AtomicU64::new(0),
+            release_x: AtomicU64::new(0),
+            release_y: AtomicU64::new(0),
+            detached: AtomicBool::new(false),
+            hidden: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
+            time: AtomicU8::new(UNKNOWN_TIME),
+            portals: Mutex::new(Arc::new(Vec::new())),
+        });
+        *cursor.owner.lock().unwrap() = Arc::downgrade(&shared);
+        (shared, receiver, cursor)
     }
 
     #[test]
@@ -2407,7 +2811,12 @@ mod tests {
     // and nothing is posted; every path below avoids button_state, so the result does not
     // depend on the session's real mouse.
     fn tap_fixture() -> (TapState, Receiver<Delivery>) {
-        let (shared, receiver) = shared_fixture();
+        let (tap, receiver, _) = tap_cursor_fixture(true);
+        (tap, receiver)
+    }
+
+    fn tap_cursor_fixture(pin_enabled: bool) -> (TapState, Receiver<Delivery>, Arc<FakeCursor>) {
+        let (shared, receiver, cursor) = shared_cursor_fixture(pin_enabled);
         let display = Display {
             id: DisplayId(1),
             bounds: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(100.0, 100.0)),
@@ -2441,13 +2850,666 @@ mod tests {
                 blinded: false,
                 lock_keys: LockKeys::default(),
                 display: None,
+                pin: None,
                 local_keys: [false; 128],
                 suppressed_keys: [0; 128],
                 suppressed_buttons: [0; 256],
                 held_buttons: HeldButtons::default(),
             },
             receiver,
+            cursor,
         )
+    }
+
+    fn activate_pin(tap: &mut TapState, scale: f64) -> CGPoint {
+        let display = Display {
+            scale,
+            ..tap.portals[0].display
+        };
+        tap.display = Some(display);
+        tap.shared
+            .active
+            .store(1 << 2 | EFFECTIVE, Ordering::Release);
+        tap.shared.capturing.store(true, Ordering::Release);
+        tap.start_pin(
+            1,
+            tap.shared.epoch.load(Ordering::Acquire),
+            display,
+            CGPoint::new(100.0, 50.0),
+        )
+        .unwrap();
+        display.pin_point(CGPoint::new(100.0, 50.0)).unwrap()
+    }
+
+    fn motion_events(receiver: &Receiver<Delivery>) -> Vec<(u64, f64, f64, MotionKind)> {
+        receiver
+            .try_iter()
+            .filter_map(|delivery| match delivery {
+                Delivery::Event(token, CaptureEvent::Motion { dx, dy, kind, .. }) => {
+                    Some((token, dx, dy, kind))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn captured_motion_pins_once_and_preserves_scaled_deltas() {
+        let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+        let point = activate_pin(&mut tap, 2.0);
+        let event = pointer(CGEventType::MouseMoved, 0, false);
+        CGEvent::set_double_value_field(Some(&event), CGEventField::MouseEventDeltaY, -3.0);
+        for (location, warp_count) in [
+            (CGPoint::new(75.0, 60.0), 1),
+            (point, 1),
+            (CGPoint::new(30.0, 80.0), 2),
+        ] {
+            CGEvent::set_location(Some(&event), location);
+            assert!(!tap.event(CGEventType::MouseMoved, &event));
+            assert_eq!(cursor.warps().len(), warp_count);
+        }
+        assert_eq!(cursor.warps(), [point, point]);
+        assert_eq!(
+            motion_events(&receiver),
+            vec![
+                (
+                    1,
+                    10.0,
+                    -6.0,
+                    MotionKind::Accelerated {
+                        display: DisplayId(1)
+                    }
+                );
+                3
+            ]
+        );
+        assert_eq!(tap.shared.pin_metrics.motions.load(Ordering::Acquire), 3);
+        assert_eq!(tap.shared.pin_metrics.warps.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn subscribed_motion_and_edge_hits_do_not_warp() {
+        let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+        let event = pointer(CGEventType::MouseMoved, 0, false);
+        CGEvent::set_location(Some(&event), CGPoint::new(50.0, 50.0));
+        assert!(tap.event(CGEventType::MouseMoved, &event));
+        CGEvent::set_location(Some(&event), CGPoint::new(100.0, 50.0));
+        assert!(tap.event(CGEventType::MouseMoved, &event));
+        assert_eq!(edge_events(&receiver), [EdgeSeen::Pressed(1)]);
+        assert!(cursor.warps().is_empty());
+    }
+
+    #[test]
+    fn injected_motion_during_capture_does_not_warp() {
+        let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+        activate_pin(&mut tap, 2.0);
+        for kind in [CGEventType::MouseMoved, CGEventType::LeftMouseDragged] {
+            assert!(tap.event(kind, &pointer(kind, 0, true)));
+        }
+        assert!(cursor.warps().is_empty());
+        assert!(motion_events(&receiver).is_empty());
+        assert_eq!(tap.shared.pin_metrics.motions.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn ended_closed_gate_recovering_and_stale_pins_do_not_warp() {
+        for state in ["ended", "gate", "recovering", "epoch", "token"] {
+            let (mut tap, _receiver, cursor) = tap_cursor_fixture(true);
+            activate_pin(&mut tap, 2.0);
+            match state {
+                "ended" => tap.shared.finish(EndReason::Requested, None).unwrap(),
+                "gate" => tap.shared.gate.set_engine_permits(false),
+                "recovering" => tap
+                    .shared
+                    .active
+                    .store(1 << 2 | RECOVERING, Ordering::Release),
+                "epoch" => {
+                    tap.shared.epoch.fetch_add(1, Ordering::AcqRel);
+                }
+                "token" => tap
+                    .shared
+                    .active
+                    .store(2 << 2 | EFFECTIVE, Ordering::Release),
+                _ => unreachable!(),
+            }
+            tap.event(
+                CGEventType::MouseMoved,
+                &pointer(CGEventType::MouseMoved, 0, false),
+            );
+            assert!(cursor.warps().is_empty(), "state: {state}");
+            // Also exercise the final authorization check without the event's capture snapshot.
+            tap.pin_motion(1, CGPoint::new(80.0, 50.0));
+            assert!(cursor.warps().is_empty(), "state: {state}");
+            assert_eq!(tap.shared.pin_token.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn captured_drags_pin_and_preserve_button_suppression() {
+        for (down, dragged, up, button) in [
+            (
+                CGEventType::LeftMouseDown,
+                CGEventType::LeftMouseDragged,
+                CGEventType::LeftMouseUp,
+                0,
+            ),
+            (
+                CGEventType::RightMouseDown,
+                CGEventType::RightMouseDragged,
+                CGEventType::RightMouseUp,
+                1,
+            ),
+            (
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseDragged,
+                CGEventType::OtherMouseUp,
+                3,
+            ),
+        ] {
+            let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+            let point = activate_pin(&mut tap, 2.0);
+            assert!(!tap.event(down, &pointer(down, button, false)));
+            assert_eq!(tap.suppressed_buttons[button as usize], 1);
+            assert!(!tap.event(dragged, &pointer(dragged, button, false)));
+            assert!(!tap.event(up, &pointer(up, button, false)));
+            assert_eq!(cursor.warps(), [point]);
+            assert_eq!(
+                motion_events(&receiver),
+                [(
+                    1,
+                    10.0,
+                    0.0,
+                    MotionKind::Accelerated {
+                        display: DisplayId(1)
+                    }
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn release_clears_pin_before_cursor_operations_and_late_motion() {
+        let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+        activate_pin(&mut tap, 2.0);
+        // Fake the foreground operations as well: no Quartz cursor API is used by this fixture.
+        (tap.shared.cursor.associate)(false).unwrap();
+        tap.shared.detached.store(true, Ordering::Release);
+        (tap.shared.cursor.hide)().unwrap();
+        tap.shared.hidden.store(true, Ordering::Release);
+        cursor.calls.lock().unwrap().clear();
+        tap.shared
+            .finish(
+                EndReason::Requested,
+                Some((DisplayId(1), PointDevice::new(20.0, 40.0))),
+            )
+            .unwrap();
+        let expected = vec![
+            (CursorCall::Associate(true), 0),
+            (CursorCall::Warp(CGPoint::new(10.0, 20.0)), 0),
+            (CursorCall::Show, 0),
+        ];
+        assert_eq!(*cursor.calls.lock().unwrap(), expected);
+        tap.event(
+            CGEventType::MouseMoved,
+            &pointer(CGEventType::MouseMoved, 0, false),
+        );
+        tap.pin_motion(1, CGPoint::new(80.0, 50.0));
+        assert_eq!(*cursor.calls.lock().unwrap(), expected);
+        assert!(tap.pin.is_none());
+        assert!(motion_events(&receiver).is_empty());
+    }
+
+    struct PausedPin {
+        shared: Arc<Shared>,
+        cursor: Arc<FakeCursor>,
+        receiver: Receiver<Delivery>,
+        resume: Sender<()>,
+        tap: std::thread::JoinHandle<()>,
+    }
+
+    fn paused_pin() -> PausedPin {
+        let (ready, fixture) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            // Build tap-only CF objects on this thread; no event is posted and every cursor
+            // operation is fake, including the foreground restore path.
+            let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+            activate_pin(&mut tap, 2.0);
+            (tap.shared.cursor.associate)(false).unwrap();
+            tap.shared.detached.store(true, Ordering::Release);
+            (tap.shared.cursor.hide)().unwrap();
+            tap.shared.hidden.store(true, Ordering::Release);
+            cursor.calls.lock().unwrap().clear();
+            *cursor.position.lock().unwrap() = Some(CGPoint::new(100.0, 50.0));
+            let (paused, resume) = cursor.pause_next_warp();
+            ready
+                .send((tap.shared.clone(), cursor, receiver, paused, resume))
+                .unwrap();
+            assert!(!tap.event(
+                CGEventType::MouseMoved,
+                &pointer(CGEventType::MouseMoved, 0, false)
+            ));
+            // An event queued after recovery must not submit another pin.
+            tap.event(
+                CGEventType::MouseMoved,
+                &pointer(CGEventType::MouseMoved, 0, false),
+            );
+        });
+        let (shared, cursor, receiver, paused, resume) =
+            fixture.recv_timeout(Duration::from_secs(1)).unwrap();
+        paused.recv_timeout(Duration::from_secs(1)).unwrap();
+        PausedPin {
+            shared,
+            cursor,
+            receiver,
+            resume,
+            tap: thread,
+        }
+    }
+
+    fn assert_ended_once(receiver: Receiver<Delivery>) {
+        // Feed the actual race's queued messages through the production delivery state machine.
+        // A watchdog may repeat an internal End message; only one public Ended may be sent.
+        let (shared, deliveries) = shared_fixture();
+        shared.active.store(1 << 2 | PENDING, Ordering::Release);
+        shared.capturing.store(true, Ordering::Release);
+        let (events, seen) = mpsc::channel();
+        shared
+            .queue(Delivery::Subscribe(
+                Arc::new(move |event| {
+                    events.send(event).unwrap();
+                }),
+                LockKeys::default(),
+                false,
+            ))
+            .unwrap();
+        let (reply, _answer) = mpsc::channel();
+        shared
+            .queue(Delivery::Activate {
+                token: 1,
+                id: CaptureId(1),
+                start: CaptureStart {
+                    held_keys: Vec::new(),
+                    lock_keys: LockKeys::default(),
+                },
+                request: Arc::new(Request {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    cancelled: AtomicBool::new(false),
+                    epoch: 0,
+                }),
+                reply,
+            })
+            .unwrap();
+        for message in receiver.try_iter() {
+            shared.queue(message).unwrap();
+        }
+        shared.queue(Delivery::Stop).unwrap();
+        deliver(shared, deliveries);
+        assert_eq!(
+            seen.try_iter()
+                .filter(|event| matches!(
+                    event,
+                    CaptureEvent::Ended {
+                        id: CaptureId(1),
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn in_flight_pin_drains_before_deferred_release_and_a_new_token() {
+        let PausedPin {
+            shared,
+            cursor,
+            receiver,
+            resume,
+            tap,
+        } = paused_pin();
+        let finishing = shared.clone();
+        let (done, finished) = mpsc::channel();
+        let end = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = finishing.finish(
+                EndReason::Requested,
+                Some((DisplayId(1), PointDevice::new(20.0, 40.0))),
+            );
+            done.send((result, started.elapsed())).unwrap();
+        });
+        let (result, elapsed) = finished.recv_timeout(CALL_BUDGET * 4).unwrap();
+        assert!(matches!(result, Err(PlatformError::Timeout)));
+        assert!(elapsed < CALL_BUDGET);
+        eprintln!("deferred end total elapsed: {elapsed:?}");
+        assert_eq!(shared.pin_token.load(Ordering::Acquire), 0);
+        assert!(!shared.detached.load(Ordering::Acquire));
+        assert!(!shared.hidden.load(Ordering::Acquire));
+        assert_eq!(shared.active.load(Ordering::Acquire), 1 << 2 | RECOVERING);
+        assert!(
+            shared
+                .active
+                .compare_exchange(0, 2 << 2 | PENDING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        );
+        // The old pin call is inside the fake but has not landed. No release was submitted yet.
+        assert_eq!(cursor.warps(), [CGPoint::new(99.5, 50.0)]);
+        assert_eq!(
+            *cursor.position.lock().unwrap(),
+            Some(CGPoint::new(100.0, 50.0))
+        );
+        resume.send(()).unwrap();
+        tap.join().unwrap();
+        end.join().unwrap();
+        assert_eq!(
+            cursor.warps(),
+            [CGPoint::new(99.5, 50.0), CGPoint::new(10.0, 20.0)]
+        );
+        assert_eq!(
+            *cursor.position.lock().unwrap(),
+            Some(CGPoint::new(10.0, 20.0))
+        );
+        assert_eq!(shared.active.load(Ordering::Acquire), 0);
+        assert_eq!(shared.pin_inflight.load(Ordering::Acquire), 0);
+        assert_eq!(shared.pin_finish.load(Ordering::Acquire), 0);
+        assert!(
+            shared
+                .active
+                .compare_exchange(0, 2 << 2 | PENDING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        );
+        let calls = cursor.calls.lock().unwrap();
+        assert_eq!(
+            calls.last(),
+            Some(&(CursorCall::Warp(CGPoint::new(10.0, 20.0)), 0))
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(call, _)| matches!(call, CursorCall::Show))
+                .count(),
+            1
+        );
+        assert_ended_once(receiver);
+    }
+
+    #[test]
+    fn in_flight_pin_abort_and_closed_gate_recover_without_waiting() {
+        for closed in [false, true] {
+            let PausedPin {
+                shared,
+                cursor,
+                receiver,
+                resume,
+                tap,
+            } = paused_pin();
+            if closed {
+                shared.gate.set_engine_permits(false);
+            }
+            let recovering = shared.clone();
+            let (done, finished) = mpsc::channel();
+            let abort = std::thread::spawn(move || {
+                let started = Instant::now();
+                if closed {
+                    recovering.finish(EndReason::Lost, None).unwrap();
+                } else {
+                    Abort(recovering).abort();
+                }
+                done.send(started.elapsed()).unwrap();
+            });
+            let elapsed = finished.recv_timeout(CALL_BUDGET * 4).unwrap();
+            assert!(elapsed < CALL_BUDGET);
+            assert_eq!(shared.pin_token.load(Ordering::Acquire), 0);
+            assert_eq!(shared.active.load(Ordering::Acquire), 1 << 2 | RECOVERING);
+            assert!(!shared.detached.load(Ordering::Acquire));
+            assert!(!shared.hidden.load(Ordering::Acquire));
+            // This was submitted while authorized, before abort/gate closure. No new warp
+            // (including a corrective warp into a closed gate) is submitted during recovery.
+            assert_eq!(cursor.warps(), [CGPoint::new(99.5, 50.0)]);
+            resume.send(()).unwrap();
+            tap.join().unwrap();
+            abort.join().unwrap();
+            assert_eq!(cursor.warps(), [CGPoint::new(99.5, 50.0)]);
+            assert_eq!(
+                *cursor.position.lock().unwrap(),
+                Some(CGPoint::new(99.5, 50.0))
+            );
+            assert_eq!(shared.active.load(Ordering::Acquire), 0);
+            assert_eq!(shared.pin_inflight.load(Ordering::Acquire), 0);
+            assert_ended_once(receiver);
+        }
+    }
+
+    #[test]
+    fn watchdog_and_closed_gate_cannot_overtake_a_pending_release() {
+        for closed in [false, true] {
+            let PausedPin {
+                shared,
+                cursor,
+                receiver,
+                resume,
+                tap,
+            } = paused_pin();
+            assert!(matches!(
+                shared.finish(
+                    EndReason::Requested,
+                    Some((DisplayId(1), PointDevice::new(20.0, 40.0))),
+                ),
+                Err(PlatformError::Timeout)
+            ));
+            if closed {
+                shared.gate.set_engine_permits(false);
+            }
+            let started = Instant::now();
+            shared.finish(EndReason::Aborted, None).unwrap();
+            assert!(started.elapsed() < CALL_BUDGET);
+            assert_eq!(shared.active.load(Ordering::Acquire), 1 << 2 | RECOVERING);
+            assert_eq!(cursor.warps(), [CGPoint::new(99.5, 50.0)]);
+            resume.send(()).unwrap();
+            tap.join().unwrap();
+            let expected = if closed {
+                vec![CGPoint::new(99.5, 50.0)]
+            } else {
+                vec![CGPoint::new(99.5, 50.0), CGPoint::new(10.0, 20.0)]
+            };
+            assert_eq!(cursor.warps(), expected);
+            assert_eq!(*cursor.position.lock().unwrap(), expected.last().copied());
+            assert_eq!(shared.active.load(Ordering::Acquire), 0);
+            assert_ended_once(receiver);
+        }
+    }
+
+    #[test]
+    fn pin_drain_before_finish_publication_releases_once_and_emits_ended_once() {
+        let PausedPin {
+            shared,
+            cursor,
+            receiver,
+            resume,
+            tap,
+        } = paused_pin();
+        let (showing, show_resume) = cursor.pause_next_show();
+        let finishing = shared.clone();
+        let end = std::thread::spawn(move || {
+            finishing.finish(
+                EndReason::Requested,
+                Some((DisplayId(1), PointDevice::new(20.0, 40.0))),
+            )
+        });
+        // Show is after the in-flight branch is selected, before the finish is published.
+        showing.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(shared.pin_finish.load(Ordering::Acquire), 0);
+        resume.send(()).unwrap();
+        tap.join().unwrap();
+        assert_eq!(shared.pin_inflight.load(Ordering::Acquire), 0);
+        assert_eq!(shared.pin_finish.load(Ordering::Acquire), 0);
+        assert_eq!(shared.active.load(Ordering::Acquire), 1 << 2 | RECOVERING);
+        assert_eq!(cursor.warps(), [CGPoint::new(99.5, 50.0)]);
+        // Publication now observes the drained pin; the caller claims the finish exactly once.
+        show_resume.send(()).unwrap();
+        assert!(matches!(end.join().unwrap(), Err(PlatformError::Timeout)));
+        shared.complete_pin_finish(1).unwrap();
+        assert_eq!(
+            cursor.warps(),
+            [CGPoint::new(99.5, 50.0), CGPoint::new(10.0, 20.0)]
+        );
+        assert_eq!(
+            *cursor.position.lock().unwrap(),
+            Some(CGPoint::new(10.0, 20.0))
+        );
+        assert!(!shared.hidden.load(Ordering::Acquire));
+        assert!(!shared.detached.load(Ordering::Acquire));
+        assert_eq!(shared.active.load(Ordering::Acquire), 0);
+        assert_eq!(shared.pin_finish.load(Ordering::Acquire), 0);
+        assert_ended_once(receiver);
+    }
+
+    #[test]
+    fn pin_warp_failure_disables_only_that_token_and_preserves_capture() {
+        let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+        activate_pin(&mut tap, 2.0);
+        cursor.fail_warps.store(1, Ordering::Release);
+        for _ in 0..3 {
+            assert!(!tap.event(
+                CGEventType::MouseMoved,
+                &pointer(CGEventType::MouseMoved, 0, false)
+            ));
+        }
+        assert_eq!(cursor.warps(), [CGPoint::new(99.5, 50.0)]);
+        assert_eq!(cursor.fail_warps.load(Ordering::Acquire), 0);
+        assert_eq!(
+            tap.shared.active.load(Ordering::Acquire),
+            1 << 2 | EFFECTIVE
+        );
+        assert!(tap.shared.capturing.load(Ordering::Acquire));
+        assert_eq!(tap.shared.pin_token.load(Ordering::Acquire), 0);
+        assert_eq!(
+            motion_events(&receiver),
+            vec![
+                (
+                    1,
+                    10.0,
+                    0.0,
+                    MotionKind::Accelerated {
+                        display: DisplayId(1)
+                    }
+                );
+                3
+            ]
+        );
+        tap.shared.finish(EndReason::Requested, None).unwrap();
+        tap.shared
+            .active
+            .store(2 << 2 | EFFECTIVE, Ordering::Release);
+        tap.shared.capturing.store(true, Ordering::Release);
+        tap.start_pin(
+            2,
+            tap.shared.epoch.load(Ordering::Acquire),
+            tap.display.unwrap(),
+            CGPoint::new(100.0, 50.0),
+        )
+        .unwrap();
+        assert!(!tap.event(
+            CGEventType::MouseMoved,
+            &pointer(CGEventType::MouseMoved, 0, false)
+        ));
+        assert_eq!(cursor.warps(), [CGPoint::new(99.5, 50.0); 2]);
+        assert_eq!(
+            motion_events(&receiver),
+            [(
+                2,
+                10.0,
+                0.0,
+                MotionKind::Accelerated {
+                    display: DisplayId(1)
+                }
+            )]
+        );
+        assert_eq!(tap.shared.pin_metrics.motions.load(Ordering::Acquire), 1);
+        assert_eq!(tap.shared.pin_metrics.warps.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cursor_pin_default_on_and_zero_kill_switch_restores_motion() {
+        assert!(cursor_pin_enabled(None));
+        assert!(cursor_pin_enabled(Some("1")));
+        assert!(cursor_pin_enabled(Some("other")));
+        assert!(!cursor_pin_enabled(Some("0")));
+        for value in [None, Some("0")] {
+            let (mut tap, receiver, cursor) = tap_cursor_fixture(cursor_pin_enabled(value));
+            let point = activate_pin(&mut tap, 2.0);
+            assert!(!tap.event(
+                CGEventType::MouseMoved,
+                &pointer(CGEventType::MouseMoved, 0, false)
+            ));
+            if value.is_none() {
+                assert_eq!(cursor.warps(), [point]);
+            } else {
+                assert!(cursor.warps().is_empty());
+                assert!(tap.pin.is_none());
+                assert_eq!(tap.shared.pin_token.load(Ordering::Acquire), 0);
+            }
+            assert_eq!(
+                motion_events(&receiver),
+                [(
+                    1,
+                    10.0,
+                    0.0,
+                    MotionKind::Accelerated {
+                        display: DisplayId(1)
+                    }
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_pin_clamps_crossing_point_inside_its_display() {
+        let display = Display {
+            id: DisplayId(9),
+            bounds: CGRect::new(CGPoint::new(-100.0, -50.0), CGSize::new(100.0, 100.0)),
+            scale: 2.0,
+        };
+        for (location, expected) in [
+            (CGPoint::new(0.0, 50.0), CGPoint::new(-0.5, 49.5)),
+            (CGPoint::new(-110.0, -60.0), CGPoint::new(-100.0, -50.0)),
+            (CGPoint::new(-20.0, 10.0), CGPoint::new(-20.0, 10.0)),
+        ] {
+            assert_eq!(display.pin_point(location).unwrap(), expected);
+        }
+        assert!(display.pin_point(CGPoint::new(f64::NAN, 0.0)).is_err());
+    }
+
+    #[test]
+    fn cursor_pin_measurements_reset_for_each_token_and_track_longest_gap() {
+        let (mut tap, _receiver, _cursor) = tap_cursor_fixture(true);
+        activate_pin(&mut tap, 2.0);
+        let metrics = &tap.shared.pin_metrics;
+        for at in [1, 10_000_001, 260_000_001, 265_000_001] {
+            metrics.motion(MonoTime::from_nanos(at));
+        }
+        assert_eq!(metrics.motions.load(Ordering::Acquire), 4);
+        assert_eq!(metrics.longest_gap.load(Ordering::Acquire), 250_000_000);
+        tap.shared.finish(EndReason::Requested, None).unwrap();
+        tap.shared.active.store(2 << 2 | PENDING, Ordering::Release);
+        tap.shared.capturing.store(true, Ordering::Release);
+        tap.start_pin(
+            2,
+            tap.shared.epoch.load(Ordering::Acquire),
+            tap.display.unwrap(),
+            CGPoint::new(100.0, 50.0),
+        )
+        .unwrap();
+        assert_eq!(tap.shared.pin_token.load(Ordering::Acquire), 2);
+        assert_eq!(tap.shared.pin_metrics.motions.load(Ordering::Acquire), 0);
+        assert_eq!(tap.shared.pin_metrics.warps.load(Ordering::Acquire), 0);
+        assert_eq!(
+            tap.shared.pin_metrics.last_motion.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            tap.shared.pin_metrics.longest_gap.load(Ordering::Acquire),
+            0
+        );
     }
 
     /// A synthetic pointer event at the right edge (x = 100) of the fixture display.
