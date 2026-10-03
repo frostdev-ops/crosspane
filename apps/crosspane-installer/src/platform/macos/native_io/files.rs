@@ -811,3 +811,164 @@ fn private_directory(fd: &OwnedFd, uid: u32) -> NativeResult<()> {
     }
     Ok(())
 }
+
+type AudioOutcomeParent = (OwnedFd, Vec<(u64, u64)>);
+
+impl MacNativeIo {
+    /// Fixed advisory metadata only: no directory listing, bundle identity, or content read.
+    /// The tuple is (file kind bits, uid, permission bits, device). Only NOENT means Absent.
+    pub fn audio_metadata(
+        &self,
+        path: &Path,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<(u32, u32, u32, u64)>> {
+        deadline.check()?;
+        if ![
+            "/Library/Audio/Plug-Ins/HAL",
+            "/Library/Audio/Plug-Ins/HAL/CrosspaneAudio.driver",
+            "/Library/Application Support",
+            "/Library/Application Support/Crosspane",
+            "/Library/Application Support/Crosspane/Installer",
+            "/Library/Application Support/Crosspane/Installer/previous",
+        ]
+        .iter()
+        .any(|p| path.as_os_str() == std::ffi::OsStr::new(p))
+        {
+            return Err(NativeError::Invalid);
+        }
+        #[cfg(test)]
+        let physical = self
+            .target
+            .test_path
+            .as_ref()
+            .map(|map| map(path))
+            .unwrap_or_else(|| path.to_owned());
+        #[cfg(not(test))]
+        let physical = path;
+        let identity = match rfs::statat(rfs::CWD, physical, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(s) => Some(FileIdentity::from_stat(&s)),
+            Err(rustix::io::Errno::NOENT) => None,
+            Err(_) => return Err(NativeError::Unavailable),
+        };
+        let identity = self.target.observe("audio-metadata", path, identity)?;
+        deadline.check()?;
+        Ok(identity.map(|s| (s.mode & 0o170000, s.uid, s.mode & 0o7777, s.device)))
+    }
+    /// Exactly the two root outcomes. ACLs are the lead-accepted residual; these are advisory.
+    pub fn read_audio_outcome(
+        &self,
+        removal: bool,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<(Vec<u8>, FileIdentity)>> {
+        deadline.check()?;
+        self.validate_target()?;
+        let parent = self.audio_outcome_parent()?;
+        let Some((fd, chain)) = parent else {
+            return Ok(None);
+        };
+        let name = if removal {
+            "audio-removal-outcome.json"
+        } else {
+            "audio-outcome.json"
+        };
+        let path = Path::new("/Library/Application Support/Crosspane/Installer").join(name);
+        if ![
+            "/Library/Application Support/Crosspane/Installer/audio-outcome.json",
+            "/Library/Application Support/Crosspane/Installer/audio-removal-outcome.json",
+        ]
+        .iter()
+        .any(|p| path.as_os_str() == std::ffi::OsStr::new(p))
+        {
+            return Err(NativeError::Invalid);
+        }
+        let leaf = match rfs::openat(
+            &fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(_) => return Err(NativeError::Foreign),
+        };
+        let observe = |s: rfs::Stat| {
+            self.target
+                .observe("audio-outcome", &path, Some(FileIdentity::from_stat(&s)))?
+                .ok_or(NativeError::Foreign)
+        };
+        let identity = observe(native(rfs::fstat(&leaf))?)?;
+        if identity.uid != 0
+            || identity.mode & 0o170000 != 0o100000
+            || identity.mode & 0o7777 != 0o644
+        {
+            return Err(NativeError::Foreign);
+        }
+        if identity.length > 256 {
+            return Err(NativeError::Oversize);
+        }
+        let mut bytes = Vec::new();
+        let mut file = File::from(leaf);
+        let mut buffer = [0; 257];
+        loop {
+            deadline.check()?;
+            let n = native(file.read(&mut buffer))?;
+            if n == 0 {
+                break;
+            }
+            if bytes.len() + n > 256 {
+                return Err(NativeError::Oversize);
+            }
+            bytes.extend_from_slice(&buffer[..n]);
+        }
+        if identity != observe(native(rfs::fstat(&file))?)?
+            || identity != observe(native(rfs::statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW))?)?
+            || self
+                .audio_outcome_parent()?
+                .is_none_or(|(_, fresh)| fresh != chain)
+        {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()?;
+        Ok(Some((bytes, identity)))
+    }
+    fn audio_outcome_parent(&self) -> NativeResult<Option<AudioOutcomeParent>> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut path = PathBuf::from("/Library");
+        #[cfg(test)]
+        let physical = self
+            .target
+            .test_path
+            .as_ref()
+            .map(|map| map(&path))
+            .unwrap_or_else(|| path.clone());
+        #[cfg(not(test))]
+        let physical = &path;
+        let mut fd = rfs::open(physical, flags, Mode::empty()).map_err(|_| NativeError::Foreign)?;
+        let mut chain = Vec::new();
+        for name in ["", "Application Support", "Crosspane", "Installer"] {
+            if !name.is_empty() {
+                path.push(name);
+                fd = match rfs::openat(&fd, name, flags, Mode::empty()) {
+                    Ok(fd) => fd,
+                    Err(rustix::io::Errno::NOENT) if matches!(name, "Crosspane" | "Installer") => {
+                        return Ok(None);
+                    }
+                    Err(_) => return Err(NativeError::Foreign),
+                };
+            }
+            let s = self
+                .target
+                .observe(
+                    "audio-ancestor",
+                    &path,
+                    Some(FileIdentity::from_stat(&native(rfs::fstat(&fd))?)),
+                )?
+                .ok_or(NativeError::Foreign)?;
+            if s.uid != 0 || s.mode & 0o170000 != 0o040000 || s.mode & 0o022 != 0 {
+                return Err(NativeError::Foreign);
+            }
+            chain.push((s.device, s.inode));
+        }
+        Ok(Some((fd, chain)))
+    }
+}

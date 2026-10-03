@@ -36,6 +36,10 @@ pub enum NativeOperation {
         path: PathBuf,
     },
     Launchctl(LaunchctlAction),
+    /// The sole package opener; the adapter verifies the production manifest hash before dispatch.
+    OpenAudioPackage {
+        path: PathBuf,
+    },
     ControlledChild {
         signature: Box<SignatureProof>,
         args: Vec<String>,
@@ -141,6 +145,39 @@ impl CommandSpec {
                     args,
                     MAX_COMMAND_BYTES,
                     mutation,
+                )
+            }
+            NativeOperation::OpenAudioPackage { path } => {
+                let directory = target.installer_dir().join("packages");
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or(NativeError::Invalid)?;
+                let version = ["CrosspaneAudio-install-", "CrosspaneAudio-remove-"]
+                    .iter()
+                    .find_map(|prefix| name.strip_prefix(prefix))
+                    .and_then(|s| s.strip_suffix(".pkg"))
+                    .ok_or(NativeError::Foreign)?;
+                let parts: Vec<_> = version.split('.').collect();
+                if path.parent() != Some(directory.as_path())
+                    || !clean(&path)
+                    || parts.len() != 3
+                    || parts.iter().any(|p| {
+                        p.is_empty() || p.len() > 4 || !p.bytes().all(|b| b.is_ascii_digit())
+                    })
+                {
+                    return Err(NativeError::Foreign);
+                }
+                (
+                    PathBuf::from("/usr/bin/open"),
+                    vec![
+                        "-b".into(),
+                        "com.apple.installer".into(),
+                        "--".into(),
+                        path_string(&path)?,
+                    ],
+                    4096,
+                    true,
                 )
             }
             NativeOperation::ControlledChild { signature, args } => {
