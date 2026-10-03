@@ -33,9 +33,10 @@ use crosspane_platform::{Parked, ParkingKind, PlatformError, WindowParking};
 use crosspane_types::geom::{PixelRect, PixelSize, PointLogical, RectLogical, SizeLogical, euclid};
 use crosspane_types::id::{DisplayId, WindowId};
 use dispatch2::DispatchQueue;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyClass, AnyObject, Bool, Method, Sel};
 use objc2::{MainThreadMarker, msg_send, sel};
+use objc2_app_kit::NSScreen;
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CGSize};
 use objc2_core_graphics::{
     CGBeginDisplayConfiguration, CGCancelDisplayConfiguration, CGCompleteDisplayConfiguration,
@@ -43,7 +44,7 @@ use objc2_core_graphics::{
     CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplaySetDisplayMode, CGError,
     CGGetActiveDisplayList, kCGDisplayShowDuplicateLowResolutionModes,
 };
-use objc2_foundation::{NSArray, NSString};
+use objc2_foundation::{NSArray, NSNumber, NSString};
 
 use crate::main_thread::{on_main, spawn_on_main};
 use crate::windows::{
@@ -56,6 +57,8 @@ const AX_WAIT: Duration = Duration::from_secs(2);
 const FULLSCREEN_WAIT: Duration = Duration::from_secs(2);
 const FULLSCREEN_POLL: Duration = Duration::from_millis(50);
 const DISPLAY_WAIT: Duration = Duration::from_secs(1);
+const INSET_WAIT: Duration = Duration::from_millis(500);
+const INSET_POLL: Duration = Duration::from_millis(50);
 const MAX_PIXELS: u32 = 8192;
 
 thread_local! {
@@ -182,6 +185,112 @@ impl Mode {
     fn logical(self) -> SizeLogical {
         SizeLogical::new(f64::from(self.width), f64::from(self.height))
     }
+
+    /// Reserve logical points above the requested window, retaining the API's density/rounding.
+    fn with_top_inset(self, inset: f64) -> Result<Self, PlatformError> {
+        let density = if self.hidpi == 1 { 2.0 } else { 1.0 };
+        let height = ((f64::from(self.height) + inset) * density).ceil();
+        if height > f64::from(MAX_PIXELS) {
+            return Err(PlatformError::Unsupported(
+                "CGVirtualDisplay maximum is 8192x8192 pixels",
+            ));
+        }
+        Self::new(PixelSize::new(self.pixels.width, height as u32), density)
+    }
+
+    /// Once a valid mode exists, a reservation that won't fit must not tear down parking.
+    fn fitting_top_inset(self, inset: f64, fallback: (Self, f64)) -> (Self, f64) {
+        self.with_top_inset(inset)
+            .map(|mode| (mode, inset))
+            .unwrap_or(fallback)
+    }
+}
+
+/// AppKit's Y axis points up: only the space above visibleFrame is the top reservation.
+fn top_inset(frame_max_y: f64, visible_max_y: f64) -> Option<f64> {
+    let inset = frame_max_y - visible_max_y;
+    inset.is_finite().then(|| inset.clamp(0.0, 64.0))
+}
+
+#[derive(Debug, PartialEq)]
+enum InsetRead {
+    Measured(f64),
+    Retry(Duration),
+    Fallback,
+}
+
+fn inset_read(
+    observed: Option<(SizeLogical, f64)>,
+    expected: SizeLogical,
+    remaining: Duration,
+) -> InsetRead {
+    if remaining.is_zero() {
+        return InsetRead::Fallback;
+    }
+    if let Some((size, inset)) = observed
+        && size == expected
+    {
+        return InsetRead::Measured(inset);
+    }
+    InsetRead::Retry(remaining.min(INSET_POLL))
+}
+
+fn measure_top_inset(id: DisplayId, expected: SizeLogical) -> (Option<f64>, u32) {
+    let deadline = Instant::now() + INSET_WAIT;
+    let mut tries = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return (None, tries);
+        }
+        tries += 1;
+        let observed = on_main(remaining, move |mtm| {
+            autoreleasepool(|_| {
+                let key = NSString::from_str("NSScreenNumber");
+                NSScreen::screens(mtm).iter().find_map(|screen| {
+                    let description = screen.deviceDescription();
+                    let number = description.objectForKey(&key)?;
+                    if number.downcast_ref::<NSNumber>()?.unsignedIntValue() != id.0 {
+                        return None;
+                    }
+                    let frame = screen.frame();
+                    let visible = screen.visibleFrame();
+                    let inset = top_inset(
+                        frame.origin.y + frame.size.height,
+                        visible.origin.y + visible.size.height,
+                    )?;
+                    Some((SizeLogical::new(frame.size.width, frame.size.height), inset))
+                })
+            })
+        })
+        .ok()
+        .flatten();
+        match inset_read(
+            observed,
+            expected,
+            deadline.saturating_duration_since(Instant::now()),
+        ) {
+            InsetRead::Measured(inset) => return (Some(inset), tries),
+            // Yield between separate main-queue calls so AppKit can process screen notifications.
+            InsetRead::Retry(wait) => std::thread::sleep(wait),
+            InsetRead::Fallback => return (None, tries),
+        }
+    }
+}
+
+fn remember_top_inset(last: &mut f64, measured: Option<f64>) -> f64 {
+    if let Some(inset) = measured {
+        *last = inset;
+    }
+    *last
+}
+
+/// CoreGraphics' Y axis points down. The window keeps its requested size below the reservation.
+fn target_rect(bounds: RectLogical, inset: f64, size: SizeLogical) -> RectLogical {
+    RectLogical::new(
+        PointLogical::new(bounds.min_x(), bounds.min_y() + inset),
+        size,
+    )
 }
 
 fn settings(mode: Mode) -> Result<Retained<AnyObject>, PlatformError> {
@@ -225,6 +334,7 @@ fn apply(display: &AnyObject, mode: Mode) -> Result<(), PlatformError> {
 struct VirtualDisplay {
     serial: u32,
     id: DisplayId,
+    inset: f64,
 }
 
 impl VirtualDisplay {
@@ -281,6 +391,7 @@ impl VirtualDisplay {
             Ok(Self {
                 serial,
                 id: DisplayId(id),
+                inset: 0.0,
             })
         })?
     }
@@ -840,6 +951,8 @@ struct TwinState {
     displays: BTreeMap<WindowId, VirtualDisplay>,
     /// Each parked window's last frame AX reported, for when AX has no window for it.
     last: BTreeMap<WindowId, RectLogical>,
+    /// Last successful measurement on any twin; a failed or timed-out read is best effort.
+    last_inset: f64,
     query: WindowQuery,
     /// The bounds of the active displays ([`active_display_bounds`]; a test stubs it).
     probe: fn() -> Result<Vec<RectLogical>, PlatformError>,
@@ -857,6 +970,7 @@ impl MacTwinParking {
                 entries,
                 displays: BTreeMap::new(),
                 last: BTreeMap::new(),
+                last_inset: 0.0,
                 query: WindowQuery::new()?,
                 probe: active_display_bounds,
             }),
@@ -876,6 +990,29 @@ impl MacTwinParking {
 }
 
 impl TwinState {
+    fn measure_inset(&mut self, id: DisplayId, expected: SizeLogical) -> f64 {
+        let (measured, tries) = measure_top_inset(id, expected);
+        let inset = remember_top_inset(&mut self.last_inset, measured);
+        tracing::debug!(
+            display = id.0,
+            inset,
+            fallback = measured.is_none(),
+            tries,
+            "twin top inset measurement completed"
+        );
+        inset
+    }
+
+    /// Metadata-only refusal before the resize abort path, journal writes or native calls.
+    fn resize_mode(&self, window: WindowId, mode: Mode) -> Result<(Mode, f64), PlatformError> {
+        let inset = self
+            .displays
+            .get(&window)
+            .ok_or(PlatformError::NotFound)?
+            .inset;
+        Ok((mode.with_top_inset(inset)?, inset))
+    }
+
     /// The parked window and the whole Quartz list it came from (one WindowServer round trip).
     /// `NotFound`: the window is gone (the list includes windows on every Space).
     fn quartz(&self, window: WindowId) -> Result<(RawWindow, Vec<RawWindow>), PlatformError> {
@@ -1254,7 +1391,20 @@ impl TwinState {
         let id = display.id;
         self.displays.insert(window, display);
         let result = (|| {
-            let placement = place_twin(id)?;
+            let mut placement = place_twin(id)?;
+            let measured = self.measure_inset(id, mode.logical());
+            // At capacity, keep today's valid zero-inset parking rather than aborting it.
+            let (grown, inset) = mode.fitting_top_inset(measured, (mode, 0.0));
+            let display = self
+                .displays
+                .get_mut(&window)
+                .ok_or(PlatformError::NotFound)?;
+            if grown != mode {
+                display.apply(grown)?;
+                wait_mode(id, grown)?;
+                placement = place_twin(id)?;
+            }
+            display.inset = inset;
             // A fresh read right before the AX write (and a fresh AX deadline, so no expired
             // message moves a window). Parking a window that is fullscreen or not showing isn't
             // done: there is no geometry to retain yet, so the setup is rolled back.
@@ -1270,7 +1420,7 @@ impl TwinState {
             let ax = ax_required(&raw)?;
             // The lookup can take up to two seconds: ask again after it and before each write.
             let mut allowed = || matches!(self.plan(window, &displays), Ok(Plan::Write(_)));
-            let target = RectLogical::new(placement.frame.origin, mode.logical());
+            let target = target_rect(placement.frame, inset, mode.logical());
             if !ax.restore_guarded(target, &mut allowed)? {
                 return Err(PlatformError::Backend(
                     "window went fullscreen or left the screen; not parked".into(),
@@ -1283,9 +1433,7 @@ impl TwinState {
     }
 
     fn resize(&mut self, window: WindowId, mode: Mode) -> Result<Parked, PlatformError> {
-        if !self.displays.contains_key(&window) {
-            return Err(PlatformError::NotFound);
-        }
+        let (grown, previous_inset) = self.resize_mode(window, mode)?;
         let result = (|| {
             require_accessibility()?;
             write_journal(&self.journal, &self.entries)?;
@@ -1296,8 +1444,20 @@ impl TwinState {
             let fullscreen = matches!(self.plan(window, &[twin])?, Plan::WholeDisplay);
             let display = self.displays.get(&window).ok_or(PlatformError::NotFound)?;
             let id = display.id;
-            display.apply(mode)?;
-            wait_mode(id, mode)?;
+            display.apply(grown)?;
+            wait_mode(id, grown)?;
+            let measured = self.measure_inset(id, grown.logical());
+            let (corrected, inset) = mode.fitting_top_inset(measured, (grown, previous_inset));
+            let display = self
+                .displays
+                .get_mut(&window)
+                .ok_or(PlatformError::NotFound)?;
+            // A mode change can move the menu bar. Correct at most once, never chase it in a loop.
+            if corrected != grown {
+                display.apply(corrected)?;
+                wait_mode(id, corrected)?;
+            }
+            display.inset = inset;
             // Mode changes can alter the arrangement. Re-isolate before moving the window again.
             let placement = place_twin(id)?;
             if fullscreen {
@@ -1307,7 +1467,7 @@ impl TwinState {
             // fullscreen meanwhile: look again right before the write, after the AX lookup, and
             // before each frame write. Then AX exposes only the title-less stand-in, or takes
             // the write on a fullscreen window and refuses it; neither aborts (`settle`).
-            let target = RectLogical::new(placement.frame.origin, mode.logical());
+            let target = target_rect(placement.frame, inset, mode.logical());
             let settled = self.guarded_ax(window, &[placement.frame], |raw, guard| {
                 ax_move(raw, target, guard)
             })?;
@@ -1692,6 +1852,257 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn twin_mode_reserves_menu_bar_at_hidpi() {
+        let requested = Mode::new(PixelSize::new(3420, 2812), 2.0).unwrap();
+        let twin = requested.with_top_inset(30.0).unwrap();
+        assert_eq!(requested.logical(), SizeLogical::new(1710.0, 1406.0));
+        assert_eq!(twin.logical(), SizeLogical::new(1710.0, 1436.0));
+        assert_eq!(twin.pixels, PixelSize::new(3420, 2872));
+        assert_eq!(twin.hidpi, requested.hidpi);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn twin_mode_preserves_odd_pixel_rounding() {
+        for scale in [1.0, 1.5, 2.0, 3.0] {
+            let requested = Mode::new(PixelSize::new(1601, 1201), scale).unwrap();
+            let density = if scale > 1.0 { 2 } else { 1 };
+            let expected = Mode::new(
+                PixelSize::new(requested.pixels.width, requested.pixels.height + 61),
+                f64::from(density),
+            )
+            .unwrap();
+            assert_eq!(
+                requested.with_top_inset(61.0 / f64::from(density)).unwrap(),
+                expected
+            );
+            assert_eq!(expected.hidpi, requested.hidpi);
+        }
+    }
+
+    #[test]
+    fn top_inset_is_clamped_to_sixty_four_points() {
+        for (visible_max_y, expected) in
+            [(1010.0, 0.0), (1000.0, 0.0), (970.0, 30.0), (900.0, 64.0)]
+        {
+            assert_eq!(top_inset(1000.0, visible_max_y), Some(expected));
+        }
+        assert_eq!(top_inset(-1406.0, -1436.0), Some(30.0));
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(top_inset(value, 0.0), None);
+            assert_eq!(top_inset(0.0, value), None);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn twin_mode_refuses_height_plus_inset_over_pixel_limit() {
+        for scale in [1.0, 2.0] {
+            let density = if scale > 1.0 { 2 } else { 1 };
+            let requested =
+                Mode::new(PixelSize::new(MAX_PIXELS, MAX_PIXELS - 60 * density), scale).unwrap();
+            assert_eq!(
+                requested.with_top_inset(60.0).unwrap().pixels.height,
+                MAX_PIXELS
+            );
+            assert!(matches!(
+                requested.with_top_inset(60.5),
+                Err(PlatformError::Unsupported(_))
+            ));
+            let full = Mode::new(PixelSize::new(MAX_PIXELS, MAX_PIXELS), scale).unwrap();
+            assert!(matches!(
+                full.with_top_inset(1.0),
+                Err(PlatformError::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn target_rectangle_below_inset_has_exact_requested_size() {
+        let requested = Mode::new(PixelSize::new(3420, 2812), 2.0).unwrap();
+        let twin = requested.with_top_inset(30.0).unwrap();
+        let bounds = RectLogical::new(PointLogical::new(1800.0, -1436.0), twin.logical());
+        let target = target_rect(bounds, 30.0, requested.logical());
+        assert_eq!(target, rect(1800.0, -1406.0, 1710.0, 1406.0));
+        assert_eq!(target.max_y(), bounds.max_y());
+        assert_eq!(
+            content(target, bounds, twin.pixels).unwrap(),
+            PixelRect::new(
+                euclid::Point2D::new(0, 60),
+                euclid::Point2D::new(3420, 2872)
+            )
+        );
+        // An app's smaller actual frame still determines the crop; no requested-size fabrication.
+        let actual = rect(target.min_x(), target.min_y(), 850.0, 1376.0);
+        assert_eq!(
+            content(actual, bounds, twin.pixels).unwrap(),
+            PixelRect::new(
+                euclid::Point2D::new(0, 60),
+                euclid::Point2D::new(1700, 2812)
+            )
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn zero_inset_preserves_existing_mode_and_target() {
+        for scale in [1.0, 2.0] {
+            let requested = Mode::new(PixelSize::new(1601, 1201), scale).unwrap();
+            let bounds = RectLogical::new(PointLogical::new(1800.0, -601.0), requested.logical());
+            assert_eq!(requested.with_top_inset(0.0).unwrap(), requested);
+            assert_eq!(target_rect(bounds, 0.0, requested.logical()), bounds);
+        }
+    }
+
+    #[test]
+    fn inset_read_failure_reuses_last_measurement() {
+        let mut last = 0.0;
+        assert_eq!(remember_top_inset(&mut last, None), 0.0);
+        assert_eq!(remember_top_inset(&mut last, Some(30.0)), 30.0);
+        assert_eq!(remember_top_inset(&mut last, None), 30.0);
+        // A measurement on another twin supersedes the fallback, including a real zero inset.
+        assert_eq!(remember_top_inset(&mut last, Some(0.0)), 0.0);
+        assert_eq!(remember_top_inset(&mut last, None), 0.0);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn inset_overflow_refusal_preserves_twin_window_frame_and_journal() {
+        let window = WindowId(10);
+        let mut state = scripted_state(vec![]);
+        let frame = rect(1800.0, -1406.0, 1710.0, 1406.0);
+        state.last.insert(window, frame);
+        // Numeric metadata only: no native display is created, and this handle is forgotten below.
+        state.displays.insert(
+            window,
+            VirtualDisplay {
+                serial: u32::MAX,
+                id: DisplayId(99),
+                inset: 30.0,
+            },
+        );
+        state.journal = std::env::temp_dir().join(format!(
+            "crosspane-twin-inset-refusal-{}-{}.journal",
+            std::process::id(),
+            crate::clock::now().as_nanos()
+        ));
+        write_journal(&state.journal, &state.entries).unwrap();
+        let journal = fs::read(&state.journal).unwrap();
+        let entries = state.entries.clone();
+        let requested = Mode::new(PixelSize::new(1710, 8180), 1.0).unwrap();
+        assert!(matches!(
+            state.resize_mode(window, requested),
+            Err(PlatformError::Unsupported(_))
+        ));
+        let twin = state.displays.get(&window).unwrap();
+        assert_eq!(
+            (twin.serial, twin.id, twin.inset),
+            (u32::MAX, DisplayId(99), 30.0)
+        );
+        assert_eq!(state.last.get(&window), Some(&frame));
+        assert_eq!(state.entries, entries);
+        assert_eq!(fs::read(&state.journal).unwrap(), journal);
+        assert_eq!(read_journal(&state.journal).unwrap(), entries);
+        std::mem::forget(state.displays.remove(&window).unwrap());
+        fs::remove_file(&state.journal).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn inset_overflow_keeps_valid_park_and_resize_modes() {
+        let requested = Mode::new(PixelSize::new(1710, 8180), 1.0).unwrap();
+        // Parking has already created a valid twin: an oversized reservation keeps zero-inset geometry.
+        assert_eq!(
+            requested.fitting_top_inset(30.0, (requested, 0.0)),
+            (requested, 0.0)
+        );
+        // Resize applied the known ten-point inset; a new thirty-point read won't fit.
+        let grown = requested.with_top_inset(10.0).unwrap();
+        let (corrected, inset) = requested.fitting_top_inset(30.0, (grown, 10.0));
+        assert_eq!((corrected, inset), (grown, 10.0));
+        let bounds = RectLogical::new(PointLogical::new(1800.0, -8190.0), corrected.logical());
+        let target = target_rect(bounds, inset, requested.logical());
+        assert_eq!(target, rect(1800.0, -8180.0, 1710.0, 8180.0));
+        assert_eq!(target.max_y(), bounds.max_y());
+    }
+
+    #[test]
+    fn inset_read_accepts_current_screen() {
+        let expected = SizeLogical::new(1710.0, 1436.0);
+        for inset in [0.0, 30.0] {
+            assert_eq!(
+                inset_read(Some((expected, inset)), expected, INSET_WAIT),
+                InsetRead::Measured(inset)
+            );
+        }
+    }
+
+    #[test]
+    fn inset_read_retries_stale_frame() {
+        let expected = SizeLogical::new(1710.0, 1436.0);
+        for stale in [
+            SizeLogical::new(1710.0, 1406.0),
+            SizeLogical::new(1700.0, 1436.0),
+        ] {
+            assert_eq!(
+                inset_read(Some((stale, 30.0)), expected, INSET_WAIT),
+                InsetRead::Retry(INSET_POLL)
+            );
+        }
+    }
+
+    #[test]
+    fn inset_read_retries_missing_screen() {
+        let expected = SizeLogical::new(1710.0, 1436.0);
+        assert_eq!(
+            inset_read(None, expected, INSET_WAIT),
+            InsetRead::Retry(INSET_POLL)
+        );
+        let remaining = Duration::from_millis(20);
+        assert_eq!(
+            inset_read(None, expected, remaining),
+            InsetRead::Retry(remaining)
+        );
+    }
+
+    #[test]
+    fn inset_read_falls_back_when_budget_exhausted() {
+        let expected = SizeLogical::new(1710.0, 1436.0);
+        for observed in [
+            None,
+            Some((expected, 30.0)),
+            Some((SizeLogical::new(1710.0, 1406.0), 30.0)),
+        ] {
+            assert_eq!(
+                inset_read(observed, expected, Duration::ZERO),
+                InsetRead::Fallback
+            );
+        }
+    }
+
+    #[test]
+    fn visible_area_window_is_not_fullscreen_on_enlarged_twin() {
+        let bounds = rect(1800.0, -1436.0, 1710.0, 1436.0);
+        let window = RawWindow::fixture(
+            10,
+            500,
+            target_rect(bounds, 30.0, SizeLogical::new(1710.0, 1406.0)),
+            true,
+        );
+        assert_eq!(
+            fullscreen_gate(&window, std::slice::from_ref(&window), &[bounds]),
+            Gate::Clear
+        );
+        let fullscreen = RawWindow::fixture(10, 500, bounds, true);
+        assert_eq!(
+            fullscreen_gate(&fullscreen, std::slice::from_ref(&fullscreen), &[bounds]),
+            Gate::Itself
+        );
+    }
+
     fn rect(x: f64, y: f64, w: f64, h: f64) -> RectLogical {
         RectLogical::new(PointLogical::new(x, y), SizeLogical::new(w, h))
     }
@@ -1948,6 +2359,7 @@ pub(crate) mod tests {
             )]),
             displays: BTreeMap::new(),
             last: BTreeMap::new(),
+            last_inset: 0.0,
             query: WindowQuery::scripted(replies),
             probe: || Ok(vec![built_in(), twin_rect()]),
         }
