@@ -1573,7 +1573,8 @@ fn entry_needs_recent_local_motion() {
 
 #[test]
 fn entry_refused_without_offerable_edge() {
-    // A fullscreen proxy touches every edge of B's display: no exit can be offered.
+    // A fullscreen proxy with no layout continuation offers no exit. First enter B normally,
+    // then separate its display from A so the flush left edge no longer has a return portal.
     let mut h = H::bare();
     h.project(
         W1,
@@ -1594,10 +1595,16 @@ fn entry_refused_without_offerable_edge() {
         }),
     );
     h.cross();
+    h.feed(Input::Layout(flush_placements(&[
+        (A, 1, 0.0, 0.0),
+        (B, 1, 200.0, 0.0),
+    ])));
     assert!(
         set_portals(&h.log)
+            .last()
+            .unwrap()
             .iter()
-            .all(|p| p.iter().all(|c| c.display != TWIN)),
+            .all(|c| c.display != TWIN),
         "no strip is offered"
     );
     h.motion(5.0, 0.0);
@@ -3400,17 +3407,1015 @@ fn strip_edges(out: &[Output]) -> BTreeSet<&'static str> {
         .unwrap_or_default()
 }
 
+fn flush_placements(displays: &[(NodeId, u32, f64, f64)]) -> Vec<Placement> {
+    displays
+        .iter()
+        .map(|&(node, id, x, y)| Placement {
+            node,
+            display: DisplayId(id),
+            origin: PointMm::new(x, y),
+            version: 2,
+        })
+        .collect()
+}
+
+fn flush_layout(displays: &[(NodeId, u32, f64, f64)]) -> Layout {
+    Layout::new(
+        displays
+            .iter()
+            .map(|&(node, id, x, y)| Placed {
+                id: GlobalDisplayId {
+                    node,
+                    display: DisplayId(id),
+                },
+                geometry: display(id).geometry,
+                origin: PointMm::new(x, y),
+            })
+            .collect(),
+        H::config().layout,
+    )
+    .unwrap()
+}
+
+fn fullscreen_host_home(displays: &[(NodeId, u32, f64, f64)]) -> H {
+    fullscreen_host_home_with(flush_layout(displays).displays(), &[B, C])
+}
+
+fn flush_display(
+    node: NodeId,
+    id: u32,
+    origin: (f64, f64),
+    pixels: (u32, u32),
+    millimetres: (f64, f64),
+) -> Placed {
+    let mut geometry = display(id).geometry;
+    geometry.pixel_size = PixelSize::new(pixels.0, pixels.1);
+    geometry.physical_size = SizeMm::new(millimetres.0, millimetres.1);
+    Placed {
+        id: GlobalDisplayId {
+            node,
+            display: DisplayId(id),
+        },
+        geometry,
+        origin: PointMm::new(origin.0, origin.1),
+    }
+}
+
+fn fullscreen_host_home_with(displays: &[Placed], reachable: &[NodeId]) -> H {
+    let mut h = H::bare();
+    for node in [A, B, C] {
+        let infos: Vec<_> = displays
+            .iter()
+            .filter(|d| d.id.node == node)
+            .map(|d| DisplayInfo {
+                geometry: d.geometry,
+                ..display(d.id.display.0)
+            })
+            .collect();
+        if infos.is_empty() {
+            continue;
+        }
+        if node == A {
+            h.feed(Input::LocalDisplays(infos));
+        } else {
+            h.feed(Input::PeerDisplays {
+                peer: node,
+                displays: infos,
+            });
+            if reachable.contains(&node) {
+                h.feed(Input::PeerUp { peer: node });
+            }
+        }
+    }
+    let layout = Layout::new(displays.to_vec(), H::config().layout).unwrap();
+    h.layout_portal = layout
+        .portals()
+        .iter()
+        .find(|p| p.from.node == A && p.to.node == B)
+        .unwrap()
+        .id;
+    h.feed(Input::Layout(
+        displays
+            .iter()
+            .map(|d| Placement {
+                node: d.id.node,
+                display: d.id.display,
+                origin: d.origin,
+                version: 2,
+            })
+            .collect(),
+    ));
+    let geometry = layout
+        .get(GlobalDisplayId {
+            node: B,
+            display: REMOTE,
+        })
+        .unwrap()
+        .geometry;
+    h.project(
+        W1,
+        B,
+        P1,
+        TWIN,
+        rect(
+            0,
+            0,
+            geometry.pixel_size.width as i32,
+            geometry.pixel_size.height as i32,
+        ),
+        PlatformParking::Twin,
+    );
+    h.place(
+        B,
+        P1,
+        1,
+        Some(Proxy {
+            display: REMOTE,
+            origin: point(0.0, 0.0),
+            size: geometry.pixel_size,
+        }),
+    );
+    h.cross();
+    let entry = motions(&h.motion(0.0, 0.0))[0].position;
+    let delta = geometry.device_to_mm(point(50.0 - entry.x, 100.0 - entry.y));
+    h.motion(delta.x / 0.1, delta.y / 0.1);
+    h.home_now();
+    h
+}
+
 #[test]
-fn exit_edges_not_offered_when_clamped() {
-    // An edge is offered only if the point just outside the proxy there is not inside it after
-    // clamping into the display: a proxy that touches or exceeds a side offers no exit on it.
+fn fullscreen_host_right_exit_returns_to_controller_at_portal_point_with_hysteresis() {
+    let mut h = fullscreen_host_home(&[(B, 1, 0.0, 0.0), (A, 1, 100.0, 0.0)]);
+    assert_eq!(strip_edges(&h.log), ["right"].into());
+    let session = h.session.unwrap();
+    let out = h.exit_through(Edge::Right, 0.25);
+    let id = h.last_begin();
+    let (op, target) = warp(&out).expect("normal return releases and warps");
+    assert_eq!(target, (LOCAL, point(0.0, 250.0)));
+    assert_eq!(end_controls(&out), vec![(B, session, EndReason::Released)]);
+    assert!(left_home(&out));
+    assert!(motions(&out).is_empty());
+    let returned_at = h.now_ms();
+    h.confirm_removal(&out);
+    h.released(op, Ok(Warp::Done));
+    h.ended(id, CaptureEnd::Requested);
+    assert_eq!(h.engine.controlling(), None);
+    assert!(!has_hud_show(&h.feed(Input::Capture(
+        CaptureEvent::EdgePressed {
+            portal: h.layout_portal,
+            position: 0.25,
+            at: h.now,
+        }
+    ))));
+    h.tick(returned_at + REENTRY_GUARD);
+    let out = h.feed(Input::Capture(CaptureEvent::EdgePressed {
+        portal: h.layout_portal,
+        position: 0.25,
+        at: h.now,
+    }));
+    assert!(
+        has_hud_show(&out),
+        "reverse portal re-arms after hysteresis: {out:?}"
+    );
+    h.feed(Input::Overlay(OverlayEvent::Unavailable(HUD)));
+    h.quiet();
+}
+
+#[test]
+fn fullscreen_host_flush_edge_without_continuation_is_not_offered() {
+    let mut h = fullscreen_host_home(&[(A, 1, 0.0, 0.0), (B, 1, 100.0, 0.0)]);
+    assert_eq!(strip_edges(&h.log), ["left"].into());
+    let out = h.press(Edge::Right, 0.5);
+    assert!(out.is_empty(), "no continuation, no exit: {out:?}");
+    assert_eq!(h.engine.controlling(), Some(B));
+    h.quiet();
+}
+
+#[test]
+fn fullscreen_host_flush_exit_to_another_host_display_lands_and_continues() {
+    let mut h = fullscreen_host_home(&[(A, 1, 0.0, 0.0), (B, 1, 100.0, 0.0), (B, 2, 200.0, 0.0)]);
+    assert!(strip_edges(&h.log).contains("right"));
+    let out = h.exit_through(Edge::Right, 0.25);
+    let sent = motions(&out);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (sent[0].display, sent[0].position),
+        (DisplayId(2), point(0.0, 250.0))
+    );
+    assert_eq!(sent[0].session, h.session.unwrap());
+    assert!(end_controls(&out).is_empty() && warps(&out).is_empty());
+    h.confirm_removal(&out);
+    assert_eq!(h.engine.controlling(), Some(B));
+    let out = h.motion(10.0, 0.0);
+    assert_eq!(motions(&out)[0].position, point(10.0, 250.0));
+    h.quiet();
+}
+
+#[test]
+fn nonflush_home_exit_mapping_is_unchanged_on_all_four_edges() {
+    for (edge, expected) in [
+        (Edge::Left, point(199.0, 375.0)),
+        (Edge::Right, point(600.0, 375.0)),
+        (Edge::Top, point(300.0, 299.0)),
+        (Edge::Bottom, point(300.0, 600.0)),
+    ] {
+        let mut h = H::home();
+        let out = h.exit_through(edge, 0.25);
+        assert_eq!(motions(&out)[0].position, expected, "{edge:?}");
+        assert_eq!(motions(&out)[0].display, REMOTE);
+        assert_eq!(h.engine.controlling(), Some(B));
+        h.confirm_removal(&out);
+        h.quiet();
+    }
+    // Non-flush mapping continues to use the current display geometry during activation,
+    // even while a layout confirmation is pending. Only flush continuation uses its snapshot.
+    let mut h = H::home();
+    // Keep the bottom strip available through a same-host neighbour before and after growth,
+    // so this geometry change does not cancel activation by changing the offered strip set.
+    h.feed(Input::PeerDisplays {
+        peer: B,
+        displays: vec![display(1), display(2)],
+    });
+    h.feed(Input::Layout(flush_placements(&[
+        (A, 1, 0.0, 0.0),
+        (B, 1, 100.0, 0.0),
+        (B, 2, 100.0, 100.0),
+    ])));
+    h.place(
+        B,
+        P1,
+        2,
+        Some(Proxy {
+            origin: point(200.0, 800.0),
+            ..Proxy::standard()
+        }),
+    );
+    let (id, _) = h.exit_to_activating(Edge::Right, 1.0);
+    h.auto_portals = false;
+    let mut larger = display(1);
+    larger.geometry.pixel_size.height = 1200;
+    h.feed(Input::PeerDisplays {
+        peer: B,
+        displays: vec![larger, display(2)],
+    });
+    h.started(id);
+    let out = h.capture_begun(id, vec![]);
+    assert_eq!(motions(&out)[0].position, point(600.0, 1100.0));
+    h.confirm_removal(&out);
+    h.quiet();
+}
+
+#[test]
+fn flush_local_destination_removed_during_activation_uses_current_fallback() {
+    let mut h = fullscreen_host_home(&[
+        (A, 1, 0.0, 0.0),
+        (B, 1, 100.0, 0.0),
+        (A, 2, 200.0, -50.0),
+        (C, 1, 200.0, 50.0),
+    ]);
+    let (id, _) = h.exit_to_activating(Edge::Right, 0.25);
+    h.auto_portals = false;
+    let update = h.feed(Input::LocalDisplays(vec![display(1)]));
+    assert!(!set_portals(&update).is_empty());
+    assert!(strip_edges(&update).contains("right"));
+    h.started(id);
+    let out = h.capture_begun(id, vec![]);
+    assert!(home_failed(&out, HomeFailure::Gone));
+    let (op, target) = warp(&out).unwrap();
+    assert_eq!(target, FALLBACK);
+    h.confirm_removal(&out);
+    h.released(op, Ok(Warp::Skipped));
+    h.ended(id, CaptureEnd::Requested);
+    let retry = h.tick_after(STRANDED_RETRY);
+    let (op, target) = warp(&retry).unwrap();
+    assert_eq!(
+        target, FALLBACK,
+        "stranded retry never targets the removed A2"
+    );
+    h.released(op, Ok(Warp::Done));
+    assert!(
+        warps(&h.log)
+            .iter()
+            .all(|(_, (display, _))| *display != DisplayId(2))
+    );
+    h.quiet();
+}
+
+#[test]
+fn normal_dimension_growth_behind_identical_strip_preserves_nonflush_mapping() {
+    let mut h = fullscreen_host_home(&[(B, 1, 0.0, 0.0), (A, 1, 100.0, 0.0)]);
+    let previous = set_portals(&h.log).last().unwrap().clone();
+    let (id, _) = h.exit_to_activating(Edge::Right, 0.25);
+    h.auto_portals = false;
+    let mut larger = display(1);
+    larger.geometry.pixel_size.width = 1200;
+    let update = h.feed(Input::PeerDisplays {
+        peer: B,
+        displays: vec![larger],
+    });
+    assert_eq!(
+        set_portals(&update)
+            .last()
+            .unwrap()
+            .iter()
+            .filter(|p| p.id.0 >= TWIN_PORTAL_BASE)
+            .copied()
+            .collect::<Vec<_>>(),
+        previous
+            .iter()
+            .filter(|p| p.id.0 >= TWIN_PORTAL_BASE)
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    h.started(id);
+    let out = h.capture_begun(id, vec![]);
+    assert!(warps(&out).is_empty() && end_controls(&out).is_empty());
+    assert_eq!(
+        (motions(&out)[0].display, motions(&out)[0].position),
+        (REMOTE, point(1000.0, 250.0))
+    );
+    assert_eq!(h.engine.controlling(), Some(B));
+    h.confirm_removal(&out);
+    h.quiet();
+}
+
+#[test]
+fn partial_flush_proxy_endpoints_cross_independently_of_tangent_containment() {
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        for position in [0.0, 1.0] {
+            let mut h = H::home();
+            h.feed(Input::LocalDisplays(vec![display(1), display(2)]));
+            let (neighbor, origin, expected) = match edge {
+                Edge::Left => (
+                    (0.0, 0.0),
+                    point(0.0, 300.0),
+                    (LOCAL, point(999.0, 300.0 + 300.0 * position)),
+                ),
+                Edge::Right => (
+                    (200.0, 0.0),
+                    point(600.0, 300.0),
+                    (DisplayId(2), point(0.0, 300.0 + 300.0 * position)),
+                ),
+                Edge::Top => (
+                    (100.0, -100.0),
+                    point(200.0, 0.0),
+                    (DisplayId(2), point(200.0 + 400.0 * position, 999.0)),
+                ),
+                Edge::Bottom => (
+                    (100.0, 100.0),
+                    point(200.0, 700.0),
+                    (DisplayId(2), point(200.0 + 400.0 * position, 0.0)),
+                ),
+            };
+            let mut displays = vec![(A, 1, 0.0, 0.0), (B, 1, 100.0, 0.0)];
+            if edge != Edge::Left {
+                displays.push((A, 2, neighbor.0, neighbor.1));
+            }
+            h.feed(Input::Layout(flush_placements(&displays)));
+            h.place(
+                B,
+                P1,
+                2,
+                Some(Proxy {
+                    display: REMOTE,
+                    origin,
+                    size: PixelSize::new(400, 300),
+                }),
+            );
+            let out = h.exit_through(edge, position);
+            assert_eq!(
+                warp(&out).unwrap().1,
+                expected,
+                "{edge:?}, position {position}"
+            );
+            assert!(
+                motions(&out).is_empty(),
+                "endpoint must cross rather than resume on B"
+            );
+            h.confirm_removal(&out);
+            h.quiet();
+        }
+    }
+}
+
+#[test]
+fn unrelated_layout_changes_do_not_reoffer_portals_or_cancel_shown_home_exit_hud() {
+    for flush in [false, true] {
+        let mut h = if flush {
+            fullscreen_host_home(&[(B, 1, 0.0, 0.0), (A, 1, 100.0, 0.0), (C, 1, 500.0, 500.0)])
+        } else {
+            let mut h = H::home();
+            h.feed(Input::PeerDisplays {
+                peer: C,
+                displays: vec![display(1)],
+            });
+            h.feed(Input::PeerUp { peer: C });
+            h.feed(Input::Layout(flush_placements(&[
+                (A, 1, 0.0, 0.0),
+                (B, 1, 100.0, 0.0),
+                (C, 1, 500.0, 500.0),
+            ])));
+            h
+        };
+        assert!(has_hud_show(&h.press(Edge::Right, 0.25)));
+        h.auto_portals = false;
+        let (a_x, b_x) = if flush { (100.0, 0.0) } else { (0.0, 100.0) };
+        let mut update = h.feed(Input::Layout(flush_placements(&[
+            (A, 1, a_x, 0.0),
+            (B, 1, b_x, 0.0),
+            (C, 1, 700.0, 500.0),
+        ])));
+        let mut info = display(1);
+        info.geometry.pixel_size.width = 1400;
+        update.extend(h.feed(Input::PeerDisplays {
+            peer: C,
+            displays: vec![info],
+        }));
+        assert!(
+            set_portals(&update).is_empty(),
+            "unrelated layout must not be re-confirmed: {update:?}"
+        );
+        assert!(!has_hud_hide(&update));
+        let visible = h.visible();
+        let (id, _, _) =
+            begin_capture(&visible).expect("shown HUD remains valid without a new answer");
+        h.started(id);
+        let out = h.capture_begun(id, vec![]);
+        if flush {
+            assert_eq!(warp(&out).unwrap().1, (LOCAL, point(0.0, 250.0)));
+        } else {
+            assert_eq!(motions(&out)[0].position, point(600.0, 375.0));
+        }
+        h.confirm_removal(&out);
+        h.quiet();
+    }
+}
+
+#[test]
+fn off_midpoint_flush_portal_offers_full_strip_and_uncovered_press_stays_home_quietly() {
+    let mut h = fullscreen_host_home(&[(B, 1, 0.0, 0.0), (A, 1, 100.0, 70.0)]);
+    assert_eq!(strip_edges(&h.log), ["right"].into());
+    let strip = set_portals(&h.log)
+        .last()
+        .unwrap()
+        .iter()
+        .find(|p| p.id == h.strip(0, Edge::Right))
+        .copied()
+        .unwrap();
+    assert_eq!((strip.from, strip.to), (0.0, 1000.0));
+    let out = h.press(Edge::Right, 0.25);
+    assert!(
+        out.is_empty(),
+        "uncovered press has no HUD/capture/notice: {out:?}"
+    );
+    assert_eq!(h.engine.controlling(), Some(B));
+    let out = h.exit_through(Edge::Right, 0.8);
+    assert_eq!(warp(&out).unwrap().1, (LOCAL, point(0.0, 100.0)));
+    h.confirm_removal(&out);
+    h.quiet();
+}
+
+fn third_node_fullscreen_home() -> H {
+    fullscreen_host_home(&[(A, 1, 0.0, 0.0), (B, 1, 100.0, 0.0), (C, 1, 200.0, 0.0)])
+}
+
+#[test]
+fn flush_third_node_pending_handoff_revalidates_pointer_button_and_confirmed_mapping() {
+    for change in ["pointer", "button", "mapping"] {
+        let mut h = third_node_fullscreen_home();
+        let old = h.session.unwrap();
+        let exit = h.exit_through(Edge::Right, 0.25);
+        match change {
+            "pointer" => {
+                assert_eq!(
+                    motions(&h.motion(-10.0, 0.0))[0].position,
+                    point(989.0, 250.0)
+                );
+            }
+            "button" => {
+                let down = h.feed(Input::Capture(CaptureEvent::Button {
+                    button: BUTTON,
+                    down: true,
+                    at: h.now,
+                }));
+                assert_eq!(sent_transitions(&down), [(B, Held::Button(BUTTON), true)]);
+            }
+            "mapping" => {
+                let update = h.feed(Input::Layout(flush_placements(&[
+                    (A, 1, 0.0, 0.0),
+                    (B, 1, 100.0, 0.0),
+                    (C, 1, 200.0, -10.0),
+                ])));
+                assert!(
+                    !set_portals(&update).is_empty(),
+                    "new continuation is confirmed before removal"
+                );
+            }
+            _ => unreachable!(),
+        }
+        let out = h.confirm_removal(&exit);
+        assert!(start_control_to(&out).is_none(), "{change}: {out:?}");
+        assert_eq!(end_controls(&out), [(B, old, EndReason::Released)]);
+        let (op, target) = warp(&out).unwrap();
+        assert_eq!(target, FALLBACK);
+        if change == "button" {
+            assert_eq!(sent_transitions(&out), [(B, Held::Button(BUTTON), false)]);
+            h.feed(Input::Capture(CaptureEvent::Button {
+                button: BUTTON,
+                down: false,
+                at: h.now,
+            }));
+        }
+        h.released(op, Ok(Warp::Done));
+        h.ended(h.last_begin(), CaptureEnd::Requested);
+        h.quiet();
+    }
+}
+
+#[test]
+fn flush_third_node_handshake_refusal_and_timeout_release_retained_capture_to_desktop() {
+    for timeout in [false, true] {
+        let mut h = third_node_fullscreen_home();
+        let exit = h.exit_through(Edge::Right, 0.25);
+        let crossing = h.confirm_removal(&exit);
+        let session = crossing
+            .iter()
+            .find_map(|o| match o {
+                Output::SendControl {
+                    peer: C,
+                    msg: ControlMessage::StartControl { session, .. },
+                } => Some(*session),
+                _ => None,
+            })
+            .unwrap();
+        assert!(begin_capture(&crossing).is_none());
+        let out = if timeout {
+            h.tick_after(START_TIMEOUT)
+        } else {
+            h.feed(control(
+                C,
+                ControlMessage::ControlRefused {
+                    session,
+                    reason: Refusal::Busy,
+                },
+            ))
+        };
+        let (op, target) = warp(&out).expect("retained twin capture needs a physical fallback");
+        assert_eq!(target, FALLBACK);
+        assert!(begin_capture(&out).is_none() && start_control_to(&out).is_none());
+        h.released(op, Ok(Warp::Done));
+        h.ended(h.last_begin(), CaptureEnd::Requested);
+        assert_eq!(h.engine.controlling(), None);
+        let late = h.feed(control(C, ControlMessage::ControlStarted { session }));
+        assert!(begin_capture(&late).is_none());
+        assert_eq!(h.engine.controlling(), None);
+        h.quiet();
+    }
+}
+
+#[test]
+fn flush_third_node_reachability_controls_offers_without_removing_layout_display() {
+    let displays = flush_layout(&[(A, 1, 0.0, 0.0), (B, 1, 100.0, 0.0), (C, 1, 200.0, 0.0)]);
+    let mut h = fullscreen_host_home_with(displays.displays(), &[B]);
+    assert_eq!(strip_edges(&h.log), ["left"].into());
+    assert!(h.press(Edge::Right, 0.25).is_empty());
+    assert_eq!(h.engine.controlling(), Some(B));
+    let connected = h.feed(Input::PeerUp { peer: C });
+    assert_eq!(strip_edges(&connected), ["left", "right"].into());
+    let disconnected = h.feed(closed(C));
+    assert_eq!(strip_edges(&disconnected), ["left"].into());
+    assert!(!left_home(&disconnected));
+    assert!(h.press(Edge::Right, 0.25).is_empty());
+    assert_eq!(h.engine.controlling(), Some(B));
+    h.feed(Input::PeerUp { peer: C });
+    let exit = h.exit_through(Edge::Right, 0.25);
+    let disconnected = h.feed(closed(C));
+    assert!(start_control_to(&disconnected).is_none());
+    let out = h.confirm_removal(&exit);
+    assert!(
+        start_control_to(&out).is_none(),
+        "disconnect also invalidates a pending continuation"
+    );
+    let (op, target) = warp(&out).unwrap();
+    assert_eq!(target, FALLBACK);
+    h.released(op, Ok(Warp::Done));
+    h.ended(h.last_begin(), CaptureEnd::Requested);
+    h.quiet();
+}
+
+#[test]
+fn flush_left_top_bottom_map_offset_spans_and_unequal_densities_with_touch_tolerance() {
+    for destination in [A, B] {
+        for (edge, local_origin, destination_origin, pixels, millimetres, expected) in [
+            (
+                Edge::Left,
+                (200.0, 100.0),
+                (-2.0, 120.0),
+                (2000, 200),
+                (100.0, 40.0),
+                point(1999.0, 100.0),
+            ),
+            (
+                Edge::Top,
+                (0.0, 100.0),
+                (120.0, -2.0),
+                (200, 2000),
+                (40.0, 100.0),
+                point(100.0, 1999.0),
+            ),
+            (
+                Edge::Bottom,
+                (0.0, 100.0),
+                (120.0, 202.0),
+                (200, 2000),
+                (40.0, 100.0),
+                point(100.0, 0.0),
+            ),
+        ] {
+            let displays = [
+                flush_display(A, 1, local_origin, (1000, 1000), (100.0, 100.0)),
+                flush_display(B, 1, (100.0, 100.0), (1000, 1000), (100.0, 100.0)),
+                flush_display(destination, 2, destination_origin, pixels, millimetres),
+            ];
+            let mut h = fullscreen_host_home_with(&displays, &[B]);
+            let out = h.exit_through(edge, 0.4);
+            if destination == A {
+                assert_eq!(warp(&out).unwrap().1, (DisplayId(2), expected), "{edge:?}");
+                assert!(motions(&out).is_empty());
+            } else {
+                assert_eq!(
+                    (motions(&out)[0].display, motions(&out)[0].position),
+                    (DisplayId(2), expected),
+                    "{edge:?}"
+                );
+                assert!(warps(&out).is_empty());
+                assert_eq!(h.engine.controlling(), Some(B));
+            }
+            h.confirm_removal(&out);
+            h.quiet();
+        }
+    }
+    // A gap beyond the ordinary touch tolerance offers no bottom continuation.
+    let mut h = fullscreen_host_home_with(
+        &[
+            flush_display(A, 1, (0.0, 100.0), (1000, 1000), (100.0, 100.0)),
+            flush_display(B, 1, (100.0, 100.0), (1000, 1000), (100.0, 100.0)),
+            flush_display(B, 2, (120.0, 202.01), (200, 2000), (40.0, 100.0)),
+        ],
+        &[B],
+    );
+    assert!(!strip_edges(&h.log).contains("bottom"));
+    assert!(h.press(Edge::Bottom, 0.4).is_empty());
+    h.quiet();
+}
+
+#[test]
+fn flush_shared_boundary_and_competing_continuations_preserve_same_host_precedence() {
+    let displays = [
+        flush_display(A, 1, (0.0, 100.0), (1000, 1000), (100.0, 100.0)),
+        flush_display(B, 1, (100.0, 100.0), (1000, 1000), (100.0, 100.0)),
+        flush_display(B, 2, (200.0, 100.0), (2000, 250), (100.0, 50.0)),
+        // One millimetre of overlap is legal within the layout's touch tolerance. In that
+        // overlap the same-host neighbour wins; at its exclusive end the cross-node portal wins.
+        flush_display(C, 1, (200.0, 149.0), (500, 1020), (100.0, 51.0)),
+    ];
+    for (position, same_host, expected) in [
+        (0.0, true, point(0.0, 0.0)),
+        (0.495, true, point(0.0, 247.5)),
+        (0.5, false, point(0.0, 20.0)),
+    ] {
+        let mut h = fullscreen_host_home_with(&displays, &[B, C]);
+        let exit = h.exit_through(Edge::Right, position);
+        if same_host {
+            assert_eq!(
+                (motions(&exit)[0].display, motions(&exit)[0].position),
+                (DisplayId(2), expected)
+            );
+            assert!(start_control_to(&h.confirm_removal(&exit)).is_none());
+        } else {
+            let out = h.confirm_removal(&exit);
+            assert!(out.iter().any(|o| matches!(o,
+                Output::SendControl { peer: C, msg: ControlMessage::StartControl { entry_display: DisplayId(1), entry, .. } }
+                    if *entry == expected
+            )), "{out:?}");
+            h.feed(Input::Command(Command::ReleaseControl));
+        }
+        h.quiet();
+    }
+}
+
+#[test]
+fn flush_cross_node_shared_span_endpoints_are_inclusive_and_uncovered_positions_are_quiet() {
+    let displays = [
+        flush_display(A, 1, (0.0, 0.0), (1000, 1000), (100.0, 100.0)),
+        flush_display(B, 1, (100.0, 0.0), (1000, 1000), (100.0, 100.0)),
+        flush_display(C, 1, (200.0, 30.0), (600, 600), (100.0, 30.0)),
+    ];
+    for (position, expected) in [(0.3, point(0.0, 0.0)), (0.6, point(0.0, 599.0))] {
+        let mut h = fullscreen_host_home_with(&displays, &[B, C]);
+        assert!(h.press(Edge::Right, 0.2999).is_empty());
+        assert!(h.press(Edge::Right, 0.6001).is_empty());
+        let exit = h.exit_through(Edge::Right, position);
+        let out = h.confirm_removal(&exit);
+        assert!(out.iter().any(|o| matches!(o,
+            Output::SendControl { peer: C, msg: ControlMessage::StartControl { entry_display: DisplayId(1), entry, .. } }
+                if *entry == expected
+        )), "{position}: {out:?}");
+        h.feed(Input::Command(Command::ReleaseControl));
+        h.quiet();
+    }
+}
+
+#[test]
+fn flush_third_node_entry_edge_requires_normal_spatial_rearm_before_returning() {
+    let mut h = third_node_fullscreen_home();
+    let exit = h.exit_through(Edge::Right, 0.25);
+    let out = h.confirm_removal(&exit);
+    let session = out
+        .iter()
+        .find_map(|o| match o {
+            Output::SendControl {
+                peer: C,
+                msg: ControlMessage::StartControl { session, .. },
+            } => Some(*session),
+            _ => None,
+        })
+        .unwrap();
+    h.feed(control(C, ControlMessage::ControlStarted { session }));
+    let blocked = h.motion(-10.0, 0.0);
+    assert!(start_control_to(&blocked).is_none() && end_controls(&blocked).is_empty());
+    assert_eq!(motions(&blocked)[0].position, point(0.0, 250.0));
+    assert_eq!(h.engine.controlling(), Some(C));
+    assert_eq!(
+        motions(&h.motion(20.0, 0.0))[0].position,
+        point(20.0, 250.0)
+    );
+    let return_crossing = h.motion(-21.0, 0.0);
+    assert_eq!(
+        start_control_to(&return_crossing),
+        Some(B),
+        "inward 2 mm exceeds REARM_MM=1.5"
+    );
+    assert!(begin_capture(&return_crossing).is_none());
+    assert_eq!(
+        end_controls(&return_crossing),
+        [(C, session, EndReason::Released)]
+    );
+    h.feed(Input::Command(Command::ReleaseControl));
+    h.quiet();
+}
+
+#[test]
+fn flush_controller_return_retries_skipped_and_failed_crossing_warps() {
+    for failure in [Ok(Warp::Skipped), Err(Failure::Other)] {
+        let mut h = fullscreen_host_home(&[(B, 1, 0.0, 0.0), (A, 1, 100.0, 0.0)]);
+        let out = h.exit_through(Edge::Right, 0.25);
+        let (op, target) = warp(&out).unwrap();
+        assert_eq!(target, (LOCAL, point(0.0, 250.0)));
+        h.confirm_removal(&out);
+        h.released(op, failure);
+        h.ended(h.last_begin(), CaptureEnd::Requested);
+        let out = h.tick_after(STRANDED_RETRY);
+        let (retry, retry_target) = warp(&out).unwrap();
+        assert_ne!(retry, op);
+        assert_eq!(retry_target, target);
+        h.released(retry, Ok(Warp::Done));
+        assert!(warps(&h.tick_after(STRANDED_RETRY)).is_empty());
+        assert_eq!(h.engine.controlling(), None);
+        h.quiet();
+    }
+}
+
+#[test]
+fn flush_third_node_continuation_waits_for_confirmed_bind_removal_then_crosses() {
+    let mut h = third_node_fullscreen_home();
+    let old = h.session.unwrap();
+    let out = h.exit_through(Edge::Right, 0.25);
+    assert!(start_control_to(&out).is_none());
+    assert!(end_controls(&out).is_empty());
+    assert!(!h.probe(P1), "A1 keeps the input fence until removal");
+    let out = h.confirm_removal(&out);
+    assert_eq!(start_control_to(&out), Some(C));
+    assert_eq!(end_controls(&out), vec![(B, old, EndReason::Released)]);
+    let session = out
+        .iter()
+        .find_map(|o| match o {
+            Output::SendControl {
+                peer: C,
+                msg: ControlMessage::StartControl { session, .. },
+            } => Some(*session),
+            _ => None,
+        })
+        .unwrap();
+    let out = h.feed(control(C, ControlMessage::ControlStarted { session }));
+    assert!(
+        begin_capture(&out).is_none(),
+        "ordinary handoff retains capture"
+    );
+    assert_eq!(h.engine.controlling(), Some(C));
+    assert_eq!(motions(&h.motion(0.0, 0.0))[0].position, point(0.0, 250.0));
+    h.quiet();
+}
+
+#[test]
+fn flush_third_node_failed_or_timed_out_removal_returns_safely_without_crossing() {
+    for timeout in [false, true] {
+        let mut h = third_node_fullscreen_home();
+        let old = h.session.unwrap();
+        let exit = h.exit_through(Edge::Right, 0.25);
+        let removal = bind(&exit, false).unwrap();
+        let out = if timeout {
+            h.tick_after(100)
+        } else {
+            h.bind_set(removal, false, false)
+        };
+        assert!(start_control_to(&out).is_none(), "{timeout}: {out:?}");
+        assert_eq!(end_controls(&out), vec![(B, old, EndReason::Released)]);
+        assert_eq!(warp(&out).unwrap().1, FALLBACK);
+        assert!(!h.probe(P1));
+        let current = h.last_removal();
+        let out = h.bind_set(current, false, true);
+        assert!(
+            start_control_to(&out).is_none(),
+            "cancelled handoff never revives"
+        );
+        h.quiet();
+    }
+    // A successful removal stamped at the retry deadline, before any Tick, still removes the
+    // bind but cannot revive the expired continuation.
+    let mut h = third_node_fullscreen_home();
+    let old = h.session.unwrap();
+    let exit = h.exit_through(Edge::Right, 0.25);
+    h.advance(100);
+    let out = h.bind_set(bind(&exit, false).unwrap(), false, true);
+    assert!(start_control_to(&out).is_none());
+    assert_eq!(end_controls(&out), vec![(B, old, EndReason::Released)]);
+    assert_eq!(warp(&out).unwrap().1, FALLBACK);
+    h.quiet();
+}
+
+#[test]
+fn flush_third_node_continuation_is_cancelled_by_release_while_removal_is_pending() {
+    let mut h = third_node_fullscreen_home();
+    let exit = h.exit_through(Edge::Right, 0.25);
+    let out = h.feed(Input::Command(Command::ReleaseControl));
+    assert_eq!(warp(&out).unwrap().1, FALLBACK);
+    assert!(start_control_to(&out).is_none());
+    let out = h.confirm_removal(&exit);
+    assert!(start_control_to(&out).is_none());
+    h.quiet();
+}
+
+#[test]
+fn flush_return_preserves_bind_teardown_and_home_fence_across_another_local_portal() {
+    let displays = [(B, 1, 0.0, 0.0), (A, 1, 100.0, 0.0), (A, 2, 0.0, 100.0)];
+    let mut h = fullscreen_host_home(&displays);
+    let out = h.exit_through(Edge::Right, 0.25);
+    let exited = h.now_ms();
+    let (leave, target) = warp(&out).unwrap();
+    assert_eq!(target, (LOCAL, point(0.0, 250.0)));
+    let removal = bind(&out, false).unwrap();
+    let remove_index = out
+        .iter()
+        .position(|o| matches!(o, Output::HomeBind { install: false, .. }))
+        .unwrap();
+    let warp_index = out
+        .iter()
+        .position(|o| matches!(o, Output::ReleaseAndWarp { .. }))
+        .unwrap();
+    assert!(
+        remove_index < warp_index,
+        "A1 removal begins before the warp"
+    );
+    assert!(!h.probe(P1));
+    h.bind_set(removal, false, false);
+    assert!(!h.probe(P1));
+    let retry = h.tick_after(100);
+    let current = bind(&retry, false).unwrap();
+    assert_ne!(current, removal);
+    h.bind_set(removal, false, true);
+    assert!(!h.probe(P1), "A2 rejects the stale removal answer");
+    h.bind_set(current, false, true);
+    h.released(leave, Ok(Warp::Done));
+    h.ended(h.last_begin(), CaptureEnd::Requested);
+    // Return through a different local connection: reverse-portal hysteresis does not block it,
+    // so this independently probes the projection's home fence.
+    h.layout_portal = flush_layout(&displays)
+        .portals()
+        .iter()
+        .find(|p| p.from.node == A && p.from.display == DisplayId(2) && p.to.node == B)
+        .unwrap()
+        .id;
+    h.cross();
+    let entry = motions(&h.motion(0.0, 0.0))[0].position;
+    h.motion(50.0 - entry.x, 100.0 - entry.y);
+    let out = h.trigger();
+    assert_no_entry(&h, &out);
+    h.now = ms(exited + REENTRY_GUARD + 1);
+    h.motion(1.0, 0.0);
+    let out = h.report(P1, point(51.0, 100.0));
+    assert!(
+        bind(&out, true).is_some(),
+        "home is allowed only after its fence: {out:?}"
+    );
+    let out = h.feed(Input::Command(Command::ReleaseControl));
+    h.confirm_removal(&out);
+    h.quiet();
+}
+
+#[test]
+fn flush_activation_uses_confirmed_host_mapping_behind_identical_strip_and_local_portals() {
+    let original = [(A, 1, 0.0, 0.0), (B, 1, 100.0, 0.0), (C, 1, 200.0, 70.0)];
+    let changed = [(A, 1, 0.0, 0.0), (B, 1, 100.0, 0.0), (C, 1, 200.0, -70.0)];
+    let mut h = fullscreen_host_home(&original);
+    let previous = set_portals(&h.log).last().unwrap().clone();
+    let (id, _) = h.exit_to_activating(Edge::Right, 0.8);
+    h.auto_portals = false;
+    let update = h.feed(Input::Layout(flush_placements(&changed)));
+    assert_eq!(
+        set_portals(&update),
+        vec![previous.clone()],
+        "changed host mapping gets its own confirmation"
+    );
+    h.started(id);
+    let exit = h.capture_begun(id, vec![]);
+    assert!(left_home(&exit));
+    let out = h.confirm_removal(&exit);
+    assert!(
+        out.iter().any(|o| matches!(o,
+            Output::SendControl { peer: C, msg: ControlMessage::StartControl { entry, .. } }
+                if *entry == point(0.0, 100.0)
+        )),
+        "pending layout never replaces the confirmed entry: {out:?}"
+    );
+    h.feed(Input::Command(Command::ReleaseControl));
+    h.quiet();
+
+    // Once the same strip's new meaning is confirmed, the old covered position is quiet and
+    // its new covered position maps through the new portal.
+    let mut h = fullscreen_host_home(&original);
+    h.auto_portals = false;
+    let update = h.feed(Input::Layout(flush_placements(&changed)));
+    let ids = ids_of(&set_portals(&update)[0]);
+    h.portals_set(ids, Ok(()));
+    assert!(h.press(Edge::Right, 0.8).is_empty());
+    let exit = h.exit_through(Edge::Right, 0.2);
+    let out = h.confirm_removal(&exit);
+    assert!(
+        out.iter().any(|o| matches!(o,
+            Output::SendControl { peer: C, msg: ControlMessage::StartControl { entry, .. } }
+                if *entry == point(0.0, 900.0)
+        )),
+        "confirmed mapping supplies the new entry: {out:?}"
+    );
+    h.feed(Input::Command(Command::ReleaseControl));
+    h.quiet();
+}
+
+#[test]
+fn rejected_host_mapping_change_cannot_redirect_a_flush_activation() {
+    let original = [(A, 1, 0.0, 0.0), (B, 1, 100.0, 0.0), (C, 1, 200.0, 70.0)];
+    let mut h = fullscreen_host_home(&original);
+    let (id, _) = h.exit_to_activating(Edge::Right, 0.8);
+    h.auto_portals = false;
+    let update = h.feed(Input::Layout(flush_placements(&[
+        (A, 1, 0.0, 0.0),
+        (B, 1, 100.0, 0.0),
+        (C, 1, 200.0, -70.0),
+    ])));
+    let out = h.portals_set(
+        ids_of(&set_portals(&update)[0]),
+        Err(PortalsFailure::Rejected),
+    );
+    assert!(
+        home_failed(&out, HomeFailure::Gone),
+        "existing A9 rejection fails closed: {out:?}"
+    );
+    assert_eq!(warp(&out).unwrap().1, FALLBACK);
+    h.confirm_removal(&out);
+    let late = h.capture_begun(id, vec![]);
+    assert!(start_control_to(&late).is_none());
+    assert!(!h.log.iter().any(|o| matches!(
+        o,
+        Output::SendControl {
+            peer: C,
+            msg: ControlMessage::StartControl { .. }
+        }
+    )));
+    h.quiet();
+}
+
+#[test]
+fn exit_edges_clamped_to_host_are_offered_only_with_continuation() {
+    // B has a continuation only on its left edge (back to A). Clamping still removes the other
+    // flush edges, while the flush left strip remains available through that portal.
     let cases: [((f64, f64), &[&str]); 6] = [
         ((200.0, 300.0), &["left", "right", "top", "bottom"]),
         ((600.0, 300.0), &["left", "top", "bottom"]),
-        ((0.0, 300.0), &["right", "top", "bottom"]),
+        ((0.0, 300.0), &["left", "right", "top", "bottom"]),
         ((200.0, 0.0), &["left", "right", "bottom"]),
         ((200.0, 700.0), &["left", "right", "top"]),
-        ((-50.0, 800.0), &["right", "top"]),
+        ((-50.0, 800.0), &["left", "right", "top"]),
     ];
     for ((x, y), expected) in cases {
         let mut h = H::bare();
@@ -3508,9 +4513,13 @@ fn fullscreen_resize_while_home_leaves_home() {
 
 #[test]
 fn no_exit_left_leaves_home() {
-    // B's display shrinks to the proxy's size around it: no edge can be offered any more.
+    // B's display shrinks to the proxy's size around it, with no continuation on any edge.
     let mut h = H::home();
     let session = h.session.unwrap();
+    h.feed(Input::Layout(flush_placements(&[
+        (A, 1, 0.0, 0.0),
+        (B, 1, 200.0, 0.0),
+    ])));
     let small = DisplayInfo {
         geometry: DisplayGeometry {
             physical_size: SizeMm::new(40.0, 30.0),

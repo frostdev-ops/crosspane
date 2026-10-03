@@ -162,6 +162,24 @@ struct Teardown {
     next: MonoTime,
     peer: NodeId,
     projection: ProjectionId,
+    /// A flush exit to a third node cannot start its session until this removal succeeds.
+    continuation: Option<FlushHandoff>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExitTarget {
+    host: GlobalDisplayId,
+    host_point: PointDevice,
+    display: GlobalDisplayId,
+    point: PointDevice,
+    portal: Option<Portal>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FlushHandoff {
+    capture: CaptureId,
+    target: ExitTarget,
+    fallback: (DisplayId, PointDevice),
 }
 
 /// §2.7: the pointer may have been left on the invisible twin.
@@ -384,6 +402,9 @@ pub struct ControllerE1 {
     twin_slots: BTreeMap<ProjectionId, u32>,
     next_slot: u32,
     twin_strips: Vec<CapturePortal>,
+    // Only mappings a flush home exit can use: their meaning may change behind identical
+    // full-content strips and identical local capture portals.
+    home_exit_mapping: Vec<FlushMapping>,
     // Grows whenever the offered twin strips change; every exit request records it.
     strips_gen: u64,
     // What the last answers said about the current set (`portal_requests` holds the ones still
@@ -435,6 +456,17 @@ pub struct ControllerE1 {
 
 /// One offered layout portal and the two placed displays its entry coordinate is computed from.
 type PortalMapping = (Portal, Placed, Placed);
+
+#[derive(Clone, Debug, PartialEq)]
+struct FlushMapping {
+    projection: ProjectionId,
+    edge: Edge,
+    host: Placed,
+    start: PointDevice,
+    end: PointDevice,
+    portals: Vec<PortalMapping>,
+    neighbors: Vec<Placed>,
+}
 
 /// What a portal id means in the layout it was offered under.
 #[derive(Clone, Debug)]
@@ -496,6 +528,7 @@ impl ControllerE1 {
             twin_slots: BTreeMap::new(),
             next_slot: 0,
             twin_strips: Vec::new(),
+            home_exit_mapping: Vec::new(),
             strips_gen: 0,
             portals_installed: false,
             portals_failed: false,
@@ -860,9 +893,14 @@ impl ControllerE1 {
                 .filter_map(|p| Some((*p, *layout.get(p.from)?, *layout.get(p.to)?)))
                 .collect()
         });
-        if offered != self.portals || mapping != self.portal_mapping {
+        let home_exit_mapping = self.flush_mapping();
+        if offered != self.portals
+            || mapping != self.portal_mapping
+            || home_exit_mapping != self.home_exit_mapping
+        {
             self.portals = offered;
             self.portal_mapping = mapping;
+            self.home_exit_mapping = home_exit_mapping;
             out.push(Output::SetPortals(self.portals.clone()));
         }
         // A disarmed portal stays disarmed only while it is still offered.
@@ -1893,10 +1931,51 @@ fn exit_point(placement: &Proxy, geometry: &DisplayGeometry, edge: Edge, t: f64)
     })
 }
 
-/// §2.5 "Offerability": an edge is offered only if its mapped point (at `t = 0.5`) is not inside
-/// the placement after clamping, i.e. the proxy does not touch or exceed the display on that side.
+/// A side with room on the host needs no continuation. Check only the edge's normal coordinate:
+/// the tangent endpoint is valid even when it is outside the half-open proxy rectangle.
 fn offerable(placement: &Proxy, geometry: &DisplayGeometry, edge: Edge) -> bool {
-    !inside(placement, exit_point(placement, geometry, edge, 0.5))
+    let point = exit_point(placement, geometry, edge, 0.5);
+    match edge {
+        Edge::Left | Edge::Right => {
+            point.x < placement.origin.x
+                || point.x >= placement.origin.x + f64::from(placement.size.width)
+        }
+        Edge::Top | Edge::Bottom => {
+            point.y < placement.origin.y
+                || point.y >= placement.origin.y + f64::from(placement.size.height)
+        }
+    }
+}
+
+/// Same-host displays have no portal records. Match the ordinary pointer tracker's adjacency,
+/// including its touch tolerance and half-open shared span, in canvas millimetres.
+fn host_span(from: &Placed, to: &Placed, edge: Edge) -> Option<(f64, f64)> {
+    if from.id == to.id || from.id.node != to.id.node {
+        return None;
+    }
+    let a = from.rect();
+    let b = to.rect();
+    let distance = match edge {
+        Edge::Left => a.min().x - b.max().x,
+        Edge::Right => a.max().x - b.min().x,
+        Edge::Top => a.min().y - b.max().y,
+        Edge::Bottom => a.max().y - b.min().y,
+    };
+    if distance.abs() > crosspane_input::layout::TOUCH_TOLERANCE_MM {
+        return None;
+    }
+    let (start, end) = match edge {
+        Edge::Left | Edge::Right => (a.min().y.max(b.min().y), a.max().y.min(b.max().y)),
+        Edge::Top | Edge::Bottom => (a.min().x.max(b.min().x), a.max().x.min(b.max().x)),
+    };
+    (start < end).then_some((start, end))
+}
+
+fn along_edge(point: PointDevice, edge: Edge) -> f64 {
+    match edge {
+        Edge::Left | Edge::Right => point.y,
+        Edge::Top | Edge::Bottom => point.x,
+    }
 }
 
 /// §2.5: a strip sits on the twin output's `edge` and spans the content's extent along it, in
@@ -1925,6 +2004,171 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 impl ControllerE1 {
+    /// Snapshot only the continuations that intersect an offered flush strip. Unrelated layout
+    /// changes, especially for non-flush homes, must not invalidate an already shown exit HUD.
+    fn flush_mapping(&self) -> Vec<FlushMapping> {
+        let (Phase::Controlling(c), Some(layout)) = (&self.phase, &self.layout) else {
+            return Vec::new();
+        };
+        let mut mappings = Vec::new();
+        for home in self.twin_homes.iter().filter(|h| h.peer == c.session.peer) {
+            let Some((placement, host, geometry)) = self.coherent(home) else {
+                continue;
+            };
+            let Some(from) = layout.get(host) else {
+                continue;
+            };
+            for strip in self.strips_of(home.projection) {
+                let edge = strip.edge;
+                if offerable(&placement, &geometry, edge) {
+                    continue;
+                }
+                let start = exit_point(&placement, &geometry, edge, 0.0);
+                let end = exit_point(&placement, &geometry, edge, 1.0);
+                let portals = layout
+                    .portals()
+                    .iter()
+                    .filter(|p| {
+                        p.from == host
+                            && p.edge == edge
+                            && (p.to.node == self.config.node || self.peers.contains(&p.to.node))
+                            && along_edge(start, edge) <= p.end
+                            && along_edge(end, edge) >= p.start
+                    })
+                    .filter_map(|p| Some((*p, *from, *layout.get(p.to)?)))
+                    .collect();
+                let neighbors = layout
+                    .to_canvas(host, start)
+                    .zip(layout.to_canvas(host, end))
+                    .map_or_else(Vec::new, |(start, end)| {
+                        let (start, end) = match edge {
+                            Edge::Left | Edge::Right => (start.y, end.y),
+                            Edge::Top | Edge::Bottom => (start.x, end.x),
+                        };
+                        layout
+                            .displays()
+                            .iter()
+                            .filter(|to| {
+                                host_span(from, to, edge)
+                                    .is_some_and(|(low, high)| start < high && end >= low)
+                            })
+                            .copied()
+                            .collect()
+                    });
+                mappings.push(FlushMapping {
+                    projection: home.projection,
+                    edge,
+                    host: *from,
+                    start,
+                    end,
+                    portals,
+                    neighbors,
+                });
+            }
+        }
+        mappings
+    }
+
+    /// A flush edge keeps the full content strip when any of its mapped span continues.
+    /// Actual presses are checked separately, so uncovered positions stay home quietly.
+    fn exit_offerable(
+        &self,
+        placement: &Proxy,
+        host: GlobalDisplayId,
+        geometry: &DisplayGeometry,
+        edge: Edge,
+    ) -> bool {
+        if offerable(placement, geometry, edge) {
+            return true;
+        }
+        let Some(layout) = &self.layout else {
+            return false;
+        };
+        let Some(from) = layout.get(host) else {
+            return false;
+        };
+        let start_point = exit_point(placement, geometry, edge, 0.0);
+        let end_point = exit_point(placement, geometry, edge, 1.0);
+        let (start, end) = (along_edge(start_point, edge), along_edge(end_point, edge));
+        if layout.portals().iter().any(|p| {
+            p.from == host
+                && p.edge == edge
+                && (p.to.node == self.config.node || self.peers.contains(&p.to.node))
+                && start <= p.end
+                && end >= p.start
+        }) {
+            return true;
+        }
+        let Some(start_canvas) = layout.to_canvas(host, start_point) else {
+            return false;
+        };
+        let Some(end_canvas) = layout.to_canvas(host, end_point) else {
+            return false;
+        };
+        let (start, end) = match edge {
+            Edge::Left | Edge::Right => (start_canvas.y, end_canvas.y),
+            Edge::Top | Edge::Bottom => (start_canvas.x, end_canvas.x),
+        };
+        layout.displays().iter().any(|to| {
+            host_span(from, to, edge).is_some_and(|(low, high)| start < high && end >= low)
+        })
+    }
+
+    /// Map through the layout the backend actually confirmed, with ordinary same-host
+    /// adjacency taking precedence over cross-node portals as in PointerTracker::step.
+    fn flush_target(
+        &self,
+        host: GlobalDisplayId,
+        edge: Edge,
+        point: PointDevice,
+    ) -> Option<ExitTarget> {
+        let layout = self.confirmed_portals.as_ref()?.layout.as_ref()?;
+        let from = layout.get(host)?;
+        let canvas = layout.to_canvas(host, point)?;
+        let along = match edge {
+            Edge::Left | Edge::Right => canvas.y,
+            Edge::Top | Edge::Bottom => canvas.x,
+        };
+        if let Some(to) = layout.displays().iter().find(|to| {
+            host_span(from, to, edge).is_some_and(|(start, end)| along >= start && along < end)
+        }) {
+            let rect = to.rect();
+            let canvas = match edge {
+                Edge::Left => crosspane_types::geom::PointMm::new(rect.max().x, along),
+                Edge::Right => crosspane_types::geom::PointMm::new(rect.min().x, along),
+                Edge::Top => crosspane_types::geom::PointMm::new(along, rect.max().y),
+                Edge::Bottom => crosspane_types::geom::PointMm::new(along, rect.min().y),
+            };
+            let position = to
+                .geometry
+                .clamp_device(to.geometry.mm_to_device((canvas - to.origin).to_point()));
+            return Some(ExitTarget {
+                host,
+                host_point: point,
+                display: to.id,
+                point: position,
+                portal: None,
+            });
+        }
+        let coordinate = along_edge(point, edge);
+        let portal = layout.portals().iter().find(|p| {
+            p.from == host
+                && p.edge == edge
+                && coordinate >= p.start
+                && coordinate <= p.end
+                && (p.to.node == self.config.node || self.peers.contains(&p.to.node))
+        })?;
+        let fraction = (coordinate - portal.start) / (portal.end - portal.start);
+        let (display, position) = layout.entry(portal.id, fraction)?;
+        Some(ExitTarget {
+            host,
+            host_point: point,
+            display,
+            point: position,
+            portal: Some(*portal),
+        })
+    }
+
     // ---- state accessors ----
 
     fn home_copy(&self) -> Option<Home> {
@@ -2164,6 +2408,7 @@ impl ControllerE1 {
             next: now.saturating_add(backoff(0)),
             peer,
             projection,
+            continuation: None,
         });
         out.push(Output::HomeBind { op, install: false });
     }
@@ -2230,9 +2475,14 @@ impl ControllerE1 {
                 op,
                 attempt,
                 next: now.saturating_add(backoff(attempt)),
+                continuation: None,
                 ..t
             });
             out.push(Output::HomeBind { op, install: false });
+            if let Some(continuation) = t.continuation {
+                // An unanswered removal is retried under A1, but never authorizes a handoff.
+                self.finish_flush_handoff(continuation, false, now, out);
+            }
         }
         // §2.8: a portal set that was not installed is offered again.
         if self.portals_retry.is_some_and(|at| now >= at) {
@@ -2320,7 +2570,7 @@ impl ControllerE1 {
             if home.peer != c.session.peer {
                 continue;
             }
-            let (Some((placement, _, geometry)), Some(slot)) = (
+            let (Some((placement, host, geometry)), Some(slot)) = (
                 self.coherent(home),
                 self.twin_slots
                     .get(&home.projection)
@@ -2331,7 +2581,7 @@ impl ControllerE1 {
             };
             for edge in EDGES {
                 let (from, to) = strip_span(home.content, edge);
-                if !offerable(&placement, &geometry, edge) || from >= to {
+                if !self.exit_offerable(&placement, host, &geometry, edge) || from >= to {
                     continue;
                 }
                 strips.push(CapturePortal {
@@ -2658,9 +2908,21 @@ impl ControllerE1 {
             // Only the current attempt's answer counts; anything older is stale.
             if let Some(t) = self.teardown
                 && t.op == op
-                && result.is_ok()
             {
-                self.teardown = None;
+                if result.is_ok() {
+                    self.teardown = None;
+                } else if let Some(teardown) = &mut self.teardown {
+                    teardown.continuation = None;
+                }
+                if let Some(continuation) = t.continuation {
+                    // The timeout also wins when its callback arrives before the next Tick.
+                    self.finish_flush_handoff(
+                        continuation,
+                        result.is_ok() && now < t.next,
+                        now,
+                        out,
+                    );
+                }
             }
             return;
         }
@@ -2918,7 +3180,9 @@ impl ControllerE1 {
             }
         }
         self.twin_homes = homes;
-        if self.twin_strip_set() != self.twin_strips {
+        if self.twin_strip_set() != self.twin_strips
+            || self.flush_mapping() != self.home_exit_mapping
+        {
             self.update_portals(now, out);
         }
         self.home_follow(now, out);
@@ -3169,6 +3433,7 @@ impl ControllerE1 {
                 .get(&portal)
                 .is_some_and(|until| now < *until)
             || !self.portal_offered(home.projection, portal)
+            || self.exit_target(&home, portal, position).is_none()
         {
             return;
         }
@@ -3349,7 +3614,7 @@ impl ControllerE1 {
         } else {
             None
         };
-        let Some((host, point)) = target else {
+        let Some(target) = target else {
             self.cancel_exit(id, portal, now, out);
             return;
         };
@@ -3360,7 +3625,7 @@ impl ControllerE1 {
             self.cancel_exit_with_warp(id, portal, position, now, out);
             return;
         }
-        self.complete_exit(id, home, host, point, start, now, out);
+        self.complete_exit(id, home, target, start, now, out);
     }
 
     /// Reconcile the chord state with what the exit capture has reported: with a snapshot (the
@@ -3391,8 +3656,7 @@ impl ControllerE1 {
         &mut self,
         id: CaptureId,
         home: Home,
-        host: GlobalDisplayId,
-        point: PointDevice,
+        target: ExitTarget,
         start: &CaptureStart,
         now: MonoTime,
         out: &mut Vec<Output>,
@@ -3400,10 +3664,57 @@ impl ControllerE1 {
         if !self.ensure_sequence_room(now, out) {
             return;
         }
+        if target.display.node == self.config.node {
+            let Some(info) = self
+                .displays
+                .get(&self.config.node)
+                .and_then(|displays| displays.iter().find(|d| d.id == target.display.display))
+                .filter(|_| {
+                    self.layout
+                        .as_ref()
+                        .is_some_and(|layout| layout.get(target.display).is_some())
+                })
+            else {
+                self.leave_home(Some(HomeFailure::Gone), now, out);
+                return;
+            };
+            let point = info.geometry.clamp_device(target.point);
+            // Use the same reverse-connection hysteresis as an ordinary remote edge return.
+            self.reentry = self
+                .confirmed_portals
+                .as_ref()
+                .and_then(|map| map.layout.as_ref())
+                .and_then(|layout| {
+                    let returned = target.portal?;
+                    layout
+                        .portals()
+                        .iter()
+                        .find(|p| p.from == returned.to && p.to == returned.from)
+                })
+                .map(|p| (p.from, p.to, p.edge, now.saturating_add(REENTRY_GUARD)));
+            self.home_fence = Some((home.projection, now.saturating_add(REENTRY_GUARD)));
+            self.lock_keys = start.lock_keys;
+            self.return_home(
+                EndReason::Released,
+                Some((target.display.display, point)),
+                false,
+                true,
+                now,
+                out,
+            );
+            return;
+        }
+        let third_node = target.display.node != home.peer;
+        let (display, point) = if third_node {
+            // Until A1 confirms the removal, resume only on the old host's edge.
+            (target.host, target.host_point)
+        } else {
+            (target.display, target.point)
+        };
         let tracker = self
             .layout
             .as_ref()
-            .and_then(|layout| PointerTracker::new(layout, host, point));
+            .and_then(|layout| PointerTracker::new(layout, display, point));
         let Some(tracker) = tracker else {
             self.leave_home(Some(HomeFailure::Gone), now, out);
             return;
@@ -3425,7 +3736,7 @@ impl ControllerE1 {
             msg: PointerMessage {
                 session: c.session.id,
                 seq,
-                display: host.display,
+                display: display.display,
                 position: point,
             },
         });
@@ -3451,19 +3762,90 @@ impl ControllerE1 {
             key: self.key_of(home.projection),
             entered: false,
         }));
+        if third_node {
+            let continuation = FlushHandoff {
+                capture: id,
+                target,
+                fallback: home.fallback,
+            };
+            if let Some(teardown) = &mut self.teardown {
+                teardown.continuation = Some(continuation);
+            } else {
+                self.finish_flush_handoff(continuation, true, now, out);
+            }
+        }
+    }
+
+    fn finish_flush_handoff(
+        &mut self,
+        continuation: FlushHandoff,
+        removed: bool,
+        now: MonoTime,
+        out: &mut Vec<Output>,
+    ) {
+        let Phase::Controlling(c) = &self.phase else {
+            return;
+        };
+        if c.capture.id != continuation.capture || c.home.is_some() {
+            return;
+        }
+        let target = continuation.target;
+        if removed
+            && self.armed
+            && self.permits_io()
+            && self.router.no_buttons_held()
+            && self.capture_buttons.is_empty()
+            && c.tracker.position() == (target.host, target.host_point)
+            && target.portal.is_some_and(|p| {
+                self.flush_target(target.host, p.edge, target.host_point) == Some(target)
+            })
+        {
+            if let Some(portal) = target.portal {
+                self.switch_target(portal.id, (target.display, target.point), now, out);
+            }
+        } else {
+            // Removal failure/timeout, changed mapping or motion cancels this continuation.
+            // A1 still owns any unconfirmed removal; returning never lifts its input fence.
+            self.return_home(
+                EndReason::Released,
+                Some(continuation.fallback),
+                false,
+                true,
+                now,
+                out,
+            );
+        }
     }
 
     /// §2.5 "Mapping" with the current placement.
-    fn exit_target(
-        &self,
-        home: &Home,
-        portal: PortalId,
-        position: f64,
-    ) -> Option<(GlobalDisplayId, PointDevice)> {
+    fn exit_target(&self, home: &Home, portal: PortalId, position: f64) -> Option<ExitTarget> {
         let twin = self.twin_home(home.peer, home.projection)?;
-        let (placement, id, geometry) = self.coherent(&twin)?;
+        let (placement, id, current_geometry) = self.coherent(&twin)?;
         let strip = self.twin_strips.iter().find(|s| s.id == portal)?;
-        Some((id, exit_point(&placement, &geometry, strip.edge, position)))
+        // Classify against current geometry first. A host resize can make the same strip a
+        // non-flush exit while its replacement portal confirmation is still pending.
+        if offerable(&placement, &current_geometry, strip.edge) {
+            let point = exit_point(&placement, &current_geometry, strip.edge, position);
+            return Some(ExitTarget {
+                host: id,
+                host_point: point,
+                display: id,
+                point,
+                portal: None,
+            });
+        }
+        let geometry = self
+            .confirmed_portals
+            .as_ref()?
+            .layout
+            .as_ref()?
+            .get(id)?
+            .geometry;
+        if offerable(&placement, &geometry, strip.edge) {
+            return None;
+        }
+        let point = exit_point(&placement, &geometry, strip.edge, position);
+        self.flush_target(id, strip.edge, point)
     }
 
     /// Where on the twin the strip was pressed, one pixel inside the content.
@@ -3638,7 +4020,11 @@ mod tests {
                 // A proxy with room on a side offers an exit there; one that touches or exceeds
                 // the display's side offers none, provided its middle is on the display.
                 let mid = exit_point(&pl, &geometry(), edge, 0.5);
-                prop_assert_eq!(offerable(&pl, &geometry(), edge), !inside(&pl, mid));
+                let outside_normal = match edge {
+                    Edge::Left | Edge::Right => mid.x < ox || mid.x >= ox + fw,
+                    Edge::Top | Edge::Bottom => mid.y < oy || mid.y >= oy + fh,
+                };
+                prop_assert_eq!(offerable(&pl, &geometry(), edge), outside_normal);
                 // (a proxy that is entirely beyond the display is on no side of it: it can't be
                 // placed there, and the rule says nothing about it)
                 let (room, touches, along_on_display) = match edge {
@@ -3789,6 +4175,42 @@ mod entry_recovery_tests {
             last_motion: None,
         });
         controller
+    }
+
+    #[test]
+    fn flush_handoff_ignores_superseded_capture_or_reentered_home() {
+        for reentered in [false, true] {
+            let mut controller = releasing();
+            let Phase::Controlling(c) = &mut controller.phase else {
+                unreachable!();
+            };
+            if !reentered {
+                c.home = None;
+            }
+            let (host, host_point) = c.tracker.position();
+            let continuation = FlushHandoff {
+                capture: CaptureId(if reentered { 1 } else { 2 }),
+                target: ExitTarget {
+                    host,
+                    host_point,
+                    display: GlobalDisplayId {
+                        node: NodeId([3; 32]),
+                        display: DisplayId(1),
+                    },
+                    point: PointDevice::zero(),
+                    portal: None,
+                },
+                fallback: FALLBACK,
+            };
+            let mut out = Vec::new();
+            controller.finish_flush_handoff(continuation, true, MonoTime::ZERO, &mut out);
+            assert!(out.is_empty());
+            let Phase::Controlling(c) = &controller.phase else {
+                panic!("a stale continuation cannot end the current capture/home");
+            };
+            assert_eq!(c.capture.id, CaptureId(1));
+            assert_eq!(c.home.is_some(), reentered);
+        }
     }
 
     #[test]
