@@ -17,6 +17,671 @@ use std::{
 static ROOT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn ufw_network_reads_admit_only_four_exact_commands_and_256k_output() {
+    let fixture = Fixture::plain();
+    let environment = ChildEnvironment::selected(fixture.io.target(), BTreeMap::new()).unwrap();
+    let cases = [
+        ("/usr/bin/systemctl", vec!["is-active", "ufw.service"]),
+        ("/usr/bin/ip", vec!["-j", "-d", "addr", "show"]),
+        ("/usr/bin/ip", vec!["-j", "route", "show", "default"]),
+        ("/usr/bin/ip", vec!["-j", "-6", "route", "show", "default"]),
+    ];
+    for (path, args) in cases {
+        let argv: Vec<String> = args.iter().map(|s| (*s).into()).collect();
+        let command = CommandSpec::new(
+            path.into(),
+            argv.clone(),
+            environment.clone(),
+            MAX_FIREWALL_COMMAND_BYTES,
+        )
+        .unwrap();
+        for bad in [
+            [argv.clone(), vec!["--extra".into()]].concat(),
+            [vec!["--user".into()], argv.clone()].concat(),
+            [vec!["--system".into()], argv.clone()].concat(),
+            argv[..argv.len() - 1].to_vec(),
+        ] {
+            assert!(CommandSpec::new(path.into(), bad, environment.clone(), 256).is_err());
+        }
+        for bad_path in [
+            path.trim_start_matches('/').to_owned(),
+            path.replace("/usr/bin/", "/bin/"),
+        ] {
+            assert!(
+                CommandSpec::new(bad_path.into(), argv.clone(), environment.clone(), 256).is_err()
+            );
+        }
+        assert!(
+            CommandSpec::new(
+                path.into(),
+                argv.clone(),
+                environment.clone(),
+                MAX_FIREWALL_COMMAND_BYTES + 1
+            )
+            .is_err()
+        );
+        *fixture.runner.output.lock().unwrap() =
+            Some((Some(0), vec![b'x'; MAX_FIREWALL_COMMAND_BYTES], vec![]));
+        assert_eq!(
+            fixture.io.run(&command, &deadline()).unwrap().stdout.len(),
+            MAX_FIREWALL_COMMAND_BYTES
+        );
+        let calls = fixture.runner.calls.lock().unwrap();
+        assert_eq!(calls.last().unwrap().argv(), argv);
+        assert_eq!(
+            calls.last().unwrap().executable(),
+            std::path::Path::new(path)
+        );
+        drop(calls);
+        *fixture.runner.output.lock().unwrap() =
+            Some((Some(0), vec![0; MAX_FIREWALL_COMMAND_BYTES], vec![0]));
+        assert_eq!(
+            fixture.io.run(&command, &deadline()).unwrap_err(),
+            NativeError::Oversize
+        );
+    }
+    for args in [
+        vec!["is-active", "foreign.service"],
+        vec!["status", "ufw.service"],
+        vec!["start", "ufw.service"],
+        vec!["is-active", "ufw"],
+    ] {
+        assert!(
+            CommandSpec::new(
+                "/usr/bin/systemctl".into(),
+                args.iter().map(|s| (*s).into()).collect(),
+                environment.clone(),
+                256
+            )
+            .is_err()
+        );
+    }
+    for args in [
+        vec!["-j", "addr", "show"],
+        vec!["-j", "route", "show"],
+        vec!["-j", "-4", "route", "show", "default"],
+        vec!["-j", "route", "add", "default"],
+    ] {
+        assert!(
+            CommandSpec::new(
+                "/usr/bin/ip".into(),
+                args.iter().map(|s| (*s).into()).collect(),
+                environment.clone(),
+                256
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        CommandSpec::new(
+            "/usr/bin/fc-match".into(),
+            vec!["-f".into(), "%{file}".into(), "sans-serif".into()],
+            environment.clone(),
+            MAX_COMMAND_BYTES + 1
+        )
+        .is_err()
+    );
+    for path in [
+        "/usr/bin/pkexec",
+        "/usr/bin/sudo",
+        "/usr/bin/setsid",
+        "/usr/bin/ufw",
+    ] {
+        assert!(
+            CommandSpec::new(
+                path.into(),
+                vec!["/usr/bin/ufw".into()],
+                environment.clone(),
+                256
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn lan_cidr_canonical_network_validation_table() {
+    for (input, expected) in [
+        ("192.168.0.0/16", "192.168.0.0/16"),
+        ("10.0.0.0/8", "10.0.0.0/8"),
+        ("192.168.3.99/32", "192.168.3.99/32"),
+        ("FD00:0000:0000:0000:0000:0000:0000:0000/16", "fd00::/16"),
+        ("2001:db8::/32", "2001:db8::/32"),
+        ("fd00::1/128", "fd00::1/128"),
+    ] {
+        assert_eq!(LanCidr::parse(input).unwrap().as_str(), expected);
+    }
+    for input in [
+        "",
+        "10.0.0.0",
+        "10.0.0.1/24",
+        "10.0.0.0/7",
+        "10.0.0.0/33",
+        "10.0.0.0/024",
+        "10.0.0.0/-1",
+        "10.0.0.0/24/extra",
+        "10.0.0.0/24\n",
+        "0.0.0.0/0",
+        "0.0.0.0/8",
+        "127.0.0.0/8",
+        "224.0.0.0/8",
+        "169.254.0.0/16",
+        "169.254.1.1/32",
+        "::/16",
+        "::1/128",
+        "ff00::/16",
+        "fe80::/16",
+        "febf::/16",
+        "fd00::/15",
+        "fd00::/129",
+        "fd00::1/64",
+        "fd00::/0",
+        "fd00::%eth0/16",
+        "10.0.0.0/24;evil",
+    ] {
+        assert!(LanCidr::parse(input).is_err(), "{input}");
+    }
+}
+
+static PKEXEC_TESTS: Mutex<()> = Mutex::new(());
+#[derive(Default)]
+struct PkexecState {
+    calls: Mutex<Vec<(PkexecCommand, Deadline)>>,
+    outcome: Mutex<Option<PkexecOutcome>>,
+    entered: std::sync::atomic::AtomicBool,
+    stall_spawn: std::sync::atomic::AtomicBool,
+    reaped: std::sync::atomic::AtomicBool,
+    dropped: std::sync::atomic::AtomicBool,
+    terms: AtomicU64,
+    requires_drain: std::sync::atomic::AtomicBool,
+    out_remaining: AtomicU64,
+    err_remaining: AtomicU64,
+    hold_drop: std::sync::atomic::AtomicBool,
+    setup_error: Mutex<Option<NativeError>>,
+}
+struct FakePkexec(Arc<PkexecState>);
+impl PkexecRunner for FakePkexec {
+    fn spawn(
+        &self,
+        command: &PkexecCommand,
+        deadline: &Deadline,
+    ) -> Result<Box<dyn PkexecChild>, NativeError> {
+        self.0
+            .calls
+            .lock()
+            .unwrap()
+            .push((command.clone(), deadline.clone()));
+        self.0.entered.store(true, Ordering::Release);
+        while self.0.stall_spawn.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(Box::new(FakePkexecChild(self.0.clone())))
+    }
+}
+struct FakePkexecChild(Arc<PkexecState>);
+impl PkexecChild for FakePkexecChild {
+    fn poll(&mut self) -> Result<Option<PkexecOutcome>, NativeError> {
+        if let Some(error) = self.0.setup_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        if self.0.requires_drain.load(Ordering::Acquire)
+            && self.0.terms.load(Ordering::Acquire) != 0
+        {
+            // An EPERM-like terminate changes no child state. Both fake pipes must keep flowing.
+            for pipe in [&self.0.out_remaining, &self.0.err_remaining] {
+                let _ = pipe.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    Some(n.saturating_sub(4096))
+                });
+            }
+            if self.0.out_remaining.load(Ordering::Acquire) == 0
+                && self.0.err_remaining.load(Ordering::Acquire) == 0
+            {
+                self.0.reaped.store(true, Ordering::Release);
+            }
+        }
+        let outcome = self.0.outcome.lock().unwrap().take();
+        if outcome.is_some() {
+            self.0.reaped.store(true, Ordering::Release);
+        }
+        Ok(outcome)
+    }
+    fn terminate(&mut self) {
+        self.0.terms.fetch_add(1, Ordering::AcqRel);
+    }
+    fn reaped(&mut self) -> bool {
+        self.0.reaped.load(Ordering::Acquire)
+    }
+}
+impl Drop for FakePkexecChild {
+    fn drop(&mut self) {
+        self.0.dropped.store(true, Ordering::Release);
+        while self.0.hold_drop.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+fn pkexec_fixture() -> (Fixture, Arc<PkexecState>) {
+    let mut fixture = Fixture::plain();
+    let state = Arc::new(PkexecState::default());
+    fixture
+        .io
+        .set_scratch_pkexec_runner(Arc::new(FakePkexec(state.clone())))
+        .unwrap();
+    (fixture, state)
+}
+fn mutation(delete: bool, rule: UfwRule) -> UfwMutation {
+    UfwMutation {
+        delete,
+        cidr: LanCidr::parse("192.168.7.0/24").unwrap(),
+        rule,
+    }
+}
+fn exited(stdout: Vec<u8>, stderr: Vec<u8>) -> PkexecOutcome {
+    PkexecOutcome::Exited {
+        code: 0,
+        stdout,
+        stderr,
+        stdout_truncated: false,
+        stderr_truncated: false,
+    }
+}
+fn wait_fake(mut done: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while !done() {
+        assert!(std::time::Instant::now() < end, "fake worker stalled");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn pkexec_ufw_all_four_argv_and_environment_are_exact_and_unclassified() {
+    let _serial = PKEXEC_TESTS.lock().unwrap();
+    for delete in [false, true] {
+        for (rule, port, comment) in [
+            (UfwRule::Lan, "47811:47812", "Crosspane (LAN)"),
+            (UfwRule::Mdns, "5353", "Crosspane (mDNS)"),
+        ] {
+            let (fixture, state) = pkexec_fixture();
+            *state.outcome.lock().unwrap() = Some(PkexecOutcome::Exited {
+                code: 127,
+                stdout: b"unclassified stdout".to_vec(),
+                stderr: b"unclassified stderr".to_vec(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+            let d = deadline();
+            match fixture
+                .io
+                .pkexec_ufw(&fixture.proof(), mutation(delete, rule), &d)
+                .unwrap()
+            {
+                PkexecOutcome::Exited {
+                    code,
+                    stdout,
+                    stderr,
+                    ..
+                } => {
+                    assert_eq!(code, 127);
+                    assert_eq!(stdout, b"unclassified stdout");
+                    assert_eq!(stderr, b"unclassified stderr");
+                }
+                other => panic!("{other:?}"),
+            }
+            wait_fake(|| state.dropped.load(Ordering::Acquire));
+            let calls = state.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let (command, recorded_deadline) = &calls[0];
+            let mut argv = vec!["--wait", "/usr/bin/pkexec", "/usr/bin/ufw"];
+            if delete {
+                argv.push("delete");
+            }
+            argv.extend([
+                "allow",
+                "from",
+                "192.168.7.0/24",
+                "to",
+                "any",
+                "port",
+                port,
+                "proto",
+                "udp",
+                "comment",
+                comment,
+            ]);
+            assert_eq!(
+                command.executable(),
+                std::path::Path::new("/usr/bin/setsid")
+            );
+            assert_eq!(command.argv(), argv);
+            assert_eq!(
+                command.environment(),
+                [("PATH", "/usr/bin:/bin"), ("LANG", "C"), ("LC_ALL", "C")]
+            );
+            assert!(command.stdin_null());
+            assert!(command.new_session());
+            assert_eq!(command.process_group(), None);
+            assert_eq!(format!("{recorded_deadline:?}"), format!("{d:?}"));
+            assert_eq!(state.terms.load(Ordering::Acquire), 0);
+            assert!(fixture.runner.calls.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn pkexec_ufw_requires_current_selected_proof_and_scratch_override() {
+    let _serial = PKEXEC_TESTS.lock().unwrap();
+    let (fixture, state) = pkexec_fixture();
+    let other = Fixture::plain();
+    assert!(matches!(
+        other
+            .io
+            .pkexec_ufw(&other.proof(), mutation(false, UfwRule::Lan), &deadline()),
+        Err(NativeError::Foreign)
+    ));
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(&other.proof(), mutation(false, UfwRule::Lan), &deadline()),
+        Err(NativeError::Unsupported)
+    ));
+    let proof = fixture.proof();
+    let mut changed = facts(&fixture.io);
+    changed.active = false;
+    assert_eq!(
+        proof.revalidate(&fixture.io, &changed),
+        Err(NativeError::Unsupported)
+    );
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(&proof, mutation(false, UfwRule::Lan), &deadline()),
+        Err(NativeError::Unsupported)
+    ));
+    assert_eq!(
+        Deadline::new(120_001, Cancellation::default()).unwrap_err(),
+        NativeError::Invalid
+    );
+    let proof = fixture.proof();
+    thread::sleep(SUPPORT_LIFETIME + Duration::from_millis(10));
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(&proof, mutation(false, UfwRule::Lan), &deadline()),
+        Err(NativeError::Unsupported)
+    ));
+    let cancel = Cancellation::default();
+    let d = Deadline::new(1000, cancel.clone()).unwrap();
+    cancel.cancel();
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(&fixture.proof(), mutation(false, UfwRule::Lan), &d),
+        Err(NativeError::Cancelled)
+    ));
+    assert!(state.calls.lock().unwrap().is_empty());
+    assert!(fixture.runner.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn pkexec_timeout_terms_once_and_retains_process_wide_lease_until_reaped() {
+    let _serial = PKEXEC_TESTS.lock().unwrap();
+    let (fixture, state) = pkexec_fixture();
+    let (other, other_state) = pkexec_fixture();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(
+                &fixture.proof(),
+                mutation(false, UfwRule::Lan),
+                &Deadline::new(30, Cancellation::default()).unwrap()
+            )
+            .unwrap(),
+        PkexecOutcome::TimedOut
+    ));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    wait_fake(|| state.terms.load(Ordering::Acquire) == 1);
+    for _ in 0..3 {
+        assert!(matches!(
+            other
+                .io
+                .pkexec_ufw(&other.proof(), mutation(true, UfwRule::Mdns), &deadline()),
+            Err(NativeError::Busy)
+        ));
+    }
+    assert_eq!(state.calls.lock().unwrap().len(), 1);
+    assert!(other_state.calls.lock().unwrap().is_empty());
+    assert!(!state.dropped.load(Ordering::Acquire));
+    state.reaped.store(true, Ordering::Release);
+    wait_fake(|| state.dropped.load(Ordering::Acquire));
+    *other_state.outcome.lock().unwrap() = Some(exited(vec![], vec![]));
+    assert!(matches!(
+        other
+            .io
+            .pkexec_ufw(&other.proof(), mutation(true, UfwRule::Mdns), &deadline())
+            .unwrap(),
+        PkexecOutcome::Exited { code: 0, .. }
+    ));
+    wait_fake(|| other_state.dropped.load(Ordering::Acquire));
+    assert_eq!(state.terms.load(Ordering::Acquire), 1);
+    assert_eq!(other_state.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn pkexec_stalled_launch_is_bounded_cancelled_and_never_redispatched() {
+    let _serial = PKEXEC_TESTS.lock().unwrap();
+    let (fixture, state) = pkexec_fixture();
+    state.stall_spawn.store(true, Ordering::Release);
+    let cancel = Cancellation::default();
+    let d = Deadline::new(1000, cancel.clone()).unwrap();
+    thread::scope(|scope| {
+        let operation = scope.spawn(|| {
+            fixture
+                .io
+                .pkexec_ufw(&fixture.proof(), mutation(false, UfwRule::Lan), &d)
+        });
+        wait_fake(|| state.entered.load(Ordering::Acquire));
+        cancel.cancel();
+        assert_eq!(
+            operation.join().unwrap().unwrap_err(),
+            NativeError::Cancelled
+        );
+    });
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(&fixture.proof(), mutation(false, UfwRule::Lan), &deadline()),
+        Err(NativeError::Busy)
+    ));
+    state.stall_spawn.store(false, Ordering::Release);
+    wait_fake(|| state.terms.load(Ordering::Acquire) == 1);
+    assert!(!state.dropped.load(Ordering::Acquire));
+    state.reaped.store(true, Ordering::Release);
+    wait_fake(|| state.dropped.load(Ordering::Acquire));
+    assert_eq!(state.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn pkexec_output_bounds_are_per_stream_flagged_and_signal_is_preserved() {
+    let _serial = PKEXEC_TESTS.lock().unwrap();
+    for (out, err) in [
+        (0, 0),
+        (MAX_COMMAND_BYTES, MAX_COMMAND_BYTES),
+        (MAX_COMMAND_BYTES + 1, MAX_COMMAND_BYTES * 2),
+    ] {
+        let (fixture, state) = pkexec_fixture();
+        *state.outcome.lock().unwrap() = Some(exited(vec![b'o'; out], vec![b'e'; err]));
+        match fixture
+            .io
+            .pkexec_ufw(&fixture.proof(), mutation(false, UfwRule::Lan), &deadline())
+            .unwrap()
+        {
+            PkexecOutcome::Exited {
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+                ..
+            } => {
+                assert_eq!(stdout.len(), out.min(MAX_COMMAND_BYTES));
+                assert_eq!(stderr.len(), err.min(MAX_COMMAND_BYTES));
+                assert_eq!(stdout_truncated, out > MAX_COMMAND_BYTES);
+                assert_eq!(stderr_truncated, err > MAX_COMMAND_BYTES);
+            }
+            other => panic!("{other:?}"),
+        }
+        wait_fake(|| state.dropped.load(Ordering::Acquire));
+    }
+    let (fixture, state) = pkexec_fixture();
+    *state.outcome.lock().unwrap() = Some(PkexecOutcome::Signalled);
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(&fixture.proof(), mutation(false, UfwRule::Lan), &deadline())
+            .unwrap(),
+        PkexecOutcome::Signalled
+    ));
+    wait_fake(|| state.dropped.load(Ordering::Acquire));
+    assert_eq!(state.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn firewall_reads_refuse_admitted_bus_and_manager_environments_before_any_runner() {
+    use std::os::unix::net::UnixListener;
+    let fixture = Fixture::plain();
+    let runtime = fixture.io.target().paths().runtime_home.clone();
+    fixture
+        .io
+        .create_private_dir(&fixture.proof(), &runtime.join("systemd"))
+        .unwrap();
+    let _manager = UnixListener::bind(runtime.join("systemd/private")).unwrap();
+    let bus = runtime.join("bus");
+    let _bus = UnixListener::bind(&bus).unwrap();
+    let session = BTreeMap::from([(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        format!("unix:path={}", bus.display()),
+    )]);
+    let environments = [
+        fixture
+            .io
+            .manager_environment(BTreeMap::new(), &deadline())
+            .unwrap(),
+        ChildEnvironment::selected(fixture.io.target(), session).unwrap(),
+    ];
+    for environment in environments {
+        for (program, args) in [
+            ("/usr/bin/systemctl", vec!["is-active", "ufw.service"]),
+            ("/usr/bin/ip", vec!["-j", "-d", "addr", "show"]),
+            ("/usr/bin/ip", vec!["-j", "route", "show", "default"]),
+            ("/usr/bin/ip", vec!["-j", "-6", "route", "show", "default"]),
+        ] {
+            assert!(
+                matches!(
+                    CommandSpec::new(
+                        program.into(),
+                        args.into_iter().map(str::to_owned).collect(),
+                        environment.clone(),
+                        256
+                    ),
+                    Err(NativeError::Invalid)
+                ),
+                "{program}"
+            );
+        }
+        assert!(fixture.runner.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn pkexec_cleanup_keeps_both_pipes_flowing_when_term_cannot_stop_child() {
+    let _serial = PKEXEC_TESTS.lock().unwrap();
+    let (fixture, state) = pkexec_fixture();
+    state.requires_drain.store(true, Ordering::Release);
+    state.out_remaining.store(64 * 1024, Ordering::Release);
+    state.err_remaining.store(96 * 1024, Ordering::Release);
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(
+                &fixture.proof(),
+                mutation(false, UfwRule::Lan),
+                &Deadline::new(30, Cancellation::default()).unwrap()
+            )
+            .unwrap(),
+        PkexecOutcome::TimedOut
+    ));
+    wait_fake(|| state.terms.load(Ordering::Acquire) == 1);
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(&fixture.proof(), mutation(false, UfwRule::Lan), &deadline()),
+        Err(NativeError::Busy)
+    ));
+    wait_fake(|| state.dropped.load(Ordering::Acquire));
+    assert_eq!(state.out_remaining.load(Ordering::Acquire), 0);
+    assert_eq!(state.err_remaining.load(Ordering::Acquire), 0);
+    assert_eq!(state.terms.load(Ordering::Acquire), 1);
+    assert_eq!(state.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn pkexec_reaped_child_drop_observes_released_lease_on_repeated_dispatches() {
+    let _serial = PKEXEC_TESTS.lock().unwrap();
+    for _ in 0..20 {
+        let (first, state) = pkexec_fixture();
+        state.hold_drop.store(true, Ordering::Release);
+        *state.outcome.lock().unwrap() = Some(exited(vec![], vec![]));
+        assert!(matches!(
+            first
+                .io
+                .pkexec_ufw(&first.proof(), mutation(false, UfwRule::Lan), &deadline())
+                .unwrap(),
+            PkexecOutcome::Exited { .. }
+        ));
+        wait_fake(|| state.dropped.load(Ordering::Acquire));
+        let (next, next_state) = pkexec_fixture();
+        *next_state.outcome.lock().unwrap() = Some(exited(vec![], vec![]));
+        let result = next
+            .io
+            .pkexec_ufw(&next.proof(), mutation(false, UfwRule::Lan), &deadline());
+        state.hold_drop.store(false, Ordering::Release);
+        assert!(matches!(result.unwrap(), PkexecOutcome::Exited { .. }));
+        wait_fake(|| next_state.dropped.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn pkexec_setup_error_returns_promptly_and_common_reaper_retains_lease() {
+    let _serial = PKEXEC_TESTS.lock().unwrap();
+    let (fixture, state) = pkexec_fixture();
+    *state.setup_error.lock().unwrap() = Some(NativeError::Unavailable);
+    let start = std::time::Instant::now();
+    assert_eq!(
+        fixture
+            .io
+            .pkexec_ufw(
+                &fixture.proof(),
+                mutation(false, UfwRule::Lan),
+                &Deadline::new(30, Cancellation::default()).unwrap()
+            )
+            .unwrap_err(),
+        NativeError::Unavailable
+    );
+    assert!(start.elapsed() < Duration::from_millis(500));
+    wait_fake(|| state.terms.load(Ordering::Acquire) == 1);
+    assert!(matches!(
+        fixture
+            .io
+            .pkexec_ufw(&fixture.proof(), mutation(false, UfwRule::Lan), &deadline()),
+        Err(NativeError::Busy)
+    ));
+    assert!(!state.dropped.load(Ordering::Acquire));
+    state.reaped.store(true, Ordering::Release);
+    wait_fake(|| state.dropped.load(Ordering::Acquire));
+    assert_eq!(state.terms.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn fc_match_is_exactly_allowlisted_and_runs_only_the_injected_runner() {
     let fixture = Fixture::plain();
     let environment = ChildEnvironment::selected(fixture.io.target(), BTreeMap::new()).unwrap();

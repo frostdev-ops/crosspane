@@ -29,11 +29,16 @@ pub const SUPPORT_LIFETIME: Duration = Duration::from_secs(5);
 pub const MAX_OS_RELEASE_BYTES: usize = 64 * 1024;
 pub const MAX_FONT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ELF_PREFIX_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_UFW_BYTES: usize = 1024 * 1024;
+pub const MAX_FIREWALL_COMMAND_BYTES: usize = 256 * 1024;
 static READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Read-only system namespaces; ELF returns a prefix, never executes or resolves a program.
 #[derive(Clone, Debug)]
 pub enum SystemRead {
+    UfwConfig,
+    UfwRules,
+    UfwRules6,
     OsRelease,
     OsReleaseFallback,
     Font(PathBuf),
@@ -51,6 +56,9 @@ pub struct SystemBytes {
 impl SystemRead {
     fn path_and_limit(&self) -> Result<(PathBuf, usize)> {
         let (path, limit) = match self {
+            Self::UfwConfig => (PathBuf::from("/etc/ufw/ufw.conf"), MAX_UFW_BYTES),
+            Self::UfwRules => (PathBuf::from("/etc/ufw/user.rules"), MAX_UFW_BYTES),
+            Self::UfwRules6 => (PathBuf::from("/etc/ufw/user6.rules"), MAX_UFW_BYTES),
             Self::OsRelease => (PathBuf::from("/etc/os-release"), MAX_OS_RELEASE_BYTES),
             Self::OsReleaseFallback => (PathBuf::from("/usr/lib/os-release"), MAX_OS_RELEASE_BYTES),
             Self::Font(path) => (path.clone(), MAX_FONT_BYTES),
@@ -83,13 +91,16 @@ struct ReadParent {
 }
 impl ReadParent {
     fn open_file(&self) -> Result<OwnedFd> {
+        self.open_with_permissions(false)
+    }
+    fn open_with_permissions(&self, ufw: bool) -> Result<OwnedFd> {
         rfs::openat(
             self.directories.last().ok_or(NativeError::Invalid)?,
             &self.name,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|_| NativeError::Foreign)
+        .map_err(|error| read_error(error, ufw))
     }
     fn same_as(&self, other: &Self) -> Result<()> {
         if self.directories.len() != other.directories.len() {
@@ -113,6 +124,32 @@ fn read_stat(stat: &rfs::Stat, uid: u32, kind: u32) -> Result<()> {
 }
 // The anchor is / for system data, or the admitted private runtime for selected sockets.
 fn read_parent(anchor: OwnedFd, relative: &Path, uid: u32) -> Result<ReadParent> {
+    read_parent_permissions(anchor, relative, uid, false)
+}
+fn read_error(error: rustix::io::Errno, ufw: bool) -> NativeError {
+    if ufw && matches!(error, rustix::io::Errno::ACCESS | rustix::io::Errno::PERM) {
+        NativeError::PermissionDenied
+    } else {
+        NativeError::Foreign
+    }
+}
+fn final_read_stat(parent: &ReadParent, name: &str, ufw: bool) -> Result<rfs::Stat> {
+    rfs::statat(
+        parent.directories.last().ok_or(NativeError::Invalid)?,
+        name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|error| match read_error(error, ufw) {
+        NativeError::PermissionDenied => NativeError::PermissionDenied,
+        _ => NativeError::Unavailable,
+    })
+}
+fn read_parent_permissions(
+    anchor: OwnedFd,
+    relative: &Path,
+    uid: u32,
+    ufw: bool,
+) -> Result<ReadParent> {
     let name = relative
         .file_name()
         .and_then(|s| s.to_str())
@@ -131,7 +168,7 @@ fn read_parent(anchor: OwnedFd, relative: &Path, uid: u32) -> Result<ReadParent>
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|_| NativeError::Foreign)?;
+        .map_err(|error| read_error(error, ufw))?;
         read_stat(&native(rfs::fstat(&child))?, uid, 0o040000)?;
         directories.push(child);
     }
@@ -263,10 +300,19 @@ fn system_contents(
     }
     deadline.check()?;
     let mut bytes = Vec::new();
-    native(
-        file.take((limit + usize::from(!prefix)) as u64)
-            .read_to_end(&mut bytes),
-    )?;
+    file.take((limit + usize::from(!prefix)) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            if matches!(
+                request,
+                SystemRead::UfwConfig | SystemRead::UfwRules | SystemRead::UfwRules6
+            ) && error.kind() == std::io::ErrorKind::PermissionDenied
+            {
+                NativeError::PermissionDenied
+            } else {
+                NativeError::Unavailable
+            }
+        })?;
     deadline.check()?;
     if bytes.len() > limit {
         return Err(NativeError::Oversize);
@@ -421,6 +467,8 @@ static NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NativeError {
+    #[error("native read permission denied")]
+    PermissionDenied,
     #[error("invalid or unadmitted value")]
     Invalid,
     #[error("unavailable native observation")]
@@ -913,7 +961,12 @@ impl CommandSpec {
         if !clean(&executable)
             || argv.len() > 32
             || output_limit == 0
-            || output_limit > MAX_COMMAND_BYTES
+            || output_limit
+                > if firewall_read(&executable, &argv) {
+                    MAX_FIREWALL_COMMAND_BYTES
+                } else {
+                    MAX_COMMAND_BYTES
+                }
             || argv
                 .iter()
                 .any(|s| s.len() > 4096 || s.chars().any(char::is_control))
@@ -922,7 +975,15 @@ impl CommandSpec {
             return Err(NativeError::Invalid);
         }
         approved_executable(&executable, &argv)?;
-        if executable == Path::new("/usr/bin/systemctl") && environment.manager.is_none() {
+        if firewall_read(&executable, &argv)
+            && (environment.manager.is_some() || environment.bus.is_some())
+        {
+            return Err(NativeError::Invalid);
+        }
+        if executable == Path::new("/usr/bin/systemctl")
+            && !firewall_read(&executable, &argv)
+            && environment.manager.is_none()
+        {
             return Err(NativeError::Invalid);
         }
         Ok(Self {
@@ -958,7 +1019,27 @@ fn manager_mutation(spec: &CommandSpec) -> bool {
             Some("start" | "stop" | "restart" | "enable" | "disable" | "daemon-reload")
         )
 }
+fn firewall_read(path: &Path, argv: &[String]) -> bool {
+    let a: Vec<_> = argv.iter().map(String::as_str).collect();
+    matches!(
+        (path.to_str(), a.as_slice()),
+        (Some("/usr/bin/systemctl"), ["is-active", "ufw.service"])
+            | (Some("/usr/bin/ip"), ["-j", "-d", "addr", "show"])
+            | (Some("/usr/bin/ip"), ["-j", "route", "show", "default"])
+            | (
+                Some("/usr/bin/ip"),
+                ["-j", "-6", "route", "show", "default"]
+            )
+    )
+}
 fn approved_executable(path: &Path, argv: &[String]) -> Result<&'static str> {
+    if firewall_read(path, argv) {
+        return Ok(if path == Path::new("/usr/bin/ip") {
+            "/usr/bin/ip"
+        } else {
+            "/usr/bin/systemctl"
+        });
+    }
     let a: Vec<_> = argv.iter().map(String::as_str).collect();
     match (path.to_str(), a.as_slice()) {
         (Some("/usr/bin/fc-match"), ["-f", "%{file}", "sans-serif"]) => Ok("/usr/bin/fc-match"),
@@ -1081,6 +1162,261 @@ pub struct ManagerMutation {
 }
 pub trait CommandRunner: Send + Sync {
     fn run(&self, command: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput>;
+}
+/// Canonical network only; further LAN interface/range policy belongs to the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanCidr(String);
+impl LanCidr {
+    pub fn parse(value: &str) -> Result<Self> {
+        let (address, prefix) = value.split_once('/').ok_or(NativeError::Invalid)?;
+        let address: std::net::IpAddr = address.parse().map_err(|_| NativeError::Invalid)?;
+        let bits: u32 = prefix.parse().map_err(|_| NativeError::Invalid)?;
+        if bits.to_string() != prefix
+            || address.is_unspecified()
+            || address.is_loopback()
+            || address.is_multicast()
+        {
+            return Err(NativeError::Invalid);
+        }
+        let valid = match address {
+            std::net::IpAddr::V4(a) => {
+                (8..=32).contains(&bits)
+                    && a.octets()[..2] != [169, 254]
+                    && u32::from(a) & !(u32::MAX << (32 - bits)) == 0
+            }
+            std::net::IpAddr::V6(a) => {
+                (16..=128).contains(&bits)
+                    && a.segments()[0] & 0xffc0 != 0xfe80
+                    && u128::from(a) & !(u128::MAX << (128 - bits)) == 0
+            }
+        };
+        if !valid {
+            return Err(NativeError::Invalid);
+        }
+        Ok(Self(format!("{address}/{bits}")))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UfwRule {
+    Lan,
+    Mdns,
+}
+#[derive(Clone, Debug)]
+pub struct UfwMutation {
+    pub delete: bool,
+    pub cidr: LanCidr,
+    pub rule: UfwRule,
+}
+#[derive(Debug)]
+pub enum PkexecOutcome {
+    Exited {
+        code: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    },
+    TimedOut,
+    Signalled,
+}
+/// The only privileged command model; callers cannot provide argv or inherited environment.
+#[derive(Clone, Debug)]
+pub struct PkexecCommand {
+    argv: Vec<String>,
+    target: LinuxTarget,
+    proof: SupportProof,
+}
+impl PkexecCommand {
+    pub fn executable(&self) -> &Path {
+        Path::new("/usr/bin/setsid")
+    }
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+    pub fn environment(&self) -> [(&'static str, &'static str); 3] {
+        [("PATH", "/usr/bin:/bin"), ("LANG", "C"), ("LC_ALL", "C")]
+    }
+    pub fn stdin_null(&self) -> bool {
+        true
+    }
+    pub fn new_session(&self) -> bool {
+        true
+    }
+    pub fn process_group(&self) -> Option<i32> {
+        None
+    }
+}
+/// Injected only into an admitted scratch target. Production always uses the native runner.
+pub trait PkexecRunner: Send + Sync {
+    fn spawn(&self, command: &PkexecCommand, deadline: &Deadline) -> Result<Box<dyn PkexecChild>>;
+}
+pub trait PkexecChild: Send {
+    fn poll(&mut self) -> Result<Option<PkexecOutcome>>;
+    fn terminate(&mut self);
+    fn reaped(&mut self) -> bool;
+}
+static UFW_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+fn ufw_program_stat(stat: &rfs::Stat, pkexec: bool) -> Result<()> {
+    read_stat(stat, 0, 0o100000)?;
+    if stat.st_mode & 0o111 == 0 || stat.st_mode & 0o6000 != if pkexec { 0o4000 } else { 0 } {
+        return Err(NativeError::Foreign);
+    }
+    Ok(())
+}
+fn ufw_program(path: &Path) -> Result<OwnedFd> {
+    let parent = read_parent(
+        read_anchor(Path::new("/"))?,
+        path.strip_prefix("/").map_err(|_| NativeError::Invalid)?,
+        0,
+    )?;
+    let fd = parent.open_file()?;
+    ufw_program_stat(
+        &native(rfs::fstat(&fd))?,
+        path == Path::new("/usr/bin/pkexec"),
+    )?;
+    Ok(fd)
+}
+struct NativePkexecRunner;
+struct PkexecPipe {
+    reader: Box<dyn Read + Send>,
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+impl PkexecPipe {
+    fn empty() -> Self {
+        Self {
+            reader: Box::new(std::io::empty()),
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+    fn drain(&mut self) -> Result<bool> {
+        let mut buffer = [0; 4096];
+        // Finite work per poll, including discarded overflow; an endless writer cannot starve the deadline.
+        for _ in 0..16 {
+            match self.reader.read(&mut buffer) {
+                Ok(0) => return Ok(true),
+                Ok(n) => {
+                    let keep = n.min(MAX_COMMAND_BYTES.saturating_sub(self.bytes.len()));
+                    self.bytes.extend_from_slice(&buffer[..keep]);
+                    self.truncated |= keep != n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(NativeError::Unavailable),
+            }
+        }
+        Ok(false)
+    }
+}
+struct NativePkexecChild {
+    child: Child,
+    out: PkexecPipe,
+    err: PkexecPipe,
+    status: Option<std::process::ExitStatus>,
+    setup_error: Option<NativeError>,
+}
+impl PkexecChild for NativePkexecChild {
+    fn poll(&mut self) -> Result<Option<PkexecOutcome>> {
+        if let Some(error) = self.setup_error.take() {
+            return Err(error);
+        }
+        let out = self.out.drain();
+        let err = self.err.drain();
+        let done = (out?, err?);
+        if self.status.is_none() {
+            self.status = native(self.child.try_wait())?;
+        }
+        Ok(self
+            .status
+            .filter(|_| done == (true, true))
+            .map(|status| match status.code() {
+                Some(code) => PkexecOutcome::Exited {
+                    code,
+                    stdout: std::mem::take(&mut self.out.bytes),
+                    stderr: std::mem::take(&mut self.err.bytes),
+                    stdout_truncated: self.out.truncated,
+                    stderr_truncated: self.err.truncated,
+                },
+                None => PkexecOutcome::Signalled,
+            }))
+    }
+    fn terminate(&mut self) {
+        if self.status.is_none()
+            && let Some(pid) = rustix::process::Pid::from_raw(self.child.id() as i32)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
+    }
+    fn reaped(&mut self) -> bool {
+        self.status.is_some() || matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+}
+impl PkexecRunner for NativePkexecRunner {
+    fn spawn(&self, spec: &PkexecCommand, deadline: &Deadline) -> Result<Box<dyn PkexecChild>> {
+        use std::os::unix::process::CommandExt;
+        let paths = ["/usr/bin/setsid", "/usr/bin/pkexec", "/usr/bin/ufw"];
+        let mut admitted = Vec::new();
+        for path in paths {
+            deadline.check()?;
+            admitted.push(ufw_program(Path::new(path))?);
+        }
+        validate_target(&spec.target)?;
+        let mut command = Command::new(format!("/proc/self/fd/{}", admitted[0].as_raw_fd()));
+        command
+            .arg0(spec.executable())
+            .args(&spec.argv)
+            .env_clear()
+            .envs(spec.environment())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (path, fd) in paths.into_iter().zip(&admitted) {
+            let now = native(rfs::fstat(&ufw_program(Path::new(path))?))?;
+            let old = native(rfs::fstat(fd))?;
+            if (now.st_dev, now.st_ino) != (old.st_dev, old.st_ino) {
+                return Err(NativeError::Foreign);
+            }
+        }
+        spec.proof.check_target(&spec.target)?;
+        deadline.check()?;
+        // Never process_group: setsid must exec pkexec in place; --wait preserves status if it forks.
+        let mut child = native(command.spawn())?;
+        let out = child.stdout.take();
+        let err = child.stderr.take();
+        let pipes = (|| {
+            let out = out.ok_or(NativeError::Unavailable)?;
+            let err = err.ok_or(NativeError::Unavailable)?;
+            native(rfs::fcntl_setfl(&out, OFlags::NONBLOCK))?;
+            native(rfs::fcntl_setfl(&err, OFlags::NONBLOCK))?;
+            Ok((
+                PkexecPipe {
+                    reader: Box::new(out),
+                    bytes: Vec::new(),
+                    truncated: false,
+                },
+                PkexecPipe {
+                    reader: Box::new(err),
+                    bytes: Vec::new(),
+                    truncated: false,
+                },
+            ))
+        })();
+        let (out, err, setup_error) = match pipes {
+            Ok((out, err)) => (out, err, None),
+            Err(error) => (PkexecPipe::empty(), PkexecPipe::empty(), Some(error)),
+        };
+        Ok(Box::new(NativePkexecChild {
+            child,
+            out,
+            err,
+            status: None,
+            setup_error,
+        }))
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessFacts {
@@ -1428,6 +1764,7 @@ fn validate_target(target: &LinuxTarget) -> Result<()> {
 #[cfg(test)]
 type CommandAdmission = dyn Fn(&LinuxTarget) -> Result<()> + Send + Sync;
 pub struct LinuxNativeIo {
+    pkexec_runner: Option<Arc<dyn PkexecRunner>>,
     target: LinuxTarget,
     runner: Arc<dyn CommandRunner>,
     probe: Arc<dyn ProcessProbe>,
@@ -1463,7 +1800,12 @@ impl LinuxNativeIo {
             validate_target(&target)?;
             let (mut path, _) = request.path_and_limit()?;
             let relative = path.strip_prefix("/").map_err(|_| NativeError::Foreign)?;
-            let mut parent = read_parent(read_anchor(Path::new("/"))?, relative, 0)?;
+            let ufw = matches!(
+                request,
+                SystemRead::UfwConfig | SystemRead::UfwRules | SystemRead::UfwRules6
+            );
+            let mut parent =
+                read_parent_permissions(read_anchor(Path::new("/"))?, relative, 0, ufw)?;
             let chain = if let SystemRead::Library(name) = &request {
                 match library_chain(&mut parent, &worker_deadline, std::convert::identity) {
                     Err(NativeError::Unavailable) => {
@@ -1480,7 +1822,7 @@ impl LinuxNativeIo {
             } else {
                 Vec::new()
             };
-            let fd = parent.open_file()?;
+            let fd = parent.open_with_permissions(ufw)?;
             let before = native(rfs::fstat(&fd))?;
             if chain.last().is_some_and(|entry| {
                 (entry.stat.st_dev, entry.stat.st_ino) != (before.st_dev, before.st_ino)
@@ -1490,14 +1832,10 @@ impl LinuxNativeIo {
             let mut file = File::from(fd);
             let bytes = system_contents(&mut file, &before, &request, &worker_deadline)?;
             let relative = path.strip_prefix("/").map_err(|_| NativeError::Foreign)?;
-            let current = read_parent(read_anchor(Path::new("/"))?, relative, 0)?;
+            let current = read_parent_permissions(read_anchor(Path::new("/"))?, relative, 0, ufw)?;
             parent.same_as(&current)?;
             library_revalidate(&current, &chain, &worker_deadline, std::convert::identity)?;
-            let after = native(rfs::statat(
-                current.directories.last().ok_or(NativeError::Invalid)?,
-                &parent.name,
-                AtFlags::SYMLINK_NOFOLLOW,
-            ))?;
+            let after = final_read_stat(&current, &parent.name, ufw)?;
             read_stat(&after, 0, 0o100000)?;
             if (
                 before.st_dev,
@@ -1599,6 +1937,7 @@ impl LinuxNativeIo {
     /// Production construction has no fake runner, probe or scratch-proof override.
     pub fn selected(paths: TargetPaths) -> Result<Self> {
         let io = Self {
+            pkexec_runner: None,
             target: LinuxTarget::make(paths, false)?,
             runner: Arc::new(SystemRunner),
             probe: Arc::new(ProcProbe),
@@ -1638,6 +1977,7 @@ impl LinuxNativeIo {
             runtime_override: None,
         };
         Ok(Self {
+            pkexec_runner: None,
             target: LinuxTarget::make(paths, true)?,
             runner,
             probe,
@@ -1653,6 +1993,137 @@ impl LinuxNativeIo {
             #[cfg(test)]
             read_interleave: None,
         })
+    }
+    /// Fake launch is allowed only for this newly-created scratch target.
+    pub fn set_scratch_pkexec_runner(&mut self, runner: Arc<dyn PkexecRunner>) -> Result<()> {
+        if !self.target.scratch {
+            return Err(NativeError::Foreign);
+        }
+        self.pkexec_runner = Some(runner);
+        Ok(())
+    }
+    /// Single dispatch; admission, launch and reap all retain the process-wide lease.
+    /// A stalled spawn cannot make the caller wait or free admission for a second mutation.
+    pub fn pkexec_ufw(
+        &self,
+        proof: &SupportProof,
+        mutation: UfwMutation,
+        deadline: &Deadline,
+    ) -> Result<PkexecOutcome> {
+        proof.check(self)?;
+        deadline.check()?;
+        if deadline.end.saturating_duration_since(Instant::now())
+            > Duration::from_millis(MAX_NATIVE_TIMEOUT_MS)
+        {
+            return Err(NativeError::Invalid);
+        }
+        let runner = match &self.pkexec_runner {
+            Some(runner) => runner.clone(),
+            None if self.target.scratch => return Err(NativeError::Foreign),
+            None => Arc::new(NativePkexecRunner),
+        };
+        UFW_DISPATCHES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n == 0).then_some(1)
+            })
+            .map_err(|_| NativeError::Busy)?;
+        let slot = CleanupSlot(&UFW_DISPATCHES);
+        let (port, comment) = match mutation.rule {
+            UfwRule::Lan => ("47811:47812", "Crosspane (LAN)"),
+            UfwRule::Mdns => ("5353", "Crosspane (mDNS)"),
+        };
+        let mut argv: Vec<String> = ["--wait", "/usr/bin/pkexec", "/usr/bin/ufw"]
+            .map(str::to_owned)
+            .into();
+        if mutation.delete {
+            argv.push("delete".into());
+        }
+        argv.extend(
+            [
+                "allow",
+                "from",
+                mutation.cidr.as_str(),
+                "to",
+                "any",
+                "port",
+                port,
+                "proto",
+                "udp",
+                "comment",
+                comment,
+            ]
+            .map(str::to_owned),
+        );
+        let spec = PkexecCommand {
+            argv,
+            target: self.target.clone(),
+            proof: proof.clone(),
+        };
+        let worker_deadline = deadline.clone();
+        let (send, receive) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("installer-ufw".into())
+            .spawn(move || {
+                let lease = slot;
+                let mut child = None;
+                let mut result = (|| {
+                    worker_deadline.check()?;
+                    validate_target(&spec.target)?;
+                    spec.proof.check_target(&spec.target)?;
+                    child = Some(runner.spawn(&spec, &worker_deadline)?);
+                    loop {
+                        worker_deadline.check()?;
+                        if let Some(outcome) =
+                            child.as_mut().ok_or(NativeError::Unavailable)?.poll()?
+                        {
+                            return Ok(outcome);
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                })();
+                if result.as_ref().is_err_and(|e| *e == NativeError::Timeout) {
+                    result = Ok(PkexecOutcome::TimedOut);
+                }
+                if let Ok(PkexecOutcome::Exited {
+                    stdout,
+                    stderr,
+                    stdout_truncated,
+                    stderr_truncated,
+                    ..
+                }) = &mut result
+                {
+                    *stdout_truncated |= stdout.len() > MAX_COMMAND_BYTES;
+                    *stderr_truncated |= stderr.len() > MAX_COMMAND_BYTES;
+                    stdout.truncate(MAX_COMMAND_BYTES);
+                    stderr.truncate(MAX_COMMAND_BYTES);
+                }
+                let cleanup = result.is_err() || matches!(&result, Ok(PkexecOutcome::TimedOut));
+                if cleanup && let Some(child) = &mut child {
+                    child.terminate();
+                }
+                let _ = send.send(result);
+                if cleanup && let Some(child) = &mut child {
+                    while !child.reaped() {
+                        let _ = child.poll();
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                drop(lease); // Release only after reap, before the child's destructor can publish completion.
+            })
+            .map_err(|_| NativeError::Unavailable)?;
+        loop {
+            match deadline.check() {
+                Err(NativeError::Timeout) => return Ok(PkexecOutcome::TimedOut),
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
+            match receive.recv_timeout(Duration::from_millis(2)) {
+                Ok(result) if deadline.check().is_ok() => return result,
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(NativeError::Unavailable),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
     pub fn target(&self) -> &LinuxTarget {
         &self.target
@@ -2262,6 +2733,279 @@ pub fn parse_ps_start(bytes: &[u8]) -> Result<u64> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    /// The scratch anchor substitutes for /; only root-ownership evidence is injected.
+    #[test]
+    fn ufw_reads_are_fixed_bounded_protected_and_permission_denial_is_distinct() {
+        for (request, literal) in [
+            (SystemRead::UfwConfig, "/etc/ufw/ufw.conf"),
+            (SystemRead::UfwRules, "/etc/ufw/user.rules"),
+            (SystemRead::UfwRules6, "/etc/ufw/user6.rules"),
+        ] {
+            let (io, root) = fixture();
+            let relative = Path::new(literal).strip_prefix("/").unwrap();
+            let directory = root.join("etc/ufw");
+            fs::create_dir_all(&directory).unwrap();
+            let path = root.join(relative);
+            fs::write(&path, b"inert rules fixture").unwrap();
+            assert_eq!(
+                request.path_and_limit().unwrap(),
+                (literal.into(), MAX_UFW_BYTES)
+            );
+            let open = || {
+                read_parent_permissions(
+                    read_anchor(&root).unwrap(),
+                    relative,
+                    io.target.paths.uid,
+                    true,
+                )
+            };
+            let parent = open().unwrap();
+            let mut file = File::from(parent.open_with_permissions(true).unwrap());
+            let mut stat = rfs::fstat(&file).unwrap();
+            stat.st_uid = 0;
+            assert_eq!(
+                system_contents(&mut file, &stat, &request, &read_deadline()).unwrap(),
+                b"inert rules fixture"
+            );
+            assert!(matches!(
+                read_parent_permissions(
+                    read_anchor(&root).unwrap(),
+                    relative,
+                    io.target.paths.uid + 1,
+                    true
+                ),
+                Err(NativeError::Foreign)
+            ));
+            for mode in [0o100666, 0o100664, 0o040755, 0o120777] {
+                let mut foreign = stat;
+                foreign.st_mode = mode;
+                assert_eq!(
+                    system_contents(&mut file, &foreign, &request, &read_deadline()),
+                    Err(NativeError::Foreign)
+                );
+            }
+            stat.st_uid = 1;
+            assert_eq!(
+                system_contents(&mut file, &stat, &request, &read_deadline()),
+                Err(NativeError::Foreign)
+            );
+            stat.st_uid = 0;
+            for link in [root.join("etc"), directory.clone(), path.clone()] {
+                let saved = root.join("saved");
+                fs::rename(&link, &saved).unwrap();
+                symlink(&saved, &link).unwrap();
+                assert!(
+                    open().and_then(|p| p.open_with_permissions(true)).is_err(),
+                    "link {link:?}"
+                );
+                fs::remove_file(&link).unwrap();
+                fs::rename(saved, link).unwrap();
+            }
+            for ancestor in [root.clone(), root.join("etc"), directory.clone()] {
+                fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+                assert!(matches!(open(), Err(NativeError::Foreign)));
+                fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            for denied in [directory.clone(), path.clone()] {
+                fs::set_permissions(&denied, fs::Permissions::from_mode(0o0)).unwrap();
+                assert!(matches!(
+                    open().and_then(|p| p.open_with_permissions(true)),
+                    Err(NativeError::PermissionDenied)
+                ));
+                fs::set_permissions(
+                    &denied,
+                    fs::Permissions::from_mode(if denied == path { 0o600 } else { 0o700 }),
+                )
+                .unwrap();
+            }
+            for size in [MAX_UFW_BYTES, MAX_UFW_BYTES + 1] {
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(size as u64)
+                    .unwrap();
+                let mut file = File::from(open().unwrap().open_with_permissions(true).unwrap());
+                let mut stat = rfs::fstat(&file).unwrap();
+                stat.st_uid = 0;
+                let result = system_contents(&mut file, &stat, &request, &read_deadline());
+                if size == MAX_UFW_BYTES {
+                    assert_eq!(result.unwrap().len(), size);
+                } else {
+                    assert_eq!(result, Err(NativeError::Oversize));
+                }
+            }
+            assert_eq!(
+                read_error(rustix::io::Errno::ACCESS, true),
+                NativeError::PermissionDenied
+            );
+            assert_eq!(
+                read_error(rustix::io::Errno::PERM, true),
+                NativeError::PermissionDenied
+            );
+            assert_eq!(
+                read_error(rustix::io::Errno::ACCESS, false),
+                NativeError::Foreign
+            );
+            assert!(
+                matches!(
+                    io.read_system(request, &read_deadline()),
+                    Err(NativeError::Foreign)
+                ),
+                "scratch may never probe /etc/ufw"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ufw_programs_require_exact_setuid_role_owner_mode_and_unlinked_ancestry() {
+        for program in ["setsid", "pkexec", "ufw"] {
+            let (io, root) = fixture();
+            fs::create_dir_all(root.join("usr/bin")).unwrap();
+            let path = root.join("usr/bin").join(program);
+            fs::write(&path, b"inert executable fixture, never run").unwrap();
+            let relative = Path::new("usr/bin").join(program);
+            let open = || {
+                read_parent(read_anchor(&root).unwrap(), &relative, io.target.paths.uid)
+                    .and_then(|p| p.open_file())
+            };
+            let fd = open().unwrap();
+            let mut stat = rfs::fstat(&fd).unwrap();
+            stat.st_uid = 0;
+            stat.st_mode = if program == "pkexec" {
+                0o104755
+            } else {
+                0o100755
+            };
+            assert_eq!(ufw_program_stat(&stat, program == "pkexec"), Ok(()));
+            for uid in [1, io.target.paths.uid] {
+                let mut bad = stat;
+                bad.st_uid = uid;
+                assert_eq!(
+                    ufw_program_stat(&bad, program == "pkexec"),
+                    Err(NativeError::Foreign)
+                );
+            }
+            for mode in [0o104777, 0o104775, 0o106755, 0o100644, 0o040755, 0o120777] {
+                let mut bad = stat;
+                bad.st_mode = mode;
+                assert_eq!(
+                    ufw_program_stat(&bad, program == "pkexec"),
+                    Err(NativeError::Foreign)
+                );
+            }
+            stat.st_mode = if program == "pkexec" {
+                0o100755
+            } else {
+                0o104755
+            };
+            assert_eq!(
+                ufw_program_stat(&stat, program == "pkexec"),
+                Err(NativeError::Foreign)
+            );
+            for link in [root.join("usr"), root.join("usr/bin"), path] {
+                let saved = root.join("saved");
+                fs::rename(&link, &saved).unwrap();
+                symlink(&saved, &link).unwrap();
+                assert!(matches!(open(), Err(NativeError::Foreign)));
+                fs::remove_file(&link).unwrap();
+                fs::rename(saved, link).unwrap();
+            }
+            fs::set_permissions(root.join("usr/bin"), fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(matches!(open(), Err(NativeError::Foreign)));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ufw_final_revalidation_preserves_denial_without_changing_other_reads() {
+        let (io, root) = fixture();
+        let path = root.join("etc/ufw");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("user.rules"), b"inert fixture").unwrap();
+        let parent = read_parent_permissions(
+            read_anchor(&root).unwrap(),
+            Path::new("etc/ufw/user.rules"),
+            io.target.paths.uid,
+            true,
+        )
+        .unwrap();
+        assert!(final_read_stat(&parent, "user.rules", true).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        // Readable but no search permission: reopening the protected parent succeeds, statat fails.
+        let current = read_parent_permissions(
+            read_anchor(&root).unwrap(),
+            Path::new("etc/ufw/user.rules"),
+            io.target.paths.uid,
+            true,
+        )
+        .unwrap();
+        parent.same_as(&current).unwrap();
+        let denied = final_read_stat(&current, "user.rules", true);
+        let other = final_read_stat(&current, "user.rules", false);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(denied.map(|_| ()), Err(NativeError::PermissionDenied));
+        assert_eq!(other.map(|_| ()), Err(NativeError::Unavailable));
+    }
+
+    #[test]
+    fn pkexec_pipe_caps_each_stream_and_bounds_work_even_for_endless_output() {
+        for size in [
+            0,
+            MAX_COMMAND_BYTES,
+            MAX_COMMAND_BYTES + 1,
+            MAX_COMMAND_BYTES * 3,
+        ] {
+            let mut pipe = PkexecPipe {
+                reader: Box::new(std::io::Cursor::new(vec![b'x'; size])),
+                bytes: Vec::new(),
+                truncated: false,
+            };
+            while !pipe.drain().unwrap() {}
+            assert_eq!(pipe.bytes.len(), size.min(MAX_COMMAND_BYTES));
+            assert_eq!(pipe.truncated, size > MAX_COMMAND_BYTES);
+        }
+        struct Endless;
+        impl Read for Endless {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'x');
+                Ok(buffer.len())
+            }
+        }
+        let mut pipe = PkexecPipe {
+            reader: Box::new(Endless),
+            bytes: Vec::new(),
+            truncated: false,
+        };
+        assert!(!pipe.drain().unwrap());
+        assert_eq!(pipe.bytes.len(), MAX_COMMAND_BYTES);
+        assert!(!pipe.truncated);
+        assert!(!pipe.drain().unwrap());
+        assert!(pipe.truncated);
+    }
+
+    #[test]
+    fn pkexec_rejects_an_injected_deadline_beyond_120_seconds_before_dispatch() {
+        let (io, root) = fixture();
+        let proof = io.scratch_support(observations(&io)).unwrap();
+        let mutation = UfwMutation {
+            delete: false,
+            cidr: LanCidr::parse("10.0.0.0/8").unwrap(),
+            rule: UfwRule::Lan,
+        };
+        let deadline = Deadline {
+            end: Instant::now() + Duration::from_secs(121),
+            cancellation: Cancellation::default(),
+        };
+        assert!(matches!(
+            io.pkexec_ufw(&proof, mutation, &deadline),
+            Err(NativeError::Invalid)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn injected_library_snapshot(mut stat: rfs::Stat) -> rfs::Stat {
         stat.st_uid = 0;
