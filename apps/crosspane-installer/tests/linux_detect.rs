@@ -3,6 +3,1129 @@
 
 // Runtime tests are owned by WP-4.8c and will be added in a separate runtime_tests block.
 mod session_tests {
+    mod support_report {
+        use super::*;
+        use crosspane_installer::platform::linux::native_io::*;
+        use rustix::{
+            fd::OwnedFd,
+            fs::{self, AtFlags, Mode, OFlags},
+        };
+        use std::{
+            collections::BTreeMap,
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicU64, Ordering},
+            },
+            thread,
+            time::Duration,
+        };
+        const START: &[u8] = b"Mon Sep 28 08:00:00 2026\n";
+        static IDS: AtomicU64 = AtomicU64::new(1);
+        struct Fake {
+            path: Mutex<PathBuf>,
+            error: Mutex<Option<NativeError>>,
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl CommandRunner for Fake {
+            fn run(
+                &self,
+                command: &CommandSpec,
+                deadline: &Deadline,
+            ) -> Result<CommandOutput, NativeError> {
+                deadline.check()?;
+                assert_eq!(command.executable(), std::path::Path::new("/bin/ps"));
+                self.calls.lock().unwrap().push(command.argv().to_vec());
+                if let Some(error) = *self.error.lock().unwrap() {
+                    return Err(error);
+                }
+                let stdout = if command.argv()[1] == "lstart=" {
+                    START.to_vec()
+                } else {
+                    b"crosspane-agent\n".to_vec()
+                };
+                Ok(CommandOutput {
+                    code: Some(0),
+                    stdout,
+                    stderr: vec![],
+                })
+            }
+        }
+        impl ProcessProbe for Fake {
+            fn snapshot(&self, pid: u32, deadline: &Deadline) -> Result<ProcessFacts, NativeError> {
+                deadline.check()?;
+                assert_eq!(pid, std::process::id());
+                Ok(ProcessFacts {
+                    uid: rustix::process::geteuid().as_raw(),
+                    executable: self.path.lock().unwrap().clone(),
+                    generation: 1,
+                })
+            }
+        }
+        struct Scratch {
+            io: Arc<LinuxNativeIo>,
+            fake: Arc<Fake>,
+            root: OwnedFd,
+            parent: OwnedFd,
+            name: String,
+            files: Vec<(OwnedFd, String)>,
+            dirs: Vec<(OwnedFd, String)>,
+        }
+        impl Scratch {
+            fn new() -> Self {
+                let name = format!(
+                    "crosspane-support-{}-{}",
+                    std::process::id(),
+                    IDS.fetch_add(1, Ordering::SeqCst)
+                );
+                let fake = Arc::new(Fake {
+                    path: Mutex::new(PathBuf::new()),
+                    error: Mutex::new(None),
+                    calls: Mutex::new(vec![]),
+                });
+                let io = Arc::new(
+                    LinuxNativeIo::scratch(
+                        &PathBuf::from("/tmp").join(&name),
+                        fake.clone(),
+                        fake.clone(),
+                    )
+                    .unwrap(),
+                );
+                *fake.path.lock().unwrap() = io.target().agent_path();
+                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                let parent = fs::open("/tmp", flags, Mode::empty()).unwrap();
+                let root = fs::openat(&parent, &name, flags, Mode::empty()).unwrap();
+                Self {
+                    io,
+                    fake,
+                    root,
+                    parent,
+                    name,
+                    files: vec![],
+                    dirs: vec![],
+                }
+            }
+            fn dir(&mut self, parent: &OwnedFd, name: &str) -> OwnedFd {
+                fs::mkdirat(parent, name, Mode::from_raw_mode(0o700)).unwrap();
+                self.dirs.push((parent.try_clone().unwrap(), name.into()));
+                fs::openat(
+                    parent,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .unwrap()
+            }
+            fn write(&mut self, parent: &OwnedFd, name: &str, bytes: &[u8], mode: u32) {
+                let fd = fs::openat(
+                    parent,
+                    name,
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(mode),
+                )
+                .unwrap();
+                std::fs::File::from(fd).write_all(bytes).unwrap();
+                self.files.push((parent.try_clone().unwrap(), name.into()));
+            }
+            fn ready(&mut self) -> OwnedFd {
+                let root = self.root.try_clone().unwrap();
+                let run = self.dir(&root, "run");
+                let runtime = self.dir(&run, "crosspane");
+                let local = self.dir(&root, ".local");
+                let bin = self.dir(&local, "bin");
+                self.write(&bin, "crosspane-agent", b"inert fixture", 0o700);
+                self.write(
+                    &runtime,
+                    "bootstrap.json",
+                    &serde_json::to_vec(&self.bootstrap()).unwrap(),
+                    0o600,
+                );
+                runtime
+            }
+            fn bootstrap(&self) -> BootstrapV1 {
+                let mut value = parse_bootstrap(BOOTSTRAP).unwrap();
+                value.pid = std::process::id();
+                value.started_unix_ms = parse_ps_start(START).unwrap();
+                value.runtime_dir = self.io.target().runtime_dir().to_string_lossy().into();
+                value
+            }
+            fn status(&self) -> Vec<u8> {
+                let mut value: serde_json::Value = serde_json::from_slice(STATUS).unwrap();
+                let instance = &mut value["result"]["installer"]["instance"];
+                instance["pid"] = std::process::id().into();
+                instance["uid"] = self.io.target().paths().uid.into();
+                instance["exe"] = self
+                    .io
+                    .target()
+                    .agent_path()
+                    .to_string_lossy()
+                    .into_owned()
+                    .into();
+                instance["runtime_dir"] = self.bootstrap().runtime_dir.into();
+                instance["started_unix_ms"] = self.bootstrap().started_unix_ms.into();
+                serde_json::to_vec(&value).unwrap()
+            }
+            fn probes(&self) -> NativeSessionProbes {
+                NativeSessionProbes::new(
+                    self.io.clone(),
+                    ChildEnvironment::selected(self.io.target(), BTreeMap::new()).unwrap(),
+                    Arc::new(|| 901),
+                )
+                .unwrap()
+            }
+        }
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                for (parent, name) in self.files.iter().rev() {
+                    fs::unlinkat(parent, name.as_str(), AtFlags::empty()).unwrap();
+                }
+                for (parent, name) in self.dirs.iter().rev() {
+                    fs::unlinkat(parent, name.as_str(), AtFlags::REMOVEDIR).unwrap();
+                }
+                let expected = fs::fstat(&self.root).unwrap();
+                let current =
+                    fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+                assert_eq!(
+                    (expected.st_dev, expected.st_ino),
+                    (current.st_dev, current.st_ino)
+                );
+                fs::unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR).unwrap();
+            }
+        }
+        fn deadline() -> Deadline {
+            Deadline::new(1000, Cancellation::default()).unwrap()
+        }
+        struct Server {
+            thread: Option<thread::JoinHandle<()>>,
+            stop: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(thread) = self.thread.take() {
+                    let result = thread.join();
+                    if !thread::panicking() {
+                        result.unwrap();
+                    }
+                }
+            }
+        }
+        fn start_server(
+            scratch: &mut Scratch,
+            response: Option<Vec<u8>>,
+        ) -> (Server, std::sync::mpsc::Receiver<()>) {
+            let runtime = scratch.ready();
+            let listener = UnixListener::bind(scratch.io.target().socket_path()).unwrap();
+            let stat = fs::statat(&runtime, "agent.sock", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            assert_eq!(stat.st_uid, scratch.io.target().paths().uid);
+            assert_eq!(stat.st_mode & 0o170000, 0o140000);
+            fs::chmodat(
+                &runtime,
+                "agent.sock",
+                Mode::from_raw_mode(0o600),
+                AtFlags::empty(),
+            )
+            .unwrap();
+            scratch.files.push((runtime, "agent.sock".into()));
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = stop.clone();
+            let (sent, requested) = std::sync::mpsc::sync_channel(1);
+            let thread = thread::spawn(move || {
+                let end = std::time::Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    if stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < end =>
+                        {
+                            thread::sleep(Duration::from_millis(2))
+                        }
+                        other => panic!("owned accept {other:?}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(20)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut bytes = vec![];
+                loop {
+                    if stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let mut one = [0];
+                    match stream.read(&mut one) {
+                        Ok(0) => panic!("request closed early"),
+                        Ok(_) if one[0] == b'\n' => break,
+                        Ok(_) => {
+                            bytes.push(one[0]);
+                            assert!(bytes.len() < 65536);
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) && std::time::Instant::now() < end =>
+                        {
+                            continue;
+                        }
+                        other => panic!("owned request {other:?}"),
+                    }
+                }
+                assert_eq!(bytes, b"{\"cmd\":\"status\"}");
+                sent.send(()).unwrap();
+                if let Some(response) = response {
+                    stream.write_all(&response).unwrap();
+                    stream.write_all(b"\n").unwrap();
+                } else {
+                    while !stopped.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    assert!(
+                        matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock)
+                    );
+                    return;
+                }
+                loop {
+                    let mut one = [0];
+                    match stream.read(&mut one) {
+                        Ok(0) => break,
+                        Ok(_) => panic!("unexpected second request"),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) && std::time::Instant::now() < end =>
+                        {
+                            continue;
+                        }
+                        other => panic!("owned close {other:?}"),
+                    }
+                }
+                assert!(
+                    matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock)
+                );
+            });
+            (
+                Server {
+                    thread: Some(thread),
+                    stop,
+                },
+                requested,
+            )
+        }
+        fn owned_exchange(
+            scratch: &mut Scratch,
+            response: Option<Vec<u8>>,
+            deadline: &Deadline,
+        ) -> Fact<InstalledAgentFacts> {
+            let (_server, _requested) = start_server(scratch, response);
+            scratch.probes().installed_agent(deadline)
+        }
+        fn assert_worker_released_with_server_alive(scratch: &Scratch, server: &Server) {
+            use crosspane_installer::platform::linux::transport::LinuxAgentPort;
+            assert!(!server.thread.as_ref().unwrap().is_finished());
+            let end = std::time::Instant::now() + Duration::from_millis(500);
+            let mut ports = vec![];
+            while ports.len() < 4 && std::time::Instant::now() < end {
+                match LinuxAgentPort::new(scratch.io.clone(), None, Arc::new(|| 902)) {
+                    Ok(port) => ports.push(port),
+                    Err(NativeError::Busy) => thread::sleep(Duration::from_millis(2)),
+                    other => panic!("fresh owned port {other:?}"),
+                }
+            }
+            assert_eq!(
+                ports.len(),
+                4,
+                "timed-out/cancelled worker still owns its slot"
+            );
+            assert!(!server.thread.as_ref().unwrap().is_finished());
+        }
+        fn pass(scratch: &Scratch) -> (EffectiveEnvironment, DetectionPass) {
+            let mut s = session();
+            s.uid = scratch.io.target().paths().uid;
+            s.selected_environment.runtime_dir = scratch.io.target().paths().runtime_home.clone();
+            s.selected_session
+                .value
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .session
+                .uid = Some(s.uid);
+            (
+                s.selected_environment.clone(),
+                DetectionPass {
+                    os: OsFacts {
+                        family: s.os,
+                        path: Some("/usr/lib/os-release".into()),
+                    },
+                    architecture: known(parse_architecture(std::env::consts::ARCH).unwrap()),
+                    logind: known(LogindFacts {
+                        selected_session: s.selected_session,
+                        graphical_sessions: s.graphical_sessions,
+                    }),
+                    manager: known(ManagerFacts {
+                        uwsm_managed: s.uwsm_managed,
+                        graphical_target_active: s.graphical_target_active,
+                        compositor_pid: Some(71),
+                    }),
+                    manager_environment: known(s.selected_environment),
+                    hyprland: known(HyprlandFacts {
+                        version: s.hyprland_version,
+                        pid: 71,
+                    }),
+                    registry: known(RegistryFacts {
+                        globals: vec![],
+                        protocols: s.protocols,
+                        pid: 71,
+                    }),
+                    installed_agent: Fact::issue(ProbeIssue::Missing, ObservationSource::Demo, 300),
+                    reduced_motion: Fact::issue(
+                        ProbeIssue::Unverified,
+                        ObservationSource::Demo,
+                        301,
+                    ),
+                },
+            )
+        }
+        fn expected_observations(io: &LinuxNativeIo) -> SupportObservations {
+            SupportObservations {
+                uid: io.target().paths().uid,
+                architecture: std::env::consts::ARCH.into(),
+                arch_based: true,
+                hyprland_version: [0, 56, 0],
+                protocols_ready: true,
+                runtime_libraries_ready: true,
+                uwsm_managed: true,
+                graphical_target_active: true,
+                graphical_sessions: 1,
+                session_id: "c7".into(),
+                session_type: "wayland".into(),
+                seat: "seat0".into(),
+                active: true,
+            }
+        }
+        #[test]
+        fn os_fallback_on_every_read_error_records_supplier_and_original_receipt() {
+            for error in [
+                NativeError::Invalid,
+                NativeError::Unavailable,
+                NativeError::Foreign,
+                NativeError::Timeout,
+                NativeError::Cancelled,
+                NativeError::Busy,
+                NativeError::Oversize,
+                NativeError::Unsupported,
+                NativeError::OutcomeUnknown,
+            ] {
+                let mut calls = vec![];
+                let time = AtomicU64::new(10);
+                let facts = os_from_reader(
+                    |request, _| {
+                        calls.push(request.clone());
+                        time.fetch_add(10, Ordering::SeqCst);
+                        if calls.len() == 1 {
+                            Err(error)
+                        } else {
+                            Ok(SystemBytes {
+                                path: "/usr/lib/os-release".into(),
+                                bytes: b"ID=arch\n".to_vec(),
+                                file_size: 8,
+                            })
+                        }
+                    },
+                    &deadline(),
+                    ObservationSource::Demo,
+                    &|| time.load(Ordering::SeqCst),
+                );
+                assert!(matches!(
+                    calls.as_slice(),
+                    [SystemRead::OsRelease, SystemRead::OsReleaseFallback]
+                ));
+                assert_eq!(
+                    facts.family,
+                    Fact::known(OsFamily::Arch, ObservationSource::Demo, 30)
+                );
+                assert_eq!(facts.path, Some("/usr/lib/os-release".into()));
+            }
+        }
+        #[test]
+        fn os_success_even_malformed_never_falls_back_and_both_fail_unverified() {
+            for (bytes, expected) in [
+                (b"ID=arch\n".as_slice(), Ok(OsFamily::Arch)),
+                (b"ID=\"arch".as_slice(), Err(ProbeIssue::Malformed)),
+            ] {
+                let mut count = 0;
+                let result = os_from_reader(
+                    |request, _| {
+                        count += 1;
+                        assert!(matches!(request, SystemRead::OsRelease));
+                        Ok(SystemBytes {
+                            path: "/etc/os-release".into(),
+                            bytes: bytes.into(),
+                            file_size: bytes.len() as u64,
+                        })
+                    },
+                    &deadline(),
+                    ObservationSource::Demo,
+                    &|| 5,
+                );
+                assert_eq!(count, 1);
+                assert_eq!(result.family.value, expected);
+                assert_eq!(result.path, Some("/etc/os-release".into()));
+            }
+            let result = os_from_reader(
+                |_, _| Err(NativeError::Foreign),
+                &deadline(),
+                ObservationSource::Demo,
+                &|| 6,
+            );
+            assert_eq!(result.family.value, Err(ProbeIssue::Unverified));
+            assert_eq!(result.path, None);
+        }
+        #[test]
+        fn every_required_backend_nonready_carries_literal_state_reason_and_optionals_never_block()
+        {
+            let facts = agent_facts(STATUS, ObservationSource::Demo, 10).unwrap();
+            let StatusAdmission::Supported(health) = facts.status else {
+                panic!()
+            };
+            let mut base = health.installer().clone();
+            base.startup_recovery = StartupRecovery::NothingParked;
+            for index in 0..15 {
+                for state in [
+                    BackendState::Ready,
+                    BackendState::Blocked,
+                    BackendState::Missing,
+                    BackendState::Failed,
+                ] {
+                    let mut status = base.clone();
+                    let fact = &mut status.backends[index];
+                    fact.state = state;
+                    fact.reason = Some(BackendReason::WorkerExited);
+                    let expected =
+                        if [9, 11, 12, 13, 14].contains(&index) || state == BackendState::Ready {
+                            BackendReadiness::Ready
+                        } else if state == BackendState::Blocked {
+                            BackendReadiness::Pending(vec![fact.clone()])
+                        } else {
+                            BackendReadiness::NotReady(vec![fact.clone()])
+                        };
+                    assert_eq!(backend_readiness(&status), expected, "{index} {state:?}");
+                }
+            }
+        }
+        #[test]
+        fn backend_invalid_order_missing_duplicates_and_failed_recovery_zero_pending() {
+            let facts = agent_facts(STATUS, ObservationSource::Demo, 10).unwrap();
+            let StatusAdmission::Supported(health) = facts.status else {
+                panic!()
+            };
+            let base = health.installer().clone();
+            for index in 0..15 {
+                let mut status = base.clone();
+                status.backends.remove(index);
+                assert_eq!(backend_readiness(&status), BackendReadiness::Invalid);
+                let mut status = base.clone();
+                status
+                    .backends
+                    .insert(index, status.backends[index].clone());
+                assert_eq!(backend_readiness(&status), BackendReadiness::Invalid);
+                if index < 14 {
+                    let mut status = base.clone();
+                    status.backends.swap(index, index + 1);
+                    assert_eq!(backend_readiness(&status), BackendReadiness::Invalid);
+                }
+            }
+            assert_eq!(
+                backend_readiness(&base),
+                BackendReadiness::Recovery {
+                    pending: 0,
+                    startup: StartupRecovery::Failed
+                }
+            );
+            let mut status = base;
+            status.startup_recovery = StartupRecovery::Restored;
+            status.recovery_pending = 5;
+            assert_eq!(
+                backend_readiness(&status),
+                BackendReadiness::Recovery {
+                    pending: 5,
+                    startup: StartupRecovery::Restored
+                }
+            );
+        }
+        #[test]
+        fn report_admits_exact_fresh_proof_preserving_receipts_not_readiness() {
+            let scratch = Scratch::new();
+            let (env, acquired) = pass(&scratch);
+            let result = assemble_support(&scratch.io, env, acquired, runtime(), &deadline());
+            assert_eq!(result.report.eligibility, Eligibility::Supported);
+            assert_eq!(result.os_path, Some("/usr/lib/os-release".into()));
+            assert_eq!(result.report.session.os.observed_at_ms, 17);
+            assert_eq!(
+                result.report.runtime.pipewire.value,
+                Err(ProbeIssue::Unverified)
+            );
+            assert_eq!(
+                result.report.installed_agent.value,
+                Err(ProbeIssue::Missing)
+            );
+            assert_eq!(
+                result.report.reduced_motion.value,
+                Err(ProbeIssue::Unverified)
+            );
+            let first = result.proof.unwrap();
+            first
+                .revalidate(&scratch.io, &expected_observations(&scratch.io))
+                .unwrap();
+            let (env, pass) = pass(&scratch);
+            let second = assemble_support(&scratch.io, env, pass, runtime(), &deadline())
+                .proof
+                .unwrap();
+            let mut changed = expected_observations(&scratch.io);
+            changed.active = false;
+            assert!(first.revalidate(&scratch.io, &changed).is_err());
+            second.check(&scratch.io).unwrap();
+        }
+        #[test]
+        fn every_structural_negative_and_pending_issues_no_proof() {
+            let scratch = Scratch::new();
+            for field in 0..15 {
+                let (env, mut p) = pass(&scratch);
+                let mut r = runtime();
+                let expected = match field {
+                    0 => {
+                        p.os.family.value = Ok(OsFamily::Other("debian".into()));
+                        Eligibility::NotSupported(UnsupportedReason::OperatingSystem)
+                    }
+                    1 => {
+                        p.architecture.value = Ok(Architecture::Other("riscv64".into()));
+                        Eligibility::NotSupported(UnsupportedReason::Architecture)
+                    }
+                    2 => {
+                        p.hyprland.value.as_mut().unwrap().version.value = Ok([0, 55, 0]);
+                        Eligibility::NotSupported(UnsupportedReason::HyprlandVersion)
+                    }
+                    3 => {
+                        p.registry.value.as_mut().unwrap().protocols.value = Ok(false);
+                        Eligibility::NotSupported(UnsupportedReason::RequiredProtocols)
+                    }
+                    4 => {
+                        p.manager.value.as_mut().unwrap().uwsm_managed.value = Ok(false);
+                        Eligibility::NotSupported(UnsupportedReason::Uwsm)
+                    }
+                    5 => {
+                        p.logind
+                            .value
+                            .as_mut()
+                            .unwrap()
+                            .selected_session
+                            .value
+                            .as_mut()
+                            .unwrap()
+                            .as_mut()
+                            .unwrap()
+                            .session
+                            .kind = Some("x11".into());
+                        Eligibility::NotSupported(UnsupportedReason::SessionType)
+                    }
+                    6 => {
+                        r.video_feature.value = Ok(false);
+                        Eligibility::NotSupported(UnsupportedReason::VideoFeature)
+                    }
+                    7 => {
+                        r.opus.value = Ok(false);
+                        Eligibility::NotSupported(UnsupportedReason::RuntimeLibrary)
+                    }
+                    8 => {
+                        p.logind.value = Err(ProbeIssue::Timeout);
+                        Eligibility::Pending(ProbeIssue::Timeout)
+                    }
+                    9 => {
+                        p.manager_environment.value = Err(ProbeIssue::Malformed);
+                        Eligibility::Pending(ProbeIssue::Malformed)
+                    }
+                    10 => {
+                        p.registry.value.as_mut().unwrap().pid = 72;
+                        Eligibility::Pending(ProbeIssue::Foreign)
+                    }
+                    11 => {
+                        p.hyprland.value.as_mut().unwrap().pid = 72;
+                        Eligibility::Pending(ProbeIssue::Foreign)
+                    }
+                    12 => {
+                        p.manager.value.as_mut().unwrap().compositor_pid = None;
+                        Eligibility::Pending(ProbeIssue::Unverified)
+                    }
+                    13 => {
+                        p.manager.value = Err(ProbeIssue::Unavailable);
+                        Eligibility::Pending(ProbeIssue::Unavailable)
+                    }
+                    _ => {
+                        r.libraries[0].resolved.value = Err(ProbeIssue::Unavailable);
+                        Eligibility::Pending(ProbeIssue::Unavailable)
+                    }
+                };
+                let result = assemble_support(&scratch.io, env, p, r, &deadline());
+                assert_eq!(result.report.eligibility, expected, "{field}");
+                assert!(result.proof.is_none());
+                assert!(scratch.fake.calls.lock().unwrap().is_empty());
+            }
+        }
+        #[test]
+        fn support_deadline_cancel_foreign_target_and_absent_selected_environment_never_admit() {
+            let scratch = Scratch::new();
+            let cancel = Cancellation::default();
+            cancel.cancel();
+            let (env, p) = pass(&scratch);
+            let result = assemble_support(
+                &scratch.io,
+                env,
+                p,
+                runtime(),
+                &Deadline::new(1000, cancel).unwrap(),
+            );
+            assert_eq!(
+                result.report.eligibility,
+                Eligibility::Pending(ProbeIssue::Cancelled)
+            );
+            assert!(result.proof.is_none());
+            for field in 0..3 {
+                let (mut env, mut p) = pass(&scratch);
+                if field == 0 {
+                    env.runtime_dir = "/run/user/other".into()
+                } else if field == 1 {
+                    env.wayland_display.clear()
+                } else {
+                    env.hyprland_instance_signature.clear()
+                };
+                p.manager_environment = known(env.clone());
+                let result = assemble_support(&scratch.io, env, p, runtime(), &deadline());
+                assert!(result.proof.is_none());
+            }
+        }
+        #[test]
+        fn native_missing_is_only_fresh_metadata_absence_and_existing_failures_keep_cause() {
+            let mut scratch = Scratch::new();
+            assert_eq!(
+                scratch.probes().installed_agent(&deadline()).value,
+                Err(ProbeIssue::Foreign)
+            );
+            let root = scratch.root.try_clone().unwrap();
+            let run = scratch.dir(&root, "run");
+            assert_eq!(
+                scratch.probes().installed_agent(&deadline()).value,
+                Err(ProbeIssue::Missing)
+            );
+            let runtime = scratch.dir(&run, "crosspane");
+            assert_eq!(
+                scratch.probes().installed_agent(&deadline()).value,
+                Err(ProbeIssue::Missing)
+            );
+            scratch.write(&runtime, "bootstrap.json", b"invalid", 0o600);
+            assert_eq!(
+                scratch.probes().installed_agent(&deadline()).value,
+                Err(ProbeIssue::Malformed)
+            );
+            assert!(scratch.fake.calls.lock().unwrap().is_empty());
+            let cancellation = Cancellation::default();
+            cancellation.cancel();
+            assert_eq!(
+                scratch
+                    .probes()
+                    .installed_agent(&Deadline::new(500, cancellation).unwrap())
+                    .value,
+                Err(ProbeIssue::Cancelled)
+            );
+        }
+        #[test]
+        fn native_bootstrap_foreign_and_timeout_preserve_original_bounded_cause() {
+            let mut scratch = Scratch::new();
+            let _runtime = scratch.ready();
+            for (error, expected) in [
+                (NativeError::Foreign, ProbeIssue::Foreign),
+                (NativeError::Timeout, ProbeIssue::Timeout),
+            ] {
+                *scratch.fake.error.lock().unwrap() = Some(error);
+                assert_eq!(
+                    scratch.probes().installed_agent(&deadline()).value,
+                    Err(expected)
+                );
+            }
+        }
+        #[test]
+        fn direct_native_instance_helper_rejects_each_field_and_retains_pending_contract() {
+            let scratch = Scratch::new();
+            let bootstrap = scratch.bootstrap();
+            let process = ProcessIdentity {
+                pid: std::process::id(),
+                uid: scratch.io.target().paths().uid,
+                executable: scratch.io.target().agent_path(),
+                started_unix_ms: bootstrap.started_unix_ms,
+                generation: 1,
+            };
+            for field in ["id", "pid", "uid", "exe", "runtime_dir", "started_unix_ms"] {
+                let mut json: serde_json::Value =
+                    serde_json::from_slice(&scratch.status()).unwrap();
+                let v = &mut json["result"]["installer"]["instance"][field];
+                *v = if v.is_string() {
+                    "/wrong".into()
+                } else if field == "id" {
+                    1u64.into()
+                } else {
+                    (v.as_u64().unwrap() + 1).into()
+                };
+                let reply = AgentReply {
+                    id: 1,
+                    source: ObservationSource::Demo,
+                    observed_at_ms: 888,
+                    result: Ok(DecodedReply::Status(
+                        parse_status(&serde_json::to_vec(&json).unwrap(), AgentPlatform::Linux)
+                            .unwrap(),
+                    )),
+                };
+                assert_eq!(
+                    associate_installed(&scratch.io, bootstrap.clone(), &process, reply).value,
+                    Err(ProbeIssue::Foreign),
+                    "{field}"
+                );
+            }
+            let reply = AgentReply {
+                id: 1,
+                source: ObservationSource::Demo,
+                observed_at_ms: 889,
+                result: Ok(DecodedReply::Status(
+                    StatusAdmission::PendingHealthContract(PendingHealthReason::Incomplete),
+                )),
+            };
+            let facts = associate_installed(&scratch.io, bootstrap, &process, reply);
+            assert_eq!(facts.observed_at_ms, 889);
+            assert!(matches!(
+                facts.value.unwrap().status,
+                StatusAdmission::PendingHealthContract(_)
+            ));
+        }
+        #[test]
+        fn single_status_malformed_refusal_and_incomplete_contract_do_not_gain_readiness() {
+            for (bytes, issue) in [
+                (b"invalid".as_slice(), Some(ProbeIssue::Malformed)),
+                (
+                    br#"{"ok":false,"error":"not_supported"}"#.as_slice(),
+                    Some(ProbeIssue::Unverified),
+                ),
+                (br#"{"ok":true,"result":{}}"#.as_slice(), None),
+            ] {
+                let mut scratch = Scratch::new();
+                let result = owned_exchange(&mut scratch, Some(bytes.into()), &deadline());
+                if let Some(issue) = issue {
+                    assert_eq!(result.value, Err(issue));
+                } else {
+                    assert!(matches!(
+                        result.value.unwrap().status,
+                        StatusAdmission::PendingHealthContract(_)
+                    ));
+                }
+            }
+        }
+        #[test]
+        fn single_status_outer_deadline_shuts_down_owned_transport_without_retry() {
+            let mut scratch = Scratch::new();
+            let deadline = Deadline::new(150, Cancellation::default()).unwrap();
+            let (server, requested) = start_server(&mut scratch, None);
+            let begin = std::time::Instant::now();
+            let result = scratch.probes().installed_agent(&deadline);
+            requested.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(result.value, Err(ProbeIssue::Timeout));
+            assert_worker_released_with_server_alive(&scratch, &server);
+            assert!(begin.elapsed() < Duration::from_secs(2));
+        }
+        #[test]
+        fn cancellation_after_single_status_request_releases_worker_while_server_stays_alive() {
+            let mut scratch = Scratch::new();
+            let cancellation = Cancellation::default();
+            let shared = Deadline::new(1000, cancellation.clone()).unwrap();
+            let (server, requested) = start_server(&mut scratch, None);
+            let probes = scratch.probes();
+            let caller = thread::spawn(move || probes.installed_agent(&shared));
+            requested.recv_timeout(Duration::from_secs(1)).unwrap();
+            cancellation.cancel();
+            assert_eq!(caller.join().unwrap().value, Err(ProbeIssue::Cancelled));
+            assert_worker_released_with_server_alive(&scratch, &server);
+        }
+        #[test]
+        fn actual_facade_status_identity_mismatches_are_unavailable_without_backends() {
+            for field in ["id", "pid", "uid", "exe", "runtime_dir", "started_unix_ms"] {
+                let mut scratch = Scratch::new();
+                let mut json: serde_json::Value =
+                    serde_json::from_slice(&scratch.status()).unwrap();
+                let value = &mut json["result"]["installer"]["instance"][field];
+                *value = if value.is_string() {
+                    "/wrong".into()
+                } else if field == "id" {
+                    1u64.into()
+                } else {
+                    (value.as_u64().unwrap() + 1).into()
+                };
+                let installed = owned_exchange(
+                    &mut scratch,
+                    Some(serde_json::to_vec(&json).unwrap()),
+                    &deadline(),
+                );
+                assert_eq!(installed.value, Err(ProbeIssue::Unavailable), "{field}");
+                let (env, mut p) = pass(&scratch);
+                p.installed_agent = installed.clone();
+                let report = assemble_support(&scratch.io, env, p, runtime(), &deadline());
+                assert_eq!(report.report.installed_agent, installed);
+                assert_eq!(report.backends.value, Err(ProbeIssue::Unavailable));
+            }
+        }
+        #[test]
+        fn known_unsupported_survives_expiry_and_cancellation_without_admission() {
+            let scratch = Scratch::new();
+            for cancel in [false, true] {
+                let cancellation = Cancellation::default();
+                let shared = Deadline::new(1, cancellation.clone()).unwrap();
+                if cancel {
+                    cancellation.cancel();
+                } else {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let (env, mut p) = pass(&scratch);
+                p.os.family.value = Ok(OsFamily::Other("debian".into()));
+                let result = assemble_support(&scratch.io, env, p, runtime(), &shared);
+                assert_eq!(
+                    result.report.eligibility,
+                    Eligibility::NotSupported(UnsupportedReason::OperatingSystem)
+                );
+                assert!(result.proof.is_none());
+                assert!(scratch.fake.calls.lock().unwrap().is_empty());
+            }
+        }
+        #[test]
+        fn every_transport_failure_maps_bounded_issue_without_retiming_reply() {
+            let scratch = Scratch::new();
+            let bootstrap = scratch.bootstrap();
+            let process = ProcessIdentity {
+                pid: bootstrap.pid,
+                uid: scratch.io.target().paths().uid,
+                executable: scratch.io.target().agent_path(),
+                started_unix_ms: bootstrap.started_unix_ms,
+                generation: 1,
+            };
+            for (failure, expected) in [
+                (CallFailure::Unavailable, ProbeIssue::Unavailable),
+                (CallFailure::QueueFull, ProbeIssue::Unavailable),
+                (
+                    CallFailure::InvalidCall(ContractError::InvalidDeadline),
+                    ProbeIssue::Malformed,
+                ),
+                (CallFailure::InvalidResponse, ProbeIssue::Malformed),
+                (CallFailure::TimeoutOutcomeUnknown, ProbeIssue::Timeout),
+                (
+                    CallFailure::Refused(AgentRefusal::NotSupported),
+                    ProbeIssue::Unverified,
+                ),
+            ] {
+                let facts = associate_installed(
+                    &scratch.io,
+                    bootstrap.clone(),
+                    &process,
+                    AgentReply {
+                        id: 1,
+                        source: ObservationSource::Demo,
+                        observed_at_ms: 101,
+                        result: Err(failure),
+                    },
+                );
+                assert_eq!(facts, Fact::issue(expected, ObservationSource::Demo, 101));
+            }
+        }
+        #[test]
+        fn native_cancelled_pass_preserves_pending_fact_with_unverified_motion_and_no_commands() {
+            let scratch = Scratch::new();
+            let cancellation = Cancellation::default();
+            cancellation.cancel();
+            let result = scratch
+                .probes()
+                .detect(runtime(), &Deadline::new(1000, cancellation).unwrap());
+            assert_eq!(
+                result.report.eligibility,
+                Eligibility::Pending(ProbeIssue::Foreign)
+            );
+            // Scratch system-bus admission is already Foreign; cancellation must not replace it.
+            assert_eq!(
+                result.report.installed_agent.value,
+                Err(ProbeIssue::Cancelled)
+            );
+            assert_eq!(
+                result.report.reduced_motion.value,
+                Err(ProbeIssue::Unverified)
+            );
+            assert_eq!(result.report.reduced_motion.observed_at_ms, 901);
+            assert!(result.proof.is_none());
+            assert!(scratch.fake.calls.lock().unwrap().is_empty());
+        }
+        #[test]
+        fn inner_receipts_and_installed_gate_remain_literal_through_report_delivery() {
+            let scratch = Scratch::new();
+            let (env, mut p) = pass(&scratch);
+            let original = agent_facts(STATUS, ObservationSource::Demo, 700).unwrap();
+            p.installed_agent = Fact::known(original.clone(), ObservationSource::Demo, 700);
+            p.logind
+                .value
+                .as_mut()
+                .unwrap()
+                .selected_session
+                .observed_at_ms = 101;
+            p.manager
+                .value
+                .as_mut()
+                .unwrap()
+                .uwsm_managed
+                .observed_at_ms = 202;
+            p.hyprland.value.as_mut().unwrap().version.observed_at_ms = 303;
+            p.registry.value.as_mut().unwrap().protocols.observed_at_ms = 404;
+            p.manager_environment.observed_at_ms = 505;
+            let result = assemble_support(&scratch.io, env, p, runtime(), &deadline());
+            assert_eq!(result.report.eligibility, Eligibility::Supported);
+            assert!(result.proof.is_some());
+            assert_eq!(result.report.session.selected_session.observed_at_ms, 101);
+            assert_eq!(result.report.session.uwsm_managed.observed_at_ms, 202);
+            assert_eq!(result.report.session.hyprland_version.observed_at_ms, 303);
+            assert_eq!(result.report.session.protocols.observed_at_ms, 404);
+            assert_eq!(
+                result.report.session.manager_environment.observed_at_ms,
+                505
+            );
+            assert_eq!(result.report.installed_agent.value, Ok(original));
+            assert_eq!(
+                result.backends,
+                Fact::known(
+                    BackendReadiness::Recovery {
+                        pending: 0,
+                        startup: StartupRecovery::Failed
+                    },
+                    ObservationSource::Demo,
+                    700
+                )
+            );
+        }
+        #[test]
+        fn admission_refusal_and_expired_pass_keep_observations_and_issue_no_proof() {
+            let scratch = Scratch::new();
+            let (env, mut p) = pass(&scratch);
+            p.logind
+                .value
+                .as_mut()
+                .unwrap()
+                .selected_session
+                .value
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .session
+                .id = "s".repeat(65);
+            let result = assemble_support(&scratch.io, env, p, runtime(), &deadline());
+            assert_eq!(
+                result.report.eligibility,
+                Eligibility::Pending(ProbeIssue::Unavailable)
+            );
+            assert!(result.proof.is_none());
+            assert_eq!(result.report.session.selected_session.observed_at_ms, 17);
+            let (env, p) = pass(&scratch);
+            let expired = Deadline::new(1, Cancellation::default()).unwrap();
+            thread::sleep(Duration::from_millis(5));
+            let result = assemble_support(&scratch.io, env, p, runtime(), &expired);
+            assert_eq!(
+                result.report.eligibility,
+                Eligibility::Pending(ProbeIssue::Timeout)
+            );
+            assert!(result.proof.is_none());
+            assert_eq!(result.report.session.os.observed_at_ms, 17);
+        }
+        #[test]
+        fn native_single_status_owned_socket_retains_exact_health_and_complete_receipt_time() {
+            let mut scratch = Scratch::new();
+            let runtime = scratch.ready();
+            let listener = UnixListener::bind(scratch.io.target().socket_path()).unwrap();
+            let stat = fs::statat(&runtime, "agent.sock", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            assert_eq!(stat.st_uid, scratch.io.target().paths().uid);
+            assert_eq!(stat.st_mode & 0o170000, 0o140000);
+            fs::chmodat(
+                &runtime,
+                "agent.sock",
+                Mode::from_raw_mode(0o600),
+                AtFlags::empty(),
+            )
+            .unwrap();
+            scratch
+                .files
+                .push((runtime.try_clone().unwrap(), "agent.sock".into()));
+            listener.set_nonblocking(true).unwrap();
+            let response = scratch.status();
+            let server = thread::spawn(move || {
+                let end = std::time::Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < end =>
+                        {
+                            thread::sleep(Duration::from_millis(2))
+                        }
+                        other => panic!("owned accept {other:?}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = vec![];
+                loop {
+                    let mut one = [0];
+                    if stream.read(&mut one).unwrap() == 0 || one[0] == b'\n' {
+                        break;
+                    };
+                    bytes.push(one[0]);
+                }
+                assert_eq!(bytes, b"{\"cmd\":\"status\"}");
+                stream.write_all(&response).unwrap();
+                stream.write_all(b"\n").unwrap();
+                let mut one = [0];
+                assert_eq!(stream.read(&mut one).unwrap(), 0);
+            });
+            let result = scratch.probes().installed_agent(&deadline());
+            server.join().unwrap();
+            assert_eq!(result.observed_at_ms, 901);
+            assert_eq!(result.source, ObservationSource::Demo);
+            let facts = result.value.unwrap();
+            assert_eq!(facts.call_id, 1);
+            assert_eq!(facts.received_at_ms, 901);
+            let StatusAdmission::Supported(health) = facts.status else {
+                panic!()
+            };
+            assert_eq!(health.installer().startup_recovery, StartupRecovery::Failed);
+            assert_eq!(health.installer().recovery_pending, 0);
+            assert!(!health.installer().gate.open);
+        }
+    }
     mod native_desktop {
         use crosspane_installer::platform::linux::{
             detect::*,

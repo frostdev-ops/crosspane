@@ -1,14 +1,18 @@
 //! Read-only acquisition. Streams come only from the frozen native boundary. No reconnect by
-//! pathname, owner-environment fallback, mutation, readiness policy, or support-proof creation.
+//! pathname, owner-environment fallback, mutation or readiness policy; detect composes support.
 mod hyprland;
+mod installed;
 mod logind;
 mod manager;
+mod os;
 mod registry;
 use super::*;
 use crate::platform::linux::{native_io::*, transport::CallerClock};
 pub use hyprland::{HyprlandFacts, hyprland_from_stream, parse_hyprland_version};
+pub use installed::associate_installed;
 pub use logind::{LogindFacts, Properties, decode_session, decode_user, logind_from_stream};
 pub use manager::{ManagerFacts, UnitRows, decode_units, manager_from_stream};
+pub use os::{OsFacts, os_from_reader};
 pub use registry::{REQUIRED_PROTOCOLS, RegistryFacts, protocols_satisfy, registry_from_stream};
 use std::{
     net::Shutdown,
@@ -28,7 +32,7 @@ impl Drop for Slot {
         WORKERS.fetch_sub(1, Ordering::AcqRel);
     }
 }
-fn issue(error: NativeError) -> ProbeIssue {
+pub(super) fn issue(error: NativeError) -> ProbeIssue {
     match error {
         NativeError::Timeout => ProbeIssue::Timeout,
         NativeError::Cancelled => ProbeIssue::Cancelled,
@@ -104,6 +108,54 @@ impl std::fmt::Debug for NativeSessionProbes {
     }
 }
 impl NativeSessionProbes {
+    pub fn os(&self, deadline: &Deadline) -> OsFacts {
+        os_from_reader(
+            |request, deadline| self.io.read_system(request, deadline),
+            deadline,
+            self.io.target().source(),
+            &*self.clock,
+        )
+    }
+    pub fn installed_agent(&self, deadline: &Deadline) -> Fact<InstalledAgentFacts> {
+        installed::read(self.io.clone(), deadline, self.clock.clone())
+    }
+    /// One pass and shared deadline, with no cache, mutation, fallback target or preference probe.
+    pub fn detect(&self, runtime: RuntimeFacts, deadline: &Deadline) -> DetectionResult {
+        let source = self.io.target().source();
+        let values = self.environment.values();
+        let selected_environment = EffectiveEnvironment {
+            runtime_dir: self.io.target().paths().runtime_home.clone(),
+            wayland_display: values.get("WAYLAND_DISPLAY").cloned().unwrap_or_default(),
+            hyprland_instance_signature: values
+                .get("HYPRLAND_INSTANCE_SIGNATURE")
+                .cloned()
+                .unwrap_or_default(),
+            session_id: values.get("XDG_SESSION_ID").cloned(),
+        };
+        let pass = DetectionPass {
+            os: self.os(deadline),
+            architecture: Fact {
+                value: parse_architecture(std::env::consts::ARCH),
+                source,
+                observed_at_ms: (self.clock)(),
+            },
+            logind: self.logind(deadline),
+            manager: self.manager(deadline),
+            manager_environment: self.manager_environment(deadline),
+            hyprland: self.hyprland(deadline),
+            registry: self.registry(deadline),
+            installed_agent: self.installed_agent(deadline),
+            reduced_motion: Fact::issue(ProbeIssue::Unverified, source, (self.clock)()),
+        };
+        super::report::compose_support(
+            &self.io,
+            selected_environment,
+            pass,
+            runtime,
+            deadline,
+            true,
+        )
+    }
     pub fn new(
         io: Arc<LinuxNativeIo>,
         environment: ChildEnvironment,
