@@ -45,6 +45,12 @@ workdir=$2
 PATH=$3
 export PATH
 shift 3
+# launchd restarts submitted jobs even after a clean exit: run the command once, then idle until
+# the caller removes the job.
+if [ -e "$tmp/started" ]; then
+    exec /bin/sleep 3600
+fi
+: > "$tmp/started"
 if cd "$workdir"; then
     "$@"
     result=$?
@@ -53,7 +59,7 @@ else
 fi
 printf '%s\n' "$result" > "$tmp/status.tmp"
 /bin/mv "$tmp/status.tmp" "$tmp/status"
-# submit restarts failed jobs; the caller returns the recorded command status.
+# The caller returns the recorded command status and removes the job.
 exit 0
 WRAPPER
 
