@@ -1,11 +1,14 @@
-//! Windows platform skeleton for Phase 3 Lane W.
+//! Windows platform adapters for Phase 3 Lane W.
 //!
-//! Cross-checking establishes buildability only. Runtime claims require testing on a real
-//! Windows machine; this crate currently implements no native behaviour.
+//! [`model`] holds the pure logic behind the Win32 calls (WP-W0.2). It builds and is unit-tested
+//! on every host. Everything that touches Windows is `cfg(windows)`. Cross-checking establishes
+//! buildability only; runtime claims require testing on a real Windows machine.
 
-#![cfg(windows)]
 #![deny(unsafe_code)]
 
+pub mod model;
+#[cfg(windows)]
 pub mod stubs;
 
+#[cfg(windows)]
 pub use stubs::UnsupportedWindows;

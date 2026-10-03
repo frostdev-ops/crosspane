@@ -13,7 +13,12 @@ workspace = true
 [dependencies]
 crosspane-platform.workspace = true
 crosspane-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
