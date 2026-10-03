@@ -677,6 +677,21 @@ struct Entry {
     frame: RectLogical,
 }
 
+struct ParkAttempt {
+    write_attempted: bool,
+    forget_entry: bool,
+}
+
+impl ParkAttempt {
+    fn new(inserted: bool, current: RectLogical, journaled: RectLogical) -> Self {
+        Self {
+            write_attempted: false,
+            // A prior failed park may have moved this window: only proven-home entries are safe.
+            forget_entry: inserted || same_frame(current, journaled),
+        }
+    }
+}
+
 /// The window that fills one of `displays` (bounds, in the global logical space), if any: the
 /// tracked `window` itself, or else an on-screen window of the same process (a fullscreen stand-in
 /// such as WebKit's). A window of another process never counts, and neither does one that isn't on
@@ -1219,18 +1234,27 @@ impl TwinState {
         Ok(true)
     }
 
-    fn restore_frame(&self, window: WindowId) -> Result<bool, PlatformError> {
+    fn restore_frame(
+        &self,
+        window: WindowId,
+        already_home: &mut bool,
+    ) -> Result<bool, PlatformError> {
         let Some(entry) = self.entries.get(&window) else {
             return Ok(false);
         };
         // Whether the window is fullscreen on any display, not only on a twin we still own: after
         // a release or a restart there is no twin, and macOS has moved a fullscreen Space to a
         // physical display. The journal stays until a restore succeeds, so `recover` retries.
-        let (gate, raw) = match self.gate(window) {
+        let (raw, list) = match self.quartz(window) {
             Ok(found) => found,
             Err(PlatformError::NotFound) => return Ok(false),
             Err(error) => return Err(error),
         };
+        if same_frame(raw.frame, entry.frame) {
+            *already_home = true;
+            return Ok(true);
+        }
+        let gate = fullscreen_gate(&raw, &list, &(self.probe)()?);
         require_accessibility()?;
         write_journal(&self.journal, &self.entries)?;
         match gate {
@@ -1297,20 +1321,34 @@ impl TwinState {
     }
 
     fn restore(&mut self, window: WindowId) -> Result<bool, PlatformError> {
+        let mut already_home = false;
+        let restored = self.restore_with(
+            window,
+            |state, window| state.restore_frame(window, &mut already_home),
+            VirtualDisplay::release,
+        )?;
+        if already_home {
+            tracing::info!("parked window already at its original frame; journal entry removed");
+        }
+        Ok(restored)
+    }
+
+    fn restore_with(
+        &mut self,
+        window: WindowId,
+        restore_frame: impl FnOnce(&Self, WindowId) -> Result<bool, PlatformError>,
+        release: impl FnOnce(VirtualDisplay) -> Result<(), PlatformError>,
+    ) -> Result<bool, PlatformError> {
         self.last.remove(&window);
         if !self.entries.contains_key(&window) {
             if let Some(display) = self.displays.remove(&window) {
-                display.release()?;
+                release(display)?;
             }
             return Ok(false);
         }
-        let restored = self.restore_frame(window);
+        let restored = restore_frame(self, window);
         // Release even if AX restoration failed or permission was revoked; retain the journal.
-        let released = self
-            .displays
-            .remove(&window)
-            .map(VirtualDisplay::release)
-            .transpose();
+        let released = self.displays.remove(&window).map(release).transpose();
         if let Err(error) = released.as_ref() {
             tracing::warn!(%error, "twin release failed; cleanup queued on main thread, journal retained");
         }
@@ -1332,6 +1370,60 @@ impl TwinState {
                 }
             }
         }
+    }
+
+    /// Native park and injected tests share the fresh plan, write marker and failure routing.
+    fn park_sequence_with<A>(
+        &mut self,
+        window: WindowId,
+        mut attempt: ParkAttempt,
+        prepare: impl FnOnce(&mut Self) -> Result<(RectLogical, RectLogical), PlatformError>,
+        ax: (
+            impl FnOnce(&RawWindow) -> Result<A, PlatformError>,
+            impl FnOnce(A, RectLogical, &mut dyn FnMut() -> bool) -> Result<RectLogical, PlatformError>,
+        ),
+        finish: impl FnOnce(&mut Self) -> Result<Parked, PlatformError>,
+        cleanup: (
+            impl FnOnce(VirtualDisplay) -> Result<(), PlatformError>,
+            impl FnOnce(&mut Self, WindowId, PlatformError) -> PlatformError,
+        ),
+    ) -> Result<Parked, PlatformError> {
+        let result = (|| {
+            let (bounds, target) = prepare(self)?;
+            // No geometry can be retained yet: a fresh fullscreen/off-Space refusal is cleanup.
+            let raw = match self.plan(window, &[bounds])? {
+                Plan::Write(raw) => raw,
+                Plan::WholeDisplay | Plan::Retain => {
+                    return Err(PlatformError::Backend(
+                        "window is fullscreen or not showing; not parked".into(),
+                    ));
+                }
+            };
+            let window_ax = (ax.0)(&raw)?;
+            // The lookup can take two seconds: re-read after it and before each frame write.
+            let mut allowed = || matches!(self.plan(window, &[bounds]), Ok(Plan::Write(_)));
+            // AXSize can be written before restore_guarded's later guard refuses AXPosition.
+            attempt.write_attempted = true;
+            let frame = (ax.1)(window_ax, target, &mut allowed)?;
+            self.last.insert(window, frame);
+            finish(self)
+        })();
+        result.map_err(|error| {
+            if attempt.write_attempted {
+                return (cleanup.1)(self, window, error);
+            }
+            if let Some(display) = self.displays.remove(&window)
+                && let Err(cleanup) = (cleanup.0)(display)
+            {
+                tracing::warn!(%cleanup, "refused park twin cleanup failed; release queued on main thread");
+            }
+            if attempt.forget_entry
+                && let Err(cleanup) = self.remove_entry(window)
+            {
+                tracing::warn!(%cleanup, "refused park journal cleanup failed; entry retained");
+            }
+            error
+        })
     }
 
     fn park(&mut self, window: WindowId, mode: Mode) -> Result<Parked, PlatformError> {
@@ -1364,72 +1456,56 @@ impl TwinState {
         let ax = ax_required(&raw)?;
         let original = ax.frame()?;
         let inserted = !self.entries.contains_key(&window);
-        self.entries.entry(window).or_insert(Entry {
-            pid: raw.pid,
-            frame: original,
-        });
-        write_journal(&self.journal, &self.entries)?;
-        let setup = (|| {
-            let display = VirtualDisplay::create(mode)?;
-            if let Err(error) = wait_mode(display.id, mode) {
-                if let Err(cleanup) = display.release() {
-                    tracing::warn!(%cleanup, "twin setup cleanup queued on main thread");
+        let journaled = self
+            .entries
+            .entry(window)
+            .or_insert(Entry {
+                pid: raw.pid,
+                frame: original,
+            })
+            .frame;
+        self.park_sequence_with(
+            window,
+            ParkAttempt::new(inserted, original, journaled),
+            |state| {
+                write_journal(&state.journal, &state.entries)?;
+                let display = VirtualDisplay::create(mode)?;
+                if let Err(error) = wait_mode(display.id, mode) {
+                    if let Err(cleanup) = display.release() {
+                        tracing::warn!(%cleanup, "twin setup cleanup queued on main thread");
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-            Ok(display)
-        })();
-        let display = match setup {
-            Ok(display) => display,
-            Err(error) => {
-                if inserted {
-                    self.remove_entry(window)?;
+                let id = display.id;
+                state.displays.insert(window, display);
+                let mut placement = place_twin(id)?;
+                let measured = state.measure_inset(id, mode.logical());
+                // At capacity, keep today's valid zero-inset parking rather than aborting it.
+                let (grown, inset) = mode.fitting_top_inset(measured, (mode, 0.0));
+                let display = state
+                    .displays
+                    .get_mut(&window)
+                    .ok_or(PlatformError::NotFound)?;
+                if grown != mode {
+                    display.apply(grown)?;
+                    wait_mode(id, grown)?;
+                    placement = place_twin(id)?;
                 }
-                return Err(error);
-            }
-        };
-        let id = display.id;
-        self.displays.insert(window, display);
-        let result = (|| {
-            let mut placement = place_twin(id)?;
-            let measured = self.measure_inset(id, mode.logical());
-            // At capacity, keep today's valid zero-inset parking rather than aborting it.
-            let (grown, inset) = mode.fitting_top_inset(measured, (mode, 0.0));
-            let display = self
-                .displays
-                .get_mut(&window)
-                .ok_or(PlatformError::NotFound)?;
-            if grown != mode {
-                display.apply(grown)?;
-                wait_mode(id, grown)?;
-                placement = place_twin(id)?;
-            }
-            display.inset = inset;
-            // A fresh read right before the AX write (and a fresh AX deadline, so no expired
-            // message moves a window). Parking a window that is fullscreen or not showing isn't
-            // done: there is no geometry to retain yet, so the setup is rolled back.
-            let displays = [placement.frame];
-            let raw = match self.plan(window, &displays)? {
-                Plan::Write(raw) => raw,
-                Plan::WholeDisplay | Plan::Retain => {
+                display.inset = inset;
+                let target = target_rect(placement.frame, inset, mode.logical());
+                Ok((placement.frame, target))
+            },
+            (ax_required, |ax, target, allowed| {
+                if !ax.restore_guarded(target, allowed)? {
                     return Err(PlatformError::Backend(
-                        "window is fullscreen or not showing; not parked".into(),
+                        "window went fullscreen or left the screen; not parked".into(),
                     ));
                 }
-            };
-            let ax = ax_required(&raw)?;
-            // The lookup can take up to two seconds: ask again after it and before each write.
-            let mut allowed = || matches!(self.plan(window, &displays), Ok(Plan::Write(_)));
-            let target = target_rect(placement.frame, inset, mode.logical());
-            if !ax.restore_guarded(target, &mut allowed)? {
-                return Err(PlatformError::Backend(
-                    "window went fullscreen or left the screen; not parked".into(),
-                ));
-            }
-            self.last.insert(window, ax.frame()?);
-            self.geometry(window)
-        })();
-        result.map_err(|error| self.abort(window, error))
+                ax.frame()
+            }),
+            |state| state.geometry(window),
+            (VirtualDisplay::release, Self::abort),
+        )
     }
 
     fn resize(&mut self, window: WindowId, mode: Mode) -> Result<Parked, PlatformError> {
@@ -2363,6 +2439,296 @@ pub(crate) mod tests {
             query: WindowQuery::scripted(replies),
             probe: || Ok(vec![built_in(), twin_rect()]),
         }
+    }
+
+    #[allow(clippy::unwrap_used)]
+    fn journal_state(
+        replies: Vec<Result<Vec<RawWindow>, PlatformError>>,
+        original: RectLogical,
+    ) -> TwinState {
+        let mut state = scripted_state(replies);
+        state.entries.get_mut(&WindowId(10)).unwrap().frame = original;
+        state.journal = std::env::temp_dir().join(format!(
+            "crosspane-refused-park-{}-{}.journal",
+            std::process::id(),
+            crate::clock::now().as_nanos()
+        ));
+        write_journal(&state.journal, &state.entries).unwrap();
+        state
+    }
+
+    fn fake_twin(state: &mut TwinState) {
+        state.displays.insert(
+            WindowId(10),
+            VirtualDisplay {
+                serial: u32::MAX,
+                id: DisplayId(99),
+                inset: 0.0,
+            },
+        );
+    }
+
+    fn fake_release(display: VirtualDisplay) -> Result<(), PlatformError> {
+        // Numeric fixture only: never run native display release or its Drop cleanup.
+        std::mem::forget(display);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_pre_write_refusal_forgets_new_entry_and_preserves_original_error() {
+        for cleanup_fails in [false, true] {
+            let window = WindowId(10);
+            let original = built_in();
+            let mut state = journal_state(
+                vec![Ok(vec![RawWindow::fixture(10, 500, original, true)])],
+                original,
+            );
+            let released = std::cell::Cell::new(0);
+            let message = "window is fullscreen or not showing; not parked";
+            let error = state
+                .park_sequence_with(
+                    window,
+                    ParkAttempt::new(true, original, original),
+                    |state| {
+                        fake_twin(state);
+                        Ok((original, twin_rect()))
+                    },
+                    (
+                        |_| -> Result<(), PlatformError> {
+                            panic!("fullscreen plan must refuse before AX lookup")
+                        },
+                        |(), _, _| panic!("pre-write refusal must not write AX"),
+                    ),
+                    |_| panic!("refused park has no geometry"),
+                    (
+                        |display| {
+                            released.set(released.get() + 1);
+                            fake_release(display)?;
+                            if cleanup_fails {
+                                Err(PlatformError::Backend("fake release failed".into()))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                        |_, _, _| panic!("pre-write refusal must not attempt restoration"),
+                    ),
+                )
+                .unwrap_err();
+            assert!(matches!(error, PlatformError::Backend(text) if text == message));
+            assert_eq!(released.get(), 1);
+            assert!(state.displays.is_empty());
+            assert!(state.entries.is_empty());
+            assert!(read_journal(&state.journal).unwrap().is_empty());
+            fs::remove_file(&state.journal).unwrap();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn partial_ax_size_write_then_position_guard_refusal_rolls_back_and_retains_entry() {
+        let window = WindowId(10);
+        let original = built_in();
+        let target = rect(1800.0, -600.0, 500.0, 400.0);
+        // Fresh plan, AXSize guard, AXPosition guard: fullscreen begins after AXSize succeeds.
+        let mut state = journal_state(
+            vec![
+                Ok(vec![RawWindow::fixture(10, 500, original, true)]),
+                Ok(vec![RawWindow::fixture(10, 500, original, true)]),
+                Ok(vec![RawWindow::fixture(10, 500, twin_rect(), true)]),
+            ],
+            original,
+        );
+        let journal = fs::read(&state.journal).unwrap();
+        let actual = std::cell::Cell::new(original);
+        let size_writes = std::cell::Cell::new(0);
+        let position_writes = std::cell::Cell::new(0);
+        let rollback = std::cell::Cell::new(0);
+        let restore_writes = std::cell::Cell::new(0);
+        let message = "window went fullscreen or left the screen; not parked";
+        let error = state
+            .park_sequence_with(
+                window,
+                ParkAttempt::new(true, original, original),
+                |state| {
+                    fake_twin(state);
+                    Ok((twin_rect(), target))
+                },
+                (
+                    |raw| {
+                        assert_eq!(raw.frame, original);
+                        Ok(())
+                    },
+                    |(), target, allowed| {
+                        // Fake restore_guarded follows AxWindow's size/guard/position ordering.
+                        assert!(allowed());
+                        size_writes.set(size_writes.get() + 1);
+                        actual.set(RectLogical::new(original.origin, target.size));
+                        if !allowed() {
+                            return Err(PlatformError::Backend(message.into()));
+                        }
+                        position_writes.set(position_writes.get() + 1);
+                        actual.set(target);
+                        Ok(target)
+                    },
+                ),
+                |_| panic!("partial write never reaches parked geometry"),
+                (
+                    |display| {
+                        fake_release(display)?;
+                        panic!("after a write the existing rollback owns display release")
+                    },
+                    |state, window, error| {
+                        rollback.set(rollback.get() + 1);
+                        let restored = state.restore_with(
+                            window,
+                            |_, _| {
+                                restore_writes.set(restore_writes.get() + 1);
+                                Err(PlatformError::Backend("fake restore failed".into()))
+                            },
+                            fake_release,
+                        );
+                        assert!(
+                            matches!(restored, Err(PlatformError::Backend(text)) if text == "fake restore failed")
+                        );
+                        error
+                    },
+                ),
+            )
+            .unwrap_err();
+        assert!(matches!(error, PlatformError::Backend(text) if text == message));
+        assert_eq!(size_writes.get(), 1);
+        assert_eq!(position_writes.get(), 0);
+        assert_eq!(actual.get(), RectLogical::new(original.origin, target.size));
+        assert_eq!(rollback.get(), 1);
+        assert_eq!(restore_writes.get(), 1);
+        assert!(state.displays.is_empty());
+        assert_eq!(state.entries.get(&window).unwrap().frame, original);
+        assert_eq!(fs::read(&state.journal).unwrap(), journal);
+        fs::remove_file(&state.journal).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn refused_repark_preserves_unmatched_prior_journal_entry() {
+        let window = WindowId(10);
+        let original = rect(20.0, 30.0, 800.0, 600.0);
+        let current = built_in();
+        let mut state = journal_state(
+            vec![Ok(vec![RawWindow::fixture(10, 500, current, true)])],
+            original,
+        );
+        let journal = fs::read(&state.journal).unwrap();
+        let error = state
+            .park_sequence_with(
+                window,
+                ParkAttempt::new(false, current, original),
+                |state| {
+                    fake_twin(state);
+                    Ok((current, twin_rect()))
+                },
+                (
+                    |_| -> Result<(), PlatformError> {
+                        panic!("pre-write refusal must not lookup AX")
+                    },
+                    |(), _, _| panic!("pre-write refusal must not write AX"),
+                ),
+                |_| panic!("refused re-park has no geometry"),
+                (fake_release, |_, _, _| {
+                    panic!("pre-write re-park must not restore a prior window")
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, PlatformError::Backend(text) if text == "window is fullscreen or not showing; not parked")
+        );
+        assert!(state.displays.is_empty());
+        assert_eq!(state.entries.get(&window).unwrap().frame, original);
+        assert_eq!(fs::read(&state.journal).unwrap(), journal);
+        fs::remove_file(&state.journal).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn refused_repark_forgets_prior_entry_proven_home() {
+        let window = WindowId(10);
+        let original = built_in();
+        let mut state = journal_state(vec![], original);
+        fake_twin(&mut state);
+        let error = state
+            .park_sequence_with(
+                window,
+                ParkAttempt::new(false, original, original),
+                |_| Err(PlatformError::Timeout),
+                (
+                    |_| -> Result<(), PlatformError> { panic!("setup failed before AX lookup") },
+                    |(), _, _| panic!("setup failed before AX write"),
+                ),
+                |_| panic!("setup failed before geometry"),
+                (fake_release, |_, _, _| {
+                    panic!("a proven-home entry needs no restoration")
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(error, PlatformError::Timeout));
+        assert!(state.displays.is_empty());
+        assert!(state.entries.is_empty());
+        assert!(read_journal(&state.journal).unwrap().is_empty());
+        fs::remove_file(&state.journal).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn recover_at_original_frame_removes_fullscreen_and_ordinary_entries_without_ax() {
+        let window = WindowId(10);
+        for (original, expected_gate) in [
+            (built_in(), Gate::Itself),
+            (rect(20.0, 30.0, 800.0, 600.0), Gate::Clear),
+        ] {
+            let raw = RawWindow::fixture(10, 500, original, true);
+            assert_eq!(
+                fullscreen_gate(&raw, std::slice::from_ref(&raw), &[built_in()]),
+                expected_gate
+            );
+            let mut state = journal_state(vec![Ok(vec![raw])], original);
+            state.probe = || panic!("already-home recovery must finish before gates or AX");
+            let path = state.journal.clone();
+            // Construct with injected Quartz data; never preflight private APIs or owner resources.
+            let mut parking = MacTwinParking {
+                state: Mutex::new(state),
+            };
+            assert_eq!(parking.recover().unwrap(), vec![window]);
+            assert!(parking.state().unwrap().entries.is_empty());
+            assert!(parking.state().unwrap().displays.is_empty());
+            assert!(read_journal(&path).unwrap().is_empty());
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn recover_elsewhere_still_keeps_journal_when_restore_cannot_proceed() {
+        let window = WindowId(10);
+        let original = rect(20.0, 30.0, 800.0, 600.0);
+        let mut state = journal_state(
+            vec![Ok(vec![RawWindow::fixture(10, 500, built_in(), true)])],
+            original,
+        );
+        state.probe = || Err(PlatformError::Backend("fake display lookup failed".into()));
+        let path = state.journal.clone();
+        let journal = fs::read(&path).unwrap();
+        let mut parking = MacTwinParking {
+            state: Mutex::new(state),
+        };
+        assert!(
+            matches!(parking.recover(), Err(PlatformError::Backend(text)) if text == "fake display lookup failed")
+        );
+        assert_eq!(
+            parking.state().unwrap().entries.get(&window).unwrap().frame,
+            original
+        );
+        assert_eq!(fs::read(&path).unwrap(), journal);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
