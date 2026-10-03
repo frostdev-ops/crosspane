@@ -33,7 +33,9 @@ e1() {
   local before after crossings
   # Whatever happens below, never leave this desktop controlling the Mac (a failed check used to
   # exit before the release and left input routed to the Mac).
-  trap 'crosspanectl release >/dev/null 2>&1 || true' EXIT
+  trap 'crosspanectl release >/dev/null 2>&1 || true; crosspanectl rearm >/dev/null 2>&1 || true' EXIT
+  # An earlier explicit release leaves crossing disarmed; this check needs it armed.
+  crosspanectl rearm >/dev/null 2>&1 || true
   crossings=$(mac 'grep -a -c "controlled by desktop" ~/Library/Logs/Crosspane/agent.log' || echo 0)
   before=$(mac '~/cp-tools/cursorpos')
   hyprctl dispatch 'hl.dsp.cursor.move({x=200, y=1500})' >/dev/null
