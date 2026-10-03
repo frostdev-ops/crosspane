@@ -528,3 +528,34 @@ impl Drop for NativeCommandQueue {
         self.sender.take();
     }
 }
+impl CommandSpec {
+    /// Fixed selected-user disable; no generic launchctl verb or domain is admitted.
+    pub fn disable_agent(target: &MacTarget) -> NativeResult<Self> {
+        let mut spec = Self::new(target, NativeOperation::Launchctl(LaunchctlAction::Print))?;
+        spec.args = vec![
+            "disable".into(),
+            format!("gui/{}/{AGENT_LABEL}", target.paths.uid),
+        ];
+        spec.mutation = true;
+        Ok(spec)
+    }
+    // Only the opaque correlated native cleanup path may construct this one-shot.
+    pub(super) fn installed_erase(
+        target: &MacTarget,
+        signature: &SignatureProof,
+    ) -> NativeResult<Self> {
+        if signature.nonce != target.nonce
+            || signature.requirement.role != ArtifactRole::Agent
+            || signature.path != target.agent_path()
+        {
+            return Err(NativeError::Foreign);
+        }
+        let mut spec = Self::new(target, NativeOperation::Launchctl(LaunchctlAction::Print))?;
+        spec.program = signature.path.clone();
+        spec.args = vec!["erase-identity".into()];
+        spec.max_output = 4096;
+        spec.mutation = true;
+        spec.child_signature = Some(signature.clone());
+        Ok(spec)
+    }
+}

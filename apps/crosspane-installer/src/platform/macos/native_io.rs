@@ -182,6 +182,7 @@ pub struct TargetPaths {
     /// Explicit read-only distribution root containing Crosspane.app; never an owner default.
     pub payload_root: PathBuf,
 }
+type EraseLatches = Vec<(u64, ProcessIdentity, Arc<AtomicBool>)>;
 #[derive(Clone)]
 pub struct MacTarget {
     paths: TargetPaths,
@@ -189,6 +190,7 @@ pub struct MacTarget {
     nonce: u64,
     scratch: bool,
     mutation: Arc<Mutex<()>>,
+    erase_latches: Arc<Mutex<EraseLatches>>,
     #[cfg(test)]
     pub(crate) test_hook: Option<TestHook>,
     #[cfg(test)]
@@ -248,6 +250,7 @@ impl MacTarget {
             nonce: next_nonce()?,
             scratch,
             mutation: Arc::new(Mutex::new(())),
+            erase_latches: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             test_hook: None,
             #[cfg(test)]
@@ -911,5 +914,271 @@ impl MacNativeIo {
         }
         deadline.check()?;
         Ok(first)
+    }
+}
+// Opaque authority captured while the exact admitted original instance is still live.
+pub struct TrackedAgent {
+    io: Arc<MacNativeIo>,
+    support: SupportProof,
+    signature: SignatureProof,
+    instance: Arc<AdmittedInstance>,
+    erase_attempted: Arc<AtomicBool>,
+}
+pub struct CleanAgentExit {
+    original: Arc<TrackedAgent>,
+    receipt: crate::agent_contract::LastExitV1,
+}
+opaque_debug!(TrackedAgent, CleanAgentExit);
+impl TrackedAgent {
+    pub fn process(&self) -> &ProcessIdentity {
+        self.instance.process()
+    }
+    pub fn instance_id(&self) -> u64 {
+        self.instance.bootstrap().instance_id
+    }
+}
+impl CleanAgentExit {
+    pub fn receipt(&self) -> &crate::agent_contract::LastExitV1 {
+        &self.receipt
+    }
+}
+static REMOVAL_OBSERVATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+impl MacNativeIo {
+    /// The entire support/signature/process observation is bounded, including admission I/O.
+    pub fn track_original(
+        self: &Arc<Self>,
+        support: &SupportProof,
+        signature: &SignatureProof,
+        instance: Arc<AdmittedInstance>,
+        deadline: &Deadline,
+    ) -> NativeResult<Arc<TrackedAgent>> {
+        let (io, support, signature, limit) = (
+            self.clone(),
+            support.clone(),
+            signature.clone(),
+            deadline.clone(),
+        );
+        bounded_result(&REMOVAL_OBSERVATIONS, deadline, move || {
+            instance.revalidate(&io, &support, &limit)?;
+            if io.process_identity(instance.process().pid, &signature, &limit)?
+                != *instance.process()
+            {
+                return Err(NativeError::Foreign);
+            }
+            // Target-lifetime tombstones survive handle drops and never reset after uncertainty.
+            let erase_attempted = {
+                let mut latches = io
+                    .target
+                    .erase_latches
+                    .lock()
+                    .map_err(|_| NativeError::Busy)?;
+                let key = (instance.bootstrap().instance_id, instance.process());
+                if let Some((_, _, latch)) = latches
+                    .iter()
+                    .find(|(id, process, _)| (*id, process) == key)
+                {
+                    latch.clone()
+                } else {
+                    if latches.len() >= MAX_NATIVE_CALLS {
+                        return Err(NativeError::Busy);
+                    }
+                    let latch = Arc::new(AtomicBool::new(false));
+                    latches.push((key.0, key.1.clone(), latch.clone()));
+                    latch
+                }
+            };
+            io.tutorial_proof_current(&support)?;
+            limit.check()?;
+            Ok(Arc::new(TrackedAgent {
+                io,
+                support,
+                signature,
+                instance,
+                erase_attempted,
+            }))
+        })
+    }
+    /// No receipt, already-stopped untracked installation, or ambiguous PID can mint authority.
+    /// Fresh support must retain the captured session/target; expiry never renews identity.
+    pub fn observe_clean_exit(
+        self: &Arc<Self>,
+        original: Arc<TrackedAgent>,
+        support: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<CleanAgentExit>> {
+        let (io, support, limit) = (self.clone(), support.clone(), deadline.clone());
+        bounded_result(&REMOVAL_OBSERVATIONS, deadline, move || {
+            io.checked_original_exit(&original, &support, &limit)
+                .map(|receipt| {
+                    receipt
+                        .filter(|r| r.clean)
+                        .map(|receipt| CleanAgentExit { original, receipt })
+                })
+        })
+    }
+    fn removal_proof_current(
+        &self,
+        original: &TrackedAgent,
+        support: &SupportProof,
+    ) -> NativeResult<()> {
+        if !original.support.valid.load(Ordering::Acquire) {
+            return Err(NativeError::Unsupported);
+        }
+        if support.facts != original.support.facts {
+            return Err(NativeError::Foreign);
+        }
+        self.tutorial_proof_current(support)
+    }
+    fn checked_original_exit(
+        &self,
+        original: &TrackedAgent,
+        support: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<crate::agent_contract::LastExitV1>> {
+        if self.target.nonce != original.io.target.nonce {
+            return Err(NativeError::Foreign);
+        }
+        self.removal_proof_current(original, support)?;
+        support.check(self, deadline)?;
+        original.signature.revalidate(self)?;
+        let bootstrap_path = self.target.runtime.join("bootstrap.json");
+        let bootstrap = if self.metadata(&bootstrap_path)?.is_some() {
+            let bytes = self.read(&bootstrap_path, 4096, true, deadline)?;
+            let b = parse_bootstrap(&bytes).map_err(|_| NativeError::Invalid)?;
+            if b.instance_id != original.instance_id()
+                || b.pid != original.process().pid
+                || b.started_unix_ms != original.instance.bootstrap().started_unix_ms
+                || b.phase_seq < original.instance.bootstrap().phase_seq
+                || admitted_spelling(Path::new(&b.runtime_dir))? != self.target.runtime
+            {
+                return Err(NativeError::Foreign);
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        // Observe the exact original start time, not merely a process name. Reuse is refused.
+        for _ in 0..2 {
+            let uid = self.execute(
+                &CommandSpec::new(
+                    &self.target,
+                    NativeOperation::Process {
+                        pid: original.process().pid,
+                        field: PsField::Uid,
+                    },
+                )?,
+                None,
+                deadline,
+            )?;
+            if uid.code == Some(0) {
+                if self.process_identity(original.process().pid, &original.signature, deadline)?
+                    != *original.process()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                return Ok(None);
+            }
+            if uid.code != Some(1) || !uid.stdout.is_empty() || !uid.stderr.is_empty() {
+                return Err(NativeError::Unavailable);
+            }
+        }
+        let receipt_path = self.target.state_dir().join("last_exit.json");
+        let identity = self.metadata(&receipt_path)?;
+        let bytes = identity
+            .as_ref()
+            .map(|_| self.read(&receipt_path, 4096, true, deadline))
+            .transpose()?;
+        let receipt = self.exit_receipt(original.process(), original.instance_id(), deadline)?;
+        let fresh = if self.metadata(&bootstrap_path)?.is_some() {
+            Some(self.read(&bootstrap_path, 4096, true, deadline)?)
+        } else {
+            None
+        };
+        if self.metadata(&receipt_path)? != identity
+            || bytes
+                .as_ref()
+                .map(|_| self.read(&receipt_path, 4096, true, deadline))
+                .transpose()?
+                != bytes
+            || self.metadata(&receipt_path)? != identity
+            || bytes
+                .as_ref()
+                .map(|b| {
+                    crate::agent_contract::parse_last_exit(b).map_err(|_| NativeError::Invalid)
+                })
+                .transpose()?
+                != receipt
+            || fresh != bootstrap
+        {
+            return Err(NativeError::Foreign);
+        }
+        if let Some(r) = &receipt {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| NativeError::Unavailable)?
+                .as_millis();
+            if u128::from(r.stopped_unix_ms) > now {
+                return Err(NativeError::Foreign);
+            }
+        }
+        original.signature.revalidate(self)?;
+        self.removal_proof_current(original, support)?;
+        deadline.check()?;
+        Ok(receipt)
+    }
+    /// Exactly one attempt per exact original across all handles, including failures.
+    /// Fresh support renews session admission only. Unknown requires re-detection;
+    /// a new clean-exit observation cannot reset the dispatch latch.
+    pub fn erase_installed_identity(
+        self: &Arc<Self>,
+        clean: CleanAgentExit,
+        support: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<crate::agent_contract::EraseIdentityV1> {
+        let (io, support, limit) = (self.clone(), support.clone(), deadline.clone());
+        let attempted = Arc::new(AtomicBool::new(false));
+        let dispatched = attempted.clone();
+        let result = bounded_result(&REMOVAL_OBSERVATIONS, deadline, move || {
+            if io.checked_original_exit(&clean.original, &support, &limit)?
+                != Some(clean.receipt.clone())
+            {
+                return Err(NativeError::Refused);
+            }
+            let spec = CommandSpec::installed_erase(&io.target, &clean.original.signature)?;
+            clean
+                .original
+                .erase_attempted
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| NativeError::Refused)?;
+            io.removal_proof_current(&clean.original, &support)?;
+            limit.check()?;
+            let mut spec = spec;
+            support.check(&io, &limit)?;
+            clean.original.signature.revalidate(&io)?;
+            io.validate_target()?;
+            spec.authorized = Some(Instant::now());
+            io.target.observe("dispatch", spec.program(), None)?;
+            limit.check()?;
+            io.removal_proof_current(&clean.original, &support)?;
+            dispatched.store(true, Ordering::Release);
+            let output = io.runner.run(&spec, &limit)?;
+            if output.code != Some(0)
+                || !output.stderr.is_empty()
+                || output.stdout.len() + output.stderr.len() > spec.max_output()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let receipt = crate::agent_contract::parse_erase_identity(&output.stdout)
+                .map_err(|_| NativeError::OutcomeUnknown)?;
+            if io.checked_original_exit(&clean.original, &support, &limit)? != Some(clean.receipt) {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(receipt)
+        });
+        match result {
+            Err(_) if attempted.load(Ordering::Acquire) => Err(NativeError::OutcomeUnknown),
+            other => other,
+        }
     }
 }
