@@ -861,6 +861,238 @@ fn native_drag_case(queue_before_arm: bool) -> Result<()> {
     Ok(())
 }
 
+/// This package's distinct nest is required before any IPC or winit connection.
+fn fs3_signature() -> Result<String> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("nested runtime")?;
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let display = std::env::var("WAYLAND_DISPLAY")?;
+    let (name, _) = find_nested_state(Path::new(&runtime), &signature, &display)?;
+    ensure!(name == "FS3", "fullscreen tests require the owned FS3 nest");
+    ensure!(nested_signature()? == signature, "FS3 identity changed");
+    Ok(signature)
+}
+
+fn fs3_ipc(signature: &str, args: &[&str]) -> Result<String> {
+    ensure!(
+        fs3_signature()? == signature,
+        "FS3 identity changed before IPC"
+    );
+    ipc(signature, args)
+}
+
+fn fullscreen_resize(
+    events: &Receiver<HostEvent>,
+    fullscreen: bool,
+    expected: PixelSize,
+) -> Result<()> {
+    let mut changed = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = events.recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+        check(&event)?;
+        match event {
+            HostEvent::Fullscreen {
+                id: 246,
+                fullscreen: actual,
+            } => {
+                ensure!(
+                    actual == fullscreen && !changed,
+                    "unexpected fullscreen sample"
+                );
+                changed = true;
+            }
+            HostEvent::Resized { id: 246, size, .. } if size == expected => {
+                ensure!(
+                    changed,
+                    "Resized({expected:?}) arrived before Fullscreen({fullscreen})"
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn nested_proxy_fullscreen_precedes_resize_and_content_size_is_dropped() -> Result<()> {
+    if std::env::var("CROSSPANE_NESTED_HYPR").as_deref() != Ok("1") {
+        eprintln!("SKIP FS3 fullscreen: CROSSPANE_NESTED_HYPR is not 1");
+        return Ok(());
+    }
+    let signature = fs3_signature()?;
+    let (handles, handle_receiver) = mpsc::channel();
+    let (sender, events) = mpsc::channel();
+    let verified = signature.clone();
+    let thread = thread::spawn(move || -> Result<()> {
+        ensure!(
+            fs3_signature()? == verified,
+            "FS3 changed before winit connected"
+        );
+        let (host, handle) = ProxyHost::new_any_thread()?;
+        handles.send(handle)?;
+        host.run(Box::new(move |event| {
+            let _ = sender.send(event);
+        }))?;
+        Ok(())
+    });
+    let mut host = TestHost {
+        handle: handle_receiver.recv_timeout(Duration::from_secs(10))?,
+        thread: Some(thread),
+    };
+    let title = format!("FS3 fullscreen {}", std::process::id());
+    let old = PixelSize::new(320, 240);
+    host.handle.send(HostCommand::Open {
+        id: 246,
+        title: title.clone(),
+        size: old,
+        accent: [211, 45, 137],
+        place: None,
+    })?;
+    wait_event(&events, |event| {
+        matches!(event, HostEvent::Opened { id: 246, .. })
+    })?;
+    // Revalidate before every query/dispatch. Both socket and signature are bound to the
+    // script's current PID/start time before the host and each IPC client connects.
+    fs3_signature()?;
+    poll_client(&signature, &title, true)?;
+    let address = client_address(&signature, &title)?.context("owned fullscreen proxy")?;
+    fs3_ipc(
+        &signature,
+        &[
+            "dispatch",
+            &format!("hl.dsp.window.float({{action=\"enable\",window=\"address:{address}\"}})"),
+        ],
+    )?;
+    fs3_ipc(
+        &signature,
+        &[
+            "dispatch",
+            &format!(
+                "hl.dsp.window.resize({{x=320,y=240,relative=false,window=\"address:{address}\"}})"
+            ),
+        ],
+    )?;
+    fs3_ipc(
+        &signature,
+        &[
+            "dispatch",
+            &format!(
+                "hl.dsp.window.move({{x=120,y=120,relative=false,window=\"address:{address}\"}})"
+            ),
+        ],
+    )?;
+    wait_event(
+        &events,
+        |event| matches!(event, HostEvent::Resized { id: 246, size, .. } if *size == old),
+    )?;
+    let placed = ClientBox {
+        x: 120,
+        y: 120,
+        width: 320,
+        height: 240,
+        floating: true,
+    };
+    wait_box(&signature, &address, placed)?;
+    let monitors = fs3_ipc(&signature, &["-j", "monitors"])?;
+    let mut jq = Command::new("jq")
+        .args([
+            "-r",
+            "if length == 1 then .[0] | [.width,.height,.scale] | @tsv else empty end",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    jq.stdin
+        .take()
+        .context("monitor query input")?
+        .write_all(monitors.as_bytes())?;
+    let output = jq.wait_with_output()?;
+    ensure!(output.status.success(), "monitor parsing failed");
+    let text = String::from_utf8(output.stdout)?;
+    let values: Vec<_> = text.split_whitespace().collect();
+    ensure!(
+        values.len() == 3 && values[2].parse::<f64>()? == 1.0,
+        "one scale-1 FS3 monitor required"
+    );
+    let monitor = PixelSize::new(values[0].parse()?, values[1].parse()?);
+    drain(&events)?;
+    fs3_ipc(
+        &signature,
+        &[
+            "dispatch",
+            &format!(
+                "hl.dsp.window.fullscreen({{action=\"set\",mode=\"fullscreen\",window=\"address:{address}\"}})"
+            ),
+        ],
+    )?;
+    fullscreen_resize(&events, true, monitor)?;
+    fs3_signature()?;
+    let before = client_box(&signature, &address)?;
+    // Let the compositor's entry events settle, then drain the host queue before the command.
+    let settled = Instant::now() + Duration::from_millis(250);
+    while let Ok(event) = events.recv_timeout(settled.saturating_duration_since(Instant::now())) {
+        check(&event)?;
+        if let HostEvent::Fullscreen { id: 246, .. } = event {
+            bail!("duplicate fullscreen report while settling");
+        }
+    }
+    drain(&events)?;
+    host.handle.send(HostCommand::SetContentSize {
+        id: 246,
+        size: PixelSize::new(111, 77),
+    })?;
+    let (done, ack) = mpsc::sync_channel(1);
+    host.handle.send(HostCommand::Run(Box::new(move || {
+        let _ = done.send(());
+    })))?;
+    ack.recv_timeout(Duration::from_secs(1))?;
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while let Ok(event) = events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        check(&event)?;
+        match event {
+            HostEvent::Resized { id: 246, .. } => {
+                bail!("fullscreen content-size command generated Resized")
+            }
+            HostEvent::Fullscreen { id: 246, .. } => bail!("duplicate fullscreen report"),
+            _ => {}
+        }
+    }
+    fs3_signature()?;
+    ensure!(
+        client_box(&signature, &address)? == before,
+        "fullscreen content-size command changed geometry"
+    );
+    host.handle.send(HostCommand::SetFullscreen {
+        id: 246,
+        fullscreen: false,
+    })?;
+    fullscreen_resize(&events, false, old)?;
+    fs3_signature()?;
+    wait_box(&signature, &address, placed)?;
+    // The host's enter request also uses the frozen Borderless contract.
+    host.handle.send(HostCommand::SetFullscreen {
+        id: 246,
+        fullscreen: true,
+    })?;
+    fullscreen_resize(&events, true, monitor)?;
+    host.handle.send(HostCommand::SetFullscreen {
+        id: 246,
+        fullscreen: false,
+    })?;
+    fullscreen_resize(&events, false, old)?;
+    host.handle.send(HostCommand::Close { id: 246 })?;
+    host.handle.send(HostCommand::Shutdown)?;
+    host.thread
+        .take()
+        .context("fullscreen host thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("fullscreen host panicked"))??;
+    eprintln!(
+        "FS3: WM and host enter/exit each Fullscreen before Resized; fullscreen content-size no-op; original 320x240 restored"
+    );
+    Ok(())
+}
+
 fn check(event: &HostEvent) -> Result<()> {
     match event {
         HostEvent::Lost { id } => bail!("proxy {id} was lost"),
@@ -893,6 +1125,10 @@ fn wait_event(
 }
 
 fn ipc(signature: &str, args: &[&str]) -> Result<String> {
+    ensure!(
+        nested_signature()? == signature,
+        "nested identity changed before IPC"
+    );
     let output = Command::new("timeout")
         .args(["5", "hyprctl", "-i", signature])
         .args(args)

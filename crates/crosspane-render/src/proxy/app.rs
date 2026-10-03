@@ -15,7 +15,7 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     keyboard::PhysicalKey,
     monitor::MonitorHandle,
-    window::{CursorIcon, CustomCursor, Window, WindowId},
+    window::{CursorIcon, CustomCursor, Fullscreen, Window, WindowId},
 };
 
 use super::{
@@ -53,6 +53,8 @@ struct ProxyWindow {
     scale: f64,
     accent: [u8; 3],
     fullscreen: bool,
+    #[cfg(target_os = "macos")]
+    fullscreen_poll: Option<FullscreenPoll>,
     flash_until: Option<Instant>,
     input: InputState,
     consecutive_surface_losses: u8,
@@ -197,6 +199,8 @@ impl App {
             scale,
             accent,
             fullscreen: false,
+            #[cfg(target_os = "macos")]
+            fullscreen_poll: None,
             flash_until: None,
             input: InputState::default(),
             consecutive_surface_losses: 0,
@@ -308,7 +312,11 @@ impl App {
                 }
             }
             HostCommand::SetFullscreen { id, fullscreen } => {
-                tracing::debug!(id, fullscreen, "proxy fullscreen is not implemented");
+                if let Some(window) = self.windows.get(&id) {
+                    window
+                        .window
+                        .set_fullscreen(fullscreen.then(|| Fullscreen::Borderless(None)));
+                }
             }
             HostCommand::SetContentSize { id, size } => {
                 if size.width == 0 || size.height == 0 {
@@ -317,7 +325,12 @@ impl App {
                 if let Some(window) = self.windows.get_mut(&id) {
                     // The source's size is exact: no opening fit and no logical rounding, or the
                     // window system's answer would differ from it and be sent back as a resize.
-                    let result = window.window.request_inner_size(content_request(size));
+                    let Some(request) = content_request(size, window.window.fullscreen().is_some())
+                    else {
+                        tracing::debug!(id, "content resize dropped while proxy is fullscreen");
+                        return;
+                    };
+                    let result = window.window.request_inner_size(request);
                     if let Some(actual) = result {
                         self.resized(id, actual, window_scale(&self.windows, id));
                     }
@@ -423,22 +436,13 @@ impl App {
         let (Some(gpu), Some(window)) = (&self.gpu, self.windows.get_mut(&id)) else {
             return;
         };
-        let fullscreen = window.window.fullscreen().is_some();
-        if fullscreen && !window.fullscreen {
-            window.flash_until = Some(Instant::now() + Duration::from_secs(2));
-        }
-        window.fullscreen = fullscreen;
         window.scale = scale;
         if let Err(error) = window.resize(gpu, size) {
             tracing::warn!(id, %error, "proxy resize failed");
             self.remove(id, true);
             return;
         }
-        (self.events)(HostEvent::Resized {
-            id,
-            size: pixel_size(size),
-            scale,
-        });
+        window.observe_fullscreen(id, Some((size, scale)), self.events.as_mut());
         // After `Resized`, so the engine has the new size before the placement that carries it.
         self.report_placement(id, Trigger::Geometry);
     }
@@ -552,6 +556,12 @@ impl ApplicationHandler<HostCommand> for App {
         let Some(window) = self.windows.get_mut(&id) else {
             return;
         };
+        if matches!(
+            &event,
+            WindowEvent::Moved(_) | WindowEvent::Focused(_) | WindowEvent::Occluded(_)
+        ) {
+            window.observe_fullscreen(id, None, self.events.as_mut());
+        }
         match event {
             WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
                 if let PhysicalKey::Code(code) = event.physical_key
@@ -610,6 +620,10 @@ impl ApplicationHandler<HostCommand> for App {
             // macOS `Resized` is a frame snapshot taken when the event was queued, and delivery
             // can come after later native changes.
             WindowEvent::Resized(size) => {
+                #[cfg(target_os = "macos")]
+                {
+                    FullscreenPoll::after_resize(&mut window.fullscreen_poll, Instant::now());
+                }
                 let report = reported(Change::Resized(size), sample(&window.window));
                 self.geometry_changed(id, report);
             }
@@ -655,7 +669,20 @@ impl ApplicationHandler<HostCommand> for App {
         }
         let now = Instant::now();
         let mut next = None;
+        #[cfg(target_os = "macos")]
+        let mut corrections = Vec::new();
         for (&id, window) in &mut self.windows {
+            #[cfg(target_os = "macos")]
+            if let Some(poll) = &mut window.fullscreen_poll {
+                if poll.due(now) && window.window.fullscreen().is_some() != window.fullscreen {
+                    corrections.push((id, sample(&window.window)));
+                }
+                if let Some(deadline) = poll.deadline(now) {
+                    next = Some(next.map_or(deadline, |previous: Instant| previous.min(deadline)));
+                } else {
+                    window.fullscreen_poll = None;
+                }
+            }
             if let Some(frames) = window.presents.report(now) {
                 (self.events)(HostEvent::Presented { id, frames });
             }
@@ -670,6 +697,12 @@ impl ApplicationHandler<HostCommand> for App {
                     next = Some(next.map_or(deadline, |previous: Instant| previous.min(deadline)));
                 }
             }
+        }
+        // AppKit can update the fullscreen ivar after its queued Resized. A late change gets
+        // Fullscreen followed by fresh current geometry; unchanged ticks never resize or rearm.
+        #[cfg(target_os = "macos")]
+        for (id, (size, scale)) in corrections {
+            self.resized(id, size, scale);
         }
         event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
@@ -722,6 +755,20 @@ impl Gpu {
 }
 
 impl ProxyWindow {
+    fn observe_fullscreen(
+        &mut self,
+        id: u64,
+        geometry: Option<(PhysicalSize<u32>, f64)>,
+        emit: &mut dyn FnMut(HostEvent),
+    ) {
+        let fullscreen = self.window.fullscreen().is_some();
+        if fullscreen && !self.fullscreen {
+            self.flash_until = Some(Instant::now() + Duration::from_secs(2));
+            self.window.request_redraw();
+        }
+        report_fullscreen(id, &mut self.fullscreen, fullscreen, geometry, emit);
+    }
+
     fn resize(&mut self, gpu: &Gpu, size: PhysicalSize<u32>) -> Result<(), String> {
         self.size = size;
         if size.width == 0 || size.height == 0 {
@@ -1132,9 +1179,66 @@ fn reported(change: Change, actual: (PhysicalSize<u32>, f64)) -> Report {
 
 /// The size to request for a `SetContentSize`: the exact physical content size. Only the opening
 /// size is fitted to the screen (`fit`); the size the source reports back is applied as it is.
-fn content_request(size: PixelSize) -> PhysicalSize<u32> {
-    PhysicalSize::new(size.width, size.height)
+fn content_request(size: PixelSize, fullscreen: bool) -> Option<PhysicalSize<u32>> {
+    (!fullscreen).then_some(PhysicalSize::new(size.width, size.height))
 }
+
+/// Reports one sampled state and, when present, the geometry from the same observation.
+fn report_fullscreen(
+    id: u64,
+    previous: &mut bool,
+    fullscreen: bool,
+    geometry: Option<(PhysicalSize<u32>, f64)>,
+    emit: &mut dyn FnMut(HostEvent),
+) {
+    if *previous != fullscreen {
+        *previous = fullscreen;
+        emit(HostEvent::Fullscreen { id, fullscreen });
+    }
+    if let Some((size, scale)) = geometry {
+        emit(HostEvent::Resized {
+            id,
+            size: pixel_size(size),
+            scale,
+        });
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct FullscreenPoll {
+    next: Instant,
+    until: Instant,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl FullscreenPoll {
+    fn after_resize(poll: &mut Option<Self>, now: Instant) {
+        // Native resize storms must not postpone the next sample or extend this poll's budget.
+        if poll.is_none() {
+            *poll = Some(Self::new(now));
+        }
+    }
+
+    fn new(now: Instant) -> Self {
+        Self {
+            next: now + Duration::from_millis(50),
+            until: now + Duration::from_secs(2),
+        }
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        if now < self.next || now > self.until {
+            return false;
+        }
+        self.next = now + Duration::from_millis(50);
+        true
+    }
+
+    fn deadline(&self, now: Instant) -> Option<Instant> {
+        (now <= self.until && self.next <= self.until).then_some(self.next)
+    }
+}
+
 fn logical_size(size: PixelSize, scale: f64) -> LogicalSize<f64> {
     LogicalSize::new(
         f64::from(size.width) / scale,
@@ -1415,8 +1519,8 @@ mod tests {
             LogicalSize::new(388.0, 216.0)
         );
         assert_eq!(
-            content_request(PixelSize::new(777, 433)),
-            PhysicalSize::new(777, 433)
+            content_request(PixelSize::new(777, 433), false),
+            Some(PhysicalSize::new(777, 433))
         );
         // Beyond the opening fit: on a 1512x982 logical screen at scale 2 it would cap 2800x1600
         // physical to 2720x1554. The request is neither capped nor reshaped.
@@ -1425,7 +1529,197 @@ mod tests {
             fit(logical_size(size, 2.0), laptop),
             LogicalSize::new(1360.0, 777.0)
         );
-        assert_eq!(content_request(size), PhysicalSize::new(2800, 1600));
+        assert_eq!(
+            content_request(size, false),
+            Some(PhysicalSize::new(2800, 1600))
+        );
+    }
+
+    #[test]
+    fn fullscreen_samples_emit_change_before_resize_and_deduplicate() {
+        let mut previous = false;
+        let mut events = Vec::new();
+        let monitor = PhysicalSize::new(1280, 720);
+        let old = PhysicalSize::new(320, 240);
+        for (fullscreen, size) in [(true, monitor), (true, monitor), (false, old), (false, old)] {
+            report_fullscreen(3, &mut previous, fullscreen, Some((size, 1.0)), &mut |e| {
+                events.push(e)
+            });
+        }
+        assert_eq!(
+            events,
+            [
+                HostEvent::Fullscreen {
+                    id: 3,
+                    fullscreen: true
+                },
+                HostEvent::Resized {
+                    id: 3,
+                    size: pixel_size(monitor),
+                    scale: 1.0
+                },
+                HostEvent::Resized {
+                    id: 3,
+                    size: pixel_size(monitor),
+                    scale: 1.0
+                },
+                HostEvent::Fullscreen {
+                    id: 3,
+                    fullscreen: false
+                },
+                HostEvent::Resized {
+                    id: 3,
+                    size: pixel_size(old),
+                    scale: 1.0
+                },
+                HostEvent::Resized {
+                    id: 3,
+                    size: pixel_size(old),
+                    scale: 1.0
+                },
+            ]
+        );
+        assert!(!previous);
+    }
+
+    #[test]
+    fn fullscreen_samples_without_geometry_emit_only_changes() {
+        let mut previous = false;
+        let mut events = Vec::new();
+        for actual in [false, true, true, false, false] {
+            report_fullscreen(3, &mut previous, actual, None, &mut |e| events.push(e));
+        }
+        assert_eq!(
+            events,
+            [
+                HostEvent::Fullscreen {
+                    id: 3,
+                    fullscreen: true
+                },
+                HostEvent::Fullscreen {
+                    id: 3,
+                    fullscreen: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_poll_is_50ms_and_stops_at_2s() {
+        let now = Instant::now();
+        let mut poll = FullscreenPoll::new(now);
+        assert_eq!(poll.deadline(now), Some(now + Duration::from_millis(50)));
+        assert!(!poll.due(now + Duration::from_millis(49)));
+        for elapsed in (50..=2000).step_by(50) {
+            let sample = now + Duration::from_millis(elapsed);
+            assert!(poll.due(sample), "missing sample at {elapsed}ms");
+            assert!(!poll.due(sample), "same tick sampled twice");
+        }
+        assert_eq!(poll.deadline(now + Duration::from_secs(2)), None);
+        assert!(!poll.due(now + Duration::from_millis(2001)));
+        assert_eq!(poll.deadline(now + Duration::from_millis(2001)), None);
+    }
+
+    #[test]
+    fn fullscreen_resizes_preserve_active_poll_cadence_and_original_expiry() {
+        let now = Instant::now();
+        let mut poll = None;
+        FullscreenPoll::after_resize(&mut poll, now);
+        let mut samples = Vec::new();
+        for elapsed in (10..=2000).step_by(10) {
+            let instant = now + Duration::from_millis(elapsed);
+            if elapsed % 30 == 0 {
+                FullscreenPoll::after_resize(&mut poll, instant);
+            }
+            let active = poll.as_mut().unwrap();
+            assert_eq!(active.until, now + Duration::from_secs(2));
+            if active.due(instant) {
+                samples.push(elapsed);
+            }
+            if elapsed < 2000 {
+                let next = (elapsed / 50 + 1) * 50;
+                assert_eq!(
+                    active.deadline(instant),
+                    Some(now + Duration::from_millis(next))
+                );
+            } else {
+                assert_eq!(active.deadline(instant), None);
+                poll = None;
+            }
+        }
+        assert_eq!(samples, (50..=2000).step_by(50).collect::<Vec<_>>());
+        let later = now + Duration::from_millis(2010);
+        FullscreenPoll::after_resize(&mut poll, later);
+        assert_eq!(
+            poll.unwrap().deadline(later),
+            Some(now + Duration::from_millis(2060))
+        );
+    }
+
+    #[test]
+    fn fullscreen_poll_delays_do_not_extend_its_budget_and_new_polls_get_their_own_budget() {
+        let now = Instant::now();
+        let mut delayed = FullscreenPoll::new(now);
+        assert!(delayed.due(now + Duration::from_millis(1975)));
+        assert_eq!(delayed.deadline(now + Duration::from_millis(1975)), None);
+        assert!(!delayed.due(now + Duration::from_millis(2025)));
+        let resized = now + Duration::from_secs(1);
+        let mut restarted = FullscreenPoll::new(resized);
+        assert_eq!(
+            restarted.deadline(resized),
+            Some(resized + Duration::from_millis(50))
+        );
+        assert!(restarted.due(now + Duration::from_millis(2050)));
+        assert!(!restarted.due(now + Duration::from_millis(3001)));
+    }
+
+    #[test]
+    fn fullscreen_late_exit_reports_current_corrective_geometry_once() {
+        let now = Instant::now();
+        let mut poll = FullscreenPoll::new(now);
+        let mut previous = true;
+        let current = PhysicalSize::new(320, 240);
+        let mut events = Vec::new();
+        // AppKit's queued resize arrived before winit cleared its fullscreen ivar.
+        report_fullscreen(3, &mut previous, true, Some((current, 2.0)), &mut |e| {
+            events.push(e)
+        });
+        assert!(poll.due(now + Duration::from_millis(50)));
+        report_fullscreen(3, &mut previous, false, Some((current, 2.0)), &mut |e| {
+            events.push(e)
+        });
+        assert!(poll.due(now + Duration::from_millis(100)));
+        report_fullscreen(3, &mut previous, false, None, &mut |e| events.push(e));
+        assert_eq!(
+            events,
+            [
+                HostEvent::Resized {
+                    id: 3,
+                    size: pixel_size(current),
+                    scale: 2.0
+                },
+                HostEvent::Fullscreen {
+                    id: 3,
+                    fullscreen: false
+                },
+                HostEvent::Resized {
+                    id: 3,
+                    size: pixel_size(current),
+                    scale: 2.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_content_size_request_is_dropped() {
+        for size in [PixelSize::new(777, 433), PixelSize::new(2800, 1600)] {
+            assert_eq!(content_request(size, true), None);
+            assert_eq!(
+                content_request(size, false),
+                Some(PhysicalSize::new(size.width, size.height))
+            );
+        }
     }
 
     fn pos(x: i32, y: i32) -> PhysicalPosition<i32> {
