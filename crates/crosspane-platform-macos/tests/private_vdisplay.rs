@@ -1,11 +1,11 @@
-//! Also compiled as a standalone GUI driver by the two tests below: libtest owns the
+//! Also compiled as a standalone GUI driver by the tests below: libtest owns the
 //! process's main thread, while AppKit needs it running main_thread::run_app().
 //! The display-only probe grows its mode to the descriptor maximum without moving windows.
 #![cfg(all(target_os = "macos", feature = "private-vdisplay"))]
 #![allow(unexpected_cfgs, clippy::unwrap_used, clippy::expect_used)]
 
 #[cfg(not(crosspane_vdisplay_driver))]
-fn run_driver(live: bool) {
+fn run_driver(live: bool, fullscreen: bool) {
     use std::process::Command;
     let deps = std::env::current_exe()
         .unwrap()
@@ -90,6 +90,10 @@ fn run_driver(live: bool) {
     let status = Command::new(&executable)
         .env("CROSSPANE_MAC_LIVE", if live { "1" } else { "0" })
         .env("CROSSPANE_MAC_GUI", "1")
+        .env(
+            "CROSSPANE_MAC_FULLSCREEN",
+            if fullscreen { "1" } else { "0" },
+        )
         .status()
         .unwrap();
     std::fs::remove_file(executable).unwrap();
@@ -103,7 +107,7 @@ fn gui_virtual_display_lifecycle() {
         eprintln!("skipped: display-only GUI test requires CROSSPANE_MAC_GUI=1 via run-in-gui.sh");
         return;
     }
-    run_driver(false);
+    run_driver(false, false);
 }
 
 #[cfg(not(crosspane_vdisplay_driver))]
@@ -115,7 +119,17 @@ fn live_textedit_park_and_restore() {
         );
         return;
     }
-    run_driver(true);
+    run_driver(true, false);
+}
+
+#[cfg(not(crosspane_vdisplay_driver))]
+#[test]
+fn live_textedit_fullscreen_sync() {
+    if std::env::var("CROSSPANE_MAC_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: fullscreen TextEdit twin requires the lead's attended GUI session");
+        return;
+    }
+    run_driver(true, true);
 }
 
 // The driver compiles the implementation directly, so it tests the internal creation
@@ -153,7 +167,11 @@ fn main() {
     std::thread::spawn(|| {
         let result = std::panic::catch_unwind(|| {
             if std::env::var("CROSSPANE_MAC_LIVE").as_deref() == Ok("1") {
-                private_vdisplay::tests::live_textedit();
+                if std::env::var("CROSSPANE_MAC_FULLSCREEN").as_deref() == Ok("1") {
+                    private_vdisplay::tests::live_textedit_fullscreen();
+                } else {
+                    private_vdisplay::tests::live_textedit();
+                }
             } else {
                 private_vdisplay::tests::gui_lifecycle();
             }

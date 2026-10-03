@@ -48,14 +48,13 @@ use objc2_foundation::{NSArray, NSNumber, NSString};
 
 use crate::main_thread::{on_main, spawn_on_main};
 use crate::windows::{
-    AxLookup, AxWindow, RawWindow, WindowQuery, bounds_equal, require_accessibility, valid_frame,
+    AxLookup, AxWindow, FULLSCREEN_WAIT, RawWindow, WindowQuery, bounds_equal,
+    ensure_fullscreen_with, fullscreen_pause, fullscreen_press_needed, require_accessibility,
+    valid_frame,
 };
 
 const MAIN_WAIT: Duration = Duration::from_secs(2);
 const AX_WAIT: Duration = Duration::from_secs(2);
-/// How long `restore` waits for a fullscreen window to leave fullscreen, and how often it looks.
-const FULLSCREEN_WAIT: Duration = Duration::from_secs(2);
-const FULLSCREEN_POLL: Duration = Duration::from_millis(50);
 const DISPLAY_WAIT: Duration = Duration::from_secs(1);
 const INSET_WAIT: Duration = Duration::from_millis(500);
 const INSET_POLL: Duration = Duration::from_millis(50);
@@ -770,6 +769,14 @@ fn ax_miss_decision(lookup: Result<&RawWindow, &PlatformError>) -> AxMiss {
     }
 }
 
+fn retain_ax_error(error: &PlatformError, quartz: Result<(), PlatformError>) -> bool {
+    matches!(error, PlatformError::NotFound | PlatformError::Backend(_))
+        && !matches!(
+            quartz,
+            Err(PlatformError::NotFound | PlatformError::PermissionDenied(_))
+        )
+}
+
 /// What an AX write to the parked window may do, from one fresh look at the Quartz list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreWrite {
@@ -846,7 +853,7 @@ enum Settled {
     Frame(RectLogical),
     /// A fullscreen window fills the twin: the content is the whole display.
     WholeDisplay,
-    /// No AX read or write: the retained geometry (`hint`: a frame to use if none is retained).
+    /// No AX read or write: retained geometry, or a fresh normal Quartz frame replacing it.
     Retained(Option<RectLogical>),
 }
 
@@ -881,21 +888,15 @@ fn settle(
     }
 }
 
-/// How long to sleep before the next poll: one `poll`, clamped to what is left of the budget;
-/// `None` once `deadline` has passed.
-fn next_sleep(deadline: Instant, now: Instant, poll: Duration) -> Option<Duration> {
-    deadline
-        .checked_duration_since(now)
-        .filter(|left| !left.is_zero())
-        .map(|left| left.min(poll))
-}
-
 /// The AX window of `raw` by the twin's matching (a fresh AX deadline). A miss is an error here:
 /// callers that need the window (parking it, restoring it) can't go on without it.
 fn ax_required(raw: &RawWindow) -> Result<AxWindow, PlatformError> {
     match AxWindow::lookup(raw, Instant::now() + AX_WAIT)? {
         AxLookup::Found(ax) => Ok(ax),
-        AxLookup::Missing(why) => Err(PlatformError::Backend(why)),
+        AxLookup::Missing(why) => {
+            tracing::debug!(reason = %why, "AX window not found");
+            Err(PlatformError::NotFound)
+        }
     }
 }
 
@@ -966,6 +967,7 @@ struct TwinState {
     displays: BTreeMap<WindowId, VirtualDisplay>,
     /// Each parked window's last frame AX reported, for when AX has no window for it.
     last: BTreeMap<WindowId, RectLogical>,
+    last_fullscreen: BTreeMap<WindowId, bool>,
     /// Last successful measurement on any twin; a failed or timed-out read is best effort.
     last_inset: f64,
     query: WindowQuery,
@@ -985,6 +987,7 @@ impl MacTwinParking {
                 entries,
                 displays: BTreeMap::new(),
                 last: BTreeMap::new(),
+                last_fullscreen: BTreeMap::new(),
                 last_inset: 0.0,
                 query: WindowQuery::new()?,
                 probe: active_display_bounds,
@@ -1028,6 +1031,19 @@ impl TwinState {
         Ok((mode.with_top_inset(inset)?, inset))
     }
 
+    fn resize_mode_for_plan(
+        &self,
+        window: WindowId,
+        mode: Mode,
+        fullscreen: bool,
+    ) -> Result<(Mode, f64), PlatformError> {
+        if fullscreen {
+            Ok((mode, 0.0))
+        } else {
+            self.resize_mode(window, mode)
+        }
+    }
+
     /// The parked window and the whole Quartz list it came from (one WindowServer round trip).
     /// `NotFound`: the window is gone (the list includes windows on every Space).
     fn quartz(&self, window: WindowId) -> Result<(RawWindow, Vec<RawWindow>), PlatformError> {
@@ -1064,6 +1080,26 @@ impl TwinState {
         route(self.quartz(window), displays)
     }
 
+    fn observed_plan(
+        &mut self,
+        window: WindowId,
+        displays: &[RectLogical],
+    ) -> Result<Plan, PlatformError> {
+        let plan = self.plan(window, displays)?;
+        // Commit conclusive Quartz geometry before AX or display waits can lose visibility.
+        match &plan {
+            Plan::Write(raw) => {
+                self.last.insert(window, raw.frame);
+                self.last_fullscreen.insert(window, false);
+            }
+            Plan::WholeDisplay => {
+                self.last_fullscreen.insert(window, true);
+            }
+            Plan::Retain => {}
+        }
+        Ok(plan)
+    }
+
     /// Whether an AX write to the window may go ahead right now: a fresh read, over every active
     /// display (a window being restored may be fullscreen anywhere), says `Write`. An unreadable
     /// display list or Quartz read says no.
@@ -1089,28 +1125,76 @@ impl TwinState {
     /// the AX lookup and before each frame write. However it ends, [`settle`] re-reads once more:
     /// a failed or refused step never aborts by itself.
     fn guarded_ax(
-        &self,
+        &mut self,
         window: WindowId,
         displays: &[RectLogical],
         ax: impl FnOnce(&RawWindow, &mut dyn FnMut() -> bool) -> Result<AxStep, PlatformError>,
     ) -> Result<Settled, PlatformError> {
-        let raw = match self.plan(window, displays)? {
+        let raw = match self.observed_plan(window, displays)? {
             Plan::Write(raw) => raw,
             Plan::WholeDisplay => return Ok(Settled::WholeDisplay),
             Plan::Retain => return Ok(Settled::Retained(None)),
         };
-        let mut guard = || matches!(self.plan(window, displays), Ok(Plan::Write(_)));
+        let mut guard = || matches!(self.observed_plan(window, displays), Ok(Plan::Write(_)));
         let step = ax(&raw, &mut guard);
-        settle(step, || self.plan(window, displays))
+        settle(step, || self.observed_plan(window, displays))
     }
 
     /// The parked window's geometry for what `guarded_ax` settled on.
     fn settled(&mut self, window: WindowId, settled: Settled) -> Result<Parked, PlatformError> {
-        match settled {
-            Settled::Frame(frame) => self.parked_at(window, frame),
-            Settled::WholeDisplay => self.whole_display(window),
-            Settled::Retained(hint) => self.retained(window, hint),
+        self.settled_with_metrics(window, settled, self.twin_metrics(window)?)
+    }
+
+    fn settled_with_metrics(
+        &mut self,
+        window: WindowId,
+        settled: Settled,
+        (display, bounds, pixels): (DisplayId, RectLogical, PixelSize),
+    ) -> Result<Parked, PlatformError> {
+        let retained = matches!(settled, Settled::Retained(_));
+        let (frame, fullscreen) = match settled {
+            Settled::Frame(frame) => {
+                self.last.insert(window, frame);
+                (Some(frame), bounds_equal(frame, bounds))
+            }
+            Settled::WholeDisplay => (Some(bounds), true),
+            // A hint is a fresh normal Quartz frame after an AX miss, not cached geometry.
+            Settled::Retained(Some(frame)) => {
+                self.last.insert(window, frame);
+                self.last_fullscreen.insert(window, false);
+                (Some(frame), false)
+            }
+            Settled::Retained(None) => (
+                self.last.get(&window).copied(),
+                self.last_fullscreen.get(&window).copied().unwrap_or(false),
+            ),
+        };
+        if !retained {
+            self.last_fullscreen.insert(window, fullscreen);
         }
+        Ok(Parked {
+            fullscreen,
+            window,
+            kind: ParkingKind::Twin,
+            display,
+            content: if retained {
+                kept_content(if fullscreen { None } else { frame }, bounds, pixels)?
+            } else {
+                content(frame.unwrap_or(bounds), bounds, pixels)?
+            },
+        })
+    }
+
+    fn resized_fullscreen_with_metrics(
+        &mut self,
+        window: WindowId,
+        metrics: (DisplayId, RectLogical, PixelSize),
+    ) -> Result<Parked, PlatformError> {
+        // Native mode/placement waits can span a Space transition; use the final twin bounds.
+        let settled = settle(Ok(AxStep::Missing), || {
+            self.observed_plan(window, &[metrics.1])
+        })?;
+        self.settled_with_metrics(window, settled, metrics)
     }
 
     /// The twin's bounds now. `NotFound`: the twin display is gone.
@@ -1142,50 +1226,6 @@ impl TwinState {
         Ok((display.id, bounds, pixels))
     }
 
-    /// A fullscreen window is the whole twin: no AX move, the content is the whole display.
-    fn whole_display(&self, window: WindowId) -> Result<Parked, PlatformError> {
-        let (display, bounds, pixels) = self.twin_metrics(window)?;
-        Ok(Parked {
-            fullscreen: false,
-            window,
-            kind: ParkingKind::Twin,
-            display,
-            content: content(bounds, bounds, pixels)?,
-        })
-    }
-
-    /// The geometry of a window we can't (or mustn't) read through AX: where it last was, clipped
-    /// to the twin as it is now, else `hint`, else the whole twin.
-    fn retained(
-        &self,
-        window: WindowId,
-        hint: Option<RectLogical>,
-    ) -> Result<Parked, PlatformError> {
-        tracing::debug!("keeping a parked window's last known geometry; no AX read or write");
-        let frame = self.last.get(&window).copied().or(hint);
-        let (display, bounds, pixels) = self.twin_metrics(window)?;
-        Ok(Parked {
-            fullscreen: false,
-            window,
-            kind: ParkingKind::Twin,
-            display,
-            content: kept_content(frame, bounds, pixels)?,
-        })
-    }
-
-    /// The parked window's geometry for a frame AX reported (or that we wrote).
-    fn parked_at(&mut self, window: WindowId, frame: RectLogical) -> Result<Parked, PlatformError> {
-        let (display, bounds, pixels) = self.twin_metrics(window)?;
-        self.last.insert(window, frame);
-        Ok(Parked {
-            fullscreen: false,
-            window,
-            kind: ParkingKind::Twin,
-            display,
-            content: content(frame, bounds, pixels)?,
-        })
-    }
-
     fn remove_entry(&mut self, window: WindowId) -> Result<(), PlatformError> {
         let mut entries = self.entries.clone();
         entries.remove(&window);
@@ -1194,47 +1234,58 @@ impl TwinState {
         Ok(())
     }
 
-    /// Take a native-fullscreen window out of fullscreen (it ignores an AX frame write): press its
-    /// full-screen button, when it has one, and wait until no display is filled for it, it is on
-    /// screen, and its frame has stopped changing. The whole wait, AX lookup and press included,
-    /// ends by `FULLSCREEN_WAIT` from the start, plus at most one poll in flight. `Ok(false)`:
-    /// nothing was pressed (no button, no AX window). Best effort: callers re-read before they
-    /// write and refuse if the window is still fullscreen.
-    fn exit_fullscreen(&self, window: WindowId, raw: &RawWindow) -> Result<bool, PlatformError> {
-        let deadline = Instant::now() + FULLSCREEN_WAIT;
-        let pressed = match AxWindow::lookup(raw, deadline) {
-            Ok(AxLookup::Found(ax)) => ax.press_fullscreen_button().unwrap_or_else(|error| {
-                tracing::debug!(%error, "pressing the full-screen button failed");
-                false
-            }),
-            Ok(AxLookup::Missing(_)) => false,
-            Err(error) => {
-                tracing::debug!(%error, "no AX window to leave fullscreen with");
-                false
-            }
-        };
-        if !pressed {
+    fn fullscreen_observation(
+        &self,
+        window: WindowId,
+        deadline: Instant,
+        displays: &[RectLogical],
+    ) -> Result<(RawWindow, Gate), PlatformError> {
+        let (raw, list) = self.quartz_until(window, deadline)?;
+        let gate = fullscreen_gate(&raw, &list, displays);
+        Ok((raw, gate))
+    }
+
+    fn fullscreen_press_needed(
+        &self,
+        window: WindowId,
+        desired: bool,
+        deadline: Instant,
+        displays: &[RectLogical],
+    ) -> Result<bool, PlatformError> {
+        let (raw, gate) = self.fullscreen_observation(window, deadline, displays)?;
+        if !fullscreen_press_needed(&raw, gate != Gate::Clear, desired, deadline)? {
             return Ok(false);
         }
-        let mut previous = None;
-        // Each sleep is clamped to what is left, and the same deadline bounds the Quartz read.
-        while let Some(sleep) = next_sleep(deadline, Instant::now(), FULLSCREEN_POLL) {
-            std::thread::sleep(sleep);
-            let Ok((now, list)) = self.quartz_until(window, deadline) else {
-                break;
-            };
-            let Ok(displays) = (self.probe)() else {
-                break;
-            };
-            let settled = now.on_screen
-                && fullscreen_on_any_display(&now, &list, &displays).is_none()
-                && previous.is_some_and(|previous| bounds_equal(previous, now.frame));
-            previous = Some(now.frame);
-            if settled {
-                break;
-            }
+        if gate == Gate::StandIn {
+            return Err(PlatformError::Unsupported(
+                "fullscreen stand-in has no button",
+            ));
         }
         Ok(true)
+    }
+
+    fn set_fullscreen(
+        &self,
+        window: WindowId,
+        desired: bool,
+        displays: &[RectLogical],
+    ) -> Result<(), PlatformError> {
+        let deadline = Instant::now() + FULLSCREEN_WAIT;
+        require_accessibility()?;
+        ensure_fullscreen_with(
+            desired,
+            || {
+                let (raw, gate) = self.fullscreen_observation(window, deadline, displays)?;
+                Ok((raw, gate != Gate::Clear))
+            },
+            |observed| match AxWindow::lookup(observed, deadline)? {
+                AxLookup::Found(ax) => ax.press_fullscreen_button(|| {
+                    self.fullscreen_press_needed(window, desired, deadline, displays)
+                }),
+                AxLookup::Missing(_) => Ok(false),
+            },
+            || fullscreen_pause(deadline),
+        )
     }
 
     fn restore_frame(
@@ -1272,9 +1323,7 @@ impl TwinState {
                         .into(),
                 ));
             }
-            Gate::Itself => {
-                self.exit_fullscreen(window, &raw)?;
-            }
+            Gate::Itself => self.set_fullscreen(window, false, &(self.probe)()?)?,
         }
         // A fresh read right before the AX write: leaving fullscreen changes the window, and
         // nothing may be written through AX while a window fills a display or this one isn't
@@ -1343,6 +1392,7 @@ impl TwinState {
         release: impl FnOnce(VirtualDisplay) -> Result<(), PlatformError>,
     ) -> Result<bool, PlatformError> {
         self.last.remove(&window);
+        self.last_fullscreen.remove(&window);
         if !self.entries.contains_key(&window) {
             if let Some(display) = self.displays.remove(&window) {
                 release(display)?;
@@ -1362,7 +1412,23 @@ impl TwinState {
     }
 
     fn abort(&mut self, window: WindowId, error: PlatformError) -> PlatformError {
-        match self.restore(window) {
+        self.abort_with(window, error, |state, window| {
+            state.restore(window).map(|_| ())
+        })
+    }
+
+    fn abort_with(
+        &mut self,
+        window: WindowId,
+        error: PlatformError,
+        rollback: impl FnOnce(&mut Self, WindowId) -> Result<(), PlatformError>,
+    ) -> PlatformError {
+        if matches!(error, PlatformError::NotFound | PlatformError::Backend(_))
+            && retain_ax_error(&error, self.quartz(window).map(|_| ()))
+        {
+            return error;
+        }
+        match rollback(self, window) {
             Ok(_) => error,
             Err(rollback) => {
                 tracing::warn!(%rollback, "twin rollback failed; display released or cleanup queued, journal retained");
@@ -1373,6 +1439,29 @@ impl TwinState {
                 }
             }
         }
+    }
+
+    fn finish_geometry(
+        &mut self,
+        window: WindowId,
+        result: Result<Parked, PlatformError>,
+    ) -> Result<Parked, PlatformError> {
+        result.or_else(|error| {
+            if matches!(error, PlatformError::NotFound | PlatformError::Backend(_))
+                && retain_ax_error(&error, self.quartz(window).map(|_| ()))
+            {
+                let twin = self.twin_bounds(window)?;
+                let settled = match self.observed_plan(window, &[twin]) {
+                    Ok(Plan::WholeDisplay) => Settled::WholeDisplay,
+                    Ok(Plan::Write(raw)) => Settled::Frame(raw.frame),
+                    _ => Settled::Retained(None),
+                };
+                return self
+                    .settled(window, settled)
+                    .or_else(|_| self.settled(window, Settled::Retained(None)));
+            }
+            Err(self.abort(window, error))
+        })
     }
 
     /// Native park and injected tests share the fresh plan, write marker and failure routing.
@@ -1394,7 +1483,7 @@ impl TwinState {
         let result = (|| {
             let (bounds, target) = prepare(self)?;
             // No geometry can be retained yet: a fresh fullscreen/off-Space refusal is cleanup.
-            let raw = match self.plan(window, &[bounds])? {
+            let raw = match self.observed_plan(window, &[bounds])? {
                 Plan::Write(raw) => raw,
                 Plan::WholeDisplay | Plan::Retain => {
                     return Err(PlatformError::Backend(
@@ -1404,7 +1493,8 @@ impl TwinState {
             };
             let window_ax = (ax.0)(&raw)?;
             // The lookup can take two seconds: re-read after it and before each frame write.
-            let mut allowed = || matches!(self.plan(window, &[bounds]), Ok(Plan::Write(_)));
+            let mut allowed =
+                || matches!(self.observed_plan(window, &[bounds]), Ok(Plan::Write(_)));
             // AXSize can be written before restore_guarded's later guard refuses AXPosition.
             attempt.write_attempted = true;
             let frame = (ax.1)(window_ax, target, &mut allowed)?;
@@ -1444,8 +1534,8 @@ impl TwinState {
                     "leave fullscreen before projecting",
                 ));
             }
-            (Gate::Itself, raw) => {
-                self.exit_fullscreen(window, &raw)?;
+            (Gate::Itself, _) => {
+                self.set_fullscreen(window, false, &(self.probe)()?)?;
                 match self.gate(window)? {
                     (Gate::Clear, raw) => raw,
                     _ => {
@@ -1512,19 +1602,25 @@ impl TwinState {
     }
 
     fn resize(&mut self, window: WindowId, mode: Mode) -> Result<Parked, PlatformError> {
-        let (grown, previous_inset) = self.resize_mode(window, mode)?;
+        // Observe the old bounds first; padding refusal still precedes journal/native mutations.
+        // Only a fullscreen window filling the old twin bypasses the normal menu reservation.
+        let fullscreen = self
+            .twin_bounds(window)
+            .and_then(|twin| self.observed_plan(window, &[twin]))
+            .map(|plan| matches!(plan, Plan::WholeDisplay))
+            .map_err(|error| self.abort(window, error))?;
+        let (grown, previous_inset) = self.resize_mode_for_plan(window, mode, fullscreen)?;
         let result = (|| {
             require_accessibility()?;
             write_journal(&self.journal, &self.entries)?;
-            // Asked before the mode changes, while the window still has the twin's old bounds: a
-            // window that fills the twin is fullscreen and AX can't move it. A window confirmed
-            // gone releases the display; an inconclusive read doesn't (`route`).
-            let twin = self.twin_bounds(window)?;
-            let fullscreen = matches!(self.plan(window, &[twin])?, Plan::WholeDisplay);
             let display = self.displays.get(&window).ok_or(PlatformError::NotFound)?;
             let id = display.id;
             display.apply(grown)?;
             wait_mode(id, grown)?;
+            if fullscreen {
+                place_twin(id)?;
+                return self.resized_fullscreen_with_metrics(window, self.twin_metrics(window)?);
+            }
             let measured = self.measure_inset(id, grown.logical());
             let (corrected, inset) = mode.fitting_top_inset(measured, (grown, previous_inset));
             let display = self
@@ -1539,9 +1635,6 @@ impl TwinState {
             display.inset = inset;
             // Mode changes can alter the arrangement. Re-isolate before moving the window again.
             let placement = place_twin(id)?;
-            if fullscreen {
-                return self.whole_display(window);
-            }
             // The mode change and the placement wait can take a while, and the window can go
             // fullscreen meanwhile: look again right before the write, after the AX lookup, and
             // before each frame write. Then AX exposes only the title-less stand-in, or takes
@@ -1552,7 +1645,7 @@ impl TwinState {
             })?;
             self.settled(window, settled)
         })();
-        result.map_err(|error| self.abort(window, error))
+        self.finish_geometry(window, result)
     }
 
     fn geometry(&mut self, window: WindowId) -> Result<Parked, PlatformError> {
@@ -1567,8 +1660,12 @@ impl TwinState {
 }
 
 impl WindowParking for MacTwinParking {
-    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    fn set_fullscreen(&mut self, window: WindowId, fullscreen: bool) -> Result<(), PlatformError> {
+        let state = self.state()?;
+        if !state.displays.contains_key(&window) {
+            return Err(PlatformError::NotFound);
+        }
+        state.set_fullscreen(window, fullscreen, &[state.twin_bounds(window)?])
     }
 
     fn park(
@@ -1592,18 +1689,7 @@ impl WindowParking for MacTwinParking {
     fn geometry(&self, window: WindowId) -> Result<Parked, PlatformError> {
         let mut state = self.state()?;
         let result = state.geometry(window);
-        result.map_err(|error| {
-            if state.displays.contains_key(&window)
-                && matches!(
-                    error,
-                    PlatformError::NotFound | PlatformError::PermissionDenied(_)
-                )
-            {
-                state.abort(window, error)
-            } else {
-                error
-            }
-        })
+        state.finish_geometry(window, result)
     }
 
     fn restore(&mut self, window: WindowId) -> Result<(), PlatformError> {
@@ -1797,6 +1883,9 @@ fn write_journal(path: &Path, entries: &BTreeMap<WindowId, Entry>) -> Result<(),
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    // Standalone GUI driver compiles helpers without the #[test] bodies.
+    use crate::windows::next_sleep;
 
     #[test]
     fn encoding_comparison_fails_closed() {
@@ -1814,6 +1903,32 @@ pub(crate) mod tests {
             assert!(!encoding_matches(observed, c"@32@0:8I16I20d24"));
         }
         assert!(!encoding_matches(Some(c"c24@0:8@16"), c"B24@0:8@16"));
+    }
+
+    #[test]
+    fn ax_failure_keeps_a_quartz_window_and_releases_only_confirmed_loss() {
+        for error in [
+            PlatformError::NotFound,
+            PlatformError::Backend("AX miss".into()),
+        ] {
+            assert!(retain_ax_error(&error, Ok(())));
+            assert!(retain_ax_error(&error, Err(PlatformError::Timeout)));
+            assert!(retain_ax_error(
+                &error,
+                Err(PlatformError::Backend("Quartz stalled".into()))
+            ));
+            assert!(!retain_ax_error(&error, Err(PlatformError::NotFound)));
+            assert!(!retain_ax_error(
+                &error,
+                Err(PlatformError::PermissionDenied(
+                    crosspane_platform::Permission::Accessibility
+                ))
+            ));
+        }
+        assert!(!retain_ax_error(
+            &PlatformError::PermissionDenied(crosspane_platform::Permission::Accessibility),
+            Ok(())
+        ));
     }
 
     #[test]
@@ -2442,6 +2557,7 @@ pub(crate) mod tests {
             )]),
             displays: BTreeMap::new(),
             last: BTreeMap::new(),
+            last_fullscreen: BTreeMap::new(),
             last_inset: 0.0,
             query: WindowQuery::scripted(replies),
             probe: || Ok(vec![built_in(), twin_rect()]),
@@ -2479,6 +2595,286 @@ pub(crate) mod tests {
         // Numeric fixture only: never run native display release or its Drop cleanup.
         std::mem::forget(display);
         Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn parked_fullscreen_ignores_same_pid_fullscreen_on_another_display() {
+        let observed = vec![page(true), stand_in(built_in())];
+        let state = scripted_state(vec![Ok(observed.clone()), Ok(observed)]);
+        let deadline = Instant::now() + FULLSCREEN_WAIT;
+        let (_, parked) = state
+            .fullscreen_observation(WindowId(10), deadline, &[twin_rect()])
+            .unwrap();
+        assert_eq!(parked, Gate::Clear);
+        // Initial parking and restoration must still inspect every active display.
+        assert_eq!(state.gate(WindowId(10)).unwrap().0, Gate::StandIn);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_button_rechecks_desired_state_after_lookup_before_press() {
+        use std::cell::Cell;
+        let normal = page(true);
+        let full = RawWindow::fixture(10, 500, twin_rect(), true);
+        for desired in [true, false] {
+            let (initial, changed) = if desired {
+                (normal.clone(), full.clone())
+            } else {
+                (full.clone(), normal.clone())
+            };
+            let state = scripted_state(vec![
+                Ok(vec![initial]),
+                Ok(vec![changed.clone()]),
+                Ok(vec![changed.clone()]),
+                Ok(vec![changed]),
+            ]);
+            let deadline = Instant::now() + FULLSCREEN_WAIT;
+            let presses = Cell::new(0);
+            let result = ensure_fullscreen_with(
+                desired,
+                || {
+                    let (raw, gate) =
+                        state.fullscreen_observation(WindowId(10), deadline, &[twin_rect()])?;
+                    Ok((raw, gate != Gate::Clear))
+                },
+                |_| {
+                    if state.fullscreen_press_needed(
+                        WindowId(10),
+                        desired,
+                        deadline,
+                        &[twin_rect()],
+                    )? {
+                        presses.set(presses.get() + 1);
+                    }
+                    Ok(true)
+                },
+                || Ok(()),
+            );
+            assert_eq!(presses.get(), 0, "state changed during AX lookup");
+            assert!(result.is_ok());
+        }
+        let state = scripted_state(vec![Ok(vec![page(false)])]);
+        assert!(matches!(
+            state.fullscreen_press_needed(
+                WindowId(10),
+                true,
+                Instant::now() + FULLSCREEN_WAIT,
+                &[twin_rect()]
+            ),
+            Err(PlatformError::Unsupported(_)),
+        ));
+    }
+
+    fn fixture_metrics(bounds: RectLogical) -> (DisplayId, RectLogical, PixelSize) {
+        (DisplayId(99), bounds, PixelSize::new(1710, 1406))
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fresh_normal_before_ax_miss_and_quartz_timeout_replaces_cached_fullscreen() {
+        let window = WindowId(10);
+        let normal = page(true);
+        let mut state = scripted_state(vec![
+            Ok(vec![RawWindow::fixture(10, 500, twin_rect(), true)]),
+            Ok(vec![normal.clone()]),
+            Err(PlatformError::Timeout),
+        ]);
+        let metrics = fixture_metrics(twin_rect());
+        let initial = state
+            .guarded_ax(window, &[twin_rect()], |_, _| {
+                panic!("fullscreen has no AX read")
+            })
+            .unwrap();
+        assert!(
+            state
+                .settled_with_metrics(window, initial, metrics)
+                .unwrap()
+                .fullscreen
+        );
+        let observed = state
+            .guarded_ax(window, &[twin_rect()], |_, _| Ok(AxStep::Missing))
+            .unwrap();
+        assert_eq!(observed, Settled::Retained(None));
+        let parked = state
+            .settled_with_metrics(window, observed, metrics)
+            .unwrap();
+        assert!(!parked.fullscreen);
+        assert_eq!(
+            parked.content,
+            content(normal.frame, metrics.1, metrics.2).unwrap()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fresh_fullscreen_before_resize_and_hidden_after_waits_replaces_cached_normal() {
+        let window = WindowId(10);
+        let normal = page(true);
+        let mut state = scripted_state(vec![
+            Ok(vec![normal.clone()]),
+            Ok(vec![RawWindow::fixture(10, 500, twin_rect(), true)]),
+            Ok(vec![page(false)]),
+        ]);
+        let metrics = fixture_metrics(twin_rect());
+        let initial = state
+            .guarded_ax(window, &[twin_rect()], |raw, _| {
+                Ok(AxStep::Frame(raw.frame))
+            })
+            .unwrap();
+        assert!(
+            !state
+                .settled_with_metrics(window, initial, metrics)
+                .unwrap()
+                .fullscreen
+        );
+        // The real resize path commits this observation before applying/waiting for the mode.
+        let before_mode = state.observed_plan(window, &[twin_rect()]).unwrap();
+        let fullscreen = matches!(before_mode, Plan::WholeDisplay);
+        assert!(fullscreen);
+        let requested = Mode::new(PixelSize::new(1200, 900), 1.0).unwrap();
+        assert_eq!(
+            state
+                .resize_mode_for_plan(window, requested, fullscreen)
+                .unwrap()
+                .0,
+            requested
+        );
+        let final_bounds = rect(1800.0, -900.0, 1200.0, 900.0);
+        let final_metrics = fixture_metrics(final_bounds);
+        let parked = state
+            .resized_fullscreen_with_metrics(window, final_metrics)
+            .unwrap();
+        assert!(parked.fullscreen);
+        assert_eq!(
+            parked.content,
+            content(final_bounds, final_bounds, final_metrics.2).unwrap()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_exit_then_ax_miss_uses_fresh_normal_frame_and_clears_cached_bit() {
+        let fresh = RawWindow::fixture(10, 500, rect(1850.0, -1300.0, 800.0, 600.0), true);
+        let mut state = scripted_state(vec![Ok(vec![fresh.clone()]), Ok(vec![fresh.clone()])]);
+        let window = WindowId(10);
+        let metrics = fixture_metrics(twin_rect());
+        state.last.insert(window, page(true).frame);
+        assert!(
+            state
+                .settled_with_metrics(window, Settled::WholeDisplay, metrics)
+                .unwrap()
+                .fullscreen
+        );
+        let settled = state
+            .guarded_ax(window, &[twin_rect()], |_, _| Ok(AxStep::Missing))
+            .unwrap();
+        assert_eq!(settled, Settled::Retained(Some(fresh.frame)));
+        let parked = state
+            .settled_with_metrics(window, settled, metrics)
+            .unwrap();
+        assert!(!parked.fullscreen);
+        assert_eq!(
+            parked.content,
+            content(fresh.frame, metrics.1, metrics.2).unwrap()
+        );
+        assert_eq!(state.last.get(&window), Some(&fresh.frame));
+        assert_eq!(state.last_fullscreen.get(&window), Some(&false));
+        let hidden = state
+            .settled_with_metrics(window, Settled::Retained(None), metrics)
+            .unwrap();
+        assert_eq!(hidden, parked);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_resize_reobserves_normal_hidden_closed_and_fullscreen_after_waits() {
+        let final_bounds = rect(1800.0, -900.0, 1200.0, 900.0);
+        let normal = RawWindow::fixture(10, 500, rect(1820.0, -850.0, 800.0, 600.0), true);
+        let metrics = fixture_metrics(final_bounds);
+        for (after_waits, expected) in [
+            (Ok(vec![normal.clone()]), Some(false)),
+            (Ok(vec![page(false)]), Some(true)),
+            (Ok(vec![]), None),
+            (Err(PlatformError::Timeout), Some(true)),
+            (
+                Ok(vec![RawWindow::fixture(10, 500, final_bounds, true)]),
+                Some(true),
+            ),
+            (Ok(vec![page(false), stand_in(final_bounds)]), Some(true)),
+        ] {
+            let mut state = scripted_state(vec![
+                Ok(vec![RawWindow::fixture(10, 500, twin_rect(), true)]),
+                after_waits,
+            ]);
+            let window = WindowId(10);
+            assert!(matches!(
+                state.plan(window, &[twin_rect()]).unwrap(),
+                Plan::WholeDisplay
+            ));
+            state
+                .settled_with_metrics(window, Settled::WholeDisplay, fixture_metrics(twin_rect()))
+                .unwrap();
+            let result = state.resized_fullscreen_with_metrics(window, metrics);
+            match expected {
+                Some(fullscreen) => {
+                    let parked = result.unwrap();
+                    assert_eq!(parked.fullscreen, fullscreen);
+                    if !fullscreen {
+                        assert_eq!(
+                            parked.content,
+                            content(normal.frame, metrics.1, metrics.2).unwrap()
+                        );
+                    }
+                }
+                None => assert!(matches!(result, Err(PlatformError::NotFound))),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_resize_at_capacity_ignores_stale_menu_inset() {
+        for scale in [1.0, 2.0] {
+            let mut state = scripted_state(vec![]);
+            fake_twin(&mut state);
+            state.displays.get_mut(&WindowId(10)).unwrap().inset = 30.0;
+            let requested = Mode::new(PixelSize::new(8192, 8192), scale).unwrap();
+            let full = state.resize_mode_for_plan(WindowId(10), requested, true);
+            let normal = state.resize_mode_for_plan(WindowId(10), requested, false);
+            // Dispose of the numeric fixture before assertions, including a red failure.
+            fake_release(state.displays.remove(&WindowId(10)).unwrap()).unwrap();
+            assert_eq!(full.unwrap(), (requested, 0.0));
+            assert!(matches!(normal, Err(PlatformError::Unsupported(_))));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn abort_keeps_owned_twin_and_journal_on_ax_miss_with_existing_quartz_window() {
+        for error in [
+            PlatformError::NotFound,
+            PlatformError::Backend("AX missing".into()),
+        ] {
+            let mut state = journal_state(vec![Ok(vec![page(true)])], built_in());
+            fake_twin(&mut state);
+            let journal = fs::read(&state.journal).unwrap();
+            let before = state.entries.clone();
+            let expected = error.to_string();
+            let actual = state.abort_with(WindowId(10), error, |_, _| {
+                panic!("an AX miss must not restore or release this window")
+            });
+            let retained = state.displays.contains_key(&WindowId(10));
+            // Remove the numeric fixture without invoking native display release or Drop.
+            for (_, display) in std::mem::take(&mut state.displays) {
+                fake_release(display).unwrap();
+            }
+            assert_eq!(actual.to_string(), expected);
+            assert!(retained);
+            assert_eq!(state.entries, before);
+            assert_eq!(fs::read(&state.journal).unwrap(), journal);
+            fs::remove_file(&state.journal).unwrap();
+        }
     }
 
     #[test]
@@ -2774,7 +3170,7 @@ pub(crate) mod tests {
         replies: Vec<Result<Vec<RawWindow>, PlatformError>>,
         step: impl FnOnce(&mut dyn FnMut() -> bool, &dyn Fn()) -> Result<AxStep, PlatformError>,
     ) -> (Result<Settled, PlatformError>, u32) {
-        let state = scripted_state(replies);
+        let mut state = scripted_state(replies);
         let writes = std::cell::Cell::new(0);
         let note_write = || writes.set(writes.get() + 1);
         let settled = state.guarded_ax(WindowId(10), &[twin_rect()], |_raw, guard| {
@@ -3164,5 +3560,61 @@ pub(crate) mod tests {
         assert!(parking.recover().unwrap().is_empty());
         fs::remove_file(path).unwrap();
         println!("private_vdisplay_live: 1 passed");
+    }
+
+    /// Lead-attended only; compiling this body never opens a window or creates a display.
+    #[allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
+    pub(crate) fn live_textedit_fullscreen() {
+        use crosspane_platform::WindowSource;
+        let windows = crate::windows::MacWindows::new().unwrap();
+        let window = windows
+            .windows()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.app_id == "com.apple.TextEdit")
+            .expect("lead must open disposable TextEdit window");
+        let path = std::env::temp_dir().join(format!(
+            "crosspane-twin-fullscreen-{}.journal",
+            std::process::id()
+        ));
+        let mut parking = MacTwinParking::new(path.clone()).unwrap();
+        let normal = parking
+            .park(window.id, PixelSize::new(1600, 1200), 2.0)
+            .unwrap();
+        assert!(!normal.fullscreen);
+        parking.set_fullscreen(window.id, true).unwrap();
+        parking.set_fullscreen(window.id, true).unwrap();
+        let fullscreen = parking.geometry(window.id).unwrap();
+        assert!(fullscreen.fullscreen);
+        let (_, bounds, pixels) = parking.state().unwrap().twin_metrics(window.id).unwrap();
+        let raw = parking.state().unwrap().quartz(window.id).unwrap().0;
+        assert!(raw.on_screen && bounds_equal(raw.frame, bounds));
+        assert_eq!(fullscreen.content, content(bounds, bounds, pixels).unwrap());
+        let resized = parking
+            .resize(window.id, PixelSize::new(1920, 1080), 2.0)
+            .unwrap();
+        assert!(resized.fullscreen);
+        assert_eq!(resized.display, normal.display);
+        assert_eq!(
+            resized.content,
+            PixelRect::new(euclid::Point2D::new(0, 0), euclid::Point2D::new(1920, 1080))
+        );
+        assert_eq!(parking.geometry(window.id).unwrap(), resized);
+        let (_, bounds, _) = parking.state().unwrap().twin_metrics(window.id).unwrap();
+        let raw = parking.state().unwrap().quartz(window.id).unwrap().0;
+        assert!(raw.on_screen && bounds_equal(raw.frame, bounds));
+        parking.set_fullscreen(window.id, false).unwrap();
+        parking.set_fullscreen(window.id, false).unwrap();
+        assert!(!parking.geometry(window.id).unwrap().fullscreen);
+        parking.restore(window.id).unwrap();
+        wait_display(normal.display, false).unwrap();
+        assert!(same_frame(
+            parking.state().unwrap().quartz(window.id).unwrap().0.frame,
+            window.frame
+        ));
+        assert!(parking.recover().unwrap().is_empty());
+        assert_eq!(read_journal(&path).unwrap(), BTreeMap::new());
+        fs::remove_file(path).unwrap();
+        println!("private_vdisplay_fullscreen: 1 passed");
     }
 }

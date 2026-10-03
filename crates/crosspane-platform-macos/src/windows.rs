@@ -669,6 +669,114 @@ fn match_ax_window(
     }
 }
 
+fn match_fullscreen_ax(
+    policy: AxPolicy,
+    title: &str,
+    frame: RectLogical,
+    candidates: &[AxCandidate],
+    fullscreen: bool,
+) -> AxMatch {
+    if !fullscreen {
+        return match_ax_window(policy, title, frame, candidates);
+    }
+    let framed = |c: &AxCandidate| ax_frame_matches(c.frame, frame);
+    let titled = |c: &AxCandidate| !title.is_empty() && c.title.as_deref() == Some(title);
+    let tiers: [&dyn Fn(&AxCandidate) -> bool; 3] = [&|c| framed(c) && titled(c), &framed, &titled];
+    for tier in tiers {
+        let mut hits = candidates.iter().enumerate().filter(|(_, c)| tier(c));
+        match (hits.next(), hits.next()) {
+            (Some((i, _)), None) => return AxMatch::One(i),
+            (Some(_), Some(_)) => return AxMatch::Ambiguous,
+            _ => {}
+        }
+    }
+    AxMatch::Missing
+}
+
+pub(crate) const FULLSCREEN_WAIT: Duration = Duration::from_secs(2);
+
+/// Only an on-screen Quartz window filling its display admits the relaxed AX ranking.
+pub(crate) fn quartz_fullscreen(raw: &RawWindow) -> bool {
+    let bounds = display_for_frame(raw.frame).ok().and_then(display_bounds);
+    window_state(raw.on_screen, raw.frame, bounds) == WindowState::Fullscreen
+}
+
+/// Both parking adapters use this ensure sequence; the injected operations also test it without
+/// AX or a window server. An unsupported public button never falls back to an undocumented API.
+pub(crate) fn ensure_fullscreen_with(
+    desired: bool,
+    mut observe: impl FnMut() -> Result<(RawWindow, bool), PlatformError>,
+    press: impl FnOnce(&RawWindow) -> Result<bool, PlatformError>,
+    mut pause: impl FnMut() -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    let (raw, actual) = observe()?;
+    if actual == desired && (desired || raw.on_screen) {
+        return Ok(());
+    }
+    if actual != desired && (!raw.on_screen || !press(&raw)?) {
+        return Err(PlatformError::Unsupported(
+            "window has no accessible full-screen button",
+        ));
+    }
+    let mut previous = None;
+    loop {
+        pause()?;
+        let (raw, actual) = observe()?;
+        // Leaving a Space briefly hides and animates the window. Keep the restore guard:
+        // don't write AX geometry until two visible normal frames agree.
+        if actual == desired
+            && (desired
+                || (raw.on_screen && previous.is_some_and(|frame| bounds_equal(frame, raw.frame))))
+        {
+            return Ok(());
+        }
+        previous = (raw.on_screen && !actual).then_some(raw.frame);
+    }
+}
+
+pub(crate) fn fullscreen_pause(deadline: Instant) -> Result<(), PlatformError> {
+    let sleep = next_sleep(deadline, Instant::now(), Duration::from_millis(50))
+        .ok_or(PlatformError::Timeout)?;
+    std::thread::sleep(sleep);
+    Ok(())
+}
+
+pub(crate) fn fullscreen_press_needed(
+    raw: &RawWindow,
+    actual: bool,
+    desired: bool,
+    deadline: Instant,
+) -> Result<bool, PlatformError> {
+    if Instant::now() >= deadline {
+        return Err(PlatformError::Timeout);
+    }
+    if actual == desired && (desired || raw.on_screen) {
+        return Ok(false);
+    }
+    if !raw.on_screen && !actual {
+        return Err(PlatformError::Unsupported("window is not showing"));
+    }
+    Ok(true)
+}
+
+fn prepare_fullscreen_press_with(
+    still_needed: impl FnOnce() -> Result<bool, PlatformError>,
+    prepare: impl FnOnce() -> Result<(), PlatformError>,
+) -> Result<bool, PlatformError> {
+    let needed = still_needed()?;
+    if needed {
+        prepare()?;
+    }
+    Ok(needed)
+}
+
+pub(crate) fn next_sleep(deadline: Instant, now: Instant, poll: Duration) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|left| !left.is_zero())
+        .map(|left| left.min(poll))
+}
+
 /// The previous matching, exactly: candidates are the AX windows with the Quartz window's title
 /// (all of them when it has none). The frame only picks between several candidates: right after an
 /// AX move or resize Quartz still reports the old frame for a while, so a lone candidate matches
@@ -734,6 +842,7 @@ impl AxWindow {
         let remaining = self
             .deadline
             .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
             .ok_or(PlatformError::Timeout)?;
         // SAFETY: valid retained AX object; positive timeout bounds its synchronous messages.
         ax_result(unsafe {
@@ -794,13 +903,15 @@ impl AxWindow {
         }
     }
 
-    /// The AX window of `raw` for M1 mirror parking, or an error where AX has none. This is the
-    /// matching `parking.rs` had before WP-2.45a, unchanged ([`AxPolicy::Mirror`]); twin parking
-    /// uses [`AxWindow::lookup`].
+    /// The AX window of `raw` for mirror parking. Ordinary windows keep `AxPolicy::Mirror`;
+    /// confirmed fullscreen windows may match display bounds regardless of title.
     pub(crate) fn find(raw: &RawWindow, deadline: Instant) -> Result<Self, PlatformError> {
         match Self::lookup_with(raw, deadline, AxPolicy::Mirror)? {
             AxLookup::Found(window) => Ok(window),
-            AxLookup::Missing(why) => Err(PlatformError::Backend(why)),
+            AxLookup::Missing(why) => {
+                tracing::debug!(reason = %why, "AX window not found");
+                Err(PlatformError::NotFound)
+            }
         }
     }
 
@@ -820,9 +931,11 @@ impl AxWindow {
         policy: AxPolicy,
     ) -> Result<AxLookup, PlatformError> {
         require_accessibility()?;
+        let fullscreen = quartz_fullscreen(raw);
         let app = Self::application(raw.pid, deadline);
         let values = app
-            .attribute("AXWindows")?
+            .attribute_opt("AXWindows")?
+            .ok_or(PlatformError::NotFound)?
             .downcast::<CFArray>()
             .map_err(|_| PlatformError::Backend("AXWindows is not an array".into()))?;
         // SAFETY: the public AXWindows attribute is an array of AXUIElement CF objects;
@@ -844,7 +957,7 @@ impl AxWindow {
             // failing on a window whose title can't be read; the twin treats that as untitled.
             let title = if raw.title.is_empty() {
                 None
-            } else if policy == AxPolicy::Mirror {
+            } else if policy == AxPolicy::Mirror && !fullscreen {
                 Some(
                     window
                         .attribute("AXTitle")?
@@ -858,7 +971,7 @@ impl AxWindow {
             candidates.push(AxCandidate { title, frame });
             windows.push(window);
         }
-        match match_ax_window(policy, &raw.title, raw.frame, &candidates) {
+        match match_fullscreen_ax(policy, &raw.title, raw.frame, &candidates, fullscreen) {
             AxMatch::One(index) => Ok(AxLookup::Found(windows.swap_remove(index))),
             AxMatch::Ambiguous => Err(PlatformError::Backend("ambiguous AX window match".into())),
             // Frames only: titles never go into logs.
@@ -884,8 +997,11 @@ impl AxWindow {
     /// Press the window's full-screen button (`kAXFullScreenButtonAttribute`, `kAXPressAction`),
     /// which toggles native fullscreen. `Ok(false)`: the window has no such button (a title-less
     /// window, an app that doesn't do native fullscreen) and nothing was pressed.
-    #[cfg(feature = "private-vdisplay")]
-    pub(crate) fn press_fullscreen_button(&self) -> Result<bool, PlatformError> {
+    /// `still_needed` rechecks after button lookup; false is a successful no-op.
+    pub(crate) fn press_fullscreen_button(
+        &self,
+        still_needed: impl FnOnce() -> Result<bool, PlatformError>,
+    ) -> Result<bool, PlatformError> {
         let Some(button) = self.attribute_opt("AXFullScreenButton")? else {
             return Ok(false);
         };
@@ -896,7 +1012,10 @@ impl AxWindow {
             element,
             deadline: self.deadline,
         };
-        button.prepare()?;
+        // Lookup may wait: the adapter's final Quartz check runs after it, before AXPress.
+        if !prepare_fullscreen_press_with(still_needed, || button.prepare())? {
+            return Ok(true);
+        }
         // SAFETY: valid retained AX button element; AXPress is a public action name
         // (HIServices/AXActionConstants.h kAXPressAction).
         let status = unsafe {
@@ -988,6 +1107,65 @@ impl AxWindow {
 mod tests {
     use super::*;
     use objc2_core_graphics::CGRectCreateDictionaryRepresentation;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_press_refreshes_timeout_after_the_fresh_quartz_check() {
+        use std::cell::{Cell, RefCell};
+        let start = Instant::now();
+        let deadline = start + FULLSCREEN_WAIT;
+        let clock = Cell::new(start + Duration::from_millis(200));
+        let timeout = Cell::new(None);
+        let sequence = RefCell::new(Vec::new());
+        assert!(
+            prepare_fullscreen_press_with(
+                || {
+                    sequence.borrow_mut().push("fresh Quartz");
+                    clock.set(clock.get() + Duration::from_millis(500));
+                    Ok(true)
+                },
+                || {
+                    sequence.borrow_mut().push("prepare AXPress");
+                    timeout.set(deadline.checked_duration_since(clock.get()));
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(*sequence.borrow(), ["fresh Quartz", "prepare AXPress"]);
+        assert_eq!(timeout.get(), Some(Duration::from_millis(1300)));
+        assert!(
+            !prepare_fullscreen_press_with(
+                || Ok(false),
+                || panic!("a satisfied request must not prepare an AX press"),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn fullscreen_press_does_not_start_after_its_fresh_check_exhausts_the_deadline() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let deadline = start + FULLSCREEN_WAIT;
+        for elapsed in [FULLSCREEN_WAIT, FULLSCREEN_WAIT + Duration::from_millis(1)] {
+            let clock = Cell::new(start + Duration::from_millis(200));
+            let result = prepare_fullscreen_press_with(
+                || {
+                    clock.set(start + elapsed);
+                    Ok(true)
+                },
+                || {
+                    deadline
+                        .checked_duration_since(clock.get())
+                        .filter(|remaining| !remaining.is_zero())
+                        .map(|_| ())
+                        .ok_or(PlatformError::Timeout)
+                },
+            );
+            assert!(matches!(result, Err(PlatformError::Timeout)));
+        }
+    }
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> RectLogical {
         RectLogical::new(PointLogical::new(x, y), SizeLogical::new(w, h))
@@ -1312,6 +1490,217 @@ mod tests {
             AxMatch::Ambiguous
         );
         assert_eq!(mirror("Mine", a, &[]), AxMatch::Missing);
+    }
+
+    #[test]
+    fn fullscreen_ax_ranking_prefers_display_bounds_over_a_stale_title() {
+        let display = rect(1800.0, -900.0, 1200.0, 900.0);
+        let ordinary = rect(20.0, 30.0, 600.0, 400.0);
+        for policy in [AxPolicy::Mirror, AxPolicy::Twin] {
+            assert_eq!(
+                match_fullscreen_ax(
+                    policy,
+                    "Page",
+                    display,
+                    &[candidate(Some("Page"), ordinary), candidate(None, display)],
+                    true,
+                ),
+                AxMatch::One(1)
+            );
+            assert_eq!(
+                match_fullscreen_ax(
+                    policy,
+                    "Page",
+                    display,
+                    &[candidate(Some("Other"), display)],
+                    true,
+                ),
+                AxMatch::One(0)
+            );
+        }
+    }
+
+    #[test]
+    fn titleless_same_pid_at_a_non_display_frame_is_never_a_lone_fallback() {
+        let display = rect(1800.0, -900.0, 1200.0, 900.0);
+        let ordinary = rect(20.0, 30.0, 600.0, 400.0);
+        for policy in [AxPolicy::Mirror, AxPolicy::Twin] {
+            for fullscreen in [false, true] {
+                assert_eq!(
+                    match_fullscreen_ax(
+                        policy,
+                        "Page",
+                        display,
+                        &[candidate(None, ordinary)],
+                        fullscreen,
+                    ),
+                    AxMatch::Missing
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_ax_ranking_keeps_equal_candidates_ambiguous() {
+        let display = rect(1800.0, -900.0, 1200.0, 900.0);
+        for policy in [AxPolicy::Mirror, AxPolicy::Twin] {
+            assert_eq!(
+                match_fullscreen_ax(
+                    policy,
+                    "Page",
+                    display,
+                    &[candidate(None, display), candidate(Some("Other"), display)],
+                    true,
+                ),
+                AxMatch::Ambiguous
+            );
+            assert_eq!(
+                match_fullscreen_ax(policy, "Page", display, &[], true),
+                AxMatch::Missing
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_ensure_is_idempotent_and_presses_once_for_either_transition() {
+        use std::cell::Cell;
+        use std::collections::VecDeque;
+        let dictionary = window_dictionary(0, 123, rect(0.0, 0.0, 800.0, 600.0), Some(true));
+        let raw = parse_window(dictionary.as_opaque()).unwrap();
+        for desired in [false, true] {
+            assert!(
+                ensure_fullscreen_with(
+                    desired,
+                    || Ok((raw.clone(), desired)),
+                    |_| panic!("already in the requested state"),
+                    || panic!("no wait needed"),
+                )
+                .is_ok()
+            );
+            let mut observations = VecDeque::from([!desired, !desired, desired, desired]);
+            let presses = Cell::new(0);
+            let waits = Cell::new(0);
+            assert!(
+                ensure_fullscreen_with(
+                    desired,
+                    || Ok((raw.clone(), observations.pop_front().unwrap())),
+                    |_| {
+                        presses.set(presses.get() + 1);
+                        Ok(true)
+                    },
+                    || {
+                        waits.set(waits.get() + 1);
+                        Ok(())
+                    },
+                )
+                .is_ok()
+            );
+            assert_eq!(presses.get(), 1);
+            assert_eq!(waits.get(), if desired { 2 } else { 3 });
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_ensure_refusal_timeout_and_read_errors_are_bounded() {
+        use std::cell::Cell;
+        let dictionary = window_dictionary(0, 123, rect(0.0, 0.0, 800.0, 600.0), Some(true));
+        let raw = parse_window(dictionary.as_opaque()).unwrap();
+        let presses = Cell::new(0);
+        assert!(matches!(
+            ensure_fullscreen_with(
+                true,
+                || Ok((raw.clone(), false)),
+                |_| Ok(false),
+                || panic!("no button"),
+            ),
+            Err(PlatformError::Unsupported(_))
+        ));
+        assert!(matches!(
+            ensure_fullscreen_with(
+                true,
+                || Ok((raw.clone(), false)),
+                |_| {
+                    presses.set(presses.get() + 1);
+                    Ok(true)
+                },
+                || Err(PlatformError::Timeout),
+            ),
+            Err(PlatformError::Timeout)
+        ));
+        assert_eq!(presses.get(), 1);
+        assert!(matches!(
+            ensure_fullscreen_with(
+                true,
+                || Err(PlatformError::NotFound),
+                |_| panic!("no window"),
+                || panic!("no window"),
+            ),
+            Err(PlatformError::NotFound)
+        ));
+        assert!(matches!(
+            fullscreen_pause(Instant::now() - Duration::from_secs(1)),
+            Err(PlatformError::Timeout)
+        ));
+        assert_eq!(FULLSCREEN_WAIT, Duration::from_secs(2));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_exit_waits_for_visible_stable_geometry_before_restore() {
+        use std::cell::Cell;
+        use std::collections::VecDeque;
+        let dictionary = window_dictionary(0, 123, rect(0.0, 0.0, 800.0, 600.0), Some(true));
+        let fullscreen = parse_window(dictionary.as_opaque()).unwrap();
+        let mut hidden = fullscreen.clone();
+        hidden.on_screen = false;
+        let mut normal = fullscreen.clone();
+        normal.frame = rect(10.0, 20.0, 400.0, 300.0);
+        let mut settled = normal.clone();
+        settled.frame.origin.x += 100.0;
+        let mut readings = VecDeque::from([
+            (fullscreen, true),
+            (hidden, false),
+            (normal, false),
+            (settled.clone(), false),
+            (settled, false),
+        ]);
+        let waits = Cell::new(0);
+        let presses = Cell::new(0);
+        assert!(
+            ensure_fullscreen_with(
+                false,
+                || Ok(readings.pop_front().unwrap()),
+                |_| {
+                    presses.set(presses.get() + 1);
+                    Ok(true)
+                },
+                || {
+                    waits.set(waits.get() + 1);
+                    Ok(())
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(presses.get(), 1);
+        assert_eq!(waits.get(), 4);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn fullscreen_ensure_never_presses_a_hidden_window() {
+        let dictionary = window_dictionary(0, 123, rect(0.0, 0.0, 800.0, 600.0), None);
+        let hidden = parse_window(dictionary.as_opaque()).unwrap();
+        assert!(matches!(
+            ensure_fullscreen_with(
+                true,
+                || Ok((hidden.clone(), false)),
+                |_| panic!("an off-Space AX window could be another window"),
+                || panic!("unsupported transition"),
+            ),
+            Err(PlatformError::Unsupported(_))
+        ));
     }
 
     /// Injected dictionaries only: never call own_windows or inspect WindowServer in this test.

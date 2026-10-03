@@ -16,7 +16,9 @@ use objc2_core_graphics::{
 };
 
 use crate::windows::{
-    AxWindow, RawWindow, WindowQuery, display_for_frame, require_accessibility, valid_frame,
+    AxWindow, FULLSCREEN_WAIT, RawWindow, WindowQuery, bounds_equal, display_for_frame,
+    ensure_fullscreen_with, fullscreen_pause, fullscreen_press_needed, quartz_fullscreen,
+    require_accessibility, valid_frame,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,6 +40,7 @@ enum Command {
     Park(WindowId, PixelSize),
     Resize(WindowId, PixelSize),
     Geometry(WindowId),
+    Fullscreen(WindowId, bool),
     Restore(WindowId),
     Recover,
 }
@@ -103,6 +106,9 @@ impl MacMirrorParking {
                             Command::Geometry(window) => {
                                 state.geometry(window, deadline).map(Reply::Geometry)
                             }
+                            Command::Fullscreen(window, desired) => state
+                                .set_fullscreen(window, desired, deadline)
+                                .map(|_| Reply::Done),
                             Command::Restore(window) => {
                                 state.restore_entry(window, deadline).map(|_| Reply::Done)
                             }
@@ -118,7 +124,12 @@ impl MacMirrorParking {
     }
 
     fn request(&self, command: Command) -> Result<Reply, PlatformError> {
-        let deadline = Instant::now() + CALL_WAIT;
+        let wait = if matches!(command, Command::Fullscreen(_, _)) {
+            FULLSCREEN_WAIT
+        } else {
+            CALL_WAIT
+        };
+        let deadline = Instant::now() + wait;
         let (tx, rx) = mpsc::sync_channel(1);
         self.commands
             .try_send((command, deadline, tx))
@@ -150,6 +161,54 @@ fn wait_error(error: mpsc::RecvTimeoutError) -> PlatformError {
 }
 
 impl ParkingState {
+    fn set_fullscreen(
+        &self,
+        window: WindowId,
+        desired: bool,
+        deadline: Instant,
+    ) -> Result<(), PlatformError> {
+        require_accessibility()?;
+        let pid = self
+            .entries
+            .get(&window)
+            .ok_or(PlatformError::NotFound)?
+            .pid;
+        ensure_fullscreen_with(
+            desired,
+            || {
+                let raw = self.window(window, Some(pid), deadline)?;
+                let fullscreen = quartz_fullscreen(&raw);
+                Ok((raw, fullscreen))
+            },
+            |raw| match AxWindow::find(raw, deadline) {
+                Ok(ax) => ax.press_fullscreen_button(|| {
+                    self.fullscreen_press_needed_with(
+                        window,
+                        pid,
+                        desired,
+                        deadline,
+                        quartz_fullscreen,
+                    )
+                }),
+                Err(PlatformError::NotFound) => Ok(false),
+                Err(error) => Err(error),
+            },
+            || fullscreen_pause(deadline),
+        )
+    }
+
+    fn fullscreen_press_needed_with(
+        &self,
+        window: WindowId,
+        pid: i32,
+        desired: bool,
+        deadline: Instant,
+        classify: impl FnOnce(&RawWindow) -> bool,
+    ) -> Result<bool, PlatformError> {
+        let raw = self.window(window, Some(pid), deadline)?;
+        fullscreen_press_needed(&raw, classify(&raw), desired, deadline)
+    }
+
     fn window(
         &self,
         window: WindowId,
@@ -169,6 +228,9 @@ impl ParkingState {
         size: PixelSize,
         deadline: Instant,
     ) -> Result<Parked, PlatformError> {
+        if quartz_fullscreen(raw) {
+            return parked(raw.id, raw.frame);
+        }
         let ax = AxWindow::find(raw, deadline)?;
         let frame = ax.frame()?;
         let display = display_for_frame(frame)?;
@@ -212,6 +274,10 @@ impl ParkingState {
         // A prior park may have failed while persisting its in-memory entry. Ensure that entry
         // is durable even when restore is the very next call after that failure.
         write_journal(&self.journal, &self.entries)?;
+        if quartz_fullscreen(&raw) {
+            self.set_fullscreen(window, false, deadline)?;
+        }
+        let raw = self.window(window, Some(entry.pid), deadline)?;
         let ax = AxWindow::find(&raw, deadline)?;
         ax.restore(entry.frame)?;
         let actual = ax.frame()?;
@@ -269,6 +335,9 @@ impl ParkingState {
         require_accessibility()?;
         let entry = self.entries.get(&window).ok_or(PlatformError::NotFound)?;
         let raw = self.window(window, Some(entry.pid), deadline)?;
+        if quartz_fullscreen(&raw) {
+            return parked(window, raw.frame);
+        }
         let ax = AxWindow::find(&raw, deadline)?;
         parked(window, ax.frame()?)
     }
@@ -285,8 +354,11 @@ impl ParkingState {
 }
 
 impl WindowParking for MacMirrorParking {
-    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    fn set_fullscreen(&mut self, window: WindowId, fullscreen: bool) -> Result<(), PlatformError> {
+        match self.request(Command::Fullscreen(window, fullscreen))? {
+            Reply::Done => Ok(()),
+            _ => Err(PlatformError::Backend("unexpected parking reply".into())),
+        }
     }
 
     fn park(
@@ -361,7 +433,7 @@ fn parked(window: WindowId, frame: RectLogical) -> Result<Parked, PlatformError>
     let display = display_for_frame(frame)?;
     let (bounds, scale) = display_metrics(display)?;
     Ok(Parked {
-        fullscreen: false,
+        fullscreen: bounds_equal(frame, bounds),
         window,
         kind: ParkingKind::Mirror,
         display,
@@ -497,6 +569,60 @@ fn write_journal(path: &Path, entries: &BTreeMap<WindowId, Entry>) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "private-vdisplay")]
+    fn mirror_transition_needs_press(desired: bool, hidden: bool) -> Result<bool, PlatformError> {
+        let bounds = RectLogical::new(PointLogical::zero(), SizeLogical::new(1800.0, 1169.0));
+        let normal = RectLogical::new(
+            PointLogical::new(50.0, 80.0),
+            SizeLogical::new(800.0, 600.0),
+        );
+        let initial = RawWindow::fixture(42, 500, if desired { normal } else { bounds }, true);
+        let changed = RawWindow::fixture(42, 500, if desired { bounds } else { normal }, !hidden);
+        let state = ParkingState {
+            journal: PathBuf::new(),
+            entries: BTreeMap::new(),
+            query: WindowQuery::scripted(vec![Ok(vec![initial]), Ok(vec![changed])]),
+        };
+        let deadline = Instant::now() + FULLSCREEN_WAIT;
+        let observed = state.window(WindowId(42), Some(500), deadline)?;
+        assert_eq!(
+            observed.on_screen && bounds_equal(observed.frame, bounds),
+            !desired
+        );
+        state.fullscreen_press_needed_with(WindowId(42), 500, desired, deadline, |raw| {
+            raw.on_screen && bounds_equal(raw.frame, bounds)
+        })
+    }
+
+    #[test]
+    #[cfg(feature = "private-vdisplay")]
+    fn mirror_fullscreen_entry_rechecks_after_button_lookup() {
+        assert!(matches!(
+            mirror_transition_needs_press(true, false),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "private-vdisplay")]
+    fn mirror_fullscreen_exit_rechecks_after_button_lookup() {
+        assert!(matches!(
+            mirror_transition_needs_press(false, false),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "private-vdisplay")]
+    fn mirror_fullscreen_press_refuses_a_newly_hidden_window() {
+        for desired in [true, false] {
+            assert!(matches!(
+                mirror_transition_needs_press(desired, true),
+                Err(PlatformError::Unsupported(_))
+            ));
+        }
+    }
 
     #[test]
     #[allow(clippy::unwrap_used)]
