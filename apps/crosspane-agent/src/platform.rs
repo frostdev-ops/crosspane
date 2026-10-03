@@ -12,7 +12,13 @@ use crosspane_platform::{
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{PointDevice, RectLogical};
 use crosspane_types::id::DisplayId;
+#[cfg(target_os = "macos")]
+use crosspane_types::id::WindowId;
 use crosspane_types::time::MonoTime;
+
+/// Injectable read of this process's on-screen Quartz identities and titles.
+#[cfg(target_os = "macos")]
+pub type OwnWindowsRead = fn() -> Result<Vec<(WindowId, String)>, PlatformError>;
 
 /// What "home on the twin" (WP-2.43) needs from the compositor beyond the platform traits: the
 /// keybind that exists only while this node's input is home in one of its own projected windows
@@ -319,6 +325,10 @@ pub struct Platform {
     /// Hyprland, and on Hyprland when the bind can't be spelled (the agent logs why).
     pub home: Option<Box<dyn HomeSeat>>,
     pub proxy_placement: Option<Box<dyn ProxyPlacementSeat>>,
+    #[cfg(target_os = "macos")]
+    pub visible_frame: fn(DisplayId) -> Result<RectLogical, PlatformError>,
+    #[cfg(target_os = "macos")]
+    pub own_windows: OwnWindowsRead,
     /// What the startup recovery of parked windows came to (WP-4.5).
     pub startup_recovery: StartupRecovery,
 }
@@ -963,6 +973,8 @@ pub fn create(
         // request is answered with an error).
         home: None,
         proxy_placement: None,
+        visible_frame: crosspane_platform_macos::displays::visible_frame,
+        own_windows: crosspane_platform_macos::windows::own_windows,
         gate,
     })
 }

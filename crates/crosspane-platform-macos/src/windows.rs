@@ -35,6 +35,90 @@ const POLL: Duration = Duration::from_millis(250);
 const QUERY_WAIT: Duration = Duration::from_millis(500);
 const MAIN_WAIT: Duration = Duration::from_millis(250);
 
+static OWN_QUERY_BUSY: AtomicBool = AtomicBool::new(false);
+struct OwnQueryLease;
+impl Drop for OwnQueryLease {
+    fn drop(&mut self) {
+        OWN_QUERY_BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// Own on-screen Quartz window numbers and titles, including accessory-app windows. Waits at
+/// most 500 ms; the single admission remains occupied until a timed-out read actually finishes.
+/// This does not change the normal WindowSource's exclusion of our process.
+pub fn own_windows() -> Result<Vec<(WindowId, String)>, PlatformError> {
+    if OWN_QUERY_BUSY.swap(true, Ordering::AcqRel) {
+        return Err(PlatformError::Timeout);
+    }
+    let lease = OwnQueryLease;
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("mac-own-window-query".into())
+        .spawn(move || {
+            let _lease = lease;
+            let _ = tx.send(own_window_snapshot());
+        })
+        .map_err(|e| PlatformError::Backend(format!("spawn own-window query: {e}")))?;
+    rx.recv_timeout(QUERY_WAIT)
+        .map_err(|_| PlatformError::Timeout)?
+}
+
+fn own_window_snapshot() -> Result<Vec<(WindowId, String)>, PlatformError> {
+    let list = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        kCGNullWindowID,
+    )
+    .ok_or_else(|| PlatformError::Backend("Quartz own-window list unavailable".into()))?;
+    // SAFETY: CGWindowListCopyWindowInfo returns a CFArray of CFDictionary CF objects.
+    let list = unsafe { list.cast_unchecked::<CFType>() };
+    Ok(list
+        .iter()
+        .filter_map(|value| {
+            let dictionary = value.downcast::<CFDictionary>().ok()?;
+            parse_own_window(&dictionary, std::process::id())
+        })
+        .collect())
+}
+
+fn parse_own_window(dictionary: &CFDictionary, own_pid: u32) -> Option<(WindowId, String)> {
+    // SAFETY: Quartz/fixture dictionaries have CFString keys and checked CF object values.
+    let dictionary = unsafe { dictionary.cast_unchecked::<CFString, CFType>() };
+    // SAFETY: immutable public CoreGraphics dictionary keys.
+    let (number, pid, name, on_screen) = unsafe {
+        (
+            kCGWindowNumber,
+            kCGWindowOwnerPID,
+            kCGWindowName,
+            kCGWindowIsOnscreen,
+        )
+    };
+    if dictionary.get(pid)?.downcast::<CFNumber>().ok()?.as_i64()? != i64::from(own_pid)
+        || !dictionary
+            .get(on_screen)?
+            .downcast::<CFBoolean>()
+            .ok()?
+            .as_bool()
+    {
+        return None;
+    }
+    let number = u32::try_from(
+        dictionary
+            .get(number)?
+            .downcast::<CFNumber>()
+            .ok()?
+            .as_i64()?,
+    )
+    .ok()?;
+    Some((
+        WindowId(u64::from(number)),
+        dictionary
+            .get(name)?
+            .downcast::<CFString>()
+            .ok()?
+            .to_string(),
+    ))
+}
+
 /// A Send handle; no AppKit objects cross the main-thread boundary.
 #[derive(Debug)]
 pub struct MacWindows {
@@ -1228,6 +1312,55 @@ mod tests {
             AxMatch::Ambiguous
         );
         assert_eq!(mirror("Mine", a, &[]), AxMatch::Missing);
+    }
+
+    /// Injected dictionaries only: never call own_windows or inspect WindowServer in this test.
+    #[test]
+    fn own_window_dictionary_filters_pid_visibility_and_preserves_quartz_identity() {
+        let number = CFNumber::new_i64(0x123);
+        let title = CFString::from_str("accessory proxy");
+        // SAFETY: immutable public CoreGraphics dictionary keys.
+        let keys = unsafe {
+            [
+                kCGWindowNumber,
+                kCGWindowOwnerPID,
+                kCGWindowName,
+                kCGWindowIsOnscreen,
+            ]
+        };
+        let pid = 987;
+        for (owner, visible, expected) in [
+            (pid, true, true),
+            (pid + 1, true, false),
+            (pid, false, false),
+        ] {
+            let owner = CFNumber::new_i64(i64::from(owner));
+            let dict = CFDictionary::<CFString, CFType>::from_slices(
+                &keys,
+                &[&number, &owner, &title, CFBoolean::new(visible)],
+            );
+            assert_eq!(
+                parse_own_window(dict.as_opaque(), pid),
+                expected.then(|| (WindowId(0x123), "accessory proxy".into()))
+            );
+        }
+        // No app activation policy or bounds metadata is required for own accessory windows.
+        let owner = CFNumber::new_i64(i64::from(pid));
+        let wrong_number = CFString::from_str("not a Quartz ID");
+        let dict = CFDictionary::<CFString, CFType>::from_slices(
+            &keys,
+            &[&wrong_number, &owner, &title, CFBoolean::new(true)],
+        );
+        assert!(parse_own_window(dict.as_opaque(), pid).is_none());
+        let missing_title =
+            CFDictionary::<CFString, CFType>::from_slices(&keys[..2], &[&number, &owner]);
+        assert!(parse_own_window(missing_title.as_opaque(), pid).is_none());
+        let overflow = CFNumber::new_i64(i64::from(u32::MAX) + 1);
+        let dict = CFDictionary::<CFString, CFType>::from_slices(
+            &keys,
+            &[&overflow, &owner, &title, CFBoolean::new(true)],
+        );
+        assert!(parse_own_window(dict.as_opaque(), pid).is_none());
     }
 
     #[test]

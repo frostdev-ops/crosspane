@@ -269,6 +269,12 @@ struct PlacementSource {
     native: BTreeMap<ProjectionKey, WindowId>,
     blocked: BTreeSet<ProjectionKey>,
     confirmed: BTreeSet<WindowId>,
+    #[cfg(target_os = "macos")]
+    lookup_warned: BTreeSet<ProjectionKey>,
+    #[cfg(target_os = "macos")]
+    lookup_retry: BTreeMap<ProjectionKey, (Instant, Instant, Duration)>,
+    #[cfg(target_os = "macos")]
+    lookup_rereport: BTreeSet<ProjectionKey>,
 }
 
 impl PlacementSource {
@@ -283,6 +289,12 @@ impl PlacementSource {
             native: BTreeMap::new(),
             blocked: BTreeSet::new(),
             confirmed: BTreeSet::new(),
+            #[cfg(target_os = "macos")]
+            lookup_warned: BTreeSet::new(),
+            #[cfg(target_os = "macos")]
+            lookup_retry: BTreeMap::new(),
+            #[cfg(target_os = "macos")]
+            lookup_rereport: BTreeSet::new(),
         }
     }
 
@@ -311,6 +323,8 @@ impl PlacementSource {
     /// across our title request: a window-title event is debounced and may arrive after a flush.
     /// Geometry still comes from the compositor, and its next event revalidates the identity.
     fn retitled(&mut self, key: ProjectionKey, title: &str) {
+        #[cfg(target_os = "macos")]
+        let changed = self.proxies.get(&key).is_some_and(|old| old != title);
         if self.compute(&key).0.is_some()
             && let Some(old) = self.proxies.get(&key)
             && let Some(window) = self
@@ -323,6 +337,13 @@ impl PlacementSource {
         if let Some(own) = self.proxies.get_mut(&key) {
             title.clone_into(own);
         }
+        #[cfg(target_os = "macos")]
+        if changed {
+            // SetTitle is asynchronous: keep the established Quartz ID until its new title lands.
+            self.lookup_rereport.insert(key);
+            self.lookup_warned.remove(&key);
+            self.lookup_retry.remove(&key);
+        }
     }
 
     fn closed(&mut self, key: ProjectionKey) {
@@ -333,6 +354,12 @@ impl PlacementSource {
             self.confirmed.remove(&window);
         }
         self.blocked.remove(&key);
+        #[cfg(target_os = "macos")]
+        {
+            self.lookup_warned.remove(&key);
+            self.lookup_retry.remove(&key);
+            self.lookup_rereport.remove(&key);
+        }
     }
 
     fn set_visible(&mut self, key: ProjectionKey, visible: bool) {
@@ -402,6 +429,7 @@ impl PlacementSource {
     /// (remembered as reported) and whether the report is notable: the proxy's first, or the one
     /// that places it after it was nowhere. The first report of a proxy always goes out, placed or
     /// not.
+    #[cfg(any(not(target_os = "macos"), test))]
     fn changes(&mut self) -> Vec<(ProjectionKey, Placed, bool)> {
         let keys: Vec<ProjectionKey> = self.proxies.keys().copied().collect();
         let mut changed = Vec::new();
@@ -1002,6 +1030,15 @@ impl Agent {
         let timeout = self.retired_twin_video.values().fold(timeout, |wait, at| {
             wait.min(at.saturating_duration_since(clock_now))
         });
+        #[cfg(target_os = "macos")]
+        let timeout = self
+            .placement
+            .lookup_retry
+            .values()
+            .filter(|(until, next, _)| clock_now < *until && next < until)
+            .fold(timeout, |wait, (_, next, _)| {
+                wait.min(next.saturating_duration_since(clock_now))
+            });
         if self.home_watchdog_needed() {
             let deadline = self
                 .home
@@ -1159,6 +1196,7 @@ impl Agent {
 
     /// Report every proxy whose placement changed (the Hyprland placement source). Each report is
     /// an input of its own, queued behind whatever is being handled.
+    #[cfg(not(target_os = "macos"))]
     fn flush_placements(&mut self) {
         if !std::mem::take(&mut self.placement_dirty) || !HYPRLAND_PLACEMENT {
             return;
@@ -1224,6 +1262,124 @@ impl Agent {
                 },
             ));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn flush_placements(&mut self) {
+        self.flush_mac_placements(Instant::now());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn flush_mac_placements(&mut self, now: Instant) {
+        let dirty = std::mem::take(&mut self.placement_dirty);
+        if self.placement.proxies.is_empty()
+            || !(dirty
+                || self
+                    .placement
+                    .lookup_retry
+                    .values()
+                    .any(|(until, next, _)| now < *until && now >= *next))
+        {
+            return;
+        }
+        let windows = (self.platform.own_windows)().unwrap_or_default();
+        let keys: Vec<_> = self.placement.proxies.keys().copied().collect();
+        for key in keys {
+            let title = &self.placement.proxies[&key];
+            let mut matches = windows.iter().filter(|(_, name)| name == title);
+            let window = match (matches.next(), matches.next()) {
+                (Some((id, _)), None)
+                    if self
+                        .placement
+                        .proxies
+                        .values()
+                        .filter(|t| *t == title)
+                        .count()
+                        == 1
+                        && self
+                            .placement
+                            .native
+                            .get(&key)
+                            .is_none_or(|pinned| pinned == id) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            };
+            if let Some(window) = window {
+                self.placement.lookup_retry.remove(&key);
+                let rereport = self.placement.lookup_rereport.remove(&key);
+                if self.placement.native.insert(key, window) != Some(window) || rereport {
+                    self.pending.push_back(Input::ProxyWindow { key, window });
+                }
+            } else {
+                // One episode per title: 100 ms doubling to 1 s, stopped after 10 s.
+                let retry = self.placement.lookup_retry.entry(key).or_insert((
+                    now + Duration::from_secs(10),
+                    now,
+                    Duration::from_millis(100),
+                ));
+                retry.1 = (now + retry.2).min(retry.0);
+                retry.2 = (retry.2 * 2).min(Duration::from_secs(1));
+                if self.placement.lookup_warned.insert(key) {
+                    tracing::warn!(
+                        projection = key.projection.0,
+                        "proxy window identity not uniquely observed"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mac_proxy_place(
+        &self,
+        place: Option<ProxyPlacement>,
+    ) -> Result<Option<crosspane_render::proxy::HostPlace>, PlatformError> {
+        let Some(place) = place else {
+            return Ok(None);
+        };
+        let display = self
+            .local_displays
+            .iter()
+            .find(|d| d.id == place.display)
+            .ok_or(PlatformError::NotFound)?;
+        let g = &display.geometry;
+        let visible = (self.platform.visible_frame)(place.display)?;
+        let right = visible.origin.x + visible.size.width;
+        let bottom = visible.origin.y + visible.size.height;
+        if !g.is_valid()
+            || ![
+                visible.origin.x,
+                visible.origin.y,
+                visible.size.width,
+                visible.size.height,
+                right,
+                bottom,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            || visible.size.width <= 0.0
+            || visible.size.height <= 0.0
+            || visible.origin.x < g.logical_origin.x
+            || visible.origin.y < g.logical_origin.y
+            || right > g.logical_origin.x + f64::from(g.pixel_size.width) / g.scale
+            || bottom > g.logical_origin.y + f64::from(g.pixel_size.height) / g.scale
+        {
+            return Err(PlatformError::Backend(
+                "invalid proxy visible-frame placement".into(),
+            ));
+        }
+        Ok(Some(crosspane_render::proxy::HostPlace {
+            // The host's final size may differ: preserve the anchor, even for oversized content.
+            content: (
+                (g.logical_origin.x + f64::from(place.x) / g.scale)
+                    .clamp(visible.origin.x, right - 1.0_f64.min(visible.size.width)),
+                (g.logical_origin.y + f64::from(place.y) / g.scale)
+                    .clamp(visible.origin.y, bottom - 1.0_f64.min(visible.size.height)),
+            )
+                .into(),
+        }))
     }
 
     /// `platform::create` completed startup recovery before handing us this backend.
@@ -2075,6 +2231,18 @@ impl Agent {
                 size,
                 place,
             } => {
+                #[cfg(target_os = "macos")]
+                let host_place = match self.mac_proxy_place(place) {
+                    Ok(place) => place,
+                    Err(error) => {
+                        tracing::warn!(%error, "proxy placement refused");
+                        self.pending.push_back(Input::ProxyOpened {
+                            key,
+                            result: Err(Failure::Other),
+                        });
+                        return;
+                    }
+                };
                 if HYPRLAND_PLACEMENT && let Some(place) = place {
                     self.drag_places.insert(key, place);
                     self.placement.blocked.insert(key);
@@ -2088,6 +2256,9 @@ impl Agent {
                         title,
                         size,
                         accent: node_accent(key.source),
+                        #[cfg(target_os = "macos")]
+                        place: host_place,
+                        #[cfg(not(target_os = "macos"))]
                         place: None,
                     })
                     .is_ok()
@@ -3499,6 +3670,8 @@ impl Agent {
     }
 
     fn housekeeping(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.flush_placements();
         #[cfg(target_os = "linux")]
         self.twin_video_home();
         #[cfg(target_os = "linux")]
@@ -7923,6 +8096,10 @@ mod audio_tests {
             gpu: None,
             home: None,
             proxy_placement: None,
+            #[cfg(target_os = "macos")]
+            visible_frame: |_| Err(PlatformError::Unsupported("fake has no visible frame")),
+            #[cfg(target_os = "macos")]
+            own_windows: || Ok(Vec::new()),
             startup_recovery: crate::platform::StartupRecovery::None,
         };
         let e2 = E2Wiring {
@@ -13532,6 +13709,300 @@ mod home_tests {
     }
 
     const NOWHERE: Placed = (None, PointDevice::new(0.0, 0.0), PixelSize::new(0, 0));
+
+    #[cfg(target_os = "macos")]
+    thread_local! {
+        static MAC_PROXY_WINDOWS: std::cell::RefCell<Option<Vec<(WindowId, String)>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(target_os = "macos")]
+    fn injected_own_windows() -> Result<Vec<(WindowId, String)>, PlatformError> {
+        MAC_PROXY_WINDOWS.with(|rows| rows.borrow().clone().ok_or(PlatformError::Timeout))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_proxy_identity_requires_unique_own_pid_title_and_re_reports_after_retitle() {
+        let mut h = home();
+        command_host(&mut h, None);
+        let key = proxy_key(1);
+        MAC_PROXY_WINDOWS.with(|rows| *rows.borrow_mut() = Some(Vec::new()));
+        h.rig.agent.platform.own_windows = injected_own_windows;
+        h.rig.agent.titles.insert(key, ("proxy".into(), 0));
+        h.rig.agent.proxy_ids.open(key);
+        h.rig.agent.observe(&Input::ProxyOpened {
+            key,
+            result: Ok((PixelSize::new(800, 600), 2.0)),
+        });
+        h.rig.agent.flush_placements();
+        assert!(h.rig.agent.pending.is_empty());
+        assert_eq!(h.rig.agent.placement.lookup_warned.len(), 1);
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_placements();
+        assert_eq!(
+            h.rig.agent.placement.lookup_warned.len(),
+            1,
+            "absent lookup warns only once"
+        );
+        let own = (WindowId(0x123), "proxy".into());
+        // The public adapter filters own PID before returning rows; its dictionary test covers it.
+        MAC_PROXY_WINDOWS.with(|rows| {
+            *rows.borrow_mut() = Some(vec![(WindowId(0x789), "different title".into())])
+        });
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_placements();
+        assert!(h.rig.agent.pending.is_empty());
+        MAC_PROXY_WINDOWS.with(|rows| rows.borrow_mut().as_mut().unwrap().push(own.clone()));
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_placements();
+        assert!(
+            matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key:k, window:WindowId(0x123) }) if k == key)
+        );
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_placements();
+        assert!(
+            h.rig.agent.pending.is_empty(),
+            "ordinary observations are deduplicated"
+        );
+        let mut duplicate = own.clone();
+        duplicate.0 = WindowId(0xabc);
+        MAC_PROXY_WINDOWS.with(|rows| rows.borrow_mut().as_mut().unwrap().push(duplicate));
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_placements();
+        assert!(
+            h.rig.agent.pending.is_empty(),
+            "ambiguous lookup reports no ID"
+        );
+        for _ in 0..3 {
+            h.rig.agent.set_proxy_title(key, "proxy".into());
+            assert!(
+                h.rig.agent.placement.lookup_warned.contains(&key),
+                "identical title cannot clear warn-once state"
+            );
+            h.rig.agent.flush_placements();
+            assert!(h.rig.agent.pending.is_empty());
+        }
+        h.rig.agent.set_proxy_title(key, "renamed".into());
+        assert!(!h.rig.agent.placement.lookup_warned.contains(&key));
+        h.rig.agent.flush_placements();
+        assert!(
+            h.rig.agent.pending.is_empty(),
+            "the old title cannot authorize a retitle"
+        );
+        let mut renamed = own;
+        renamed.1 = "renamed".into();
+        MAC_PROXY_WINDOWS.with(|rows| *rows.borrow_mut() = Some(vec![renamed]));
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_placements();
+        assert!(
+            matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key:k, window:WindowId(0x123) }) if k == key)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_swapped_retitles_keep_pinned_ids_until_the_same_quartz_ids_have_fresh_titles() {
+        let mut h = home();
+        let commands = command_host(&mut h, None);
+        h.rig.agent.platform.own_windows = injected_own_windows;
+        let a = proxy_key(1);
+        let b = proxy_key(2);
+        let first = WindowId(0x123);
+        let second = WindowId(0x456);
+        MAC_PROXY_WINDOWS.with(|rows| {
+            *rows.borrow_mut() = Some(vec![(first, "A".into()), (second, "B".into())])
+        });
+        for (key, title) in [(a, "A"), (b, "B")] {
+            h.rig.agent.titles.insert(key, (title.into(), 0));
+            h.rig.agent.proxy_ids.open(key);
+            h.rig.agent.observe(&Input::ProxyOpened {
+                key,
+                result: Ok((PixelSize::new(800, 600), 2.0)),
+            });
+        }
+        h.rig.agent.flush_placements();
+        assert!(
+            matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key, window }) if key == a && window == first)
+        );
+        assert!(
+            matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key, window }) if key == b && window == second)
+        );
+        h.rig.agent.set_proxy_title(a, "B".into());
+        h.rig.agent.set_proxy_title(b, "A".into());
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            2,
+            "title commands are queued, not applied to Quartz"
+        );
+        assert_eq!(h.rig.agent.placement.native[&a], first);
+        assert_eq!(h.rig.agent.placement.native[&b], second);
+        let start = Instant::now();
+        h.rig.agent.flush_mac_placements(start);
+        assert!(
+            h.rig.agent.pending.is_empty(),
+            "stale swapped titles cannot exchange native identities"
+        );
+        for key in [a, b] {
+            assert!(h.rig.agent.placement.lookup_rereport.contains(&key));
+            assert!(h.rig.agent.placement.lookup_retry.contains_key(&key));
+        }
+        assert_eq!(h.rig.agent.placement.native[&a], first);
+        assert_eq!(h.rig.agent.placement.native[&b], second);
+        MAC_PROXY_WINDOWS.with(|rows| {
+            *rows.borrow_mut() = Some(vec![(first, "B".into()), (second, "A".into())])
+        });
+        h.rig
+            .agent
+            .flush_mac_placements(start + Duration::from_millis(100));
+        assert!(
+            matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key, window }) if key == a && window == first)
+        );
+        assert!(
+            matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key, window }) if key == b && window == second)
+        );
+        assert!(h.rig.agent.placement.lookup_rereport.is_empty());
+        assert!(h.rig.agent.placement.lookup_retry.is_empty());
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_placements();
+        assert!(
+            h.rig.agent.pending.is_empty(),
+            "fresh titles re-report only once"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_proxy_lookup_retries_without_window_events_backs_off_expires_and_cancels_on_close() {
+        let mut h = home();
+        let key = proxy_key(1);
+        h.rig.agent.platform.own_windows = injected_own_windows;
+        h.rig.agent.placement.opened(key, "proxy");
+        h.rig.agent.placement_dirty = true;
+        MAC_PROXY_WINDOWS.with(|rows| *rows.borrow_mut() = None);
+        let start = Instant::now();
+        h.rig.agent.flush_mac_placements(start);
+        assert!(h.rig.agent.pending.is_empty());
+        let (until, next, delay) = h.rig.agent.placement.lookup_retry[&key];
+        assert_eq!(until - start, Duration::from_secs(10));
+        assert_eq!(next - start, Duration::from_millis(100));
+        assert_eq!(delay, Duration::from_millis(200));
+        assert_eq!(
+            h.rig.agent.receive_timeout(platform::now(), start),
+            Duration::from_millis(100)
+        );
+        MAC_PROXY_WINDOWS
+            .with(|rows| *rows.borrow_mut() = Some(vec![(WindowId(0x123), "proxy".into())]));
+        h.rig
+            .agent
+            .flush_mac_placements(start + Duration::from_millis(99));
+        assert!(h.rig.agent.pending.is_empty());
+        h.rig.agent.flush_mac_placements(next);
+        assert!(
+            matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key:k, window:WindowId(0x123) }) if k == key)
+        );
+        assert!(!h.rig.agent.placement.lookup_retry.contains_key(&key));
+        h.rig.agent.placement.retitled(key, "missing");
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_mac_placements(start);
+        for _ in 0..15 {
+            let (_, next, _) = h.rig.agent.placement.lookup_retry[&key];
+            h.rig.agent.flush_mac_placements(next);
+            assert!(h.rig.agent.placement.lookup_retry[&key].2 <= Duration::from_secs(1));
+        }
+        MAC_PROXY_WINDOWS
+            .with(|rows| *rows.borrow_mut() = Some(vec![(WindowId(0x123), "missing".into())]));
+        h.rig
+            .agent
+            .flush_mac_placements(start + Duration::from_secs(11));
+        assert!(h.rig.agent.pending.is_empty(), "give up after 10 s");
+        assert_eq!(
+            h.rig
+                .agent
+                .receive_timeout(platform::now(), start + Duration::from_secs(11)),
+            HOUSEKEEPING
+        );
+        h.rig.agent.placement.retitled(key, "new episode");
+        h.rig.agent.placement_dirty = true;
+        h.rig.agent.flush_mac_placements(start);
+        h.rig.agent.placement.closed(key);
+        assert!(!h.rig.agent.placement.lookup_retry.contains_key(&key));
+        assert!(!h.rig.agent.placement.lookup_rereport.contains(&key));
+        MAC_PROXY_WINDOWS
+            .with(|rows| *rows.borrow_mut() = Some(vec![(WindowId(0x123), "new episode".into())]));
+        h.rig
+            .agent
+            .flush_mac_placements(start + Duration::from_secs(1));
+        assert!(
+            h.rig.agent.pending.is_empty(),
+            "closed proxies cannot report late results"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_open_proxy_converts_and_clamps_content_without_native_reads_and_none_passes_through() {
+        let mut h = home();
+        let commands = command_host(&mut h, None);
+        h.rig.agent.local_displays = vec![
+            display(2, 1.0, (500.0, 0.0), (1920, 1080)),
+            display(1, 2.0, (-500.0, 100.0), (2000, 1600)),
+        ];
+        h.rig.agent.platform.visible_frame = |_| {
+            Ok(RectLogical::new(
+                PointLogical::new(-480.0, 130.0),
+                SizeLogical::new(950.0, 720.0),
+            ))
+        };
+        for (i, x, y, expected) in [
+            (1, 300, 200, (-350.0, 200.0)),
+            (2, -9999, -9999, (-480.0, 130.0)),
+            (3, 9999, 9999, (469.0, 849.0)),
+        ] {
+            h.rig.agent.execute_one(Output::OpenProxy {
+                key: proxy_key(i),
+                title: "fixture".into(),
+                app_id: "app".into(),
+                size: PixelSize::new(800, 600),
+                place: Some(ProxyPlacement {
+                    display: DisplayId(1),
+                    x,
+                    y,
+                    drag: true,
+                }),
+            });
+            assert!(
+                matches!(commands.lock().unwrap().last(), Some(HostCommand::Open { place:Some(p), .. }) if (p.content.x, p.content.y) == expected)
+            );
+        }
+        h.rig.agent.execute_one(Output::OpenProxy {
+            key: proxy_key(4),
+            title: "oversized".into(),
+            app_id: "app".into(),
+            size: PixelSize::new(10000, 10000),
+            place: Some(ProxyPlacement {
+                display: DisplayId(1),
+                x: 0,
+                y: 0,
+                drag: true,
+            }),
+        });
+        assert!(
+            matches!(commands.lock().unwrap().last(), Some(HostCommand::Open { place:Some(p), .. }) if (p.content.x, p.content.y) == (-480.0, 130.0)),
+            "oversized content keeps its top-left visible, independent of the primary display's scale"
+        );
+        h.rig.agent.platform.visible_frame = |_| panic!("None must not query a screen");
+        h.rig.agent.execute_one(Output::OpenProxy {
+            key: proxy_key(5),
+            title: "unplaced".into(),
+            app_id: "app".into(),
+            size: PixelSize::new(800, 600),
+            place: None,
+        });
+        assert!(matches!(
+            commands.lock().unwrap().last(),
+            Some(HostCommand::Open { place: None, .. })
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     struct ConfirmPlacement {

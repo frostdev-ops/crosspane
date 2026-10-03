@@ -15,7 +15,9 @@ use std::time::Duration;
 use crosspane_platform::{Displays, EventSink, PlatformError};
 use crosspane_types::color::ColorSpace;
 use crosspane_types::display::DisplayInfo;
-use crosspane_types::geom::{DisplayGeometry, PixelSize, PointLogical, SizeMm};
+use crosspane_types::geom::{
+    DisplayGeometry, PixelSize, PointLogical, RectLogical, SizeLogical, SizeMm,
+};
 use crosspane_types::id::DisplayId;
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSScreen;
@@ -64,6 +66,76 @@ impl MacDisplays {
             subscription: None,
         })
     }
+}
+
+/// The selected screen's public visible frame, in global top-left logical coordinates.
+/// Off the main thread, the existing helper bounds the wait to 250 ms; late reads are inert.
+pub fn visible_frame(id: DisplayId) -> Result<RectLogical, PlatformError> {
+    on_main(MAIN_WAIT, move |mtm| {
+        autoreleasepool(|_| {
+            let key = NSString::from_str("NSScreenNumber");
+            for screen in NSScreen::screens(mtm).iter() {
+                let description = screen.deviceDescription();
+                if description
+                    .objectForKey(&key)
+                    .and_then(|n| n.downcast_ref::<NSNumber>().map(|n| n.unsignedIntValue()))
+                    != Some(id.0)
+                {
+                    continue;
+                }
+                let frame = screen.frame();
+                let visible = screen.visibleFrame();
+                let bounds = CGDisplayBounds(id.0);
+                return map_visible_frame(
+                    (bounds.origin.x, bounds.origin.y),
+                    (
+                        frame.origin.x,
+                        frame.origin.y,
+                        frame.size.width,
+                        frame.size.height,
+                    ),
+                    (
+                        visible.origin.x,
+                        visible.origin.y,
+                        visible.size.width,
+                        visible.size.height,
+                    ),
+                );
+            }
+            Err(PlatformError::NotFound)
+        })
+    })?
+}
+
+fn map_visible_frame(
+    origin: (f64, f64),
+    frame: (f64, f64, f64, f64),
+    visible: (f64, f64, f64, f64),
+) -> Result<RectLogical, PlatformError> {
+    let (fx, fy, fw, fh) = frame;
+    let (vx, vy, vw, vh) = visible;
+    let x = origin.0 + vx - fx;
+    let y = origin.1 + (fy + fh) - (vy + vh);
+    if ![origin.0, origin.1, fx, fy, fw, fh, vx, vy, vw, vh, x, y]
+        .iter()
+        .all(|n| n.is_finite())
+        || fw <= 0.0
+        || fh <= 0.0
+        || vw <= 0.0
+        || vh <= 0.0
+        || vx < fx
+        || vy < fy
+        || vx + vw > fx + fw
+        || vy + vh > fy + fh
+    {
+        return Err(PlatformError::Backend(
+            "invalid visible display frame".into(),
+        ));
+    }
+    Ok(RectLogical::new(
+        PointLogical::new(x, y),
+        SizeLogical::new(vw, vh),
+    ))
 }
 
 impl Displays for MacDisplays {
@@ -419,6 +491,26 @@ fn map_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Numeric conversion only: never enumerates screens or runs AppKit.
+    #[test]
+    fn visible_frame_maps_appkit_reservations_to_global_top_left_without_native_reads() {
+        let mapped = map_visible_frame(
+            (-1200.0, 200.0),
+            (-1200.0, -100.0, 1200.0, 800.0),
+            (-1160.0, -50.0, 1160.0, 720.0),
+        )
+        .unwrap();
+        assert_eq!(mapped.origin, PointLogical::new(-1160.0, 230.0));
+        assert_eq!(mapped.size, SizeLogical::new(1160.0, 720.0));
+        for bad in [
+            (0.0, 0.0, 0.0, 100.0),
+            (0.0, 0.0, 1201.0, 800.0),
+            (f64::NAN, 0.0, 100.0, 100.0),
+        ] {
+            assert!(map_visible_frame((0.0, 0.0), (0.0, 0.0, 1200.0, 800.0), bad).is_err());
+        }
+    }
 
     #[test]
     fn maps_mode_rotation_and_fallbacks() {
