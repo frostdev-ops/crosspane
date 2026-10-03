@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // AGENTS.md permits assertions in test fixtures.
-//! WP-4.12a native admission tests. Transport/framing is supplied by the sequential WP-4.12b.
+//! WP-4.12a native admission and WP-4.12b bounded transport, with injected observations.
 use crosspane_installer::agent_contract::{
     self, BootstrapPhase, InstanceStatus, ObservationSource,
 };
@@ -8,6 +8,14 @@ use crosspane_installer::agent_contract::{
 #[path = "../src/platform/macos/native_io.rs"]
 #[allow(dead_code, unused_imports)]
 mod subject;
+use subject as native_io;
+#[path = "../src/platform/macos/transport.rs"]
+#[allow(dead_code, unused_imports)]
+mod wire;
+use crate::agent_contract::{
+    AgentCall, AgentPlatform, AgentPort, AgentRefusal, CallFailure, ContractError, DecodedReply,
+    InstallerRequest, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, StatusAdmission,
+};
 use std::{
     collections::BTreeMap,
     fs,
@@ -23,6 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 use subject::*;
+use wire::{BoundedResolver, HostLookup, MacAgentPort, SelectedAgent, SelectedLink};
 
 #[derive(Default)]
 struct FakeClock(AtomicU64);
@@ -365,6 +374,1652 @@ fn explicit_scratch_target_never_uses_owner_defaults_and_discovery_is_read_only(
     assert!(calls.is_empty());
     assert!(!f.home.join("Library/LaunchAgents").exists());
 }
+
+// Producer-shaped bytes. Only scratch identity/path fields are replaced for each selected target.
+const MAC_STATUS: &[u8] = br#"{"ok":true,"result":{"controlling":null,"controlled_by":null,
+"projections":[],"displays":[],"peers":[],"layout":[],"installer":{
+"schema_version":1,"build":{"version":"0.0.0","features":["video"]},
+"instance":{"id":18446744073709551615,"pid":4242,"uid":1,"exe":"/explicit/scratch",
+"runtime_dir":"/explicit/scratch","started_unix_ms":0},"config_revision":"9f86d081884c7d65",
+"node":"1111111111111111111111111111111111111111111111111111111111111111",
+"recovery_pending":0,"startup_recovery":"nothing_parked",
+"gate":{"open":true,"session":"unlocked","active":true,"armed":false,"panic":false},
+"epochs":{"gate":1,"grants":2,"layout":3,"backends":4},
+"backends":[{"name":"capture","state":"ready","reason":null},
+{"name":"keys","state":"ready","reason":null},{"name":"pointer","state":"ready","reason":null},
+{"name":"overlay","state":"ready","reason":null},{"name":"hotkeys","state":"ready","reason":null},
+{"name":"keystore","state":"ready","reason":null},{"name":"windows","state":"ready","reason":null},
+{"name":"parking","state":"ready","reason":null},{"name":"frames","state":"ready","reason":null},
+{"name":"tray","state":"ready","reason":null},{"name":"links","state":"ready","reason":null},
+{"name":"gpu","state":"ready","reason":null},{"name":"home","state":"ready","reason":null},
+{"name":"audio","state":"ready","reason":null},{"name":"discovery","state":"ready","reason":null}],
+"keystore":"os_store","permissions":[{"name":"screen_recording","state":"granted"},
+{"name":"accessibility","state":"granted"},{"name":"input_monitoring","state":"granted"}],
+"discovery":{"enabled":false,"running":false,"candidates":0,"error":null},"tray":{"created":true},
+"audio":{"enabled":false,"active_peers":[],"frames_sent":0,"frames_played":0},"settings_opened":0,
+"peers":[{"node":"2222222222222222222222222222222222222222222222222222222222222222",
+"name":"owned peer","connected":true,"link_generation":3,"features":["e1"],"grants_given":[],
+"last_source_parking":null,"counters":{"e1_controller_started":0,"e1_controller_ended":0,
+"e1_target_started":0,"e1_target_ended":0,"e1_injections_ok":0,"e1_hud_shows":0,
+"e1_chord_releases":0,"e1_command_releases":0,"e2_source_started":0,"e2_source_returned":0,
+"e2_dest_started":0,"e2_dest_returned":0,"e2_frames_presented":null,"e2_returns_failed":0}}]}}}"#;
+fn wire_status(f: &Fixture) -> serde_json::Value {
+    let mut value: serde_json::Value = serde_json::from_slice(MAC_STATUS).unwrap();
+    value["result"]["installer"]["instance"] = serde_json::to_value(f.status()).unwrap();
+    let bytes = line(&value);
+    assert!(matches!(
+        agent_contract::decode_reply(&InstallerRequest::Status, &bytes, AgentPlatform::Macos),
+        Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+    ));
+    value
+}
+fn line(value: &serde_json::Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+fn selected(f: &Fixture) -> SelectedAgent {
+    SelectedAgent {
+        io: f.io.clone(),
+        support: f.proof(),
+        instance: Arc::new(f.admitted()),
+        link: Some(SelectedLink {
+            node: crosspane_types::id::NodeId([0x22; 32]),
+            generation: 3,
+        }),
+    }
+}
+fn call(id: u64, request: InstallerRequest, timeout_ms: u64) -> AgentCall {
+    AgentCall {
+        id,
+        request,
+        timeout_ms,
+    }
+}
+fn drain(port: &mut MacAgentPort, count: usize) -> Vec<agent_contract::AgentReply> {
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut replies = Vec::new();
+    while replies.len() < count {
+        replies.extend(port.poll());
+        assert!(Instant::now() < until, "missing selected-agent reply");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    replies
+}
+type SocketHandler = Arc<dyn Fn(&[u8], &mut std::os::unix::net::UnixStream) + Send + Sync>;
+struct ReleaseOnDrop(Arc<AtomicBool>);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+fn wait_for(mut ready: impl FnMut() -> bool) {
+    let until = Instant::now() + Duration::from_secs(3);
+    while !ready() {
+        assert!(Instant::now() < until, "owned test stage did not finish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+struct Server {
+    requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    stop: Arc<AtomicBool>,
+    task: Option<std::thread::JoinHandle<()>>,
+}
+impl Server {
+    fn new(f: &Fixture, handler: SocketHandler) -> Self {
+        Self::guarded(f, handler, None)
+    }
+    fn guarded(
+        f: &Fixture,
+        handler: SocketHandler,
+        before_read: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+    ) -> Self {
+        let listener = f._listener.try_clone().unwrap();
+        Self::owned(listener, handler, before_read)
+    }
+    fn owned(
+        listener: UnixListener,
+        handler: SocketHandler,
+        before_read: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+    ) -> Self {
+        Self::reader(listener, handler, before_read, false)
+    }
+    fn reader(
+        listener: UnixListener,
+        handler: SocketHandler,
+        before_read: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+        prefix: bool,
+    ) -> Self {
+        use std::io::Read;
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let task = std::thread::spawn(move || {
+            let mut accepted = 0;
+            while !stopping.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        accepted += 1;
+                        if let Some(before) = &before_read {
+                            before(accepted);
+                        }
+                        // macOS refuses socket options (EINVAL) once the peer has already
+                        // closed the connection: such a client sent nothing.
+                        let configured = socket
+                            .set_nonblocking(false)
+                            .and_then(|()| socket.set_read_timeout(Some(Duration::from_secs(2))))
+                            .and_then(|()| socket.set_write_timeout(Some(Duration::from_secs(2))));
+                        if configured.is_err() {
+                            received.lock().unwrap().push(Vec::new());
+                            continue;
+                        }
+                        let mut bytes = Vec::new();
+                        if prefix {
+                            let mut buffer = [0; 8192];
+                            let n = socket.read(&mut buffer).unwrap();
+                            bytes.extend_from_slice(&buffer[..n]);
+                        } else {
+                            (&mut socket)
+                                .take((MAX_REQUEST_BYTES + 1) as u64)
+                                .read_to_end(&mut bytes)
+                                .unwrap();
+                        }
+                        assert!(bytes.len() <= MAX_REQUEST_BYTES);
+                        received.lock().unwrap().push(bytes.clone());
+                        if !bytes.is_empty() {
+                            handler(&bytes, &mut socket);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("owned listener failed: {e}"),
+                }
+            }
+        });
+        Self {
+            requests,
+            stop,
+            task: Some(task),
+        }
+    }
+    fn commands(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| !b.is_empty())
+            .map(|b| {
+                serde_json::from_slice::<serde_json::Value>(b).unwrap()["cmd"]
+                    .as_str()
+                    .unwrap()
+                    .into()
+            })
+            .collect()
+    }
+}
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let result = self.task.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
+fn command(bytes: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["cmd"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+fn send_owned(socket: &mut std::os::unix::net::UnixStream, bytes: &[u8]) {
+    use std::io::Write;
+    if let Err(error) = socket.write_all(bytes) {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ),
+            "unexpected owned socket error: {error}"
+        );
+    }
+}
+fn basic_server(f: &Fixture, answer: &[u8]) -> Server {
+    let status = line(&wire_status(f));
+    let answer = answer.to_vec();
+    Server::new(
+        f,
+        Arc::new(move |bytes, socket| {
+            send_owned(
+                socket,
+                if command(bytes) == "status" {
+                    &status
+                } else {
+                    &answer
+                },
+            );
+        }),
+    )
+}
+
+fn bound_not_listening(f: &Fixture) -> Arc<rustix::fd::OwnedFd> {
+    use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketType};
+    let path = f.io.target().socket_path();
+    fs::remove_file(&path).unwrap();
+    let socket = net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    net::bind(&socket, &SocketAddrUnix::new(&path).unwrap()).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    Arc::new(socket)
+}
+
+#[test]
+fn transport_reconnect_has_three_fresh_pre_byte_attempts_and_two_four_ms_backoff() {
+    for ready_at in [None, Some(2), Some(3)] {
+        let f = Fixture::new();
+        let socket = bound_not_listening(&f);
+        let selection = selected(&f);
+        let checks = Arc::new(AtomicU64::new(0));
+        let checked = checks.clone();
+        let server = Arc::new(Mutex::new(None::<Server>));
+        let started = server.clone();
+        let status = line(&wire_status(&f));
+        *f.support.2.lock().unwrap() = Some(Arc::new(move |_| {
+            let attempt = checked.fetch_add(1, Ordering::AcqRel) + 1;
+            if Some(attempt) == ready_at {
+                rustix::net::listen(&socket, 16).unwrap();
+                let listener = UnixListener::from(socket.try_clone().unwrap());
+                let status = status.clone();
+                *started.lock().unwrap() = Some(Server::owned(
+                    listener,
+                    Arc::new(move |bytes, stream| {
+                        assert_eq!(command(bytes), "status");
+                        send_owned(stream, &status);
+                    }),
+                    None,
+                ));
+            }
+        }));
+        let mut port = MacAgentPort::new(selection, Arc::new(|| 17)).unwrap();
+        port.submit(call(1, InstallerRequest::Status, 5000))
+            .unwrap();
+        let reply = drain(&mut port, 1).pop().unwrap();
+        assert_eq!(
+            wire::BACKOFF
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(home, _)| home == &f.home)
+                .map(|(_, delay)| *delay)
+                .collect::<Vec<_>>(),
+            if ready_at == Some(2) {
+                vec![2]
+            } else {
+                vec![2, 4]
+            }
+        );
+        if ready_at.is_none() {
+            assert_eq!(reply.result, Err(CallFailure::Unavailable));
+            assert_eq!(checks.load(Ordering::Acquire), 3);
+        } else {
+            assert!(matches!(
+                reply.result,
+                Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+            ));
+            assert_eq!(
+                server.lock().unwrap().as_ref().unwrap().commands(),
+                ["status"]
+            );
+        }
+        *f.support.2.lock().unwrap() = None;
+    }
+}
+
+#[test]
+fn transport_reconnect_cannot_escape_total_deadline_or_original_instance() {
+    for expires in [false, true] {
+        let f = Fixture::new();
+        let _socket = bound_not_listening(&f);
+        let selection = selected(&f);
+        let checks = Arc::new(AtomicU64::new(0));
+        let checked = checks.clone();
+        let clock = f.clock.clone();
+        let bootstrap = f.runtime.join("bootstrap.json");
+        let mut replacement: serde_json::Value =
+            serde_json::from_slice(&fs::read(&bootstrap).unwrap()).unwrap();
+        replacement["instance_id"] = 7.into();
+        *f.support.2.lock().unwrap() = Some(Arc::new(move |_| {
+            if checked.fetch_add(1, Ordering::AcqRel) + 1 == 2 {
+                if expires {
+                    clock.set(5001);
+                } else {
+                    fs::write(&bootstrap, serde_json::to_vec(&replacement).unwrap()).unwrap();
+                }
+            }
+        }));
+        let mut port = MacAgentPort::new(selection, Arc::new(|| 19)).unwrap();
+        port.submit(call(1, InstallerRequest::Status, 5000))
+            .unwrap();
+        assert_eq!(
+            drain(&mut port, 1)[0].result,
+            Err(if expires {
+                CallFailure::TimeoutOutcomeUnknown
+            } else {
+                CallFailure::Unavailable
+            })
+        );
+        assert_eq!(checks.load(Ordering::Acquire), 2);
+        *f.support.2.lock().unwrap() = None;
+    }
+}
+
+#[test]
+fn transport_status_and_partial_reply_retain_complete_byte_clock_before_poll_and_post_status() {
+    let f = Fixture::new();
+    let status = line(&wire_status(&f));
+    let ticks = Arc::new(AtomicU64::new(10));
+    let body = Arc::new(AtomicBool::new(false));
+    let newline = Arc::new(AtomicBool::new(false));
+    let receipt = Arc::new(AtomicBool::new(false));
+    let continue_receipt = Arc::new(AtomicBool::new(false));
+    let validation = Arc::new(AtomicBool::new(false));
+    let stages = Arc::new(AtomicU64::new(0));
+    let home = f.home.clone();
+    let received = receipt.clone();
+    let resumed = continue_receipt.clone();
+    let count = stages.clone();
+    *wire::HOOK.lock().unwrap() = Some(Arc::new(move |selected, stage| {
+        if selected == home && stage == "receipt" && count.fetch_add(1, Ordering::AcqRel) + 1 == 2 {
+            received.store(true, Ordering::Release);
+            wait_for(|| resumed.load(Ordering::Acquire));
+        }
+    }));
+    let after = receipt.clone();
+    let advanced = validation.clone();
+    let during = ticks.clone();
+    *f.support.2.lock().unwrap() = Some(Arc::new(move |_| {
+        if after.load(Ordering::Acquire) && !advanced.swap(true, Ordering::AcqRel) {
+            during.store(50, Ordering::Release);
+        }
+    }));
+    let sent = body.clone();
+    let send_newline = newline.clone();
+    let before = ticks.clone();
+    let server = Server::new(
+        &f,
+        Arc::new(move |bytes, socket| {
+            if command(bytes) == "status" {
+                send_owned(socket, &status);
+                return;
+            }
+            assert_eq!(command(bytes), "settings_update");
+            let answer=b"{\"ok\":true,\"result\":{\"revision\":\"9f86d081884c7d65\",\"restart_required\":true}}";
+            before.store(20, Ordering::Release);
+            for chunk in answer.chunks(13) {
+                send_owned(socket, chunk);
+            }
+            sent.store(true, Ordering::Release);
+            wait_for(|| send_newline.load(Ordering::Acquire));
+            send_owned(socket, b"\n");
+        }),
+    );
+    let _newline_unwind = ReleaseOnDrop(newline.clone());
+    let _receipt_unwind = ReleaseOnDrop(continue_receipt.clone());
+    let clock = ticks.clone();
+    let mut port = MacAgentPort::new(
+        selected(&f),
+        Arc::new(move || clock.load(Ordering::Acquire)),
+    )
+    .unwrap();
+    port.submit(call(
+        1,
+        InstallerRequest::SettingsUpdate {
+            expected_revision: "9f86d081884c7d65".into(),
+            mac_virtual_display: false,
+        },
+        5000,
+    ))
+    .unwrap();
+    wait_for(|| body.load(Ordering::Acquire));
+    assert_eq!(stages.load(Ordering::Acquire), 1); // Pre-status only; body without newline has no receipt.
+    ticks.store(30, Ordering::Release);
+    newline.store(true, Ordering::Release);
+    wait_for(|| receipt.load(Ordering::Acquire)); // Complete bytes, before EOF/post-read admission.
+    ticks.store(40, Ordering::Release);
+    continue_receipt.store(true, Ordering::Release);
+    wait_for(|| validation.load(Ordering::Acquire) && server.commands().len() == 3);
+    assert_eq!(ticks.load(Ordering::Acquire), 50);
+    ticks.store(60, Ordering::Release); // GUI delivery cannot refresh the completed receipt.
+    let reply = drain(&mut port, 1).pop().unwrap();
+    assert_eq!(reply.observed_at_ms, 30);
+    assert_eq!(reply.source, ObservationSource::Demo);
+    assert_eq!(
+        reply.result,
+        Ok(DecodedReply::SettingsUpdated(
+            agent_contract::SettingsUpdated {
+                revision: "9f86d081884c7d65".into(),
+                restart_required: true
+            }
+        ))
+    );
+    assert_eq!(server.commands(), ["status", "settings_update", "status"]);
+    *wire::HOOK.lock().unwrap() = None;
+    *f.support.2.lock().unwrap() = None;
+}
+
+#[test]
+fn transport_full_typed_place_request_uses_partial_writes_and_keeps_exact_bytes() {
+    let f = Fixture::new();
+    let server = basic_server(&f, b"{\"ok\":true}\n");
+    let selection = selected(&f);
+    let before = f.runner.calls.lock().unwrap().len();
+    let mut port = MacAgentPort::new(selection, Arc::new(|| 29)).unwrap();
+    let request = InstallerRequest::Place {
+        placements: (0..128)
+            .map(|display| agent_contract::Placement {
+                node: crosspane_types::id::NodeId([0x22; 32]),
+                display,
+                origin_mm: [1.234567890123456e200, -1.234567890123456e200],
+            })
+            .collect(),
+    };
+    let expected = agent_contract::encode_request(&request).unwrap();
+    assert!(expected.len() > 8192 && expected.len() < MAX_REQUEST_BYTES);
+    port.submit(call(1, request, 5000)).unwrap();
+    assert_eq!(
+        drain(&mut port, 1)[0].result,
+        Ok(DecodedReply::Acknowledged)
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests[1], expected);
+    assert!(
+        f.runner.calls.lock().unwrap().len() - before > 120,
+        "bounded send buffer must require another mutation write and original-instance recheck"
+    );
+}
+
+#[test]
+fn transport_refusal_payload_categories_and_sensitive_debug_are_preserved() {
+    for (reason, refusal) in [
+        ("revision_conflict", AgentRefusal::RevisionConflict),
+        ("not_supported", AgentRefusal::NotSupported),
+        ("other", AgentRefusal::Other),
+    ] {
+        let f = Fixture::new();
+        let reason = if reason == "other" {
+            "SENSITIVE-WIRE-SENTINEL"
+        } else {
+            reason
+        };
+        let answer = format!("{{\"ok\":false,\"error\":\"{reason}\",\"result\":null}}\n");
+        let server = basic_server(&f, answer.as_bytes());
+        let selection = selected(&f);
+        assert!(!format!("{selection:?}").contains("SENSITIVE"));
+        let mut port = MacAgentPort::new(selection, Arc::new(|| 31)).unwrap();
+        port.submit(call(1, InstallerRequest::Release, 1000))
+            .unwrap();
+        let reply = drain(&mut port, 1).pop().unwrap();
+        assert_eq!(reply.result, Err(CallFailure::Refused(refusal)));
+        assert_eq!(reply.observed_at_ms, 31);
+        assert_eq!(reply.source, ObservationSource::Demo);
+        assert!(!format!("{reply:?} {port:?}").contains("SENSITIVE-WIRE-SENTINEL"));
+        assert_eq!(server.commands(), ["status", "release", "status"]);
+    }
+}
+
+#[test]
+fn transport_response_limit_exact_boundary_missing_newline_and_trailing_objects() {
+    for kind in [
+        "exact",
+        "oversize",
+        "missing-newline",
+        "trailing",
+        "invalid-json",
+    ] {
+        let f = Fixture::new();
+        let mut answer = b"{\"ok\":true}".to_vec();
+        match kind {
+            "exact" | "oversize" => {
+                answer.resize(MAX_RESPONSE_BYTES - usize::from(kind == "exact"), b' ');
+                answer.push(b'\n');
+            }
+            "missing-newline" => {}
+            "trailing" => answer.extend_from_slice(b"\n{\"ok\":true}\n"),
+            "invalid-json" => answer = b"not-json\n".to_vec(),
+            _ => unreachable!(),
+        }
+        let server = basic_server(&f, &answer);
+        let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 47)).unwrap();
+        port.submit(call(1, InstallerRequest::Release, 5000))
+            .unwrap();
+        assert_eq!(
+            drain(&mut port, 1)[0].result,
+            if kind == "exact" {
+                Ok(DecodedReply::Acknowledged)
+            } else {
+                Err(CallFailure::InvalidResponse)
+            }
+        );
+        assert_eq!(
+            server.commands().iter().filter(|c| *c == "release").count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn transport_queue_full_and_local_invalid_calls_start_no_io_and_poll_is_bounded() {
+    let f = Fixture::new();
+    let selection = selected(&f);
+    let before = f.runner.calls.lock().unwrap().len();
+    f._listener.set_nonblocking(true).unwrap();
+    f.runner.blocked.store(true, Ordering::Release);
+    let mut port = MacAgentPort::new(selection.clone(), Arc::new(|| 50)).unwrap();
+    assert_eq!(f.runner.calls.lock().unwrap().len(), before);
+    assert_eq!(
+        port.submit(call(0, InstallerRequest::Status, 1000)),
+        Err(CallFailure::InvalidCall(ContractError::InvalidValue))
+    );
+    assert_eq!(
+        port.submit(call(1, InstallerRequest::Status, 0)),
+        Err(CallFailure::InvalidCall(ContractError::InvalidDeadline))
+    );
+    assert_eq!(
+        port.submit(call(1, InstallerRequest::Status, 5001)),
+        Err(CallFailure::InvalidCall(ContractError::InvalidDeadline))
+    );
+    assert_eq!(
+        port.submit(call(
+            1,
+            InstallerRequest::PairListen { allow_input: true },
+            1000
+        )),
+        Err(CallFailure::InvalidCall(ContractError::InvalidValue))
+    );
+    let begin = Instant::now();
+    for id in 1..=32 {
+        port.submit(call(id, InstallerRequest::Status, 1000))
+            .unwrap();
+    }
+    assert!(begin.elapsed() < Duration::from_millis(100));
+    assert_eq!(
+        port.submit(call(33, InstallerRequest::Status, 1000)),
+        Err(CallFailure::QueueFull)
+    );
+    assert_eq!(port.redetect(selection), Err(NativeError::Busy));
+    assert!(matches!(f._listener.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+    f.clock.set(1001);
+    let replies = drain(&mut port, 32);
+    assert_eq!(replies.len(), 32);
+    assert!(
+        replies
+            .iter()
+            .all(|r| r.result == Err(CallFailure::TimeoutOutcomeUnknown)
+                && r.source == ObservationSource::Demo)
+    );
+    assert_eq!(
+        replies.iter().map(|r| r.id).collect::<Vec<_>>(),
+        (1..=32).collect::<Vec<_>>()
+    );
+    f.runner.blocked.store(false, Ordering::Release);
+    assert_eq!(
+        port.submit(call(32, InstallerRequest::Status, 1000)),
+        Err(CallFailure::InvalidCall(ContractError::InvalidValue))
+    );
+}
+
+#[test]
+fn transport_completed_undrained_replies_still_count_toward_thirty_two() {
+    let f = Fixture::new();
+    let server = basic_server(&f, b"{\"ok\":true}\n");
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 61)).unwrap();
+    for id in 1..=32 {
+        port.submit(call(id, InstallerRequest::Status, 5000))
+            .unwrap();
+    }
+    let until = Instant::now() + Duration::from_secs(5);
+    while server.commands().len() < 32 {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        port.submit(call(33, InstallerRequest::Status, 1000)),
+        Err(CallFailure::QueueFull)
+    );
+    assert_eq!(drain(&mut port, 32).len(), 32);
+    port.submit(call(33, InstallerRequest::Status, 1000))
+        .unwrap();
+    assert!(matches!(
+        drain(&mut port, 1)[0].result,
+        Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+    ));
+}
+
+#[test]
+fn transport_mutation_timeout_detects_but_never_resends_or_unblocks_without_explicit_handoff() {
+    let f = Fixture::new();
+    let status = line(&wire_status(&f));
+    let clock = f.clock.clone();
+    let release = Arc::new(AtomicBool::new(false));
+    let released = release.clone();
+    let server = Server::new(
+        &f,
+        Arc::new(move |bytes, socket| match command(bytes).as_str() {
+            "status" => send_owned(socket, &status),
+            "release" => {
+                clock.set(1001);
+                while !released.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            "panic" => send_owned(socket, b"{\"ok\":true}\n"),
+            other => panic!("unexpected command {other}"),
+        }),
+    );
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 71)).unwrap();
+    let _unwind_release = ReleaseOnDrop(release.clone());
+    port.submit(call(1, InstallerRequest::Release, 1000))
+        .unwrap();
+    port.submit(call(2, InstallerRequest::Panic, 5000)).unwrap();
+    let replies = drain(&mut port, 2);
+    assert_eq!(replies[0].result, Err(CallFailure::TimeoutOutcomeUnknown));
+    assert_eq!(replies[1].result, Err(CallFailure::Unavailable));
+    release.store(true, Ordering::Release);
+    port.submit(call(3, InstallerRequest::Status, 1000))
+        .unwrap();
+    assert!(matches!(
+        drain(&mut port, 1)[0].result,
+        Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+    ));
+    port.submit(call(4, InstallerRequest::Panic, 1000)).unwrap();
+    assert_eq!(drain(&mut port, 1)[0].result, Err(CallFailure::Unavailable));
+    port.redetect(selected(&f)).unwrap();
+    port.submit(call(5, InstallerRequest::Panic, 1000)).unwrap();
+    assert_eq!(
+        drain(&mut port, 1)[0].result,
+        Ok(DecodedReply::Acknowledged)
+    );
+    assert_eq!(
+        server.commands().iter().filter(|c| *c == "release").count(),
+        1
+    );
+    assert_eq!(
+        server.commands().iter().filter(|c| *c == "panic").count(),
+        1
+    );
+}
+
+#[test]
+fn transport_restart_or_link_change_requires_idle_explicit_re_detection_and_new_call_id() {
+    for restart in [false, true] {
+        let f = Fixture::new();
+        let current = Arc::new(Mutex::new(wire_status(&f)));
+        let replies = current.clone();
+        let server = Server::new(
+            &f,
+            Arc::new(move |bytes, socket| {
+                if command(bytes) == "status" {
+                    send_owned(socket, &line(&replies.lock().unwrap()));
+                } else {
+                    send_owned(socket, b"{\"ok\":true}\n");
+                }
+            }),
+        );
+        let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 83)).unwrap();
+        port.submit(call(1, InstallerRequest::Status, 1000))
+            .unwrap();
+        drain(&mut port, 1);
+        if restart {
+            f.bootstrap(7, 0, "ready", 1);
+            current.lock().unwrap()["result"]["installer"]["instance"]["id"] = 7.into();
+        } else {
+            current.lock().unwrap()["result"]["installer"]["peers"][0]["link_generation"] =
+                8.into();
+        }
+        port.submit(call(2, InstallerRequest::Release, 1000))
+            .unwrap();
+        assert_eq!(drain(&mut port, 1)[0].result, Err(CallFailure::Unavailable));
+        assert!(!server.commands().iter().any(|c| c == "release"));
+        let mut renewed = selected(&f);
+        if !restart {
+            renewed.link.as_mut().unwrap().generation = 8;
+        }
+        port.redetect(renewed).unwrap();
+        assert_eq!(
+            port.submit(call(2, InstallerRequest::Release, 1000)),
+            Err(CallFailure::InvalidCall(ContractError::InvalidValue))
+        );
+        port.submit(call(3, InstallerRequest::Release, 1000))
+            .unwrap();
+        assert_eq!(
+            drain(&mut port, 1)[0].result,
+            Ok(DecodedReply::Acknowledged)
+        );
+        assert_eq!(
+            server.commands().iter().filter(|c| *c == "release").count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn transport_wrong_status_identity_and_wrong_requested_peer_never_transmit_mutation() {
+    for field in [
+        "id",
+        "pid",
+        "uid",
+        "exe",
+        "runtime_dir",
+        "started_unix_ms",
+        "requested-peer",
+    ] {
+        let f = Fixture::new();
+        let mut status = wire_status(&f);
+        let instance = &mut status["result"]["installer"]["instance"];
+        match field {
+            "id" => instance[field] = 9.into(),
+            "pid" => instance[field] = 4243.into(),
+            "uid" => instance[field] = (f.runner.uid + 1).into(),
+            "exe" => instance[field] = "/explicit/other/Crosspane".into(),
+            "runtime_dir" => instance[field] = "/private/tmp/explicit-other/crosspane".into(),
+            "started_unix_ms" => instance[field] = 1000.into(),
+            "requested-peer" => {}
+            _ => unreachable!(),
+        }
+        let status = line(&status);
+        let server = Server::new(
+            &f,
+            Arc::new(move |bytes, socket| {
+                assert_eq!(command(bytes), "status");
+                send_owned(socket, &status);
+            }),
+        );
+        let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 97)).unwrap();
+        let request = if field == "requested-peer" {
+            InstallerRequest::Project {
+                window: crosspane_types::id::WindowId(1),
+                peer: crosspane_types::id::NodeId([0x33; 32]),
+            }
+        } else {
+            InstallerRequest::Release
+        };
+        port.submit(call(1, request, 1000)).unwrap();
+        assert_eq!(drain(&mut port, 1)[0].result, Err(CallFailure::Unavailable));
+        assert!(server.commands().iter().all(|c| c == "status"));
+    }
+}
+
+#[test]
+fn transport_incomplete_health_remains_pending_and_never_authorizes_a_mutation() {
+    let f = Fixture::new();
+    let server = Server::new(
+        &f,
+        Arc::new(|bytes, socket| {
+            assert_eq!(command(bytes), "status");
+            send_owned(socket, b"{\"ok\":true,\"result\":{}}\n");
+        }),
+    );
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 103)).unwrap();
+    port.submit(call(1, InstallerRequest::Status, 1000))
+        .unwrap();
+    assert_eq!(
+        drain(&mut port, 1)[0].result,
+        Ok(DecodedReply::Status(
+            StatusAdmission::PendingHealthContract(agent_contract::PendingHealthReason::Absent)
+        ))
+    );
+    port.submit(call(2, InstallerRequest::Release, 1000))
+        .unwrap();
+    assert_eq!(drain(&mut port, 1)[0].result, Err(CallFailure::Unavailable));
+    assert_eq!(server.commands(), ["status", "status"]);
+}
+
+#[test]
+fn transport_endpoint_replacement_after_connect_or_before_mutation_write_transmits_no_bytes() {
+    for connection in [1, 2] {
+        let f = Fixture::new();
+        let path = f.io.target().socket_path();
+        let home = f.home.clone();
+        let sockets = Arc::new(Mutex::new(Vec::<UnixListener>::new()));
+        let held = sockets.clone();
+        let connected = Arc::new(AtomicU64::new(0));
+        let count = connected.clone();
+        *wire::HOOK.lock().unwrap() = Some(Arc::new(move |selected, stage| {
+            if selected == home
+                && stage == "connected"
+                && count.fetch_add(1, Ordering::AcqRel) + 1 == connection
+            {
+                fs::remove_file(&path).unwrap();
+                held.lock()
+                    .unwrap()
+                    .push(UnixListener::bind(&path).unwrap());
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }));
+        let status = line(&wire_status(&f));
+        let server = Server::new(
+            &f,
+            Arc::new(move |bytes, socket| {
+                assert_eq!(command(bytes), "status");
+                send_owned(socket, &status);
+            }),
+        );
+        let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 109)).unwrap();
+        port.submit(call(1, InstallerRequest::Release, 5000))
+            .unwrap();
+        assert_eq!(drain(&mut port, 1)[0].result, Err(CallFailure::Unavailable));
+        wait_for(|| server.requests.lock().unwrap().len() == connection as usize);
+        assert!(server.requests.lock().unwrap().last().unwrap().is_empty());
+        assert_eq!(
+            server.commands(),
+            if connection == 1 {
+                vec![]
+            } else {
+                vec!["status"]
+            }
+        );
+        *wire::HOOK.lock().unwrap() = None;
+    }
+}
+
+#[test]
+fn transport_unsafe_runtime_foreign_selection_and_stale_socket_are_refused_before_connect() {
+    for kind in ["runtime", "selection", "socket"] {
+        let f = Fixture::new();
+        let other = Fixture::new();
+        let mut selection = selected(&f);
+        let replacement = match kind {
+            "runtime" => {
+                fs::set_permissions(&f.runtime, fs::Permissions::from_mode(0o777)).unwrap();
+                None
+            }
+            "selection" => {
+                selection.instance = Arc::new(other.admitted());
+                None
+            }
+            "socket" => {
+                let path = f.io.target().socket_path();
+                fs::remove_file(&path).unwrap();
+                let listener = UnixListener::bind(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                Some(listener)
+            }
+            _ => unreachable!(),
+        };
+        f._listener.set_nonblocking(true).unwrap();
+        if let Some(listener) = &replacement {
+            listener.set_nonblocking(true).unwrap();
+        }
+        let mut port = MacAgentPort::new(selection, Arc::new(|| 109)).unwrap();
+        port.submit(call(1, InstallerRequest::Release, 1000))
+            .unwrap();
+        assert_eq!(drain(&mut port, 1)[0].result, Err(CallFailure::Unavailable));
+        assert!(matches!(f._listener.accept(),Err(e)if e.kind()==std::io::ErrorKind::WouldBlock));
+        if let Some(listener) = &replacement {
+            assert!(matches!(listener.accept(),Err(e)if e.kind()==std::io::ErrorKind::WouldBlock));
+        }
+        fs::set_permissions(&f.runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+#[test]
+fn transport_support_revocation_and_post_reply_restart_cannot_report_admitted_success() {
+    for revoked in [true, false] {
+        let f = Fixture::new();
+        let selection = selected(&f);
+        let status = line(&wire_status(&f));
+        let bootstrap = f.runtime.join("bootstrap.json");
+        let runtime = f.runtime.clone();
+        let server = Server::new(
+            &f,
+            Arc::new(move |bytes_received, socket| {
+                assert_eq!(command(bytes_received), "status");
+                if !revoked {
+                    let changed = serde_json::json!({"schema_version":1,"instance_id":7,"pid":4242,"started_unix_ms":0,
+                    "phase":"ready","phase_seq":1,"keystore":null,"reason":null,"runtime_dir":runtime});
+                    bytes(&bootstrap, &serde_json::to_vec(&changed).unwrap(), 0o600);
+                }
+                send_owned(socket, &status);
+            }),
+        );
+        if revoked {
+            selection.support.revoke();
+        }
+        let mut port = MacAgentPort::new(selection, Arc::new(|| 113)).unwrap();
+        port.submit(call(1, InstallerRequest::Release, 1000))
+            .unwrap();
+        let reply = drain(&mut port, 1).pop().unwrap();
+        assert_eq!(reply.result, Err(CallFailure::Unavailable));
+        assert_eq!(reply.source, ObservationSource::Demo);
+        assert!(!server.commands().iter().any(|c| c == "release"));
+    }
+}
+
+#[test]
+fn transport_shutdown_cancels_owned_pending_mutation_and_queued_calls_without_join_or_resend() {
+    let f = Fixture::new();
+    let status = line(&wire_status(&f));
+    let entered = Arc::new(AtomicBool::new(false));
+    let active = entered.clone();
+    let release = Arc::new(AtomicBool::new(false));
+    let released = release.clone();
+    let server = Server::new(
+        &f,
+        Arc::new(move |bytes, socket| {
+            if command(bytes) == "status" {
+                send_owned(socket, &status);
+            } else {
+                assert_eq!(command(bytes), "release");
+                active.store(true, Ordering::Release);
+                while !released.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }),
+    );
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 127)).unwrap();
+    let _unwind_release = ReleaseOnDrop(release.clone());
+    port.submit(call(1, InstallerRequest::Release, 1000))
+        .unwrap();
+    port.submit(call(2, InstallerRequest::Status, 1000))
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while !entered.load(Ordering::Acquire) {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let begin = Instant::now();
+    port.shutdown();
+    assert!(begin.elapsed() < Duration::from_millis(100));
+    assert!(
+        drain(&mut port, 2)
+            .iter()
+            .all(|r| r.result == Err(CallFailure::TimeoutOutcomeUnknown))
+    );
+    release.store(true, Ordering::Release);
+    assert_eq!(
+        port.submit(call(3, InstallerRequest::Status, 1000)),
+        Err(CallFailure::Unavailable)
+    );
+    assert_eq!(port.redetect(selected(&f)), Err(NativeError::Unavailable));
+    assert_eq!(server.commands(), ["status", "release"]);
+}
+
+#[test]
+fn transport_typed_dial_pairing_and_id_exhaustion_never_substitute_requests() {
+    for request in [
+        InstallerRequest::Dial {
+            addr: "[::1]:47811".parse().unwrap(),
+        },
+        InstallerRequest::PairJoin {
+            addr: "192.0.2.1:47811".parse().unwrap(),
+            allow_input: false,
+        },
+    ] {
+        let f = Fixture::new();
+        let server = basic_server(&f, b"{\"ok\":true}\n");
+        let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 131)).unwrap();
+        let expected = agent_contract::encode_request(&request).unwrap();
+        port.submit(call(u64::MAX, request, 1000)).unwrap();
+        assert_eq!(
+            drain(&mut port, 1)[0].result,
+            Ok(DecodedReply::Acknowledged)
+        );
+        assert_eq!(server.requests.lock().unwrap()[1], expected);
+        assert_eq!(
+            port.submit(call(u64::MAX, InstallerRequest::Status, 1000)),
+            Err(CallFailure::InvalidCall(ContractError::IdExhausted))
+        );
+    }
+}
+#[test]
+fn transport_live_source_requires_admission_and_scratch_never_acquires_live_authority() {
+    assert_eq!(
+        wire::reply_source(false, ObservationSource::Live),
+        ObservationSource::Demo
+    );
+    assert_eq!(
+        wire::reply_source(true, ObservationSource::Live),
+        ObservationSource::Live
+    );
+    assert_eq!(
+        wire::reply_source(false, ObservationSource::Demo),
+        ObservationSource::Demo
+    );
+    assert_eq!(
+        wire::reply_source(true, ObservationSource::Demo),
+        ObservationSource::Demo
+    );
+}
+
+struct Lookup {
+    answers: Mutex<NativeResult<Vec<std::net::SocketAddr>>>,
+    calls: Mutex<Vec<(String, u16)>>,
+    blocked: AtomicBool,
+    entered: AtomicBool,
+    finished: AtomicBool,
+}
+impl HostLookup for Lookup {
+    fn lookup(
+        &self,
+        host: &str,
+        port: u16,
+        _: &Deadline,
+    ) -> NativeResult<Vec<std::net::SocketAddr>> {
+        self.calls.lock().unwrap().push((host.into(), port));
+        self.entered.store(true, Ordering::Release);
+        let until = Instant::now() + Duration::from_secs(5);
+        while self.blocked.load(Ordering::Acquire) {
+            if Instant::now() >= until {
+                self.finished.store(true, Ordering::Release);
+                return Err(NativeError::Unavailable);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let answers = self.answers.lock().unwrap().clone();
+        self.finished.store(true, Ordering::Release);
+        answers
+    }
+}
+fn lookup(answers: NativeResult<Vec<std::net::SocketAddr>>) -> Arc<Lookup> {
+    Arc::new(Lookup {
+        answers: Mutex::new(answers),
+        calls: Mutex::default(),
+        blocked: AtomicBool::new(false),
+        entered: AtomicBool::new(false),
+        finished: AtomicBool::new(false),
+    })
+}
+fn resolve(resolver: &mut BoundedResolver) -> NativeResult<std::net::SocketAddr> {
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(result) = resolver.poll() {
+            return result;
+        }
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+#[test]
+fn resolver_literals_never_lookup_and_hostnames_are_explicit_normalized_bounded_and_typed() {
+    let answers = vec![
+        "192.0.2.8:47811".parse().unwrap(),
+        "192.0.2.1:47811".parse().unwrap(),
+        "192.0.2.1:47811".parse().unwrap(),
+    ];
+    let lookup = lookup(Ok(answers));
+    let clock = Arc::new(FakeClock::default());
+    let mut resolver = BoundedResolver::injected(lookup.clone(), clock);
+    for input in ["[::1]:47811", "192.0.2.9:47811"] {
+        resolver.submit(input, 1000).unwrap();
+        assert_eq!(resolve(&mut resolver).unwrap(), input.parse().unwrap());
+    }
+    assert!(lookup.calls.lock().unwrap().is_empty());
+    resolver
+        .submit("Selected-Peer.EXAMPLE:47811", 1000)
+        .unwrap();
+    assert_eq!(
+        resolve(&mut resolver).unwrap(),
+        "192.0.2.1:47811".parse().unwrap()
+    );
+    assert_eq!(
+        lookup.calls.lock().unwrap().as_slice(),
+        [("selected-peer.example".into(), 47811)]
+    );
+    assert!(!format!("{resolver:?}").contains("selected-peer"));
+}
+#[test]
+fn resolver_bad_inputs_answers_and_deadlines_remain_explicit_errors() {
+    let fake = lookup(Ok(vec![]));
+    let clock = Arc::new(FakeClock::default());
+    let mut resolver = BoundedResolver::injected(fake.clone(), clock.clone());
+    for input in [
+        "",
+        "hostname",
+        "bad name:47811",
+        "-bad:47811",
+        "bad-:47811",
+        "bad..name:47811",
+        "host:0",
+        "host:65536",
+        "host:\n47811",
+        "[::1]:0",
+    ] {
+        assert_eq!(resolver.submit(input, 1000), Err(NativeError::Invalid));
+    }
+    assert_eq!(
+        resolver.submit(&format!("{}:47811", "a".repeat(254)), 1000),
+        Err(NativeError::Invalid)
+    );
+    assert_eq!(resolver.submit("host:47811", 0), Err(NativeError::Invalid));
+    assert_eq!(
+        resolver.submit("host:47811", 5001),
+        Err(NativeError::Invalid)
+    );
+    assert!(fake.calls.lock().unwrap().is_empty());
+    for (answers, error) in [
+        (Ok(vec![]), NativeError::Unavailable),
+        (Err(NativeError::Unavailable), NativeError::Unavailable),
+        (
+            Ok(vec!["192.0.2.1:1".parse().unwrap()]),
+            NativeError::Oversize,
+        ),
+        (
+            Ok(vec!["192.0.2.1:47811".parse().unwrap(); 17]),
+            NativeError::Oversize,
+        ),
+    ] {
+        let mut resolver = BoundedResolver::injected(lookup(answers), clock.clone());
+        resolver.submit("host:47811", 1000).unwrap();
+        assert_eq!(resolve(&mut resolver), Err(error));
+    }
+    resolver.submit("192.0.2.1:47811", 100).unwrap();
+    clock.set(100);
+    assert_eq!(resolver.poll(), Some(Err(NativeError::Timeout)));
+}
+#[test]
+fn resolver_cancelled_noncooperative_lookup_retains_four_slots_and_never_delivers_late_answer() {
+    let mut lookups = Vec::new();
+    let mut resolvers = Vec::new();
+    for _ in 0..4 {
+        let fake = lookup(Ok(vec!["192.0.2.1:47811".parse().unwrap()]));
+        fake.blocked.store(true, Ordering::Release);
+        let mut resolver = BoundedResolver::injected(fake.clone(), Arc::new(FakeClock::default()));
+        resolver
+            .submit("explicit-owned-test.example:47811", 1000)
+            .unwrap();
+        wait_for(|| fake.entered.load(Ordering::Acquire));
+        assert_eq!(resolver.submit("other:47811", 1000), Err(NativeError::Busy));
+        resolver.cancel();
+        assert_eq!(resolver.poll(), Some(Err(NativeError::Cancelled)));
+        assert!(resolver.poll().is_none());
+        lookups.push(fake);
+        resolvers.push(resolver);
+    }
+    let fifth = lookup(Ok(vec![]));
+    let mut fifth_resolver =
+        BoundedResolver::injected(fifth.clone(), Arc::new(FakeClock::default()));
+    assert_eq!(
+        fifth_resolver.submit("fifth:47811", 1000),
+        Err(NativeError::Busy)
+    );
+    assert!(fifth.calls.lock().unwrap().is_empty());
+    for fake in &lookups {
+        fake.blocked.store(false, Ordering::Release);
+    }
+    wait_for(|| {
+        lookups
+            .iter()
+            .all(|fake| fake.finished.load(Ordering::Acquire))
+    });
+    // Wait for actual slot release, then occupy all four again with DISTINCT answers.
+    for (i, (resolver, fake)) in resolvers.iter_mut().zip(&lookups).enumerate() {
+        assert!(resolver.poll().is_none());
+        fake.entered.store(false, Ordering::Release);
+        fake.finished.store(false, Ordering::Release);
+        fake.blocked.store(true, Ordering::Release);
+        *fake.answers.lock().unwrap() =
+            Ok(vec![format!("192.0.2.{}:47811", i + 2).parse().unwrap()]);
+        wait_for(
+            || match resolver.submit("second-owned-test.example:47811", 1000) {
+                Ok(()) => true,
+                Err(NativeError::Busy) => false,
+                other => panic!("unexpected capacity recovery {other:?}"),
+            },
+        );
+        wait_for(|| fake.entered.load(Ordering::Acquire));
+    }
+    assert_eq!(
+        fifth_resolver.submit("still-fifth:47811", 1000),
+        Err(NativeError::Busy)
+    );
+    for fake in &lookups {
+        fake.blocked.store(false, Ordering::Release);
+    }
+    wait_for(|| {
+        lookups
+            .iter()
+            .all(|fake| fake.finished.load(Ordering::Acquire))
+    });
+    for (i, (resolver, fake)) in resolvers.iter_mut().zip(&lookups).enumerate() {
+        assert_eq!(
+            resolve(resolver),
+            Ok(format!("192.0.2.{}:47811", i + 2).parse().unwrap())
+        );
+        assert_eq!(fake.calls.lock().unwrap().len(), 2);
+        assert!(resolver.poll().is_none()); // No cancelled old result contaminates this request.
+    }
+}
+#[test]
+fn transport_cancel_or_expiry_inside_final_endpoint_walk_sends_zero_mutation_bytes() {
+    for cancel in [false, true] {
+        let f = Fixture::new();
+        let enabled = Arc::new(AtomicBool::new(false));
+        let pausing = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let resume = Arc::new(AtomicBool::new(false));
+        let walks = Arc::new(AtomicU64::new(0));
+        let limit = Arc::new(AtomicU64::new(u64::MAX));
+        let runtime = f.runtime.clone();
+        let active = enabled.clone();
+        let pause = pausing.clone();
+        let count = walks.clone();
+        let last = limit.clone();
+        let reached = entered.clone();
+        let resumed = resume.clone();
+        let io = f.hooked(Arc::new(move |stage, path, value| {
+            if stage == "walk" && path == runtime && active.load(Ordering::Acquire) {
+                let n = count.fetch_add(1, Ordering::AcqRel) + 1;
+                if pause.load(Ordering::Acquire) && n == last.load(Ordering::Acquire) {
+                    reached.store(true, Ordering::Release);
+                    wait_for(|| resumed.load(Ordering::Acquire));
+                }
+            }
+            Ok(value)
+        }));
+        let mut selection = selected(&f);
+        selection.io = io;
+        enabled.store(true, Ordering::Release);
+        selection
+            .instance
+            .endpoint()
+            .revalidate(&selection.io)
+            .unwrap();
+        limit.store(walks.load(Ordering::Acquire), Ordering::Release);
+        assert!(limit.load(Ordering::Acquire) > 0);
+        enabled.store(false, Ordering::Release);
+        walks.store(0, Ordering::Release);
+        let home = f.home.clone();
+        let validations = Arc::new(AtomicU64::new(0));
+        let checks = validations.clone();
+        *wire::HOOK.lock().unwrap() = Some(Arc::new(move |selected, stage| {
+            if selected == home
+                && stage == "write_validation"
+                && checks.fetch_add(1, Ordering::AcqRel) + 1 == 2
+            {
+                pausing.store(true, Ordering::Release);
+                enabled.store(true, Ordering::Release);
+            }
+        }));
+        let server = basic_server(&f, b"{\"ok\":true}\n");
+        let _unwind = ReleaseOnDrop(resume.clone());
+        let mut port = MacAgentPort::new(selection, Arc::new(|| 151)).unwrap();
+        port.emulate_live();
+        port.submit(call(1, InstallerRequest::Release, 5000))
+            .unwrap();
+        wait_for(|| entered.load(Ordering::Acquire));
+        if cancel {
+            port.shutdown();
+        } else {
+            f.clock.set(5001);
+        }
+        resume.store(true, Ordering::Release);
+        let reply = drain(&mut port, 1).pop().unwrap();
+        assert_eq!(reply.result, Err(CallFailure::TimeoutOutcomeUnknown));
+        assert_eq!(reply.source, ObservationSource::Live);
+        wait_for(|| server.requests.lock().unwrap().len() == 2);
+        assert!(server.requests.lock().unwrap()[1].is_empty());
+        assert_eq!(server.commands(), ["status"]);
+        *wire::HOOK.lock().unwrap() = None;
+    }
+}
+
+#[test]
+fn transport_partial_mutation_prefix_is_unknown_and_never_reconnected_or_resent() {
+    let f = Fixture::new();
+    let request = InstallerRequest::Place {
+        placements: (0..128)
+            .map(|display| agent_contract::Placement {
+                node: crosspane_types::id::NodeId([0x22; 32]),
+                display,
+                origin_mm: [1.234567890123456e200, -1.234567890123456e200],
+            })
+            .collect(),
+    };
+    let expected = agent_contract::encode_request(&request).unwrap();
+    let status = line(&wire_status(&f));
+    let clock = f.clock.clone();
+    let prefix = Arc::new(AtomicBool::new(false));
+    let saw_prefix = prefix.clone();
+    let server = Server::reader(
+        f._listener.try_clone().unwrap(),
+        Arc::new(move |bytes, socket| {
+            if !bytes.ends_with(b"\n") {
+                assert!(!saw_prefix.swap(true, Ordering::AcqRel));
+                clock.set(5001); // The owned peer closes after a nonempty, incomplete mutation.
+            } else if command(bytes) == "status" {
+                send_owned(socket, &status);
+            } else {
+                assert_eq!(command(bytes), "panic");
+                send_owned(socket, b"{\"ok\":true}\n");
+            }
+        }),
+        None,
+        true,
+    );
+    let home = f.home.clone();
+    let writes = Arc::new(AtomicU64::new(0));
+    let count = writes.clone();
+    let received = prefix.clone();
+    *wire::HOOK.lock().unwrap() = Some(Arc::new(move |selected, stage| {
+        if selected == home && stage == "written" && count.fetch_add(1, Ordering::AcqRel) + 1 == 2 {
+            wait_for(|| received.load(Ordering::Acquire));
+        }
+    }));
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 157)).unwrap();
+    port.emulate_live();
+    port.submit(call(1, request, 5000)).unwrap();
+    let reply = drain(&mut port, 1).pop().unwrap();
+    assert_eq!(reply.result, Err(CallFailure::TimeoutOutcomeUnknown));
+    assert_eq!(reply.source, ObservationSource::Live);
+    let received = server.requests.lock().unwrap()[1].clone();
+    assert!(!received.is_empty() && received.len() < expected.len());
+    assert_eq!(received, expected[..received.len()]);
+    port.submit(call(2, InstallerRequest::Panic, 1000)).unwrap();
+    assert_eq!(drain(&mut port, 1)[0].result, Err(CallFailure::Unavailable));
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    port.redetect(selected(&f)).unwrap();
+    port.emulate_live();
+    port.submit(call(3, InstallerRequest::Panic, 1000)).unwrap();
+    assert_eq!(
+        drain(&mut port, 1)[0].result,
+        Ok(DecodedReply::Acknowledged)
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 5);
+    *wire::HOOK.lock().unwrap() = None;
+}
+
+#[test]
+fn transport_admitted_refusal_survives_followup_status_timeout_without_uncertainty_latch() {
+    let f = Fixture::new();
+    let status = line(&wire_status(&f));
+    let clock = f.clock.clone();
+    let queries = Arc::new(AtomicU64::new(0));
+    let count = queries.clone();
+    let server = Server::new(
+        &f,
+        Arc::new(move |bytes, socket| match command(bytes).as_str() {
+            "status" => {
+                if count.fetch_add(1, Ordering::AcqRel) + 1 == 2 {
+                    clock.set(1001);
+                } else {
+                    send_owned(socket, &status);
+                }
+            }
+            "release" => send_owned(
+                socket,
+                b"{\"ok\":false,\"result\":null,\"error\":\"revision_conflict\"}\n",
+            ),
+            "panic" => send_owned(socket, b"{\"ok\":true}\n"),
+            other => panic!("unexpected owned command {other}"),
+        }),
+    );
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 163)).unwrap();
+    port.emulate_live();
+    port.submit(call(1, InstallerRequest::Release, 1000))
+        .unwrap();
+    let reply = drain(&mut port, 1).pop().unwrap();
+    assert_eq!(
+        reply.result,
+        Err(CallFailure::Refused(AgentRefusal::RevisionConflict))
+    );
+    assert_eq!(reply.source, ObservationSource::Live);
+    port.submit(call(2, InstallerRequest::Panic, 1000)).unwrap();
+    assert_eq!(
+        drain(&mut port, 1)[0].result,
+        Ok(DecodedReply::Acknowledged)
+    );
+    assert_eq!(
+        server.commands(),
+        ["status", "release", "status", "status", "panic", "status"]
+    );
+}
+
+#[test]
+fn admitted_unknown_outcomes_drive_frozen_settings_and_tutorial_detection_without_replay() {
+    use crosspane_installer::tutorial_flow::*;
+    use crosspane_installer_core::{AttemptId, Flow, FlowEvent, StepId, StepSpec};
+    for settings in [true, false] {
+        let f = Fixture::new();
+        let status_value = wire_status(&f);
+        let status = line(&status_value);
+        let clock = f.clock.clone();
+        let server = Server::new(
+            &f,
+            Arc::new(move |bytes, socket| match command(bytes).as_str() {
+                "status" => send_owned(socket, &status),
+                "settings_update" | "release" => clock.set(5001),
+                other => panic!("unexpected owned command {other}"),
+            }),
+        );
+        let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 10)).unwrap();
+        port.emulate_live(); // In-memory source seam only; all native facts and sockets remain explicit scratch.
+        if settings {
+            let StatusAdmission::Supported(health) =
+                agent_contract::parse_status(&line(&status_value), AgentPlatform::Macos).unwrap()
+            else {
+                panic!("missing fixture health")
+            };
+            let mut transition =
+                SettingsTransition::new(crosspane_types::id::NodeId([0x11; 32]), 17);
+            transition
+                .detected(&health, ObservationSource::Live, 1, 1, 17)
+                .unwrap();
+            port.submit(transition.consent_update(1, 17, true).unwrap())
+                .unwrap();
+            let reply = drain(&mut port, 1).pop().unwrap();
+            assert_eq!(reply.source, ObservationSource::Live);
+            assert_eq!(reply.result, Err(CallFailure::TimeoutOutcomeUnknown));
+            let outcome = transition.reply(reply, 10).unwrap();
+            assert!(outcome.detect_after_unknown);
+            assert_eq!(transition.state(), &SettingsTransitionState::NeedsDetection);
+            assert!(transition.consent_update(2, 17, true).is_err());
+            transition
+                .detected(&health, ObservationSource::Live, 11, 11, 18)
+                .unwrap();
+            assert!(transition.consent_update(2, 17, true).is_err());
+            assert!(transition.consent_update(2, 18, true).is_ok());
+            assert_eq!(server.commands(), ["status", "settings_update"]);
+        } else {
+            let step = StepId(1);
+            let mut core = Flow::new(vec![
+                StepSpec {
+                    id: step,
+                    prerequisites: vec![],
+                    required_for_installed: false,
+                    required_for_ready: false,
+                    requires_fresh_observation: false,
+                    requires_activity: true,
+                    requires_human: true,
+                    requires_fixture: false,
+                },
+                StepSpec {
+                    id: StepId(99),
+                    prerequisites: vec![],
+                    required_for_installed: true,
+                    required_for_ready: true,
+                    requires_fresh_observation: true,
+                    requires_activity: false,
+                    requires_human: false,
+                    requires_fixture: false,
+                },
+            ])
+            .unwrap();
+            let detect = core.reduce(FlowEvent::Begin { step }, 1).unwrap().remove(0);
+            let verify = core
+                .reduce(
+                    FlowEvent::Detected {
+                        step,
+                        operation: detect.operation,
+                        needs_action: false,
+                    },
+                    1,
+                )
+                .unwrap()
+                .remove(0);
+            let attempt = TutorialAttempt {
+                step,
+                operation: verify.operation,
+                attempt: AttemptId(1),
+                local: crosspane_types::id::NodeId([0x11; 32]),
+                peer: None,
+                role: TutorialRole::Menu,
+            };
+            let mut tutorial = Tutorial::new();
+            let mut effects = tutorial
+                .begin(
+                    attempt.clone(),
+                    TutorialContext {
+                        machine_label: "owned fake Mac".into(),
+                        platform: AgentPlatform::Macos,
+                        source_policy: TutorialSourcePolicy::MacMirror,
+                        speakers: None,
+                    },
+                    verify,
+                    17,
+                    1,
+                )
+                .unwrap();
+            for round in 0..2 {
+                assert!(matches!(
+                    effects[0].kind,
+                    TutorialEffectKind::Core(FlowEvent::Observe { .. })
+                ));
+                let mut submitted = 0;
+                for effect in effects {
+                    assert_eq!(effect.binding.attempt, attempt);
+                    assert_eq!(effect.binding.view_revision, 17);
+                    match effect.kind {
+                        TutorialEffectKind::Core(event) => {
+                            assert!(!matches!(event, FlowEvent::Verified { .. }));
+                            core.reduce(event, if round == 0 { 1 } else { 10 }).unwrap();
+                        }
+                        TutorialEffectKind::Agent(call) => {
+                            tutorial.submitted(call.id).unwrap();
+                            port.submit(call).unwrap();
+                            submitted += 1;
+                        }
+                        TutorialEffectKind::WaitForUser
+                        | TutorialEffectKind::WaitForPeer
+                        | TutorialEffectKind::WaitForContract => {
+                            assert_ne!(tutorial.state(), TutorialState::Verified)
+                        }
+                        TutorialEffectKind::Fixture { .. }
+                        | TutorialEffectKind::DetectAfterUnknown => {
+                            panic!("unexpected pre-error menu effect")
+                        }
+                    }
+                }
+                assert_eq!(submitted, 1);
+                let reply = drain(&mut port, 1).pop().unwrap();
+                assert_eq!(reply.source, ObservationSource::Live);
+                if round == 1 {
+                    assert_eq!(reply.result, Err(CallFailure::TimeoutOutcomeUnknown));
+                }
+                effects = tutorial.reduce(TutorialEvent::Reply(reply), 10).unwrap();
+                if round == 0 {
+                    // Menu activity is human-driven; its explicit cancellation owns Release.
+                    for effect in effects {
+                        match effect.kind {
+                            TutorialEffectKind::Core(event) => {
+                                core.reduce(event, 10).unwrap();
+                            }
+                            TutorialEffectKind::WaitForUser
+                            | TutorialEffectKind::WaitForPeer
+                            | TutorialEffectKind::WaitForContract => {
+                                assert_ne!(tutorial.state(), TutorialState::Verified)
+                            }
+                            TutorialEffectKind::Agent(_)
+                            | TutorialEffectKind::Fixture { .. }
+                            | TutorialEffectKind::DetectAfterUnknown => {
+                                panic!("unexpected pre-cancel menu action")
+                            }
+                        }
+                    }
+                    effects = tutorial
+                        .reduce(
+                            TutorialEvent::User {
+                                attempt: AttemptId(1),
+                                view_revision: 17,
+                                action: TutorialUserAction::Cancel,
+                            },
+                            10,
+                        )
+                        .unwrap();
+                }
+            }
+            let mut detection = false;
+            let mut queries = 0;
+            assert!(matches!(
+                effects[0].kind,
+                TutorialEffectKind::Core(FlowEvent::Observe { .. })
+            ));
+            for effect in effects {
+                assert_eq!(effect.binding.attempt, attempt);
+                assert_eq!(effect.binding.view_revision, 17);
+                match effect.kind {
+                    TutorialEffectKind::Core(event) => {
+                        assert!(!matches!(event, FlowEvent::Verified { .. }));
+                        core.reduce(event, 10).unwrap();
+                    }
+                    TutorialEffectKind::Agent(call) => {
+                        assert_eq!(call.request, InstallerRequest::Status);
+                        queries += 1;
+                    }
+                    TutorialEffectKind::DetectAfterUnknown => detection = true,
+                    TutorialEffectKind::WaitForUser
+                    | TutorialEffectKind::WaitForPeer
+                    | TutorialEffectKind::WaitForContract => {
+                        assert_ne!(tutorial.state(), TutorialState::Verified)
+                    }
+                    TutorialEffectKind::Fixture { .. } => panic!("menu owns no native fixture"),
+                }
+            }
+            assert!(detection);
+            assert_eq!(queries, 1);
+            assert_eq!(tutorial.state(), TutorialState::Failed);
+            assert_eq!(server.commands(), ["status", "status", "release"]);
+        }
+    }
+}
+
+#[test]
+fn owned_server_teardown_releases_waiting_handler_during_assertion_unwind() {
+    let f = Fixture::new();
+    let release = Arc::new(AtomicBool::new(false));
+    let released = release.clone();
+    let entered = Arc::new(AtomicBool::new(false));
+    let active = entered.clone();
+    let status = line(&wire_status(&f));
+    let server = Server::new(
+        &f,
+        Arc::new(move |bytes, socket| {
+            if command(bytes) == "status" {
+                send_owned(socket, &status);
+            } else {
+                active.store(true, Ordering::Release);
+                wait_for(|| released.load(Ordering::Acquire));
+            }
+        }),
+    );
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 173)).unwrap();
+    port.submit(call(1, InstallerRequest::Release, 5000))
+        .unwrap();
+    wait_for(|| entered.load(Ordering::Acquire));
+    let begin = Instant::now();
+    let failure = std::panic::catch_unwind(|| {
+        let _unwind = ReleaseOnDrop(release.clone());
+        panic!("owned simulated assertion");
+    });
+    assert!(failure.is_err());
+    drop(port);
+    drop(server);
+    assert!(begin.elapsed() < Duration::from_secs(3));
+}
+
 #[test]
 fn finite_alias_table_accepts_only_var_and_tmp_and_rejects_dirty_spellings() {
     assert_eq!(
