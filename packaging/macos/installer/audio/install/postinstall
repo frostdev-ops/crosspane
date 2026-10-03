@@ -1,0 +1,44 @@
+#!/bin/bash -p
+set -euo pipefail
+umask 022
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C
+readonly SYS=''                                # prefix of every fixed path
+readonly ROOT_UID=0
+readonly OWNER=root:wheel
+readonly RESTART=(/usr/bin/killall coreaudiod)
+readonly CODESIGN=/usr/bin/codesign
+[[ $EUID == "$ROOT_UID" && ${3:-} == / ]] || exit 1
+script_dir="${BASH_SOURCE%/*}"; common="$script_dir/common.sh"
+[[ -d $script_dir && ! -L $script_dir && -f $common && ! -L $common ]] || exit 1
+for entry in "$script_dir" "$common"; do
+    values=$(/usr/bin/stat -f '%u %Lp' "$entry") || exit 1
+    [[ $values =~ ^[0-9]+\ [0-7]+$ ]] || exit 1
+    read -r uid mode <<< "$values"
+    [[ $uid == "$ROOT_UID" ]] && (( (8#$mode & 022) == 0 )) || exit 1
+done
+source "$common"
+admit "$3" skip-staging && safe_dir "$INST" || exit 1
+if ! safe_dir "$STAGING"; then outcome verify_failed '@VERSION@' "$OUTCOME"; exit 1; fi
+same_volume || exit 1
+if ! verify_driver "$STAGED" '@VERSION@' '@TEAM_ID@' '@CDHASH@' yes; then
+    remove_bundle "$STAGED" || true
+    outcome verify_failed '@VERSION@' "$OUTCOME"; exit 1
+fi
+commit_driver() {
+    if present "$INSTALLED"; then
+        ours "$INSTALLED" || return 1
+        if ! present "$SLOT"; then
+            if ! present "$PREVIOUS"; then /bin/mkdir -m 0700 "$PREVIOUS" || return 1; fi
+            previous_ok && rename_ok "$INSTALLED" "$SLOT" && ! present "$SLOT" &&
+                /bin/mv -- "$INSTALLED" "$SLOT" || return 1
+        else
+            rename_ok "$INSTALLED" "$DISCARD" && ! present "$DISCARD" &&
+                /bin/mv -- "$INSTALLED" "$DISCARD" || return 1
+        fi
+    fi
+    rename_ok "$STAGED" "$INSTALLED" && ! present "$INSTALLED" &&
+        /bin/mv -- "$STAGED" "$INSTALLED" && remove_bundle "$DISCARD"
+}
+if ! commit_driver; then outcome move_failed '@VERSION@' "$OUTCOME"; exit 1; fi
+"${RESTART[@]}" || true
+outcome installed '@VERSION@' "$OUTCOME"

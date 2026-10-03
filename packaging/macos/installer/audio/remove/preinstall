@@ -1,0 +1,21 @@
+#!/bin/bash -p
+set -euo pipefail
+umask 022
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C
+readonly SYS=''                                # prefix of every fixed path
+readonly ROOT_UID=0
+readonly OWNER=root:wheel
+readonly RESTART=(/usr/bin/killall coreaudiod)
+readonly CODESIGN=/usr/bin/codesign
+[[ $EUID == "$ROOT_UID" && ${3:-} == / ]] || exit 1
+script_dir="${BASH_SOURCE%/*}"; common="$script_dir/common.sh"
+[[ -d $script_dir && ! -L $script_dir && -f $common && ! -L $common ]] || exit 1
+for entry in "$script_dir" "$common"; do
+    values=$(/usr/bin/stat -f '%u %Lp' "$entry") || exit 1
+    [[ $values =~ ^[0-9]+\ [0-7]+$ ]] || exit 1
+    read -r uid mode <<< "$values"
+    [[ $uid == "$ROOT_UID" ]] && (( (8#$mode & 022) == 0 )) || exit 1
+done
+source "$common"
+admit "$3" && prepare || exit 1
+same_volume || exit 1

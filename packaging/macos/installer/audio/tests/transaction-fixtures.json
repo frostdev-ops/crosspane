@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "cases": [
+    "absent_install", "current_and_empty_previous", "occupied_slot_retry", "verify_failed_preserves_A",
+    "staged_symlink", "staged_wrong_id", "staged_missing_plist", "unsafe_staging",
+    "foreign_installed", "unsafe_ancestor", "previous_conflict", "common_link", "common_mode",
+    "non_system_volume", "tree_extra", "tree_symlink", "tree_hardlink", "tree_special", "tree_setid",
+    "tree_oversize", "owner_admission", "cdhash_mismatch", "real_adhoc_refusal", "restart_refused",
+    "outcome_replaced", "remove_absent", "remove_current_previous", "remove_previous_only", "remove_foreign",
+    "interrupt_before_previous", "interrupt_before_save", "interrupt_before_publish", "interrupt_before_discard_cleanup",
+    "interrupt_before_restart", "interrupt_before_outcome", "remove_failed", "move_failed_after_save",
+    "preinstall_cleans_links", "ancestor_acl", "tree_setgid", "tree_writable", "interrupt_outcome_publish",
+    "remove_without_staging", "exact_transaction_order", "privilege_refusal", "environment_ignored",
+    "installer_wrong_group", "installer_special_bits",
+    "discard_install_no_staging", "discard_remove_link", "discard_remove_directory", "discard_rename_race",
+    "outcome_link", "outcome_directory", "tmp_link", "tmp_directory", "outcome_rename_race", "tmp_rename_race",
+    "date_status", "date_nonnumeric", "stat_status", "stat_nonnumeric", "volume_before_prepare", "volume_before_rename",
+    "script_directory_link", "script_directory_mode",
+    "ours_plist_failure", "verify_identity_failure", "verify_executable_failure", "verify_version_failure",
+    "verify_hash_failure", "verify_details_failure", "build_version_failure", "build_details_failure", "build_hash_failure"
+  ]
+}
