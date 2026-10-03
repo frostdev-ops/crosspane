@@ -1,0 +1,147 @@
+//! Read-only acquisition. Streams come only from the frozen native boundary. No reconnect by
+//! pathname, owner-environment fallback, mutation, readiness policy, or support-proof creation.
+mod logind;
+use super::*;
+use crate::platform::linux::{native_io::*, transport::CallerClock};
+pub use logind::{LogindFacts, Properties, decode_session, decode_user, logind_from_stream};
+use std::{
+    net::Shutdown,
+    os::unix::net::UnixStream,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
+
+static WORKERS: AtomicUsize = AtomicUsize::new(0);
+struct Slot;
+impl Drop for Slot {
+    fn drop(&mut self) {
+        WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+fn issue(error: NativeError) -> ProbeIssue {
+    match error {
+        NativeError::Timeout => ProbeIssue::Timeout,
+        NativeError::Cancelled => ProbeIssue::Cancelled,
+        NativeError::Oversize => ProbeIssue::Oversize,
+        NativeError::Foreign => ProbeIssue::Foreign,
+        NativeError::Invalid => ProbeIssue::Malformed,
+        _ => ProbeIssue::Unavailable,
+    }
+}
+/// Four owned workers maximum. Shutdown of our descriptor interrupts authentication
+/// as well as method reads. One caller deadline covers the entire exchange; no worker is joined
+/// on timeout. Its slot remains occupied until it actually exits, including unwinding.
+fn bounded<T: Send + 'static>(
+    stream: UnixStream,
+    deadline: &Deadline,
+    clock: CallerClock,
+    source: ObservationSource,
+    work: impl FnOnce(UnixStream) -> Result<T, ProbeIssue> + Send + 'static,
+) -> Fact<T> {
+    let result = (|| {
+        deadline.check().map_err(issue)?;
+        WORKERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < 4).then_some(n + 1)
+            })
+            .map_err(|_| ProbeIssue::Unavailable)?;
+        let slot = Slot;
+        let stop = stream.try_clone().map_err(|_| ProbeIssue::Unavailable)?;
+        let (send, receive) = mpsc::sync_channel(1);
+        let stamp = clock.clone();
+        std::thread::Builder::new()
+            .name("installer-session-read".into())
+            .spawn(move || {
+                let _slot = slot;
+                let value = work(stream);
+                let _ = send.send(Fact {
+                    value,
+                    source,
+                    observed_at_ms: stamp(),
+                });
+            })
+            .map_err(|_| ProbeIssue::Unavailable)?;
+        loop {
+            if let Err(error) = deadline.check() {
+                let _ = stop.shutdown(Shutdown::Both);
+                return Err(issue(error));
+            }
+            match receive.recv_timeout(Duration::from_millis(5)) {
+                Ok(fact) => {
+                    if let Err(error) = deadline.check() {
+                        let _ = stop.shutdown(Shutdown::Both);
+                        return Err(issue(error));
+                    }
+                    return Ok(fact);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err(ProbeIssue::Unavailable),
+            }
+        }
+    })();
+    result.unwrap_or_else(|error| Fact::issue(error, source, clock()))
+}
+
+/// Data-only probes of the selected native target. No support or readiness authority is issued.
+pub struct NativeSessionProbes {
+    io: Arc<LinuxNativeIo>,
+    environment: ChildEnvironment,
+    clock: CallerClock,
+}
+impl std::fmt::Debug for NativeSessionProbes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeSessionProbes")
+    }
+}
+impl NativeSessionProbes {
+    pub fn new(
+        io: Arc<LinuxNativeIo>,
+        environment: ChildEnvironment,
+        clock: CallerClock,
+    ) -> Result<Self, NativeError> {
+        io.validate_target()?;
+        Ok(Self {
+            io,
+            environment,
+            clock,
+        })
+    }
+    fn read<T: Send + 'static>(
+        &self,
+        stream: Result<UnixStream, NativeError>,
+        deadline: &Deadline,
+        work: impl FnOnce(UnixStream) -> Result<T, ProbeIssue> + Send + 'static,
+    ) -> Fact<T> {
+        match stream {
+            Ok(stream) => bounded(
+                stream,
+                deadline,
+                self.clock.clone(),
+                self.io.target().source(),
+                work,
+            ),
+            Err(error) => Fact::issue(issue(error), self.io.target().source(), (self.clock)()),
+        }
+    }
+    pub fn logind(&self, deadline: &Deadline) -> Fact<LogindFacts> {
+        let uid = self.io.target().paths().uid;
+        let id = self.environment.values().get("XDG_SESSION_ID").cloned();
+        let clock = self.clock.clone();
+        let shared = deadline.clone();
+        let source = self.io.target().source();
+        self.read(
+            self.io.connect_system_bus(deadline),
+            deadline,
+            move |stream| {
+                let mut facts = logind::read(stream, uid, std::process::id(), id, &shared, &clock)?;
+                facts.selected_session.source = source;
+                facts.graphical_sessions.source = source;
+                Ok(facts)
+            },
+        )
+    }
+}

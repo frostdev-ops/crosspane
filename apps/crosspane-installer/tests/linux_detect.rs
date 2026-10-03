@@ -3,6 +3,985 @@
 
 // Runtime tests are owned by WP-4.8c and will be added in a separate runtime_tests block.
 mod session_tests {
+    mod native_logind {
+        use crosspane_installer::agent_contract::ObservationSource;
+        use crosspane_installer::platform::linux::{
+            detect::*,
+            native_io::{Cancellation, Deadline},
+            transport::CallerClock,
+        };
+        use serde::Serialize;
+        use std::{
+            io::{Read, Write},
+            net::Shutdown,
+            num::NonZeroU32,
+            os::unix::net::UnixStream,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicU64, Ordering},
+            },
+            thread::{self, JoinHandle},
+            time::{Duration, Instant},
+        };
+        use zbus::zvariant::{DynamicType, OwnedObjectPath, OwnedValue, Value};
+
+        fn path(value: &str) -> OwnedObjectPath {
+            value.try_into().unwrap()
+        }
+        fn value<T: Into<Value<'static>> + DynamicType>(value: T) -> OwnedValue {
+            OwnedValue::try_from(Value::new(value)).unwrap()
+        }
+        fn session(id: &str, kind: &str, uid: u32, active: bool, locked: bool) -> Properties {
+            [
+                ("Id", value(id.to_string())),
+                ("Type", value(kind.to_string())),
+                (
+                    "User",
+                    value((uid, path("/org/freedesktop/login1/user/_1000"))),
+                ),
+                (
+                    "Seat",
+                    value((
+                        "seat0".to_string(),
+                        path("/org/freedesktop/login1/seat/seat0"),
+                    )),
+                ),
+                ("Active", value(active)),
+                ("LockedHint", value(locked)),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect()
+        }
+        fn user(ids: &[&str], display: &str) -> Properties {
+            let rows: Vec<_> = ids
+                .iter()
+                .map(|id| (id.to_string(), path(&format!("/session/{id}"))))
+                .collect();
+            let display_path = if display.is_empty() {
+                path("/")
+            } else {
+                path(&format!("/session/{display}"))
+            };
+            [
+                ("Display".into(), value((display.to_string(), display_path))),
+                ("Sessions".into(), value(rows)),
+            ]
+            .into_iter()
+            .collect()
+        }
+        enum Response {
+            Text(String),
+            Path(OwnedObjectPath),
+            Properties(Properties),
+            Error(&'static str),
+            ErrorBody(&'static str, String),
+            Stall,
+        }
+        struct Step {
+            method: &'static str,
+            path: &'static str,
+            body: Option<Vec<u8>>,
+            response: Response,
+        }
+        fn step(method: &'static str, path: &'static str, response: Response) -> Step {
+            Step {
+                method,
+                path,
+                body: None,
+                response,
+            }
+        }
+        fn return_message<T: Serialize + DynamicType>(
+            serial: NonZeroU32,
+            value: &T,
+        ) -> zbus::Message {
+            let dummy = zbus::Message::method_call("/fake", "Request")
+                .unwrap()
+                .serial(serial)
+                .build(&())
+                .unwrap();
+            zbus::Message::method_return(&dummy.header())
+                .unwrap()
+                .sender(":1.1")
+                .unwrap()
+                .build(value)
+                .unwrap()
+        }
+        fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+            let mut line = Vec::new();
+            while !line.ends_with(b"\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte)?;
+                line.push(byte[0]);
+                if line.len() > 4096 {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+            }
+            Ok(line)
+        }
+        fn frame(stream: &mut UnixStream) -> std::io::Result<(NonZeroU32, Vec<u8>, Vec<u8>)> {
+            let mut header = [0; 16];
+            stream.read_exact(&mut header)?;
+            assert_eq!(header[0], b'l');
+            let body_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            let fields_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+            let body_at = (16 + fields_len + 7) & !7;
+            assert!(body_at + body_len <= MAX_PROBE_BYTES);
+            let mut bytes = header.to_vec();
+            bytes.resize(body_at + body_len, 0);
+            stream.read_exact(&mut bytes[16..])?;
+            let body = bytes[body_at..].to_vec();
+            Ok((
+                NonZeroU32::new(u32::from_le_bytes(header[8..12].try_into().unwrap())).unwrap(),
+                bytes,
+                body,
+            ))
+        }
+        fn has_string(bytes: &[u8], text: &str) -> bool {
+            let mut encoded = (text.len() as u32).to_le_bytes().to_vec();
+            encoded.extend_from_slice(text.as_bytes());
+            encoded.push(0);
+            bytes.windows(encoded.len()).any(|window| window == encoded)
+        }
+        struct Server {
+            control: UnixStream,
+            join: Option<JoinHandle<std::io::Result<()>>>,
+            log: Arc<Mutex<Vec<String>>>,
+        }
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.control.shutdown(Shutdown::Both);
+                if let Some(join) = self.join.take() {
+                    let _ = join.join();
+                }
+            }
+        }
+        impl Server {
+            fn new(script: Vec<Step>) -> (UnixStream, Self) {
+                let (client, mut server) = UnixStream::pair().unwrap();
+                server
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let control = server.try_clone().unwrap();
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let record = log.clone();
+                let join = thread::spawn(move || {
+                    loop {
+                        let line = read_line(&mut server)?;
+                        if line.ends_with(b"BEGIN\r\n") {
+                            break;
+                        }
+                        if line.starts_with(b"\0AUTH") || line.starts_with(b"AUTH") {
+                            server.write_all(b"OK 0123456789abcdef0123456789abcdef\r\n")?;
+                        } else {
+                            assert!(line.starts_with(b"NEGOTIATE_UNIX_FD"));
+                            server.write_all(b"ERROR no descriptor passing\r\n")?;
+                        }
+                    }
+                    for request in std::iter::once(step(
+                        "Hello",
+                        "/org/freedesktop/DBus",
+                        Response::Text(":1.42".into()),
+                    ))
+                    .chain(script)
+                    {
+                        let (serial, bytes, body) = frame(&mut server)?;
+                        assert!(
+                            has_string(&bytes, request.method),
+                            "wrong method for {}",
+                            request.method
+                        );
+                        assert!(
+                            has_string(&bytes, request.path),
+                            "wrong path for {}",
+                            request.method
+                        );
+                        if let Some(expected) = request.body {
+                            assert_eq!(body, expected);
+                        }
+                        if request.method != "Hello" {
+                            let interface = if request.method == "GetAll" {
+                                "org.freedesktop.DBus.Properties"
+                            } else {
+                                "org.freedesktop.login1.Manager"
+                            };
+                            assert!(has_string(&bytes, interface));
+                            assert!(has_string(&bytes, "org.freedesktop.login1"));
+                        }
+                        record.lock().unwrap().push(request.method.into());
+                        let reply = match request.response {
+                            Response::Text(v) => return_message(serial, &v),
+                            Response::Path(v) => return_message(serial, &v),
+                            Response::Properties(v) => return_message(serial, &v),
+                            Response::Error(name) => {
+                                let dummy = zbus::Message::method_call("/fake", "Request")
+                                    .unwrap()
+                                    .serial(serial)
+                                    .build(&())
+                                    .unwrap();
+                                zbus::Message::error(&dummy.header(), name)
+                                    .unwrap()
+                                    .sender(":1.1")
+                                    .unwrap()
+                                    .build(&"injected error")
+                                    .unwrap()
+                            }
+                            Response::ErrorBody(name, body) => {
+                                let dummy = zbus::Message::method_call("/fake", "Request")
+                                    .unwrap()
+                                    .serial(serial)
+                                    .build(&())
+                                    .unwrap();
+                                zbus::Message::error(&dummy.header(), name)
+                                    .unwrap()
+                                    .sender(":1.1")
+                                    .unwrap()
+                                    .build(&body)
+                                    .unwrap()
+                            }
+                            Response::Stall => {
+                                let mut one = [0];
+                                server.read_exact(&mut one)?;
+                                panic!("unexpected extra request");
+                            }
+                        };
+                        server.write_all(reply.data().bytes())?;
+                    }
+                    let mut one = [0];
+                    assert_eq!(server.read(&mut one)?, 0, "unexpected request after script");
+                    Ok(())
+                });
+                (
+                    client,
+                    Self {
+                        control,
+                        join: Some(join),
+                        log,
+                    },
+                )
+            }
+            fn finish(mut self) -> Vec<String> {
+                let result = self.join.take().unwrap().join().unwrap();
+                result.unwrap();
+                self.log.lock().unwrap().clone()
+            }
+        }
+        fn absent() -> Step {
+            step(
+                "GetSessionByPID",
+                "/org/freedesktop/login1",
+                Response::Error("org.freedesktop.login1.NoSessionForPID"),
+            )
+        }
+        fn display_script(rows: &[&str], props: Vec<Properties>) -> Vec<Step> {
+            let mut script = vec![
+                absent(),
+                step(
+                    "GetUser",
+                    "/org/freedesktop/login1",
+                    Response::Path(path("/user/1000")),
+                ),
+                step(
+                    "GetAll",
+                    "/user/1000",
+                    Response::Properties(user(rows, rows.first().copied().unwrap_or(""))),
+                ),
+            ];
+            for (id, properties) in rows.iter().zip(props) {
+                // These fixture IDs are fixed test literals; no filesystem path is opened.
+                let session_path = match *id {
+                    "c7" => "/session/c7",
+                    "c8" => "/session/c8",
+                    "tty" => "/session/tty",
+                    _ => panic!("unknown test fixture"),
+                };
+                script.push(step(
+                    "GetAll",
+                    session_path,
+                    Response::Properties(properties),
+                ));
+            }
+            script
+        }
+        fn probe(script: Vec<Step>, id: Option<&str>) -> (Fact<LogindFacts>, Vec<String>) {
+            let (stream, server) = Server::new(script);
+            let sequence = Arc::new(AtomicU64::new(10));
+            let clock: CallerClock = Arc::new(move || sequence.fetch_add(10, Ordering::SeqCst));
+            let result = logind_from_stream(
+                stream,
+                1000,
+                4242,
+                id.map(str::to_string),
+                &Deadline::new(1500, Cancellation::default()).unwrap(),
+                clock,
+            );
+            (result, server.finish())
+        }
+
+        #[test]
+        fn login1_codec_pins_signatures_and_each_missing_or_wrong_typed_field() {
+            let decoded =
+                decode_session("/session/c7", &session("c7", "x11", 1000, false, true)).unwrap();
+            assert_eq!(
+                decoded,
+                SessionCandidate {
+                    id: "c7".into(),
+                    path: "/session/c7".into(),
+                    kind: Some("x11".into()),
+                    uid: Some(1000),
+                    seat: Some("seat0".into()),
+                    active: Some(false),
+                    locked_hint: Some(true)
+                }
+            );
+            for field in ["Type", "User", "Seat", "Active", "LockedHint"] {
+                let mut values = session("c7", "wayland", 1000, true, false);
+                values.remove(field);
+                let result = decode_session("/session/c7", &values).unwrap();
+                match field {
+                    "Type" => assert!(result.kind.is_none()),
+                    "User" => assert!(result.uid.is_none()),
+                    "Seat" => assert!(result.seat.is_none()),
+                    "Active" => assert!(result.active.is_none()),
+                    "LockedHint" => assert!(result.locked_hint.is_none()),
+                    _ => unreachable!(),
+                }
+                values.insert(field.into(), value(7i64));
+                assert_eq!(
+                    decode_session("/session/c7", &values),
+                    Err(ProbeIssue::Malformed)
+                );
+            }
+            let mut values = session("c7", "wayland", 1000, true, false);
+            values.remove("Id");
+            assert_eq!(
+                decode_session("/session/c7", &values).unwrap().id,
+                "/session/c7"
+            );
+            values.insert("Id".into(), value(String::new()));
+            assert_eq!(
+                decode_session("/session/c7", &values),
+                Err(ProbeIssue::Malformed)
+            );
+            for field in ["Display", "Sessions"] {
+                let mut values = user(&["c7"], "c7");
+                values.remove(field);
+                assert_eq!(decode_user(&values), Err(ProbeIssue::Unverified));
+                values.insert(field.into(), value(true));
+                assert_eq!(decode_user(&values), Err(ProbeIssue::Malformed));
+            }
+        }
+        #[test]
+        fn login1_codec_rejects_short_extra_tuples_and_wrong_empty_arrays() {
+            for (field, malformed) in [
+                ("User", value((1000u32,))),
+                ("User", value((1000u32, path("/user/1000"), true))),
+                ("Seat", value(("seat0".to_string(),))),
+                (
+                    "Seat",
+                    value(("seat0".to_string(), path("/seat/seat0"), true)),
+                ),
+            ] {
+                let mut values = session("c7", "wayland", 1000, true, false);
+                values.insert(field.into(), malformed);
+                assert_eq!(
+                    decode_session("/session/c7", &values),
+                    Err(ProbeIssue::Malformed),
+                    "wrong {field} tuple must fail without conversion panic"
+                );
+            }
+            for malformed in [
+                value(("c7".to_string(),)),
+                value(("c7".to_string(), path("/session/c7"), true)),
+            ] {
+                let mut values = user(&["c7"], "c7");
+                values.insert("Display".into(), malformed);
+                assert_eq!(decode_user(&values), Err(ProbeIssue::Malformed));
+            }
+            for (signature, malformed) in [
+                ("as", value(Vec::<String>::new())),
+                ("au", value(Vec::<u32>::new())),
+                ("a(uo)", value(Vec::<(u32, OwnedObjectPath)>::new())),
+                ("a(s)", value(Vec::<(String,)>::new())),
+                (
+                    "a(sob)",
+                    value(Vec::<(String, OwnedObjectPath, bool)>::new()),
+                ),
+            ] {
+                assert_eq!(malformed.value_signature().to_string(), signature);
+                let mut values = user(&[], "");
+                values.insert("Sessions".into(), malformed);
+                assert_eq!(decode_user(&values), Err(ProbeIssue::Malformed));
+            }
+            let exact = user(&[], "");
+            assert_eq!(exact["Sessions"].value_signature().to_string(), "a(so)");
+            assert_eq!(decode_user(&exact), Ok(("/".into(), vec![])));
+            assert_eq!(
+                decode_session("/session/c7", &session("c7", "wayland", 1000, true, false))
+                    .unwrap()
+                    .uid,
+                Some(1000)
+            );
+        }
+        #[test]
+        fn actual_client_rejects_malformed_tuple_and_empty_array_signatures() {
+            for malformed in [
+                value((1000u32,)),
+                value((1000u32, path("/user/1000"), true)),
+            ] {
+                let mut properties = session("c7", "wayland", 1000, true, false);
+                properties.insert("User".into(), malformed);
+                let (fact, log) = probe(
+                    vec![
+                        step(
+                            "GetSessionByPID",
+                            "/org/freedesktop/login1",
+                            Response::Path(path("/session/c7")),
+                        ),
+                        step("GetAll", "/session/c7", Response::Properties(properties)),
+                    ],
+                    Some("never_queried"),
+                );
+                let decoded = fact.value.unwrap();
+                assert_eq!(decoded.selected_session.value, Err(ProbeIssue::Malformed));
+                assert_eq!(decoded.graphical_sessions.value, Err(ProbeIssue::Malformed));
+                assert_eq!(log, ["Hello", "GetSessionByPID", "GetAll"]);
+            }
+            for malformed in [
+                value(Vec::<String>::new()),
+                value(Vec::<(String, OwnedObjectPath, bool)>::new()),
+            ] {
+                let mut properties = user(&[], "");
+                properties.insert("Sessions".into(), malformed);
+                let (fact, log) = probe(
+                    vec![
+                        absent(),
+                        step(
+                            "GetUser",
+                            "/org/freedesktop/login1",
+                            Response::Path(path("/user/1000")),
+                        ),
+                        step("GetAll", "/user/1000", Response::Properties(properties)),
+                    ],
+                    None,
+                );
+                let decoded = fact.value.unwrap();
+                assert_eq!(decoded.selected_session.value, Err(ProbeIssue::Malformed));
+                assert_eq!(decoded.graphical_sessions.value, Err(ProbeIssue::Malformed));
+                assert_eq!(log, ["Hello", "GetSessionByPID", "GetUser", "GetAll"]);
+            }
+        }
+        #[test]
+        fn login1_codec_bounds_rows_keys_paths_ids_and_identity_duplicates() {
+            let ids: Vec<_> = (0..MAX_SESSIONS).map(|i| format!("c{i}")).collect();
+            let refs: Vec<_> = ids.iter().map(String::as_str).collect();
+            assert_eq!(
+                decode_user(&user(&refs, "c0")).unwrap().1.len(),
+                MAX_SESSIONS
+            );
+            let mut too_many = refs.clone();
+            too_many.push("extra");
+            assert_eq!(
+                decode_user(&user(&too_many, "c0")),
+                Err(ProbeIssue::Oversize)
+            );
+            assert_eq!(
+                decode_user(&user(&["c7", "c7"], "c7")),
+                Err(ProbeIssue::Malformed)
+            );
+            let mut duplicate = user(&["c7"], "c7");
+            duplicate.insert(
+                "Sessions".into(),
+                value(vec![
+                    ("c7".to_string(), path("/session/c7")),
+                    ("c7".to_string(), path("/session/c8")),
+                ]),
+            );
+            assert_eq!(decode_user(&duplicate), Err(ProbeIssue::Malformed));
+            for field in ["Id", "Type"] {
+                let mut values = session("c7", "wayland", 1000, true, false);
+                values.insert(field.into(), value("x".repeat(65)));
+                assert_eq!(
+                    decode_session("/session/c7", &values),
+                    Err(ProbeIssue::Oversize)
+                );
+            }
+            for field in ["Id", "Type"] {
+                let mut values = session("c7", "wayland", 1000, true, false);
+                values.insert(field.into(), value("bad\nvalue".to_string()));
+                assert_eq!(
+                    decode_session("/session/c7", &values),
+                    Err(ProbeIssue::Malformed)
+                );
+            }
+            for bad in ["/", "not-an-object-path", "/bad-path"] {
+                assert_eq!(
+                    decode_session(bad, &Properties::new()),
+                    Err(ProbeIssue::Malformed)
+                );
+            }
+            assert_eq!(
+                decode_session(&format!("/{}", "p".repeat(512)), &Properties::new()),
+                Err(ProbeIssue::Oversize)
+            );
+            let mut values = session("c7", "wayland", 1000, true, false);
+            for i in 0..129 {
+                values.insert(format!("Extra{i}"), value(true));
+            }
+            assert_eq!(
+                decode_session("/session/c7", &values),
+                Err(ProbeIssue::Oversize)
+            );
+        }
+        #[test]
+        fn actual_client_preserves_pid_selection_inactive_locked_and_distinct_receipts() {
+            let mut own = step(
+                "GetSessionByPID",
+                "/org/freedesktop/login1",
+                Response::Path(path("/session/c7")),
+            );
+            own.body = Some(4242u32.to_le_bytes().to_vec());
+            let mut script = vec![
+                own,
+                step(
+                    "GetAll",
+                    "/session/c7",
+                    Response::Properties(session("c7", "wayland", 1000, false, true)),
+                ),
+            ];
+            script.extend(
+                display_script(&["c7"], vec![session("c7", "wayland", 1000, false, true)])
+                    .into_iter()
+                    .skip(1),
+            );
+            let (fact, log) = probe(script, Some("must_not_be_queried"));
+            let result = fact.value.unwrap();
+            let selected = result
+                .selected_session
+                .value
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap();
+            assert_eq!(selected.selection, SessionSelection::Pid);
+            assert_eq!(selected.session.active, Some(false));
+            assert_eq!(selected.session.locked_hint, Some(true));
+            assert_eq!(result.graphical_sessions.value, Ok(1));
+            assert_eq!(result.selected_session.observed_at_ms, 20);
+            assert_eq!(result.graphical_sessions.observed_at_ms, 50);
+            assert_eq!(fact.observed_at_ms, 60);
+            assert_eq!(fact.source, ObservationSource::Demo);
+            assert_eq!(result.selected_session.source, ObservationSource::Demo);
+            assert_eq!(result.graphical_sessions.source, ObservationSource::Demo);
+            assert_eq!(
+                log,
+                [
+                    "Hello",
+                    "GetSessionByPID",
+                    "GetAll",
+                    "GetUser",
+                    "GetAll",
+                    "GetAll"
+                ]
+            );
+            let delivered_later = result.clone();
+            assert_eq!(delivered_later.selected_session.observed_at_ms, 20);
+        }
+        #[test]
+        fn actual_client_uses_exact_absence_fallback_and_display_reads_each_listed_session() {
+            for kind in ["wayland", "x11"] {
+                let mut script = display_script(
+                    &["c7", "tty"],
+                    vec![
+                        session("c7", kind, 1000, true, false),
+                        session("tty", "tty", 1000, true, false),
+                    ],
+                );
+                script.insert(
+                    1,
+                    step(
+                        "GetSession",
+                        "/org/freedesktop/login1",
+                        Response::Error("org.freedesktop.login1.NoSuchSession"),
+                    ),
+                );
+                let (fact, log) = probe(script, Some("absent"));
+                let result = fact.value.unwrap();
+                assert_eq!(
+                    result.selected_session.value.unwrap().unwrap().selection,
+                    SessionSelection::Display
+                );
+                assert_eq!(result.graphical_sessions.value, Ok(1));
+                assert_eq!(
+                    log,
+                    [
+                        "Hello",
+                        "GetSessionByPID",
+                        "GetSession",
+                        "GetUser",
+                        "GetAll",
+                        "GetAll",
+                        "GetAll"
+                    ]
+                );
+            }
+            let (fact, log) = probe(
+                display_script(&["c7"], vec![session("c7", "wayland", 1000, true, false)]),
+                None,
+            );
+            assert!(
+                fact.value
+                    .unwrap()
+                    .selected_session
+                    .value
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(!log.iter().any(|s| s == "GetSession"));
+        }
+        #[test]
+        fn actual_client_other_bus_errors_stop_without_any_fallback_or_mutation() {
+            for error in [
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "org.freedesktop.login1.NoSuchSession",
+            ] {
+                let (fact, log) = probe(
+                    vec![step(
+                        "GetSessionByPID",
+                        "/org/freedesktop/login1",
+                        Response::Error(error),
+                    )],
+                    Some("c7"),
+                );
+                let facts = fact.value.unwrap();
+                assert_eq!(facts.selected_session.value, Err(ProbeIssue::Unavailable));
+                assert_eq!(facts.graphical_sessions.value, Err(ProbeIssue::Unavailable));
+                assert_eq!(facts.selected_session.observed_at_ms, 10);
+                assert_eq!(log, ["Hello", "GetSessionByPID"]);
+            }
+            let (fact, log) = probe(
+                vec![
+                    absent(),
+                    step(
+                        "GetSession",
+                        "/org/freedesktop/login1",
+                        Response::Error("org.freedesktop.DBus.Error.AccessDenied"),
+                    ),
+                ],
+                Some("c7"),
+            );
+            assert_eq!(
+                fact.value.unwrap().selected_session.value,
+                Err(ProbeIssue::Unavailable)
+            );
+            assert_eq!(log, ["Hello", "GetSessionByPID", "GetSession"]);
+        }
+        #[test]
+        fn actual_client_display_zero_multiple_and_each_unreadable_listed_fact_fail_closed() {
+            let (fact, _) = probe(display_script(&[], vec![]), None);
+            let result = fact.value.unwrap();
+            assert_eq!(result.selected_session.value, Ok(None));
+            assert_eq!(result.graphical_sessions.value, Ok(0));
+            let (fact, _) = probe(
+                display_script(
+                    &["c7", "c8"],
+                    vec![
+                        session("c7", "wayland", 1000, true, false),
+                        session("c8", "x11", 1000, false, true),
+                    ],
+                ),
+                None,
+            );
+            assert_eq!(
+                fact.value.unwrap().selected_session.value,
+                Err(ProbeIssue::Ambiguous)
+            );
+            for field in ["Type", "User", "Seat"] {
+                let mut unreadable = session("tty", "tty", 2000, true, false);
+                unreadable.remove(field);
+                let (fact, _) = probe(
+                    display_script(
+                        &["c7", "tty"],
+                        vec![session("c7", "wayland", 1000, true, false), unreadable],
+                    ),
+                    None,
+                );
+                let result = fact.value.unwrap();
+                assert_eq!(result.selected_session.value, Err(ProbeIssue::Unverified));
+                assert_eq!(result.graphical_sessions.value, Err(ProbeIssue::Unverified));
+            }
+        }
+        #[test]
+        fn actual_client_oversized_and_wrong_signature_replies_are_explicit() {
+            let mut large = session("c7", "wayland", 1000, true, false);
+            large.insert("Ignored".into(), value("s".repeat(MAX_PROBE_BYTES)));
+            let (fact, _) = probe(
+                vec![
+                    step(
+                        "GetSessionByPID",
+                        "/org/freedesktop/login1",
+                        Response::Path(path("/session/c7")),
+                    ),
+                    step("GetAll", "/session/c7", Response::Properties(large)),
+                ],
+                None,
+            );
+            assert_eq!(
+                fact.value.unwrap().selected_session.value,
+                Err(ProbeIssue::Oversize)
+            );
+            let (fact, _) = probe(
+                vec![step(
+                    "GetSessionByPID",
+                    "/org/freedesktop/login1",
+                    Response::Text("wrong signature".into()),
+                )],
+                None,
+            );
+            assert_eq!(
+                fact.value.unwrap().selected_session.value,
+                Err(ProbeIssue::Malformed)
+            );
+            let (fact, log) = probe(
+                vec![step(
+                    "GetSessionByPID",
+                    "/org/freedesktop/login1",
+                    Response::ErrorBody(
+                        "org.freedesktop.login1.NoSessionForPID",
+                        "s".repeat(MAX_PROBE_BYTES),
+                    ),
+                )],
+                Some("never_queried"),
+            );
+            assert_eq!(
+                fact.value.unwrap().selected_session.value,
+                Err(ProbeIssue::Oversize)
+            );
+            assert_eq!(log, ["Hello", "GetSessionByPID"]);
+        }
+        #[test]
+        fn actual_client_environment_success_follows_own_nongraphical_session() {
+            let mut script = vec![
+                step(
+                    "GetSessionByPID",
+                    "/org/freedesktop/login1",
+                    Response::Path(path("/session/tty")),
+                ),
+                step(
+                    "GetAll",
+                    "/session/tty",
+                    Response::Properties(session("tty", "tty", 1000, true, false)),
+                ),
+                step(
+                    "GetSession",
+                    "/org/freedesktop/login1",
+                    Response::Path(path("/session/c7")),
+                ),
+                step(
+                    "GetAll",
+                    "/session/c7",
+                    Response::Properties(session("c7", "x11", 1000, false, true)),
+                ),
+            ];
+            script.extend(
+                display_script(&["c7"], vec![session("c7", "x11", 1000, false, true)])
+                    .into_iter()
+                    .skip(1),
+            );
+            let (fact, log) = probe(script, Some("c7"));
+            let result = fact.value.unwrap();
+            let chosen = result.selected_session.value.unwrap().unwrap();
+            assert_eq!(chosen.selection, SessionSelection::Environment);
+            assert_eq!(chosen.session.kind.as_deref(), Some("x11"));
+            assert_eq!(chosen.session.active, Some(false));
+            assert_eq!(chosen.session.locked_hint, Some(true));
+            assert_eq!(result.graphical_sessions.value, Ok(1));
+            assert_eq!(
+                log,
+                [
+                    "Hello",
+                    "GetSessionByPID",
+                    "GetAll",
+                    "GetSession",
+                    "GetAll",
+                    "GetUser",
+                    "GetAll",
+                    "GetAll"
+                ]
+            );
+        }
+        #[test]
+        fn worker_slot_is_released_when_caller_clock_unwinds_in_owned_worker() {
+            let (stream, peer) = UnixStream::pair().unwrap();
+            drop(peer);
+            let calls = Arc::new(AtomicU64::new(0));
+            let count = calls.clone();
+            let fact = logind_from_stream(
+                stream,
+                1000,
+                4242,
+                None,
+                &Deadline::new(500, Cancellation::default()).unwrap(),
+                Arc::new(move || {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    assert_ne!(n, 0, "test-owned clock unwind");
+                    n
+                }),
+            );
+            assert_eq!(fact.value, Err(ProbeIssue::Unavailable));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let (fact, _) = probe(display_script(&[], vec![]), None);
+            assert_eq!(fact.value.unwrap().graphical_sessions.value, Ok(0));
+        }
+        #[test]
+        fn owned_stream_authentication_and_method_reads_share_deadline_and_cancel() {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let started = Instant::now();
+            let result = logind_from_stream(
+                stream,
+                1000,
+                4242,
+                None,
+                &Deadline::new(40, Cancellation::default()).unwrap(),
+                Arc::new(|| 77),
+            );
+            assert_eq!(result.value, Err(ProbeIssue::Timeout));
+            assert!(started.elapsed() < Duration::from_millis(300));
+            let mut auth = Vec::new();
+            peer.read_to_end(&mut auth).unwrap();
+            assert!(auth.starts_with(b"\0AUTH"));
+            let (stream, server) = Server::new(vec![step(
+                "GetSessionByPID",
+                "/org/freedesktop/login1",
+                Response::Stall,
+            )]);
+            let result = logind_from_stream(
+                stream,
+                1000,
+                4242,
+                Some("must_not_query".into()),
+                &Deadline::new(80, Cancellation::default()).unwrap(),
+                Arc::new(|| 88),
+            );
+            assert_eq!(result.value, Err(ProbeIssue::Timeout));
+            assert_eq!(*server.log.lock().unwrap(), ["Hello", "GetSessionByPID"]);
+            drop(server);
+            let cancellation = Cancellation::default();
+            cancellation.cancel();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let result = logind_from_stream(
+                stream,
+                1000,
+                4242,
+                None,
+                &Deadline::new(100, cancellation).unwrap(),
+                Arc::new(|| 99),
+            );
+            assert_eq!(result.value, Err(ProbeIssue::Cancelled));
+            let mut byte = [0];
+            assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        }
+        #[test]
+        fn worker_capacity_refuses_without_auth_bytes_and_recovers_after_cancel() {
+            let cancellation = Cancellation::default();
+            let mut jobs = Vec::new();
+            let mut peers = Vec::new();
+            for _ in 0..4 {
+                let (stream, mut peer) = UnixStream::pair().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let token = cancellation.clone();
+                jobs.push(thread::spawn(move || {
+                    logind_from_stream(
+                        stream,
+                        1000,
+                        4242,
+                        None,
+                        &Deadline::new(1500, token).unwrap(),
+                        Arc::new(|| 1),
+                    )
+                }));
+                assert!(read_line(&mut peer).unwrap().starts_with(b"\0AUTH"));
+                peers.push(peer);
+            }
+            let (stream, mut fifth) = UnixStream::pair().unwrap();
+            let result = logind_from_stream(
+                stream,
+                1000,
+                4242,
+                None,
+                &Deadline::new(500, Cancellation::default()).unwrap(),
+                Arc::new(|| 2),
+            );
+            assert_eq!(result.value, Err(ProbeIssue::Unavailable));
+            let mut byte = [0];
+            assert_eq!(fifth.read(&mut byte).unwrap(), 0);
+            cancellation.cancel();
+            for job in jobs {
+                assert_eq!(job.join().unwrap().value, Err(ProbeIssue::Cancelled));
+            }
+            for peer in peers {
+                let _ = peer.shutdown(Shutdown::Both);
+            }
+            let limit = Instant::now() + Duration::from_secs(1);
+            loop {
+                let (stream, server) = Server::new(display_script(&[], vec![]));
+                let fact = logind_from_stream(
+                    stream,
+                    1000,
+                    4242,
+                    None,
+                    &Deadline::new(500, Cancellation::default()).unwrap(),
+                    Arc::new(|| 3),
+                );
+                if fact.value == Err(ProbeIssue::Unavailable)
+                    && server.log.lock().unwrap().is_empty()
+                {
+                    drop(server);
+                    assert!(Instant::now() < limit);
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                assert_eq!(fact.value.unwrap().graphical_sessions.value, Ok(0));
+                assert_eq!(
+                    server.finish(),
+                    ["Hello", "GetSessionByPID", "GetUser", "GetAll"]
+                );
+                break;
+            }
+        }
+        #[test]
+        fn cancellation_during_authentication_closes_only_owned_stream() {
+            let cancellation = Cancellation::default();
+            let token = cancellation.clone();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let job = thread::spawn(move || {
+                logind_from_stream(
+                    stream,
+                    1000,
+                    4242,
+                    None,
+                    &Deadline::new(1000, token).unwrap(),
+                    Arc::new(|| 123),
+                )
+            });
+            assert!(read_line(&mut peer).unwrap().starts_with(b"\0AUTH"));
+            cancellation.cancel();
+            assert_eq!(job.join().unwrap().value, Err(ProbeIssue::Cancelled));
+            let mut byte = [0];
+            assert_eq!(peer.read(&mut byte).unwrap(), 0);
+            let (mut unrelated, mut unrelated_peer) = UnixStream::pair().unwrap();
+            unrelated.write_all(b"owned independent stream").unwrap();
+            let mut bytes = [0; 24];
+            unrelated_peer.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"owned independent stream");
+        }
+    }
     use crosspane_installer::agent_contract::*;
     use crosspane_installer::platform::linux::detect::*;
     use serde_json::{Value, json};
