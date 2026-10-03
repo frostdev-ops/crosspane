@@ -2592,4 +2592,1204 @@ mod current_tests {
             assert!(f.auth.calls.lock().unwrap().is_empty());
         }
     }
+
+    mod receipt_tests {
+        use super::*;
+        use crosspane_installer::platform::linux::firewall::receipts::*;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        fn journal(f: &Fixture) -> PathBuf {
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/ufw/journal.json")
+        }
+        fn intent(f: &Fixture, op: u64, kind: RuleKind, network: &str) -> FirewallIntent {
+            FirewallIntent {
+                operation: OperationId(op),
+                revision: op,
+                target: f.io.target().paths().clone(),
+                link: LanLink {
+                    interface: "enp1s0".into(),
+                    cidr: cidr(network),
+                    default_route: true,
+                },
+                kind,
+            }
+        }
+        fn seed(
+            f: &Fixture,
+            fw: &mut LinuxFirewall,
+            kind: RuleKind,
+            network: &str,
+        ) -> DurableIntentStore {
+            let mut store = DurableIntentStore::open(fw, &f.proof()).unwrap();
+            let i = intent(f, 1, kind, network);
+            store.record_intent(&f.proof(), &i).unwrap();
+            store
+                .record_outcome(&f.proof(), &i, RuleResult::PendingVerification)
+                .unwrap();
+            store
+        }
+        fn installed(f: &Fixture, kind: RuleKind, network: &str) {
+            let mut reads = f.reads.lock().unwrap();
+            if network.contains(':') {
+                reads.ipv6 = Ok(rule_file(network, kind, Some(kind_comment(kind))));
+                reads.addresses = links_bytes(vec![link("enp1s0", "fd42::31", 64)]);
+                reads.routes4 = b"[]".to_vec();
+                reads.routes6 = br#"[{"dst":"default","dev":"enp1s0"}]"#.to_vec();
+            } else {
+                reads.ipv4 = Ok(rule_file(network, kind, Some(kind_comment(kind))));
+            }
+        }
+        fn kind_comment(kind: RuleKind) -> &'static str {
+            if kind == RuleKind::Lan {
+                "Crosspane (LAN)"
+            } else {
+                "Crosspane (mDNS)"
+            }
+        }
+        fn removal(
+            f: &Fixture,
+            fw: &mut LinuxFirewall,
+            store: &DurableIntentStore,
+            op: u64,
+        ) -> RemovalPlan {
+            let bytes = store.receipt(&f.proof(), OperationId(1)).unwrap();
+            let receipt = store.admit_receipt(&f.proof(), &bytes).unwrap();
+            let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            fw.plan_removal(&snapshot, receipt, OperationId(op), op)
+                .unwrap()
+        }
+        fn remove(
+            f: &Fixture,
+            fw: &mut LinuxFirewall,
+            store: &mut DurableIntentStore,
+            op: u64,
+        ) -> Result<FirewallResult, FirewallError> {
+            let plan = removal(f, fw, store, op);
+            let consent = plan.consent(OperationId(op), op).unwrap();
+            fw.apply_removal(
+                &f.proof(),
+                ManagerSelection::Ufw,
+                plan,
+                consent,
+                store,
+                &deadline(),
+            )
+        }
+
+        #[test]
+        fn durable_add_records_complete_intent_before_fake_dispatch_and_outcome_after() {
+            let _serial = MUTATIONS.lock().unwrap();
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let mut store = DurableIntentStore::open(&mut fw, &f.proof()).unwrap();
+            let path = journal(&f);
+            *f.auth.hook.lock().unwrap() = Some(Box::new(move || {
+                let j: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert_eq!(j["records"][0]["operation"], 7);
+                assert_eq!(j["records"][0]["delete"], false);
+                assert_eq!(j["records"][0]["outcome"], Value::Null);
+            }));
+            let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let plan = fw.plan(&snapshot, request(RuleKind::Lan, 7, 9)).unwrap();
+            let consent = plan.consent(OperationId(7), 9).unwrap();
+            assert_eq!(
+                fw.apply(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut store,
+                    &deadline()
+                )
+                .unwrap()
+                .result,
+                RuleResult::PendingVerification
+            );
+            f.wait();
+            let bytes = store.receipt(&f.proof(), OperationId(7)).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                json!({"version":1,"cidr":"192.168.4.0/24","kind":"Lan","result":0})
+            );
+            assert!(store.admit_receipt(&f.proof(), &bytes).is_ok());
+            let metadata = fs::metadata(journal(&f)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(journal(&f).parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(f.auth.calls.lock().unwrap().len(), 1);
+        }
+
+        /// Atomic write/file-sync/rename/parent-sync failures delegate to 4.7a's tested native
+        /// contract. These real scratch journals cover installer interruption at publication boundaries.
+        #[test]
+        fn durable_reconstruction_before_intent_after_intent_and_after_outcome_never_resends() {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let store = DurableIntentStore::open(&mut fw, &f.proof()).unwrap();
+            assert!(!journal(&f).exists());
+            drop(store);
+            let mut store = DurableIntentStore::open(&mut fw, &f.proof()).unwrap();
+            let i = intent(&f, 1, RuleKind::Lan, "192.168.4.0/24");
+            store.record_intent(&f.proof(), &i).unwrap();
+            assert_eq!(
+                f.io.lock(&f.proof(), &journal(&f).with_file_name("journal.lock"))
+                    .unwrap_err(),
+                NativeError::Busy
+            );
+            drop(store);
+            let mut reconstructed = f.firewall();
+            let store = DurableIntentStore::open(&mut reconstructed, &f.proof()).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(
+                    &store.receipt(&f.proof(), OperationId(1)).unwrap()
+                )
+                .unwrap()["result"],
+                3
+            );
+            let snapshot = reconstructed
+                .detect(ManagerSelection::Ufw, &deadline())
+                .unwrap();
+            assert_eq!(
+                reconstructed
+                    .plan(&snapshot, request(RuleKind::Lan, 2, 2))
+                    .unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+            drop(store);
+            let f2 = Fixture::new();
+            let mut second = f2.firewall();
+            let store = seed(&f2, &mut second, RuleKind::Lan, "192.168.4.0/24");
+            drop(store);
+            let mut reconstructed = f2.firewall();
+            let store = DurableIntentStore::open(&mut reconstructed, &f2.proof()).unwrap();
+            let snapshot = reconstructed
+                .detect(ManagerSelection::Ufw, &deadline())
+                .unwrap();
+            assert!(
+                reconstructed
+                    .plan(&snapshot, request(RuleKind::Lan, 2, 2))
+                    .is_ok()
+            );
+            assert!(store.receipt(&f2.proof(), OperationId(1)).is_ok());
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+            assert!(f2.auth.calls.lock().unwrap().is_empty());
+            assert!(
+                fs::read_dir(journal(&f).parent().unwrap())
+                    .unwrap()
+                    .all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".crosspane-"))
+            );
+        }
+
+        #[test]
+        fn durable_intent_refusal_has_zero_dispatch_and_prior_record_is_preserved() {
+            let _serial = MUTATIONS.lock().unwrap();
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            let old = fs::read(journal(&f)).unwrap();
+            fs::set_permissions(journal(&f), fs::Permissions::from_mode(0o400)).unwrap();
+            let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let plan = fw.plan(&snapshot, request(RuleKind::Lan, 2, 2)).unwrap();
+            let consent = plan.consent(OperationId(2), 2).unwrap();
+            assert!(
+                fw.apply(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut store,
+                    &deadline()
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(journal(&f)).unwrap(), old);
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn failed_outcome_publication_preserves_pending_intent_and_returns_unknown() {
+            let _serial = MUTATIONS.lock().unwrap();
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let mut store = DurableIntentStore::open(&mut fw, &f.proof()).unwrap();
+            let path = journal(&f);
+            *f.auth.hook.lock().unwrap() = Some(Box::new(move || {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap()
+            }));
+            let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let plan = fw.plan(&snapshot, request(RuleKind::Lan, 2, 2)).unwrap();
+            let consent = plan.consent(OperationId(2), 2).unwrap();
+            assert_eq!(
+                fw.apply(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut store,
+                    &deadline()
+                )
+                .unwrap()
+                .result,
+                RuleResult::OutcomeUnknown
+            );
+            f.wait();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(journal(&f)).unwrap()).unwrap()["records"]
+                    [0]["outcome"],
+                Value::Null
+            );
+            drop(store);
+            fs::set_permissions(journal(&f), fs::Permissions::from_mode(0o600)).unwrap();
+            let mut rebuilt = f.firewall();
+            let store = DurableIntentStore::open(&mut rebuilt, &f.proof()).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(
+                    &store.receipt(&f.proof(), OperationId(2)).unwrap()
+                )
+                .unwrap()["result"],
+                3
+            );
+            assert_eq!(f.auth.calls.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn receipt_rejects_cidr_kind_result_version_extra_fields_and_oversize_forgery() {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            let valid = store.receipt(&f.proof(), OperationId(1)).unwrap();
+            let original: Value = serde_json::from_slice(&valid).unwrap();
+            for (key, value) in [
+                ("cidr", json!("192.168.0.0/16")),
+                ("cidr", json!("192.168.4.1/24")),
+                ("kind", json!("Mdns")),
+                ("result", json!(3)),
+                ("result", json!(255)),
+                ("version", json!(2)),
+                ("comment", json!("Crosspane (LAN)")),
+                ("path", json!("/etc/ufw/user.rules")),
+                ("port", json!(22)),
+            ] {
+                let mut forged = original.clone();
+                forged[key] = value;
+                assert!(
+                    store
+                        .admit_receipt(&f.proof(), &serde_json::to_vec(&forged).unwrap())
+                        .is_err(),
+                    "{forged}"
+                );
+            }
+            for bytes in [
+                b"{".to_vec(),
+                vec![b' '; MAX_RECEIPT_BYTES + 1],
+                b"{\"version\":1,\"version\":1}".to_vec(),
+            ] {
+                assert!(store.admit_receipt(&f.proof(), &bytes).is_err());
+            }
+            assert_eq!(
+                format!("{:?}", store.admit_receipt(&f.proof(), &valid).unwrap()),
+                "AdmittedReceipt { .. }"
+            );
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn journal_target_mode_link_schema_size_and_record_bounds_fail_closed() {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            let valid = fs::read(journal(&f)).unwrap();
+            drop(store);
+            let original: Value = serde_json::from_slice(&valid).unwrap();
+            let mut mutations = vec![];
+            for (key, value) in [("version", json!(2)), ("extra", json!(true))] {
+                let mut j = original.clone();
+                j[key] = value;
+                mutations.push(serde_json::to_vec(&j).unwrap());
+            }
+            let mut foreign = original.clone();
+            foreign["target"][1][0] = json!("/foreign");
+            mutations.push(serde_json::to_vec(&foreign).unwrap());
+            for (key, value) in [
+                ("operation", json!(0)),
+                ("outcome", json!(255)),
+                ("cidr", json!("192.168.4.1/24")),
+                ("interface", json!("evil\n")),
+            ] {
+                let mut j = original.clone();
+                j["records"][0][key] = value;
+                mutations.push(serde_json::to_vec(&j).unwrap());
+            }
+            let mut many = original.clone();
+            many["records"] = json!(vec![
+                original["records"][0].clone();
+                MAX_JOURNAL_RECORDS + 1
+            ]);
+            mutations.push(serde_json::to_vec(&many).unwrap());
+            mutations.push(vec![b' '; MAX_JOURNAL_BYTES + 1]);
+            mutations.push(b"{\"records\":".to_vec());
+            for bytes in mutations {
+                fs::write(journal(&f), bytes).unwrap();
+                assert!(DurableIntentStore::open(&mut fw, &f.proof()).is_err());
+            }
+            fs::write(journal(&f), &valid).unwrap();
+            fs::set_permissions(journal(&f), fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(DurableIntentStore::open(&mut fw, &f.proof()).is_err());
+            fs::set_permissions(journal(&f), fs::Permissions::from_mode(0o600)).unwrap();
+            let saved = journal(&f).with_file_name("saved.json");
+            fs::rename(journal(&f), &saved).unwrap();
+            symlink(&saved, journal(&f)).unwrap();
+            assert!(DurableIntentStore::open(&mut fw, &f.proof()).is_err());
+            fs::remove_file(journal(&f)).unwrap();
+            fs::hard_link(&saved, journal(&f)).unwrap();
+            assert!(DurableIntentStore::open(&mut fw, &f.proof()).is_err());
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn durable_lock_serializes_competing_intents_and_releases_only_after_outcome_or_drop() {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let mut a = DurableIntentStore::open(&mut fw, &f.proof()).unwrap();
+            let mut b = DurableIntentStore::open(&mut fw, &f.proof()).unwrap();
+            let i = intent(&f, 1, RuleKind::Lan, "192.168.4.0/24");
+            a.record_intent(&f.proof(), &i).unwrap();
+            assert_eq!(
+                b.record_intent(&f.proof(), &intent(&f, 2, RuleKind::Lan, "192.168.4.0/24")),
+                Err(NativeError::Busy)
+            );
+            let mut wrong = i.clone();
+            wrong.revision += 1;
+            assert_eq!(
+                a.record_outcome(&f.proof(), &wrong, RuleResult::PendingVerification),
+                Err(NativeError::Foreign)
+            );
+            a.record_outcome(&f.proof(), &i, RuleResult::PendingVerification)
+                .unwrap();
+            assert_eq!(
+                b.record_intent(&f.proof(), &intent(&f, 2, RuleKind::Mdns, "192.168.4.0/24")),
+                Err(NativeError::OutcomeUnknown)
+            );
+            b = DurableIntentStore::open(&mut fw, &f.proof()).unwrap();
+            b.record_intent(&f.proof(), &intent(&f, 2, RuleKind::Mdns, "192.168.4.0/24"))
+                .unwrap();
+            drop(b);
+            assert!(
+                f.io.lock(&f.proof(), &journal(&f).with_file_name("journal.lock"))
+                    .is_ok()
+            );
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn journal_capacity_and_duplicate_operation_refuse_before_publication() {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            assert_eq!(
+                store.record_intent(&f.proof(), &intent(&f, 1, RuleKind::Lan, "192.168.4.0/24")),
+                Err(NativeError::Invalid)
+            );
+            for op in 2..=MAX_JOURNAL_RECORDS as u64 {
+                let i = intent(&f, op, RuleKind::Lan, "192.168.4.0/24");
+                store.record_intent(&f.proof(), &i).unwrap();
+                store
+                    .record_outcome(&f.proof(), &i, RuleResult::Kept)
+                    .unwrap();
+            }
+            let bytes = fs::read(journal(&f)).unwrap();
+            assert_eq!(
+                store.record_intent(&f.proof(), &intent(&f, 99, RuleKind::Lan, "192.168.4.0/24")),
+                Err(NativeError::Oversize)
+            );
+            assert_eq!(fs::read(journal(&f)).unwrap(), bytes);
+        }
+
+        #[test]
+        fn exact_lan_ipv4_ipv6_removal_has_separate_consent_and_literal_global_toctou_preview() {
+            let _serial = MUTATIONS.lock().unwrap();
+            for network in ["192.168.4.0/24", "fd42::/64"] {
+                let f = Fixture::new();
+                installed(&f, RuleKind::Lan, network);
+                let mut fw = f.firewall();
+                let mut store = seed(&f, &mut fw, RuleKind::Lan, network);
+                let plan = removal(&f, &mut fw, &store, 2);
+                assert!(plan.preview().starts_with(&format!("pkexec /usr/bin/ufw delete allow from {network} to any port 47811:47812 proto udp comment 'Crosspane (LAN)'\n")));
+                assert!(plan.preview().contains(REMOVAL_TOCTOU));
+                assert!(!plan.preview().contains(REMOVAL_LIMIT));
+                assert_eq!(
+                    plan.consent(OperationId(2), 3).unwrap_err(),
+                    FirewallError::Stale
+                );
+                let consent = plan.consent(OperationId(2), 2).unwrap();
+                let result = fw
+                    .apply_removal(
+                        &f.proof(),
+                        ManagerSelection::Ufw,
+                        plan,
+                        consent,
+                        &mut store,
+                        &deadline(),
+                    )
+                    .unwrap();
+                f.wait();
+                assert_eq!(result.result, RuleResult::PendingVerification);
+                assert_eq!(result.inventory, Presence::Owned);
+                let calls = f.auth.calls.lock().unwrap();
+                assert_eq!(
+                    calls[0].argv(),
+                    [
+                        "--wait",
+                        "/usr/bin/pkexec",
+                        "/usr/bin/ufw",
+                        "delete",
+                        "allow",
+                        "from",
+                        network,
+                        "to",
+                        "any",
+                        "port",
+                        "47811:47812",
+                        "proto",
+                        "udp",
+                        "comment",
+                        "Crosspane (LAN)"
+                    ]
+                );
+                assert_eq!(calls.len(), 1);
+            }
+        }
+
+        #[test]
+        fn mdns_removal_uses_current_same_kind_stamp_after_discovery_recovered_without_add_evidence()
+         {
+            let _serial = MUTATIONS.lock().unwrap();
+            let f = Fixture::new();
+            installed(&f, RuleKind::Mdns, "192.168.4.0/24");
+            let mut fw = f.firewall();
+            let input = install(&f, &mut fw);
+            input.lock().unwrap().observations =
+                Ok(observations(&f, 60, 70, true, Some(2), 9, None));
+            let mut store = seed(&f, &mut fw, RuleKind::Mdns, "192.168.4.0/24");
+            f.auth
+                .outcomes
+                .lock()
+                .unwrap()
+                .push_back(exited(126, "", "cancelled"));
+            assert_eq!(
+                remove(&f, &mut fw, &mut store, 2).unwrap().result,
+                RuleResult::OutcomeUnknown
+            );
+            f.wait();
+            let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let selected = selected(&snapshot);
+            input.lock().unwrap().observations =
+                Ok(observations(&f, 100, 101, true, Some(2), 9, None));
+            fw.refresh_current(&snapshot, &selected, &deadline())
+                .unwrap();
+            let receipt = store
+                .admit_receipt(
+                    &f.proof(),
+                    &store.receipt(&f.proof(), OperationId(1)).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                fw.plan_removal(&snapshot, receipt, OperationId(3), 3)
+                    .unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+            input.lock().unwrap().observations =
+                Ok(observations(&f, 110, 111, true, Some(2), 9, None));
+            input.lock().unwrap().stamp = Ok(120);
+            fw.refresh_current(&snapshot, &selected, &deadline())
+                .unwrap();
+            let plan = removal(&f, &mut fw, &store, 3);
+            assert!(plan.preview().contains("port 5353"));
+            input.lock().unwrap().observations =
+                Ok(observations(&f, 130, 140, true, Some(2), 9, None));
+            input.lock().unwrap().stamp = Ok(150);
+            let consent = plan.consent(OperationId(3), 3).unwrap();
+            assert!(
+                fw.apply_removal(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut store,
+                    &deadline()
+                )
+                .is_ok()
+            );
+            f.wait();
+            assert_eq!(
+                f.auth.calls.lock().unwrap()[0].argv().last().unwrap(),
+                "Crosspane (mDNS)"
+            );
+            assert_eq!(f.auth.calls.lock().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn mdns_removal_without_current_reader_or_valid_stamp_records_not_dispatched() {
+            let f = Fixture::new();
+            installed(&f, RuleKind::Mdns, "192.168.4.0/24");
+            let mut fw = f.firewall();
+            let mut store = seed(&f, &mut fw, RuleKind::Mdns, "192.168.4.0/24");
+            assert_eq!(
+                remove(&f, &mut fw, &mut store, 2).unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+            let data: Value = serde_json::from_slice(&fs::read(journal(&f)).unwrap()).unwrap();
+            assert_eq!(data["records"][1]["delete"], true);
+            assert_eq!(data["records"][1]["outcome"], 1);
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn unreadable_inventory_requires_inspection_limit_preview_and_keeps_poststate_unknown() {
+            let _serial = MUTATIONS.lock().unwrap();
+            for network in ["192.168.4.0/24", "fd42::/64"] {
+                let f = Fixture::new();
+                installed(&f, RuleKind::Lan, network);
+                let mut fw = f.firewall();
+                let mut store = seed(&f, &mut fw, RuleKind::Lan, network);
+                if network.contains(':') {
+                    f.reads.lock().unwrap().ipv6 = Err(NativeError::PermissionDenied);
+                } else {
+                    f.reads.lock().unwrap().ipv4 = Err(NativeError::PermissionDenied);
+                }
+                let plan = removal(&f, &mut fw, &store, 2);
+                assert!(plan.preview().contains(REMOVAL_LIMIT));
+                let consent = plan.consent(OperationId(2), 2).unwrap();
+                let result = fw
+                    .apply_removal(
+                        &f.proof(),
+                        ManagerSelection::Ufw,
+                        plan,
+                        consent,
+                        &mut store,
+                        &deadline(),
+                    )
+                    .unwrap();
+                f.wait();
+                assert_eq!(result.result, RuleResult::PendingVerification);
+                assert_eq!(
+                    result.inventory,
+                    Presence::Unknown(InspectionIssue::Unreadable(NativeError::PermissionDenied))
+                );
+            }
+        }
+
+        #[test]
+        fn duplicate_equivalent_modified_malformed_and_affected_uncertainty_never_authorize_removal()
+         {
+            for network in ["192.168.4.0/24", "fd42::/64"] {
+                let f = Fixture::new();
+                installed(&f, RuleKind::Lan, network);
+                let mut fw = f.firewall();
+                let store = seed(&f, &mut fw, RuleKind::Lan, network);
+                let exact =
+                    String::from_utf8(rule_file(network, RuleKind::Lan, Some("Crosspane (LAN)")))
+                        .unwrap();
+                let body = exact
+                    .split("### RULES ###\n")
+                    .nth(1)
+                    .unwrap()
+                    .split("### END RULES ###")
+                    .next()
+                    .unwrap();
+                for bytes in [
+                    rule_file(network, RuleKind::Lan, None),
+                    rule_file(network, RuleKind::Lan, Some("Administrator")),
+                    rule_file(
+                        if network.contains(':') {
+                            "fd43::/64"
+                        } else {
+                            "192.168.5.0/24"
+                        },
+                        RuleKind::Lan,
+                        Some("Crosspane (LAN)"),
+                    ),
+                    exact
+                        .replace("### END RULES ###", &format!("{body}### END RULES ###"))
+                        .into_bytes(),
+                    exact
+                        .replace("### END RULES ###", "unsupported\n### END RULES ###")
+                        .into_bytes(),
+                    b"malformed".to_vec(),
+                    vec![b' '; MAX_UFW_BYTES + 1],
+                ] {
+                    if network.contains(':') {
+                        f.reads.lock().unwrap().ipv6 = Ok(bytes);
+                    } else {
+                        f.reads.lock().unwrap().ipv4 = Ok(bytes);
+                    }
+                    let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+                    let receipt = store
+                        .admit_receipt(
+                            &f.proof(),
+                            &store.receipt(&f.proof(), OperationId(1)).unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        fw.plan_removal(&snapshot, receipt, OperationId(2), 2)
+                            .unwrap_err(),
+                        FirewallError::Kept
+                    );
+                }
+                assert!(f.auth.calls.lock().unwrap().is_empty());
+            }
+        }
+
+        #[test]
+        fn stale_consent_snapshot_backend_and_predelete_edits_refuse_without_dispatch() {
+            let f = Fixture::new();
+            installed(&f, RuleKind::Lan, "192.168.4.0/24");
+            let mut fw = f.firewall();
+            let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            let old = removal(&f, &mut fw, &store, 2);
+            let consent = old.consent(OperationId(2), 2).unwrap();
+            let current = removal(&f, &mut fw, &store, 3);
+            assert_eq!(
+                fw.apply_removal(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    current,
+                    consent,
+                    &mut store,
+                    &deadline()
+                )
+                .unwrap_err(),
+                FirewallError::Stale
+            );
+            let plan = removal(&f, &mut fw, &store, 4);
+            let consent = plan.consent(OperationId(4), 4).unwrap();
+            f.reads.lock().unwrap().ipv4 = Ok(rule_file("192.168.4.0/24", RuleKind::Lan, None));
+            assert_eq!(
+                fw.apply_removal(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut store,
+                    &deadline()
+                )
+                .unwrap_err(),
+                FirewallError::Changed
+            );
+            installed(&f, RuleKind::Lan, "192.168.4.0/24");
+            let plan = removal(&f, &mut fw, &store, 5);
+            let consent = plan.consent(OperationId(5), 5).unwrap();
+            assert_eq!(
+                fw.apply_removal(
+                    &f.proof(),
+                    ManagerSelection::Manual,
+                    plan,
+                    consent,
+                    &mut store,
+                    &deadline()
+                )
+                .unwrap_err(),
+                FirewallError::Changed
+            );
+            assert_eq!(serde_json::from_slice::<Value>(&fs::read(journal(&f)).unwrap()).unwrap()["records"].as_array().unwrap().len(), 1);
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn authorization_time_edit_is_reported_and_never_restores_or_resends_rules() {
+            let _serial = MUTATIONS.lock().unwrap();
+            let f = Fixture::new();
+            installed(&f, RuleKind::Lan, "192.168.4.0/24");
+            let mut fw = f.firewall();
+            let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            let reads = f.reads.clone();
+            *f.auth.hook.lock().unwrap() = Some(Box::new(move || {
+                let mut r = reads.lock().unwrap();
+                r.ipv4 = Ok(rule_file(
+                    "192.168.4.0/24",
+                    RuleKind::Lan,
+                    Some("Administrator"),
+                ));
+                r.addresses = links_bytes(vec![link("enp1s0", "192.168.5.31", 24)]);
+            }));
+            let result = remove(&f, &mut fw, &mut store, 2).unwrap();
+            f.wait();
+            assert_eq!(result.result, RuleResult::OutcomeUnknown);
+            assert_eq!(result.inventory, Presence::Equivalent);
+            assert_eq!(f.auth.calls.lock().unwrap().len(), 1);
+            assert_eq!(
+                f.reads.lock().unwrap().ipv4.as_ref().unwrap(),
+                &rule_file("192.168.4.0/24", RuleKind::Lan, Some("Administrator"))
+            );
+        }
+
+        #[test]
+        fn absent_result_and_fresh_absence_retire_receipts_but_exit_zero_owned_does_not() {
+            let _serial = MUTATIONS.lock().unwrap();
+            for (mode, expected) in [
+                (0, RuleResult::Absent),
+                (1, RuleResult::Absent),
+                (2, RuleResult::PendingVerification),
+                (3, RuleResult::Absent),
+            ] {
+                let f = Fixture::new();
+                installed(&f, RuleKind::Lan, "192.168.4.0/24");
+                let mut fw = f.firewall();
+                let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+                let old = store.receipt(&f.proof(), OperationId(1)).unwrap();
+                if mode == 0 {
+                    f.auth.outcomes.lock().unwrap().push_back(exited(
+                        1,
+                        "",
+                        "Could not delete non-existent rule\n",
+                    ));
+                }
+                if mode == 1 {
+                    let reads = f.reads.clone();
+                    *f.auth.hook.lock().unwrap() = Some(Box::new(move || {
+                        reads.lock().unwrap().ipv4 = Ok(empty_rules())
+                    }));
+                }
+                if mode == 3 {
+                    f.reads.lock().unwrap().ipv4 = Ok(empty_rules());
+                }
+                assert_eq!(remove(&f, &mut fw, &mut store, 2).unwrap().result, expected);
+                if mode != 3 {
+                    f.wait();
+                }
+                assert_eq!(store.admit_receipt(&f.proof(), &old).is_ok(), mode == 2);
+                assert_eq!(f.auth.calls.lock().unwrap().len(), usize::from(mode != 3));
+            }
+        }
+
+        #[test]
+        fn removal_prompt_unavailable_timeout_and_other_nonzero_keep_receipt_and_require_redetection()
+         {
+            let _serial = MUTATIONS.lock().unwrap();
+            for (outcome, expected) in [
+                (
+                    exited(
+                        127,
+                        "",
+                        "Error creating textual authentication agent: no terminal\n",
+                    ),
+                    RuleResult::PromptUnavailable,
+                ),
+                (
+                    exited(
+                        127,
+                        "",
+                        "Error executing command as another user: No authentication agent found.\n",
+                    ),
+                    RuleResult::PromptUnavailable,
+                ),
+                (PkexecOutcome::TimedOut, RuleResult::OutcomeUnknown),
+                (exited(126, "", "cancelled"), RuleResult::OutcomeUnknown),
+            ] {
+                let f = Fixture::new();
+                installed(&f, RuleKind::Lan, "192.168.4.0/24");
+                let mut fw = f.firewall();
+                let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+                f.auth.outcomes.lock().unwrap().push_back(outcome);
+                let result = remove(&f, &mut fw, &mut store, 2).unwrap();
+                f.wait();
+                assert_eq!(result.result, expected);
+                assert_eq!(
+                    result.manual.is_some(),
+                    expected == RuleResult::PromptUnavailable
+                );
+                if let Some(manual) = result.manual {
+                    assert!(
+                        manual.starts_with("sudo /usr/bin/ufw delete allow from 192.168.4.0/24")
+                    );
+                }
+                let bytes = store.receipt(&f.proof(), OperationId(1)).unwrap();
+                let receipt = store.admit_receipt(&f.proof(), &bytes).unwrap();
+                let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+                assert_eq!(
+                    fw.plan_removal(&snapshot, receipt, OperationId(3), 3)
+                        .unwrap_err(),
+                    FirewallError::CurrentRequired
+                );
+                assert_eq!(f.auth.calls.lock().unwrap().len(), 1);
+            }
+        }
+
+        #[test]
+        fn proof_revocation_foreign_intent_and_receipt_target_mismatch_refuse_all_io_mutations() {
+            let f = Fixture::new();
+            let other = Fixture::new();
+            let mut fw = f.firewall();
+            let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            let old = fs::read(journal(&f)).unwrap();
+            let mut foreign = intent(&f, 2, RuleKind::Lan, "192.168.4.0/24");
+            foreign.target = other.io.target().paths().clone();
+            assert_eq!(
+                store.record_intent(&f.proof(), &foreign),
+                Err(NativeError::Foreign)
+            );
+            assert!(store.receipt(&other.proof(), OperationId(1)).is_err());
+            let proof = f.proof();
+            let mut revoked = f.facts();
+            revoked.active = false;
+            assert!(proof.revalidate(&f.io, &revoked).is_err());
+            assert!(
+                store
+                    .record_intent(&proof, &intent(&f, 2, RuleKind::Lan, "192.168.4.0/24"))
+                    .is_err()
+            );
+            let receipt = store
+                .admit_receipt(
+                    &f.proof(),
+                    &store.receipt(&f.proof(), OperationId(1)).unwrap(),
+                )
+                .unwrap();
+            let mut other_fw = other.firewall();
+            let snapshot = other_fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            assert!(
+                other_fw
+                    .plan_removal(&snapshot, receipt, OperationId(2), 2)
+                    .is_err()
+            );
+            assert_eq!(fs::read(journal(&f)).unwrap(), old);
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn receipt_admission_revalidated_after_preview_and_cancelled_removal_never_dispatches() {
+            let f = Fixture::new();
+            installed(&f, RuleKind::Lan, "192.168.4.0/24");
+            let mut fw = f.firewall();
+            let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            let plan = removal(&f, &mut fw, &store, 2);
+            let consent = plan.consent(OperationId(2), 2).unwrap();
+            let original = fs::read(journal(&f)).unwrap();
+            let mut data: Value = serde_json::from_slice(&original).unwrap();
+            data["records"][0]["retired"] = json!(true);
+            fs::write(journal(&f), serde_json::to_vec(&data).unwrap()).unwrap();
+            assert!(
+                fw.apply_removal(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut store,
+                    &deadline()
+                )
+                .is_err()
+            );
+            fs::write(journal(&f), original).unwrap();
+            let plan = removal(&f, &mut fw, &store, 3);
+            let consent = plan.consent(OperationId(3), 3).unwrap();
+            let cancellation = Cancellation::default();
+            cancellation.cancel();
+            assert!(
+                fw.apply_removal(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut store,
+                    &Deadline::new(5000, cancellation).unwrap()
+                )
+                .is_err()
+            );
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn b2b_r1_native_oversize_and_integrity_inventory_errors_never_authorize_deletion() {
+            for network in ["192.168.4.0/24", "fd42::/64"] {
+                let f = Fixture::new();
+                installed(&f, RuleKind::Lan, network);
+                let mut fw = f.firewall();
+                let store = seed(&f, &mut fw, RuleKind::Lan, network);
+                for error in [
+                    NativeError::Oversize,
+                    NativeError::Foreign,
+                    NativeError::Invalid,
+                    NativeError::Unavailable,
+                    NativeError::Timeout,
+                    NativeError::Cancelled,
+                    NativeError::Busy,
+                    NativeError::OutcomeUnknown,
+                    NativeError::Unsupported,
+                ] {
+                    if network.contains(':') {
+                        f.reads.lock().unwrap().ipv6 = Err(error);
+                    } else {
+                        f.reads.lock().unwrap().ipv4 = Err(error);
+                    }
+                    let bytes = store.receipt(&f.proof(), OperationId(1)).unwrap();
+                    let receipt = store.admit_receipt(&f.proof(), &bytes).unwrap();
+                    let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+                    assert_eq!(
+                        fw.plan_removal(&snapshot, receipt, OperationId(2), 2)
+                            .unwrap_err(),
+                        FirewallError::Kept,
+                        "{network}: {error:?}"
+                    );
+                    assert!(f.auth.calls.lock().unwrap().is_empty());
+                }
+            }
+        }
+
+        struct EditingCurrentReader {
+            reads: Arc<Mutex<Reads>>,
+            observations: CurrentObservations,
+            auth: Arc<Auth>,
+        }
+        impl CurrentReader for EditingCurrentReader {
+            fn read(
+                &mut self,
+                _: &LinuxTarget,
+                _: &LanLink,
+                _: NodeId,
+                d: &Deadline,
+            ) -> NativeResult<CurrentObservations> {
+                d.check()?;
+                self.auth.order.lock().unwrap().push("current");
+                self.reads.lock().unwrap().ipv4 = Ok(rule_file(
+                    "192.168.4.0/24",
+                    RuleKind::Lan,
+                    Some("Administrator"),
+                ));
+                Ok(self.observations.clone())
+            }
+            fn dispatch_stamp_ms(&self) -> NativeResult<u64> {
+                self.auth.order.lock().unwrap().push("stamp");
+                Ok(100)
+            }
+        }
+        #[test]
+        fn b2b_r1_current_reader_inventory_change_is_refused_before_stamp_or_dispatch() {
+            let _serial = MUTATIONS.lock().unwrap();
+            let f = Fixture::new();
+            installed(&f, RuleKind::Lan, "192.168.4.0/24");
+            let mut fw = f.firewall();
+            let mut store = seed(&f, &mut fw, RuleKind::Lan, "192.168.4.0/24");
+            fw.install_current_reader(
+                peer(),
+                Box::new(EditingCurrentReader {
+                    reads: f.reads.clone(),
+                    observations: observations(&f, 60, 70, true, Some(2), 9, None),
+                    auth: f.auth.clone(),
+                }),
+            );
+            let result = remove(&f, &mut fw, &mut store, 2);
+            if !f.auth.calls.lock().unwrap().is_empty() {
+                f.wait();
+            }
+            assert_eq!(result.unwrap_err(), FirewallError::Changed);
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+            assert_eq!(*f.auth.order.lock().unwrap(), ["current"]);
+            let j: Value = serde_json::from_slice(&fs::read(journal(&f)).unwrap()).unwrap();
+            assert_eq!(j["records"][1]["outcome"], 1);
+            assert_eq!(j["records"][1]["delete"], true);
+        }
+
+        struct InterruptedOutcome(DurableIntentStore);
+        impl IntentStore for InterruptedOutcome {
+            fn record_intent(&mut self, p: &SupportProof, i: &FirewallIntent) -> NativeResult<()> {
+                self.0.record_intent(p, i)
+            }
+            fn record_outcome(
+                &mut self,
+                _: &SupportProof,
+                _: &FirewallIntent,
+                _: RuleResult,
+            ) -> NativeResult<()> {
+                Err(NativeError::Unavailable)
+            }
+        }
+        #[test]
+        fn b2b_r1_preopened_second_controller_cannot_bypass_interrupted_attempt_recovery() {
+            let _serial = MUTATIONS.lock().unwrap();
+            let f = Fixture::new();
+            let mut a = f.firewall();
+            let mut b = f.firewall();
+            let mut first =
+                InterruptedOutcome(DurableIntentStore::open(&mut a, &f.proof()).unwrap());
+            let mut second = DurableIntentStore::open(&mut b, &f.proof()).unwrap();
+            let snapshot = a.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let plan = a.plan(&snapshot, request(RuleKind::Lan, 1, 1)).unwrap();
+            let consent = plan.consent(OperationId(1), 1).unwrap();
+            assert_eq!(
+                a.apply(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut first,
+                    &deadline()
+                )
+                .unwrap()
+                .result,
+                RuleResult::OutcomeUnknown
+            );
+            f.wait();
+            drop(first);
+            let original = fs::read(journal(&f)).unwrap();
+            let snapshot = b.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let plan = b.plan(&snapshot, request(RuleKind::Lan, 2, 2)).unwrap();
+            let consent = plan.consent(OperationId(2), 2).unwrap();
+            let result = b.apply(
+                &f.proof(),
+                ManagerSelection::Ufw,
+                plan,
+                consent,
+                &mut second,
+                &deadline(),
+            );
+            if f.auth.calls.lock().unwrap().len() > 1 {
+                f.wait();
+            }
+            assert!(result.is_err());
+            assert_eq!(f.auth.calls.lock().unwrap().len(), 1);
+            assert_eq!(fs::read(journal(&f)).unwrap(), original);
+            drop(second);
+            let _recovered = DurableIntentStore::open(&mut b, &f.proof()).unwrap();
+            let snapshot = b.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            assert_eq!(
+                b.plan(&snapshot, request(RuleKind::Lan, 3, 3)).unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+        }
+
+        #[test]
+        fn b2b_r1_foreign_outcome_target_preserves_pending_bytes_and_owned_lock() {
+            let f = Fixture::new();
+            let other = Fixture::new();
+            let mut fw = f.firewall();
+            let mut store = DurableIntentStore::open(&mut fw, &f.proof()).unwrap();
+            let i = intent(&f, 1, RuleKind::Lan, "192.168.4.0/24");
+            store.record_intent(&f.proof(), &i).unwrap();
+            let original = fs::read(journal(&f)).unwrap();
+            let mut foreign = i.clone();
+            foreign.target = other.io.target().paths().clone();
+            assert_eq!(
+                store.record_outcome(&f.proof(), &foreign, RuleResult::PendingVerification),
+                Err(NativeError::Foreign)
+            );
+            assert_eq!(fs::read(journal(&f)).unwrap(), original);
+            assert_eq!(
+                f.io.lock(&f.proof(), &journal(&f).with_file_name("journal.lock"))
+                    .unwrap_err(),
+                NativeError::Busy
+            );
+            store
+                .record_outcome(&f.proof(), &i, RuleResult::PendingVerification)
+                .unwrap();
+            assert!(
+                f.io.lock(&f.proof(), &journal(&f).with_file_name("journal.lock"))
+                    .is_ok()
+            );
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn b2b_r1_recovery_forgets_older_stamp_but_retains_reader_and_replay_history() {
+            let _serial = MUTATIONS.lock().unwrap();
+            let f = Fixture::new();
+            let mut b = f.firewall();
+            let input = install(&f, &mut b);
+            let mut old_store = DurableIntentStore::open(&mut b, &f.proof()).unwrap();
+            let snapshot = admit(&f, &mut b, 0);
+            let plan = b.plan(&snapshot, request(RuleKind::Lan, 1, 1)).unwrap();
+            let consent = plan.consent(OperationId(1), 1).unwrap();
+            assert_eq!(
+                b.apply(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut old_store,
+                    &deadline()
+                )
+                .unwrap()
+                .result,
+                RuleResult::PendingVerification
+            );
+            f.wait();
+            let mut a = f.firewall();
+            let newer = install(&f, &mut a);
+            newer.lock().unwrap().observations = Ok(observations(
+                &f,
+                160,
+                170,
+                true,
+                Some(2),
+                9,
+                Some("browse_failed"),
+            ));
+            newer.lock().unwrap().stamp = Ok(200);
+            let mut store_a = DurableIntentStore::open(&mut a, &f.proof()).unwrap();
+            let snapshot = a.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let plan = a.plan(&snapshot, request(RuleKind::Lan, 2, 2)).unwrap();
+            let consent = plan.consent(OperationId(2), 2).unwrap();
+            f.auth
+                .outcomes
+                .lock()
+                .unwrap()
+                .push_back(exited(126, "", "dismissed"));
+            assert_eq!(
+                a.apply(
+                    &f.proof(),
+                    ManagerSelection::Ufw,
+                    plan,
+                    consent,
+                    &mut store_a,
+                    &deadline()
+                )
+                .unwrap()
+                .result,
+                RuleResult::OutcomeUnknown
+            );
+            f.wait();
+            drop(old_store);
+            let _recovered = DurableIntentStore::open(&mut b, &f.proof()).unwrap();
+            input.lock().unwrap().observations = Ok(observations(
+                &f,
+                110,
+                111,
+                true,
+                Some(2),
+                9,
+                Some("browse_failed"),
+            ));
+            let snapshot = b.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let link = selected(&snapshot);
+            b.refresh_current(&snapshot, &link, &deadline()).unwrap();
+            assert_eq!(
+                b.plan(&snapshot, request(RuleKind::Lan, 3, 3)).unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+            assert_eq!(input.lock().unwrap().calls.len(), 2);
+            // Recovery must retain both the receipt floor and already admitted call IDs.
+            for (offset, call_id) in [(0, 16), (200, 12)] {
+                let mut s = sequence(&f, offset);
+                s.call.id = call_id;
+                s.acknowledgement.id = call_id;
+                let evidence = TrafficEvidence::after_dial(f.io.target(), link.clone(), s).unwrap();
+                assert_eq!(
+                    b.admit_dial(&snapshot, evidence).unwrap_err(),
+                    FirewallError::MdnsPending
+                );
+            }
+            assert_eq!(f.auth.calls.lock().unwrap().len(), 2);
+        }
+    }
 }

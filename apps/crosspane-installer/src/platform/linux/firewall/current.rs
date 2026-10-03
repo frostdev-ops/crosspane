@@ -189,6 +189,9 @@ pub(super) struct CurrentState {
     admitted: Option<(u64, [u64; 4])>,
 }
 impl CurrentState {
+    pub(super) fn forget_dispatch(&mut self, kind: RuleKind) {
+        self.watermarks[kind.index()] = None;
+    }
     fn read(
         &mut self,
         target: &LinuxTarget,
@@ -255,23 +258,50 @@ impl CurrentState {
         intent: &FirewallIntent,
         deadline: &Deadline,
     ) -> Result<()> {
+        let receipt = self.observe_dispatch(target, intent, deadline, false)?;
+        self.stamp_dispatch(intent, receipt, deadline)
+    }
+    pub(super) fn before_removal(
+        &mut self,
+        target: &LinuxTarget,
+        intent: &FirewallIntent,
+        deadline: &Deadline,
+    ) -> Result<Option<u64>> {
+        self.observe_dispatch(target, intent, deadline, true)
+    }
+    fn observe_dispatch(
+        &mut self,
+        target: &LinuxTarget,
+        intent: &FirewallIntent,
+        deadline: &Deadline,
+        removing: bool,
+    ) -> Result<Option<u64>> {
         // First LAN remains b1-compatible. An unknown watermark never readmits an unresolved kind.
         if self.reader.is_none() && intent.kind == RuleKind::Lan {
-            return Ok(());
+            return Ok(None);
         }
         let o = self
             .read(target, &intent.link, deadline)
             .map_err(|_| FirewallError::CurrentRequired)?;
-        if intent.kind == RuleKind::Mdns && self.traffic.is_none() {
+        if !removing && intent.kind == RuleKind::Mdns && self.traffic.is_none() {
             return Err(FirewallError::CurrentRequired);
         }
+        Ok(Some(o.discovery.observed_at_ms))
+    }
+    pub(super) fn stamp_dispatch(
+        &mut self,
+        intent: &FirewallIntent,
+        receipt: Option<u64>,
+        deadline: &Deadline,
+    ) -> Result<()> {
+        let Some(receipt) = receipt else {
+            return Ok(());
+        };
         let (_, reader) = self.reader.as_ref().ok_or(FirewallError::CurrentRequired)?;
         let stamp = reader
             .dispatch_stamp_ms()
             .map_err(|_| FirewallError::CurrentRequired)?;
-        if stamp < o.discovery.observed_at_ms
-            || self.watermarks.iter().flatten().any(|t| stamp < *t)
-        {
+        if stamp < receipt || self.watermarks.iter().flatten().any(|t| stamp < *t) {
             return Err(FirewallError::CurrentRequired);
         }
         deadline.check()?;

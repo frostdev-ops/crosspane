@@ -1,5 +1,6 @@
 //! Ordinary ufw inspection and exact, single-use consented mutations. No networking readiness policy.
 pub mod current;
+pub mod receipts;
 use super::native_io::*;
 use crate::agent_contract::ObservationSource;
 use crosspane_installer_core::OperationId;
