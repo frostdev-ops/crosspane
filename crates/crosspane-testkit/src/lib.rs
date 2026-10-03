@@ -1,6 +1,9 @@
 //! Fake platform implementations, in-memory/simulated network (loss, reorder, partition, delay),
 //! deterministic clock, and golden-image helpers.
 
+mod clipboard;
+pub use clipboard::FakeClipboardHost;
+
 /// Where a physical release goes; native settlement and suppressed tails are separate events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PhysicalRelease {

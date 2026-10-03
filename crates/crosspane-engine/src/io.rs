@@ -4,23 +4,35 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crosspane_platform::{
-    AudioEvent, CaptureEvent, CaptureId, CapturePortal, CaptureStart, CaptureTarget, HotkeyEvent,
-    Overlay, OverlayEvent, OverlayId, Parked, PortalId, SessionEvent, StreamEndReason, StreamId,
-    WindowEvent,
+    AudioEvent, CaptureEvent, CaptureId, CapturePortal, CaptureStart, CaptureTarget, ClipKinds,
+    ClipboardEvent, HotkeyEvent, LocalPasteId, Overlay, OverlayEvent, OverlayId, Parked, PortalId,
+    SessionEvent, StreamEndReason, StreamId, WindowEvent,
 };
 use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{
-    Capability, ControlMessage, InputMessage, Placement, PointerMessage, Refusal,
+    Capability, ClipFailure, ClipFetchId, ControlMessage, InputMessage, Placement, PointerMessage,
+    Refusal,
 };
 use crosspane_protocol::projection::{
     BrowsableWindow, ParkingKind, ProjectionEndReason, ProxyPlacement,
 };
+use crosspane_types::ClipKind;
 use crosspane_types::audio::{AudioKind, AudioStreamId};
 use crosspane_types::display::DisplayInfo;
 use crosspane_types::geom::{PixelRect, PixelSize, PointDevice};
 use crosspane_types::hid::{HidUsage, MouseButton};
 use crosspane_types::id::{DisplayId, NodeId, ProjectionId, WindowId};
 use crosspane_types::input::{LockKeys, ScrollDelta};
+
+/// Clipboard content in flight. `Debug` shows only the length, so the derived `Debug` of
+/// `Input`/`Output` never prints content.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClipBytes(pub Vec<u8>);
+impl std::fmt::Debug for ClipBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClipBytes({} bytes)", self.0.len())
+    }
+}
 
 /// The HUD on the controller: "Input → ⟨target⟩" (04 §5).
 pub const HUD: OverlayId = OverlayId(1);
@@ -213,6 +225,28 @@ pub enum ProxyEvent {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Input {
+    /// CLIP-v0: after `PeerUp`, only when both `Hello`s carry `CLIP_FEATURE`; false removes it
+    /// (link loss, or a `HelloRefresh` without the feature).
+    ClipPeer {
+        peer: NodeId,
+        available: bool,
+    },
+    /// A local clipboard event from `ClipboardHost` (CLIP-v0 §5).
+    Clipboard(ClipboardEvent),
+    /// The agent's answer to `Output::ClipRead`: the content for `fetch`, or why not.
+    ClipReadDone {
+        peer: NodeId,
+        fetch: ClipFetchId,
+        result: Result<ClipBytes, ClipFailure>,
+    },
+    /// A complete clip data stream from `peer`. The agent has already checked the header (kind
+    /// cap, exact length, no extra bytes) and reset any stream that failed.
+    ClipData {
+        peer: NodeId,
+        fetch: ClipFetchId,
+        kind: ClipKind,
+        data: ClipBytes,
+    },
     /// A timer fired: deliver at or after [`crate::Engine::next_deadline`].
     Tick,
     // ---- Audio (D8) ----
@@ -364,6 +398,36 @@ pub enum Input {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Output {
+    /// `ClipboardHost::promise(offer, kinds)`. `offer` is the engine's local promise number, not
+    /// the peer's `ClipOfferId`.
+    ClipPromise {
+        offer: u64,
+        kinds: ClipKinds,
+    },
+    /// `ClipboardHost::withdraw(offer)`.
+    ClipWithdraw {
+        offer: u64,
+    },
+    /// `ClipboardHost::fulfil(paste, data)`. Backends ignore an unknown or already answered paste.
+    ClipFulfil {
+        paste: LocalPasteId,
+        data: Option<ClipBytes>,
+    },
+    /// `ClipboardHost::read(kind, max_bytes)` to answer `peer`'s admitted fetch; the agent replies
+    /// with `Input::ClipReadDone`. Never emitted except for an admitted fetch.
+    ClipRead {
+        peer: NodeId,
+        fetch: ClipFetchId,
+        kind: ClipKind,
+        max_bytes: usize,
+    },
+    /// Open a clip data stream to `peer`: `ClipDataHeader` and exactly `data`, lowest priority.
+    SendClipData {
+        peer: NodeId,
+        fetch: ClipFetchId,
+        kind: ClipKind,
+        data: ClipBytes,
+    },
     // ---- Audio (D8) ----
     AddAudioPeer {
         peer: NodeId,
