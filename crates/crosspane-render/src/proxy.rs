@@ -38,6 +38,7 @@ pub enum HostCommand {
     /// (`Window::drag_window`), without reporting it (DRAG-v0 D-5). One press only. `done` is answered
     /// once the arm is installed on the host thread (`true`), or can't be (`false`); the target never
     /// injects the press before `true`.
+    /// The caller creates `done` with capacity ≥ 1.
     Arm {
         id: u64,
         until: std::time::Instant,

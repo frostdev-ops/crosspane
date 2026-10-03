@@ -19,9 +19,9 @@ use winit::{
 };
 
 use super::{
-    HostCommand, HostEvent, PictureImporter, cursor,
+    HostCommand, HostEvent, HostPlace, PictureImporter, cursor,
     gpu::{Presenter, surface_format},
-    input::{InputState, mouse_button, scroll},
+    input::{InputState, install_arm, mouse_button, scroll},
 };
 use crate::keymap::keycode_to_hid;
 
@@ -33,6 +33,7 @@ pub(super) struct App {
     windows: HashMap<u64, ProxyWindow>,
     ids: HashMap<WindowId, u64>,
     pending: VecDeque<HostCommand>,
+    pending_arms: HashMap<u64, (Instant, std::sync::mpsc::SyncSender<bool>, bool)>,
     importer: Option<PictureImporter>,
 }
 
@@ -75,6 +76,7 @@ impl App {
             windows: HashMap::new(),
             ids: HashMap::new(),
             pending: VecDeque::new(),
+            pending_arms: HashMap::new(),
         }
     }
 
@@ -85,6 +87,7 @@ impl App {
         title: String,
         size: PixelSize,
         accent: [u8; 3],
+        place: Option<HostPlace>,
     ) -> Result<(), String> {
         if self.windows.contains_key(&id) {
             return Err("proxy ID is already open".into());
@@ -125,6 +128,28 @@ impl App {
                 screen(window.current_monitor().as_ref()),
             ));
         }
+        // Wayland ignores placement: the destination agent floats/moves it by IPC (WP-2.58).
+        #[cfg(target_os = "macos")]
+        let scale = if let Some(place) = place {
+            place_content(
+                place.content,
+                || {
+                    let scale = window.scale_factor();
+                    Ok::<_, winit::error::NotSupportedError>((
+                        window.outer_position()?.to_logical(scale),
+                        window.inner_position()?.to_logical(scale),
+                        scale,
+                    ))
+                },
+                |outer| window.set_outer_position(outer),
+            )
+            .map_err(|error| error.to_string())?;
+            window.scale_factor()
+        } else {
+            scale
+        };
+        #[cfg(not(target_os = "macos"))]
+        let _ = place;
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
@@ -211,12 +236,20 @@ impl App {
     }
 
     fn remove(&mut self, id: u64, lost: bool) {
+        self.cancel_pending_arm(id);
         if let Some(mut window) = self.windows.remove(&id) {
             self.ids.remove(&window.window.id());
+            window.input.close();
             window.input.release(id, self.events.as_mut());
             if lost {
                 (self.events)(HostEvent::Lost { id });
             }
+        }
+    }
+
+    fn cancel_pending_arm(&mut self, id: u64) {
+        if let Some((until, done, _)) = self.pending_arms.remove(&id) {
+            install_arm(None, until, done);
         }
     }
 
@@ -241,15 +274,30 @@ impl App {
     fn command(&mut self, event_loop: &ActiveEventLoop, command: HostCommand) {
         self.check_gpu();
         match command {
-            HostCommand::Arm { .. } | HostCommand::Disarm { .. } => {}
+            HostCommand::Arm { id, until, done } => {
+                self.cancel_pending_arm(id);
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.input.disarm();
+                }
+                // Winit delivers commands before buffered Wayland input. Install only after
+                // that input drains, so an earlier click cannot consume this new arm.
+                self.pending_arms
+                    .insert(id, (until, done, self.windows.contains_key(&id)));
+            }
+            HostCommand::Disarm { id } => {
+                self.cancel_pending_arm(id);
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.input.disarm();
+                }
+            }
             HostCommand::Open {
                 id,
                 title,
                 size,
                 accent,
-                ..
+                place,
             } => {
-                if let Err(error) = self.open(event_loop, id, title, size, accent) {
+                if let Err(error) = self.open(event_loop, id, title, size, accent, place) {
                     (self.events)(HostEvent::OpenFailed { id, error });
                 }
             }
@@ -350,6 +398,9 @@ impl App {
                 for id in ids {
                     self.remove(id, false);
                 }
+                for (_, (until, done, _)) in self.pending_arms.drain() {
+                    install_arm(None, until, done);
+                }
                 self.pending.clear();
                 event_loop.exit();
             }
@@ -388,6 +439,35 @@ impl App {
         // After `Resized`, so the engine has the new size before the placement that carries it.
         self.report_placement(id, Trigger::Geometry);
     }
+}
+
+/// Physical frame/content readings become global logical coordinates at the current scale.
+#[cfg(any(target_os = "macos", test))]
+type ContentGeometry = (
+    winit::dpi::LogicalPosition<f64>,
+    winit::dpi::LogicalPosition<f64>,
+    f64,
+);
+
+#[cfg(any(target_os = "macos", test))]
+fn place_content<E>(
+    desired: winit::dpi::LogicalPosition<f64>,
+    mut geometry: impl FnMut() -> Result<ContentGeometry, E>,
+    mut set_outer: impl FnMut(winit::dpi::LogicalPosition<f64>),
+) -> Result<(), E> {
+    let (outer, inner, _) = geometry()?;
+    set_outer(winit::dpi::LogicalPosition::new(
+        desired.x + outer.x - inner.x,
+        desired.y + outer.y - inner.y,
+    ));
+    let (outer, inner, scale) = geometry()?;
+    if (desired.x - inner.x).abs() * scale > 1.0 || (desired.y - inner.y).abs() * scale > 1.0 {
+        set_outer(winit::dpi::LogicalPosition::new(
+            outer.x + desired.x - inner.x,
+            outer.y + desired.y - inner.y,
+        ));
+    }
+    Ok(())
 }
 
 fn set_cursor(
@@ -483,6 +563,11 @@ impl ApplicationHandler<HostCommand> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if window.input.drag_button(button, state, Instant::now(), || {
+                    window.window.drag_window()
+                }) {
+                    return;
+                }
                 if let Some(button) = mouse_button(button) {
                     window.input.button(button, state);
                     (self.events)(HostEvent::Button {
@@ -536,7 +621,11 @@ impl ApplicationHandler<HostCommand> for App {
                 window.placement.set_occluded(occluded);
                 self.report_placement(id, Trigger::Occlusion);
             }
-            WindowEvent::CloseRequested => (self.events)(HostEvent::CloseRequested { id }),
+            WindowEvent::CloseRequested => {
+                window.input.close();
+                self.cancel_pending_arm(id);
+                (self.events)(HostEvent::CloseRequested { id });
+            }
             WindowEvent::Destroyed => self.remove(id, true),
             WindowEvent::RedrawRequested => {
                 if let (Some(gpu), Some(instance)) = (&self.gpu, &self.instance)
@@ -553,6 +642,14 @@ impl ApplicationHandler<HostCommand> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.check_gpu();
+        for (id, (until, done, known)) in std::mem::take(&mut self.pending_arms) {
+            let input = self
+                .windows
+                .get_mut(&id)
+                .filter(|_| known)
+                .map(|w| &mut w.input);
+            install_arm(input, until, done);
+        }
         let now = Instant::now();
         let mut next = None;
         for (&id, window) in &mut self.windows {
@@ -1071,6 +1168,88 @@ fn window_scale(windows: &HashMap<u64, ProxyWindow>, id: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_placement_uses_frame_offsets_and_corrects_at_most_once() {
+        use std::cell::RefCell;
+        use winit::dpi::LogicalPosition as P;
+        for (offset, scale, drift) in [
+            ((0.0, 28.0), 1.0, (0.0, 0.0)),
+            ((5.0, 32.0), 2.0, (1.0, -3.0)),
+            ((-2.5, 22.5), 1.5, (-4.0, 2.0)),
+        ] {
+            let desired = P::new(-300.5, 60.25);
+            let frame = RefCell::new(P::new(100.0, 100.0));
+            let sets = RefCell::new(Vec::new());
+            place_content(
+                desired,
+                || {
+                    let outer = *frame.borrow();
+                    let drift = if sets.borrow().is_empty() {
+                        (0.0, 0.0)
+                    } else {
+                        drift
+                    };
+                    Ok::<_, ()>((
+                        outer,
+                        P::new(outer.x + offset.0 + drift.0, outer.y + offset.1 + drift.1),
+                        scale,
+                    ))
+                },
+                |outer| {
+                    *frame.borrow_mut() = outer;
+                    sets.borrow_mut().push(outer);
+                },
+            )
+            .unwrap();
+            let sets = sets.borrow();
+            assert_eq!(sets[0], P::new(desired.x - offset.0, desired.y - offset.1));
+            assert_eq!(sets.len(), if drift == (0.0, 0.0) { 1 } else { 2 });
+            let final_outer = *frame.borrow();
+            assert_eq!(
+                P::new(
+                    final_outer.x + offset.0 + drift.0,
+                    final_outer.y + offset.1 + drift.1
+                ),
+                desired
+            );
+        }
+    }
+
+    #[test]
+    fn content_placement_tolerance_is_one_physical_pixel_and_read_failures_propagate() {
+        use std::cell::Cell;
+        use winit::dpi::LogicalPosition as P;
+        for error in [0.5, 0.5001] {
+            let calls = Cell::new(0);
+            let mut reads = 0;
+            place_content(
+                P::new(0.0, 0.0),
+                || {
+                    reads += 1;
+                    Ok::<_, ()>((
+                        P::new(0.0, 0.0),
+                        P::new(if reads == 1 { 0.0 } else { error }, 0.0),
+                        2.0,
+                    ))
+                },
+                |_| calls.set(calls.get() + 1),
+            )
+            .unwrap();
+            assert_eq!(calls.get(), if error == 0.5 { 1 } else { 2 });
+            assert_eq!(reads, 2);
+        }
+        let mut sets = 0;
+        assert_eq!(
+            place_content(
+                P::new(0.0, 0.0),
+                || Err::<(P<f64>, P<f64>, f64), _>("no geometry"),
+                |_| sets += 1
+            ),
+            Err("no geometry")
+        );
+        assert_eq!(sets, 0);
+    }
 
     #[test]
     fn proxy_backends_exclude_egl_and_keep_vulkan_and_metal() {

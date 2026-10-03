@@ -3,7 +3,7 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -461,6 +461,403 @@ fn nested_proxy_reports_only_new_content() -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
+    Ok(())
+}
+
+/// Existing platform example, built separately without adding render dependencies. Its own
+/// CROSSPANE_NESTED_HYPR guard is additional to our PID/start/lock/display validation.
+struct VirtualPointer {
+    child: Child,
+    input: Option<ChildStdin>,
+    held: bool,
+}
+
+impl VirtualPointer {
+    fn new(signature: &str) -> Result<Self> {
+        ensure!(nested_signature()? == signature, "nested identity changed");
+        let executable = PathBuf::from(std::env::var_os("CROSSPANE_TEST_VINPUT").context(
+            "build crosspane-platform-linux --example vinput and set CROSSPANE_TEST_VINPUT",
+        )?);
+        ensure!(
+            executable.is_absolute() && executable.is_file(),
+            "explicit vinput executable required"
+        );
+        let mut child = Command::new(executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let input = child.stdin.take();
+        Ok(Self {
+            child,
+            input,
+            held: false,
+        })
+    }
+
+    fn send(&mut self, command: &str) -> Result<()> {
+        if command == "btn left down" {
+            self.held = true;
+        }
+        let input = self.input.as_mut().context("virtual pointer closed")?;
+        writeln!(input, "{command}")?;
+        input.flush()?;
+        if command == "btn left up" {
+            self.held = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VirtualPointer {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = self.send("btn left up");
+        }
+        self.input.take();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        // Only the helper spawned by this test, never the compositor or another process.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClientBox {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    floating: bool,
+}
+
+fn client_box(signature: &str, address: &str) -> Result<ClientBox> {
+    let clients = ipc(signature, &["-j", "clients"])?;
+    let mut jq = Command::new("jq")
+        .args(["-r", "--arg", "address", address,
+            ".[] | select(.address == $address) | [.at[0], .at[1], .size[0], .size[1], .floating] | @tsv"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    jq.stdin
+        .take()
+        .context("jq input")?
+        .write_all(clients.as_bytes())?;
+    let result = jq.wait_with_output()?;
+    ensure!(result.status.success(), "client geometry query failed");
+    let text = String::from_utf8(result.stdout)?;
+    let fields: Vec<_> = text.split_whitespace().collect();
+    ensure!(
+        fields.len() == 5,
+        "unique owned client geometry required: {text}"
+    );
+    Ok(ClientBox {
+        x: fields[0].parse()?,
+        y: fields[1].parse()?,
+        width: fields[2].parse()?,
+        height: fields[3].parse()?,
+        floating: match fields[4] {
+            "true" => true,
+            "false" => false,
+            _ => bail!("unknown float state"),
+        },
+    })
+}
+
+fn wait_box(signature: &str, address: &str, expected: ClientBox) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let actual = client_box(signature, address)?;
+        if actual == expected {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "proxy did not reach {expected:?}, actual {actual:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_pointer(signature: &str, x: i32, y: i32) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let value = ipc(signature, &["cursorpos"])?;
+        let coordinates: Vec<_> = value.trim().split(',').map(str::trim).collect();
+        ensure!(coordinates.len() == 2, "unknown pointer position");
+        // Absolute-protocol fractions can floor one pixel at the compositor.
+        if (coordinates[0].parse::<i32>()? - x).abs() <= 1
+            && (coordinates[1].parse::<i32>()? - y).abs() <= 1
+        {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "virtual pointer did not reach ({x},{y}): {value}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_no_buttons(receiver: &Receiver<HostEvent>) -> Result<()> {
+    while let Ok(event) = receiver.try_recv() {
+        check(&event)?;
+        ensure!(
+            !matches!(event, HostEvent::Button { .. }),
+            "armed native interaction leaked {event:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn nested_proxy_one_press_native_drag_consumes_pair_then_routes_unarmed_click() -> Result<()> {
+    native_drag_case(false)
+}
+
+#[test]
+fn nested_queued_unarmed_click_drains_before_arm_ack_and_next_press_drags() -> Result<()> {
+    native_drag_case(true)
+}
+
+fn native_drag_case(queue_before_arm: bool) -> Result<()> {
+    if std::env::var("CROSSPANE_NESTED_HYPR").as_deref() != Ok("1") {
+        eprintln!("SKIP native drag: CROSSPANE_NESTED_HYPR is not 1");
+        return Ok(());
+    }
+    let signature = nested_signature()?;
+    let (handle_sender, handle_receiver) = mpsc::channel();
+    let (event_sender, events) = mpsc::channel();
+    let thread = thread::spawn(move || -> Result<()> {
+        let (host, handle) = ProxyHost::new_any_thread()?;
+        handle_sender.send(handle)?;
+        host.run(Box::new(move |event| {
+            let _ = event_sender.send(event);
+        }))?;
+        Ok(())
+    });
+    let host = TestHost {
+        handle: handle_receiver.recv_timeout(Duration::from_secs(10))?,
+        thread: Some(thread),
+    };
+    let title = format!("WP-2.57 native drag {}", std::process::id());
+    let size = PixelSize::new(320, 240);
+    host.handle.send(HostCommand::Open {
+        id: 257,
+        title: title.clone(),
+        size,
+        accent: [211, 45, 137],
+        place: None,
+    })?;
+    wait_event(&events, |event| {
+        matches!(event, HostEvent::Opened { id: 257, .. })
+    })?;
+    host.handle.send(HostCommand::Frame {
+        id: 257,
+        size,
+        pixels: vec![0x42; 320 * 240 * 4].into(),
+        dirty: vec![PixelRect::new(point2(0, 0), point2(320, 240))],
+    })?;
+    wait_event(&events, |event| {
+        matches!(event, HostEvent::Presented { id: 257, .. })
+    })?;
+    poll_client(&signature, &title, true)?;
+    let address = client_address(&signature, &title)?.context("owned drag proxy")?;
+    ipc(
+        &signature,
+        &[
+            "dispatch",
+            &format!("hl.dsp.window.float({{action=\"enable\",window=\"address:{address}\"}})"),
+        ],
+    )?;
+    ipc(
+        &signature,
+        &[
+            "dispatch",
+            &format!(
+                "hl.dsp.window.resize({{x=320,y=240,relative=false,window=\"address:{address}\"}})"
+            ),
+        ],
+    )?;
+    ipc(
+        &signature,
+        &[
+            "dispatch",
+            &format!(
+                "hl.dsp.window.move({{x=120,y=120,relative=false,window=\"address:{address}\"}})"
+            ),
+        ],
+    )?;
+    let placed = ClientBox {
+        x: 120,
+        y: 120,
+        width: 320,
+        height: 240,
+        floating: true,
+    };
+    wait_box(&signature, &address, placed)?;
+    // Float and placement are confirmed BEFORE Arm and the virtual down (P8a Q4).
+    let mut pointer = VirtualPointer::new(&signature)?;
+    pointer.send("abs 200 200")?;
+    wait_pointer(&signature, 200, 200)?;
+    drain(&events)?;
+    let resume = if queue_before_arm {
+        let (paused, pause_ack) = mpsc::sync_channel(1);
+        let (resume, continued) = mpsc::sync_channel(1);
+        host.handle.send(HostCommand::Run(Box::new(move || {
+            let _ = paused.send(());
+            // Bounded even if the test unwinds before releasing its owned host thread.
+            let _ = continued.recv_timeout(Duration::from_secs(5));
+        })))?;
+        pause_ack.recv_timeout(Duration::from_secs(1))?;
+        pointer.send("btn left down")?;
+        pointer.send("btn left up")?;
+        pointer.send("abs 209 200")?;
+        // The virtual device processes commands in order. The observed cursor move proves
+        // the earlier complete click reached the compositor while the host was paused.
+        wait_pointer(&signature, 209, 200)?;
+        Some(resume)
+    } else {
+        None
+    };
+    let mut retired = Vec::new();
+    if queue_before_arm {
+        for disarm in [true, false] {
+            let (done, ack) = mpsc::sync_channel(1);
+            host.handle.send(HostCommand::Arm {
+                id: 257,
+                until: Instant::now() + Duration::from_secs(2),
+                done,
+            })?;
+            retired.push(ack);
+            if disarm {
+                host.handle.send(HostCommand::Disarm { id: 257 })?;
+            }
+        }
+    }
+    let (done, ack) = mpsc::sync_channel(1);
+    host.handle.send(HostCommand::Arm {
+        id: 257,
+        until: Instant::now() + Duration::from_secs(2),
+        done,
+    })?;
+    if let Some(resume) = resume {
+        resume.send(())?;
+    }
+    ensure!(
+        ack.recv_timeout(Duration::from_millis(500))?,
+        "host refused native drag arm"
+    );
+    if queue_before_arm {
+        let mut buttons = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            check(&event)?;
+            if let HostEvent::Button {
+                id, button, down, ..
+            } = event
+            {
+                ensure!(id == 257 && button == crosspane_types::hid::MouseButton::PRIMARY);
+                buttons.push(down);
+            }
+        }
+        ensure!(
+            buttons == [true, false],
+            "queued unarmed click consumed before arm ack: {buttons:?}"
+        );
+        ensure!(
+            client_box(&signature, &address)? == placed,
+            "queued unarmed click moved proxy"
+        );
+        for ack in retired {
+            ensure!(
+                !ack.recv_timeout(Duration::from_millis(500))?,
+                "retired pending arm acknowledged installed"
+            );
+        }
+        pointer.send("abs 200 200")?;
+        wait_pointer(&signature, 200, 200)?;
+    }
+    pointer.send("btn left down")?;
+    // The device's roundtrip does not acknowledge the host's separate xdg move request.
+    thread::sleep(Duration::from_millis(30));
+    for step in 1..=6 {
+        pointer.send("rel 8 3")?;
+        wait_box(
+            &signature,
+            &address,
+            ClientBox {
+                x: placed.x + 8 * step,
+                y: placed.y + 3 * step,
+                ..placed
+            },
+        )?;
+    }
+    let dropped = client_box(&signature, &address)?;
+    pointer.send("btn left up")?;
+    pointer.send("rel 16 6")?;
+    wait_pointer(&signature, 200 + 8 * 6 + 16, 200 + 3 * 6 + 6)?;
+    ensure!(
+        client_box(&signature, &address)? == dropped,
+        "native move continued after device release"
+    );
+    assert_no_buttons(&events)?;
+    let x = dropped.x + 80;
+    let y = dropped.y + 80;
+    pointer.send(&format!("abs {x} {y}"))?;
+    wait_pointer(&signature, x, y)?;
+    pointer.send("btn left down")?;
+    pointer.send("btn left up")?;
+    let mut buttons = Vec::new();
+    while buttons.len() < 2 {
+        let event = wait_event(&events, |event| matches!(event, HostEvent::Button { .. }))?;
+        if let HostEvent::Button {
+            id, button, down, ..
+        } = event
+        {
+            ensure!(
+                id == 257 && button == crosspane_types::hid::MouseButton::PRIMARY,
+                "unexpected unarmed button"
+            );
+            buttons.push(down);
+        }
+    }
+    ensure!(
+        buttons == [true, false],
+        "unarmed click was not a complete pair: {buttons:?}"
+    );
+    assert_no_buttons(&events)?;
+    ipc(
+        &signature,
+        &[
+            "dispatch",
+            &format!("hl.dsp.window.close({{window=\"address:{address}\"}})"),
+        ],
+    )?;
+    wait_event(&events, |event| {
+        matches!(event, HostEvent::CloseRequested { id: 257 })
+    })?;
+    for id in [257, 999] {
+        let (done, ack) = mpsc::sync_channel(1);
+        host.handle.send(HostCommand::Arm {
+            id,
+            until: Instant::now() + Duration::from_secs(1),
+            done,
+        })?;
+        ensure!(
+            !ack.recv_timeout(Duration::from_millis(500))?,
+            "closing/unknown proxy armed"
+        );
+    }
+    eprintln!(
+        "WP-2.57: queued-click={queue_before_arm}, float/place confirmed, 6/6 native moves, release stopped, zero armed Buttons, normal unarmed pair, closing/unknown refused"
+    );
     Ok(())
 }
 
