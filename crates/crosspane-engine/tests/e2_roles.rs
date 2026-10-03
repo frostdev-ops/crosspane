@@ -1100,6 +1100,7 @@ fn source_end_paths_release_stop_restore_and_ignore_unrelated_peers() {
         let mut out = f.handle(event, 1);
         if link_lost {
             assert_eq!(out.len(), 2); // Immediate release and StopCapture, then grace.
+            f.confirm(&out, true, 1);
             out.extend(f.handle(Input::Tick, 20_001));
         }
         assert_eq!(commands(&out), vec![up()]);

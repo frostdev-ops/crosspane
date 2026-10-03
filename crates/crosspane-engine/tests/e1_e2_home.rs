@@ -5772,8 +5772,8 @@ fn remapped_key_released_to_right_node() {
 fn competing_projection_up_during_entry() {
     let mut h = H::with_extra_sources();
     h.cross();
-    // The same key is down in two projected windows (each lease holds it; the journal keeps the
-    // record until the last of them confirms its release).
+    // The same key is down in two projected windows (each lease holds it;
+    // the journal keeps the record until the single physical release confirms).
     h.focus(Some(W1));
     let a = h.proj_key(P1, KEY, true);
     h.confirm(&a, true);
@@ -5785,26 +5785,59 @@ fn competing_projection_up_during_entry() {
     h.aim();
     let out = h.trigger();
     let ups = injects(&out);
-    assert_eq!(ups.len(), 2, "each lease releases its own: {out:?}");
+    assert_eq!(
+        ups.len(),
+        1,
+        "the union releases the physical key once: {out:?}"
+    );
+    assert!(binds(&out).is_empty());
+    assert_eq!(h.e2_journal.items(), vec![Held::Key(KEY)]);
     // A competing up from B for the second projection arrives meanwhile: dropped.
     let late = h.proj_key(P2, KEY, false);
     assert!(!has_inject(&late), "{late:?}");
-    let first = h.feed(Input::InjectDone {
+    let confirmed = h.feed(Input::InjectDone {
         id: ups[0].0,
         ok: true,
     });
-    assert!(binds(&first).is_empty());
-    assert_eq!(
-        h.e2_journal.items(),
-        vec![Held::Key(KEY)],
-        "the other lease still owes its release"
-    );
-    let second = h.feed(Input::InjectDone {
-        id: ups[1].0,
-        ok: true,
-    });
-    assert!(bind(&second, true).is_some(), "{second:?}");
+    assert!(bind(&confirmed, true).is_some(), "{confirmed:?}");
     assert_eq!(h.e2_journal.items(), vec![]);
+    h.quiet();
+}
+
+#[test]
+fn unanswered_shared_final_up_retries_and_unblocks_home_entry() {
+    let mut h = H::with_extra_sources();
+    h.cross();
+    for (window, projection) in [(W1, P1), (W2, P2)] {
+        h.focus(Some(window));
+        let down = h.proj_key(projection, KEY, true);
+        h.confirm(&down, true);
+    }
+    h.focus(Some(W1));
+    h.aim();
+    let trigger = h.trigger();
+    let unanswered = injects(&trigger);
+    assert_eq!(unanswered.len(), 1);
+    assert!(is_up_of(&unanswered[0].1, KEY));
+    assert!(binds(&trigger).is_empty());
+    assert_eq!(h.e2_journal.items(), vec![Held::Key(KEY)]);
+    let early = h.tick_after(49);
+    assert!(!has_inject(&early));
+    assert!(binds(&early).is_empty());
+    let retry = h.tick_after(1);
+    let ups = injects(&retry);
+    assert_eq!(
+        ups.len(),
+        1,
+        "unanswered final up must be retried: {retry:?}"
+    );
+    assert!(is_up_of(&ups[0].1, KEY));
+    assert_ne!(ups[0].0, unanswered[0].0);
+    assert!(binds(&retry).is_empty());
+    assert_eq!(h.e2_journal.items(), vec![Held::Key(KEY)]);
+    let confirmed = h.confirm(&retry, true);
+    assert!(bind(&confirmed, true).is_some(), "{confirmed:?}");
+    assert!(h.e2_journal.items().is_empty());
     h.quiet();
 }
 

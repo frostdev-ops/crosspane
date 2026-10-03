@@ -113,10 +113,10 @@ impl E2 {
     pub fn new(
         config: &EngineConfig,
         journal: Box<dyn Journal>,
-        _now: MonoTime,
+        now: MonoTime,
     ) -> Result<(E2, Vec<Output>), JournalError> {
         let mut out = Vec::new();
-        let ledgers = Ledgers::new(journal, &mut out)?;
+        let ledgers = Ledgers::new(journal, now, &mut out)?;
         Ok((
             E2 {
                 node: config.node,
@@ -350,7 +350,7 @@ impl E2 {
             Input::Proxy { key, event } => self.proxy_event(*key, event, now, out),
             Input::MediaError { key } => self.media_error(*key, now, out),
             Input::InjectDone { id, ok } => {
-                if let Some(owner) = self.ledgers.done(*id, *ok, now) {
+                if let Some(owner) = self.ledgers.done(*id, *ok, now, out) {
                     self.end_source(owner, Reason::Failed, false, now, out);
                 }
                 self.source_inject_done(*id, *ok, now, out);

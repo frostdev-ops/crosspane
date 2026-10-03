@@ -116,6 +116,9 @@ struct Mesh {
     clipboard: BTreeMap<NodeId, FakeClipboardHost>,
     delayed_clip_reads: Vec<(NodeId, Input)>,
     delay_clip_reads: bool,
+    defer_targeting: bool,
+    fail_next_press: bool,
+    defer_releases: bool,
 }
 impl Mesh {
     fn new(split: bool) -> Self {
@@ -152,6 +155,9 @@ impl Mesh {
             clipboard: BTreeMap::new(),
             delayed_clip_reads: Vec::new(),
             delay_clip_reads: false,
+            defer_targeting: false,
+            fail_next_press: false,
+            defer_releases: false,
         };
         for (node, output) in startup {
             m.complete(node, &output);
@@ -410,6 +416,22 @@ impl Mesh {
                     }),
                 )
             }),
+            Output::Inject {
+                cmd: InjectCmd::MoveTo { .. },
+                ..
+            } if self.defer_targeting => None,
+            Output::Inject {
+                id,
+                cmd: InjectCmd::Key { down: true, .. } | InjectCmd::Button { down: true, .. },
+            } if self.fail_next_press => {
+                // The fake already applied the down above: failure does not mean rejected input.
+                self.fail_next_press = false;
+                Some((node, Input::InjectDone { id: *id, ok: false }))
+            }
+            Output::Inject {
+                cmd: InjectCmd::Key { down: false, .. } | InjectCmd::Button { down: false, .. },
+                ..
+            } if self.defer_releases => None,
             Output::Inject { id, .. } => Some((node, Input::InjectDone { id: *id, ok: true })),
             Output::OpenProxy { key, size, .. } => Some((
                 node,
@@ -699,6 +721,51 @@ impl Mesh {
                 key,
                 event: ProxyEvent::Key { usage, down },
             },
+        );
+    }
+
+    fn proxy_item(&mut self, node: NodeId, key: ProjectionKey, item: Held, down: bool) {
+        match item {
+            Held::Key(usage) => self.proxy_key(node, key, usage, down),
+            Held::Button(button) => {
+                self.feed(
+                    node,
+                    Input::Proxy {
+                        key,
+                        event: ProxyEvent::Focus(true),
+                    },
+                );
+                self.feed(
+                    node,
+                    Input::Proxy {
+                        key,
+                        event: ProxyEvent::Button {
+                            button,
+                            down,
+                            position: PointDevice::new(50.0, 50.0),
+                        },
+                    },
+                );
+            }
+        }
+    }
+
+    fn heartbeat(&mut self, peer: NodeId, key: ProjectionKey, item: Held, seq: u32) {
+        let (keys, buttons) = match item {
+            Held::Key(usage) => (vec![usage], vec![]),
+            Held::Button(button) => (vec![], vec![button]),
+        };
+        self.feed(
+            key.source,
+            Input::Link(LinkEvent::Input {
+                peer,
+                msg: InputMessage::Proj(crosspane_protocol::projection::ProjInput::Held {
+                    projection: key.projection,
+                    seq,
+                    keys,
+                    buttons,
+                }),
+            }),
         );
     }
 }
@@ -1271,7 +1338,6 @@ fn two_audio_peers_have_independent_stream_ids_and_grant_teardown() {
 }
 
 #[test]
-#[ignore = "N0 gap: one projection releases another peer's held physical key"]
 fn ending_one_projection_preserves_the_other_peers_held_key() {
     let mut m = Mesh::new(false);
     let b = m.project(A, B, WINDOW);
@@ -1312,7 +1378,6 @@ fn ending_one_projection_preserves_the_other_peers_held_key() {
 }
 
 #[test]
-#[ignore = "N0 gap: one projection releases another peer's held physical button"]
 fn ending_one_projection_preserves_the_other_peers_held_button() {
     let mut m = Mesh::new(false);
     let b = m.project(A, B, WINDOW);
@@ -1383,6 +1448,429 @@ fn three_node_default_layout_is_identical_from_every_local_order() {
         expected.iter().map(|p| p.origin.x).collect::<Vec<_>>(),
         vec![0.0, 100.0, 200.0]
     );
+}
+
+#[test]
+fn owner_end_paths_preserve_the_other_peers_key_and_button() {
+    for item in [Held::Key(KEY), Held::Button(MouseButton::PRIMARY)] {
+        for path in ["return", "revoke", "link grace", "lease expiry"] {
+            let mut m = Mesh::new(false);
+            let b = m.project(A, B, WINDOW);
+            let c = m.project(A, C, WindowId(11));
+            m.proxy_item(B, b, item, true);
+            m.proxy_item(C, c, item, true);
+            m.log.clear();
+            match path {
+                "return" => {
+                    m.feed(B, Input::Command(Command::Return(b)));
+                    m.returned(B, b, WINDOW);
+                }
+                "revoke" => {
+                    m.feed(A, grants(&[C]));
+                    assert_eq!(m.count(A, |o| matches!(o,
+                        Output::Notice(Notice::ProjectionEnded { key, reason: ProjectionEndReason::Revoked })
+                        if *key == b)), 1);
+                }
+                "link grace" => {
+                    m.blocked.extend([(A, B), (B, A)]);
+                    m.feed(
+                        A,
+                        Input::Link(LinkEvent::Closed {
+                            peer: B,
+                            error: LinkError::Closed,
+                        }),
+                    );
+                    assert!(
+                        m.physical_trace(A, item).is_empty(),
+                        "link suspension must retain C"
+                    );
+                    m.now = 19_999;
+                    m.heartbeat(C, c, item, 100);
+                    m.now = 20_000;
+                    m.feed(A, Input::Tick);
+                    assert_eq!(m.count(A, |o| matches!(o,
+                        Output::Notice(Notice::ProjectionEnded { key, reason: ProjectionEndReason::LinkLost })
+                        if *key == b)), 1);
+                }
+                "lease expiry" => {
+                    m.now = 100;
+                    m.heartbeat(C, c, item, 100);
+                    m.now = 301;
+                    m.feed(A, Input::Tick);
+                    assert_eq!(m.count(B, |o| matches!(o, Output::CloseProxy { .. })), 0);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                m.physical_trace(A, item).is_empty(),
+                "{path} lifted {item:?}"
+            );
+            assert_eq!(m.count(C, |o| matches!(o, Output::CloseProxy { .. })), 0);
+            m.log.clear();
+            m.feed(C, Input::Command(Command::Return(c)));
+            m.returned(C, c, WindowId(11));
+            assert_eq!(
+                m.physical_trace(A, item),
+                vec![false],
+                "final {path}: {item:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_or_timed_out_targeting_preserves_the_other_peers_held_key() {
+    for timeout in [false, true] {
+        let mut m = Mesh::new(false);
+        let b = m.project(A, B, WINDOW);
+        let c = m.project(A, C, WindowId(11));
+        m.proxy_key(B, b, KEY, true);
+        m.proxy_key(C, c, KEY, true);
+        m.log.clear();
+        m.defer_targeting = true;
+        m.proxy_item(B, b, Held::Button(MouseButton::PRIMARY), true);
+        let id = m
+            .log
+            .iter()
+            .find_map(|(node, output)| match output {
+                Output::Inject {
+                    id,
+                    cmd: InjectCmd::MoveTo { .. },
+                } if *node == A => Some(*id),
+                _ => None,
+            })
+            .expect("actual button targeting request");
+        if timeout {
+            for t in [100, 200, 300, 400, 499] {
+                m.now = t;
+                m.heartbeat(B, b, Held::Key(KEY), t as u32 + 100);
+                m.heartbeat(C, c, Held::Key(KEY), t as u32 + 100);
+            }
+            m.now = 500;
+            m.feed(A, Input::Tick);
+            assert_eq!(
+                m.count(A, |o| matches!(o,
+                Output::Notice(Notice::ProjectionEnded { key, reason: ProjectionEndReason::Failed })
+                if *key == b)),
+                1
+            );
+        } else {
+            m.feed(A, Input::InjectDone { id, ok: false });
+            // A failed targeting operation discards the unissued click; the live source then returns.
+            m.feed(B, Input::Command(Command::Return(b)));
+            m.returned(B, b, WINDOW);
+        }
+        assert!(m.physical_trace(A, Held::Key(KEY)).is_empty());
+        assert!(
+            m.physical_trace(A, Held::Button(MouseButton::PRIMARY))
+                .is_empty()
+        );
+        assert!(m.held.contains(&(A, KEY)));
+        m.feed(A, Input::InjectDone { id, ok: true });
+        assert!(
+            m.buttons.is_empty(),
+            "late targeting completion must not invent a press"
+        );
+        m.log.clear();
+        m.feed(C, Input::Command(Command::Return(c)));
+        m.returned(C, c, WindowId(11));
+        assert_eq!(m.physical_trace(A, Held::Key(KEY)), vec![false]);
+    }
+}
+
+#[test]
+fn failed_press_cleanup_never_represses_after_focus_changes() {
+    let mut m = Mesh::new(false);
+    let b = m.project(A, B, WINDOW);
+    let c = m.project(A, C, WindowId(11));
+    m.fail_next_press = true;
+    m.defer_releases = true;
+    m.proxy_key(B, b, KEY, true);
+    m.feed(A, Input::Windows(WindowEvent::Focused(Some(WindowId(999)))));
+    m.log.clear();
+    m.now = 51;
+    m.feed(A, Input::Tick);
+    assert!(
+        !m.physical_trace(A, Held::Key(KEY)).contains(&true),
+        "cleanup retry must never press into the newly focused local window"
+    );
+    let cleanup = m.log.iter().find_map(|(node, o)| match o {
+        Output::Inject {
+            id,
+            cmd: InjectCmd::Key { down: false, .. },
+        } if *node == A => Some(*id),
+        _ => None,
+    });
+    m.feed(
+        A,
+        Input::InjectDone {
+            id: cleanup.expect("immediate cleanup up"),
+            ok: true,
+        },
+    );
+    assert!(!m.held.contains(&(A, KEY)));
+    m.log.clear();
+    for seq in [100, 101] {
+        m.feed(
+            A,
+            Input::Link(LinkEvent::Input {
+                peer: C,
+                msg: InputMessage::Proj(crosspane_protocol::projection::ProjInput::Key {
+                    projection: c.projection,
+                    seq,
+                    usage: KEY,
+                    down: true,
+                }),
+            }),
+        );
+        if seq == 100 {
+            assert!(m.physical_trace(A, Held::Key(KEY)).is_empty());
+            assert_eq!(
+                m.count(
+                    A,
+                    |o| matches!(o, Output::ActivateWindow { window } if *window == WindowId(11))
+                ),
+                1
+            );
+            m.log.clear();
+        }
+    }
+    assert_eq!(m.physical_trace(A, Held::Key(KEY)), vec![true]);
+}
+
+#[test]
+fn failed_button_cleanup_never_bypasses_pending_pointer_targeting() {
+    let mut m = Mesh::new(false);
+    let b = m.project(A, B, WINDOW);
+    let c = m.project(A, C, WindowId(11));
+    m.fail_next_press = true;
+    m.defer_releases = true;
+    m.proxy_item(B, b, Held::Button(MouseButton::PRIMARY), true);
+    m.defer_targeting = true;
+    m.log.clear();
+    m.proxy_item(C, c, Held::Button(MouseButton::PRIMARY), true);
+    let target = m.log.iter().find_map(|(node, o)| match o {
+        Output::Inject {
+            id,
+            cmd: InjectCmd::MoveTo { .. },
+        } if *node == A => Some(*id),
+        _ => None,
+    });
+    assert!(target.is_none(), "a blocked down cannot begin MoveTo");
+    m.log.clear();
+    m.now = 51;
+    m.feed(A, Input::Tick);
+    assert!(
+        !m.physical_trace(A, Held::Button(MouseButton::PRIMARY))
+            .contains(&true),
+        "cleanup retry must never press around the outstanding MoveTo"
+    );
+    assert!(
+        !m.buttons.contains(&(A, MouseButton::PRIMARY)),
+        "a down admitted before cleanup confirmation is absorbed"
+    );
+    let cleanup = m.log.iter().find_map(|(node, o)| match o {
+        Output::Inject {
+            id,
+            cmd: InjectCmd::Button { down: false, .. },
+        } if *node == A => Some(*id),
+        _ => None,
+    });
+    m.feed(
+        A,
+        Input::InjectDone {
+            id: cleanup.expect("immediate cleanup up"),
+            ok: true,
+        },
+    );
+    m.proxy_item(C, c, Held::Button(MouseButton::PRIMARY), false);
+    m.log.clear();
+    m.proxy_item(C, c, Held::Button(MouseButton::PRIMARY), true);
+    assert!(
+        m.physical_trace(A, Held::Button(MouseButton::PRIMARY))
+            .is_empty()
+    );
+    let fresh_target = m
+        .log
+        .iter()
+        .find_map(|(node, o)| match o {
+            Output::Inject {
+                id,
+                cmd: InjectCmd::MoveTo { .. },
+            } if *node == A => Some(*id),
+            _ => None,
+        })
+        .expect("new press needs a new MoveTo");
+    m.feed(
+        A,
+        Input::InjectDone {
+            id: fresh_target,
+            ok: true,
+        },
+    );
+    assert_eq!(
+        m.physical_trace(A, Held::Button(MouseButton::PRIMARY)),
+        vec![true]
+    );
+}
+
+#[test]
+#[ignore = "N1e gap: E1 target ReleaseAll clears another projection's E2 hold"]
+fn ending_e1_target_preserves_another_peers_e2_hold() {
+    let mut m = Mesh::new(false);
+    let c = m.project(A, C, WINDOW);
+    m.enter(B, A, 0.5);
+    m.press(B, KEY, true);
+    assert_eq!(m.engines[&A].controlled_by(), Some(B));
+    m.proxy_key(C, c, KEY, true);
+    assert!(m.held.contains(&(A, KEY)));
+    m.log.clear();
+    // Removing only B's grant ends A's real E1 target session; C's projection stays authorized.
+    m.feed(A, grants(&[C]));
+    assert_eq!(m.engines[&A].controlled_by(), None);
+    assert_eq!(m.count(C, |o| matches!(o, Output::CloseProxy { .. })), 0);
+    assert_eq!(
+        m.count(A, |o| matches!(
+            o,
+            Output::Inject {
+                cmd: InjectCmd::ReleaseAll,
+                ..
+            }
+        )),
+        1,
+        "positive control: the E1 target issued global cleanup"
+    );
+    assert!(
+        m.held.contains(&(A, KEY)),
+        "E1 cleanup must preserve C's E2 physical hold"
+    );
+}
+
+fn blocked_down_callback_orders(item: Held, cleanup_first: bool) {
+    let mut m = Mesh::new(false);
+    let b = m.project(A, B, WINDOW);
+    let c = m.project(A, C, WindowId(11));
+    m.fail_next_press = true;
+    m.defer_releases = true;
+    m.proxy_item(B, b, item, true);
+    let cleanup = m
+        .log
+        .iter()
+        .find_map(|(node, output)| match (item, output) {
+            (
+                Held::Key(key),
+                Output::Inject {
+                    id,
+                    cmd: InjectCmd::Key { usage, down: false },
+                },
+            ) if *node == A && *usage == key => Some(*id),
+            (
+                Held::Button(key),
+                Output::Inject {
+                    id,
+                    cmd:
+                        InjectCmd::Button {
+                            button,
+                            down: false,
+                        },
+                },
+            ) if *node == A && *button == key => Some(*id),
+            _ => None,
+        })
+        .expect("failed establishing press emitted cleanup");
+    m.defer_targeting = true;
+    m.log.clear();
+    if matches!(item, Held::Key(_)) {
+        // A different item's MoveTo keeps the real source FIFO busy while the key is blocked.
+        m.proxy_item(C, c, Held::Button(MouseButton(2)), true);
+    }
+    m.proxy_item(C, c, item, true);
+    let target = m.log.iter().find_map(|(node, output)| match output {
+        Output::Inject {
+            id,
+            cmd: InjectCmd::MoveTo { .. },
+        } if *node == A => Some(*id),
+        _ => None,
+    });
+    if cleanup_first {
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: cleanup,
+                ok: true,
+            },
+        );
+    }
+    if let Some(id) = target {
+        m.feed(A, Input::InjectDone { id, ok: true });
+    }
+    if !cleanup_first {
+        m.feed(
+            A,
+            Input::InjectDone {
+                id: cleanup,
+                ok: true,
+            },
+        );
+    }
+    assert!(
+        m.physical_trace(A, item).is_empty(),
+        "a down admitted during cleanup cannot survive either callback order: {item:?}"
+    );
+    // A late duplicate callback cannot resurrect the rejected admission either.
+    if let Some(id) = target {
+        m.feed(A, Input::InjectDone { id, ok: true });
+    }
+    assert!(m.physical_trace(A, item).is_empty());
+    m.defer_targeting = false;
+    m.defer_releases = false;
+    m.proxy_item(C, c, item, false);
+    m.log.clear();
+    m.proxy_item(C, c, item, true);
+    assert_eq!(
+        m.physical_trace(A, item),
+        vec![true],
+        "fresh input uses ordinary admission"
+    );
+    if matches!(item, Held::Button(_)) {
+        assert_eq!(
+            m.count(A, |o| matches!(
+                o,
+                Output::Inject {
+                    cmd: InjectCmd::MoveTo { .. },
+                    ..
+                }
+            )),
+            1
+        );
+    }
+    m.proxy_item(C, c, item, false);
+    assert_eq!(m.physical_trace(A, item), vec![true, false]);
+    if matches!(item, Held::Key(_)) {
+        m.proxy_item(C, c, Held::Button(MouseButton(2)), false);
+    }
+    assert!(m.held.is_empty());
+    assert!(m.buttons.is_empty());
+}
+
+#[test]
+fn blocked_button_does_not_survive_cleanup_then_targeting() {
+    blocked_down_callback_orders(Held::Button(MouseButton::PRIMARY), true);
+}
+
+#[test]
+fn blocked_button_does_not_survive_targeting_then_cleanup() {
+    blocked_down_callback_orders(Held::Button(MouseButton::PRIMARY), false);
+}
+
+#[test]
+fn blocked_key_does_not_survive_cleanup_then_targeting() {
+    blocked_down_callback_orders(Held::Key(KEY), true);
+}
+
+#[test]
+fn blocked_key_does_not_survive_targeting_then_cleanup() {
+    blocked_down_callback_orders(Held::Key(KEY), false);
 }
 
 #[test]

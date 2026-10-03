@@ -913,7 +913,9 @@ impl E2 {
                     .map(Held::Key)
                     .chain(buttons.iter().copied().map(Held::Button))
                     .collect();
-                self.ledgers.input_heartbeat(projection, &items, now, out);
+                if !self.ledgers.input_heartbeat(projection, &items, now, out) {
+                    self.end_source(projection, Reason::Failed, false, now, out);
+                }
             }
             _ => {}
         }
