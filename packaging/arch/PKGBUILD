@@ -47,10 +47,12 @@ package() {
   install -Dm755 target/release/crosspane-agent "$pkgdir/usr/bin/crosspane-agent"
   install -Dm755 target/release/crosspanectl "$pkgdir/usr/bin/crosspanectl"
   install -Dm755 target/release/crosspane-ui "$pkgdir/usr/bin/crosspane-ui"
-  install -Dm644 packaging/linux/crosspane-settings.desktop \
-    "$pkgdir/usr/share/applications/crosspane-settings.desktop"
-  sed 's|%h/.local/bin/crosspane-agent|/usr/bin/crosspane-agent|' \
-    packaging/linux/crosspane-agent.service \
+  # The templates carry the installer's placeholders (WP-4.7b/c); render them for /usr.
+  sed 's|{{settings_executable}}|/usr/bin/crosspane-ui|' \
+    packaging/linux/crosspane-settings.desktop \
+    | install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/crosspane-settings.desktop"
+  sed -e 's|{{agent_executable}}|/usr/bin/crosspane-agent|' -e '/^Environment={{/d' \
+    -e '/^# Installer payload template/d' packaging/linux/crosspane-agent.service \
     | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/crosspane-agent.service"
   install -Dm644 docs/running.md "$pkgdir/usr/share/doc/crosspane/running.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

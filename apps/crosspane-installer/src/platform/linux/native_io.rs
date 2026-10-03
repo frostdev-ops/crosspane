@@ -355,11 +355,72 @@ impl BusEndpoint {
         Ok(())
     }
 }
+/// Pin the private user manager, including both directory identities. The same-UID window
+/// between the final check and systemctl's connect is outside the admitted threat model.
+#[derive(Clone, Debug)]
+struct ManagerEndpoint {
+    runtime: Arc<OwnedFd>,
+    directory: Arc<OwnedFd>,
+    socket: (u64, u64),
+}
+fn manager_socket_stat(stat: &rfs::Stat, uid: u32) -> Result<()> {
+    if stat.st_uid != uid || stat.st_mode & 0o170000 != 0o140000 || stat.st_nlink != 1 {
+        return Err(NativeError::Foreign);
+    }
+    Ok(())
+}
+impl ManagerEndpoint {
+    fn admit(target: &LinuxTarget) -> Result<Self> {
+        let runtime =
+            walk_dir(target, &target.paths.runtime_home, None)?.ok_or(NativeError::Unavailable)?;
+        let stat = native(rfs::fstat(&runtime))?;
+        if stat.st_uid != target.paths.uid || stat.st_mode & 0o777 != 0o700 {
+            return Err(NativeError::Foreign);
+        }
+        let directory = rfs::openat(
+            &runtime,
+            "systemd",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| NativeError::Foreign)?;
+        let stat = native(rfs::fstat(&directory))?;
+        if stat.st_uid != target.paths.uid || stat.st_mode & 0o022 != 0 {
+            return Err(NativeError::Foreign);
+        }
+        let stat = rfs::statat(&directory, "private", AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| NativeError::Foreign)?;
+        manager_socket_stat(&stat, target.paths.uid)?;
+        Ok(Self {
+            runtime: Arc::new(runtime),
+            directory: Arc::new(directory),
+            socket: (stat.st_dev, stat.st_ino),
+        })
+    }
+    fn revalidate(&self, target: &LinuxTarget) -> Result<()> {
+        let current = Self::admit(target).map_err(|_| NativeError::Foreign)?;
+        for (old, new) in [
+            (&self.runtime, &current.runtime),
+            (&self.directory, &current.directory),
+        ] {
+            let old = native(rfs::fstat(old.as_ref()))?;
+            let new = native(rfs::fstat(new.as_ref()))?;
+            if (old.st_dev, old.st_ino) != (new.st_dev, new.st_ino) {
+                return Err(NativeError::Foreign);
+            }
+        }
+        if self.socket != current.socket {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ChildEnvironment {
     nonce: u64,
     values: BTreeMap<String, String>,
     bus: Option<BusEndpoint>,
+    manager: Option<ManagerEndpoint>,
 }
 impl ChildEnvironment {
     pub fn selected(target: &LinuxTarget, session: BTreeMap<String, String>) -> Result<Self> {
@@ -419,19 +480,35 @@ impl ChildEnvironment {
             nonce: target.nonce,
             values,
             bus,
+            manager: None,
         })
     }
     pub fn values(&self) -> &BTreeMap<String, String> {
         &self.values
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CommandSpec {
     executable: PathBuf,
     argv: Vec<String>,
     environment: ChildEnvironment,
     output_limit: usize,
     admission: Option<(LinuxTarget, Option<SupportProof>)>,
+    lease: Option<Arc<LeaseGuard>>,
+    spawn_attempt: Option<Arc<AtomicBool>>,
+}
+impl Clone for CommandSpec {
+    fn clone(&self) -> Self {
+        Self {
+            executable: self.executable.clone(),
+            argv: self.argv.clone(),
+            environment: self.environment.clone(),
+            output_limit: self.output_limit,
+            admission: self.admission.clone(),
+            lease: None,
+            spawn_attempt: self.spawn_attempt.clone(),
+        }
+    }
 }
 impl CommandSpec {
     pub fn new(
@@ -452,12 +529,17 @@ impl CommandSpec {
             return Err(NativeError::Invalid);
         }
         approved_executable(&executable, &argv)?;
+        if executable == Path::new("/usr/bin/systemctl") && environment.manager.is_none() {
+            return Err(NativeError::Invalid);
+        }
         Ok(Self {
             executable,
             argv,
             environment,
             output_limit,
             admission: None,
+            lease: None,
+            spawn_attempt: None,
         })
     }
     pub fn executable(&self) -> &Path {
@@ -473,8 +555,16 @@ impl CommandSpec {
         self.output_limit
     }
 }
-// Only /bin/ps -> /usr/bin/ps is admitted. No generic aliases/canonicalization.
-// WP-4.7c must pin systemd/private and every used bus before admitting any systemctl argv.
+// Fixed mappings only: /bin/ps -> /usr/bin/ps; /usr/bin/systemctl -> /usr/bin/systemctl.
+/// The sole show query; no caller-selected property, unit, scope or remote target.
+pub const MANAGER_PROPERTIES: &str = "Id,LoadState,FragmentPath,DropInPaths,ExecStart,Environment,User,Group,DynamicUser,ActiveState,SubState,UnitFileState,MainPID,PartOf,After,Requisite,WantedBy,KillSignal,TimeoutStopUSec,Restart,RestartUSec,NeedDaemonReload,ExecStartPre,ExecStartPost,ExecStop,ExecStopPost,ExecReload,EnvironmentFiles,RootDirectory,RootImage,StartLimitIntervalUSec,StartLimitBurst,ExecCondition,Type,Requires,Wants,BindsTo,Upholds,OnFailure,Conflicts,Before,DefaultDependencies,KillMode,SendSIGKILL,FinalKillSignal,RestartKillSignal,SendSIGHUP,UnsetEnvironment,PassEnvironment,WorkingDirectory,UMask,BusName,PIDFile,RemainAfterExit,NotifyAccess,ExecSearchPath,StandardInput,StandardOutput,StandardError,TTYPath,OnSuccess,PropagatesStopTo,PropagatesReloadTo,ReloadPropagatedFrom,StopPropagatedFrom,JoinsNamespaceOf,RequiresMountsFor,WantsMountsFor,RequiredBy,RequisiteOf,BoundBy,UpheldBy,ConsistsOf,ConflictedBy,OnSuccessOf,OnFailureOf,Triggers,TriggeredBy,Following,SliceOf,DelegateControllers,DelegateSubgroup,Conditions,Asserts,ExecConditionEx,ExecStartPreEx,ExecStartPostEx,ExecStopEx,ExecStopPostEx,ExecReloadEx,ExecReloadPost,ExecReloadPostEx,RestartPreventExitStatus,RestartForceExitStatus,SuccessExitStatus,OpenFile,ExtraFileDescriptorNames,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,MountImages,ExtensionImages,ExtensionDirectories,PAMName,Slice,Delegate,OOMPolicy,ManagedOOMSwap,ManagedOOMMemoryPressure,ManagedOOMPreference,SuccessAction,FailureAction,StartLimitAction,JobTimeoutAction,OnSuccessJobMode,OnFailureJobMode,StopWhenUnneeded,RefuseManualStart,RefuseManualStop,AllowIsolate,IgnoreOnIsolate,SurviveFinalKillSignal,JobTimeoutUSec,JobRunningTimeoutUSec,CollectMode,RestartMode,RestartSteps,RestartMaxDelayUSec,TimeoutStartFailureMode,TimeoutStopFailureMode,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,WatchdogUSec,ExitType,FileDescriptorStoreMax,NFileDescriptorStore,FileDescriptorStorePreserve,RootDirectoryStartOnly,RootEphemeral,ExecStartEx,RuntimeDirectory,StateDirectory,CacheDirectory,LogsDirectory,ConfigurationDirectory,RuntimeDirectorySymlink,StateDirectorySymlink,CacheDirectorySymlink,LogsDirectorySymlink,RootMStack,RuntimeDirectoryPreserve";
+fn manager_mutation(spec: &CommandSpec) -> bool {
+    spec.executable == Path::new("/usr/bin/systemctl")
+        && matches!(
+            spec.argv.get(1).map(String::as_str),
+            Some("start" | "stop" | "restart" | "enable" | "disable" | "daemon-reload")
+        )
+}
 fn approved_executable(path: &Path, argv: &[String]) -> Result<&'static str> {
     let a: Vec<_> = argv.iter().map(String::as_str).collect();
     match (path.to_str(), a.as_slice()) {
@@ -485,6 +575,27 @@ fn approved_executable(path: &Path, argv: &[String]) -> Result<&'static str> {
         {
             Ok("/usr/bin/ps")
         }
+        (Some("/usr/bin/systemctl"), ["--user", "daemon-reload"])
+        | (
+            Some("/usr/bin/systemctl"),
+            [
+                "--user",
+                "start" | "stop" | "restart" | "enable" | "disable" | "is-active" | "is-enabled"
+                | "cat",
+                "crosspane-agent.service",
+            ],
+        ) => Ok("/usr/bin/systemctl"),
+        (
+            Some("/usr/bin/systemctl"),
+            [
+                "--user",
+                "show",
+                "--all",
+                "crosspane-agent.service",
+                "-p",
+                properties,
+            ],
+        ) if *properties == MANAGER_PROPERTIES => Ok("/usr/bin/systemctl"),
         _ => Err(NativeError::Invalid),
     }
 }
@@ -540,6 +651,38 @@ pub struct CommandOutput {
     pub code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+/// Owns only the admitted payload installation flock; there is no path or unlock API.
+#[derive(Debug)]
+pub struct InstallLease {
+    lock: File,
+    nonce: u64,
+}
+#[derive(Debug)]
+struct LeaseGuard {
+    lease: Option<InstallLease>,
+    finished: Arc<AtomicBool>,
+}
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if let Some(InstallLease { lock, .. }) = self.lease.take() {
+            drop(lock);
+        }
+        self.finished.store(true, Ordering::Release);
+    }
+}
+/// Completion of outstanding launch AND child cleanup, without access to its installation lock.
+#[derive(Clone, Debug)]
+pub struct PendingOperation(Arc<AtomicBool>);
+impl PendingOperation {
+    pub fn completed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+#[derive(Debug)]
+pub struct ManagerMutation {
+    pub result: Result<CommandOutput>,
+    pub pending: Option<PendingOperation>,
 }
 pub trait CommandRunner: Send + Sync {
     fn run(&self, command: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput>;
@@ -615,6 +758,18 @@ impl Cleanup for Child {
         matches!(self.try_wait(), Ok(Some(_)))
     }
 }
+struct ManagerChild<T: Cleanup> {
+    child: T,
+    _lease: Option<Arc<LeaseGuard>>,
+}
+impl<T: Cleanup> Cleanup for ManagerChild<T> {
+    fn terminate(&mut self) {
+        self.child.terminate();
+    }
+    fn reaped(&mut self) -> bool {
+        self.child.reaped()
+    }
+}
 // Admission precedes spawn. A stalled termination keeps its slot until actually reaped.
 fn cleanup_admission<T: Cleanup>(counter: &'static AtomicUsize) -> Result<SyncSender<T>> {
     counter
@@ -658,29 +813,53 @@ fn drain(pipe: &mut impl Read, bytes: &mut Vec<u8>, limit: usize) -> Result<bool
 impl CommandRunner for SystemRunner {
     fn run(&self, spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput> {
         // LinuxNativeIo's private executor already owns bounded admission for this whole operation.
+        if let Some(attempt) = &spec.spawn_attempt {
+            attempt.store(false, Ordering::Release);
+        }
         system_command(spec, deadline)
     }
+}
+fn child_environment(command: &mut Command, environment: &ChildEnvironment) {
+    command.env_clear().envs(&environment.values);
 }
 fn system_command(spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput> {
     use std::os::unix::process::CommandExt;
     deadline.check()?;
     let (target, proof) = spec.admission.as_ref().ok_or(NativeError::Unsupported)?;
-    let cleanup = cleanup_admission::<Child>(&PROCESS_CLEANUPS)?;
+    let cleanup = cleanup_admission::<ManagerChild<Child>>(&PROCESS_CLEANUPS)?;
     let executable = executable_fd(approved_executable(&spec.executable, &spec.argv)?)?;
-    validate_target(target)?;
+    validate_target(target).map_err(|e| {
+        if spec.environment.manager.is_some() {
+            NativeError::Foreign
+        } else {
+            e
+        }
+    })?;
     if let Some(bus) = &spec.environment.bus {
-        bus.revalidate(target)?;
+        bus.revalidate(target).map_err(|e| {
+            if spec.environment.manager.is_some() {
+                NativeError::Foreign
+            } else {
+                e
+            }
+        })?;
+    }
+    if let Some(manager) = &spec.environment.manager {
+        manager.revalidate(target)?;
     }
     if let Some(proof) = proof {
         proof.check_target(target)?;
     }
     deadline.check()?;
+    let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+    child_environment(&mut command, &spec.environment);
+    if let Some(attempt) = &spec.spawn_attempt {
+        attempt.store(true, Ordering::Release);
+    }
     let mut child = native(
-        Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()))
+        command
             .arg0(&spec.executable)
             .args(&spec.argv)
-            .env_clear()
-            .envs(&spec.environment.values)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -715,7 +894,10 @@ fn system_command(spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutp
         }
     })();
     if result.is_err() {
-        let _ = cleanup.try_send(child);
+        let _ = cleanup.try_send(ManagerChild {
+            child,
+            _lease: spec.lease.clone(),
+        });
     }
     result
 }
@@ -1138,7 +1320,31 @@ impl LinuxNativeIo {
         Ok(File::from(fd))
     }
     pub fn run(&self, spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput> {
+        if manager_mutation(spec) {
+            return Err(NativeError::Unsupported);
+        }
         self.execute(spec, deadline, None)
+    }
+    /// Bounded admission for the user manager and optional selected session bus. No inherited
+    /// SYSTEMD_* or system-bus variable enters the explicit child environment.
+    pub fn manager_environment(
+        &self,
+        session: BTreeMap<String, String>,
+        deadline: &Deadline,
+    ) -> Result<ChildEnvironment> {
+        if session.keys().any(|k| k != "DBUS_SESSION_BUS_ADDRESS") {
+            return Err(NativeError::Invalid);
+        }
+        let target = self.target.clone();
+        let worker_deadline = deadline.clone();
+        bounded_launch(&PROCESS_LAUNCHES, deadline, move || {
+            validate_target(&target)?;
+            let mut environment = ChildEnvironment::selected(&target, session)?;
+            environment.manager = Some(ManagerEndpoint::admit(&target)?);
+            environment.values.remove("DBUS_SYSTEM_BUS_ADDRESS");
+            worker_deadline.check()?;
+            Ok(environment)
+        })
     }
     fn execute(
         &self,
@@ -1148,10 +1354,15 @@ impl LinuxNativeIo {
     ) -> Result<CommandOutput> {
         deadline.check()?;
         let mut admitted = spec.clone();
+        admitted.lease = spec.lease.clone();
         admitted.admission = Some((self.target.clone(), proof.cloned()));
         let target = self.target.clone();
         let runner = self.runner.clone();
         let worker_deadline = deadline.clone();
+        let mutation = manager_mutation(spec);
+        let started = Arc::new(AtomicBool::new(false));
+        let worker_started = started.clone();
+        admitted.spawn_attempt = Some(worker_started.clone());
         #[cfg(test)]
         let admission = self
             .command_admission
@@ -1161,13 +1372,23 @@ impl LinuxNativeIo {
         let counter = self.command_workers;
         #[cfg(not(test))]
         let counter = &PROCESS_LAUNCHES;
-        bounded_launch(counter, deadline, move || {
+        let result = bounded_launch(counter, deadline, move || {
             worker_deadline.check()?;
             #[cfg(test)]
-            admission(&target)?;
+            let admitted_target = admission(&target);
             #[cfg(not(test))]
-            validate_target(&target)?;
-            let expected = ChildEnvironment::selected(&target, BTreeMap::new())?;
+            let admitted_target = validate_target(&target);
+            admitted_target.map_err(|e| {
+                if admitted.environment.manager.is_some() {
+                    NativeError::Foreign
+                } else {
+                    e
+                }
+            })?;
+            let mut expected = ChildEnvironment::selected(&target, BTreeMap::new())?;
+            if admitted.environment.manager.is_some() {
+                expected.values.remove("DBUS_SYSTEM_BUS_ADDRESS");
+            }
             if admitted.environment.nonce != target.nonce
                 || expected
                     .values
@@ -1177,18 +1398,64 @@ impl LinuxNativeIo {
                 return Err(NativeError::Foreign);
             }
             if let Some(bus) = &admitted.environment.bus {
-                bus.revalidate(&target)?;
+                bus.revalidate(&target).map_err(|e| {
+                    if admitted.environment.manager.is_some() {
+                        NativeError::Foreign
+                    } else {
+                        e
+                    }
+                })?;
+            }
+            if let Some(manager) = &admitted.environment.manager {
+                manager.revalidate(&target)?;
             }
             worker_deadline.check()?;
             if let Some((_, Some(proof))) = &admitted.admission {
                 proof.check_target(&target)?;
             }
-            let result = runner.run(&admitted, &worker_deadline)?;
+            worker_started.store(true, Ordering::Release);
+            let result = runner.run(&admitted, &worker_deadline);
+            let drift = if let Some(manager) = &admitted.environment.manager {
+                manager.revalidate(&target).and_then(|_| {
+                    admitted
+                        .environment
+                        .bus
+                        .as_ref()
+                        .map(|b| b.revalidate(&target))
+                        .transpose()
+                })
+            } else {
+                Ok(None)
+            };
+            if drift.is_err() {
+                return Err(if mutation && worker_started.load(Ordering::Acquire) {
+                    NativeError::OutcomeUnknown
+                } else {
+                    NativeError::Foreign
+                });
+            }
             worker_deadline.check()?;
+            let result = result?;
             if result.stdout.len() + result.stderr.len() > admitted.output_limit {
                 return Err(NativeError::Oversize);
             }
             Ok(result)
+        });
+        result.map_err(|error| {
+            if mutation
+                && started.load(Ordering::Acquire)
+                && matches!(
+                    error,
+                    NativeError::Timeout
+                        | NativeError::Cancelled
+                        | NativeError::Unavailable
+                        | NativeError::Oversize
+                )
+            {
+                NativeError::OutcomeUnknown
+            } else {
+                error
+            }
         })
     }
     pub fn run_mutation(
@@ -1197,8 +1464,63 @@ impl LinuxNativeIo {
         spec: &CommandSpec,
         deadline: &Deadline,
     ) -> Result<CommandOutput> {
+        // Manager mutations require the worker-owned lease and pending-operation route.
+        if manager_mutation(spec) {
+            return Err(NativeError::Unsupported);
+        }
         proof.check(self)?;
         self.execute(spec, deadline, Some(proof))
+    }
+    pub fn install_lease(&self, proof: &SupportProof) -> Result<InstallLease> {
+        self.lock(
+            proof,
+            &self
+                .target
+                .paths
+                .state_home
+                .join("crosspane/installer/install.lock"),
+        )
+        .map(|lock| InstallLease {
+            lock,
+            nonce: self.target.nonce,
+        })
+    }
+    /// The worker and, when needed, its cleanup thread retain the lease until the child is
+    /// reaped. Dropping a pending handle cannot release it; process exit releases flock normally.
+    pub fn run_manager_mutation(
+        &self,
+        proof: &SupportProof,
+        spec: &CommandSpec,
+        lease: InstallLease,
+        deadline: &Deadline,
+    ) -> ManagerMutation {
+        if !manager_mutation(spec) || lease.nonce != self.target.nonce {
+            return ManagerMutation {
+                result: Err(NativeError::Invalid),
+                pending: None,
+            };
+        }
+        let pending = PendingOperation(Arc::new(AtomicBool::new(false)));
+        let mut command = spec.clone();
+        command.lease = Some(Arc::new(LeaseGuard {
+            lease: Some(lease),
+            finished: pending.0.clone(),
+        }));
+        let result = proof
+            .check(self)
+            .and_then(|()| self.execute(&command, deadline, Some(proof)));
+        drop(command);
+        if pending.completed() {
+            ManagerMutation {
+                result,
+                pending: None,
+            }
+        } else {
+            ManagerMutation {
+                result: Err(NativeError::OutcomeUnknown),
+                pending: Some(pending),
+            }
+        }
     }
     pub fn process_identity(&self, pid: u32, deadline: &Deadline) -> Result<ProcessIdentity> {
         if pid == 0 {
@@ -1392,6 +1714,171 @@ pub fn parse_ps_start(bytes: &[u8]) -> Result<u64> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn actual_child_environment_preparation_clears_contaminated_fake_parent() {
+        let (io, root) = fixture();
+        let environment = ChildEnvironment::selected(io.target(), BTreeMap::new()).unwrap();
+        let mut manager_environment = environment;
+        manager_environment.values.remove("DBUS_SYSTEM_BUS_ADDRESS");
+        // A fake launch seeds inherited values without changing this process's environment.
+        // Production uses this same preparation function immediately before its own spawn.
+        let mut command = Command::new("/inert/never-executed");
+        command.envs([
+            ("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/foreign/system"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/foreign/session"),
+            ("SYSTEMD_BUS_ADDRESS", "unix:path=/foreign/manager"),
+            ("SYSTEMD_UNIT_PATH", "/foreign/units"),
+            ("SYSTEMD_HOST", "foreign"),
+            ("HOME", "/foreign/home"),
+            ("XDG_RUNTIME_DIR", "/foreign/runtime"),
+        ]);
+        child_environment(&mut command, &manager_environment);
+        let actual: BTreeMap<String, String> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_str().unwrap().into(),
+                    v.unwrap().to_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, manager_environment.values);
+        assert!(
+            !actual
+                .keys()
+                .any(|k| k.starts_with("SYSTEMD_") || k.starts_with("DBUS_"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manager_pre_spawn_drift_is_foreign_but_attempted_mutation_drift_is_unknown() {
+        struct FakeAdmission(bool);
+        impl CommandRunner for FakeAdmission {
+            fn run(&self, spec: &CommandSpec, _: &Deadline) -> Result<CommandOutput> {
+                // Model the real runner's admission versus spawn handshake without executing.
+                spec.spawn_attempt
+                    .as_ref()
+                    .unwrap()
+                    .store(self.0, Ordering::Release);
+                let path = PathBuf::from(&spec.environment.values["XDG_RUNTIME_DIR"])
+                    .join("systemd/private");
+                fs::rename(&path, path.with_extension("old")).unwrap();
+                let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                Err(NativeError::Foreign)
+            }
+        }
+        for attempted in [false, true] {
+            let (mut io, root) = fixture();
+            io.runner = Arc::new(FakeAdmission(attempted));
+            let proof = io.scratch_support(observations(&io)).unwrap();
+            for path in [
+                io.target.paths.runtime_home.join("systemd"),
+                io.target.paths.state_home.join("crosspane/installer"),
+            ] {
+                io.create_private_dir(&proof, &path).unwrap();
+            }
+            let _socket = std::os::unix::net::UnixListener::bind(
+                io.target.paths.runtime_home.join("systemd/private"),
+            )
+            .unwrap();
+            let deadline = Deadline::new(5000, Cancellation::default()).unwrap();
+            let command = CommandSpec::new(
+                "/usr/bin/systemctl".into(),
+                vec![
+                    "--user".into(),
+                    "start".into(),
+                    "crosspane-agent.service".into(),
+                ],
+                io.manager_environment(BTreeMap::new(), &deadline).unwrap(),
+                256,
+            )
+            .unwrap();
+            let result = io.run_manager_mutation(
+                &proof,
+                &command,
+                io.install_lease(&proof).unwrap(),
+                &deadline,
+            );
+            assert_eq!(
+                result.result.unwrap_err(),
+                if attempted {
+                    NativeError::OutcomeUnknown
+                } else {
+                    NativeError::Foreign
+                }
+            );
+            assert!(result.pending.is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn manager_child_cleanup_retains_install_lease_until_fake_reaping_finishes() {
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        struct FakeChild(Arc<AtomicBool>);
+        impl Cleanup for FakeChild {
+            fn terminate(&mut self) {}
+            fn reaped(&mut self) -> bool {
+                self.0.load(Ordering::Acquire)
+            }
+        }
+        let (io, root) = fixture();
+        let proof = io.scratch_support(observations(&io)).unwrap();
+        io.create_private_dir(
+            &proof,
+            &io.target.paths.state_home.join("crosspane/installer"),
+        )
+        .unwrap();
+        let pending = PendingOperation(Arc::new(AtomicBool::new(false)));
+        let reaped = Arc::new(AtomicBool::new(false));
+        let cleanup = cleanup_admission::<ManagerChild<FakeChild>>(&COUNT).unwrap();
+        assert!(
+            cleanup
+                .try_send(ManagerChild {
+                    child: FakeChild(reaped.clone()),
+                    _lease: Some(Arc::new(LeaseGuard {
+                        lease: Some(io.install_lease(&proof).unwrap()),
+                        finished: pending.0.clone(),
+                    })),
+                })
+                .is_ok()
+        );
+        drop(cleanup);
+        assert!(!pending.completed());
+        assert!(matches!(io.install_lease(&proof), Err(NativeError::Busy)));
+        reaped.store(true, Ordering::Release);
+        let until = Instant::now() + Duration::from_secs(1);
+        while !pending.completed() {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        drop(io.install_lease(&proof).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manager_socket_requires_selected_uid_socket_type_and_single_link() {
+        let (io, root) = fixture();
+        let path = root.join("manager-test-socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket = rfs::stat(&path).unwrap();
+        assert_eq!(manager_socket_stat(&socket, io.target.paths.uid), Ok(()));
+        for choice in 0..3 {
+            let mut facts = socket;
+            match choice {
+                0 => facts.st_uid += 1,
+                1 => facts.st_mode = 0o100600,
+                _ => facts.st_nlink = 2,
+            }
+            assert_eq!(
+                manager_socket_stat(&facts, io.target.paths.uid),
+                Err(NativeError::Foreign)
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FileStep {

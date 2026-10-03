@@ -2,6 +2,7 @@
 Type=Application
 Name=Crosspane Settings
 Comment=Machines, screen layout, pairing and projected windows
-Exec=crosspane-ui
+Exec={{settings_executable}}
+Icon=crosspane
 Terminal=false
 Categories=Settings;Utility;

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Crosspane Setup
+Comment=Set up Crosspane for this user
+Exec={{installer_executable}}
+Icon=crosspane
+Terminal=false
+Categories=Settings;Utility;

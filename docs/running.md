@@ -94,7 +94,9 @@ the machine they run on.
   it with the graphical session as a systemd user service:
 
   ```sh
-  install -Dm644 packaging/linux/crosspane-agent.service ~/.config/systemd/user/crosspane-agent.service
+  sed -e "s|{{agent_executable}}|$HOME/.local/bin/crosspane-agent|" -e '/^Environment={{/d' \
+      -e '/^# Installer payload template/d' packaging/linux/crosspane-agent.service \
+    | install -Dm644 /dev/stdin ~/.config/systemd/user/crosspane-agent.service
   systemctl --user daemon-reload && systemctl --user enable --now crosspane-agent
   ```
 

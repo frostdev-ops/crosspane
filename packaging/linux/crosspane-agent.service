@@ -1,23 +1,18 @@
-# systemd user unit: runs the Crosspane agent with the graphical session.
-#   install -Dm644 packaging/linux/crosspane-agent.service ~/.config/systemd/user/crosspane-agent.service
-#   systemctl --user daemon-reload && systemctl --user enable --now crosspane-agent
-# Needs WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE in the user manager's environment (uwsm
-# and most session managers import them). Logs: journalctl --user -u crosspane-agent
+# Installer payload template; WP-4.7b renders the complete quoted values.
 [Unit]
 Description=Crosspane agent (one keyboard and mouse, projected windows)
 PartOf=graphical-session.target
 After=graphical-session.target
 Requisite=graphical-session.target
-# Hyprland can restart in place after a crash without ending the session; the agent then exits
-# (status 75) and is started again. The first tries may still see the old instance in the user
-# manager's environment, so allow a run of quick restarts.
 StartLimitIntervalSec=120
 StartLimitBurst=30
 
 [Service]
-ExecStart=%h/.local/bin/crosspane-agent run
-Environment=RUST_LOG=info
-# SIGTERM is a clean stop: injected input is released and parked windows are put back.
+ExecStart={{agent_executable}} run
+Environment={{xdg_config_environment}}
+Environment={{xdg_state_environment}}
+Environment={{xdg_runtime_environment}}
+Environment={{crosspane_runtime_environment}}
 KillSignal=SIGTERM
 TimeoutStopSec=10
 Restart=on-failure
