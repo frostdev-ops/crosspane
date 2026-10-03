@@ -77,7 +77,7 @@ const ENTRY_CLEARANCE: i32 = 8;
 const ENTRY_NEAR: i32 = 48;
 /// WP-2.43j: presses on the entry's own strips this soon after the entry are the entering motion,
 /// not an exit. A strip pressed in that time stays ignored until the pointer leaves it
-/// (`EdgeReleased`): the spatial re-arm of WP-1.39, which the controller can't measure on the
+/// (`EdgeReleased`): the spatial re-arm of WP-1.39b, which the controller can't measure on the
 /// twin directly (the pointer is local while home).
 const ENTRY_GUARD: Duration = Duration::from_millis(300);
 /// WP-2.43j: a strip held since the guard counts again after this long from the entry even
@@ -2235,7 +2235,7 @@ impl ControllerE1 {
                         // Ordinary capture leaves the pointer at its frozen departure point;
                         // home/twin captures retain return_home's fallback and teardown rules.
                         // Its exact departure portal is not retained. This controller-wide
-                        // 150 ms guard is the lead-approved substitute for WP-1.39's tracker
+                        // 150 ms guard is the lead-approved substitute for WP-1.39b's tracker
                         // hysteresis here: portal refreshes, replacement answers and queued
                         // releases cannot expose an unguarded connection before the deadline.
                         self.local_override_until = Some(now.saturating_add(REENTRY_GUARD));

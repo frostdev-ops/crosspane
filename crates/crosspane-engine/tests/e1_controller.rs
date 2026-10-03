@@ -891,7 +891,7 @@ fn crossing_home_warps_to_layout_entry_and_keeps_hud_until_ended() {
     let mut f = Fixture::new(config(), 2);
     let (session, capture) = f.controlling(vec![]);
     f.send(key(KEY, true, f.now));
-    // Right after entering, the edge back home is disarmed (WP-1.39): move in first.
+    // Right after entering, the edge back home is disarmed (WP-1.39b): move in first.
     f.raw(1, 50.0);
     let out = f.raw(2, -2000.0);
     assert_eq!(
@@ -922,7 +922,7 @@ fn button_held_blocks_crossing_and_restores_previous_pointer_position() {
     let mut f = Fixture::new(config(), 3);
     f.up(C);
     f.controlling(vec![]);
-    // Right after entering, the edge back home is disarmed (WP-1.39): move in first.
+    // Right after entering, the edge back home is disarmed (WP-1.39b): move in first.
     let inside = motions(&f.raw(1, 50.0))[0].1.position.x;
     f.send(button(true, f.now));
     assert!(f.raw(2, -2000.0).is_empty());
@@ -2299,7 +2299,7 @@ fn buttons_after_started_block_crossings_until_their_physical_ups() {
         });
         if !released_before_activation {
             assert!(f.raw(1, 2000.0).is_empty());
-            // The edge back home is disarmed right after entering (WP-1.39): move in first.
+            // The edge back home is disarmed right after entering (WP-1.39b): move in first.
             f.raw(2, 50.0);
             assert!(f.raw(3, -2000.0).is_empty());
             assert!(f.send(button(false, f.now)).is_empty()); // Its down was never forwarded.
@@ -3035,7 +3035,7 @@ fn pointer_return_guards_only_the_return_portal_for_150_ms() {
     for (delay, crosses) in [(100, false), (200, true)] {
         let mut f = Fixture::new(config(), 2);
         let (_, capture) = f.controlling(vec![]);
-        // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+        // Rearm the entry edge after WP-1.39b hysteresis before returning home.
         f.raw(1, 50.0);
         f.raw(2, -60.0);
         f.ended(3, capture);
@@ -3109,7 +3109,7 @@ fn pointer_return_guards_only_the_return_portal_for_150_ms() {
         .unwrap()
         .id;
     let (_, capture) = f.controlling(vec![]);
-    // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+    // Rearm the entry edge after WP-1.39b hysteresis before returning home.
     f.raw(1, 50.0);
     f.raw(2, -60.0);
     f.ended(3, capture);
@@ -3133,7 +3133,7 @@ fn pointer_return_guard_survives_layout_portal_id_reassignment() {
     f.up(C);
     let original_id = f.portal;
     let (_, capture) = f.controlling(vec![]);
-    // Rearm the entry edge after WP-1.39 hysteresis before returning home.
+    // Rearm the entry edge after WP-1.39b hysteresis before returning home.
     f.raw(1, 50.0);
     f.raw(2, -60.0);
     f.ended(3, capture);
