@@ -166,7 +166,7 @@ impl ApprovedInventory {
         }
         Ok(())
     }
-    pub(super) fn payload_digest(&self) -> [u8; 32] {
+    pub(crate) fn payload_digest(&self) -> [u8; 32] {
         let mut bytes = Vec::new();
         for file in &self.files {
             bytes.extend_from_slice(&(file.path.len() as u64).to_le_bytes());
