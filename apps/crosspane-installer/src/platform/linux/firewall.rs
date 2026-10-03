@@ -1,4 +1,5 @@
 //! Ordinary ufw inspection and exact, single-use consented mutations. No networking readiness policy.
+pub mod current;
 use super::native_io::*;
 use crate::agent_contract::ObservationSource;
 use crosspane_installer_core::OperationId;
@@ -587,8 +588,7 @@ pub fn observe(
     })
 }
 
-// Mutation: LAN add only. Current-agent evidence/readmission belongs to b2a;
-// durable stores and receipt-bound removal belong to b2b.
+// Mutation: independent LAN/mDNS add. Durable stores and receipt-bound removal belong to b2b.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleResult {
     PendingVerification,
@@ -749,6 +749,7 @@ pub struct LinuxFirewall {
     current: Option<u64>,
     observed: bool,
     unresolved: [bool; 2],
+    current_checks: current::CurrentState,
 }
 impl std::fmt::Debug for LinuxFirewall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -766,6 +767,7 @@ impl LinuxFirewall {
             current: None,
             observed: false,
             unresolved: [false; 2],
+            current_checks: current::CurrentState::default(),
         }
     }
     pub fn scratch(io: Arc<LinuxNativeIo>, reader: Arc<dyn FirewallReader>) -> Result<Self> {
@@ -802,9 +804,8 @@ impl LinuxFirewall {
         request: PlanRequest,
     ) -> Result<FirewallPlan> {
         self.current = None;
-        // Current-agent readmission and mDNS evidence belong to b2a.
         if request.kind == RuleKind::Mdns {
-            return Err(FirewallError::MdnsPending);
+            self.current_checks.mdns(None)?;
         }
         if self.unresolved[request.kind.index()] {
             return Err(FirewallError::CurrentRequired);
@@ -841,6 +842,9 @@ impl LinuxFirewall {
                 }
             }
         };
+        if request.kind == RuleKind::Mdns {
+            self.current_checks.mdns(Some(&link))?;
+        }
         if snapshot.facts.presence(&link.cidr, request.kind) == Presence::Modified {
             return Err(FirewallError::Kept);
         }
@@ -900,7 +904,7 @@ impl LinuxFirewall {
             });
         }
         store.record_intent(proof, &plan.intent)?;
-        // An interrupted post-intent attempt also stays blocked until b2a readmission.
+        // An interrupted post-intent attempt also requires current-observation readmission.
         self.unresolved[plan.intent.kind.index()] = true;
         let preflight = (|| {
             if observe(self.reader.as_ref(), manager, deadline)? != plan.before {
@@ -908,7 +912,8 @@ impl LinuxFirewall {
             }
             proof.check(&self.io)?;
             deadline.check()?;
-            Ok(())
+            self.current_checks
+                .before_dispatch(self.io.target(), &plan.intent, deadline)
         })();
         if let Err(error) = preflight {
             store.record_outcome(proof, &plan.intent, RuleResult::NotDispatched)?;

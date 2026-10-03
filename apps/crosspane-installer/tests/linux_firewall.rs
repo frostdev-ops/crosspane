@@ -1609,3 +1609,987 @@ fn verify2_counter_prefixed_matched_ipv4_ipv6_rules_retain_exact_evidence() {
         }
     }
 }
+
+mod current_tests {
+    use super::*;
+    use crosspane_installer::agent_contract::{
+        AgentCall, AgentPlatform, AgentReply, CallFailure, DecodedReply, InstallerRequest,
+        ObservationSource, StatusAdmission, decode_reply,
+    };
+    use crosspane_installer::platform::linux::firewall::current::*;
+    use crosspane_types::id::NodeId;
+
+    fn peer() -> NodeId {
+        NodeId([2; 32])
+    }
+    // Every status is inert JSON decoded by the merged codec, never a native agent observation.
+    #[allow(clippy::too_many_arguments)] // Explicit fixture identity, receipt and connection axes.
+    fn status_reply(
+        f: &Fixture,
+        id: u64,
+        at: u64,
+        connected: bool,
+        generation: Option<u64>,
+        instance: u64,
+        error: Option<&str>,
+    ) -> AgentReply {
+        let names = [
+            "capture",
+            "keys",
+            "pointer",
+            "overlay",
+            "hotkeys",
+            "keystore",
+            "windows",
+            "parking",
+            "frames",
+            "tray",
+            "links",
+            "gpu",
+            "home",
+            "audio",
+            "discovery",
+        ];
+        let counters = json!({
+            "e1_controller_started":0,"e1_controller_ended":0,"e1_target_started":0,"e1_target_ended":0,
+            "e1_injections_ok":0,"e1_hud_shows":0,"e1_chord_releases":0,"e1_command_releases":0,
+            "e2_source_started":0,"e2_source_returned":0,"e2_dest_started":0,"e2_dest_returned":0,
+            "e2_frames_presented":null,"e2_returns_failed":0
+        });
+        let bytes = serde_json::to_vec(&json!({"ok":true,"result":{
+            "controlling":null,"controlled_by":null,"projections":[],"displays":[],"peers":[],"layout":[],
+            "installer":{"schema_version":1,"build":{"version":"0.0.0","features":["video"]},
+            "instance":{"id":instance,"pid":4242,"uid":f.io.target().paths().uid,
+                "exe":f.io.target().agent_path(),"runtime_dir":f.io.target().runtime_dir(),"started_unix_ms":1},
+            "config_revision":"9f86d081884c7d65","node":NodeId([1;32]),"recovery_pending":0,
+            "startup_recovery":"nothing_parked","gate":{"open":true,"session":"unlocked","active":true,"armed":true,"panic":false},
+            "epochs":{"gate":1,"grants":1,"layout":1,"backends":1},
+            "backends":names.map(|name| json!({"name":name,"state":"ready","reason":null})),
+            "keystore":"os_store","permissions":[],"discovery":{"enabled":true,"running":true,"candidates":0,"error":error},
+            "tray":{"created":true},"audio":{"enabled":false,"active_peers":[],"frames_sent":0,"frames_played":0},
+            "settings_opened":0,"peers":[{"node":peer(),"name":"inert","connected":connected,"link_generation":generation,
+                "features":[],"grants_given":[],"last_source_parking":null,"counters":counters}]
+        }}})).unwrap();
+        let result = decode_reply(&InstallerRequest::Status, &bytes, AgentPlatform::Linux);
+        assert!(matches!(
+            &result,
+            Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+        ));
+        AgentReply {
+            id,
+            observed_at_ms: at,
+            source: ObservationSource::Demo,
+            result,
+        }
+    }
+    fn observations(
+        f: &Fixture,
+        a: u64,
+        b: u64,
+        connected: bool,
+        generation: Option<u64>,
+        instance: u64,
+        error: Option<&str>,
+    ) -> CurrentObservations {
+        CurrentObservations {
+            peer: peer(),
+            connection: status_reply(f, 31, a, connected, generation, instance, None),
+            discovery: status_reply(f, 32, b, connected, generation, instance, error),
+        }
+    }
+    fn sequence(f: &Fixture, offset: u64) -> DialSequence {
+        let address = "192.168.4.2:47811".parse().unwrap();
+        DialSequence {
+            peer: peer(),
+            address,
+            before: status_reply(f, 11, offset + 10, false, None, 9, None),
+            call: AgentCall {
+                id: 12,
+                request: InstallerRequest::Dial { addr: address },
+                timeout_ms: 5000,
+            },
+            acknowledgement: AgentReply {
+                id: 12,
+                observed_at_ms: offset + 20,
+                source: ObservationSource::Demo,
+                result: Ok(DecodedReply::Acknowledged),
+            },
+            connection: status_reply(f, 13, offset + 30, true, Some(2), 9, None),
+            discovery: status_reply(f, 14, offset + 40, true, Some(2), 9, Some("browse_failed")),
+        }
+    }
+    struct Input {
+        observations: NativeResult<CurrentObservations>,
+        stamp: NativeResult<u64>,
+        calls: Vec<(TargetPaths, LanLink, NodeId)>,
+        cancel: Option<Cancellation>,
+    }
+    struct Reader {
+        input: Arc<Mutex<Input>>,
+        auth: Arc<Auth>,
+    }
+    impl CurrentReader for Reader {
+        fn read(
+            &mut self,
+            target: &LinuxTarget,
+            link: &LanLink,
+            peer: NodeId,
+            d: &Deadline,
+        ) -> NativeResult<CurrentObservations> {
+            d.check()?;
+            self.auth.order.lock().unwrap().push("current");
+            let mut input = self.input.lock().unwrap();
+            input
+                .calls
+                .push((target.paths().clone(), link.clone(), peer));
+            if let Some(cancel) = &input.cancel {
+                cancel.cancel();
+            }
+            input.observations.clone()
+        }
+        fn dispatch_stamp_ms(&self) -> NativeResult<u64> {
+            self.auth.order.lock().unwrap().push("stamp");
+            self.input.lock().unwrap().stamp
+        }
+    }
+    fn install(f: &Fixture, fw: &mut LinuxFirewall) -> Arc<Mutex<Input>> {
+        let input = Arc::new(Mutex::new(Input {
+            observations: Ok(observations(
+                f,
+                60,
+                70,
+                true,
+                Some(2),
+                9,
+                Some("browse_failed"),
+            )),
+            stamp: Ok(100),
+            calls: vec![],
+            cancel: None,
+        }));
+        fw.install_current_reader(
+            peer(),
+            Box::new(Reader {
+                input: input.clone(),
+                auth: f.auth.clone(),
+            }),
+        );
+        input
+    }
+    fn selected(snapshot: &FirewallSnapshot) -> LanLink {
+        snapshot.facts().links.as_ref().unwrap()[0].clone()
+    }
+    fn admit(f: &Fixture, fw: &mut LinuxFirewall, offset: u64) -> FirewallSnapshot {
+        let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        let evidence =
+            TrafficEvidence::after_dial(f.io.target(), selected(&snapshot), sequence(f, offset))
+                .unwrap();
+        fw.admit_dial(&snapshot, evidence).unwrap();
+        snapshot
+    }
+    fn execute(
+        f: &Fixture,
+        fw: &mut LinuxFirewall,
+        snapshot: &FirewallSnapshot,
+        kind: RuleKind,
+        op: u64,
+        store: &mut Store,
+        d: &Deadline,
+    ) -> Result<FirewallResult, FirewallError> {
+        let plan = fw.plan(snapshot, request(kind, op, op)).unwrap();
+        let consent = plan.consent(OperationId(op), op).unwrap();
+        fw.apply(&f.proof(), ManagerSelection::Ufw, plan, consent, store, d)
+    }
+
+    #[test]
+    fn first_lan_without_reader_preserves_b1_dispatch_and_intent_contract() {
+        let _serial = MUTATIONS.lock().unwrap();
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        let mut store = f.store();
+        assert_eq!(
+            execute(
+                &f,
+                &mut fw,
+                &snapshot,
+                RuleKind::Lan,
+                1,
+                &mut store,
+                &deadline()
+            )
+            .unwrap()
+            .result,
+            RuleResult::PendingVerification
+        );
+        f.wait();
+        assert_eq!(
+            *f.auth.order.lock().unwrap(),
+            ["intent", "spawn", "outcome"]
+        );
+        assert_eq!(f.auth.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn after_dial_requires_exact_correlated_ack_and_later_new_connected_generation() {
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        let link = selected(&snapshot);
+        for case in 0..15 {
+            let mut s = sequence(&f, 0);
+            match case {
+                0 => {
+                    s.call.request = InstallerRequest::PairJoin {
+                        addr: s.address,
+                        allow_input: false,
+                    }
+                }
+                1 => {
+                    s.call.request = InstallerRequest::Dial {
+                        addr: "192.168.4.3:47811".parse().unwrap(),
+                    }
+                }
+                2 => s.acknowledgement.id += 1,
+                3 => s.acknowledgement.result = Err(CallFailure::Unavailable),
+                4 => s.acknowledgement.source = ObservationSource::Live,
+                5 => s.connection.observed_at_ms = s.acknowledgement.observed_at_ms,
+                6 => s.discovery.observed_at_ms = s.connection.observed_at_ms,
+                7 => s.before = status_reply(&f, 11, 10, true, Some(2), 9, None),
+                8 => s.connection = status_reply(&f, 13, 30, false, None, 9, None),
+                9 => s.connection = status_reply(&f, 13, 30, true, Some(2), 10, None),
+                10 => {
+                    s.discovery = status_reply(&f, 14, 40, true, Some(3), 9, Some("browse_failed"))
+                }
+                11 => s.discovery = status_reply(&f, 14, 40, true, Some(2), 9, None),
+                12 => s.call.timeout_ms = 0,
+                13 => s.before.id = s.call.id,
+                _ => s.discovery.result = Ok(DecodedReply::PairScan(vec![])),
+            }
+            assert!(
+                TrafficEvidence::after_dial(f.io.target(), link.clone(), s).is_err(),
+                "case{case}"
+            );
+        }
+        for old in [None, Some(1)] {
+            let mut s = sequence(&f, 0);
+            s.before = status_reply(&f, 11, 10, old.is_some(), old, 9, None);
+            assert!(TrafficEvidence::after_dial(f.io.target(), link.clone(), s).is_ok());
+        }
+        assert!(f.auth.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn evidence_is_bound_to_selected_target_peer_and_link_without_native_acquisition() {
+        let f = Fixture::new();
+        let other = Fixture::new();
+        let mut fw = f.firewall();
+        install(&f, &mut fw);
+        let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        let evidence = TrafficEvidence::after_dial(
+            other.io.target(),
+            selected(&snapshot),
+            sequence(&other, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            fw.admit_dial(&snapshot, evidence).unwrap_err(),
+            FirewallError::MdnsPending
+        );
+        assert!(
+            TrafficEvidence::after_dial(other.io.target(), selected(&snapshot), sequence(&f, 0))
+                .is_err()
+        );
+        let mut evidence_link = selected(&snapshot);
+        evidence_link.interface = "different".into();
+        let evidence =
+            TrafficEvidence::after_dial(f.io.target(), evidence_link, sequence(&f, 0)).unwrap();
+        assert_eq!(
+            fw.admit_dial(&snapshot, evidence).unwrap_err(),
+            FirewallError::Stale
+        );
+        assert_eq!(
+            fw.plan(&snapshot, request(RuleKind::Mdns, 1, 1))
+                .unwrap_err(),
+            FirewallError::MdnsPending
+        );
+        assert!(f.auth.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mdns_has_separate_exact_preview_consent_and_one_post_intent_current_read() {
+        let _serial = MUTATIONS.lock().unwrap();
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        let input = install(&f, &mut fw);
+        let snapshot = admit(&f, &mut fw, 0);
+        let plan = fw.plan(&snapshot, request(RuleKind::Mdns, 2, 7)).unwrap();
+        assert!(plan.preview().starts_with("pkexec /usr/bin/ufw allow from 192.168.4.0/24 to any port 5353 proto udp comment 'Crosspane (mDNS)'"));
+        assert_eq!(
+            plan.consent(OperationId(1), 7).unwrap_err(),
+            FirewallError::Stale
+        );
+        let consent = plan.consent(OperationId(2), 7).unwrap();
+        let mut store = f.store();
+        let result = fw
+            .apply(
+                &f.proof(),
+                ManagerSelection::Ufw,
+                plan,
+                consent,
+                &mut store,
+                &deadline(),
+            )
+            .unwrap();
+        f.wait();
+        assert_eq!(result.result, RuleResult::PendingVerification);
+        assert_eq!(result.inventory, Presence::Absent);
+        assert_eq!(
+            *f.auth.order.lock().unwrap(),
+            ["intent", "current", "stamp", "spawn", "outcome"]
+        );
+        assert_eq!(
+            input.lock().unwrap().calls,
+            [(f.io.target().paths().clone(), selected(&snapshot), peer())]
+        );
+        assert_eq!(
+            f.auth.calls.lock().unwrap()[0].argv(),
+            [
+                "--wait",
+                "/usr/bin/pkexec",
+                "/usr/bin/ufw",
+                "allow",
+                "from",
+                "192.168.4.0/24",
+                "to",
+                "any",
+                "port",
+                "5353",
+                "proto",
+                "udp",
+                "comment",
+                "Crosspane (mDNS)"
+            ]
+        );
+    }
+
+    #[test]
+    fn round1_mdns_later_success_disconnect_restart_and_generation_change_retire_evidence() {
+        for case in 0..4 {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let input = install(&f, &mut fw);
+            let snapshot = admit(&f, &mut fw, 0);
+            let saved =
+                TrafficEvidence::after_dial(f.io.target(), selected(&snapshot), sequence(&f, 0))
+                    .unwrap();
+            input.lock().unwrap().observations = Ok(match case {
+                0 => observations(&f, 80, 90, true, Some(2), 9, None),
+                1 => observations(&f, 80, 90, false, None, 9, Some("browse_failed")),
+                2 => observations(&f, 80, 90, true, Some(2), 10, Some("browse_failed")),
+                _ => observations(&f, 80, 90, true, Some(3), 9, Some("browse_failed")),
+            });
+            fw.refresh_current(&snapshot, &selected(&snapshot), &deadline())
+                .unwrap();
+            assert_eq!(
+                fw.plan(&snapshot, request(RuleKind::Mdns, 1, 1))
+                    .unwrap_err(),
+                FirewallError::MdnsPending
+            );
+            assert_eq!(
+                fw.admit_dial(&snapshot, saved).unwrap_err(),
+                FirewallError::MdnsPending
+            );
+            input.lock().unwrap().observations = Ok(observations(
+                &f,
+                100,
+                110,
+                true,
+                Some(2),
+                9,
+                Some("browse_failed"),
+            ));
+            fw.refresh_current(&snapshot, &selected(&snapshot), &deadline())
+                .unwrap();
+            assert_eq!(
+                fw.plan(&snapshot, request(RuleKind::Mdns, 2, 2))
+                    .unwrap_err(),
+                FirewallError::MdnsPending
+            );
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn post_intent_discovery_success_disconnect_restart_and_reader_error_are_not_dispatched() {
+        for case in 0..4 {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let input = install(&f, &mut fw);
+            let snapshot = admit(&f, &mut fw, 0);
+            let mut store = f.store();
+            let replaced = input.clone();
+            let changed = match case {
+                0 => Ok(observations(&f, 80, 90, true, Some(2), 9, None)),
+                1 => Ok(observations(
+                    &f,
+                    80,
+                    90,
+                    false,
+                    None,
+                    9,
+                    Some("browse_failed"),
+                )),
+                2 => Ok(observations(
+                    &f,
+                    80,
+                    90,
+                    true,
+                    Some(2),
+                    10,
+                    Some("browse_failed"),
+                )),
+                _ => Err(NativeError::Unavailable),
+            };
+            store.hook = Some(Box::new(move || {
+                replaced.lock().unwrap().observations = changed;
+            }));
+            assert_eq!(
+                execute(
+                    &f,
+                    &mut fw,
+                    &snapshot,
+                    RuleKind::Mdns,
+                    1,
+                    &mut store,
+                    &deadline()
+                )
+                .unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+            assert_eq!(store.results, [RuleResult::NotDispatched]);
+            assert_eq!(store.intents.len(), 1);
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+            let fresh = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            assert_eq!(
+                fw.plan(&fresh, request(RuleKind::Mdns, 2, 2)).unwrap_err(),
+                FirewallError::MdnsPending
+            );
+        }
+    }
+
+    #[test]
+    fn round1_retry_needs_fresh_firewall_and_both_strictly_later_current_receipts() {
+        let _serial = MUTATIONS.lock().unwrap();
+        for (a, b, allowed) in [
+            (100, 110, false),
+            (110, 110, true),
+            (110, 100, false),
+            (99, 110, false),
+        ] {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let input = install(&f, &mut fw);
+            f.auth
+                .outcomes
+                .lock()
+                .unwrap()
+                .push_back(exited(126, "", "Request dismissed\n"));
+            let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let mut store = f.store();
+            assert_eq!(
+                execute(
+                    &f,
+                    &mut fw,
+                    &snapshot,
+                    RuleKind::Lan,
+                    1,
+                    &mut store,
+                    &deadline()
+                )
+                .unwrap()
+                .result,
+                RuleResult::OutcomeUnknown
+            );
+            f.wait();
+            assert!(
+                fw.refresh_current(&snapshot, &selected(&snapshot), &deadline())
+                    .is_err()
+            );
+            input.lock().unwrap().observations = Ok(observations(
+                &f,
+                a,
+                b,
+                true,
+                Some(2),
+                9,
+                Some("browse_failed"),
+            ));
+            let fresh = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let _ = fw.refresh_current(&fresh, &selected(&fresh), &deadline());
+            let planned = fw.plan(&fresh, request(RuleKind::Lan, 2, 2));
+            assert_eq!(planned.is_ok(), allowed, "{a},{b}");
+            if allowed {
+                input.lock().unwrap().stamp = Ok(150);
+                let plan = planned.unwrap();
+                let consent = plan.consent(OperationId(2), 2).unwrap();
+                assert_eq!(
+                    fw.apply(
+                        &f.proof(),
+                        ManagerSelection::Ufw,
+                        plan,
+                        consent,
+                        &mut store,
+                        &deadline()
+                    )
+                    .unwrap()
+                    .result,
+                    RuleResult::PendingVerification
+                );
+                f.wait();
+            }
+            assert_eq!(f.auth.calls.lock().unwrap().len(), 1 + usize::from(allowed));
+        }
+    }
+
+    #[test]
+    fn unknown_watermark_cannot_be_invented_after_no_reader_unknown_dispatch() {
+        let _serial = MUTATIONS.lock().unwrap();
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        f.auth
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(PkexecOutcome::TimedOut);
+        let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        let mut store = f.store();
+        assert_eq!(
+            execute(
+                &f,
+                &mut fw,
+                &snapshot,
+                RuleKind::Lan,
+                1,
+                &mut store,
+                &deadline()
+            )
+            .unwrap()
+            .result,
+            RuleResult::OutcomeUnknown
+        );
+        f.wait();
+        let input = install(&f, &mut fw);
+        input.lock().unwrap().observations =
+            Ok(observations(&f, 1000, 1100, true, Some(2), 9, None));
+        let fresh = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        fw.refresh_current(&fresh, &selected(&fresh), &deadline())
+            .unwrap();
+        assert_eq!(
+            fw.plan(&fresh, request(RuleKind::Lan, 2, 2)).unwrap_err(),
+            FirewallError::CurrentRequired
+        );
+        assert_eq!(f.auth.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_or_backwards_dispatch_stamp_refuses_and_records_not_dispatched() {
+        for stamp in [Err(NativeError::Unavailable), Ok(69)] {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let input = install(&f, &mut fw);
+            input.lock().unwrap().stamp = stamp;
+            let snapshot = admit(&f, &mut fw, 0);
+            let mut store = f.store();
+            assert_eq!(
+                execute(
+                    &f,
+                    &mut fw,
+                    &snapshot,
+                    RuleKind::Mdns,
+                    1,
+                    &mut store,
+                    &deadline()
+                )
+                .unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+            assert_eq!(store.results, [RuleResult::NotDispatched]);
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+            input.lock().unwrap().observations = Ok(observations(
+                &f,
+                200,
+                210,
+                true,
+                Some(2),
+                9,
+                Some("browse_failed"),
+            ));
+            input.lock().unwrap().stamp = Ok(220);
+            let fresh = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            fw.refresh_current(&fresh, &selected(&fresh), &deadline())
+                .unwrap();
+            assert_eq!(
+                fw.plan(&fresh, request(RuleKind::Mdns, 2, 2)).unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+        }
+    }
+
+    #[test]
+    fn per_kind_watermarks_keep_lan_and_mdns_retries_and_consents_independent() {
+        let _serial = MUTATIONS.lock().unwrap();
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        let input = install(&f, &mut fw);
+        f.auth
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(PkexecOutcome::TimedOut);
+        let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        let mut store = f.store();
+        assert_eq!(
+            execute(
+                &f,
+                &mut fw,
+                &snapshot,
+                RuleKind::Lan,
+                1,
+                &mut store,
+                &deadline()
+            )
+            .unwrap()
+            .result,
+            RuleResult::OutcomeUnknown
+        );
+        f.wait();
+        input.lock().unwrap().observations = Ok(observations(
+            &f,
+            150,
+            160,
+            true,
+            Some(2),
+            9,
+            Some("browse_failed"),
+        ));
+        input.lock().unwrap().stamp = Ok(200);
+        f.auth
+            .outcomes
+            .lock()
+            .unwrap()
+            .push_back(PkexecOutcome::TimedOut);
+        let snapshot = admit(&f, &mut fw, 100);
+        assert_eq!(
+            execute(
+                &f,
+                &mut fw,
+                &snapshot,
+                RuleKind::Mdns,
+                2,
+                &mut store,
+                &deadline()
+            )
+            .unwrap()
+            .result,
+            RuleResult::OutcomeUnknown
+        );
+        f.wait();
+        input.lock().unwrap().observations = Ok(observations(
+            &f,
+            170,
+            180,
+            true,
+            Some(2),
+            9,
+            Some("browse_failed"),
+        ));
+        let fresh = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        fw.refresh_current(&fresh, &selected(&fresh), &deadline())
+            .unwrap();
+        assert!(fw.plan(&fresh, request(RuleKind::Lan, 3, 3)).is_ok());
+        assert_eq!(
+            fw.plan(&fresh, request(RuleKind::Mdns, 4, 4)).unwrap_err(),
+            FirewallError::CurrentRequired
+        );
+        input.lock().unwrap().observations = Ok(observations(
+            &f,
+            210,
+            220,
+            true,
+            Some(2),
+            9,
+            Some("browse_failed"),
+        ));
+        fw.refresh_current(&fresh, &selected(&fresh), &deadline())
+            .unwrap();
+        let mdns = fw.plan(&fresh, request(RuleKind::Mdns, 5, 5)).unwrap();
+        let consent = mdns.consent(OperationId(5), 5).unwrap();
+        let lan = fw.plan(&fresh, request(RuleKind::Lan, 6, 6)).unwrap();
+        assert_eq!(
+            fw.apply(
+                &f.proof(),
+                ManagerSelection::Ufw,
+                lan,
+                consent,
+                &mut store,
+                &deadline()
+            )
+            .unwrap_err(),
+            FirewallError::Stale
+        );
+        assert_eq!(f.auth.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn current_read_source_identity_peer_and_receipt_regressions_refuse_retry() {
+        let _serial = MUTATIONS.lock().unwrap();
+        for case in 0..5 {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let input = install(&f, &mut fw);
+            f.auth.outcomes.lock().unwrap().push_back(exited(
+                127,
+                "",
+                "Error creating textual authentication agent: none\n",
+            ));
+            let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            let mut store = f.store();
+            execute(
+                &f,
+                &mut fw,
+                &snapshot,
+                RuleKind::Lan,
+                1,
+                &mut store,
+                &deadline(),
+            )
+            .unwrap();
+            f.wait();
+            let mut o = observations(&f, 110, 120, true, Some(2), 9, None);
+            match case {
+                0 => o.peer = NodeId([3; 32]),
+                1 => o.connection.source = ObservationSource::Live,
+                2 => o.discovery = status_reply(&f, 32, 120, true, Some(2), 10, None),
+                3 => o.discovery.result = Err(CallFailure::Unavailable),
+                _ => o.discovery.observed_at_ms = 109,
+            }
+            input.lock().unwrap().observations = Ok(o);
+            let fresh = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+            assert_eq!(
+                fw.refresh_current(&fresh, &selected(&fresh), &deadline())
+                    .unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+            assert_eq!(
+                fw.plan(&fresh, request(RuleKind::Lan, 2, 2)).unwrap_err(),
+                FirewallError::CurrentRequired
+            );
+            assert_eq!(f.auth.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn reader_cancellation_after_intent_and_intent_failure_never_dispatch() {
+        for fail_intent in [false, true] {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let input = install(&f, &mut fw);
+            let snapshot = admit(&f, &mut fw, 0);
+            let cancel = Cancellation::default();
+            input.lock().unwrap().cancel = Some(cancel.clone());
+            let mut store = f.store();
+            store.fail_intent = fail_intent;
+            let result = execute(
+                &f,
+                &mut fw,
+                &snapshot,
+                RuleKind::Mdns,
+                1,
+                &mut store,
+                &Deadline::new(5000, cancel).unwrap(),
+            );
+            assert!(result.is_err());
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+            assert_eq!(input.lock().unwrap().calls.len(), usize::from(!fail_intent));
+            assert_eq!(
+                store.results,
+                if fail_intent {
+                    vec![]
+                } else {
+                    vec![RuleResult::NotDispatched]
+                }
+            );
+        }
+    }
+
+    fn retirement_replay(replace_reader: bool) {
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        let input = install(&f, &mut fw);
+        let snapshot = admit(&f, &mut fw, 0);
+        let link = selected(&snapshot);
+        input.lock().unwrap().observations = Ok(observations(&f, 80, 90, true, Some(2), 9, None));
+        fw.refresh_current(&snapshot, &link, &deadline()).unwrap();
+        if replace_reader {
+            install(&f, &mut fw);
+        }
+        for call_id in [12, 16] {
+            let mut replay = sequence(&f, 0);
+            replay.call.id = call_id;
+            replay.acknowledgement.id = call_id;
+            replay.discovery = status_reply(&f, 14, 100, true, Some(2), 9, Some("browse_failed"));
+            let evidence =
+                TrafficEvidence::after_dial(f.io.target(), link.clone(), replay).unwrap();
+            assert!(matches!(
+                fw.admit_dial(&snapshot, evidence),
+                Err(FirewallError::MdnsPending)
+            ));
+        }
+        // A genuinely later, new call and generation still admit; no unbounded history is needed.
+        let mut fresh = sequence(&f, 100);
+        fresh.call.id = 17;
+        fresh.acknowledgement.id = 17;
+        fresh.before = status_reply(&f, 11, 110, true, Some(2), 9, None);
+        fresh.connection = status_reply(&f, 13, 130, true, Some(3), 9, None);
+        fresh.discovery = status_reply(&f, 14, 140, true, Some(3), 9, Some("browse_failed"));
+        let evidence = TrafficEvidence::after_dial(f.io.target(), link, fresh).unwrap();
+        fw.admit_dial(&snapshot, evidence).unwrap();
+        assert!(fw.plan(&snapshot, request(RuleKind::Mdns, 1, 1)).is_ok());
+        assert!(f.auth.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn round1_retired_attempt_cannot_rebuild_evidence_with_new_failure() {
+        retirement_replay(false);
+    }
+
+    #[test]
+    fn round1_reader_replacement_keeps_retired_attempt_and_sequence_floor() {
+        retirement_replay(true);
+    }
+
+    #[test]
+    fn round1_already_admitted_attempt_cannot_repeat_with_later_receipts() {
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        install(&f, &mut fw);
+        let snapshot = admit(&f, &mut fw, 0);
+        for call_id in [12, 5] {
+            let mut replay = sequence(&f, 50);
+            replay.call.id = call_id;
+            replay.acknowledgement.id = call_id;
+            let evidence =
+                TrafficEvidence::after_dial(f.io.target(), selected(&snapshot), replay).unwrap();
+            assert!(matches!(
+                fw.admit_dial(&snapshot, evidence),
+                Err(FirewallError::MdnsPending)
+            ));
+        }
+        assert!(f.auth.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn round1_traffic_evidence_debug_is_type_only() {
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        let evidence =
+            TrafficEvidence::after_dial(f.io.target(), selected(&snapshot), sequence(&f, 0))
+                .unwrap();
+        assert_eq!(format!("{evidence:?}"), "TrafficEvidence { .. }");
+        assert!(f.auth.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn round1_concurrent_inbound_reachability_does_not_claim_dial_completion() {
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        install(&f, &mut fw);
+        let snapshot = fw.detect(ManagerSelection::Ufw, &deadline()).unwrap();
+        // The asynchronous Dial has no completion field. This fixture models independent inbound
+        // reachability of the selected peer/link after its Ack, which the lead accepts as evidence.
+        let evidence =
+            TrafficEvidence::after_dial(f.io.target(), selected(&snapshot), sequence(&f, 0))
+                .unwrap();
+        fw.admit_dial(&snapshot, evidence).unwrap();
+        assert!(fw.plan(&snapshot, request(RuleKind::Mdns, 1, 1)).is_ok());
+        assert!(f.auth.calls.lock().unwrap().is_empty());
+    }
+
+    fn reordered_batch_replay(replace_reader: bool) {
+        let f = Fixture::new();
+        let mut fw = f.firewall();
+        let input = install(&f, &mut fw);
+        let snapshot = admit(&f, &mut fw, 0);
+        let link = selected(&snapshot);
+        let mut captured = sequence(&f, 40);
+        captured.call.id = 16;
+        captured.acknowledgement.id = 16;
+        let evidence = TrafficEvidence::after_dial(f.io.target(), link.clone(), captured).unwrap();
+        input.lock().unwrap().observations = Ok(observations(&f, 100, 90, true, Some(2), 9, None));
+        assert!(matches!(
+            fw.refresh_current(&snapshot, &link, &deadline()),
+            Err(FirewallError::CurrentRequired)
+        ));
+        if replace_reader {
+            install(&f, &mut fw);
+        }
+        assert!(matches!(
+            fw.admit_dial(&snapshot, evidence),
+            Err(FirewallError::MdnsPending)
+        ));
+        let mut fresh = sequence(&f, 100);
+        fresh.call.id = 17;
+        fresh.acknowledgement.id = 17;
+        fresh.before = status_reply(&f, 11, 110, true, Some(2), 9, None);
+        fresh.connection = status_reply(&f, 13, 130, true, Some(3), 9, None);
+        fresh.discovery = status_reply(&f, 14, 140, true, Some(3), 9, Some("browse_failed"));
+        let evidence = TrafficEvidence::after_dial(f.io.target(), link, fresh).unwrap();
+        fw.admit_dial(&snapshot, evidence).unwrap();
+        assert!(f.auth.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verify2_reordered_batch_retires_all_older_sequence_receipts() {
+        reordered_batch_replay(false);
+    }
+
+    #[test]
+    fn verify2_reader_replacement_retains_reordered_batch_retirement_floor() {
+        reordered_batch_replay(true);
+    }
+
+    #[test]
+    fn verify2_only_individually_valid_status_receipts_advance_the_floor() {
+        for invalid_connection in [false, true] {
+            let f = Fixture::new();
+            let mut fw = f.firewall();
+            let input = install(&f, &mut fw);
+            let snapshot = admit(&f, &mut fw, 0);
+            let link = selected(&snapshot);
+            let mut batch = observations(&f, 100, 100, true, Some(2), 9, None);
+            let invalid = if invalid_connection {
+                &mut batch.connection
+            } else {
+                &mut batch.discovery
+            };
+            invalid.source = ObservationSource::Live;
+            invalid.observed_at_ms = 1000;
+            input.lock().unwrap().observations = Ok(batch);
+            assert!(matches!(
+                fw.refresh_current(&snapshot, &link, &deadline()),
+                Err(FirewallError::CurrentRequired)
+            ));
+            for (offset, call_id, allowed) in [(40, 16, false), (100, 17, true)] {
+                let mut sequence = sequence(&f, offset);
+                sequence.call.id = call_id;
+                sequence.acknowledgement.id = call_id;
+                let evidence =
+                    TrafficEvidence::after_dial(f.io.target(), link.clone(), sequence).unwrap();
+                assert_eq!(fw.admit_dial(&snapshot, evidence).is_ok(), allowed);
+            }
+            assert!(f.auth.calls.lock().unwrap().is_empty());
+        }
+    }
+}
