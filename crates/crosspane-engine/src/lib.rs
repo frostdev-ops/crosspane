@@ -9,6 +9,7 @@
 #![deny(unsafe_code)]
 
 mod audio;
+mod clip;
 pub mod config;
 pub mod e1;
 pub mod e2;
@@ -38,6 +39,7 @@ pub struct Engine {
     target: TargetE1,
     e2: E2,
     audio: audio::Audio,
+    clip: clip::Clip,
 }
 
 impl Engine {
@@ -62,6 +64,7 @@ impl Engine {
                 target,
                 e2,
                 audio: audio::Audio::new(config.node),
+                clip: clip::Clip::new(),
             },
             out,
         ))
@@ -241,6 +244,7 @@ impl Engine {
             .collect();
         for permits in audio_gates {
             self.audio.engine_gate(permits, &mut out);
+            self.clip.engine_gate(permits, &mut out);
         }
         self.audio.handle(&input, now, &mut out);
         let controlled = self.target.is_controlled();
@@ -263,6 +267,13 @@ impl Engine {
                 self.controller.portal_emitted(set);
             }
         }
+        self.clip.handle(
+            input,
+            now,
+            self.controller.established(),
+            self.target.controller(),
+            &mut out,
+        );
         out
     }
 
@@ -295,6 +306,7 @@ impl Engine {
             self.target.next_deadline(),
             self.e2.next_deadline(),
             self.audio.next_deadline(),
+            self.clip.next_deadline(),
         ]
         .into_iter()
         .flatten()
