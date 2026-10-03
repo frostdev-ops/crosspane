@@ -1,10 +1,14 @@
 //! Hyprland clipboard metadata and lazy, bounded reads. Native objects stay on one event thread;
-//! neither watching nor `kinds` receives content. Promise support is the sequential WP-C2b.
+//! neither watching nor `kinds` receives content. Promises fetch content only for local pastes.
 //!
 //! \[E\] Hyprland 0.56, `src/managers/SeatManager.cpp:635–659`, notifies only wl_data_device
 //! clients when clearing a selection. ext-data-control metadata can therefore stay stale after
 //! a clear; `read` still requests the current source and never returns cached content.
+//! Withdrawal destroys only our source: \[E\] `SeatManager.cpp:641–652` resets its current-source
+//! destroy listener on replacement. Unlike set_selection(NULL), this preserves a newer selection.
 
+#[path = "clipboard/paste.rs"]
+pub(crate) mod paste;
 #[path = "clipboard/read.rs"]
 pub(crate) mod read;
 #[path = "clipboard/wayland.rs"]
@@ -36,6 +40,8 @@ enum Action {
     Subscribe(Arc<dyn EventSink<ClipboardEvent>>),
     Kinds,
     Read(ClipKind, PipeWriter, u64),
+    Promise(u64, ClipKinds, u64),
+    Withdraw(u64),
 }
 
 struct Command {
@@ -53,6 +59,7 @@ fn backend(message: &'static str) -> PlatformError {
 pub struct HyprlandClipboard {
     commands: SyncSender<Command>,
     gate: Arc<IoGate>,
+    pastes: Arc<paste::Pastes>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     #[cfg(test)]
@@ -82,17 +89,18 @@ impl HyprlandClipboard {
         let (ready, result) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let deadline = Instant::now() + BUDGET;
-        let (thread_gate, thread_stop, path) =
-            (gate.clone(), stop.clone(), display.as_ref().to_owned());
+        let (thread_stop, path) = (stop.clone(), display.as_ref().to_owned());
         let thread_marker = marker.clone();
+        let pastes = paste::Pastes::new(gate.clone());
+        let thread_pastes = pastes.clone();
         let thread = std::thread::Builder::new()
             .name("crosspane-clipboard".into())
             .spawn(move || {
                 wayland::run(
                     path,
-                    thread_gate,
                     thread_stop,
                     thread_marker,
+                    thread_pastes,
                     receiver,
                     ready,
                     deadline,
@@ -102,6 +110,7 @@ impl HyprlandClipboard {
         let handle = Self {
             commands,
             gate,
+            pastes,
             stop,
             thread: Some(thread),
             #[cfg(test)]
@@ -163,20 +172,28 @@ impl ClipboardHost for HyprlandClipboard {
         Ok(data)
     }
 
-    fn promise(&mut self, _: u64, kinds: ClipKinds) -> Result<(), PlatformError> {
+    fn promise(&mut self, offer: u64, kinds: ClipKinds) -> Result<(), PlatformError> {
+        let epoch = self.gate.epoch();
         if !self.gate.is_open() {
             return Err(PlatformError::Locked);
         }
         if !kinds.text && !kinds.image {
             return Err(backend("empty clipboard promise"));
         }
-        Err(PlatformError::Unsupported("clipboard promises (WP-C2b)"))
+        self.call(
+            Action::Promise(offer, kinds, epoch),
+            Instant::now() + BUDGET,
+        )
+        .map(|_| ())
     }
 
-    fn fulfil(&mut self, _: LocalPasteId, _: Option<Vec<u8>>) {}
+    fn fulfil(&mut self, paste: LocalPasteId, data: Option<Vec<u8>>) {
+        self.pastes.fulfil(paste, data);
+    }
 
-    fn withdraw(&mut self, _: u64) -> Result<(), PlatformError> {
-        Ok(())
+    fn withdraw(&mut self, offer: u64) -> Result<(), PlatformError> {
+        self.call(Action::Withdraw(offer), Instant::now() + BUDGET)
+            .map(|_| ())
     }
 }
 
@@ -186,5 +203,6 @@ impl Drop for HyprlandClipboard {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.pastes.close();
     }
 }

@@ -11,6 +11,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::Instant;
 
 use crosspane_platform::{ClipKinds, ClipboardEvent, EventSink, IoGate, PlatformError};
+use crosspane_types::ClipKind;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use wayland_client::backend::{ObjectId, WaylandError};
 use wayland_client::protocol::{wl_callback, wl_registry, wl_seat};
@@ -21,9 +22,16 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
     ext_data_control_manager_v1::ExtDataControlManagerV1,
     ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
+    ext_data_control_source_v1::{self, ExtDataControlSourceV1},
 };
 
-use super::{Action, Command, TICK, backend, read};
+use super::{Action, Command, TICK, backend, paste::Pastes, read};
+
+struct Promise {
+    source: ExtDataControlSourceV1,
+    offer: u64,
+    kinds: ClipKinds,
+}
 
 #[derive(Default)]
 struct State {
@@ -34,6 +42,8 @@ struct State {
     marker: String,
     synced: bool,
     finished: bool,
+    promise: Option<Promise>,
+    pastes: Option<Arc<Pastes>>,
 }
 
 impl State {
@@ -58,6 +68,22 @@ impl State {
     fn remove(&mut self, id: ObjectId) {
         if let Some((offer, _)) = self.offers.remove(&id) {
             offer.destroy();
+        }
+    }
+
+    fn end_promise(&mut self, lost: bool) {
+        if let Some(promise) = self.promise.take() {
+            if let Some(pastes) = &self.pastes {
+                pastes.cancel(promise.offer);
+            }
+            if !self.finished {
+                promise.source.destroy();
+            }
+            if lost && let Some(sink) = &self.sink {
+                sink.send(ClipboardEvent::PromiseLost {
+                    offer: promise.offer,
+                });
+            }
         }
     }
 }
@@ -142,6 +168,47 @@ impl Dispatch<ExtDataControlOfferV1, ()> for State {
     }
 }
 
+impl Dispatch<ExtDataControlSourceV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        source: &ExtDataControlSourceV1,
+        event: ext_data_control_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(promise) = state
+            .promise
+            .as_ref()
+            .filter(|promise| promise.source == *source)
+        else {
+            return;
+        };
+        match event {
+            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                let kind = if promise.kinds.text && read::TEXT.contains(&mime_type.as_str()) {
+                    ClipKind::Text
+                } else if promise.kinds.image && mime_type == "image/png" {
+                    ClipKind::Image
+                } else {
+                    return; // Marker and unoffered types are answered empty by dropping fd.
+                };
+                if let (Some(pastes), Some(sink)) = (&state.pastes, &state.sink)
+                    && let Some(paste) = pastes.hold(promise.offer, fd, Instant::now())
+                {
+                    sink.send(ClipboardEvent::PasteRequested {
+                        paste,
+                        offer: promise.offer,
+                        kind,
+                    });
+                }
+            }
+            ext_data_control_source_v1::Event::Cancelled => state.end_promise(true),
+            _ => {}
+        }
+    }
+}
+
 delegate_noop!(State: ignore wl_seat::WlSeat);
 delegate_noop!(State: ignore ExtDataControlManagerV1);
 
@@ -155,12 +222,18 @@ struct Source {
 }
 
 impl Source {
-    fn new(path: PathBuf, marker: String, deadline: Instant) -> Result<Self, PlatformError> {
+    fn new(
+        path: PathBuf,
+        marker: String,
+        pastes: Arc<Pastes>,
+        deadline: Instant,
+    ) -> Result<Self, PlatformError> {
         let connection = connect(path, deadline)?;
         let mut queue = connection.new_event_queue();
         let registry = connection.display().get_registry(&queue.handle(), ());
         let mut state = State {
             marker,
+            pastes: Some(pastes),
             ..State::default()
         };
         sync(&connection, &mut queue, &mut state, deadline)?;
@@ -235,6 +308,71 @@ impl Source {
                     flush_read(gate, epoch, deadline, || self.connection.flush())?;
                     self.state.finished = false;
                 }
+                Action::Promise(offer, kinds, epoch) => {
+                    read::check(gate, epoch, deadline)?;
+                    self.state.end_promise(false);
+                    self.state.finished = true;
+                    let source = self.manager.create_data_source(&self.queue.handle(), ());
+                    for mime in read::TEXT
+                        .iter()
+                        .copied()
+                        .filter(|_| kinds.text)
+                        .chain(std::iter::once("image/png").filter(|_| kinds.image))
+                        .chain(std::iter::once(self.state.marker.as_str()))
+                    {
+                        source
+                            .send_request(ext_data_control_source_v1::Request::Offer {
+                                mime_type: mime.into(),
+                            })
+                            .map_err(|_| backend("clipboard source offer failed"))?;
+                    }
+                    self.device
+                        .send_request(ext_data_control_device_v1::Request::SetSelection {
+                            source: Some(source.clone()),
+                        })
+                        .map_err(|_| backend("clipboard source selection failed"))?;
+                    self.state.promise = Some(Promise {
+                        source,
+                        offer,
+                        kinds,
+                    });
+                    flush_read(gate, epoch, deadline, || self.connection.flush())?;
+                    self.state.finished = false;
+                    if let Err(error) =
+                        sync(&self.connection, &mut self.queue, &mut self.state, deadline)
+                            .and_then(|_| read::check(gate, epoch, deadline))
+                    {
+                        self.state.finished = true;
+                        return Err(error);
+                    }
+                    if self.state.finished {
+                        return Err(backend("clipboard data control ended"));
+                    }
+                }
+                Action::Withdraw(offer) => {
+                    if self
+                        .state
+                        .promise
+                        .as_ref()
+                        .is_some_and(|promise| promise.offer == offer)
+                    {
+                        self.state.end_promise(false);
+                        self.state.finished = true;
+                        // Withdrawal must remain possible with a closed gate. Its cleanup is
+                        // deadline-bound, but never admits data or a new clipboard promise.
+                        flush_checked(
+                            || {
+                                if Instant::now() < deadline {
+                                    Ok(())
+                                } else {
+                                    Err(PlatformError::Timeout)
+                                }
+                            },
+                            || self.connection.flush(),
+                        )?;
+                        self.state.finished = false;
+                    }
+                }
             }
             Ok(read::kinds(self.state.types()))
         })();
@@ -248,6 +386,7 @@ impl Source {
 
 impl Drop for Source {
     fn drop(&mut self) {
+        self.state.end_promise(false);
         // Do not enqueue destructors or flush an abandoned receive; dropping closes its FDs.
         if self.state.finished {
             return;
@@ -267,14 +406,15 @@ impl Drop for Source {
 
 pub(super) fn run(
     path: PathBuf,
-    gate: Arc<IoGate>,
     stop: Arc<AtomicBool>,
     marker: String,
+    pastes: Arc<Pastes>,
     commands: Receiver<Command>,
     ready: SyncSender<Result<(), PlatformError>>,
     deadline: Instant,
 ) {
-    let mut source = match Source::new(path.clone(), marker.clone(), deadline) {
+    let gate = pastes.gate.clone();
+    let mut source = match Source::new(path.clone(), marker.clone(), pastes.clone(), deadline) {
         Ok(source) => {
             let _ = ready.send(Ok(()));
             Some(source)
@@ -286,6 +426,7 @@ pub(super) fn run(
     };
     let mut sink = None;
     while !stop.load(Ordering::Acquire) {
+        pastes.expire(Instant::now());
         // Pump before each command so queued selection changes cannot be answered from old types.
         if let Some(current) = &mut source {
             if pump(
@@ -310,7 +451,12 @@ pub(super) fn run(
                         return Err(PlatformError::Timeout);
                     }
                     if source.is_none() {
-                        let mut next = Source::new(path.clone(), marker.clone(), command.deadline)?;
+                        let mut next = Source::new(
+                            path.clone(),
+                            marker.clone(),
+                            pastes.clone(),
+                            command.deadline,
+                        )?;
                         next.state.sink = sink.clone();
                         next.state.notify();
                         source = Some(next);
@@ -337,12 +483,19 @@ fn flush_read(
     gate: &IoGate,
     epoch: u64,
     deadline: Instant,
+    flush: impl FnMut() -> Result<(), WaylandError>,
+) -> Result<(), PlatformError> {
+    flush_checked(|| read::check(gate, epoch, deadline), flush)
+}
+
+fn flush_checked(
+    mut check: impl FnMut() -> Result<(), PlatformError>,
     mut flush: impl FnMut() -> Result<(), WaylandError>,
 ) -> Result<(), PlatformError> {
     loop {
-        read::check(gate, epoch, deadline)?;
+        check()?;
         match flush() {
-            Ok(()) => return read::check(gate, epoch, deadline),
+            Ok(()) => return check(),
             Err(WaylandError::Io(error)) if error.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(TICK);
             }
@@ -554,6 +707,123 @@ mod tests {
         gate.set_engine_permits(true);
         gate.set_session_permits(true);
         gate
+    }
+
+    fn promised_source() -> (Source, UnixStream, Arc<IoGate>, Receiver<ClipboardEvent>) {
+        let (mut source, peer) = fake_source();
+        let gate = open_gate();
+        source.state.pastes = Some(Pastes::new(gate.clone()));
+        let (sender, events) = std::sync::mpsc::channel();
+        source.state.sink = Some(Arc::new(move |event| {
+            let _ = sender.send(event);
+        }));
+        source.state.marker = "application/x-crosspane-promise-owned-fixture".into();
+        let native = source
+            .manager
+            .create_data_source(&source.queue.handle(), ());
+        source.state.promise = Some(Promise {
+            source: native,
+            offer: 77,
+            kinds: ClipKinds {
+                text: true,
+                image: false,
+            },
+        });
+        (source, peer, gate, events)
+    }
+
+    fn source_event(
+        source: &mut Source,
+        native: &ExtDataControlSourceV1,
+        event: ext_data_control_source_v1::Event,
+    ) {
+        <State as Dispatch<ExtDataControlSourceV1, ()>>::event(
+            &mut source.state,
+            native,
+            event,
+            &(),
+            &source.connection,
+            &source.queue.handle(),
+        );
+    }
+
+    fn request_source(source: &mut Source, mime: &str) -> std::io::PipeReader {
+        let native = source.state.promise.as_ref().unwrap().source.clone();
+        let (reader, writer) = std::io::pipe().unwrap();
+        read::nonblocking(&reader).unwrap();
+        source_event(
+            source,
+            &native,
+            ext_data_control_source_v1::Event::Send {
+                mime_type: mime.into(),
+                fd: writer.into(),
+            },
+        );
+        reader
+    }
+
+    #[test]
+    fn source_send_rejects_marker_unoffered_mime_and_closed_gate_without_event() {
+        let (mut source, _peer, gate, events) = promised_source();
+        for mime in [
+            "application/x-crosspane-promise-owned-fixture",
+            "image/png",
+            "unoffered/type",
+        ] {
+            assert_eq!(
+                request_source(&mut source, mime).read(&mut [0; 1]).unwrap(),
+                0
+            );
+            assert!(events.try_recv().is_err());
+        }
+        gate.set_engine_permits(false);
+        assert_eq!(
+            request_source(&mut source, "text/plain")
+                .read(&mut [0; 1])
+                .unwrap(),
+            0
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancelled_closes_its_pending_fd_and_emits_promise_lost_once() {
+        let (mut source, _peer, _gate, events) = promised_source();
+        let mut reader = request_source(&mut source, "text/plain;charset=utf-8");
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ClipboardEvent::PasteRequested {
+                offer: 77,
+                kind: ClipKind::Text,
+                ..
+            }
+        ));
+        let native = source.state.promise.as_ref().unwrap().source.clone();
+        let other = source
+            .manager
+            .create_data_source(&source.queue.handle(), ());
+        source_event(
+            &mut source,
+            &other,
+            ext_data_control_source_v1::Event::Cancelled,
+        );
+        assert!(events.try_recv().is_err());
+        source_event(
+            &mut source,
+            &native,
+            ext_data_control_source_v1::Event::Cancelled,
+        );
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(
+            events.try_recv().unwrap(),
+            ClipboardEvent::PromiseLost { offer: 77 }
+        );
+        source_event(
+            &mut source,
+            &native,
+            ext_data_control_source_v1::Event::Cancelled,
+        );
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

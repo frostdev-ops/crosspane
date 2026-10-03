@@ -8,16 +8,18 @@
 mod implementation;
 
 use std::fs::File;
-use std::io::Write;
-use std::os::fd::OwnedFd;
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
-use crosspane_platform::{ClipKinds, ClipboardEvent, ClipboardHost, IoGate, PlatformError};
+use crosspane_platform::{
+    ClipKinds, ClipboardEvent, ClipboardHost, IoGate, LocalPasteId, PlatformError,
+};
 use crosspane_types::ClipKind;
-use implementation::{HyprlandClipboard, connection_guard, read};
+use implementation::{HyprlandClipboard, connection_guard, paste, read};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use wayland_client::protocol::{wl_callback, wl_registry, wl_seat};
 use wayland_client::{
@@ -203,12 +205,177 @@ fn gate_closing_during_a_pending_read_cancels_without_waiting_for_timeout() {
     assert!(writer.write_all(b"x").is_err());
 }
 
+fn hold_pipe(
+    store: &paste::Pastes,
+    offer: u64,
+    now: Instant,
+) -> (Option<LocalPasteId>, std::io::PipeReader) {
+    let (reader, writer) = std::io::pipe().unwrap();
+    read::nonblocking(&reader).unwrap();
+    (store.hold(offer, writer.into(), now), reader)
+}
+
+fn assert_empty(mut reader: std::io::PipeReader) {
+    assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+}
+
+fn drain_until_closed(mut reader: std::io::PipeReader) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match reader.read(&mut [0; 4096]) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned paste writer did not close"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("owned pipe read failed: {error}"),
+        }
+    }
+}
+
+#[test]
+fn paste_fd_cap_closes_ninth_and_reuses_slot_without_reusing_id() {
+    let store = paste::Pastes::new(open_gate());
+    let now = Instant::now();
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let (paste, reader) = hold_pipe(&store, 10, now);
+        held.push((paste.unwrap(), reader));
+    }
+    let (ninth, reader) = hold_pipe(&store, 10, now);
+    assert!(ninth.is_none());
+    assert_empty(reader);
+    let (first, reader) = held.remove(0);
+    store.fulfil(first, None);
+    assert_empty(reader);
+    let (replacement, reader) = hold_pipe(&store, 10, now);
+    assert!(replacement.unwrap().0 > held.last().unwrap().0.0);
+    held.push((replacement.unwrap(), reader));
+    store.close();
+    for (_, reader) in held {
+        assert_empty(reader);
+    }
+}
+
+#[test]
+fn paste_fd_cap_includes_backpressured_off_thread_writers() {
+    let store = paste::Pastes::new(open_gate());
+    let mut readers = Vec::new();
+    let start = Instant::now();
+    for _ in 0..8 {
+        let (paste, reader) = hold_pipe(&store, 20, Instant::now());
+        store.fulfil(paste.unwrap(), Some(vec![b'x'; 512 * 1024]));
+        readers.push(reader);
+    }
+    assert!(start.elapsed() < Duration::from_millis(500));
+    let (ninth, reader) = hold_pipe(&store, 20, Instant::now());
+    assert!(ninth.is_none());
+    assert_empty(reader);
+    let start = Instant::now();
+    store.close();
+    assert!(start.elapsed() < Duration::from_millis(200));
+    for reader in readers {
+        drain_until_closed(reader);
+    }
+}
+
+#[test]
+fn fulfil_after_expiry_or_unknown_id_is_a_no_op() {
+    let store = paste::Pastes::new(open_gate());
+    let now = Instant::now();
+    let (paste, reader) = hold_pipe(&store, 30, now);
+    store.expire(now + paste::LIFETIME);
+    store.fulfil(paste.unwrap(), Some(b"owned late fixture".to_vec()));
+    store.fulfil(
+        LocalPasteId(u64::MAX),
+        Some(b"owned unknown fixture".to_vec()),
+    );
+    assert_empty(reader);
+    let (next, reader) = hold_pipe(&store, 31, Instant::now());
+    assert!(next.unwrap().0 > paste.unwrap().0);
+    store.cancel(31);
+    assert_empty(reader);
+}
+
+#[test]
+fn fulfil_writes_all_off_caller_and_none_answers_empty() {
+    let gate = open_gate();
+    let store = paste::Pastes::new(gate.clone());
+    let (paste, reader) = hold_pipe(&store, 40, Instant::now());
+    let start = Instant::now();
+    store.fulfil(paste.unwrap(), Some(vec![b'z'; 256 * 1024]));
+    assert!(start.elapsed() < Duration::from_millis(200));
+    let received = read::receive(
+        reader,
+        ClipKind::Image,
+        256 * 1024,
+        Instant::now() + Duration::from_secs(1),
+        &gate,
+        gate.epoch(),
+    )
+    .unwrap();
+    assert!(received == vec![b'z'; 256 * 1024]);
+    let (paste, reader) = hold_pipe(&store, 40, Instant::now());
+    store.fulfil(paste.unwrap(), None);
+    store.fulfil(paste.unwrap(), Some(b"owned duplicate fixture".to_vec()));
+    assert_empty(reader);
+}
+
+#[test]
+fn paste_closed_gate_and_changed_epoch_close_without_writing() {
+    for reopen in [false, true] {
+        let gate = open_gate();
+        let store = paste::Pastes::new(gate.clone());
+        let (paste, reader) = hold_pipe(&store, 50, Instant::now());
+        gate.set_session_permits(false);
+        if reopen {
+            gate.set_session_permits(true);
+        }
+        store.fulfil(paste.unwrap(), Some(b"owned gate fixture".to_vec()));
+        assert_empty(reader);
+        if !reopen {
+            let (paste, reader) = hold_pipe(&store, 50, Instant::now());
+            assert!(paste.is_none());
+            assert_empty(reader);
+        }
+    }
+}
+
+#[test]
+fn cancellation_is_offer_specific_and_drop_answers_all_pending_empty() {
+    let store = paste::Pastes::new(open_gate());
+    let (_, old) = hold_pipe(&store, 60, Instant::now());
+    let (paste, mut current) = hold_pipe(&store, 61, Instant::now());
+    store.cancel(60);
+    assert_empty(old);
+    assert!(
+        matches!(current.read(&mut [0; 1]), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    store.fulfil(paste.unwrap(), None);
+    assert_empty(current);
+    let mut pending = Vec::new();
+    for _ in 0..8 {
+        let (paste, reader) = hold_pipe(&store, 62, Instant::now());
+        assert!(paste.is_some());
+        pending.push(reader);
+    }
+    drop(store);
+    for reader in pending {
+        assert_empty(reader);
+    }
+}
+
 #[derive(Default)]
 struct FixtureState {
     globals: Vec<(u32, String, u32)>,
     synced: bool,
     sends: usize,
     held: Vec<OwnedFd>,
+    selection: Option<ExtDataControlOfferV1>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for FixtureState {
@@ -246,7 +413,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for FixtureState {
 
 impl Dispatch<ExtDataControlDeviceV1, ()> for FixtureState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &ExtDataControlDeviceV1,
         event: ext_data_control_device_v1::Event,
         _: &(),
@@ -254,8 +421,13 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for FixtureState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            ext_data_control_device_v1::Event::Selection { id: Some(offer) }
-            | ext_data_control_device_v1::Event::PrimarySelection { id: Some(offer) } => {
+            ext_data_control_device_v1::Event::Selection { id } => {
+                if let Some(previous) = state.selection.take() {
+                    previous.destroy();
+                }
+                state.selection = id;
+            }
+            ext_data_control_device_v1::Event::PrimarySelection { id: Some(offer) } => {
                 offer.destroy()
             }
             _ => {}
@@ -327,6 +499,7 @@ fn fixture_sync(
 enum FixtureCommand {
     Publish(Vec<String>, Option<Vec<u8>>, bool, SyncSender<()>),
     Sends(SyncSender<usize>),
+    Request(String, SyncSender<std::io::PipeReader>),
 }
 
 struct Fixture {
@@ -402,6 +575,18 @@ impl Fixture {
                     Ok(FixtureCommand::Sends(reply)) => {
                         reply.send(state.sends).unwrap();
                     }
+                    Ok(FixtureCommand::Request(mime, reply)) => {
+                        fixture_sync(&connection, &mut queue, &mut state);
+                        let (reader, writer) = std::io::pipe().unwrap();
+                        read::nonblocking(&reader).unwrap();
+                        state
+                            .selection
+                            .as_ref()
+                            .unwrap()
+                            .receive(mime, writer.as_fd());
+                        fixture_sync(&connection, &mut queue, &mut state);
+                        reply.send(reader).unwrap();
+                    }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
@@ -410,6 +595,9 @@ impl Fixture {
                 source.destroy();
             }
             state.held.clear();
+            if let Some(selection) = state.selection.take() {
+                selection.destroy();
+            }
             device.destroy();
             manager.destroy();
             let _ = connection.flush();
@@ -434,6 +622,14 @@ impl Fixture {
     fn sends(&self) -> usize {
         let (reply, wait) = mpsc::sync_channel(1);
         self.commands.send(FixtureCommand::Sends(reply)).unwrap();
+        wait.recv_timeout(Duration::from_secs(2)).unwrap()
+    }
+
+    fn request(&self, mime: &str) -> std::io::PipeReader {
+        let (reply, wait) = mpsc::sync_channel(1);
+        self.commands
+            .send(FixtureCommand::Request(mime.into(), reply))
+            .unwrap();
         wait.recv_timeout(Duration::from_secs(2)).unwrap()
     }
 }
@@ -615,6 +811,43 @@ impl NestedConnectionGuard {
             self.runtime.join(&self.display),
             Arc::new(move |peer| guard.check(peer)),
         )
+    }
+
+    fn lock_clipboard(&self) -> OwnedFd {
+        use rustix::fs::{FileType, FlockOperation, Mode, OFlags};
+        assert!(
+            self.verify().is_some(),
+            "owned C2 nest before scenario lock"
+        );
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let runtime = rustix::fs::open(&self.runtime, flags, Mode::empty()).unwrap();
+        let state =
+            rustix::fs::openat(&runtime, "crosspane-hypr-C2", flags, Mode::empty()).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        assert_eq!(rustix::fs::fstat(&state).unwrap().st_uid, owner);
+        let lock = rustix::fs::openat(
+            &state,
+            "clipboard-test.lock",
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        let metadata = rustix::fs::fstat(&lock).unwrap();
+        assert_eq!(metadata.st_uid, owner);
+        assert_eq!(metadata.st_nlink, 1);
+        assert_eq!(
+            FileType::from_raw_mode(metadata.st_mode),
+            FileType::RegularFile
+        );
+        let waiting = Instant::now();
+        eprintln!("C2 clipboard scenario waiting for exclusive lock");
+        rustix::fs::flock(&lock, FlockOperation::LockExclusive).unwrap();
+        assert!(self.verify().is_some(), "owned C2 nest after scenario lock");
+        eprintln!(
+            "C2 clipboard scenario acquired exclusive lock after {:?}",
+            waiting.elapsed()
+        );
+        lock
     }
 
     fn assert_connections(&self, wanted: usize) {
@@ -803,6 +1036,9 @@ fn named_c2_nested_watch_read_marker_empty_text_gate_timeout_rebuild_and_drop() 
         return;
     }
 
+    // The parent only launches the fd-limited child. Lock in that child, before any
+    // connection, so the parent cannot hold the lock while waiting for its own child.
+    let _clipboard_lock = guard.lock_clipboard();
     let _registration = guard.install();
     let gate = open_gate();
     let mut backend = HyprlandClipboard::new(gate.clone(), &display_socket).unwrap();
@@ -995,5 +1231,199 @@ fn named_c2_nested_watch_read_marker_empty_text_gate_timeout_rebuild_and_drop() 
     guard.assert_connections(3);
     eprintln!(
         "C2a: metadata-only watch, read, marker, limit, UTF-8, gate, 1.5s timeout, connection rebuild, subscriber preservation, primary isolation and drop passed"
+    );
+}
+
+fn paste_requested(events: &Receiver<ClipboardEvent>, wanted: u64) -> LocalPasteId {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let ClipboardEvent::PasteRequested { paste, offer, kind } = events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap()
+        {
+            assert_eq!(offer, wanted);
+            assert_eq!(kind, ClipKind::Text);
+            return paste;
+        }
+    }
+}
+
+fn lost(events: &Receiver<ClipboardEvent>, wanted: u64) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let ClipboardEvent::PromiseLost { offer } = events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap()
+        {
+            assert_eq!(offer, wanted);
+            return;
+        }
+    }
+}
+
+fn fixture_receive(reader: std::io::PipeReader, timeout: Duration) -> Vec<u8> {
+    let gate = open_gate();
+    read::receive(
+        reader,
+        ClipKind::Text,
+        128,
+        Instant::now() + timeout,
+        &gate,
+        gate.epoch(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn named_c2_nested_promises_round_trip_cancel_expire_withdraw_preserve_replacement_and_drop() {
+    if std::env::var("CROSSPANE_NESTED_HYPR").as_deref() != Ok("1") {
+        eprintln!("skipped: requires the owned C2 nested Hyprland");
+        return;
+    }
+    assert!(std::env::var_os("WAYLAND_SOCKET").is_none());
+    let runtime = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+    let display = std::env::var("WAYLAND_DISPLAY").unwrap();
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap();
+    let guard = NestedConnectionGuard::new(runtime, "/proc".into(), display, signature.clone());
+    let socket = guard
+        .verify()
+        .expect("owned C2 PID/start time/signature lock");
+    let _clipboard_lock = guard.lock_clipboard();
+    let _registration = guard.install();
+    let gate_a = open_gate();
+    let gate_b = open_gate();
+    let mut a = HyprlandClipboard::new(gate_a, &socket).unwrap();
+    guard.assert_connections(1);
+    let mut b = HyprlandClipboard::new(gate_b.clone(), &socket).unwrap();
+    guard.assert_connections(2);
+    let fixture = Fixture::new(socket.clone());
+    guard.assert_connections(3);
+    eprintln!(
+        "C2b A/B/fixture pre/post=3/3; socket={}; instance={signature}; pid={}; start={}",
+        socket.display(),
+        guard.pid,
+        guard.start
+    );
+    let (send_a, events_a) = mpsc::channel();
+    let (send_b, events_b) = mpsc::channel();
+    a.subscribe(Arc::new(move |event| {
+        let _ = send_a.send(event);
+    }))
+    .unwrap();
+    b.subscribe(Arc::new(move |event| {
+        let _ = send_b.send(event);
+    }))
+    .unwrap();
+    while events_a.try_recv().is_ok() {}
+    while events_b.try_recv().is_ok() {}
+    let text = ClipKinds {
+        text: true,
+        image: false,
+    };
+    assert!(
+        matches!(a.promise(1, ClipKinds::default()), Err(PlatformError::Backend(message)) if message == "empty clipboard promise")
+    );
+    a.promise(42, text).unwrap();
+    changed(&events_b, text);
+    assert!(
+        events_a.recv_timeout(Duration::from_millis(100)).is_err(),
+        "own promise emitted Changed"
+    );
+    let reading = std::thread::spawn(move || {
+        let result = b.read(ClipKind::Text, 128);
+        (b, result)
+    });
+    let paste = paste_requested(&events_a, 42);
+    a.fulfil(paste, Some(b"owned C2b promised text".to_vec()));
+    let (returned, data) = reading.join().unwrap();
+    b = returned;
+    assert!(data.unwrap() == b"owned C2b promised text");
+    b.promise(99, text).unwrap();
+    lost(&events_a, 42);
+    assert!(
+        events_b.recv_timeout(Duration::from_millis(100)).is_err(),
+        "B own promise emitted Changed"
+    );
+    gate_b.set_engine_permits(false);
+    assert!(matches!(
+        b.read(ClipKind::Text, 128),
+        Err(PlatformError::Locked)
+    ));
+    assert!(matches!(b.promise(100, text), Err(PlatformError::Locked)));
+    let reader = fixture.request("text/plain");
+    assert!(fixture_receive(reader, Duration::from_secs(1)).is_empty());
+    assert!(
+        events_b.recv_timeout(Duration::from_millis(100)).is_err(),
+        "closed gate admitted a paste"
+    );
+    gate_b.set_engine_permits(true);
+
+    let start = Instant::now();
+    let reader = fixture.request("text/plain");
+    let expired = paste_requested(&events_b, 99);
+    assert!(fixture_receive(reader, Duration::from_millis(3300)).is_empty());
+    assert!(
+        start.elapsed() >= Duration::from_millis(2400)
+            && start.elapsed() < Duration::from_millis(3300)
+    );
+    b.fulfil(expired, Some(b"owned expired fixture".to_vec()));
+
+    let marker = fixture.request(&b.marker);
+    assert!(fixture_receive(marker, Duration::from_secs(1)).is_empty());
+    assert!(
+        events_b.recv_timeout(Duration::from_millis(100)).is_err(),
+        "marker triggered a paste"
+    );
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let reader = fixture.request("text/plain");
+        let paste = paste_requested(&events_b, 99);
+        assert!(paste.0 > expired.0);
+        held.push(reader);
+    }
+    let ninth = fixture.request("text/plain");
+    assert!(fixture_receive(ninth, Duration::from_secs(1)).is_empty());
+    assert!(
+        events_b.recv_timeout(Duration::from_millis(100)).is_err(),
+        "ninth fd was admitted"
+    );
+    b.withdraw(123456).unwrap();
+    gate_b.set_engine_permits(false);
+    b.withdraw(99).unwrap();
+    for reader in held {
+        assert!(fixture_receive(reader, Duration::from_secs(1)).is_empty());
+    }
+    assert!(
+        events_b.recv_timeout(Duration::from_millis(100)).is_err(),
+        "withdraw synthesized PromiseLost"
+    );
+    assert!(matches!(
+        a.read(ClipKind::Text, 128),
+        Err(PlatformError::NotFound)
+    ));
+    gate_b.set_engine_permits(true);
+
+    // Withdrawal must preserve another client's replacement, even if cancellation races it.
+    a.promise(200, text).unwrap();
+    changed(&events_b, text);
+    b.promise(201, text).unwrap();
+    a.withdraw(200).unwrap();
+    let reader = fixture.request("text/plain");
+    let paste = paste_requested(&events_b, 201);
+    b.fulfil(paste, Some(b"owned replacement fixture".to_vec()));
+    assert!(fixture_receive(reader, Duration::from_secs(1)) == b"owned replacement fixture");
+    lost(&events_a, 200);
+
+    let reader = fixture.request("text/plain");
+    paste_requested(&events_b, 201);
+    let start = Instant::now();
+    drop(b);
+    assert!(start.elapsed() < Duration::from_millis(200));
+    assert!(fixture_receive(reader, Duration::from_secs(1)).is_empty());
+    assert!(events_b.try_recv().is_err(), "drop synthesized PromiseLost");
+    drop(a);
+    guard.assert_connections(3);
+    eprintln!(
+        "C2b: lazy promise round trip, own-marker suppression, cancelled loss, gate, eight-fd cap, 2.5s expiry, atomic source withdrawal, replacement preservation and drop passed"
     );
 }
