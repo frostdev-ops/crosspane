@@ -1081,6 +1081,9 @@ impl Agent {
     }
 
     fn feed(&mut self, mut input: Input) {
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.record_input(&input);
+        }
         let offering = match &input {
             Input::Link(LinkEvent::Control {
                 peer,
@@ -1971,6 +1974,9 @@ impl Agent {
     }
 
     fn execute_one(&mut self, output: Output) {
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.record_output(&output);
+        }
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_output(&output);
         }
@@ -2205,6 +2211,9 @@ impl Agent {
                         .is_err()
                 }) && let Some(link) = self.links.get_mut(&peer)
                 {
+                    if let Some(clipboard) = &self.clipboard {
+                        clipboard.failed(ClipFailure::Unavailable);
+                    }
                     let _ = link.send_control(&ControlMessage::ClipFetchFailed(ClipFetchFailed {
                         fetch,
                         reason: ClipFailure::Unavailable,
@@ -4833,6 +4842,7 @@ impl Agent {
                 "speaker_in_use": self.speakers.iter().any(|key| key.peer == *node),
             })).collect::<Vec<_>>(),
             "audio": self.audio_status(),
+            "clipboard": self.clipboard.as_ref().map(|worker| worker.status()),
             // Home on the twin (WP-2.43): the projection this node's input is home in (`null`
             // when it isn't) and whether the release bind is installed, as last verified.
             "home": {
@@ -9571,6 +9581,66 @@ mod home_tests {
             w.paste(0, 2);
             assert!(w.boards[0].answer_is(2, Some(b"return fixture")));
             assert_eq!(w.boards[1].reads(), 1);
+        }
+
+        #[test]
+        fn clipboard_status_counts_events_without_content_or_item_sizes() {
+            let mut w = Pair::new(true, true);
+            w.copy(0, b"clipboard counter fixture");
+            w.cross();
+            w.until(|w| w.boards[1].installed());
+            w.paste(1, 1);
+            let source = &w.homes[0].rig.agent.status()["clipboard"];
+            let receiver = &w.homes[1].rig.agent.status()["clipboard"];
+            assert_eq!(source["offers_sent"], json!(1));
+            assert_eq!(source["fetches_served"], json!(1));
+            assert_eq!(receiver["offers_received"], json!(1));
+            assert_eq!(receiver["fetches_made"], json!(1));
+            let text = source.to_string();
+            assert!(
+                !text.contains("fixture") && !text.contains("content") && !text.contains("bytes")
+            );
+        }
+
+        #[test]
+        fn clipboard_status_counts_explicit_failure_kinds_but_not_unclassified_empty_answers() {
+            let mut w = Pair::new(true, true);
+            let peer = w.homes[0].rig.peer;
+            for (index, (reason, field)) in [
+                (ClipFailure::Expired, "expired"),
+                (ClipFailure::Locked, "locked"),
+                (ClipFailure::NotGranted, "not_granted"),
+                (ClipFailure::TooLarge, "too_large"),
+                (ClipFailure::Unavailable, "unavailable"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                w.feed(
+                    0,
+                    Input::Link(LinkEvent::Control {
+                        peer,
+                        msg: ControlMessage::ClipFetchFailed(ClipFetchFailed {
+                            fetch: crosspane_protocol::msg::ClipFetchId(index as u64),
+                            reason,
+                        }),
+                    }),
+                );
+                w.homes[0].rig.agent.execute_one(Output::SendControl {
+                    peer,
+                    msg: ControlMessage::ClipFetchFailed(ClipFetchFailed {
+                        fetch: crosspane_protocol::msg::ClipFetchId(index as u64),
+                        reason,
+                    }),
+                });
+                assert_eq!(w.homes[0].rig.agent.status()["clipboard"][field], json!(2));
+            }
+            let before = w.homes[0].rig.agent.status()["clipboard"].clone();
+            w.homes[0].rig.agent.execute_one(Output::ClipFulfil {
+                paste: LocalPasteId(99),
+                data: None,
+            });
+            assert_eq!(w.homes[0].rig.agent.status()["clipboard"], before);
         }
         #[test]
         fn clipboard_private_loopback_e2_focus_text_round_trip_is_lazy() {

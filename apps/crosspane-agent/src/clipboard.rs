@@ -3,13 +3,15 @@
 //! 64 jobs wait (16 cleanup slots reserved); queued and in-flight fulfilments share 16 MiB.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crosspane_engine::{Input, Output, io::ClipBytes};
 use crosspane_platform::{ClipboardEvent, ClipboardHost, PlatformError};
-use crosspane_protocol::msg::ClipFailure;
+use crosspane_protocol::link::LinkEvent;
+use crosspane_protocol::msg::{ClipFailure, ControlMessage};
 use crosspane_types::id::NodeId;
 use zeroize::Zeroize;
 
@@ -137,6 +139,36 @@ impl Queue {
 struct Shared {
     queue: Mutex<Queue>,
     wake: Condvar,
+    counts: Counts,
+}
+
+#[derive(Default)]
+struct Counts([AtomicU64; 9]);
+
+impl Counts {
+    fn bump(&self, index: usize) {
+        let _ = self.0[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_add(1))
+        });
+    }
+    fn failed(&self, reason: ClipFailure) {
+        self.bump(match reason {
+            ClipFailure::Expired => 4,
+            ClipFailure::Locked => 5,
+            ClipFailure::NotGranted => 6,
+            ClipFailure::TooLarge => 7,
+            ClipFailure::Unavailable => 8,
+        });
+    }
+    fn status(&self) -> serde_json::Value {
+        let count = |i: usize| self.0[i].load(Ordering::Relaxed);
+        serde_json::json!({
+            "offers_sent":count(0), "offers_received":count(1),
+            "fetches_served":count(2), "fetches_made":count(3),
+            "expired":count(4), "locked":count(5), "not_granted":count(6),
+            "too_large":count(7), "unavailable":count(8),
+        })
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -152,6 +184,37 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+    pub(crate) fn status(&self) -> serde_json::Value {
+        self.shared.counts.status()
+    }
+
+    pub(crate) fn failed(&self, reason: ClipFailure) {
+        self.shared.counts.failed(reason);
+    }
+
+    pub(crate) fn record_input(&self, input: &Input) {
+        if let Input::Link(LinkEvent::Control { msg, .. }) = input {
+            match msg {
+                ControlMessage::ClipOffer(_) => self.shared.counts.bump(1),
+                ControlMessage::ClipFetchFailed(failed) => self.failed(failed.reason),
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn record_output(&self, output: &Output) {
+        match output {
+            Output::SendControl { msg, .. } => match msg {
+                ControlMessage::ClipOffer(_) => self.shared.counts.bump(0),
+                ControlMessage::ClipFetch(_) => self.shared.counts.bump(3),
+                ControlMessage::ClipFetchFailed(failed) => self.failed(failed.reason),
+                _ => {}
+            },
+            Output::SendClipData { .. } => self.shared.counts.bump(2),
+            _ => {}
+        }
+    }
+
     pub(crate) fn start(
         mut host: Box<dyn ClipboardHost>,
         events: mpsc::Sender<Event>,
@@ -231,6 +294,7 @@ impl Worker {
                     .is_some_and(|d| d.0.len() > BYTE_LIMIT - queue.buffered))
                 && let Some(mut rejected) = data.take()
             {
+                self.failed(ClipFailure::Unavailable);
                 rejected.0.zeroize();
             }
             // Once retirement is queued, native withdrawal will empty all outstanding pastes.
@@ -248,15 +312,20 @@ impl Worker {
             || (queue.retiring.is_some() && matches!(output, Output::ClipPromise { .. }))
         {
             match output {
-                Output::ClipRead { peer, fetch, .. } => completed.push(Input::ClipReadDone {
-                    peer,
-                    fetch,
-                    result: Err(ClipFailure::Unavailable),
-                }),
+                Output::ClipRead { peer, fetch, .. } => {
+                    self.failed(ClipFailure::Unavailable);
+                    completed.push(Input::ClipReadDone {
+                        peer,
+                        fetch,
+                        result: Err(ClipFailure::Unavailable),
+                    });
+                }
                 Output::ClipPromise { offer, .. } => {
+                    self.failed(ClipFailure::Unavailable);
                     completed.push(Input::Clipboard(ClipboardEvent::PromiseLost { offer }))
                 }
                 Output::ClipWithdraw { .. } | Output::ClipFulfil { .. } => {
+                    self.failed(ClipFailure::Unavailable);
                     queue.retire(&mut completed)
                 }
                 _ => {}
@@ -359,6 +428,7 @@ fn run(host: &mut dyn ClipboardHost, shared: &Shared, events: &mpsc::Sender<Even
             }
             Output::ClipPromise { offer, kinds } => {
                 if let Err(error) = host.promise(offer, kinds) {
+                    shared.counts.failed(failure(&error));
                     tracing::info!(offer, text = kinds.text, image = kinds.image,
                         reason = ?failure(&error), "clipboard promise failed");
                     let _ = events.send(Event::Input(Input::Clipboard(
@@ -369,6 +439,7 @@ fn run(host: &mut dyn ClipboardHost, shared: &Shared, events: &mpsc::Sender<Even
             Output::ClipWithdraw { offer } => {
                 let result = host.withdraw(offer);
                 if let Err(error) = &result {
+                    shared.counts.failed(failure(error));
                     tracing::info!(offer, reason = ?failure(error), "clipboard withdrawal failed");
                 }
                 let mut queue = lock(&shared.queue);
@@ -388,8 +459,10 @@ fn run(host: &mut dyn ClipboardHost, shared: &Shared, events: &mpsc::Sender<Even
         lock(&shared.queue).buffered -= supplied;
     }
     let offer = lock(&shared.queue).owned;
-    if let Some(offer) = offer {
-        let _ = host.withdraw(offer);
+    if let Some(offer) = offer
+        && let Err(error) = host.withdraw(offer)
+    {
+        shared.counts.failed(failure(&error));
     }
 }
 
@@ -401,6 +474,116 @@ mod tests {
     use crosspane_types::ClipKind;
 
     const READ_BOUND: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn clipboard_counters_saturate_and_expose_only_fixed_numeric_fields() {
+        let counts = Counts::default();
+        counts.0[0].store(u64::MAX, Ordering::Relaxed);
+        counts.bump(0);
+        let status = counts.status();
+        assert_eq!(status["offers_sent"], u64::MAX);
+        assert_eq!(status.as_object().unwrap().len(), 9);
+        assert!(
+            status
+                .as_object()
+                .unwrap()
+                .values()
+                .all(serde_json::Value::is_u64)
+        );
+    }
+
+    struct Failing;
+
+    impl ClipboardHost for Failing {
+        fn subscribe(
+            &mut self,
+            _: Arc<dyn EventSink<ClipboardEvent>>,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn kinds(&self) -> Result<ClipKinds, PlatformError> {
+            Ok(ClipKinds::default())
+        }
+        fn read(&mut self, _: ClipKind, _: usize) -> Result<Vec<u8>, PlatformError> {
+            Err(PlatformError::NotFound)
+        }
+        fn promise(&mut self, _: u64, _: ClipKinds) -> Result<(), PlatformError> {
+            Err(PlatformError::Locked)
+        }
+        fn fulfil(&mut self, _: LocalPasteId, _: Option<Vec<u8>>) {}
+        fn withdraw(&mut self, _: u64) -> Result<(), PlatformError> {
+            Err(PlatformError::TooLarge)
+        }
+    }
+
+    #[test]
+    fn clipboard_local_promise_and_withdraw_failures_use_mapped_counter_kinds() {
+        let (events, inputs) = mpsc::channel();
+        let worker = Worker::start(Box::new(Failing), events).unwrap();
+        worker.submit(Output::ClipPromise {
+            offer: 1,
+            kinds: ClipKinds {
+                text: true,
+                image: false,
+            },
+        });
+        loop {
+            if let Event::Input(Input::Clipboard(ClipboardEvent::PromiseLost { offer: 1 })) =
+                inputs.recv_timeout(Duration::from_secs(1)).unwrap()
+            {
+                break;
+            }
+        }
+        assert_eq!(worker.status()["locked"], 1);
+        worker.submit(Output::ClipWithdraw { offer: 1 });
+        let until = Instant::now() + Duration::from_secs(1);
+        while worker.status()["too_large"] != 1 {
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert_eq!(worker.status()["unavailable"], 0);
+    }
+
+    #[test]
+    fn clipboard_queue_read_and_promise_failures_count_explicit_rejections() {
+        let f = Fixture::new();
+        f.read(0);
+        assert_eq!(f.next(), Call::Read);
+        for fetch in 1..=49 {
+            f.read(fetch);
+        }
+        f.submit(Output::ClipPromise {
+            offer: 2,
+            kinds: ClipKinds {
+                text: true,
+                image: false,
+            },
+        });
+        assert_eq!(f.worker.status()["unavailable"], 2);
+        assert!(lock(&f.completed).iter().any(|input| matches!(
+            input,
+            Input::Clipboard(ClipboardEvent::PromiseLost { offer: 2 })
+        )));
+    }
+
+    #[test]
+    fn clipboard_queue_payload_budget_failure_has_no_inferred_empty_answer_reason() {
+        let f = Fixture::new();
+        f.read(0);
+        assert_eq!(f.next(), Call::Read);
+        for paste in 1..=2 {
+            f.submit(Output::ClipFulfil {
+                paste: LocalPasteId(paste),
+                data: Some(ClipBytes(vec![1; BYTE_LIMIT])),
+            });
+        }
+        assert_eq!(f.worker.status()["unavailable"], 1);
+        f.submit(Output::ClipFulfil {
+            paste: LocalPasteId(3),
+            data: None,
+        });
+        assert_eq!(f.worker.status()["unavailable"], 1);
+    }
 
     struct Paused {
         calls: mpsc::Sender<Call>,

@@ -245,6 +245,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn clipboard_grants_use_existing_directional_allow_intents() {
+        for capability in ["clipboard.read", "clipboard.write"] {
+            for allow in [true, false] {
+                assert_eq!(
+                    serde_json::to_value(Request::Allow {
+                        peer: "macbook".into(),
+                        capability: capability.into(),
+                        allow,
+                    })
+                    .unwrap(),
+                    json!({"cmd":"allow","peer":"macbook",
+                        "capability":capability,"allow":allow})
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_request_matches_protocol() {
         let peer = "macbook".to_owned();
         let cases = vec![

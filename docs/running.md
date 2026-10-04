@@ -287,6 +287,28 @@ Speakers only: microphones are not shared yet.
   runs two agents, each on its own private PipeWire server, plays a 1 kHz tone into one's "speakers"
   and records what comes out of the other's output.
 
+## Clipboard sharing (v0)
+
+Clipboard sharing is off by default in both directions. In Settings, each paired machine has
+two switches, enabled only when it advertises `clip/0`:
+
+- `clipboard.read`: the peer may read **my** clipboard when I paste there.
+- `clipboard.write`: the peer may offer **its** clipboard here, ready for a local paste.
+
+Use `crosspanectl allow <peer> clipboard.read` or `clipboard.write`; add `--off` to withdraw.
+Changes take effect when the next status confirms them. Copying advertises an offer without
+reading content; bytes are read lazily for a paste. Text is limited to 1 MiB and images to 16 MiB.
+Locking or an unknown session state blocks clipboard operations and retires promises; unlocking
+does not restore an old promise. Clipboard contents are never logged.
+
+Settings and `crosspanectl status` show node counters since agent startup: offers issued/observed, fetches
+issued, and data responses issued (not delivery acknowledgements). Failure totals count typed
+incoming/outgoing failures and mapped local promise, withdrawal and queue failures; these count
+classified events, so one failed paste can contribute more than once. Empty answers
+without a classified reason, including engine cancellation/expiry, are excluded. No content or
+per-item sizes are shown. On macOS, if remote paste is blocked, check whether Crosspane's
+**Paste from Other Apps** setting is Ask or AlwaysDeny; Settings does not read or change it.
+
 ## Known limitations (v0)
 
 Drag a window across: on paired machines with drag enabled, drag its title bar against the

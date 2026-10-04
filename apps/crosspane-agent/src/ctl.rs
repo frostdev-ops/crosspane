@@ -96,6 +96,8 @@ pub enum Request {
     /// Grant (`allow`) or withdraw a capability for a peer: `input`, `share`, `browse`,
     /// `present`, `speaker` (the peer may play sound on this machine's speakers) or `mic`
     /// (accepted and stored, but microphones are not supported yet).
+    /// `clipboard.read` permits reading my clipboard when pasting there; `clipboard.write`
+    /// permits the peer to offer its clipboard here. Both default off.
     Allow {
         peer: String,
         capability: String,

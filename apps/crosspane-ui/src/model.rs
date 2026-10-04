@@ -21,6 +21,38 @@ pub struct Status {
     pub projections: Vec<Projection>,
     /// Edge crossing is armed (false after a release or panic). Missing in older agents.
     pub armed: Option<bool>,
+    pub clipboard: Option<Clipboard>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Clipboard {
+    pub offers_sent: u64,
+    pub offers_received: u64,
+    pub fetches_served: u64,
+    pub fetches_made: u64,
+    pub expired: u64,
+    pub locked: u64,
+    pub not_granted: u64,
+    pub too_large: u64,
+    pub unavailable: u64,
+}
+
+impl Clipboard {
+    pub fn summary(&self) -> String {
+        format!(
+            "Clipboard offers: {} sent, {} received · Fetches: {} served, {} made · Failures: Expired {}, Locked {}, Not granted {}, Too large {}, Unavailable {}",
+            self.offers_sent,
+            self.offers_received,
+            self.fetches_served,
+            self.fetches_made,
+            self.expired,
+            self.locked,
+            self.not_granted,
+            self.too_large,
+            self.unavailable,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -49,6 +81,7 @@ pub struct Peer {
     pub rtt_ms: Option<f64>,
     pub displays: Vec<Display>,
     pub grants: Vec<String>,
+    pub features: Vec<String>,
     /// The link class of the path to it (`Lan`, `Wifi`, `DirectUsb4Tb`, …), if known.
     pub link: Option<String>,
 }
@@ -118,6 +151,23 @@ pub struct Window {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clipboard_status_defaults_and_ignores_unknown_payload_fields() {
+        for value in [json!({}), json!({"clipboard":null})] {
+            let status: Status = serde_json::from_value(value).unwrap();
+            assert!(status.clipboard.is_none());
+        }
+        let status: Status = serde_json::from_value(json!({"clipboard":{"offers_sent":7,
+            "content":"never display this fixture","bytes":777777},"peers":[{}]}))
+        .unwrap();
+        assert!(status.peers[0].features.is_empty());
+        let clipboard = status.clipboard.unwrap();
+        assert_eq!(clipboard.offers_sent, 7);
+        assert_eq!(clipboard.fetches_made, 0);
+        let text = clipboard.summary();
+        assert!(!text.contains("fixture") && !text.contains("777777"));
+    }
 
     #[test]
     fn parse_status_sample() {

@@ -16,13 +16,14 @@ impl Default for Demo {
             status: json!({
                 "node":"desktop000000000", "name":"desktop", "gate_open":true,
                 "armed":true, "session":"active",
+                "clipboard":{"offers_sent":0,"offers_received":0,"fetches_served":0,"fetches_made":0},
                 "displays":[
                     {"id":0,"name":"Ultrawide","pixels":[3440,1440],"scale":1.0,"mm":[800.0,335.0]},
                     {"id":1,"name":"Left display","pixels":[1920,1080],"scale":1.0,"mm":[530.0,300.0]},
                     {"id":2,"name":"Right display","pixels":[1920,1080],"scale":1.0,"mm":[530.0,300.0]}
                 ],
                 "peers":[{"node":"macbook000000000","name":"macbook","connected":true,
-                    "rtt_ms":1.8,"link":"DirectEthernet","grants":["input","share","browse"],
+                    "rtt_ms":1.8,"link":"DirectEthernet","features":["clip/0"],"grants":["input","share","browse"],
                     "displays":[{"id":0,"name":"Built-in Retina","pixels":[3024,1964],"scale":2.0,"mm":[345.0,224.0]}]}],
                 "layout":[
                     {"node":"desktop000000000","display":1,"origin_mm":[-530.0,35.0]},

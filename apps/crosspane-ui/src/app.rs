@@ -332,6 +332,12 @@ impl Settings {
                 if status.gate_open { "open" } else { "closed" },
                 status.session
             ));
+            if let Some(clipboard) = &status.clipboard {
+                ui.label(clipboard.summary());
+            }
+            if cfg!(target_os = "macos") {
+                ui.label("If remote paste is blocked, check whether Crosspane’s Paste from Other Apps setting is Ask or AlwaysDeny.");
+            }
             for display in &status.displays {
                 display_line(ui, display);
             }
@@ -428,6 +434,25 @@ impl Settings {
                             self.forget = Some(id.clone());
                         }
                     });
+                    let clipboard = peer.features.iter().any(|feature| feature == "clip/0");
+                    ui.add_enabled_ui(clipboard, |ui| {
+                        for (capability, label) in [
+                            ("clipboard.read", "May read my clipboard when pasting there"),
+                            ("clipboard.write", "May offer its clipboard here"),
+                        ] {
+                            let mut allow = peer.grants.iter().any(|grant| grant == capability);
+                            if theme::switch(ui, &mut allow, label).changed() {
+                                self.action(Request::Allow {
+                                    peer: id.clone(),
+                                    capability: capability.into(),
+                                    allow,
+                                });
+                            }
+                        }
+                    });
+                    if !clipboard {
+                        ui.label("This peer does not advertise clipboard sharing (clip/0).");
+                    }
                     if self.forget.as_deref() == Some(&id) {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("Forget {} and end its connection?", peer.name));
@@ -1122,6 +1147,194 @@ mod tests {
     use super::*;
     use eframe::App;
     use eframe::egui::Pos2;
+
+    fn clipboard_ui() -> (egui::Context, Settings) {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::fonts::load().unwrap());
+        let app = Settings::new(None, crate::art::load(&ctx), None);
+        (ctx, app)
+    }
+
+    fn clipboard_frame(
+        ctx: &egui::Context,
+        app: &mut Settings,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Rect)> {
+        fn visit(shape: &egui::Shape, texts: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| visit(shape, texts)),
+                egui::Shape::Text(text) => texts.push((
+                    text.galley.text().into(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                )),
+                _ => {}
+            }
+        }
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(1400.0, 1400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.machines(ui),
+        );
+        output.textures_delta.clear();
+        let mut texts = Vec::new();
+        for clipped in output.shapes {
+            visit(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn click_clipboard(ctx: &egui::Context, app: &mut Settings, label: &str) {
+        let texts = clipboard_frame(ctx, app, Vec::new());
+        let pos = texts
+            .iter()
+            .find(|(text, _)| text == label)
+            .expect("clipboard switch")
+            .1
+            .center();
+        for pressed in [true, false] {
+            clipboard_frame(
+                ctx,
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_switches_send_directional_intents_and_wait_for_status() {
+        for (capability, label) in [
+            ("clipboard.read", "May read my clipboard when pasting there"),
+            ("clipboard.write", "May offer its clipboard here"),
+        ] {
+            let (ctx, mut app) = clipboard_ui();
+            app.demo.as_mut().unwrap().status["peers"][0]["features"] =
+                serde_json::json!(["clip/0"]);
+            let status = app.demo.as_ref().unwrap().status.clone();
+            app.receive(Target::Status, status).unwrap();
+            click_clipboard(&ctx, &mut app, label);
+            assert!(
+                app.demo.as_ref().unwrap().status["peers"][0]["grants"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|grant| grant == capability)
+            );
+            assert!(
+                !app.status.peers[0]
+                    .grants
+                    .iter()
+                    .any(|grant| grant == capability),
+                "no optimistic grant"
+            );
+            app.show_error(Target::Action, "grant rejected".into());
+            let accepted = app.demo.as_ref().unwrap().status.clone();
+            app.demo.as_mut().unwrap().status["peers"][0]["grants"] =
+                serde_json::json!(["input", "share", "browse"]);
+            let rejected = app.demo.as_ref().unwrap().status.clone();
+            app.receive(Target::Status, rejected).unwrap();
+            assert!(
+                !app.status.peers[0]
+                    .grants
+                    .iter()
+                    .any(|grant| grant == capability)
+            );
+            app.demo.as_mut().unwrap().status = accepted;
+            let status = app.demo.as_ref().unwrap().status.clone();
+            app.receive(Target::Status, status).unwrap();
+            assert!(
+                app.status.peers[0]
+                    .grants
+                    .iter()
+                    .any(|grant| grant == capability)
+            );
+            click_clipboard(&ctx, &mut app, label);
+            assert!(
+                !app.demo.as_ref().unwrap().status["peers"][0]["grants"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|grant| grant == capability)
+            );
+            assert!(
+                app.status.peers[0]
+                    .grants
+                    .iter()
+                    .any(|grant| grant == capability),
+                "off is an intent too"
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_switches_without_the_feature_are_disabled_with_a_reason() {
+        for features in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(["clip/1"])),
+        ] {
+            let (ctx, mut app) = clipboard_ui();
+            let peer = &mut app.demo.as_mut().unwrap().status["peers"][0];
+            if let Some(features) = features {
+                peer["features"] = features;
+            } else {
+                peer.as_object_mut().unwrap().remove("features");
+            }
+            let status = app.demo.as_ref().unwrap().status.clone();
+            app.receive(Target::Status, status).unwrap();
+            let before = app.demo.as_ref().unwrap().status.clone();
+            click_clipboard(&ctx, &mut app, "May read my clipboard when pasting there");
+            click_clipboard(&ctx, &mut app, "May offer its clipboard here");
+            assert_eq!(app.demo.as_ref().unwrap().status, before);
+            assert!(
+                clipboard_frame(&ctx, &mut app, Vec::new())
+                    .iter()
+                    .any(|(text, _)| text.contains("does not advertise clipboard sharing"))
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_status_is_optional_and_renders_only_counts() {
+        let (ctx, mut app) = clipboard_ui();
+        let mut status = app.demo.as_ref().unwrap().status.clone();
+        status.as_object_mut().unwrap().remove("clipboard");
+        app.receive(Target::Status, status.clone()).unwrap();
+        assert!(
+            !clipboard_frame(&ctx, &mut app, Vec::new())
+                .iter()
+                .any(|(text, _)| text.starts_with("Clipboard offers:"))
+        );
+        status["clipboard"] = serde_json::json!({"offers_sent":7,"offers_received":3,
+            "fetches_served":2,"fetches_made":4,"expired":1,"locked":2,"not_granted":3,
+            "too_large":4,"unavailable":5,"content":"private fixture never displayed","bytes":777777});
+        app.receive(Target::Status, status).unwrap();
+        let text = clipboard_frame(&ctx, &mut app, Vec::new())
+            .iter()
+            .map(|(text, _)| text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Clipboard offers: 7 sent, 3 received"));
+        assert!(text.contains("Expired 1") && text.contains("Unavailable 5"));
+        assert!(!text.contains("private fixture") && !text.contains("777777"));
+        assert_eq!(
+            text.contains("Paste from Other Apps"),
+            cfg!(target_os = "macos")
+        );
+    }
 
     // Inspect the real egui output without a native window, renderer, compositor or socket.
     // This catches inherited layouts and offscreen content that the model tests cannot detect.

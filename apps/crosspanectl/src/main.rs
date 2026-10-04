@@ -96,7 +96,8 @@ enum Command {
     },
     /// Let a peer use a capability here, or stop with --off: input, share, browse, present,
     /// speaker (play sound on this machine's speakers) or mic (stored, but microphones are not
-    /// supported yet).
+    /// supported yet). clipboard.read lets the peer read my clipboard when pasting there;
+    /// clipboard.write lets the peer offer its clipboard here. Both default off.
     Allow {
         peer: String,
         capability: String,
@@ -132,6 +133,37 @@ mod settings_tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn clipboard_allow_help_and_off_parse_without_changing_default_grants() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("allow")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for capability in ["clipboard.read", "clipboard.write"] {
+            assert!(help.contains(capability));
+            for off in [false, true] {
+                let mut args = vec!["crosspanectl", "allow", "peer", capability];
+                if off {
+                    args.push("--off");
+                }
+                let Command::Allow {
+                    peer,
+                    capability: parsed,
+                    off: parsed_off,
+                } = Cli::try_parse_from(args).unwrap().command
+                else {
+                    panic!("allow command");
+                };
+                assert_eq!(peer, "peer");
+                assert_eq!(parsed, capability);
+                assert_eq!(parsed_off, off);
+            }
+        }
+        assert!(help.contains("Both default off"));
+    }
 
     #[test]
     fn settings_update_accepts_explicit_boolean_values_and_json() {
@@ -678,6 +710,9 @@ fn print_status(s: &Value) {
     if let Some(label) = format_drag_label(s) {
         println!("{label}");
     }
+    if let Some(label) = format_clipboard_status(s) {
+        println!("{label}");
+    }
     let missing: Vec<&str> = s["permissions"]
         .as_array()
         .into_iter()
@@ -793,9 +828,41 @@ fn format_drag_label(status: &Value) -> Option<String> {
         .map(|label| format!("  drag: {label}"))
 }
 
+fn format_clipboard_status(status: &Value) -> Option<String> {
+    let clipboard = status.get("clipboard")?.as_object()?;
+    let count = |name| clipboard.get(name).and_then(Value::as_u64).unwrap_or(0);
+    Some(format!(
+        "Clipboard offers: {} sent, {} received · Fetches: {} served, {} made · Failures: Expired {}, Locked {}, Not granted {}, Too large {}, Unavailable {}",
+        count("offers_sent"),
+        count("offers_received"),
+        count("fetches_served"),
+        count("fetches_made"),
+        count("expired"),
+        count("locked"),
+        count("not_granted"),
+        count("too_large"),
+        count("unavailable"),
+    ))
+}
+
 #[cfg(test)]
 mod drag_status_tests {
     use super::*;
+
+    #[test]
+    fn clipboard_status_defaults_and_formats_only_fixed_numeric_fields() {
+        for old in [json!({}), json!({"clipboard":null})] {
+            let parsed: Value = serde_json::from_str(&old.to_string()).unwrap();
+            assert_eq!(format_clipboard_status(&parsed), None);
+        }
+        let status: Value = serde_json::from_str(r#"{"clipboard":{"offers_sent":7,"offers_received":3,"fetches_served":2,"fetches_made":4,"expired":1,"locked":2,"not_granted":3,"too_large":4,"unavailable":5,"content":"never display this fixture","bytes":777777}}"#).unwrap();
+        let text = format_clipboard_status(&status).expect("clipboard counts");
+        assert!(text.contains("Clipboard offers: 7 sent, 3 received"));
+        assert!(text.contains("Expired 1") && text.contains("Unavailable 5"));
+        assert!(!text.contains("fixture") && !text.contains("777777"));
+        let partial = format_clipboard_status(&json!({"clipboard":{}})).unwrap();
+        assert!(partial.contains("0 sent, 0 received"));
+    }
 
     #[test]
     fn formatted_status_names_each_peers_drag_and_the_active_engine_label() {
