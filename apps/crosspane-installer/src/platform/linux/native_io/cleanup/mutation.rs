@@ -6,6 +6,7 @@ pub struct CleanupLease(pub(super) Arc<State>);
 pub(super) struct State {
     pub(super) proof: CleanupProof,
     lock: Snapshot,
+    pub(super) repair_removed: AtomicBool,
     pub(super) intent: Mutex<Snapshot>,
     pub(super) removed: Mutex<[bool; FILES.len()]>,
     busy: AtomicBool,
@@ -78,6 +79,7 @@ impl CleanupProof {
             let lease = CleanupLease(Arc::new(State {
                 proof,
                 lock,
+                repair_removed: AtomicBool::new(false),
                 intent: Mutex::new(intent),
                 removed: Mutex::new([false; FILES.len()]),
                 busy: AtomicBool::new(false),
@@ -120,6 +122,36 @@ impl State {
         }
     }
     pub(super) fn check(&self, d: &Deadline) -> Result<()> {
+        d.check()?;
+        if self.unknown.load(Ordering::Acquire) {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let io = &self.proof.0.io;
+        io.validate_target()?;
+        self.proof.0.ledger.revalidate(io, d)?;
+        if io
+            .metadata(
+                &self
+                    .proof
+                    .0
+                    .ledger
+                    .path
+                    .with_file_name("payload-intent.json"),
+            )?
+            .is_some()
+        {
+            return Err(NativeError::Foreign);
+        }
+        if let Some(repair) = &self.proof.0.repair {
+            if self.repair_removed.load(Ordering::Acquire) {
+                repair.revalidate_removed(io, d)?;
+            } else {
+                repair.revalidate(io, d)?;
+            }
+        }
+        self.check_except_repair(d)
+    }
+    pub(super) fn check_except_repair(&self, d: &Deadline) -> Result<()> {
         d.check()?;
         if self.unknown.load(Ordering::Acquire) {
             return Err(NativeError::OutcomeUnknown);
@@ -435,6 +467,8 @@ pub(crate) mod tests {
             let proof = CleanupProof(Arc::new(Admitted {
                 io,
                 ledger,
+                repair: None,
+                repair_foreign: false,
                 entries: Mutex::new(entries),
                 receipt: InstallReceipt {
                     schema_version: 1,

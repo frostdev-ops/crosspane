@@ -859,6 +859,13 @@ impl Worker {
                 let step = self.repairer.verify(status, &deadline);
                 self.repair_step(id, step);
             }
+            MaintenanceRequest::DiscardRepair { id, .. } => {
+                self.maint(MaintenanceReport::Refused {
+                    id,
+                    reason: "Discarding an earlier repair is not supported on this platform."
+                        .into(),
+                });
+            }
             MaintenanceRequest::ResumeRepair { id, status } => {
                 if self.maintenance.id != Some(id)
                     || self.maintenance.running

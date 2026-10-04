@@ -146,6 +146,12 @@ pub enum MaintenanceRequest {
         id: MaintenanceId,
         status: Option<StatusEvidence>,
     },
+    /// Discard the record of an earlier repair that stopped before replacing any file. The
+    /// platform re-proves that fact and the install's health with this fresh Status; one shot.
+    DiscardRepair {
+        id: MaintenanceId,
+        status: Option<StatusEvidence>,
+    },
     /// Resume a repair that was interrupted or whose outcome is unknown: it re-checks what is
     /// really there and never replays an uncertain change.
     ResumeRepair {
@@ -232,6 +238,8 @@ pub enum MaintenanceOutcome {
 /// How a repair that went past planning ended. Each variant says what is known, no more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairOutcome {
+    /// Only an unapplied repair record was retired; no installed file was replaced.
+    Retired,
     /// The new instance reported healthy and the repair is complete.
     Verified,
     /// The new instance reported healthy, but some backup or record cleanup is still left.
@@ -280,6 +288,16 @@ pub enum MaintenanceReport {
         id: MaintenanceId,
         plan: u64,
         preview: String,
+    },
+    /// An earlier repair stopped before replacing any file, and its record can be discarded
+    /// (sent right after `Inspected`, instead of `RepairResumable`).
+    RepairDiscardable {
+        id: MaintenanceId,
+    },
+    /// The answer to `DiscardRepair`: the record was retired; no installed file was touched.
+    RepairDiscarded {
+        id: MaintenanceId,
+        lines: Vec<String>,
     },
     /// An earlier repair left a record that can be resumed (sent right after `Inspected`).
     RepairResumable {
@@ -391,6 +409,7 @@ pub mod ids {
     pub const REPAIR: u16 = 5005;
     pub const REPAIR_CONFIRM: u16 = 5006;
     pub const REPAIR_RESUME: u16 = 5007;
+    pub const REPAIR_DISCARD: u16 = 5008;
 
     pub fn retry(step: StepId) -> u16 {
         100 + step.0

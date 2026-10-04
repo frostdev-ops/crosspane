@@ -1,6 +1,8 @@
 //! Read-only ledger authority never implies readiness or clean exit.
 //! A lost original process watch remains NotClean; recovery material and identity are retained.
 mod delete;
+mod repair;
+pub(crate) use repair::RepairJournalSnapshot;
 mod intent;
 mod ledger;
 mod manager;
@@ -24,6 +26,9 @@ pub struct CleanupProof(Arc<Admitted>);
 struct Admitted {
     io: Arc<LinuxNativeIo>,
     ledger: Snapshot,
+    repair: Option<Snapshot>,
+    /// The fixed repair journal exists but couldn't be captured; it is kept, never deleted.
+    repair_foreign: bool,
     receipt: InstallReceipt,
     entries: Mutex<Vec<Resource>>,
 }
@@ -77,6 +82,9 @@ impl CleanupProof {
         d.check()?;
         self.0.io.validate_target()?;
         self.0.ledger.revalidate(&self.0.io, d)?;
+        if let Some(repair) = &self.0.repair {
+            repair.revalidate(&self.0.io, d)?;
+        }
         let intent = self.0.ledger.path.with_file_name("payload-intent.json");
         if self.0.io.metadata(&intent)?.is_some() {
             return Err(NativeError::Foreign);
@@ -119,6 +127,8 @@ mod tests {
         let proof = CleanupProof(Arc::new(Admitted {
             io,
             ledger,
+            repair: None,
+            repair_foreign: false,
             receipt: InstallReceipt {
                 schema_version: 1,
                 operation_id: crosspane_installer_core::OperationId(1),

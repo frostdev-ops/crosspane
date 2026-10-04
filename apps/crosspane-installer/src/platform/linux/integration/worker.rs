@@ -114,6 +114,7 @@ struct Maintenance {
     repair_plan: Option<OperationId>,
     /// A confirmed repair that hasn't ended: it is changing things, or watching the new agent.
     repair_active: bool,
+    discard_offered: bool,
     /// When the repair first waited for the new agent's health.
     repair_since: Option<u64>,
     /// Maintenance operations handed out in this session.
@@ -1223,6 +1224,7 @@ impl Worker {
                 let deadline = self.deadline(READ_MS);
                 let offer = self.uninstaller.inspect(self.package.as_ref(), &deadline);
                 let repair = self.repairer.inspect(self.package.as_ref(), self.now());
+                self.maintenance.discard_offered = repair.discardable;
                 self.maint(MaintenanceReport::Inspected {
                     id,
                     uninstall: offer.uninstall,
@@ -1230,7 +1232,9 @@ impl Worker {
                     choices: offer.choices,
                 });
                 // An earlier repair that didn't finish is offered for resume.
-                if let Some(lines) = repair.resumable {
+                if repair.discardable {
+                    self.maint(MaintenanceReport::RepairDiscardable { id });
+                } else if let Some(lines) = repair.resumable {
                     self.maint(MaintenanceReport::RepairResumable { id, lines });
                 }
             }
@@ -1304,6 +1308,33 @@ impl Worker {
                     .repairer
                     .verify(self.package.as_ref(), status, self.now());
                 self.repair_step(id, step);
+            }
+            MaintenanceRequest::DiscardRepair { id, status } => {
+                if self.maintenance.id != Some(id)
+                    || self.maintenance.running
+                    || self.maintenance.repair_active
+                    || self.maintenance.planned.is_some()
+                    || self.maintenance.repair_plan.is_some()
+                    || !self.maintenance.discard_offered
+                {
+                    self.stale_repair(id, "That discard offer is no longer current.");
+                    return;
+                }
+                self.maintenance.discard_offered = false;
+                let status = status.as_ref().map(|s| &s.0);
+                match self
+                    .repairer
+                    .discard(self.package.as_ref(), status, self.now())
+                {
+                    Ok(finish) if finish.outcome == crate::live::RepairOutcome::Retired => {
+                        self.maint(MaintenanceReport::RepairDiscarded {
+                            id,
+                            lines: finish.lines,
+                        });
+                    }
+                    Ok(_) => self.stale_repair(id, "The repair record could not be discarded."),
+                    Err(reason) => self.maint(MaintenanceReport::Refused { id, reason }),
+                }
             }
             MaintenanceRequest::ResumeRepair { id, status } => {
                 if self.maintenance.id != Some(id)

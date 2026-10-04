@@ -100,6 +100,51 @@ impl Journal {
         }
         Ok(())
     }
+    pub(super) fn validate_cleanup(
+        proof: &super::super::native_io::CleanupProof,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(NativeError::Oversize.into());
+        }
+        let journal: Self = serde_json::from_slice(bytes).map_err(|_| NativeError::Invalid)?;
+        let t = journal.target;
+        let [
+            home,
+            prefix,
+            config_home,
+            state_home,
+            data_home,
+            runtime_home,
+        ] = t.roots;
+        let paths = TargetPaths {
+            uid: t.uid,
+            home,
+            prefix,
+            config_home,
+            state_home,
+            data_home,
+            runtime_home,
+            runtime_override: t.runtime_override,
+        };
+        if journal.version != 1
+            || journal.operation == 0
+            || journal.revision == 0
+            || journal.original_instance == 0
+            || !proof.repair_target_matches(&paths, t.scratch)
+        {
+            return Err(NativeError::Foreign.into());
+        }
+        Ok(())
+    }
+    pub(super) fn decode(io: &LinuxNativeIo, bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(NativeError::Oversize.into());
+        }
+        let journal: Self = serde_json::from_slice(bytes).map_err(|_| NativeError::Invalid)?;
+        journal.bound(io)?;
+        Ok(journal)
+    }
     pub(super) fn load(io: &LinuxNativeIo, input: &RepairInput<'_>) -> Result<Option<Self>> {
         input.deadline.check()?;
         input.proof.check(io)?;
@@ -108,8 +153,7 @@ impl Journal {
             return Ok(None);
         }
         let bytes = io.read(&path, MAX_RECORD_BYTES, true)?;
-        let journal: Self = serde_json::from_slice(&bytes).map_err(|_| NativeError::Invalid)?;
-        journal.bound(io)?;
+        let journal = Self::decode(io, &bytes)?;
         input.deadline.check()?;
         input.proof.check(io)?;
         Ok(Some(journal))

@@ -252,6 +252,7 @@ struct World {
     repair_confirm: VecDeque<Result<RepairStep, String>>,
     repair_verify: VecDeque<RepairStep>,
     repair_resume: Result<RepairFinish, String>,
+    discard_refusal: Option<String>,
     /// The (plan, operation) pairs each confirmation named, the status ids each verification
     /// was given, and whether each verification carried a Supported status.
     repair_confirmed: Vec<(u64, u64)>,
@@ -325,6 +326,7 @@ impl World {
             },
             script: VecDeque::new(),
             repair_offer: RepairOffer {
+                discardable: false,
                 repair: Availability::Available,
                 resumable: None,
             },
@@ -332,6 +334,7 @@ impl World {
             repair_confirm: VecDeque::new(),
             repair_verify: VecDeque::new(),
             repair_resume: Ok(finish(RepairOutcome::Verified, "Resumed and verified.", false)),
+            discard_refusal: None,
             repair_confirmed: Vec::new(),
             repair_verified: Vec::new(),
             repair_hold: false,
@@ -657,6 +660,29 @@ fn status_id(status: Option<&AgentReply>) -> Option<u64> {
 }
 
 impl Repairer for FakeRepairer {
+    fn discard(
+        &mut self,
+        _: Option<&Package>,
+        status: Option<&AgentReply>,
+        _: u64,
+    ) -> Result<RepairFinish, String> {
+        let mut w = self.0.lock().unwrap();
+        w.calls
+            .push(format!("repair.discard(status={:?})", status_id(status)));
+        if let Some(reason) = w.discard_refusal.clone() {
+            return Err(reason);
+        }
+        w.repair_offer = RepairOffer {
+            discardable: false,
+            repair: Availability::Available,
+            resumable: None,
+        };
+        Ok(finish(
+            RepairOutcome::Retired,
+            "The earlier repair record was discarded.",
+            false,
+        ))
+    }
     fn inspect(&mut self, _: Option<&Package>, _: u64) -> RepairOffer {
         note(&self.0, "repair.inspect");
         self.0.lock().unwrap().repair_offer.clone()
@@ -1984,6 +2010,7 @@ fn repair_is_offered_only_when_the_inventory_says_the_install_is_compatible() {
                   Crosspane and install it again to start clean.";
     rig.set(|w| {
         w.repair_offer = RepairOffer {
+            discardable: false,
             repair: Availability::Unavailable(reason.into()),
             resumable: None,
         };
@@ -2177,6 +2204,7 @@ fn an_interrupted_repair_is_offered_for_resume_and_resumes_to_verified() {
     let mut rig = Rig::new();
     rig.set(|w| {
         w.repair_offer = RepairOffer {
+            discardable: false,
             repair: Availability::Unavailable("An earlier repair didn't finish.".into()),
             resumable: Some(vec!["It stopped while files were being replaced.".into()]),
         }
@@ -3525,6 +3553,7 @@ fn an_incompatible_install_shows_the_guidance_and_cannot_be_repaired() {
     let guidance = "Some files where Crosspane installs weren't put there by Crosspane. Remove \
                     Crosspane and install it again to start clean.";
     f.world().lock().unwrap().repair_offer = RepairOffer {
+        discardable: false,
         repair: Availability::Unavailable(guidance.into()),
         resumable: None,
     };
@@ -3546,6 +3575,7 @@ fn an_incompatible_install_shows_the_guidance_and_cannot_be_repaired() {
 fn an_interrupted_repair_shows_resume_and_resume_reaches_verified() {
     let mut f = flow::Flow::new();
     f.world().lock().unwrap().repair_offer = RepairOffer {
+        discardable: false,
         repair: Availability::Unavailable("An earlier repair didn't finish.".into()),
         resumable: Some(vec!["It stopped while files were being replaced.".into()]),
     };
@@ -3608,6 +3638,7 @@ fn closing_the_window_mid_repair_leaves_nothing_working_and_reopening_offers_res
     // A reopened window finds the interrupted repair (the record the coordinator keeps) and
     // offers its resume; nothing is stuck working.
     world.lock().unwrap().repair_offer = RepairOffer {
+        discardable: false,
         repair: Availability::Unavailable("An earlier repair didn't finish.".into()),
         resumable: Some(vec!["It stopped after Crosspane was started again.".into()]),
     };
@@ -3749,3 +3780,158 @@ fn the_network_step_is_never_verified_by_a_rule_or_command_alone() {
 
 #[allow(dead_code)]
 fn _unused(_: Option<Value>, _: Option<&Path>, _: Option<Consent>) {}
+
+#[test]
+fn r2_gui_discard_uses_fresh_status_then_reoffers_repair_without_resuming() {
+    let mut f = flow::Flow::new();
+    f.world().lock().unwrap().repair_offer = RepairOffer {
+        discardable: true,
+        repair: Availability::Unavailable(
+            "An earlier repair stopped before changing anything".into(),
+        ),
+        resumable: None,
+    };
+    f.open_repair();
+    f.until("the discard offer", |f| f.shown(live::ids::REPAIR_DISCARD));
+    assert!(
+        f.message()
+            .contains("An earlier repair stopped before changing anything")
+    );
+    assert!(f.enabled(live::ids::REPAIR_DISCARD));
+    assert!(!f.shown(live::ids::REPAIR_RESUME));
+    assert!(!f.enabled(live::ids::REPAIR));
+    let before = calls(f.world()).len();
+    f.click(live::ids::REPAIR_DISCARD);
+    f.until("freshly offered repair after discard", |f| {
+        f.enabled(live::ids::REPAIR)
+    });
+    assert!(!f.shown(live::ids::REPAIR_DISCARD));
+    let after = calls(f.world());
+    assert!(
+        after[before..]
+            .iter()
+            .any(|c| c.starts_with("repair.discard(status=Some("))
+    );
+    assert!(
+        !after[before..]
+            .iter()
+            .any(|c| c.starts_with("repair.resume") || c.starts_with("repair.confirm"))
+    );
+    assert_eq!(
+        after[before..]
+            .iter()
+            .filter(|c| c.starts_with("repair.discard"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn r2_gui_unknown_repair_keeps_the_old_refusal_and_has_no_discard_action() {
+    let mut f = flow::Flow::new();
+    let text = "The earlier repair record can't be read. Remove Crosspane and install it again.";
+    f.world().lock().unwrap().repair_offer = RepairOffer {
+        discardable: false,
+        repair: Availability::Unavailable(text.into()),
+        resumable: None,
+    };
+    f.open_repair();
+    assert!(f.message().contains(text));
+    assert!(!f.shown(live::ids::REPAIR_DISCARD));
+    assert!(!f.enabled(live::ids::REPAIR));
+    assert!(
+        !calls(f.world())
+            .iter()
+            .any(|c| c.starts_with("repair.discard"))
+    );
+}
+
+#[test]
+fn r2_worker_discard_is_one_shot_and_refuses_unoffered_stale_or_replayed_requests() {
+    let mut rig = Rig::new();
+    // Not offered on this inspection: refused, the repairer is never asked.
+    rig.inspect(1);
+    let reports = rig.maint(MaintenanceRequest::DiscardRepair {
+        id: MaintenanceId(1),
+        status: Some(StatusEvidence(healthy(41))),
+    });
+    assert!(matches!(&reports[0], MaintenanceReport::Refused { .. }));
+    assert_eq!(rig.count("repair.discard"), 0);
+    rig.set(|w| {
+        w.repair_offer = RepairOffer {
+            discardable: true,
+            repair: Availability::Unavailable("An earlier repair stopped.".into()),
+            resumable: Some(vec!["ignored while discardable".into()]),
+        }
+    });
+    let reports = rig.inspect(2);
+    assert_eq!(
+        reports[1],
+        MaintenanceReport::RepairDiscardable {
+            id: MaintenanceId(2)
+        }
+    );
+    assert_eq!(reports.len(), 2, "discardable is offered instead of resume");
+    // An older inspection's id is stale.
+    let reports = rig.maint(MaintenanceRequest::DiscardRepair {
+        id: MaintenanceId(1),
+        status: Some(StatusEvidence(healthy(42))),
+    });
+    assert!(matches!(&reports[0], MaintenanceReport::Refused { .. }));
+    assert_eq!(rig.count("repair.discard"), 0);
+    let reports = rig.maint(MaintenanceRequest::DiscardRepair {
+        id: MaintenanceId(2),
+        status: Some(StatusEvidence(healthy(43))),
+    });
+    assert!(matches!(
+        &reports[0],
+        MaintenanceReport::RepairDiscarded { .. }
+    ));
+    // A replay of the same request is refused: the offer was consumed.
+    let reports = rig.maint(MaintenanceRequest::DiscardRepair {
+        id: MaintenanceId(2),
+        status: Some(StatusEvidence(healthy(44))),
+    });
+    assert!(matches!(&reports[0], MaintenanceReport::Refused { .. }));
+    assert_eq!(rig.count("repair.discard"), 1);
+}
+
+#[test]
+fn r2_gui_a_refused_discard_leaves_nothing_working_and_removal_reachable() {
+    let mut f = flow::Flow::new();
+    {
+        let world = f.world();
+        let mut w = world.lock().unwrap();
+        w.repair_offer = RepairOffer {
+            discardable: true,
+            repair: Availability::Unavailable("An earlier repair stopped.".into()),
+            resumable: None,
+        };
+        w.discard_refusal =
+            Some("Discarding the record needs Crosspane. Nothing was changed.".into());
+    }
+    f.open_repair();
+    f.until("the discard offer", |f| f.shown(live::ids::REPAIR_DISCARD));
+    assert!(
+        f.enabled(live::ids::REMOVE_REVIEW),
+        "removal stays offered beside Discard"
+    );
+    f.click(live::ids::REPAIR_DISCARD);
+    f.until("the refusal", |f| f.message().contains("needs Crosspane"));
+    assert!(!f.shown(live::ids::REPAIR_DISCARD));
+    assert!(f.enabled(live::ids::CLOSE) && f.enabled(live::ids::BACK));
+    // Back re-inspects: the record is offered again and removal is reachable.
+    f.click(live::ids::BACK);
+    f.open_repair();
+    f.until("the discard offer again", |f| {
+        f.enabled(live::ids::REPAIR_DISCARD)
+    });
+    assert!(f.enabled(live::ids::REMOVE_REVIEW));
+    assert_eq!(
+        calls(f.world())
+            .iter()
+            .filter(|c| c.starts_with("repair.discard"))
+            .count(),
+        1
+    );
+}

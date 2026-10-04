@@ -152,9 +152,19 @@ impl LinuxNativeIo {
                     owned,
                 });
             }
+            // A journal that isn't a private regular file of the expected shape is kept and
+            // reported as unknown; it never blocks removal and grants nothing.
+            let (repair, repair_foreign) =
+                match Snapshot::open(&io, &repair::fixed_path(&io), 0o600, MAX_RECORD_BYTES, &d) {
+                    Ok((repair, _)) => (Some(repair), false),
+                    Err(NativeError::Foreign) => (None, true),
+                    Err(error) => return Err(error),
+                };
             let proof = CleanupProof(Arc::new(Admitted {
                 io,
                 ledger: snapshot,
+                repair,
+                repair_foreign,
                 receipt: ledger.receipt,
                 entries: Mutex::new(entries),
             }));

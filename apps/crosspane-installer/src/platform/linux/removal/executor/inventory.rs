@@ -19,6 +19,7 @@ pub struct CleanupResource {
 pub struct CleanupInventory {
     proof: CleanupProof,
     resources: Vec<CleanupResource>,
+    pub(super) repair_journal_valid: bool,
     pub(super) digest: [u8; 32],
 }
 impl CleanupInventory {
@@ -56,10 +57,21 @@ impl CleanupInventory {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // An unknown or foreign repair journal is kept, and so is the recovery it may need.
+        let repair_journal_valid = match proof.repair_journal(deadline) {
+            Err(crate::platform::linux::native_io::NativeError::Foreign) => false,
+            Err(error) => return Err(error.into()),
+            Ok(None) => true,
+            Ok(Some(bytes)) => {
+                crate::platform::linux::repair::validate_removal_journal_for_cleanup(&proof, &bytes)
+                    .is_ok()
+            }
+        };
         proof.revalidate(deadline)?;
         Ok(Self {
             proof,
             resources,
+            repair_journal_valid,
             digest,
         })
     }

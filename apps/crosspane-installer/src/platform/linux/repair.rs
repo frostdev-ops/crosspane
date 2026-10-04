@@ -2,6 +2,9 @@
 //! Each native stage takes its ordinary install.lock. No cleanup capability is consumed here.
 mod executor;
 mod resume;
+mod retire;
+pub(crate) use retire::validate_removal_journal_for_cleanup;
+pub use retire::{RetireUnapplied, RetirementOutcome};
 
 use super::{
     firewall::FirewallError,

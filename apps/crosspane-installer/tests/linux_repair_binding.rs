@@ -1127,3 +1127,251 @@ fn a_new_agent_that_keeps_its_identity_in_a_file_is_tier_two_and_keeps_every_bac
     );
     assert!(done.resumable);
 }
+
+// WP-4.21r2: legacy v1 records carry no original-resource snapshot. Retirement instead requires
+// a pre-apply stage AND the current installation to match its genuine completed receipt.
+fn retirement_journal(f: &Fixture, stage: &str) -> PathBuf {
+    let paths = f.io.target().paths();
+    let path = paths
+        .state_home
+        .join("crosspane/installer/repair-intent.json");
+    let journal = json!({"version":1,"operation":10,"revision":10,
+        "manifest":sha256(&serde_json::to_vec(fixture_package(1).manifest()).unwrap()),
+        "original_instance":9,"stage":stage,"target":{"uid":paths.uid,
+        "roots":[paths.home,paths.prefix,paths.config_home,paths.state_home,
+                 paths.data_home,paths.runtime_home],
+        "runtime_override":paths.runtime_override,"scratch":true}});
+    f.io.atomic_write(&f.proof(), &path, &serde_json::to_vec(&journal).unwrap())
+        .unwrap();
+    path
+}
+fn retirement_input<'a>(
+    proof: &'a SupportProof,
+    package: &'a Package,
+    service: &'a LinuxService,
+    reply: Option<&'a AgentReply>,
+    d: &'a Deadline,
+) -> RepairInput<'a> {
+    RepairInput {
+        proof,
+        package,
+        service,
+        reply,
+        expected_reply_id: 19,
+        now_ms: NOW,
+        deadline: d,
+    }
+}
+
+#[test]
+fn r2_retirement_is_allowed_only_in_the_three_pre_apply_journal_states() {
+    for stage in [
+        "recorded",
+        "stop_pending",
+        "stopped",
+        "payload_pending",
+        "payload_applied",
+        "reload_pending",
+        "start_pending",
+        "awaiting_agent",
+        "verified",
+    ] {
+        let f = Fixture::new();
+        let path = retirement_journal(&f, stage);
+        let before = fs::read(&path).unwrap();
+        let installed = f.bytes();
+        let package = fixture_package(1);
+        let proof = f.proof();
+        let service = f.service(&package);
+        let reply = f.reply(9, 1, |_| {});
+        let d = deadline();
+        let input = retirement_input(&proof, &package, &service, Some(&reply), &d);
+        let mut repair = f.repair();
+        let permitted = matches!(stage, "recorded" | "stop_pending" | "stopped");
+        let candidate = repair.inspect_retire_unapplied(&input);
+        assert_eq!(candidate.is_ok(), permitted, "{stage}");
+        if let Ok(candidate) = candidate {
+            assert_eq!(
+                repair.retire_unapplied(candidate, &input).unwrap(),
+                RetirementOutcome::Retired
+            );
+            assert!(!path.exists());
+        } else {
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        assert_eq!(f.bytes(), installed);
+        assert!(f.mutations().is_empty());
+        assert_eq!(f.auth_calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn r2_retirement_refuses_missing_changed_unreadable_foreign_and_pending_install_evidence() {
+    for case in [
+        "missing",
+        "changed",
+        "receipt",
+        "pending",
+        "unknown_stage",
+        "foreign",
+        "unreadable",
+    ] {
+        let f = Fixture::new();
+        let path = retirement_journal(&f, "stopped");
+        let state = f.io.target().paths().state_home.join("crosspane/installer");
+        match case {
+            "missing" => fs::remove_file(&f.installer.targets()[9]).unwrap(),
+            "changed" => fs::write(&f.installer.targets()[9], b"user edit").unwrap(),
+            "receipt" => fs::write(state.join("payload-outcome.json"), b"{}").unwrap(),
+            "pending" => {
+                f.io.atomic_write(&f.proof(), &state.join("payload-intent.json"), b"{}")
+                    .unwrap()
+            }
+            "unknown_stage" | "foreign" => {
+                let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                if case == "unknown_stage" {
+                    value["stage"] = json!("future");
+                } else {
+                    value["target"]["uid"] = json!(f.io.target().paths().uid + 1);
+                }
+                fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "unreadable" => fs::write(&path, b"not a record").unwrap(),
+            _ => unreachable!(),
+        }
+        let before = fs::read(&path).unwrap();
+        let package = fixture_package(1);
+        let proof = f.proof();
+        let service = f.service(&package);
+        let reply = f.reply(9, 1, |_| {});
+        let d = deadline();
+        let input = retirement_input(&proof, &package, &service, Some(&reply), &d);
+        assert!(
+            f.repair().inspect_retire_unapplied(&input).is_err(),
+            "{case}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(f.mutations().is_empty());
+    }
+}
+
+#[test]
+fn r2_retirement_requires_fresh_supported_health_or_confirmed_inactive_absence() {
+    for case in [
+        "healthy",
+        "absent",
+        "stale",
+        "wrong_id",
+        "unhealthy",
+        "inactive_alive",
+        "no_status",
+    ] {
+        let f = Fixture::new();
+        let path = retirement_journal(&f, "stopped");
+        let package = fixture_package(1);
+        let mut reply = f.reply(9, 1, |v| {
+            if case == "unhealthy" {
+                v["result"]["installer"]["backends"][0]["state"] = json!("failed");
+            }
+        });
+        if case == "stale" {
+            reply.observed_at_ms = 0;
+        }
+        if case == "wrong_id" {
+            reply.id = 20;
+        }
+        if matches!(case, "absent" | "inactive_alive") {
+            let mut p = f.runner.properties.lock().unwrap();
+            p.insert("MainPID".into(), "0".into());
+            p.insert("ActiveState".into(), "inactive".into());
+            p.insert("SubState".into(), "dead".into());
+            if case == "absent" {
+                fs::remove_file(f.io.target().runtime_dir().join("bootstrap.json")).unwrap();
+                *f.probe.0.lock().unwrap() = None;
+            }
+        }
+        let proof = f.proof();
+        let service = f.service(&package);
+        let d = deadline();
+        let mut input = retirement_input(
+            &proof,
+            &package,
+            &service,
+            (case != "no_status").then_some(&reply),
+            &d,
+        );
+        if case == "stale" {
+            input.now_ms = 5001;
+        }
+        let mut repair = f.repair();
+        let candidate = repair.inspect_retire_unapplied(&input).unwrap();
+        let result = repair.retire_unapplied(candidate, &input);
+        let permitted = matches!(case, "healthy" | "absent");
+        assert_eq!(result.is_ok(), permitted, "{case}: {result:?}");
+        assert_eq!(path.exists(), !permitted);
+        assert!(f.mutations().is_empty());
+    }
+}
+
+#[test]
+fn r2_retirement_rechecks_journal_and_resources_after_offer() {
+    for case in [
+        "record_replaced",
+        "record_changed",
+        "resource_changed",
+        "expired",
+    ] {
+        let f = Fixture::new();
+        let path = retirement_journal(&f, "stopped");
+        let package = fixture_package(1);
+        let proof = f.proof();
+        let service = f.service(&package);
+        let reply = f.reply(9, 1, |_| {});
+        let cancel = Cancellation::default();
+        let d = Deadline::new(5000, cancel.clone()).unwrap();
+        let input = retirement_input(&proof, &package, &service, Some(&reply), &d);
+        let mut repair = f.repair();
+        let candidate = repair.inspect_retire_unapplied(&input).unwrap();
+        match case {
+            "record_replaced" => {
+                let bytes = fs::read(&path).unwrap();
+                fs::rename(&path, path.with_extension("saved")).unwrap();
+                f.io.atomic_write(&proof, &path, &bytes).unwrap();
+            }
+            "record_changed" => {
+                retirement_journal(&f, "payload_pending");
+            }
+            "resource_changed" => fs::write(&f.installer.targets()[9], b"later edit").unwrap(),
+            "expired" => cancel.cancel(),
+            _ => unreachable!(),
+        }
+        assert!(
+            repair.retire_unapplied(candidate, &input).is_err(),
+            "{case}"
+        );
+        assert!(path.exists());
+        assert!(f.mutations().is_empty());
+    }
+}
+
+#[test]
+fn r2_native_binding_offers_discard_then_reoffers_repair_after_retirement() {
+    let f = Fixture::new();
+    let path = retirement_journal(&f, "stop_pending");
+    let package = fixture_package(1);
+    let mut binding = repairer(&f);
+    let offer = binding.inspect(Some(&package), NOW);
+    assert!(offer.discardable);
+    assert!(offer.resumable.is_none());
+    assert!(matches!(offer.repair, Availability::Unavailable(_)));
+    let reply = f.reply(9, 1, |_| {});
+    let finish = binding.discard(Some(&package), Some(&reply), NOW).unwrap();
+    assert_eq!(finish.outcome, Shown::Retired);
+    assert!(!finish.resumable);
+    assert!(!path.exists());
+    assert_eq!(
+        binding.inspect(Some(&package), NOW).repair,
+        Availability::Available
+    );
+    assert!(f.mutations().is_empty());
+}

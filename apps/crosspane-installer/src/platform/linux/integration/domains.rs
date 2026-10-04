@@ -180,6 +180,7 @@ pub trait Firewalls {
 /// What compatible repair offers for the install on this computer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepairOffer {
+    pub discardable: bool,
     /// `Available` only when the producer's inventory says the install is compatible; otherwise
     /// the typed guidance (for example "remove Crosspane and install it again").
     pub repair: Availability,
@@ -245,6 +246,15 @@ pub trait Repairer {
         status: Option<&AgentReply>,
         now_ms: u64,
     ) -> RepairStep;
+    /// Retire only a proved unapplied record, using fresh current evidence; default is refusal.
+    fn discard(
+        &mut self,
+        _package: Option<&Package>,
+        _status: Option<&AgentReply>,
+        _now_ms: u64,
+    ) -> Result<RepairFinish, String> {
+        Err("That earlier repair cannot be discarded. Nothing was changed.".into())
+    }
     /// Resume an interrupted repair from its record; one attempt, never a replay.
     fn resume(
         &mut self,
@@ -840,6 +850,7 @@ pub struct NoRepairer {
 impl Repairer for NoRepairer {
     fn inspect(&mut self, _: Option<&Package>, _: u64) -> RepairOffer {
         RepairOffer {
+            discardable: false,
             repair: Availability::Unavailable(self.reason.clone()),
             resumable: None,
         }

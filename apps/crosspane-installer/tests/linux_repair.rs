@@ -2245,6 +2245,164 @@ mod uninstall_tests {
             .unwrap();
         run.remove_files(&deadline()).unwrap();
     }
+    fn r2_record(f: &Fixture, stage: &str) -> PathBuf {
+        let paths = f.io.target().paths();
+        let path = paths
+            .state_home
+            .join("crosspane/installer/repair-intent.json");
+        let value = json!({"version":1,"operation":99,"revision":99,
+            "manifest":sha256(&serde_json::to_vec(package().manifest()).unwrap()),
+            "original_instance":9,"stage":stage,"target":{"uid":paths.uid,
+            "roots":[paths.home,paths.prefix,paths.config_home,paths.state_home,paths.data_home,paths.runtime_home],
+            "runtime_override":paths.runtime_override,"scratch":true}});
+        f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        path
+    }
+    fn r2_start(f: &Fixture, valid: bool) -> (UninstallRun, PathBuf) {
+        let p = package();
+        installed(f, &p);
+        let service = known_manager(f, &p, true);
+        let path = r2_record(f, "stopped");
+        if !valid {
+            fs::write(&path, b"unknown repair record").unwrap();
+        }
+        let (plan, consent) = planned(f, RemovalSelection::default(), Some(f.tracked()), 1, 100);
+        (plan.begin(consent, service, &deadline()).unwrap(), path)
+    }
+    #[test]
+    fn r2_ordered_uninstall_deletes_the_captured_fixed_repair_intent_only_after_clean_exit() {
+        let f = Fixture::new(false);
+        let (mut run, path) = r2_start(&f, true);
+        run.disable(&deadline()).unwrap();
+        assert!(path.exists());
+        run.stop(&deadline()).unwrap();
+        run.observe_exit(&deadline()).unwrap();
+        assert!(path.exists(), "stop/exit alone never deletes recovery");
+        let agent =
+            f.io.read(&f.io.target().agent_path(), 4 * 1024 * 1024, false)
+                .unwrap();
+        run.identity(sha256(&agent), f.environment(), &deadline())
+            .unwrap();
+        let result = run.remove_files(&deadline());
+        let issues = run
+            .report()
+            .issues
+            .iter()
+            .map(|i| match i {
+                UninstallIssue::RepairIntent(e) | UninstallIssue::Resource(_, e) => e.to_string(),
+                _ => format!("{i:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            result.is_ok(),
+            "result {} issues {issues:?}",
+            result.unwrap_err()
+        );
+        assert!(
+            !path.exists(),
+            "receipt-bound clean uninstall must retire the fixed repair journal"
+        );
+        assert_eq!(run.report().form, UninstallForm::Complete);
+    }
+    #[test]
+    fn r2_uninstall_retains_unknown_repair_records_and_replaced_captured_journals() {
+        for replacement in [false, true] {
+            let f = Fixture::new(false);
+            let (mut run, path) = r2_start(&f, replacement);
+            run.disable(&deadline()).unwrap();
+            run.stop(&deadline()).unwrap();
+            run.observe_exit(&deadline()).unwrap();
+            let agent =
+                f.io.read(&f.io.target().agent_path(), 4 * 1024 * 1024, false)
+                    .unwrap();
+            run.identity(sha256(&agent), f.environment(), &deadline())
+                .unwrap();
+            if replacement {
+                let bytes = fs::read(&path).unwrap();
+                fs::rename(&path, path.with_extension("original")).unwrap();
+                f.io.atomic_write(&f.proof, &path, &bytes).unwrap();
+            }
+            let before = fs::read(&path).unwrap();
+            let _ = run.remove_files(&deadline());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_ne!(run.report().form, UninstallForm::Complete);
+            assert!(
+                f.io.target().agent_path().exists(),
+                "unknown repair recovery is retained"
+            );
+        }
+    }
+    #[test]
+    fn r2_a_foreign_shaped_repair_journal_never_blocks_removal_and_is_kept() {
+        let f = Fixture::new(false);
+        let p = package();
+        installed(&f, &p);
+        let service = known_manager(&f, &p, true);
+        let path = r2_record(&f, "stopped");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let (plan, consent) = planned(&f, RemovalSelection::default(), Some(f.tracked()), 1, 100);
+        let mut run = plan.begin(consent, service, &deadline()).unwrap();
+        run.disable(&deadline()).unwrap();
+        finish_clean(&f, &mut run);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let report = run.report();
+        assert_ne!(report.form, UninstallForm::Complete);
+        assert!(report.recovery_retained);
+        assert!(f.io.target().agent_path().exists(), "recovery is kept");
+        let installer = PayloadInstaller::new(f.io.clone()).unwrap();
+        for index in [6, 7, 8, 9] {
+            assert!(
+                f.io.metadata(&installer.targets()[index])
+                    .unwrap()
+                    .is_none(),
+                "row {index} is still removed"
+            );
+        }
+    }
+    #[test]
+    fn r2_resume_after_a_crash_in_the_files_stage_never_deletes_the_repair_journal() {
+        let f = Fixture::new(false);
+        let (mut run, path) = r2_start(&f, true);
+        run.disable(&deadline()).unwrap();
+        run.stop(&deadline()).unwrap();
+        run.observe_exit(&deadline()).unwrap();
+        assert_clean_prerequisite(&run);
+        let agent =
+            f.io.read(&f.io.target().agent_path(), 4 * 1024 * 1024, false)
+                .unwrap();
+        run.identity(sha256(&agent), f.environment(), &deadline())
+            .unwrap();
+        let intent =
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/cleanup-intent.json");
+        let mut record =
+            CleanupIntent::decode(&f.io.read(&intent, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+        // Simulated crash after FilesObserved was persisted, before the journal step ran.
+        record.progress.stage = CleanupStage::FilesObserved;
+        f.io.atomic_write(&f.proof, &intent, &record.encode().unwrap())
+            .unwrap();
+        drop(run);
+        let before = fs::read(&path).unwrap();
+        let (plan, consent) = planned(&f, RemovalSelection::default(), None, 2, 200);
+        let mut resumed = plan
+            .resume(consent, Arc::new(f.service(&package())), &deadline())
+            .unwrap();
+        resumed.disable(&deadline()).unwrap();
+        finish(&f, &mut resumed);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "no clean authority on resume"
+        );
+        assert_ne!(resumed.report().form, UninstallForm::Complete);
+        assert!(resumed.report().recovery_retained);
+        assert!(f.io.target().agent_path().exists());
+    }
     #[test]
     fn clean_default_keep_removes_owned_files_after_real_original_exit() {
         let f = Fixture::new(false);

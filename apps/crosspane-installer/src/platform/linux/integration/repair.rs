@@ -304,6 +304,30 @@ fn unreachable_text() -> String {
 // ---- wording ----------------------------------------------------------------------------------
 
 /// Why nothing was changed: a refusal with the next step.
+/// Why a Discard didn't retire the record. Only the removal step can leave its outcome unknown.
+fn discard_guidance(error: &RepairError) -> String {
+    match error {
+        RepairError::Native(NativeError::OutcomeUnknown) => {
+            "Setup couldn't tell whether the earlier repair record was discarded. No installed \
+             file was touched. Go back and open this page again to check."
+                .to_owned()
+        }
+        RepairError::NotReady => format!(
+            "Discarding the record needs the installed Crosspane to answer as healthy, or to be \
+             fully stopped. Start Crosspane and try again. Nothing was changed. If it still \
+             can't be discarded, {}",
+            REMOVE_AND_REINSTALL.to_lowercase()
+        ),
+        RepairError::RecoveryPending
+        | RepairError::Native(NativeError::Foreign | NativeError::Invalid) => format!(
+            "The earlier repair record no longer shows a repair that stopped before replacing \
+             any file, or the install doesn't match what setup recorded, so the record was kept. \
+             Nothing was changed. {REMOVE_AND_REINSTALL}"
+        ),
+        other => guidance(other),
+    }
+}
+
 fn guidance(error: &RepairError) -> String {
     let foreign = format!(
         "Some files where Crosspane installs weren't put there by Crosspane, or were taken over \
@@ -627,6 +651,7 @@ impl Repairer for NativeRepairer {
     fn inspect(&mut self, package: Option<&Package>, now_ms: u64) -> RepairOffer {
         self.held = None;
         let unavailable = |text: String| RepairOffer {
+            discardable: false,
             repair: Availability::Unavailable(text),
             resumable: None,
         };
@@ -643,12 +668,28 @@ impl Repairer for NativeRepairer {
             Err(text) => return unavailable(text),
         };
         let input = input(&proof, package, &service, None, now_ms, &deadline);
+        if self.active.is_none()
+            && self
+                .new_repair()
+                .is_ok_and(|repair| repair.inspect_retire_unapplied(&input).is_ok())
+        {
+            return RepairOffer {
+                discardable: true,
+                repair: Availability::Unavailable(
+                    "An earlier repair stopped before changing anything: no installed file was \
+                     replaced. Discard its record to review repair again."
+                        .into(),
+                ),
+                resumable: None,
+            };
+        }
         // An earlier repair's record decides first: while one is unfinished no new repair can
         // start.
         match self.earlier(&input) {
             Ok(Earlier::None) => {}
             Ok(Earlier::Unfinished(result)) => {
                 return RepairOffer {
+                    discardable: false,
                     repair: Availability::Unavailable(
                         "An earlier repair didn't finish. Resume it first; nothing else can be \
                          repaired until it is settled."
@@ -684,11 +725,44 @@ impl Repairer for NativeRepairer {
             });
         match compatible {
             Ok(()) => RepairOffer {
+                discardable: false,
                 repair: Availability::Available,
                 resumable: None,
             },
             Err(text) => unavailable(text),
         }
+    }
+
+    fn discard(
+        &mut self,
+        package: Option<&Package>,
+        status: Option<&AgentReply>,
+        now_ms: u64,
+    ) -> Result<RepairFinish, String> {
+        self.held = None;
+        if self.active.is_some() {
+            return Err(guidance(&RepairError::RecoveryPending));
+        }
+        let package = Self::package(package)?;
+        let deadline = stage_deadline(READ_MS)?;
+        let proof = self.proof(package)?;
+        let service = self.service(package, &deadline)?;
+        let input = input(&proof, package, &service, status, now_ms, &deadline);
+        let mut repair = self.new_repair()?;
+        let candidate = repair
+            .inspect_retire_unapplied(&input)
+            .map_err(|e| discard_guidance(&e))?;
+        repair
+            .retire_unapplied(candidate, &input)
+            .map_err(|e| discard_guidance(&e))?;
+        Ok(RepairFinish {
+            outcome: Shown::Retired,
+            lines: vec![
+                "The earlier repair record was discarded. Installed files were kept unchanged."
+                    .into(),
+            ],
+            resumable: false,
+        })
     }
 
     fn plan(

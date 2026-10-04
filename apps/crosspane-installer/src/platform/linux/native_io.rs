@@ -2,6 +2,7 @@
 mod cleanup;
 pub use cleanup::CleanupLease;
 pub use cleanup::CleanupProof;
+pub(crate) use cleanup::RepairJournalSnapshot;
 mod removal;
 pub mod tutorial;
 use crate::agent_contract::{BootstrapV1, InstanceStatus, ObservationSource, parse_bootstrap};

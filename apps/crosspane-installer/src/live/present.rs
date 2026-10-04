@@ -76,6 +76,7 @@ pub(super) enum RepairPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AwaitKind {
     Plan,
+    Discard,
     Confirm { plan: u64, revision: u64 },
     Resume,
 }
@@ -93,6 +94,8 @@ struct AwaitStatus {
 #[derive(Default)]
 pub(super) struct RepairState {
     pub phase: RepairPhase,
+    pub discardable: bool,
+    discarding: bool,
     /// The number of the preview on screen.
     pub plan: Option<u64>,
     pub preview: Option<String>,
@@ -411,6 +414,7 @@ impl LiveController {
         let repair = &m.repair_state;
         if let Some(end) = &repair.finished {
             let head = match end.outcome {
+                RepairOutcome::Retired => "The earlier repair record was discarded.",
                 RepairOutcome::Verified => {
                     "Crosspane was repaired. The new instance reported healthy."
                 }
@@ -905,6 +909,15 @@ impl LiveController {
                 ButtonKind::Primary,
             ));
         }
+        if repair.discardable && m.refused.is_none() {
+            buttons.push(button(
+                ids::REPAIR_DISCARD,
+                ButtonRole::Confirm,
+                "Discard",
+                !repair.engaged() && !m.planning && !m.confirmed && m.preview.is_none(),
+                ButtonKind::Secondary,
+            ));
+        }
         if repair.resume_offered() && m.refused.is_none() {
             // Not while a removal is being reviewed or runs: one change at a time.
             buttons.push(button(
@@ -1101,6 +1114,7 @@ impl LiveController {
             ids::REPAIR => self.review_repair(),
             ids::REPAIR_CONFIRM => self.confirm_repair(),
             ids::REPAIR_RESUME => self.resume_repair(),
+            ids::REPAIR_DISCARD => self.discard_repair(),
             other => self.ranged_button(other),
         }
         false
@@ -1260,6 +1274,22 @@ impl LiveController {
         self.await_repair_status(AwaitKind::Confirm { plan, revision }, RepairPhase::Running);
     }
 
+    fn discard_repair(&mut self) {
+        let m = &self.maintenance;
+        if m.current.is_none()
+            || !m.repair_state.discardable
+            || m.repair_state.engaged()
+            || m.planning
+            || m.confirmed
+            || m.preview.is_some()
+            || m.refused.is_some()
+        {
+            return;
+        }
+        self.maintenance.repair_state.discarding = true;
+        self.await_repair_status(AwaitKind::Discard, RepairPhase::Running);
+    }
+
     fn resume_repair(&mut self) {
         let m = &self.maintenance;
         if m.current.is_none()
@@ -1298,6 +1328,7 @@ impl LiveController {
         };
         self.submit_maintenance(match kind {
             AwaitKind::Plan => MaintenanceRequest::PlanRepair { id, status },
+            AwaitKind::Discard => MaintenanceRequest::DiscardRepair { id, status },
             AwaitKind::Confirm { plan, revision } => MaintenanceRequest::ConfirmRepair {
                 id,
                 plan,
@@ -1487,6 +1518,8 @@ impl LiveController {
             | MaintenanceReport::FollowUp { id, .. }
             | MaintenanceReport::Finished { id, .. }
             | MaintenanceReport::Refused { id, .. }
+            | MaintenanceReport::RepairDiscardable { id, .. }
+            | MaintenanceReport::RepairDiscarded { id, .. }
             | MaintenanceReport::RepairPlanned { id, .. }
             | MaintenanceReport::RepairResumable { id, .. }
             | MaintenanceReport::RepairWaiting { id, .. }
@@ -1495,9 +1528,30 @@ impl LiveController {
         if self.maintenance.current != Some(id) {
             return;
         }
+        if let MaintenanceReport::RepairDiscarded { lines, .. } = &report {
+            let r = &self.maintenance.repair_state;
+            if r.discarding && r.phase == RepairPhase::Running && r.awaiting.is_none() {
+                let lines = lines
+                    .iter()
+                    .take(MAX_PROGRESS_LINES)
+                    .cloned()
+                    .map(bounded)
+                    .collect();
+                self.inspect_maintenance();
+                self.maintenance.progress = lines;
+            }
+            return;
+        }
         let (now, next_call) = (self.now, self.next_call);
         let m = &mut self.maintenance;
         match report {
+            MaintenanceReport::RepairDiscardable { .. }
+                if m.repair_state.phase == RepairPhase::Idle =>
+            {
+                m.repair_state.discardable = true;
+            }
+            MaintenanceReport::RepairDiscardable { .. }
+            | MaintenanceReport::RepairDiscarded { .. } => {}
             MaintenanceReport::Inspected {
                 uninstall,
                 repair,

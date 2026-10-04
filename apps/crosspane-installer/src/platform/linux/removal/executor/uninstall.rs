@@ -56,6 +56,7 @@ pub enum UninstallIssue {
     ),
     Resource(usize, RemovalError),
     Durability(RemovalError),
+    RepairIntent(RemovalError),
 }
 /// Data-only partial results. Empty Crosspane directories remain: the ledger owns files only.
 pub struct UninstallReport {
@@ -107,6 +108,7 @@ pub struct UninstallRun {
     pub(super) rule_serial: u64,
     pub(super) rule_pending: Option<(RuleKind, OperationId, Arc<()>)>,
     renewed_unit_stop: Option<RenewedUnitStop>,
+    repair_intent_removed: bool,
 }
 type_only_debug!(
     UninstallError,
@@ -303,6 +305,7 @@ impl UninstallPlan {
             rule_serial: 0,
             rule_pending: None,
             renewed_unit_stop: None,
+            repair_intent_removed: false,
         };
         run.guarded(|run| {
             let old = run
@@ -592,6 +595,27 @@ impl UninstallRun {
             run.mark(CleanupStage::FilesObserved);
             run.persist(deadline)?;
             for index in [6, 7, 8, 9, 5, 2, 4, 1, 3, 0] {
+                // Recovery LAST, while the executable and genuine original clean evidence still
+                // exist. FilesObserved was persisted before dispatch; resume never retries this
+                // deletion or reconstructs its lost clean authority.
+                if index == 5 && run.recovery_permitted() {
+                    run.clean
+                        .as_ref()
+                        .ok_or(UninstallError::Invalid)?
+                        .revalidate(deadline)?;
+                    match run
+                        .plan
+                        .cleanup
+                        .with_lease(&run.consent.cleanup, deadline, |lease| {
+                            Ok(lease.delete_repair_journal(deadline))
+                        })? {
+                        Ok(_) => run.repair_intent_removed = true,
+                        Err(error) => {
+                            run.issues.push(UninstallIssue::RepairIntent(error.into()));
+                            return Err(RemovalError::Native(NativeError::OutcomeUnknown).into());
+                        }
+                    }
+                }
                 if run.resume.is_some() && run.progress.resources[index] != CleanupResult::Pending {
                     // Unknown is a published per-file intent without a proved outcome, not retry authority.
                     continue;
@@ -642,6 +666,7 @@ impl UninstallRun {
     }
     fn recovery_permitted(&self) -> bool {
         self.clean.is_some()
+            && self.plan.cleanup.inventory.repair_journal_valid
             && self.resume.is_none()
             && matches!(
                 self.progress.autostart,
@@ -672,6 +697,7 @@ impl UninstallRun {
     }
     pub fn report(&self) -> UninstallReport {
         let complete = self.stage == UninstallStage::Finished
+            && self.repair_intent_removed
             && self.recovery_permitted()
             && self
                 .progress
