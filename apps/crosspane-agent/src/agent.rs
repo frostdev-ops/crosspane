@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 
 use crate::audio::{AudioWorker, WorkerEvent, WorkerStats};
 use crate::ctl::{Request, Response};
-use crate::media::{DestCmd, ProxyIds, Shape, SourceCmd, SourceSender};
+use crate::media::{Capture, DestCmd, ProxyIds, Shape, SourceCmd, SourceSender};
 use crate::net::Net;
 use crate::platform::{self, Platform};
 use crate::tray::{self, PairingView, PeerView, RemoteWindows, TrayAction, TrayView};
@@ -63,6 +63,8 @@ struct TwinVideo {
     max_fps: u32,
     active: Arc<AtomicU64>,
     fence: Arc<std::sync::Mutex<()>>,
+    /// The logical stream's capture in the media layer, the same across backend swaps.
+    capture: Capture,
 }
 
 #[cfg(target_os = "linux")]
@@ -620,7 +622,12 @@ pub struct Agent {
     dest_media: Sender<DestCmd>,
     host: Option<Box<dyn ProxyCommands>>,
     proxy_ids: ProxyIds,
-    streams: HashMap<StreamId, ProjectionId>,
+    /// Each running capture's projection and its identity in the media layer.
+    streams: HashMap<StreamId, (ProjectionId, Capture)>,
+    /// Numbers whose next `StopCapture` is the engine replacing a capture that is already
+    /// retired here: the backend numbered the projection's replacement like the capture it
+    /// replaces, so that stop names the retired capture, not the replacement.
+    stale_stops: HashMap<StreamId, ProjectionId>,
     projections: BTreeMap<ProjectionKey, String>,
     events: Sender<Event>,
     crossing: bool,
@@ -897,6 +904,7 @@ impl Agent {
             host: e2.host.map(|h| Box::new(h) as Box<dyn ProxyCommands>),
             proxy_ids: e2.proxy_ids,
             streams: HashMap::new(),
+            stale_stops: HashMap::new(),
             projections: BTreeMap::new(),
             events: e2.events,
             crossing: e2.crossing,
@@ -2273,8 +2281,17 @@ impl Agent {
                 crop,
                 max_fps,
             } => {
+                // Opened before the backend can call back: all the capture delivers carries it.
+                let Some(capture) = self.source_media.open_capture() else {
+                    let error = PlatformError::Backend("capture identities used up".into());
+                    self.pending.push_back(Input::CaptureStarted {
+                        projection,
+                        result: Err(failure(error)),
+                    });
+                    return;
+                };
                 #[cfg(target_os = "linux")]
-                let mut route = self.twin_video_route(target, crop);
+                let mut route = self.twin_video_route(target, crop, &capture);
                 #[cfg(target_os = "linux")]
                 if let Some(route) = &mut route {
                     route.max_fps = max_fps;
@@ -2300,6 +2317,7 @@ impl Agent {
                 #[cfg(not(target_os = "linux"))]
                 let mapped = Ok::<_, PlatformError>((target, crop));
                 let sink = self.video_sink(
+                    capture.clone(),
                     #[cfg(target_os = "linux")]
                     route.as_ref().map(|r| r.delivery.clone()),
                     #[cfg(target_os = "linux")]
@@ -2332,7 +2350,26 @@ impl Agent {
                         route.active.store(stream.0, AtomicOrdering::Release);
                         self.twin_video.insert(stream, route);
                     }
-                    self.streams.insert(stream, projection);
+                    if let Some((older, retired)) =
+                        self.streams.insert(stream, (projection, capture.clone()))
+                    {
+                        // The backend numbered this capture like one still running: the number
+                        // now means the new capture, and the older one can't be reached by it.
+                        self.source_media.stop(&retired);
+                        if older == projection {
+                            // A replacement: the engine stops the capture it replaces by number.
+                            self.stale_stops.insert(stream, projection);
+                        } else {
+                            // Which of the two a later stop of this number means is unknown
+                            // here; it ends the new one too rather than let either run unseen.
+                            tracing::warn!(
+                                stream = stream.0,
+                                projection = older.0,
+                                "a capture was given another projection's running capture's \
+                                 number; the older one ends"
+                            );
+                        }
+                    }
                     if let CaptureTarget::Display(display) = target {
                         self.capture_display.insert(projection, display);
                     }
@@ -2342,7 +2379,7 @@ impl Agent {
                             .is_some_and(|p| p.features.iter().any(|f| f == feature))
                     };
                     let _ = self.source_media.send(SourceCmd::Start {
-                        stream,
+                        capture,
                         projection,
                         peer,
                         video: has("h264"),
@@ -2355,6 +2392,7 @@ impl Agent {
                         self.twin_video_replay(stream, stream, first);
                     }
                 } else {
+                    self.source_media.stop(&capture);
                     #[cfg(target_os = "linux")]
                     if let Some(first) = first
                         && let Ok(mut first) = first.lock()
@@ -2381,6 +2419,11 @@ impl Agent {
                 }
             }
             Output::StopCapture { stream } => {
+                if self.stale_stops.remove(&stream).is_some() {
+                    // The replaced capture's stop: it is retired already, and the backend's
+                    // stream of this number is now the replacement's.
+                    return;
+                }
                 #[cfg(target_os = "linux")]
                 let mut backend = stream;
                 #[cfg(target_os = "linux")]
@@ -2389,7 +2432,7 @@ impl Agent {
                 let backend = stream;
                 #[cfg(target_os = "linux")]
                 if let Some(mut route) = self.twin_video.remove(&stream) {
-                    // Finish any accepted enqueue before Stop clears the logical-stream mailbox.
+                    // Finish any accepted enqueue before the capture's stop clears its mailbox.
                     let fence = route.fence.lock().ok();
                     route.delivery.store(u64::MAX, AtomicOrdering::Release);
                     drop(fence);
@@ -2400,10 +2443,10 @@ impl Agent {
                     }
                     backend = route.backend;
                 }
-                if let Some(projection) = self.streams.remove(&stream) {
+                if let Some((projection, capture)) = self.streams.remove(&stream) {
                     self.capture_display.remove(&projection);
+                    self.source_media.stop(&capture);
                 }
-                let _ = self.source_media.send(SourceCmd::Stop { stream });
                 #[cfg(target_os = "linux")]
                 if closed.is_some() {
                     self.twin_video_stop_backend(backend);
@@ -2753,6 +2796,13 @@ impl Agent {
             Notice::ProjectionEnded { key, reason } => {
                 self.tracker.projection_ended(self.node, *key, *reason);
                 self.projections.remove(key);
+                // Only this node's own projection: a peer's may carry the same number.
+                if key.source == self.node {
+                    self.stale_stops.retain(|_, p| *p != key.projection);
+                    let _ = self.source_media.send(SourceCmd::Retire {
+                        projection: key.projection,
+                    });
+                }
                 format!("projection {} ended: {reason:?}", key.projection.0)
             }
             Notice::ProjectionRefused { peer, reason } => {
@@ -3404,8 +3454,11 @@ impl Agent {
         }
     }
 
+    /// The sink for `capture`'s callbacks: its pictures and cursors go to the media layer under
+    /// that capture, whatever stream number the backend gives them.
     fn video_sink(
         &self,
+        capture: Capture,
         #[cfg(target_os = "linux")] delivery: Option<Arc<AtomicU64>>,
         #[cfg(target_os = "linux")] first: Option<Arc<std::sync::Mutex<TwinFirstFrame>>>,
         #[cfg(target_os = "linux")] link: Option<TwinLink>,
@@ -3495,7 +3548,7 @@ impl Agent {
                 ev
             };
             match ev {
-                FrameEvent::Frame { stream, frame } => {
+                FrameEvent::Frame { frame, .. } => {
                     #[cfg(target_os = "linux")]
                     if delivery
                         .as_ref()
@@ -3503,15 +3556,21 @@ impl Agent {
                     {
                         return;
                     }
-                    let _ = media.send(SourceCmd::Frame { stream, frame });
+                    let _ = media.send(SourceCmd::Frame {
+                        capture: capture.clone(),
+                        frame,
+                    });
                 }
-                FrameEvent::Cursor { stream, cursor } => {
+                FrameEvent::Cursor { cursor, .. } => {
                     let cursor = cursor.map_or(Shape::Hidden, Shape::Image);
-                    let _ = media.send(SourceCmd::Cursor { stream, cursor });
-                }
-                FrameEvent::CursorDefault { stream } => {
                     let _ = media.send(SourceCmd::Cursor {
-                        stream,
+                        capture: capture.clone(),
+                        cursor,
+                    });
+                }
+                FrameEvent::CursorDefault { .. } => {
+                    let _ = media.send(SourceCmd::Cursor {
+                        capture: capture.clone(),
                         cursor: Shape::Default,
                     });
                 }
@@ -3535,6 +3594,7 @@ impl Agent {
         &self,
         target: CaptureTarget,
         crop: Option<PixelRect>,
+        capture: &Capture,
     ) -> Option<TwinVideo> {
         #[cfg(test)]
         if self.twin_geometry.is_none() && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none()
@@ -3562,6 +3622,7 @@ impl Agent {
             max_fps: 0,
             active: Arc::new(AtomicU64::new(0)),
             fence: Arc::new(std::sync::Mutex::new(())),
+            capture: capture.clone(),
         })
     }
 
@@ -3713,7 +3774,10 @@ impl Agent {
             frame.damage = None;
             first.full = false;
             drop(first);
-            let _ = self.source_media.send(SourceCmd::Frame { stream, frame });
+            let _ = self.source_media.send(SourceCmd::Frame {
+                capture: route.capture.clone(),
+                frame,
+            });
         }
     }
 
@@ -3775,6 +3839,7 @@ impl Agent {
             ..Default::default()
         }));
         let sink = self.video_sink(
+            route.capture.clone(),
             Some(route.delivery.clone()),
             Some(first.clone()),
             Some(TwinLink {
@@ -6993,17 +7058,15 @@ mod twin_video_tests {
             CaptureTarget::Display(DisplayId(2)),
             Some(rect(&geometry())),
         );
-        assert!(matches!(
-            source.try_recv().unwrap(),
-            SourceCmd::Start {
-                stream: StreamId(101),
-                ..
-            }
-        ));
-        let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+        let SourceCmd::Start { capture, .. } = source.try_recv().unwrap() else {
+            panic!("media start must come first");
+        };
+        let logical = capture.id();
+        assert_eq!(rig.agent.streams[&StreamId(101)].1.id(), logical);
+        let SourceCmd::Frame { capture, frame } = source.try_recv().unwrap() else {
             panic!("first frame lost");
         };
-        assert_eq!(stream, StreamId(101));
+        assert_eq!(capture.id(), logical);
         assert_eq!(frame.size, geometry().size);
         assert_eq!(frame.cpu_pixels().unwrap().0[0], 2);
         assert_eq!(
@@ -7011,7 +7074,19 @@ mod twin_video_tests {
             "all startup edits are covered without another capture"
         );
         assert!(source.try_recv().is_err()); // Backend emits nothing after returning.
-        rig.agent.execute_one(Output::StopCapture { stream });
+        rig.agent.execute_one(Output::StopCapture {
+            stream: StreamId(101),
+        });
+    }
+
+    /// The capture the next media Start binds (the logical stream's, across backend swaps);
+    /// what is queued before that Start is skipped.
+    fn started(source: &mpsc::Receiver<SourceCmd>) -> crate::media::CaptureId {
+        loop {
+            if let SourceCmd::Start { capture, .. } = source.try_recv().unwrap() {
+                return capture.id();
+            }
+        }
     }
 
     fn sink_for(log: &Arc<Mutex<Recorded>>, stream: StreamId) -> Arc<dyn EventSink<FrameEvent>> {
@@ -7034,6 +7109,7 @@ mod twin_video_tests {
             .insert(second.window, second.clone());
         log.lock().unwrap().emit_first = true;
         let peer = rig.peer;
+        let mut logical = Vec::new();
         for display in [DisplayId(2), DisplayId(3)] {
             start(
                 &mut rig.agent,
@@ -7041,6 +7117,7 @@ mod twin_video_tests {
                 CaptureTarget::Display(display),
                 Some(rect(&geometry())),
             );
+            logical.push(started(&source));
         }
         assert_eq!(
             log.lock().unwrap().starts,
@@ -7059,13 +7136,10 @@ mod twin_video_tests {
         rig.agent.home.active = false;
         rig.agent.twin_video_home();
         for stream in [StreamId(101), StreamId(102)] {
-            let SourceCmd::Frame {
-                stream: logical, ..
-            } = source.try_recv().unwrap()
-            else {
+            let SourceCmd::Frame { capture, .. } = source.try_recv().unwrap() else {
                 panic!("handoff first frame missing");
             };
-            assert!([StreamId(101), StreamId(102)].contains(&logical));
+            assert!(logical.contains(&capture.id()));
             assert!(!rig.agent.twin_video[&stream].output);
         }
         assert!(source.try_recv().is_err());
@@ -7096,13 +7170,7 @@ mod twin_video_tests {
             CaptureTarget::Display(DisplayId(2)),
             Some(rect(&geometry())),
         );
-        assert!(matches!(
-            source.try_recv().unwrap(),
-            SourceCmd::Start {
-                stream: StreamId(101),
-                ..
-            }
-        ));
+        let logical = started(&source);
         let old = sink_for(&log, StreamId(101));
         rig.agent.home.active = true;
         rig.agent.twin_video_home();
@@ -7123,10 +7191,10 @@ mod twin_video_tests {
                 stream: StreamId(102),
                 frame: colored_frame(value, 4),
             });
-            let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+            let SourceCmd::Frame { capture, frame } = source.try_recv().unwrap() else {
                 panic!("new video missing");
             };
-            assert_eq!(stream, StreamId(101));
+            assert_eq!(capture.id(), logical);
             assert_eq!(frame.damage, expected);
         }
         rig.agent.execute_one(Output::SetCaptureCrop {
@@ -7154,12 +7222,14 @@ mod twin_video_tests {
             stream: StreamId(103),
             frame: colored_frame(3, 12),
         });
-        let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+        let SourceCmd::Frame { capture, frame } = source.try_recv().unwrap() else {
             panic!("Window restart missing");
         };
-        assert_eq!(stream, StreamId(101));
+        assert_eq!(capture.id(), logical);
         assert_eq!(frame.damage, None);
-        assert_eq!(rig.agent.streams[&stream], ProjectionId(1));
+        let stream = StreamId(101);
+        assert_eq!(rig.agent.streams[&stream].0, ProjectionId(1));
+        assert_eq!(rig.agent.streams[&stream].1.id(), logical);
         rig.agent.execute_one(Output::StopCapture { stream });
         assert!(rig.agent.retired_twin_video.is_empty());
         assert_eq!(
@@ -7183,10 +7253,10 @@ mod twin_video_tests {
             CaptureTarget::Display(DisplayId(2)),
             Some(rect(&geometry())),
         );
-        assert!(matches!(
-            commands.try_recv().unwrap(),
-            SourceCmd::Start { .. }
-        ));
+        let SourceCmd::Start { capture, .. } = commands.try_recv().unwrap() else {
+            panic!("no media start");
+        };
+        let queue = capture.id();
         let emit = |backend, id| {
             sink_for(&log, backend).send(FrameEvent::Frame {
                 stream: backend,
@@ -7206,7 +7276,7 @@ mod twin_video_tests {
             commands.try_recv().unwrap(),
             SourceCmd::FramesReady { .. }
         ));
-        let encoding = sender.take_frame(logical).unwrap();
+        let encoding = sender.take_frame(queue).unwrap();
         emit(logical, 2);
         emit(logical, 3);
         for iteration in 0..20 {
@@ -7241,7 +7311,7 @@ mod twin_video_tests {
             1,
             "one wake and no logical encoder restart"
         );
-        let newest = sender.take_frame(logical).unwrap();
+        let newest = sender.take_frame(queue).unwrap();
         assert_eq!(
             newest.damage, None,
             "each new route's first image refreshes the full destination"
@@ -7404,10 +7474,13 @@ mod twin_video_tests {
                         stream: StreamId(103),
                         frame: colored_frame(4, 8),
                     });
-                    let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+                    let SourceCmd::Frame { capture, frame } = source.try_recv().unwrap() else {
                         panic!("previous route missing");
                     };
-                    assert_eq!(stream, StreamId(101));
+                    assert_eq!(
+                        capture.id(),
+                        rig.agent.twin_video[&StreamId(101)].capture.id()
+                    );
                     assert_eq!(frame.damage, None);
                     assert_eq!(log.lock().unwrap().sinks.len(), 1);
                 } else {
@@ -7502,19 +7575,20 @@ mod twin_video_tests {
                         .load(AtomicOrdering::Acquire),
                     video_size(geometry().size)
                 );
-                let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+                let bound = rig.agent.twin_video[&logical].capture.id();
+                let SourceCmd::Frame { capture, frame } = source.try_recv().unwrap() else {
                     panic!("fallback replay missing");
                 };
-                assert_eq!(stream, logical);
+                assert_eq!(capture.id(), bound);
                 assert_eq!(frame.damage, None);
                 sink_for(&log, StreamId(103)).send(FrameEvent::Frame {
                     stream: StreamId(103),
                     frame: colored_frame(7, 11),
                 });
-                let SourceCmd::Frame { stream, frame } = source.try_recv().unwrap() else {
+                let SourceCmd::Frame { capture, frame } = source.try_recv().unwrap() else {
                     panic!("fallback not live");
                 };
-                assert_eq!(stream, logical);
+                assert_eq!(capture.id(), bound);
                 assert_eq!(frame.cpu_pixels().unwrap().0[0], 7);
             } else {
                 assert_eq!(failed, 1);
@@ -7612,6 +7686,7 @@ mod twin_video_tests {
             ..Default::default()
         }));
         let startup = rig.agent.video_sink(
+            route.capture.clone(),
             Some(route.delivery.clone()),
             Some(first.clone()),
             Some(TwinLink {
@@ -19062,5 +19137,431 @@ mod fullscreen_wiring_tests {
             ]
         );
         assert!(calls.iter().all(|(thread, _, _)| *thread != owner));
+    }
+}
+
+#[cfg(test)]
+mod media_continuity_tests {
+    //! WP-2.46e2: a projection's pictures and cursor shapes stay numbered across a capture
+    //! replacement, and nothing of a retired capture reaches the network, even when a backend
+    //! hands a stream number out again. Each test follows the media from the backend's callbacks
+    //! through the agent and the encoder to the packets sent and what the destination shows.
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::media::recorded;
+    use crosspane_media::tiles::TileDecoder;
+    use crosspane_media::wire::{Codec, read_codec, read_cursor, read_header};
+    use crosspane_platform::{CursorImage, Frame, FrameCapture};
+    use crosspane_protocol::projection::ProjectionEndReason;
+    use crosspane_types::geom::PixelRect;
+    use crosspane_types::time::MonoTime;
+    use std::sync::Mutex;
+
+    const P: ProjectionId = ProjectionId(10);
+    const Q: ProjectionId = ProjectionId(11);
+
+    type Sink = Arc<dyn EventSink<FrameEvent>>;
+    type OnStart = Box<dyn FnOnce(&Sink) + Send>;
+
+    /// A backend that numbers each stream as it's told to, a number in use included.
+    #[derive(Default)]
+    struct Backend {
+        numbers: VecDeque<StreamId>,
+        on_start: Option<OnStart>,
+        sinks: Vec<Sink>,
+    }
+
+    struct Frames(Arc<Mutex<Backend>>);
+
+    impl FrameCapture for Frames {
+        fn start(
+            &mut self,
+            _: CaptureTarget,
+            _: Option<PixelRect>,
+            _: u32,
+            sink: Sink,
+        ) -> Result<StreamId, PlatformError> {
+            let mut backend = self.0.lock().unwrap();
+            let stream = backend.numbers.pop_front().unwrap();
+            backend.sinks.push(sink.clone());
+            let on_start = backend.on_start.take();
+            drop(backend);
+            // A capture's callbacks may come before start returns, so before the agent's Start.
+            if let Some(on_start) = on_start {
+                on_start(&sink);
+            }
+            Ok(stream)
+        }
+        fn set_crop(&mut self, _: StreamId, _: Option<PixelRect>) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn stop(&mut self, _: StreamId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    struct Harness {
+        rig: super::audio_tests::Rig,
+        backend: Arc<Mutex<Backend>>,
+        encoder: recorded::Encoder,
+        sent: Vec<Arc<[u8]>>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let mut rig = super::audio_tests::rig(false);
+            let backend = Arc::new(Mutex::new(Backend::default()));
+            rig.agent.platform.frames = Some(Box::new(Frames(backend.clone())));
+            rig.agent.peers.insert(
+                rig.peer,
+                PeerInfo {
+                    features: vec!["cursor".into()],
+                    connected: true,
+                    ..PeerInfo::default()
+                },
+            );
+            let (sender, queued) = recorded::queued();
+            rig.agent.source_media = sender;
+            Self {
+                rig,
+                backend,
+                encoder: queued.run(),
+                sent: Vec::new(),
+            }
+        }
+
+        /// Start a capture for `projection` that the backend numbers `stream`; its sink.
+        fn start(&mut self, projection: ProjectionId, stream: u64) -> Sink {
+            self.start_with(projection, stream, |_| {})
+        }
+
+        /// The same, with the backend calling back through `on_start` before start returns.
+        fn start_with(
+            &mut self,
+            projection: ProjectionId,
+            stream: u64,
+            on_start: impl FnOnce(&Sink) + Send + 'static,
+        ) -> Sink {
+            {
+                let mut backend = self.backend.lock().unwrap();
+                backend.numbers.push_back(StreamId(stream));
+                backend.on_start = Some(Box::new(on_start));
+            }
+            let peer = self.rig.peer;
+            self.rig.agent.execute_one(Output::StartCapture {
+                projection,
+                peer,
+                target: CaptureTarget::Window(WindowId(5)),
+                crop: None,
+                max_fps: 30,
+            });
+            assert!(matches!(
+                self.rig.agent.pending.pop_back(),
+                Some(Input::CaptureStarted { result: Ok(started), .. }) if started == StreamId(stream)
+            ));
+            self.backend.lock().unwrap().sinks.last().unwrap().clone()
+        }
+
+        fn stop(&mut self, stream: u64) {
+            self.rig.agent.execute_one(Output::StopCapture {
+                stream: StreamId(stream),
+            });
+        }
+
+        fn ended(&mut self, source: NodeId, projection: ProjectionId) {
+            self.rig.agent.notice(&Notice::ProjectionEnded {
+                key: ProjectionKey { source, projection },
+                reason: ProjectionEndReason::Returned,
+            });
+        }
+
+        /// Wait until the encoder has sent everything that is queued.
+        fn settle(&mut self) {
+            self.encoder.settle();
+            self.sent.extend(self.encoder.sent());
+        }
+
+        fn packets(&self, projection: ProjectionId, codec: Codec) -> Vec<Arc<[u8]>> {
+            self.sent
+                .iter()
+                .filter(|data| {
+                    read_codec(data).unwrap() == codec
+                        && read_header(data).unwrap().projection == projection.0
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// `projection`'s pictures as sent: each one's number and the colour it shows.
+        fn pictures(&self, projection: ProjectionId) -> Vec<(u64, Option<u8>)> {
+            let mut decoder = TileDecoder::new();
+            self.packets(projection, Codec::Tiles)
+                .iter()
+                .map(|data| {
+                    let seq = read_header(data).unwrap().seq;
+                    (seq, decoder.apply(data).ok().map(|_| decoder.canvas().0[0]))
+                })
+                .collect()
+        }
+
+        /// `projection`'s cursor shapes as sent: each one's number and colour.
+        fn cursors(&self, projection: ProjectionId) -> Vec<(u64, u8)> {
+            self.packets(projection, Codec::Cursor)
+                .iter()
+                .map(|data| {
+                    let cursor = read_cursor(data).unwrap();
+                    (cursor.header.seq, cursor.pixels[0])
+                })
+                .collect()
+        }
+
+        /// The colour the destination shows for `projection`, given everything sent for it.
+        fn shown(&self, projection: ProjectionId) -> Option<u8> {
+            let pictures = self.packets(projection, Codec::Tiles);
+            recorded::shown(self.rig.local, projection, &pictures).map(|(_, pixels)| pixels[0])
+        }
+
+        /// Whether the destination shows each of `projection`'s cursor shapes.
+        fn cursors_taken(&self, projection: ProjectionId) -> Vec<bool> {
+            recorded::cursors_taken(&self.packets(projection, Codec::Cursor))
+        }
+    }
+
+    fn frame(sink: &Sink, stream: u64, color: u8) {
+        let pixels: Vec<u8> = (0..64).flat_map(|_| [color, 0, 0, 255]).collect();
+        sink.send(FrameEvent::Frame {
+            stream: StreamId(stream),
+            frame: Frame::cpu(
+                PixelSize::new(8, 8),
+                32,
+                pixels.into(),
+                None,
+                MonoTime::ZERO,
+            ),
+        });
+    }
+
+    fn cursor(sink: &Sink, stream: u64, color: u8) {
+        sink.send(FrameEvent::Cursor {
+            stream: StreamId(stream),
+            cursor: Some(CursorImage {
+                size: PixelSize::new(1, 1),
+                hotspot: (0, 0),
+                pixels: Arc::from([color, 0, 0, 255]),
+            }),
+        });
+    }
+
+    /// The bug: a new capture of the same projection started its numbers over, and the
+    /// destination, which numbers per projection, dropped its pictures and cursors as stale.
+    #[test]
+    fn a_replacement_capture_continues_the_projections_numbers_and_is_shown() {
+        for make_before_break in [true, false] {
+            let mut h = Harness::new();
+            let old = h.start(P, 1);
+            frame(&old, 1, 31);
+            cursor(&old, 1, 131);
+            h.settle();
+            let new = if make_before_break {
+                // The engine's own order: the old stream stops once the new one has started.
+                let new = h.start(P, 2);
+                h.stop(1);
+                new
+            } else {
+                h.stop(1);
+                h.start(P, 2)
+            };
+            frame(&new, 2, 99);
+            cursor(&new, 2, 199);
+            h.settle();
+            let case = format!("make before break: {make_before_break}");
+            assert_eq!(h.pictures(P), [(1, Some(31)), (2, Some(99))], "{case}");
+            assert_eq!(h.cursors(P), [(1, 131), (2, 199)], "{case}");
+            assert_eq!(h.shown(P), Some(99), "{case}");
+            assert_eq!(h.cursors_taken(P), [true, true], "{case}");
+        }
+    }
+
+    /// Class 1: what a stopped capture delivers late, which the encoder would keep for a start
+    /// still to come, is never taken over by a new capture given the same number.
+    #[test]
+    fn a_stopped_captures_late_payloads_never_reach_a_capture_reusing_its_number() {
+        let mut h = Harness::new();
+        let old = h.start(P, 1);
+        frame(&old, 1, 31);
+        cursor(&old, 1, 131);
+        h.settle();
+        h.stop(1);
+        frame(&old, 1, 63);
+        cursor(&old, 1, 163);
+        h.settle();
+        let fresh = h.start(Q, 1);
+        h.settle();
+        frame(&fresh, 1, 99);
+        cursor(&fresh, 1, 199);
+        h.settle();
+        assert_eq!(h.pictures(P), [(1, Some(31))]);
+        assert_eq!(h.cursors(P), [(1, 131)]);
+        assert_eq!(h.pictures(Q), [(1, Some(99))]);
+        assert_eq!(h.cursors(Q), [(1, 199)]);
+    }
+
+    /// Class 2: a new capture's only frame and cursor, delivered while it starts, belong to it
+    /// even though an older capture still holds the number.
+    #[test]
+    fn a_new_capture_keeps_what_it_delivered_before_its_start_on_a_number_in_use() {
+        let mut h = Harness::new();
+        let old = h.start(P, 1);
+        frame(&old, 1, 31);
+        h.settle();
+        let release = h.encoder.hold();
+        // The backend numbers the new capture 1 while the old one still has that number.
+        h.start_with(Q, 1, |sink| {
+            frame(sink, 1, 99);
+            cursor(sink, 1, 199);
+        });
+        frame(&old, 1, 63);
+        cursor(&old, 1, 163);
+        drop(release);
+        h.settle();
+        assert_eq!(h.pictures(P), [(1, Some(31))]);
+        assert!(h.cursors(P).is_empty());
+        assert_eq!(h.pictures(Q), [(1, Some(99))]);
+        assert_eq!(h.cursors(Q), [(1, 199)]);
+    }
+
+    /// Class 3: a replacement retires its own projection's older capture, never another
+    /// projection's capture that has meanwhile been given the older one's number.
+    #[test]
+    fn a_replacement_retires_its_own_older_capture_not_one_reusing_that_number() {
+        let mut h = Harness::new();
+        let a = h.start(P, 1);
+        frame(&a, 1, 31);
+        h.settle();
+        let release = h.encoder.hold();
+        let b = h.start(P, 2);
+        h.stop(1);
+        let c = h.start(Q, 1);
+        frame(&b, 2, 21);
+        frame(&c, 1, 77);
+        frame(&a, 1, 13);
+        drop(release);
+        h.settle();
+        frame(&c, 1, 78);
+        h.settle();
+        assert_eq!(h.pictures(Q), [(1, Some(77)), (2, Some(78))]);
+        assert_eq!(h.pictures(P), [(1, Some(31)), (2, Some(21))]);
+    }
+
+    /// Class 4: a new capture's first frame isn't consumed with an old capture's late frame on
+    /// the same number while the old one's stop is still queued.
+    #[test]
+    fn a_new_captures_first_frame_survives_a_late_frame_on_its_number() {
+        let mut h = Harness::new();
+        let old = h.start(P, 1);
+        frame(&old, 1, 31);
+        h.settle();
+        let release = h.encoder.hold();
+        h.stop(1);
+        let late = old.clone();
+        h.start_with(Q, 1, move |sink| {
+            frame(sink, 1, 99);
+            frame(&late, 1, 63);
+        });
+        drop(release);
+        h.settle();
+        assert_eq!(h.pictures(P), [(1, Some(31))]);
+        assert_eq!(h.pictures(Q), [(1, Some(99))]);
+    }
+
+    /// Class 5: an old capture's late callbacks can't overwrite what a new capture on its
+    /// number has delivered before its start (its cursor or its frame).
+    #[test]
+    fn an_old_captures_late_callbacks_cannot_replace_a_new_captures_early_payloads() {
+        let mut h = Harness::new();
+        let old = h.start(P, 1);
+        frame(&old, 1, 31);
+        cursor(&old, 1, 131);
+        h.settle();
+        h.stop(1);
+        h.settle();
+        let release = h.encoder.hold();
+        let late = old.clone();
+        h.start_with(Q, 1, move |sink| {
+            cursor(sink, 1, 199);
+            frame(sink, 1, 99);
+            cursor(&late, 1, 163);
+            frame(&late, 1, 63);
+        });
+        drop(release);
+        h.settle();
+        assert_eq!(h.cursors(Q), [(1, 199)]);
+        assert_eq!(h.pictures(Q), [(1, Some(99))]);
+        assert_eq!(h.pictures(P), [(1, Some(31))]);
+        assert_eq!(h.cursors(P), [(1, 131)]);
+    }
+
+    /// Class 6: the engine replaces a capture by starting the new one and then stopping the
+    /// old one by its number. When the backend numbers the replacement like the capture it
+    /// replaces, that queued stop must not end the replacement or drop what it delivered first.
+    #[test]
+    fn the_replaced_captures_stop_spares_a_replacement_given_its_number() {
+        let mut h = Harness::new();
+        let old = h.start(P, 1);
+        frame(&old, 1, 31);
+        cursor(&old, 1, 131);
+        h.settle();
+        let release = h.encoder.hold();
+        let fresh = h.start_with(P, 1, |sink| {
+            frame(sink, 1, 99);
+            cursor(sink, 1, 199);
+        });
+        h.stop(1);
+        frame(&old, 1, 63);
+        cursor(&old, 1, 163);
+        drop(release);
+        h.settle();
+        frame(&fresh, 1, 98);
+        h.settle();
+        assert_eq!(h.pictures(P), [(1, Some(31)), (2, Some(99)), (3, Some(98))]);
+        assert_eq!(h.cursors(P), [(1, 131), (2, 199)]);
+        assert_eq!(h.shown(P), Some(98));
+        assert_eq!(h.cursors_taken(P), [true, true]);
+        // The number's next stop is the replacement's own.
+        h.stop(1);
+        frame(&fresh, 1, 97);
+        h.settle();
+        assert_eq!(h.pictures(P).len(), 3);
+    }
+
+    /// The numbers go when this node's projection ends, and only then: the peer ending its own
+    /// projection with the same number changes nothing here.
+    #[test]
+    fn only_a_local_projection_end_retires_its_numbers() {
+        let mut h = Harness::new();
+        let first = h.start(P, 1);
+        frame(&first, 1, 31);
+        cursor(&first, 1, 131);
+        h.settle();
+        let peer = h.rig.peer;
+        h.ended(peer, P);
+        let second = h.start(P, 2);
+        h.stop(1);
+        frame(&second, 2, 32);
+        cursor(&second, 2, 132);
+        h.settle();
+        assert_eq!(h.pictures(P), [(1, Some(31)), (2, Some(32))]);
+        assert_eq!(h.cursors(P), [(1, 131), (2, 132)]);
+        h.stop(2);
+        let local = h.rig.local;
+        h.ended(local, P);
+        // The engine never numbers two projections alike; a start under the ended number shows
+        // that none of its numbering is left.
+        let third = h.start(P, 3);
+        frame(&third, 3, 33);
+        cursor(&third, 3, 133);
+        h.settle();
+        assert_eq!(h.pictures(P)[2..], [(1, Some(33))]);
+        assert_eq!(h.cursors(P)[2..], [(1, 133)]);
     }
 }

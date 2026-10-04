@@ -17,13 +17,21 @@
 //!     hands the captured buffer to VideoToolbox. Any GPU failure falls back to the CPU path.
 //!   - Cursor shapes (03 §4.6, WP-2.16) go as codec-2 frames numbered on their own, when the peer
 //!     advertised `cursor`; the last one is sent again with every key frame request.
+//!   - Captures (WP-2.46e2): each has an identity of its own and a gate, and everything it
+//!     delivers is keyed by that identity, never by the platform's stream number, which a backend
+//!     may hand out again. Once its gate is closed nothing of it is queued or sent. Pictures and
+//!     cursor shapes are numbered per projection, so a replacement capture continues where the
+//!     one it replaces stopped; the numbers never wrap, and go when this node's projection ends.
 //! - **Destination:** media frames → a decoder thread → the proxy host. Frames are applied in
 //!   `seq` order (streams can complete out of order); a gap that doesn't fill within 300 ms, or a
 //!   frame that fails to apply, asks the source for a key frame through the engine.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::rc::Rc;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crosspane_engine::{Input, ProjectionKey};
@@ -37,7 +45,7 @@ use crosspane_media::wire::{
     Codec, FrameHeader, MediaError, TILE, VideoRegion, read_codec, read_cursor, read_header,
     read_video_region, write_cursor, write_default_cursor, write_video, write_video_region,
 };
-use crosspane_platform::{CursorImage, Frame, StreamId};
+use crosspane_platform::{CursorImage, Frame};
 use crosspane_protocol::link::LinkError;
 use crosspane_render::proxy::{HostCommand, HostHandle};
 use crosspane_render::source::{FrameRegion, SourceGpu, TileChanges};
@@ -202,14 +210,51 @@ pub enum Shape {
     Default,
 }
 
+/// One capture as the media layer knows it: an identity that no other capture of this process
+/// ever has, and a gate that retiring the capture closes. The agent opens one before the
+/// platform can call back, so everything the capture delivers, including what comes before its
+/// `Start`, carries it. A platform `StreamId` keys nothing here: a backend may number a new
+/// stream like an old one whose callbacks and commands are still on their way.
+#[derive(Clone, Debug)]
+pub struct Capture {
+    id: CaptureId,
+    open: Arc<Mutex<bool>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CaptureId(u64);
+
+impl Capture {
+    /// Run `f` unless the capture has been retired, holding its gate: retiring waits for `f`.
+    fn while_open<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        (*open).then(f)
+    }
+
+    fn is_open(&self) -> bool {
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Once this returns, nothing of the capture is queued or sent any more.
+    fn close(&self) {
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn id(&self) -> CaptureId {
+        self.id
+    }
+}
+
 pub enum SourceCmd {
-    /// Payload-free wake: pixels stay in the bounded logical-stream mailbox.
+    /// Payload-free wake: pixels stay in the capture's bounded mailbox.
     FramesReady {
-        stream: StreamId,
+        capture: Capture,
     },
-    /// A capture stream started for `projection`, to be sent to `peer`.
+    /// `capture` started for `projection`, to be sent to `peer`. It replaces any other capture
+    /// of the projection, whose numbering it continues.
     Start {
-        stream: StreamId,
+        capture: Capture,
         projection: ProjectionId,
         peer: NodeId,
         /// The peer can decode H.264 (it advertised `h264`).
@@ -222,15 +267,20 @@ pub enum SourceCmd {
         bits_per_second: u32,
     },
     Frame {
-        stream: StreamId,
+        capture: Capture,
         frame: Frame,
     },
     Cursor {
-        stream: StreamId,
+        capture: Capture,
         cursor: Shape,
     },
+    /// The capture was retired ([`SourceSender::stop`]): forget it.
     Stop {
-        stream: StreamId,
+        capture: CaptureId,
+    },
+    /// This node's projection ended: its numbers go, with any capture still feeding it.
+    Retire {
+        projection: ProjectionId,
     },
     RequestKey {
         projection: ProjectionId,
@@ -242,73 +292,174 @@ pub enum SourceCmd {
         region: bool,
         cursor: bool,
     },
+    /// Answered once everything queued before it has been handled and sent (tests).
+    #[cfg(test)]
+    Barrier(Sender<()>),
+    /// Stops the encoder until released, so that what is queued meanwhile is one batch (tests).
+    #[cfg(test)]
+    Hold(Receiver<()>),
+    /// Set a projection's last numbers (tests).
+    #[cfg(test)]
+    Seed {
+        projection: ProjectionId,
+        numbers: Sequences,
+    },
+    /// A projection's last numbers, while it has any (tests).
+    #[cfg(test)]
+    Probe {
+        projection: ProjectionId,
+        reply: Sender<Option<Sequences>>,
+    },
+}
+
+/// A projection's last picture and cursor-shape numbers. They belong to the projection, not to a
+/// capture: every capture that feeds it continues them, so the destination, which numbers per
+/// projection, takes a replacement's frames as newer. They never wrap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sequences {
+    pub picture: u64,
+    pub cursor: u64,
+}
+
+/// The numbers a projection's encodings share (all on the encoder thread).
+type Numbers = Rc<Cell<Sequences>>;
+
+/// Where encoded media goes: the transport, or a recorder in tests.
+trait SourceOutput {
+    fn send_media(&self, peer: NodeId, data: Arc<[u8]>) -> Result<(), LinkError>;
+}
+
+impl SourceOutput for Transport {
+    fn send_media(&self, peer: NodeId, data: Arc<[u8]>) -> Result<(), LinkError> {
+        Transport::send_media(self, peer, data)
+    }
 }
 
 #[derive(Default)]
 struct FrameMailbox {
-    queues: HashMap<StreamId, VecDeque<Frame>>,
+    queues: HashMap<CaptureId, VecDeque<Frame>>,
     closed: bool,
     stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 type SourceFrames = Arc<Mutex<FrameMailbox>>;
 
-/// Non-waiting frame enqueue across backend swaps: two queued images per logical stream.
+/// Non-waiting frame enqueue across backend swaps: two queued images per capture.
 #[derive(Clone)]
 pub struct SourceSender {
     commands: Sender<SourceCmd>,
     frames: Option<SourceFrames>,
+    /// The next capture identity, shared by every clone.
+    captures: Arc<AtomicU64>,
 }
 
 impl SourceSender {
+    /// A new, open capture with an identity no capture has had before; `None` once all of them
+    /// have been used.
+    pub fn open_capture(&self) -> Option<Capture> {
+        let id = self
+            .captures
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .ok()?;
+        Some(Capture {
+            id: CaptureId(id),
+            open: Arc::new(Mutex::new(true)),
+        })
+    }
+
+    /// Retire `capture`. Once this returns, none of its payloads is queued, encoded or sent any
+    /// more, and the images it had queued are released.
+    pub fn stop(&self, capture: &Capture) {
+        capture.close();
+        if let Some(frames) = &self.frames {
+            let retired = frames
+                .lock()
+                .ok()
+                .and_then(|mut frames| frames.queues.remove(&capture.id));
+            drop(retired);
+        }
+        let _ = self.commands.send(SourceCmd::Stop {
+            capture: capture.id,
+        });
+    }
+
+    /// Queue `cmd`. A frame or cursor of a retired capture is refused (and handed back).
     pub fn send(&self, cmd: SourceCmd) -> Result<(), mpsc::SendError<SourceCmd>> {
-        let Some(frames) = &self.frames else {
-            return self.commands.send(cmd);
-        };
         match cmd {
-            SourceCmd::Frame { stream, mut frame } => {
-                let Ok(mut mailbox) = frames.lock() else {
-                    return Err(mpsc::SendError(SourceCmd::Frame { stream, frame }));
-                };
-                if mailbox.closed || mailbox.stopping.load(std::sync::atomic::Ordering::Acquire) {
-                    return Err(mpsc::SendError(SourceCmd::Frame { stream, frame }));
+            SourceCmd::Frame { capture, frame } => self.send_frame(capture, frame),
+            SourceCmd::Cursor { capture, cursor } => {
+                // Queued under the gate, so it can't follow the capture's retirement.
+                let gate = Arc::clone(&capture.open);
+                let open = gate.lock().unwrap_or_else(PoisonError::into_inner);
+                if !*open {
+                    return Err(mpsc::SendError(SourceCmd::Cursor { capture, cursor }));
                 }
-                let queue = mailbox.queues.entry(stream).or_default();
-                let wake = queue.is_empty();
-                let replaced = (queue.len() == 2).then(|| queue.pop_back()).flatten();
-                if let Some(old) = &replaced {
-                    merge_frame_damage(&mut frame, old);
-                }
-                queue.push_back(frame);
-                drop(mailbox);
-                drop(replaced); // Driver/lease release never runs under the mailbox lock.
-                if !wake {
-                    return Ok(());
-                }
-                let result = self.commands.send(SourceCmd::FramesReady { stream });
-                if result.is_err() {
-                    let retired = frames
-                        .lock()
-                        .ok()
-                        .and_then(|mut frames| frames.queues.remove(&stream));
-                    drop(retired);
-                }
+                let result = self.commands.send(SourceCmd::Cursor { capture, cursor });
+                drop(open);
                 result
-            }
-            SourceCmd::Stop { stream } => {
-                let retired = frames
-                    .lock()
-                    .ok()
-                    .and_then(|mut frames| frames.queues.remove(&stream));
-                drop(retired);
-                self.commands.send(SourceCmd::Stop { stream })
             }
             other => self.commands.send(other),
         }
     }
 
+    fn send_frame(
+        &self,
+        capture: Capture,
+        mut frame: Frame,
+    ) -> Result<(), mpsc::SendError<SourceCmd>> {
+        // Queued under the gate, so it can't follow the capture's retirement.
+        let gate = Arc::clone(&capture.open);
+        let open = gate.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*open {
+            drop(open);
+            return Err(mpsc::SendError(SourceCmd::Frame { capture, frame }));
+        }
+        let Some(frames) = &self.frames else {
+            let result = self.commands.send(SourceCmd::Frame { capture, frame });
+            drop(open);
+            return result;
+        };
+        let Ok(mut mailbox) = frames.lock() else {
+            drop(open);
+            return Err(mpsc::SendError(SourceCmd::Frame { capture, frame }));
+        };
+        if mailbox.closed || mailbox.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            drop(mailbox);
+            drop(open);
+            return Err(mpsc::SendError(SourceCmd::Frame { capture, frame }));
+        }
+        let id = capture.id;
+        let queue = mailbox.queues.entry(id).or_default();
+        let wake = queue.is_empty();
+        let replaced = (queue.len() == 2).then(|| queue.pop_back()).flatten();
+        if let Some(old) = &replaced {
+            merge_frame_damage(&mut frame, old);
+        }
+        queue.push_back(frame);
+        drop(mailbox);
+        let result = if wake {
+            self.commands.send(SourceCmd::FramesReady { capture })
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            let retired = frames
+                .lock()
+                .ok()
+                .and_then(|mut frames| frames.queues.remove(&id));
+            drop(retired);
+        }
+        drop(open);
+        drop(replaced); // Driver/lease release runs under neither the mailbox lock nor the gate.
+        result
+    }
+
     #[cfg(test)]
-    pub(crate) fn take_frame(&self, stream: StreamId) -> Option<Frame> {
-        take_source_frame(self.frames.as_ref()?, stream)
+    pub(crate) fn take_frame(&self, capture: CaptureId) -> Option<Frame> {
+        take_source_frame(self.frames.as_ref()?, capture)
     }
 }
 
@@ -318,6 +469,7 @@ impl From<Sender<SourceCmd>> for SourceSender {
         Self {
             commands,
             frames: None,
+            captures: Arc::default(),
         }
     }
 }
@@ -328,13 +480,14 @@ pub(crate) fn source_channel() -> (SourceSender, Receiver<SourceCmd>) {
         SourceSender {
             commands,
             frames: Some(Arc::new(Mutex::new(FrameMailbox::default()))),
+            captures: Arc::default(),
         },
         receiver,
     )
 }
 
-fn take_source_frame(frames: &SourceFrames, stream: StreamId) -> Option<Frame> {
-    let mut queue = frames.lock().ok()?.queues.remove(&stream)?;
+fn take_source_frame(frames: &SourceFrames, capture: CaptureId) -> Option<Frame> {
+    let mut queue = frames.lock().ok()?.queues.remove(&capture)?;
     let mut newest = queue.pop_back()?;
     if let Some(older) = queue.pop_front() {
         merge_frame_damage(&mut newest, &older);
@@ -376,10 +529,12 @@ fn merge_frame_damage(new: &mut Frame, old: &Frame) {
 }
 
 struct Encoding {
+    capture: Capture,
     projection: ProjectionId,
     peer: NodeId,
     encoder: TileEncoder,
-    seq: u64,
+    /// The projection's numbers, shared with any capture that replaces this one.
+    numbers: Numbers,
     scheduler: HybridScheduler,
     /// The peer can decode H.264.
     peer_video: bool,
@@ -400,7 +555,6 @@ struct Encoding {
     /// The newest cursor the capture reported, and whether the peer still needs it.
     cursor: Option<Shape>,
     cursor_dirty: bool,
-    cursor_seq: u64,
     /// A frame was lost or the receiver asked for a key frame: if no new capture comes (captures
     /// arrive only on damage), the last frame goes again as a key frame.
     refresh_due: bool,
@@ -410,7 +564,7 @@ struct Encoding {
 }
 
 const KEY_REQUEST_GAP: Duration = Duration::from_secs(1);
-/// How long a cursor or frame that came before its stream's Start is kept.
+/// How long a cursor or frame that came before its capture's Start is kept.
 const EARLY_TTL: Duration = Duration::from_secs(5);
 /// How long a stream must be idle before a due refresh is sent from the last frame.
 const REFRESH_IDLE: Duration = Duration::from_millis(100);
@@ -526,7 +680,7 @@ pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> (SourceSend
     let frames = tx.frames.clone();
     let worker = Worker::spawn("media-encode", move |stop| {
         crate::exit_on_panic("media encoder", || {
-            encode_loop(&rx, frames.as_ref(), &transport, &video, stop);
+            encode_loop(&rx, frames.as_ref(), transport.as_ref(), &video, stop);
             if let Some(frames) = &frames {
                 close_source_frames(frames);
             }
@@ -544,16 +698,19 @@ pub fn start_source(transport: Arc<Transport>, video: VideoSetup) -> (SourceSend
 fn encode_loop(
     rx: &Receiver<SourceCmd>,
     frames: Option<&SourceFrames>,
-    transport: &Transport,
+    transport: &dyn SourceOutput,
     video: &VideoSetup,
     stop: &std::sync::atomic::AtomicBool,
 ) {
-    let mut streams: HashMap<StreamId, Encoding> = HashMap::new();
-    // Cursors reported before the stream's Start arrived (the capture thread may be first).
-    let mut early_cursors: HashMap<StreamId, (Shape, Instant)> = HashMap::new();
-    // Frames that came before their stream's Start (the capture thread may be first): a still
-    // window's first frame may be its only one.
-    let mut early_frames: HashMap<StreamId, (Frame, Instant)> = HashMap::new();
+    // At most one per projection: a capture's Start retires the projection's other one.
+    let mut streams: HashMap<CaptureId, Encoding> = HashMap::new();
+    // Each projection's numbers, from its first Start until this node's projection ends.
+    let mut numbering: HashMap<ProjectionId, Numbers> = HashMap::new();
+    // Cursors reported before the capture's Start arrived (the capture thread may be first).
+    let mut early_cursors: HashMap<CaptureId, (Capture, Shape, Instant)> = HashMap::new();
+    // Frames that came before their capture's Start (the capture thread may be first): a still
+    // window's first frame may be its only one. Only that capture's Start takes them.
+    let mut early_frames: HashMap<CaptureId, (Capture, Frame, Instant)> = HashMap::new();
     let mut out = Vec::new();
     let epoch = Instant::now();
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -562,27 +719,29 @@ fn encode_loop(
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        // Only the newest frame of each stream matters: drain what queued up meanwhile.
-        let mut latest: BTreeMap<StreamId, Frame> = BTreeMap::new();
-        let mut handle = |cmd: SourceCmd, streams: &mut HashMap<StreamId, Encoding>| {
-            let cmd = if let SourceCmd::FramesReady { stream } = cmd {
-                let Some(frame) = frames.and_then(|frames| take_source_frame(frames, stream))
+        // Only the newest frame of each capture matters: drain what queued up meanwhile.
+        let mut latest: BTreeMap<CaptureId, Frame> = BTreeMap::new();
+        #[cfg(test)]
+        let mut barriers = Vec::new();
+        let mut handle = |cmd: SourceCmd, streams: &mut HashMap<CaptureId, Encoding>| {
+            let cmd = if let SourceCmd::FramesReady { capture } = cmd {
+                let Some(frame) = frames.and_then(|frames| take_source_frame(frames, capture.id))
                 else {
                     return;
                 };
                 // A stale wake must not erase the idle-refinement image. A real replacement
                 // retires it before any encoding work, leaving one consumer-held image.
-                if let Some(enc) = streams.get_mut(&stream) {
+                if let Some(enc) = streams.get_mut(&capture.id) {
                     enc.last = None;
                 }
-                SourceCmd::Frame { stream, frame }
+                SourceCmd::Frame { capture, frame }
             } else {
                 cmd
             };
             match cmd {
                 SourceCmd::FramesReady { .. } => (),
                 SourceCmd::Start {
-                    stream,
+                    capture,
                     projection,
                     peer,
                     video: peer_video,
@@ -590,17 +749,29 @@ fn encode_loop(
                     cursor: peer_cursor,
                     bits_per_second,
                 } => {
-                    let cursor = early_cursors.remove(&stream).map(|(shape, _)| shape);
-                    if let Some((frame, _)) = early_frames.remove(&stream) {
-                        latest.entry(stream).or_insert(frame);
+                    let cursor = early_cursors.remove(&capture.id);
+                    let frame = early_frames.remove(&capture.id);
+                    if !capture.is_open() {
+                        return;
                     }
+                    let replaced = retire_where(streams, frames, |e| {
+                        e.projection == projection && e.capture.id != capture.id
+                    });
+                    for id in replaced {
+                        latest.remove(&id);
+                    }
+                    if let Some((_, frame, _)) = frame {
+                        latest.entry(capture.id).or_insert(frame);
+                    }
+                    let cursor = cursor.map(|(_, shape, _)| shape);
                     streams.insert(
-                        stream,
+                        capture.id,
                         Encoding {
+                            numbers: Rc::clone(numbering.entry(projection).or_default()),
+                            capture,
                             projection,
                             peer,
                             encoder: TileEncoder::new(),
-                            seq: 0,
                             scheduler: HybridScheduler::new(HybridConfig::default()),
                             peer_video,
                             peer_region,
@@ -614,47 +785,57 @@ fn encode_loop(
                             bits_per_second,
                             cursor_dirty: cursor.is_some(),
                             cursor,
-                            cursor_seq: 0,
                             refresh_due: false,
                             last_key_request: None,
                         },
                     );
                 }
-                SourceCmd::Frame { stream, frame } => {
-                    if streams.contains_key(&stream) {
+                SourceCmd::Frame { capture, frame } => {
+                    if streams.contains_key(&capture.id) {
                         let mut frame = frame;
-                        if let Some(old) = latest.remove(&stream) {
+                        if let Some(old) = latest.remove(&capture.id) {
                             merge_frame_damage(&mut frame, &old);
                         }
-                        latest.insert(stream, frame);
-                    } else {
-                        early_frames.retain(|_, (_, at)| at.elapsed() < EARLY_TTL);
-                        if early_frames.contains_key(&stream) || early_frames.len() < 8 {
+                        latest.insert(capture.id, frame);
+                    } else if capture.is_open() {
+                        early_frames
+                            .retain(|_, (c, _, at)| c.is_open() && at.elapsed() < EARLY_TTL);
+                        if early_frames.contains_key(&capture.id) || early_frames.len() < 8 {
                             let mut frame = frame;
-                            if let Some((old, _)) = early_frames.remove(&stream) {
+                            if let Some((_, old, _)) = early_frames.remove(&capture.id) {
                                 merge_frame_damage(&mut frame, &old);
                             }
-                            early_frames.insert(stream, (frame, Instant::now()));
+                            early_frames.insert(capture.id, (capture, frame, Instant::now()));
                         }
                     }
                 }
-                SourceCmd::Cursor { stream, cursor } => match streams.get_mut(&stream) {
+                SourceCmd::Cursor { capture, cursor } => match streams.get_mut(&capture.id) {
                     Some(e) => {
                         e.cursor = Some(cursor);
                         e.cursor_dirty = true;
                     }
-                    None => {
-                        early_cursors.retain(|_, (_, at)| at.elapsed() < EARLY_TTL);
-                        if early_cursors.len() < 64 {
-                            early_cursors.insert(stream, (cursor, Instant::now()));
+                    None if capture.is_open() => {
+                        early_cursors
+                            .retain(|_, (c, _, at)| c.is_open() && at.elapsed() < EARLY_TTL);
+                        if early_cursors.contains_key(&capture.id) || early_cursors.len() < 64 {
+                            early_cursors.insert(capture.id, (capture, cursor, Instant::now()));
                         }
                     }
+                    None => {}
                 },
-                SourceCmd::Stop { stream } => {
-                    streams.remove(&stream);
-                    latest.remove(&stream);
-                    early_cursors.remove(&stream);
-                    early_frames.remove(&stream);
+                SourceCmd::Stop { capture } => {
+                    if let Some(enc) = streams.remove(&capture) {
+                        enc.capture.close();
+                    }
+                    latest.remove(&capture);
+                    early_cursors.remove(&capture);
+                    early_frames.remove(&capture);
+                }
+                SourceCmd::Retire { projection } => {
+                    numbering.remove(&projection);
+                    for id in retire_where(streams, frames, |e| e.projection == projection) {
+                        latest.remove(&id);
+                    }
                 }
                 SourceCmd::RequestKey { projection } => {
                     for e in streams.values_mut().filter(|e| e.projection == projection) {
@@ -694,6 +875,21 @@ fn encode_loop(
                         e.peer_cursor = cursor;
                     }
                 }
+                #[cfg(test)]
+                SourceCmd::Barrier(reply) => barriers.push(reply),
+                #[cfg(test)]
+                SourceCmd::Hold(release) => {
+                    let _ = release.recv();
+                }
+                #[cfg(test)]
+                SourceCmd::Seed {
+                    projection,
+                    numbers,
+                } => numbering.entry(projection).or_default().set(numbers),
+                #[cfg(test)]
+                SourceCmd::Probe { projection, reply } => {
+                    let _ = reply.send(numbering.get(&projection).map(|numbers| numbers.get()));
+                }
             }
         };
         if let Some(first) = first {
@@ -702,12 +898,17 @@ fn encode_loop(
         while let Ok(cmd) = rx.try_recv() {
             handle(cmd, &mut streams);
         }
+        // A capture retired from outside (its stop, or numbers used up) does no more work here;
+        // what it still had waiting for its Start goes with it.
+        retire_where(&mut streams, frames, |e| !e.capture.is_open());
+        early_frames.retain(|_, (c, _, at)| c.is_open() && at.elapsed() < EARLY_TTL);
+        early_cursors.retain(|_, (c, _, at)| c.is_open() && at.elapsed() < EARLY_TTL);
         for enc in streams.values_mut().filter(|e| e.cursor_dirty) {
             send_cursor(enc, transport, &mut out);
         }
         let now = epoch.elapsed();
-        for (stream, frame) in latest {
-            let Some(enc) = streams.get_mut(&stream) else {
+        for (capture, frame) in latest {
+            let Some(enc) = streams.get_mut(&capture) else {
                 continue;
             };
             enc.refresh_due = false;
@@ -726,7 +927,7 @@ fn encode_loop(
                 enc.encoder.request_key();
                 enc.video_key = true;
                 send_tiles(enc, &frame, true, transport, &mut out);
-                tracing::debug!(seq = enc.seq, "refresh of an idle stream");
+                tracing::debug!(seq = enc.numbers.get().picture, "refresh of an idle stream");
             }
         }
         // Motion stopped during video and no new frame came: plan on the last frame so the
@@ -759,11 +960,42 @@ fn encode_loop(
                 if plan == FramePlan::TilesKey {
                     enc.encoder.request_key();
                     send_tiles(enc, &frame, true, transport, &mut out);
-                    tracing::debug!(seq = enc.seq, "lossless refresh after motion");
+                    tracing::debug!(
+                        seq = enc.numbers.get().picture,
+                        "lossless refresh after motion"
+                    );
                 }
             }
         }
+        #[cfg(test)]
+        for reply in barriers {
+            let _ = reply.send(());
+        }
     }
+}
+
+/// Retire the encodings `which` picks: their captures close and the images they had queued are
+/// released (outside the mailbox lock). Returns the captures retired.
+fn retire_where(
+    streams: &mut HashMap<CaptureId, Encoding>,
+    frames: Option<&SourceFrames>,
+    which: impl Fn(&Encoding) -> bool,
+) -> Vec<CaptureId> {
+    let ids: Vec<_> = streams
+        .iter()
+        .filter(|(_, e)| which(e))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &ids {
+        if let Some(enc) = streams.remove(id) {
+            enc.capture.close();
+            let queued = frames
+                .and_then(|frames| frames.lock().ok())
+                .and_then(|mut frames| frames.queues.remove(id));
+            drop(queued);
+        }
+    }
+    ids
 }
 
 /// Run a codec step over a frame's pixels wherever they are (a native image is mapped meanwhile).
@@ -781,14 +1013,32 @@ fn tile_count(frame: &Frame) -> u32 {
     frame.size.width.div_ceil(TILE) * frame.size.height.div_ceil(TILE)
 }
 
-fn header(enc: &Encoding, frame: &Frame) -> FrameHeader {
-    FrameHeader {
+/// The header of the projection's next picture; `None` once its numbers are used up, which ends
+/// the capture (numbers never wrap or start over).
+fn header(enc: &Encoding, frame: &Frame) -> Option<FrameHeader> {
+    let Some(seq) = enc.numbers.get().picture.checked_add(1) else {
+        exhausted(enc, "picture");
+        return None;
+    };
+    Some(FrameHeader {
         projection: enc.projection.0,
-        seq: enc.seq + 1,
+        seq,
         key: false,
         captured_ns: frame.at.as_nanos(),
         width: frame.size.width,
         height: frame.size.height,
+    })
+}
+
+/// The projection has sent its last number of `kind`: this capture ends. A replacement would
+/// find no numbers either; only the projection's end retires them.
+fn exhausted(enc: &Encoding, kind: &str) {
+    if enc.capture.is_open() {
+        tracing::warn!(
+            kind,
+            "a projection used up its media numbers; its capture ends"
+        );
+        enc.capture.close();
     }
 }
 
@@ -832,7 +1082,7 @@ fn encode_frame(
     now: Duration,
     idle: bool,
     video: &VideoSetup,
-    transport: &Transport,
+    transport: &dyn SourceOutput,
     out: &mut Vec<u8>,
 ) {
     out.clear();
@@ -1005,7 +1255,7 @@ fn emit_and_send(
     on_gpu: bool,
     video: Option<TileRect>,
     key: bool,
-    transport: &Transport,
+    transport: &dyn SourceOutput,
     out: &mut Vec<u8>,
 ) {
     match emit_tiles(enc, frame, texture, scan, video, key, out) {
@@ -1028,7 +1278,9 @@ fn emit_tiles(
     key: bool,
     out: &mut Vec<u8>,
 ) -> Result<Option<EncodeStats>, String> {
-    let header = header(enc, frame);
+    let Some(header) = header(enc, frame) else {
+        return Ok(None);
+    };
     if GATHER_ON_GPU && let (Some((texture, origin)), Some(gpu)) = (texture, enc.gpu.as_mut()) {
         let bits = enc.encoder.tiles_to_send(&scan, video, key);
         let changes = TileChanges {
@@ -1074,11 +1326,13 @@ fn send_tiles(
     enc: &mut Encoding,
     frame: &Frame,
     key: bool,
-    transport: &Transport,
+    transport: &dyn SourceOutput,
     out: &mut Vec<u8>,
 ) {
     out.clear();
-    let header = header(enc, frame);
+    let Some(header) = header(enc, frame) else {
+        return;
+    };
     match with_pixels(frame, |pixels, stride| {
         enc.encoder.encode(header, pixels, stride, key, out)
     }) {
@@ -1101,9 +1355,12 @@ fn send_video(
     region: Option<TileRect>,
     key: bool,
     video: &VideoSetup,
-    transport: &Transport,
+    transport: &dyn SourceOutput,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
+    let Some(mut header) = header(enc, frame) else {
+        return Ok(());
+    };
     let area = region.map(|rect| rect.region(frame.size));
     let (origin, size) = area.map_or(((0, 0), frame.size), |r| {
         ((r.x, r.y), PixelSize::new(r.width, r.height))
@@ -1131,7 +1388,6 @@ fn send_video(
         &mut access_unit,
     )?;
     enc.video_key = false;
-    let mut header = header(enc, frame);
     header.key = encoded.key;
     match area {
         Some(area) => write_video_region(header, area, &access_unit, out),
@@ -1219,7 +1475,7 @@ fn encode_picture(
 }
 
 /// Send the newest cursor shape; a refused one stays due and goes again on the next pass.
-fn send_cursor(enc: &mut Encoding, transport: &Transport, out: &mut Vec<u8>) {
+fn send_cursor(enc: &mut Encoding, transport: &dyn SourceOutput, out: &mut Vec<u8>) {
     enc.cursor_dirty = false;
     let Some(cursor) = &enc.cursor else { return };
     if !enc.peer_cursor {
@@ -1230,9 +1486,13 @@ fn send_cursor(enc: &mut Encoding, transport: &Transport, out: &mut Vec<u8>) {
         Shape::Image(c) => (c.size, c.hotspot, &c.pixels[..]),
         Shape::Hidden | Shape::Default => (PixelSize::new(1, 1), (0, 0), &HIDDEN[..]),
     };
+    let Some(seq) = enc.numbers.get().cursor.checked_add(1) else {
+        exhausted(enc, "cursor");
+        return;
+    };
     let header = FrameHeader {
         projection: enc.projection.0,
-        seq: enc.cursor_seq + 1,
+        seq,
         key: false,
         captured_ns: 0,
         width: size.width,
@@ -1247,25 +1507,45 @@ fn send_cursor(enc: &mut Encoding, transport: &Transport, out: &mut Vec<u8>) {
         tracing::debug!(error = %e, "cursor image not sendable");
         return;
     }
-    enc.cursor_seq += 1;
-    match transport.send_media(enc.peer, Arc::from(&out[..])) {
-        Ok(()) => {}
-        Err(LinkError::Congested) => enc.cursor_dirty = true,
-        Err(e) => tracing::debug!(error = ?e, "cursor send failed"),
+    // Numbered and handed over under the gate: once the capture is retired, nothing more of it
+    // goes out and it uses no more numbers.
+    let sent = enc.capture.while_open(|| {
+        enc.numbers.set(Sequences {
+            cursor: seq,
+            ..enc.numbers.get()
+        });
+        transport.send_media(enc.peer, Arc::from(&out[..]))
+    });
+    match sent {
+        None | Some(Ok(())) => {}
+        Some(Err(LinkError::Congested)) => enc.cursor_dirty = true,
+        Some(Err(e)) => tracing::debug!(error = ?e, "cursor send failed"),
     }
 }
 
 /// Send one encoded frame; a refused one is dropped and the next of either kind becomes a key.
-fn send(enc: &mut Encoding, frame: &[u8], transport: &Transport) {
-    enc.seq += 1;
-    match transport.send_media(enc.peer, Arc::from(frame)) {
-        Ok(()) => {}
-        Err(LinkError::Congested) => {
+fn send(enc: &mut Encoding, frame: &[u8], transport: &dyn SourceOutput) {
+    let Ok(header) = read_header(frame) else {
+        return;
+    };
+    // Numbered and handed over under the gate: once the capture is retired, nothing more of it
+    // goes out and it uses no more numbers.
+    let sent = enc.capture.while_open(|| {
+        let numbers = enc.numbers.get();
+        enc.numbers.set(Sequences {
+            picture: numbers.picture.max(header.seq),
+            ..numbers
+        });
+        transport.send_media(enc.peer, Arc::from(frame))
+    });
+    match sent {
+        None | Some(Ok(())) => {}
+        Some(Err(LinkError::Congested)) => {
             enc.encoder.request_key();
             enc.video_key = true;
             enc.refresh_due = true;
         }
-        Err(e) => tracing::debug!(error = ?e, "media send failed"),
+        Some(Err(e)) => tracing::debug!(error = ?e, "media send failed"),
     }
 }
 
@@ -1436,9 +1716,10 @@ fn decode_loop(
                 } else if header.seq > d.last && d.pending.len() < MAX_PENDING {
                     d.pending.insert(header.seq, data);
                 }
-                // Apply whatever is now consecutive.
-                while let Some(data) = d.pending.remove(&(d.last + 1)) {
-                    let seq = d.last + 1;
+                // Apply whatever is now consecutive (nothing follows the last number).
+                while let Some(seq) = d.last.checked_add(1)
+                    && let Some(data) = d.pending.remove(&seq)
+                {
                     apply(d, key, id, &data, seq, host, engine, ids, video);
                 }
                 d.gap_since = if d.pending.is_empty() {
@@ -1792,11 +2073,11 @@ mod worker_exit_tests {
         let retained = Arc::new(RetainedImages::default());
         let (sender, receiver) = source_channel();
         let frames = sender.frames.as_ref().unwrap().clone();
-        let stream = StreamId(1);
+        let capture = sender.open_capture().unwrap();
         for id in 0..2 {
             sender
                 .send(SourceCmd::Frame {
-                    stream,
+                    capture: capture.clone(),
                     frame: counted_frame(&retained, id, PixelSize::new(8, 8), None),
                 })
                 .unwrap();
@@ -1817,7 +2098,7 @@ mod worker_exit_tests {
         worker.stop.store(true, Ordering::Release);
         let rejected = sender
             .send(SourceCmd::Frame {
-                stream,
+                capture,
                 frame: counted_frame(&retained, 2, PixelSize::new(8, 8), None),
             })
             .unwrap_err();
@@ -2067,13 +2348,14 @@ pub(crate) mod source_queue_tests {
     }
     fn enqueue(
         sender: &SourceSender,
+        capture: &Capture,
         retained: &Arc<RetainedImages>,
         id: u64,
         damage: Option<Vec<PixelRect>>,
     ) {
         sender
             .send(SourceCmd::Frame {
-                stream: StreamId(1),
+                capture: capture.clone(),
                 frame: counted_frame(retained, id, PixelSize::new(8, 8), damage),
             })
             .unwrap();
@@ -2082,22 +2364,23 @@ pub(crate) mod source_queue_tests {
     #[test]
     fn stalled_encoder_keeps_two_waiting_images_and_drops_replaced_newest_immediately() {
         let (sender, receiver) = source_channel();
+        let capture = sender.open_capture().unwrap();
         let retained = Arc::new(RetainedImages::default());
-        enqueue(&sender, &retained, 1, Some(vec![rect(0, 0)]));
+        enqueue(&sender, &capture, &retained, 1, Some(vec![rect(0, 0)]));
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            SourceCmd::FramesReady {
-                stream: StreamId(1)
-            }
+            SourceCmd::FramesReady { capture: woken } if woken.id == capture.id
         ));
-        let encoding = sender.take_frame(StreamId(1)).unwrap();
+        let encoding = sender.take_frame(capture.id).unwrap();
         let producer = sender.clone();
+        let producing = capture.clone();
         let counted = retained.clone();
         let (finished, done) = mpsc::sync_channel(1);
         let join = std::thread::spawn(move || {
             for frame in 2..=22 {
                 enqueue(
                     &producer,
+                    &producing,
                     &counted,
                     frame,
                     Some(vec![rect((frame % 8) as i32, 1)]),
@@ -2117,14 +2400,14 @@ pub(crate) mod source_queue_tests {
             "one wake for the whole queued burst"
         );
         let queued = sender.frames.as_ref().unwrap().lock().unwrap();
-        let queue = &queued.queues[&StreamId(1)];
+        let queue = &queued.queues[&capture.id];
         assert_eq!(queue.iter().map(id).collect::<Vec<_>>(), vec![2, 22]);
         drop(queued);
         assert_eq!(
             *retained.dropped.lock().unwrap(),
             (3..22).collect::<Vec<_>>()
         );
-        let newest = sender.take_frame(StreamId(1)).unwrap();
+        let newest = sender.take_frame(capture.id).unwrap();
         assert_eq!(id(&newest), 22);
         assert_eq!(
             newest.damage,
@@ -2155,9 +2438,10 @@ pub(crate) mod source_queue_tests {
             (Some(vec![]), Some(vec![]), Some(vec![])),
         ] {
             let (sender, _receiver) = source_channel();
-            enqueue(&sender, &retained, 1, first);
-            enqueue(&sender, &retained, 2, second);
-            assert_eq!(sender.take_frame(StreamId(1)).unwrap().damage, expected);
+            let capture = sender.open_capture().unwrap();
+            enqueue(&sender, &capture, &retained, 1, first);
+            enqueue(&sender, &capture, &retained, 2, second);
+            assert_eq!(sender.take_frame(capture.id).unwrap().damage, expected);
         }
         let mut smaller = counted_frame(&retained, 1, PixelSize::new(8, 8), Some(vec![rect(1, 1)]));
         let larger = counted_frame(&retained, 2, PixelSize::new(9, 8), Some(vec![rect(2, 2)]));
@@ -2170,10 +2454,11 @@ pub(crate) mod source_queue_tests {
     #[test]
     fn normal_flow_preserves_frame_and_control_order_and_stop_releases_queue() {
         let (sender, receiver) = source_channel();
+        let capture = sender.open_capture().unwrap();
         let retained = Arc::new(RetainedImages::default());
         sender
             .send(SourceCmd::Start {
-                stream: StreamId(1),
+                capture: capture.clone(),
                 projection: ProjectionId(3),
                 peer: NodeId([1; 32]),
                 video: false,
@@ -2182,37 +2467,28 @@ pub(crate) mod source_queue_tests {
                 bits_per_second: 1,
             })
             .unwrap();
-        enqueue(&sender, &retained, 1, Some(vec![rect(1, 2)]));
+        enqueue(&sender, &capture, &retained, 1, Some(vec![rect(1, 2)]));
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            SourceCmd::Start {
-                stream: StreamId(1),
-                ..
-            }
+            SourceCmd::Start { capture: started, .. } if started.id == capture.id
         ));
         assert!(matches!(
             receiver.try_recv().unwrap(),
-            SourceCmd::FramesReady {
-                stream: StreamId(1)
-            }
+            SourceCmd::FramesReady { capture: woken } if woken.id == capture.id
         ));
-        let frame = sender.take_frame(StreamId(1)).unwrap();
+        let frame = sender.take_frame(capture.id).unwrap();
         assert_eq!(id(&frame), 1);
         assert_eq!(frame.damage, Some(vec![rect(1, 2)]));
-        assert!(sender.take_frame(StreamId(1)).is_none());
+        assert!(sender.take_frame(capture.id).is_none());
         drop(frame);
-        enqueue(&sender, &retained, 2, None);
+        enqueue(&sender, &capture, &retained, 2, None);
         sender
             .send(SourceCmd::Cursor {
-                stream: StreamId(1),
+                capture: capture.clone(),
                 cursor: Shape::Default,
             })
             .unwrap();
-        sender
-            .send(SourceCmd::Stop {
-                stream: StreamId(1),
-            })
-            .unwrap();
+        sender.stop(&capture);
         assert_eq!(retained.live(), 0);
         assert!(matches!(
             receiver.try_recv().unwrap(),
@@ -2226,16 +2502,493 @@ pub(crate) mod source_queue_tests {
             receiver.try_recv().unwrap(),
             SourceCmd::Stop { .. }
         ));
-        assert!(sender.take_frame(StreamId(1)).is_none());
-        drop(receiver);
+        assert!(sender.take_frame(capture.id).is_none());
         assert!(
             sender
                 .send(SourceCmd::Frame {
-                    stream: StreamId(1),
+                    capture: capture.clone(),
                     frame: counted_frame(&retained, 3, PixelSize::new(8, 8), None)
+                })
+                .is_err(),
+            "a stopped capture queues nothing"
+        );
+        assert_eq!(retained.live(), 0);
+        drop(receiver);
+        let fresh = sender.open_capture().unwrap();
+        assert!(
+            sender
+                .send(SourceCmd::Frame {
+                    capture: fresh.clone(),
+                    frame: counted_frame(&retained, 4, PixelSize::new(8, 8), None)
                 })
                 .is_err()
         );
+        assert!(sender.take_frame(fresh.id).is_none());
         assert_eq!(retained.live(), 0);
+    }
+}
+
+/// WP-2.46e2: what a capture's identity and gate guarantee in the encoder, followed to the
+/// packets it sends.
+#[cfg(test)]
+mod capture_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crosspane_types::time::MonoTime;
+
+    const P: ProjectionId = ProjectionId(20);
+    const Q: ProjectionId = ProjectionId(21);
+    const PEER: NodeId = NodeId([7; 32]);
+
+    fn start(sender: &SourceSender, capture: &Capture, projection: ProjectionId) {
+        sender
+            .send(SourceCmd::Start {
+                capture: capture.clone(),
+                projection,
+                peer: PEER,
+                video: false,
+                region: false,
+                cursor: true,
+                bits_per_second: 1,
+            })
+            .unwrap();
+    }
+
+    /// Queue an 8×8 picture of one colour; whether the capture took it.
+    fn show(sender: &SourceSender, capture: &Capture, color: u8) -> bool {
+        let pixels: Vec<u8> = (0..64).flat_map(|_| [color, 0, 0, 255]).collect();
+        let frame = Frame::cpu(
+            PixelSize::new(8, 8),
+            32,
+            pixels.into(),
+            None,
+            MonoTime::ZERO,
+        );
+        sender
+            .send(SourceCmd::Frame {
+                capture: capture.clone(),
+                frame,
+            })
+            .is_ok()
+    }
+
+    /// Queue a one-pixel cursor of one colour; whether the capture took it.
+    fn point(sender: &SourceSender, capture: &Capture, color: u8) -> bool {
+        sender
+            .send(SourceCmd::Cursor {
+                capture: capture.clone(),
+                cursor: Shape::Image(CursorImage {
+                    size: PixelSize::new(1, 1),
+                    hotspot: (0, 0),
+                    pixels: Arc::from([color, 0, 0, 255]),
+                }),
+            })
+            .is_ok()
+    }
+
+    /// `projection`'s pictures as sent: each one's number and the colour it shows.
+    fn pictures(sent: &[Arc<[u8]>], projection: ProjectionId) -> Vec<(u64, u8)> {
+        let mut decoder = TileDecoder::new();
+        sent.iter()
+            .filter(|data| {
+                read_codec(data) == Ok(Codec::Tiles)
+                    && read_header(data).unwrap().projection == projection.0
+            })
+            .map(|data| {
+                let (header, _) = decoder.apply(data).unwrap();
+                (header.seq, decoder.canvas().0[0])
+            })
+            .collect()
+    }
+
+    /// `projection`'s cursor shapes as sent: each one's number and colour.
+    fn cursors(sent: &[Arc<[u8]>], projection: ProjectionId) -> Vec<(u64, u8)> {
+        sent.iter()
+            .filter(|data| read_codec(data) == Ok(Codec::Cursor))
+            .map(|data| read_cursor(data).unwrap())
+            .filter(|cursor| cursor.header.projection == projection.0)
+            .map(|cursor| (cursor.header.seq, cursor.pixels[0]))
+            .collect()
+    }
+
+    /// Class 6: a capture's stop, queued behind everything a newer capture has delivered and
+    /// its start, retires that capture alone.
+    #[test]
+    fn a_queued_stop_retires_its_own_capture_and_nothing_newer() {
+        let (sender, queued) = recorded::queued();
+        let encoder = queued.run();
+        let old = sender.open_capture().unwrap();
+        start(&sender, &old, P);
+        assert!(show(&sender, &old, 31));
+        encoder.settle();
+        let release = encoder.hold();
+        let fresh = sender.open_capture().unwrap();
+        assert!(show(&sender, &fresh, 99));
+        assert!(point(&sender, &fresh, 199));
+        start(&sender, &fresh, Q);
+        sender.stop(&old);
+        assert!(!show(&sender, &old, 63), "a stopped capture queues nothing");
+        drop(release);
+        encoder.settle();
+        assert!(show(&sender, &fresh, 98));
+        encoder.settle();
+        let sent = encoder.sent();
+        assert_eq!(pictures(&sent, P), [(1, 31)]);
+        assert_eq!(pictures(&sent, Q), [(1, 99), (2, 98)]);
+        assert_eq!(cursors(&sent, Q), [(1, 199)]);
+    }
+
+    /// Fencing: a stop doesn't return while one of the capture's packets is being handed to the
+    /// network, and once it has returned nothing more of the capture goes out.
+    #[test]
+    fn a_stop_waits_for_its_captures_send_in_flight_and_nothing_follows() {
+        let (sender, queued) = recorded::queued();
+        let (encoder, paused) = queued.run_paused();
+        let capture = sender.open_capture().unwrap();
+        start(&sender, &capture, P);
+        assert!(show(&sender, &capture, 31));
+        paused.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (stopped, stop_returned) = mpsc::channel();
+        let stopper = {
+            let sender = sender.clone();
+            let capture = capture.clone();
+            std::thread::spawn(move || {
+                sender.stop(&capture);
+                stopped.send(()).unwrap();
+            })
+        };
+        assert!(
+            stop_returned
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "the stop waits for the send in flight"
+        );
+        paused.release.send(()).unwrap();
+        stop_returned.recv_timeout(Duration::from_secs(5)).unwrap();
+        stopper.join().unwrap();
+        assert!(
+            !show(&sender, &capture, 32),
+            "nothing queues after the stop"
+        );
+        assert!(
+            !point(&sender, &capture, 132),
+            "nothing queues after the stop"
+        );
+        encoder.settle();
+        let sent = encoder.sent();
+        assert_eq!(pictures(&sent, P), [(1, 31)]);
+        assert!(cursors(&sent, P).is_empty());
+    }
+
+    /// Checked exhaustion: a projection's last picture and cursor numbers go out, and then its
+    /// capture ends. Nothing wraps or starts over, not even for a replacement capture.
+    #[test]
+    fn a_projections_last_numbers_end_its_capture_and_never_wrap() {
+        let (sender, queued) = recorded::queued();
+        let encoder = queued.run();
+        let last = u64::MAX;
+        encoder.seed(
+            P,
+            Sequences {
+                picture: last - 1,
+                cursor: last - 1,
+            },
+        );
+        let capture = sender.open_capture().unwrap();
+        start(&sender, &capture, P);
+        assert!(show(&sender, &capture, 31));
+        assert!(point(&sender, &capture, 131));
+        encoder.settle();
+        assert!(show(&sender, &capture, 32));
+        assert!(point(&sender, &capture, 132));
+        encoder.settle();
+        assert!(!show(&sender, &capture, 33), "the capture has ended");
+        let sent = encoder.sent();
+        assert_eq!(pictures(&sent, P), [(last, 31)]);
+        assert_eq!(cursors(&sent, P), [(last, 131)]);
+        assert_eq!(
+            encoder.numbers(P),
+            Some(Sequences {
+                picture: last,
+                cursor: last
+            })
+        );
+        let replacement = sender.open_capture().unwrap();
+        start(&sender, &replacement, P);
+        assert!(show(&sender, &replacement, 34));
+        assert!(point(&sender, &replacement, 134));
+        encoder.settle();
+        assert!(encoder.sent().is_empty(), "no numbers are left for it");
+        let shown = recorded::shown(PEER, P, &sent);
+        assert_eq!(shown.map(|(_, pixels)| pixels[0]), Some(31));
+    }
+
+    /// Cleanup: the end of this node's projection retires its numbers and whatever capture still
+    /// fed it, and nothing of another projection's.
+    #[test]
+    fn a_projections_end_retires_its_numbers_and_capture_only() {
+        let (sender, queued) = recorded::queued();
+        let encoder = queued.run();
+        let p = sender.open_capture().unwrap();
+        start(&sender, &p, P);
+        assert!(show(&sender, &p, 31));
+        let q = sender.open_capture().unwrap();
+        start(&sender, &q, Q);
+        assert!(show(&sender, &q, 41));
+        encoder.settle();
+        sender.send(SourceCmd::Retire { projection: P }).unwrap();
+        encoder.settle();
+        assert_eq!(encoder.numbers(P), None);
+        assert_eq!(
+            encoder.numbers(Q),
+            Some(Sequences {
+                picture: 1,
+                cursor: 0
+            })
+        );
+        assert!(
+            !show(&sender, &p, 32),
+            "the ended projection's capture ended"
+        );
+        assert!(show(&sender, &q, 42));
+        let next = sender.open_capture().unwrap();
+        start(&sender, &next, P);
+        assert!(show(&sender, &next, 33));
+        encoder.settle();
+        let sent = encoder.sent();
+        assert_eq!(pictures(&sent, P), [(1, 31), (1, 33)]);
+        assert_eq!(pictures(&sent, Q), [(1, 41), (2, 42)]);
+    }
+}
+
+/// WP-2.46e2: the destination's numbering at the end of the range (no overflow at `u64::MAX`).
+#[cfg(test)]
+mod destination_numbering_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn the_destination_shows_a_projections_last_number_without_overflowing() {
+        let projection = ProjectionId(30);
+        let mut encoder = TileEncoder::new();
+        let mut packet = |seq: u64, color: u8, key: bool| {
+            let header = FrameHeader {
+                projection: projection.0,
+                seq,
+                key: false,
+                captured_ns: 0,
+                width: 8,
+                height: 8,
+            };
+            let pixels: Vec<u8> = (0..64).flat_map(|_| [color, 0, 0, 255]).collect();
+            let mut out = Vec::new();
+            encoder.encode(header, &pixels, 32, key, &mut out).unwrap();
+            Arc::<[u8]>::from(out)
+        };
+        let first = packet(u64::MAX - 1, 31, true);
+        let last = packet(u64::MAX, 32, false);
+        assert!(read_header(&first).unwrap().key);
+        assert!(!read_header(&last).unwrap().key, "applied in number order");
+        let shown = recorded::shown(NodeId([8; 32]), projection, &[first, last]);
+        assert_eq!(shown.map(|(_, pixels)| pixels[0]), Some(32));
+    }
+}
+
+/// The encoder thread with the network replaced by a recorder, and the destination's own
+/// numbering, for tests that follow media from capture callbacks to what a peer would show.
+#[cfg(test)]
+pub(crate) mod recorded {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    struct Recorder {
+        sent: Mutex<Sender<Arc<[u8]>>>,
+        pause: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    }
+
+    impl SourceOutput for Recorder {
+        fn send_media(&self, _: NodeId, data: Arc<[u8]>) -> Result<(), LinkError> {
+            let pause = self.pause.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+            self.sent.lock().unwrap().send(data).unwrap();
+            Ok(())
+        }
+    }
+
+    /// The encoder's first send stops inside the network call, as a slow one would, until
+    /// released.
+    pub(crate) struct Paused {
+        pub(crate) entered: Receiver<()>,
+        pub(crate) release: Sender<()>,
+    }
+
+    /// Commands queue up until [`Queued::run`] starts the encoder.
+    pub(crate) struct Queued {
+        sender: SourceSender,
+        commands: Receiver<SourceCmd>,
+    }
+
+    pub(crate) fn queued() -> (SourceSender, Queued) {
+        let (sender, commands) = source_channel();
+        (sender.clone(), Queued { sender, commands })
+    }
+
+    impl Queued {
+        pub(crate) fn run(self) -> Encoder {
+            self.run_with(None)
+        }
+
+        pub(crate) fn run_paused(self) -> (Encoder, Paused) {
+            let (entered_tx, entered) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            let encoder = self.run_with(Some((entered_tx, release_rx)));
+            (encoder, Paused { entered, release })
+        }
+
+        fn run_with(self, pause: Option<(Sender<()>, Receiver<()>)>) -> Encoder {
+            let (sent, packets) = mpsc::channel();
+            let recorder = Recorder {
+                sent: Mutex::new(sent),
+                pause: Mutex::new(pause),
+            };
+            let frames = self.sender.frames.clone();
+            let commands = self.commands;
+            let worker = Worker::spawn("media-encode", move |stop| {
+                let video = VideoSetup {
+                    codecs: None,
+                    gpu: None,
+                };
+                encode_loop(&commands, frames.as_ref(), &recorder, &video, stop);
+                if let Some(frames) = &frames {
+                    close_source_frames(frames);
+                }
+            });
+            if let Some(frames) = &self.sender.frames {
+                frames.lock().unwrap().stopping = worker.stop.clone();
+            }
+            Encoder {
+                sender: self.sender,
+                packets,
+                worker,
+            }
+        }
+    }
+
+    pub(crate) struct Encoder {
+        sender: SourceSender,
+        packets: Receiver<Arc<[u8]>>,
+        worker: Worker,
+    }
+
+    impl Encoder {
+        /// Wait until everything queued so far has been handled and sent.
+        pub(crate) fn settle(&self) {
+            let (reply, done) = mpsc::channel();
+            self.sender.send(SourceCmd::Barrier(reply)).unwrap();
+            done.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        /// Stop the encoder at its next command; what is queued until the returned sender is
+        /// dropped is handled as one batch.
+        pub(crate) fn hold(&self) -> Sender<()> {
+            let (release, held) = mpsc::channel();
+            self.sender.send(SourceCmd::Hold(held)).unwrap();
+            release
+        }
+
+        /// Everything sent since the last call, in order.
+        pub(crate) fn sent(&self) -> Vec<Arc<[u8]>> {
+            self.packets.try_iter().collect()
+        }
+
+        /// The projection's last numbers, while the encoder keeps any.
+        pub(crate) fn numbers(&self, projection: ProjectionId) -> Option<Sequences> {
+            let (reply, numbers) = mpsc::channel();
+            self.sender
+                .send(SourceCmd::Probe { projection, reply })
+                .unwrap();
+            numbers.recv_timeout(Duration::from_secs(5)).unwrap()
+        }
+
+        /// Give the projection these last numbers.
+        pub(crate) fn seed(&self, projection: ProjectionId, numbers: Sequences) {
+            self.sender
+                .send(SourceCmd::Seed {
+                    projection,
+                    numbers,
+                })
+                .unwrap();
+        }
+    }
+
+    impl Drop for Encoder {
+        fn drop(&mut self) {
+            self.worker.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.worker.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// What the destination shows for `projection` of `source` after receiving `packets` in
+    /// this order (its decoder thread, numbering included).
+    pub(crate) fn shown(
+        source: NodeId,
+        projection: ProjectionId,
+        packets: &[Arc<[u8]>],
+    ) -> Option<Shown> {
+        let ids = ProxyIds::default();
+        let key = ProjectionKey { source, projection };
+        ids.open(key);
+        let (events, _events) = mpsc::channel();
+        let video = VideoSetup {
+            codecs: None,
+            gpu: None,
+        };
+        let (destination, mut worker) = start_destination(None, ids, events, video);
+        for data in packets {
+            destination
+                .send(DestCmd::Media {
+                    peer: source,
+                    data: data.clone(),
+                })
+                .unwrap();
+        }
+        let (reply, snapshot) = mpsc::channel();
+        destination.send(DestCmd::Snapshot { key, reply }).unwrap();
+        let shown = snapshot.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.stop.store(true, Ordering::Release);
+        if let Some(thread) = worker.thread.take() {
+            thread.join().unwrap();
+        }
+        shown
+    }
+
+    /// Whether the destination shows each of one projection's cursor `packets`, in this order.
+    pub(crate) fn cursors_taken(packets: &[Arc<[u8]>]) -> Vec<bool> {
+        let mut d = Decoding {
+            decoder: TileDecoder::new(),
+            video: None,
+            last: 0,
+            cursor_seq: 0,
+            pending: BTreeMap::new(),
+            gap_since: None,
+            last_error: None,
+            showing: Showing::Nothing,
+            picture: Arc::default(),
+            native: None,
+        };
+        packets
+            .iter()
+            .map(|data| {
+                let before = d.cursor_seq;
+                apply_cursor(&mut d, 1, data, None);
+                d.cursor_seq != before
+            })
+            .collect()
     }
 }

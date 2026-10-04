@@ -100,6 +100,9 @@ pub(super) struct Source {
     capture_switch: Option<MonoTime>,
     fullscreen: bool,
     wanted_fullscreen: bool,
+    /// The fullscreen state the window was last seen in since the last park or resize was
+    /// issued (`None`: not seen since). Only issuing a park forgets it: until then `fullscreen`
+    /// may be stale, and a request is never answered from it.
     latest_state: Option<bool>,
     stand_in: Option<WindowId>,
     hidden_since: Option<MonoTime>,
@@ -1477,6 +1480,13 @@ impl Source {
         state_changed || changed_fullscreen || moved
     }
 
+    /// The last `Parked`'s fullscreen state still describes the window: it hasn't been seen in
+    /// the other state since. A request can be answered from `parked` only then.
+    fn fullscreen_current(&self) -> bool {
+        self.latest_state
+            .is_none_or(|state| state == self.fullscreen)
+    }
+
     /// A park or resize is being issued: it is based on the window's state as it is now.
     fn mark_issued(&mut self) {
         self.parked_state = Some(if self.stand_in.is_some() {
@@ -1672,7 +1682,6 @@ impl Source {
         if sane {
             self.wanted = Some(size);
             self.wanted_fullscreen = fullscreen;
-            self.latest_state = None;
         }
         if self.stage != Stage::Live || self.resizing {
             // Not now: the newest request wins, and the older one is not answered on its own.
@@ -1685,7 +1694,8 @@ impl Source {
         }
         // Satisfied means the window really is this size at this scale. What was asked before
         // doesn't count: an app's minimum size makes the two differ.
-        let satisfied = self.fullscreen == fullscreen
+        let satisfied = self.fullscreen_current()
+            && self.fullscreen == fullscreen
             && self.parked_scale == scale
             && self.parked.and_then(geometry).map(|(actual, _)| actual) == Some(size);
         if satisfied {
@@ -1740,7 +1750,10 @@ impl Source {
         };
         let actual = self.parked.and_then(geometry).map(|(actual, _)| actual);
         if !sane_size(size)
-            || (actual == Some(size) && self.parked_scale == scale && self.fullscreen == fullscreen)
+            || (self.fullscreen_current()
+                && actual == Some(size)
+                && self.parked_scale == scale
+                && self.fullscreen == fullscreen)
         {
             self.answer(projection, request, out);
         } else {

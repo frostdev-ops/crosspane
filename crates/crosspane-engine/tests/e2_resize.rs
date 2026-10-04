@@ -1635,6 +1635,81 @@ fn source_answers_a_satisfied_request_at_once() {
     );
 }
 
+/// WP-2.46f: the window left fullscreen while a park ran, and a request for fullscreen arrived
+/// before that park finished. The park's `fullscreen: true` no longer describes the window, so
+/// the queued request is parked again (the newest wish wins) instead of being answered with it.
+#[test]
+fn source_never_answers_a_request_from_a_park_the_window_has_since_left() {
+    let mut src = Src::live();
+    let (a, b) = (px(800, 600), px(900, 700));
+    let fullscreen_request = |request, size| {
+        control(
+            DST,
+            Message::Resize {
+                fullscreen: true,
+                projection: ID,
+                request,
+                size,
+                scale: SCALE,
+            },
+        )
+    };
+    let fullscreen_parked = |size| Input::Parked {
+        window: WINDOW,
+        result: Ok(Parked {
+            fullscreen: true,
+            ..parked(size)
+        }),
+    };
+    let fullscreen_resize = |size| Output::ResizeParked {
+        fullscreen: true,
+        window: WINDOW,
+        size,
+        scale: SCALE,
+    };
+    let states = |out: &[Output]| -> Vec<(u32, Option<bool>)> {
+        messages(out)
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::Geometry {
+                    answers,
+                    fullscreen,
+                    ..
+                } => Some((answers, fullscreen)),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        src.at(fullscreen_request(1, a), 10),
+        vec![fullscreen_resize(a)]
+    );
+    assert_eq!(
+        states(&src.at(fullscreen_parked(a), 20)),
+        vec![(1, Some(true))]
+    );
+    assert_eq!(
+        src.at(fullscreen_request(2, b), 30),
+        vec![fullscreen_resize(b)]
+    );
+    // The app leaves fullscreen while that park runs; then the destination asks again.
+    let mut normal = window();
+    normal.state = WindowState::Normal;
+    assert!(
+        src.at(Input::Windows(WindowEvent::Changed(normal)), 31)
+            .is_empty()
+    );
+    assert!(src.at(fullscreen_request(3, b), 32).is_empty());
+    let out = src.at(fullscreen_parked(b), 40);
+    assert_eq!(states(&out), vec![(2, Some(true))]);
+    assert_eq!(out.last(), Some(&fullscreen_resize(b)));
+    assert_eq!(
+        states(&src.at(fullscreen_parked(b), 50)),
+        vec![(3, Some(true))]
+    );
+}
+
 #[test]
 fn source_compares_the_actual_size_not_what_was_asked_for() {
     let mut src = Src::live();
@@ -2092,6 +2167,72 @@ fn user_cancels_app_fullscreen_before_host_confirmation_and_converges() {
     world.assert_converged();
 }
 
+/// One run of `resize_exchanges_converge_without_oscillation`: each op is `(kind, arg, dt)`, and
+/// host callbacks become overdue after `late` ms.
+fn run_resize_ops(ops: &[(u8, usize, u64)], late: u64) {
+    let sizes = [
+        px(200, 150),
+        px(300, 200),
+        px(400, 300),
+        px(401, 300),
+        px(500, 400),
+        px(640, 480),
+        px(777, 433),
+        px(900, 700),
+    ];
+    let mut world = World::new(px(400, 300));
+    let mut now = 0;
+    for &(kind, arg, dt) in ops {
+        now += dt;
+        world.run_to(now);
+        // The host and the platform are slow, but not unboundedly so.
+        world.host_overdue(now, late);
+        world.platform_overdue(now, 3_000);
+        match kind {
+            0 | 1 => world.user_drag(sizes[arg], now),
+            2 => {
+                world.callbacks_due.pop_front();
+                world.host_callback(now);
+            }
+            3 => world.host_callback(now),
+            4 => {
+                world.complete_one_park(now);
+            }
+            5 => {
+                world.app_resizes_itself(sizes[arg], now);
+            }
+            6 if world.link_up => world.drop_link(now),
+            7 if !world.link_up => world.resume_link(now),
+            9 => world.user_toggle(arg % 2 == 0, now),
+            10 => world.app_toggle(arg % 2 == 0, now),
+            _ => world.start_captures(now),
+        }
+    }
+    if !world.link_up {
+        world.resume_link(now);
+    }
+    world.assert_converged();
+}
+
+/// WP-2.46f: the shrunk case of a `resize_exchanges_converge_without_oscillation` failure
+/// (`proxy vs source state`: the proxy windowed, the source fullscreen).
+#[test]
+fn fullscreen_toggles_across_link_drops_converge() {
+    run_resize_ops(
+        &[
+            (0, 0, 1),
+            (9, 6, 1),
+            (6, 0, 1),
+            (7, 0, 1),
+            (4, 0, 1),
+            (4, 0, 1),
+            (10, 1, 1),
+            (6, 0, 1),
+        ],
+        500,
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 500, failure_persistence: None, ..ProptestConfig::default() })]
 
@@ -2105,48 +2246,7 @@ proptest! {
         ops in proptest::collection::vec((0u8..11, 0usize..8, 1u64..400), 1..40),
         late in prop_oneof![Just(500u64), Just(1_500), Just(4_000)],
     ) {
-        let sizes = [
-            px(200, 150),
-            px(300, 200),
-            px(400, 300),
-            px(401, 300),
-            px(500, 400),
-            px(640, 480),
-            px(777, 433),
-            px(900, 700),
-        ];
-        let mut world = World::new(px(400, 300));
-        let mut now = 0;
-        for (kind, arg, dt) in ops {
-            now += dt;
-            world.run_to(now);
-            // The host and the platform are slow, but not unboundedly so.
-            world.host_overdue(now, late);
-            world.platform_overdue(now, 3_000);
-            match kind {
-                0 | 1 => world.user_drag(sizes[arg], now),
-                2 => {
-                    world.callbacks_due.pop_front();
-                    world.host_callback(now);
-                }
-                3 => world.host_callback(now),
-                4 => {
-                    world.complete_one_park(now);
-                }
-                5 => {
-                    world.app_resizes_itself(sizes[arg], now);
-                }
-                6 if world.link_up => world.drop_link(now),
-                7 if !world.link_up => world.resume_link(now),
-                9 => world.user_toggle(arg % 2 == 0, now),
-                10 => world.app_toggle(arg % 2 == 0, now),
-                _ => world.start_captures(now),
-            }
-        }
-        if !world.link_up {
-            world.resume_link(now);
-        }
-        world.assert_converged();
+        run_resize_ops(&ops, late);
     }
 }
 
