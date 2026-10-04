@@ -6095,4 +6095,1382 @@ mod a2_tests {
             }
         }
     }
+
+    // b2b API-scaffold red stage: new APIs initially refuse/no evidence. This is not a baseline
+    // runtime claim. Every operation below is an injected runner or an exclusive scratch inode.
+    mod b2b_tests {
+        use super::*;
+
+        struct Effects {
+            base: Arc<Runner>,
+            scratch: Arc<Scratch>,
+            home: PathBuf,
+            library: PathBuf,
+            clock: Arc<FakeClock>,
+            mutations: Mutex<Vec<String>>,
+            journal_required: AtomicBool,
+            hook: Mutex<Option<Hook>>,
+            response: Mutex<Option<(String, NativeResult<CommandOutput>)>>,
+        }
+        impl CommandRunner for Effects {
+            fn run(
+                &self,
+                command: &CommandSpec,
+                deadline: &Deadline,
+            ) -> NativeResult<CommandOutput> {
+                if !command.is_mutation() {
+                    return self.base.run(command, deadline);
+                }
+                deadline.check()?;
+                let verb = if command.program() == Path::new("/usr/bin/open") {
+                    assert_eq!(&command.args()[..3], ["-b", "com.apple.installer", "--"]);
+                    assert!(command.args()[3].ends_with("/CrosspaneAudio-remove-0.1.0.pkg"));
+                    "package"
+                } else if command.program() == Path::new("/bin/launchctl") {
+                    assert_eq!(command.args().len(), 2);
+                    assert_eq!(
+                        command.args()[1],
+                        format!("gui/{}/{}", self.base.uid, AGENT_LABEL)
+                    );
+                    assert!(matches!(command.args()[0].as_str(), "disable" | "bootout"));
+                    command.args()[0].as_str()
+                } else {
+                    assert_eq!(command.program(), self.base.exe);
+                    assert_eq!(command.args(), ["erase-identity"]);
+                    "erase"
+                };
+                if self.journal_required.load(Ordering::Acquire) {
+                    let record: Value =
+                        serde_json::from_slice(
+                            &std::fs::read(self.home.join(
+                                "Library/Application Support/Crosspane/Installer/removal.json",
+                            ))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    let index = record["in_flight"]
+                        .as_u64()
+                        .expect("durable intent before dispatch");
+                    assert_eq!(record["rows"][index as usize], "Pending");
+                    assert_eq!(
+                        index,
+                        match verb {
+                            "disable" => 0,
+                            "bootout" => 1,
+                            "erase" => 2,
+                            _ => 3,
+                        }
+                    );
+                }
+                self.base
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .push((command.program().to_owned(), command.args().to_vec()));
+                self.mutations.lock().unwrap().push(verb.to_owned());
+                if let Some(hook) = self.hook.lock().unwrap().clone() {
+                    hook(verb, command.program())?;
+                }
+                if let Some((selected, response)) = self.response.lock().unwrap().clone()
+                    && selected == verb
+                {
+                    return response;
+                }
+                match verb {
+                    "disable" => {
+                        *self.base.disabled.lock().unwrap() = Ok(out(
+                            0,
+                            "disabled services = {\n \"io.frostdev.crosspane.agent\" => true\n}\n",
+                            "",
+                        ));
+                    }
+                    "bootout" => {
+                        self.base.pid.store(0, Ordering::Release);
+                        *self.base.print.lock().unwrap() = Ok(out(
+                            113,
+                            "",
+                            &format!(
+                                "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                                self.base.uid
+                            ),
+                        ));
+                        self.scratch.put(&self.home.join("Library/Application Support/Crosspane/last_exit.json"),
+                            &serde_json::to_vec(&json!({"schema_version":1,"instance_id":1,"stopped_unix_ms":1,
+                                "clean":true,"parking":"restored","input_journals_empty":true,"audio_stopped":true})).unwrap(),0o600);
+                    }
+                    "erase" => {
+                        for name in ["trust.json", "revocations.json", "device-key.pk8"] {
+                            let path = self
+                                .home
+                                .join("Library/Application Support/Crosspane")
+                                .join(name);
+                            if path.exists() {
+                                self.scratch.remove(&path);
+                            }
+                        }
+                        return Ok(CommandOutput {
+                            code: Some(0),
+                            stderr: vec![],
+                            stdout: serde_json::to_vec(
+                                &json!({"schema_version":1,"result":"removed",
+                                "reason":null,"key":"removed","trust":"removed"}),
+                            )
+                            .unwrap(),
+                        });
+                    }
+                    "package" => {
+                        for path in [
+                            self.library
+                                .join("Audio/Plug-Ins/HAL/CrosspaneAudio.driver"),
+                            self.library
+                                .join("Application Support/Crosspane/Installer/previous"),
+                        ] {
+                            if path.exists() {
+                                std::fs::remove_dir(&path).unwrap(); // Empty exclusively test-owned directory.
+                            }
+                        }
+                        self.scratch.put(&self.library.join("Application Support/Crosspane/Installer/audio-removal-outcome.json"),
+                            format!("{{\"schema_version\":1,\"result\":\"removed\",\"at_unix_ms\":{}}}\n",
+                                self.clock.unix_ms().unwrap()).as_bytes(),0o644);
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(out(0, "", ""))
+            }
+        }
+        struct Reader {
+            rig: Arc<Rig>,
+            next: AtomicU64,
+            hook: Mutex<Option<Hook>>,
+        }
+        impl RemovalCurrentReader for Reader {
+            fn read(
+                &self,
+                original: &TrackedAgent,
+                deadline: &Deadline,
+            ) -> NativeResult<(SelectedAgent, AgentReply)> {
+                deadline.check()?;
+                assert_eq!(original.process().pid, 4242);
+                assert_eq!(original.instance_id(), 1);
+                let id = self.next.fetch_add(1, Ordering::AcqRel);
+                if let Some(hook) = self.hook.lock().unwrap().clone() {
+                    hook(&format!("reader-{id}"), &self.rig.io.target().agent_path())?;
+                }
+                let mut current = self.rig.current();
+                current.1.id = id;
+                Ok(current)
+            }
+        }
+        struct Flow {
+            rig: Arc<Rig>,
+            effects: Arc<Effects>,
+            reader: Arc<Reader>,
+        }
+        impl Flow {
+            fn new() -> Self {
+                Self::from_rig(Rig::new())
+            }
+            fn from_rig(mut rig: Rig) -> Self {
+                let effects = Arc::new(Effects {
+                    base: rig.runner.clone(),
+                    scratch: rig.scratch.clone(),
+                    home: rig.io.target().paths().home.clone(),
+                    library: rig.scratch.path.join("Library"),
+                    clock: rig.clock.clone(),
+                    mutations: Mutex::default(),
+                    journal_required: AtomicBool::new(true),
+                    hook: Mutex::default(),
+                    response: Mutex::default(),
+                });
+                rig.io = Arc::new(
+                    MacNativeIo::new(
+                        rig.io.target().clone(),
+                        effects.clone(),
+                        rig.support.clone(),
+                        rig.signatures.clone(),
+                        rig.clock.clone(),
+                    )
+                    .unwrap(),
+                );
+                let rig = Arc::new(rig);
+                let reader = Arc::new(Reader {
+                    rig: rig.clone(),
+                    next: AtomicU64::new(2),
+                    hook: Mutex::default(),
+                });
+                Self {
+                    rig,
+                    effects,
+                    reader,
+                }
+            }
+            fn prepare(
+                &self,
+                choices: RemovalChoices,
+            ) -> (MacRemoval, RemovalPlan, RemovalConsent) {
+                let mut removal = MacRemoval::new(self.rig.observer());
+                let plan = removal
+                    .plan(
+                        1,
+                        OperationId(1),
+                        choices,
+                        Some(self.rig.current()),
+                        &self.rig.d(),
+                    )
+                    .unwrap();
+                let consent = removal
+                    .consent(&plan, 1, OperationId(1), choices, true, &self.rig.d())
+                    .unwrap();
+                (removal, plan, consent)
+            }
+            fn apply(&self, choices: RemovalChoices) -> RemovalApplyResult {
+                let (mut removal, plan, consent) = self.prepare(choices);
+                let whole = Deadline::new(120_000, self.rig.clock.clone(), Cancellation::default())
+                    .unwrap();
+                removal
+                    .apply(&plan, &consent, Some(self.reader.clone()), &whole)
+                    .unwrap()
+            }
+            fn journal(&self) -> Value {
+                serde_json::from_slice(
+                    &std::fs::read(self.rig.io.target().installer_dir().join("removal.json"))
+                        .unwrap(),
+                )
+                .unwrap()
+            }
+        }
+        #[test]
+        fn b2b_scaffold_owned_default_order_keeps_identity_and_recovery() {
+            let f = Flow::new();
+            let trust = f.rig.io.target().state_dir().join("trust.json");
+            f.rig.put(&trust, b"inert trust", 0o600);
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: false,
+            });
+            assert!(result.complete, "{result:?}");
+            assert_eq!(*f.effects.mutations.lock().unwrap(), ["disable", "bootout"]);
+            assert!(!f.rig.io.target().app_path().exists());
+            assert_eq!(std::fs::read(trust).unwrap(), b"inert trust");
+            assert!(
+                f.rig
+                    .io
+                    .target()
+                    .installer_dir()
+                    .join("payload.json")
+                    .exists()
+            );
+            assert!(f.journal()["in_flight"].is_null());
+            assert!(result.retained_recovery);
+        }
+        #[test]
+        fn b2b_scaffold_explicit_erase_precedes_executable_removal() {
+            let f = Flow::new();
+            let trust = f.rig.io.target().state_dir().join("trust.json");
+            f.rig.put(&trust, b"inert trust", 0o600);
+            let result = f.apply(RemovalChoices {
+                delete_identity: true,
+                remove_driver: false,
+            });
+            assert!(result.complete, "{result:?}");
+            assert_eq!(
+                *f.effects.mutations.lock().unwrap(),
+                ["disable", "bootout", "erase"]
+            );
+            assert!(!trust.exists());
+            assert!(!f.rig.io.target().agent_path().exists());
+        }
+        #[test]
+        fn b2b_scaffold_one_package_attempt_brackets_both_root_rows() {
+            let f = Flow::new();
+            let packages = f.rig.io.target().installer_dir().join("packages");
+            f.rig.put(
+                &packages.join("keep.fixture"),
+                b"inert retained sibling",
+                0o600,
+            );
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            assert!(
+                result.complete,
+                "error={:?}, mutations={:?}",
+                result.error,
+                f.effects.mutations.lock().unwrap()
+            );
+            assert_eq!(
+                *f.effects.mutations.lock().unwrap(),
+                ["disable", "bootout", "package"]
+            );
+            assert_eq!(
+                std::fs::read(packages.join("keep.fixture")).unwrap(),
+                b"inert retained sibling"
+            );
+            assert_eq!(
+                std::fs::read(packages.join("CrosspaneAudio-remove-0.1.0.pkg")).unwrap(),
+                b"inert-remove"
+            );
+            for resource in ["mac.shared-audio", "mac.shared-audio-previous"] {
+                assert_eq!(
+                    result
+                        .rows
+                        .iter()
+                        .find(|row| row.delta.resource == resource)
+                        .unwrap()
+                        .outcome,
+                    RemovalOutcome::Completed
+                );
+            }
+        }
+        #[test]
+        fn b2b_scaffold_foreign_extra_is_retained_and_blocks_empty_prune() {
+            let f = Flow::new();
+            let extra = f.rig.io.target().app_path().join("foreign.fixture");
+            f.rig.put(&extra, b"inert foreign", 0o600);
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: false,
+            });
+            assert!(!result.complete);
+            assert!(result.error.is_some());
+            assert_eq!(std::fs::read(extra).unwrap(), b"inert foreign");
+            assert!(f.rig.io.target().app_path().exists());
+            assert!(result.retained_recovery);
+        }
+        #[test]
+        fn b2b_scaffold_created_staging_directory_is_first_observed_not_owned() {
+            let f = Flow::new();
+            let selected = f.rig.selected();
+            let directory = f
+                .rig
+                .io
+                .create_package_staging_directory(&selected.support, &f.rig.d())
+                .unwrap();
+            assert_eq!(directory.mode, 0o040700);
+            assert_eq!(directory.uid, f.rig.runner.uid);
+            assert_eq!(
+                f.rig
+                    .io
+                    .metadata(&f.rig.io.target().installer_dir().join("packages"))
+                    .unwrap(),
+                Some(directory)
+            );
+        }
+        #[test]
+        fn b2b_scaffold_package_attempt_keeps_verified_staging_evidence() {
+            let f = Flow::new();
+            f.effects.journal_required.store(false, Ordering::Release);
+            let selected = f.rig.selected();
+            let mut package = MacAudioPackage::admit(
+                f.rig.io.clone(),
+                f.rig.audio(),
+                f.rig.clock.clone(),
+                &f.rig.d(),
+            )
+            .unwrap();
+            let plan = package
+                .plan(
+                    &selected.support,
+                    AudioPackageKind::Remove,
+                    1,
+                    1,
+                    &f.rig.d(),
+                )
+                .unwrap();
+            let consent = plan.consent(1, 1, true, true).unwrap();
+            let attempt = package
+                .open(plan, consent, &selected.support, &f.rig.d())
+                .unwrap();
+            assert!(attempt.facts().error.is_none());
+            let staged = attempt
+                .staged()
+                .expect("actual verified staged identity must be retained");
+            assert_eq!(staged.sha256, hex(b"inert-remove"));
+            assert_eq!(
+                staged.leaf,
+                f.rig
+                    .io
+                    .metadata(
+                        &f.rig
+                            .io
+                            .target()
+                            .installer_dir()
+                            .join("packages/CrosspaneAudio-remove-0.1.0.pkg")
+                    )
+                    .unwrap()
+                    .unwrap()
+            );
+        }
+
+        fn choices() -> RemovalChoices {
+            RemovalChoices {
+                delete_identity: false,
+                remove_driver: false,
+            }
+        }
+        fn whole(f: &Flow) -> Deadline {
+            Deadline::new(120_000, f.rig.clock.clone(), Cancellation::default()).unwrap()
+        }
+        fn failed(f: &Flow, result: &RemovalApplyResult, effects: &[&str]) {
+            assert!(!result.complete, "{result:?}");
+            assert!(result.error.is_some());
+            assert!(result.retained_recovery);
+            assert!(f.rig.io.target().app_path().exists());
+            assert_eq!(*f.effects.mutations.lock().unwrap(), effects);
+        }
+        #[test]
+        fn b2b_missing_current_reader_refuses_before_dispatch() {
+            let f = Flow::new();
+            let (mut m, p, c) = f.prepare(choices());
+            assert!(m.apply(&p, &c, None, &whole(&f)).is_err());
+            assert!(f.effects.mutations.lock().unwrap().is_empty());
+            assert!(
+                !f.rig
+                    .io
+                    .target()
+                    .installer_dir()
+                    .join("removal.json")
+                    .exists()
+            );
+            assert!(f.rig.io.target().agent_path().exists());
+        }
+        #[test]
+        fn b2b_retired_and_foreign_consents_do_zero_work() {
+            for foreign in [false, true] {
+                let f = Flow::new();
+                let (mut m, p, c) = f.prepare(choices());
+                let (_, _, other) = f.prepare(choices());
+                if !foreign {
+                    m.retire();
+                }
+                let calls = f.rig.runner.calls.lock().unwrap().len();
+                let fs = Arc::new(AtomicU64::default());
+                let observed = fs.clone();
+                *f.rig.hook.lock().unwrap() = Some(Arc::new(move |_, _| {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }));
+                assert!(
+                    m.apply(
+                        &p,
+                        if foreign { &other } else { &c },
+                        Some(f.reader.clone()),
+                        &whole(&f)
+                    )
+                    .is_err()
+                );
+                assert_eq!(f.rig.runner.calls.lock().unwrap().len(), calls);
+                assert_eq!(fs.load(Ordering::Acquire), 0);
+                assert_eq!(f.reader.next.load(Ordering::Acquire), 2);
+                assert!(f.effects.mutations.lock().unwrap().is_empty());
+            }
+        }
+        #[test]
+        fn b2b_current_reader_failure_after_intent_leaves_pending_no_dispatch() {
+            let f = Flow::new();
+            *f.reader.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                if stage == "reader-4" {
+                    Err(NativeError::Foreign)
+                } else {
+                    Ok(())
+                }
+            }));
+            let result = f.apply(choices());
+            failed(&f, &result, &[]);
+            assert_eq!(f.journal()["in_flight"], 0);
+            assert_eq!(f.journal()["rows"][0], "Pending");
+        }
+        #[test]
+        fn b2b_resource_changed_after_intent_refuses_dispatch() {
+            let f = Flow::new();
+            let scratch = f.rig.scratch.clone();
+            let plist = f
+                .rig
+                .io
+                .target()
+                .paths()
+                .home
+                .join("Library/LaunchAgents")
+                .join(format!("{AGENT_LABEL}.plist"));
+            let held = plist.clone();
+            *f.reader.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                if stage == "reader-4" {
+                    scratch.put(&held, b"inert foreign edit", 0o644);
+                }
+                Ok(())
+            }));
+            let result = f.apply(choices());
+            failed(&f, &result, &[]);
+            assert_eq!(std::fs::read(plist).unwrap(), b"inert foreign edit");
+            assert_eq!(f.journal()["in_flight"], 0);
+        }
+        #[test]
+        fn b2b_intent_publish_failure_prevents_native_effect() {
+            let f = Flow::new();
+            let seen = Arc::new(AtomicU64::default());
+            let count = seen.clone();
+            *f.rig.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                if stage == "publish"
+                    && path.ends_with("removal.json")
+                    && count.fetch_add(1, Ordering::AcqRel) == 1
+                {
+                    return Err(NativeError::Unavailable);
+                }
+                Ok(())
+            }));
+            let result = f.apply(choices());
+            failed(&f, &result, &[]);
+            assert_eq!(f.journal()["in_flight"], Value::Null);
+        }
+        #[test]
+        fn b2b_disable_exit_zero_without_expected_state_is_unknown() {
+            let f = Flow::new();
+            *f.effects.response.lock().unwrap() = Some(("disable".into(), Ok(out(0, "", ""))));
+            let result = f.apply(choices());
+            failed(&f, &result, &["disable"]);
+            assert_eq!(result.rows[0].outcome, RemovalOutcome::Unknown);
+            assert_eq!(f.journal()["in_flight"], 0);
+        }
+        #[test]
+        fn b2b_disable_nonzero_or_error_is_recorded_unknown_once() {
+            for response in [
+                Ok(out(1, "", "inert refusal")),
+                Err(NativeError::OutcomeUnknown),
+            ] {
+                let f = Flow::new();
+                *f.effects.response.lock().unwrap() = Some(("disable".into(), response));
+                let result = f.apply(choices());
+                failed(&f, &result, &["disable"]);
+                assert_eq!(f.journal()["rows"][0], "Unknown");
+                assert_eq!(f.journal()["in_flight"], Value::Null);
+            }
+        }
+        #[test]
+        fn b2b_stop_exit_zero_and_live_original_never_erases() {
+            let f = Flow::new();
+            *f.effects.response.lock().unwrap() = Some(("bootout".into(), Ok(out(0, "", ""))));
+            let effects = f.effects.clone();
+            let clock = f.rig.clock.clone();
+            *f.rig.runner.hook.lock().unwrap() = Some(Arc::new(move |_, program| {
+                if program == Path::new("/bin/ps")
+                    && effects
+                        .mutations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|v| v == "bootout")
+                {
+                    clock.0.store(120_001, Ordering::Release);
+                }
+                Ok(())
+            }));
+            let result = f.apply(RemovalChoices {
+                delete_identity: true,
+                remove_driver: false,
+            });
+            failed(&f, &result, &["disable", "bootout"]);
+            assert!(f.rig.io.target().agent_path().exists());
+            assert_eq!(result.rows[2].outcome, RemovalOutcome::Pending);
+        }
+        #[test]
+        fn b2b_stop_missing_clean_receipt_never_grants_erase() {
+            let f = Flow::new();
+            let effects = f.effects.clone();
+            let clock = f.rig.clock.clone();
+            let scratch = f.rig.scratch.clone();
+            let receipt = f.rig.io.target().state_dir().join("last_exit.json");
+            *f.rig.runner.hook.lock().unwrap() = Some(Arc::new(move |_, program| {
+                if program == Path::new("/bin/ps")
+                    && effects
+                        .mutations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|v| v == "bootout")
+                {
+                    if receipt.exists() {
+                        scratch.remove(&receipt);
+                    }
+                    clock.0.store(120_001, Ordering::Release);
+                }
+                Ok(())
+            }));
+            let result = f.apply(RemovalChoices {
+                delete_identity: true,
+                remove_driver: false,
+            });
+            failed(&f, &result, &["disable", "bootout"]);
+            assert!(f.rig.io.target().agent_path().exists());
+        }
+        #[test]
+        fn b2b_erase_uncertainty_retains_executable_and_never_resends() {
+            let f = Flow::new();
+            let trust = f.rig.io.target().state_dir().join("trust.json");
+            f.rig.put(&trust, b"inert trust", 0o600);
+            *f.effects.response.lock().unwrap() =
+                Some(("erase".into(), Err(NativeError::OutcomeUnknown)));
+            let (mut m, p, c) = f.prepare(RemovalChoices {
+                delete_identity: true,
+                remove_driver: false,
+            });
+            let result = m.apply(&p, &c, Some(f.reader.clone()), &whole(&f)).unwrap();
+            failed(&f, &result, &["disable", "bootout", "erase"]);
+            assert_eq!(f.journal()["rows"][2], "Unknown");
+            assert!(m.apply(&p, &c, Some(f.reader.clone()), &whole(&f)).is_err());
+            assert_eq!(std::fs::read(trust).unwrap(), b"inert trust");
+            assert_eq!(
+                *f.effects.mutations.lock().unwrap(),
+                ["disable", "bootout", "erase"]
+            );
+        }
+        #[test]
+        fn b2b_erase_waiting_semantics_are_not_success() {
+            let f = Flow::new();
+            let output = serde_json::to_vec(&json!({"schema_version":1,"result":"waiting",
+                "reason":"keystore_locked","key":"kept","trust":"kept"}))
+            .unwrap();
+            assert!(
+                !crate::agent_contract::parse_erase_identity(&output)
+                    .unwrap()
+                    .identity_and_pairings_removed()
+            );
+            *f.effects.response.lock().unwrap() = Some((
+                "erase".into(),
+                Ok(CommandOutput {
+                    code: Some(0),
+                    stdout: output,
+                    stderr: vec![],
+                }),
+            ));
+            let result = f.apply(RemovalChoices {
+                delete_identity: true,
+                remove_driver: false,
+            });
+            failed(&f, &result, &["disable", "bootout", "erase"]);
+        }
+        #[test]
+        fn b2b_malformed_package_outcome_preserves_staging_and_no_resend() {
+            let f = Flow::new();
+            *f.effects.response.lock().unwrap() = Some(("package".into(), Ok(out(0, "", ""))));
+            let scratch = f.rig.scratch.clone();
+            let outcome = f
+                .effects
+                .library
+                .join("Application Support/Crosspane/Installer/audio-removal-outcome.json");
+            *f.effects.hook.lock().unwrap() = Some(Arc::new(move |verb, _| {
+                if verb == "package" {
+                    scratch.put(&outcome, b"invalid fixture\n", 0o644);
+                }
+                Ok(())
+            }));
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            failed(&f, &result, &["disable", "bootout", "package"]);
+            assert!(
+                f.rig
+                    .io
+                    .target()
+                    .installer_dir()
+                    .join("packages/CrosspaneAudio-remove-0.1.0.pkg")
+                    .exists()
+            );
+            assert_eq!(f.journal()["rows"][3], "Unknown");
+        }
+        #[test]
+        fn b2b_created_packages_are_retained_and_never_pruned() {
+            let f = Flow::new();
+            let packages = f.rig.io.target().installer_dir().join("packages");
+            assert!(!packages.exists());
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            assert!(result.complete, "{result:?}");
+            assert!(packages.exists());
+            assert!(
+                !result
+                    .rows
+                    .iter()
+                    .any(|row| row.delta.path.as_deref() == Some(&packages)
+                        && row.delta.effect == RemovalEffect::PruneEmptyOwnedAfterVerification)
+            );
+            assert_eq!(
+                std::fs::read(packages.join("CrosspaneAudio-remove-0.1.0.pkg")).unwrap(),
+                b"inert-remove"
+            );
+        }
+        #[test]
+        fn b2b_extra_staging_sibling_is_foreign() {
+            let f = Flow::new();
+            let scratch = f.rig.scratch.clone();
+            let extra = f
+                .rig
+                .io
+                .target()
+                .installer_dir()
+                .join("packages/foreign.fixture");
+            let held = extra.clone();
+            *f.effects.hook.lock().unwrap() = Some(Arc::new(move |verb, _| {
+                if verb == "package" {
+                    scratch.put(&held, b"inert foreign sibling", 0o600);
+                }
+                Ok(())
+            }));
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            failed(&f, &result, &["disable", "bootout", "package"]);
+            assert_eq!(result.error, Some(NativeError::Foreign));
+            assert_eq!(std::fs::read(extra).unwrap(), b"inert foreign sibling");
+        }
+        #[test]
+        fn b2b_changed_original_staging_sibling_is_foreign() {
+            let f = Flow::new();
+            let sibling = f
+                .rig
+                .io
+                .target()
+                .installer_dir()
+                .join("packages/keep.fixture");
+            f.rig.put(&sibling, b"inert original sibling", 0o600);
+            let scratch = f.rig.scratch.clone();
+            let held = sibling.clone();
+            *f.effects.hook.lock().unwrap() = Some(Arc::new(move |verb, _| {
+                if verb == "package" {
+                    scratch.put(&held, b"inert changed sibling", 0o600);
+                }
+                Ok(())
+            }));
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            failed(&f, &result, &["disable", "bootout", "package"]);
+            assert_eq!(result.error, Some(NativeError::Foreign));
+            assert_eq!(std::fs::read(sibling).unwrap(), b"inert changed sibling");
+        }
+        #[test]
+        fn b2b_staged_leaf_replaced_after_open_is_foreign_even_same_bytes() {
+            for bytes in [b"inert-remove".as_slice(), b"foreign same-size".as_slice()] {
+                let f = Flow::new();
+                let path = f
+                    .rig
+                    .io
+                    .target()
+                    .installer_dir()
+                    .join("packages/CrosspaneAudio-remove-0.1.0.pkg");
+                let retained = path.with_extension("retained");
+                let original = retained.clone();
+                let scratch = f.rig.scratch.clone();
+                let held = path.clone();
+                *f.effects.hook.lock().unwrap() = Some(Arc::new(move |verb, _| {
+                    if verb == "package" {
+                        std::fs::rename(&held, &original).unwrap();
+                        scratch.put(&held, bytes, 0o600);
+                    }
+                    Ok(())
+                }));
+                let result = f.apply(RemovalChoices {
+                    delete_identity: false,
+                    remove_driver: true,
+                });
+                failed(&f, &result, &["disable", "bootout", "package"]);
+                assert_eq!(result.error, Some(NativeError::Foreign));
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+                assert_eq!(std::fs::read(retained).unwrap(), b"inert-remove");
+            }
+        }
+        #[test]
+        fn b2b_staging_directory_swap_after_capture_is_foreign() {
+            let f = Flow::new();
+            let path = f.rig.io.target().installer_dir().join("packages");
+            f.rig
+                .put(&path.join("keep.fixture"), b"inert original", 0o600);
+            let retained = path.with_extension("retained");
+            let original = retained.clone();
+            let held = path.clone();
+            let scratch = f.rig.scratch.clone();
+            *f.effects.hook.lock().unwrap() = Some(Arc::new(move |verb, _| {
+                if verb == "package" {
+                    std::fs::rename(&held, &original).unwrap();
+                    scratch.directory(&held);
+                    scratch.put(
+                        &held.join("CrosspaneAudio-remove-0.1.0.pkg"),
+                        b"inert-remove",
+                        0o600,
+                    );
+                }
+                Ok(())
+            }));
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            failed(&f, &result, &["disable", "bootout", "package"]);
+            assert_eq!(result.error, Some(NativeError::Foreign));
+            assert!(retained.join("keep.fixture").exists());
+            assert!(path.join("CrosspaneAudio-remove-0.1.0.pkg").exists());
+        }
+        #[test]
+        fn b2b_original_leaf_substitution_is_preserved_without_unlink() {
+            let f = Flow::new();
+            let leaf = f.rig.io.target().agent_path();
+            let retained = leaf.with_extension("retained");
+            let scratch = f.rig.scratch.clone();
+            let held = leaf.clone();
+            let original = retained.clone();
+            *f.rig.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                if stage == "verified-displace" && path == held {
+                    std::fs::rename(&held, &original).unwrap();
+                    scratch.put(&held, b"inert foreign agent", 0o755);
+                }
+                Ok(())
+            }));
+            let result = f.apply(choices());
+            failed(&f, &result, &["disable", "bootout"]);
+            assert_eq!(result.error, Some(NativeError::Foreign));
+            assert_eq!(std::fs::read(leaf).unwrap(), b"inert foreign agent");
+            assert!(retained.exists());
+        }
+        #[test]
+        fn b2b_empty_directories_are_pruned_deepest_first() {
+            let f = Flow::new();
+            let removed = Arc::new(Mutex::new(Vec::new()));
+            let seen = removed.clone();
+            *f.rig.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                if stage == "verified-displace" && path.is_dir() {
+                    seen.lock().unwrap().push(path.to_owned());
+                }
+                Ok(())
+            }));
+            assert!(f.apply(choices()).complete);
+            let removed = removed.lock().unwrap();
+            assert!(!removed.is_empty());
+            assert_eq!(removed.last(), Some(&f.rig.io.target().app_path()));
+            for pair in removed.windows(2) {
+                assert!(pair[0].components().count() >= pair[1].components().count());
+            }
+        }
+
+        #[test]
+        fn b2b_created_staging_hostile_uid_mode_or_nonempty_refuses() {
+            for variant in 0..3 {
+                let mut r = Rig::new();
+                let mut target = r.io.target().clone();
+                let previous = target.test_hook.take().unwrap();
+                let scratch = r.scratch.clone();
+                let path = target.installer_dir().join("packages");
+                let held = path.clone();
+                target.test_hook = Some(Arc::new(move |stage, p, identity| {
+                    let mut identity = previous(stage, p, identity)?;
+                    if p == held {
+                        if stage == "staging-open" && variant == 1 {
+                            let fd = scratch.directory(&held);
+                            rustix::fs::fchmod(fd, rustix::fs::Mode::from_raw_mode(0o755)).unwrap();
+                        }
+                        if stage == "staging-open" && variant == 2 {
+                            scratch.put(&held.join("foreign.fixture"), b"inert", 0o600);
+                        }
+                        if stage == "fd-stat" && variant == 0 {
+                            identity.as_mut().unwrap().uid += 1; // Injected ownership, no elevation.
+                        }
+                    }
+                    Ok(identity)
+                }));
+                r.io = Arc::new(
+                    MacNativeIo::new(
+                        target,
+                        r.runner.clone(),
+                        r.support.clone(),
+                        r.signatures.clone(),
+                        r.clock.clone(),
+                    )
+                    .unwrap(),
+                );
+                let selected = r.selected();
+                assert_eq!(
+                    r.io.create_package_staging_directory(&selected.support, &r.d())
+                        .unwrap_err(),
+                    NativeError::Foreign
+                );
+                assert!(path.exists());
+                assert!(r.runner.calls.lock().unwrap().iter().all(|(_, a)| {
+                    !a.iter()
+                        .any(|s| matches!(s.as_str(), "disable" | "bootout" | "erase-identity"))
+                }));
+            }
+        }
+        #[test]
+        fn b2b_created_staging_post_capture_drift_is_foreign() {
+            let mut r = Rig::new();
+            let mut target = r.io.target().clone();
+            let previous = target.test_hook.take().unwrap();
+            let scratch = r.scratch.clone();
+            let path = target.installer_dir().join("packages");
+            let retained = path.with_extension("retained");
+            let held = path.clone();
+            let original = retained.clone();
+            let captures = AtomicU64::default();
+            target.test_hook = Some(Arc::new(move |stage, p, identity| {
+                let identity = previous(stage, p, identity)?;
+                if stage == "fd-stat" && p == held && captures.fetch_add(1, Ordering::AcqRel) == 1 {
+                    std::fs::rename(&held, &original).unwrap();
+                    scratch.directory(&held);
+                }
+                Ok(identity)
+            }));
+            r.io = Arc::new(
+                MacNativeIo::new(
+                    target,
+                    r.runner.clone(),
+                    r.support.clone(),
+                    r.signatures.clone(),
+                    r.clock.clone(),
+                )
+                .unwrap(),
+            );
+            let selected = r.selected();
+            assert_eq!(
+                r.io.create_package_staging_directory(&selected.support, &r.d())
+                    .unwrap_err(),
+                NativeError::Foreign
+            );
+            assert!(path.exists() && retained.exists());
+        }
+        #[test]
+        fn b2b_same_uid_empty_pre_observation_swap_is_retained_residual() {
+            // mkdirat supplies no inode; the recorded first observation is evidence, NOT ownership.
+            let f = Flow::new();
+            let path = f.rig.io.target().installer_dir().join("packages");
+            let retained = path.with_extension("retained");
+            let scratch = f.rig.scratch.clone();
+            let held = path.clone();
+            let original = retained.clone();
+            *f.rig.hook.lock().unwrap() = Some(Arc::new(move |stage, p| {
+                if stage == "staging-open" && p == held {
+                    std::fs::rename(&held, &original).unwrap();
+                    scratch.directory(&held);
+                }
+                Ok(())
+            }));
+            let selected = f.rig.selected();
+            let evidence = f
+                .rig
+                .io
+                .create_package_staging_directory(&selected.support, &f.rig.d())
+                .unwrap();
+            assert_eq!(f.rig.io.metadata(&path).unwrap(), Some(evidence));
+            assert!(retained.exists());
+        }
+        #[test]
+        fn b2b_staged_debug_is_type_only() {
+            let f = Flow::new();
+            f.effects.journal_required.store(false, Ordering::Release);
+            let selected = f.rig.selected();
+            let mut package = MacAudioPackage::admit(
+                f.rig.io.clone(),
+                f.rig.audio(),
+                f.rig.clock.clone(),
+                &f.rig.d(),
+            )
+            .unwrap();
+            let plan = package
+                .plan(
+                    &selected.support,
+                    AudioPackageKind::Remove,
+                    1,
+                    1,
+                    &f.rig.d(),
+                )
+                .unwrap();
+            let consent = plan.consent(1, 1, true, true).unwrap();
+            let attempt = package
+                .open(plan, consent, &selected.support, &f.rig.d())
+                .unwrap();
+            assert_eq!(format!("{:?}", attempt.staged().unwrap()), "StagedPackage");
+            assert_eq!(attempt.staged(), attempt.staged());
+        }
+        #[test]
+        fn b2b_package_admin_refusal_is_unknown_retained_and_single() {
+            let f = Flow::new();
+            *f.effects.response.lock().unwrap() =
+                Some(("package".into(), Ok(out(1, "", "inert admin refusal"))));
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            failed(&f, &result, &["disable", "bootout", "package"]);
+            assert_eq!(f.journal()["rows"][3], "Unknown");
+            assert!(
+                f.rig
+                    .io
+                    .target()
+                    .installer_dir()
+                    .join("packages/CrosspaneAudio-remove-0.1.0.pkg")
+                    .exists()
+            );
+        }
+        #[test]
+        fn b2b_package_exit_zero_without_fresh_outcome_never_completes() {
+            let f = Flow::new();
+            *f.effects.response.lock().unwrap() = Some(("package".into(), Ok(out(0, "", ""))));
+            let clock = f.rig.clock.clone();
+            *f.effects.hook.lock().unwrap() = Some(Arc::new(move |verb, _| {
+                if verb == "package" {
+                    clock.0.store(120_001, Ordering::Release);
+                }
+                Ok(())
+            }));
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            failed(&f, &result, &["disable", "bootout", "package"]);
+            assert_eq!(f.journal()["in_flight"], 3);
+            assert_eq!(f.journal()["rows"][3], "Pending");
+        }
+        #[test]
+        fn b2b_outcome_publish_interruption_recovers_unknown_not_authority() {
+            let f = Flow::new();
+            let publications = Arc::new(AtomicU64::default());
+            let counter = publications.clone();
+            *f.rig.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                if stage == "publish"
+                    && path.ends_with("removal.json")
+                    && counter.fetch_add(1, Ordering::AcqRel) == 2
+                {
+                    return Err(NativeError::Unavailable);
+                }
+                Ok(())
+            }));
+            let (mut m, p, c) = f.prepare(choices());
+            let result = m.apply(&p, &c, Some(f.reader.clone()), &whole(&f)).unwrap();
+            failed(&f, &result, &["disable"]);
+            assert_eq!(f.journal()["in_flight"], 0);
+            assert_eq!(
+                m.removal_recovery(&f.rig.d()).unwrap().unwrap().rows[0],
+                RemovalOutcome::Unknown
+            );
+            assert!(m.apply(&p, &c, Some(f.reader.clone()), &whole(&f)).is_err());
+            assert_eq!(*f.effects.mutations.lock().unwrap(), ["disable"]);
+        }
+        #[test]
+        fn b2b_noncooperative_native_attempt_holds_lock_after_actual_finish() {
+            let f = Arc::new(Flow::new());
+            let (mut m, p, c) = f.prepare(choices());
+            let (entered, entry) = std::sync::mpsc::sync_channel(1);
+            let (release, wait) = std::sync::mpsc::sync_channel(1);
+            let wait = Mutex::new(wait);
+            let (finished, finish) = std::sync::mpsc::sync_channel(1);
+            *f.effects.hook.lock().unwrap() = Some(Arc::new(move |verb, _| {
+                if verb == "disable" {
+                    entered.try_send(()).unwrap();
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    finished.try_send(()).unwrap();
+                }
+                Ok(())
+            }));
+            let owned = f.clone();
+            let (published, result) = std::sync::mpsc::sync_channel(1);
+            let job = std::thread::spawn(move || {
+                published
+                    .send(m.apply(&p, &c, Some(owned.reader.clone()), &whole(&owned)))
+                    .unwrap();
+            });
+            entry.recv_timeout(Duration::from_secs(5)).unwrap();
+            f.rig.clock.0.store(120_001, Ordering::Release);
+            let result = result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert!(!result.complete);
+            assert!(matches!(
+                result.error,
+                Some(NativeError::Timeout | NativeError::OutcomeUnknown)
+            ));
+            let proof = f.rig.selected().support;
+            assert!(matches!(
+                f.rig.io.lock(&proof, &f.rig.d()),
+                Err(NativeError::Busy)
+            ));
+            release.send(()).unwrap();
+            finish.recv_timeout(Duration::from_secs(2)).unwrap();
+            job.join().unwrap();
+            assert!(matches!(
+                f.rig.io.lock(&proof, &f.rig.d()),
+                Err(NativeError::Busy)
+            ));
+            assert_eq!(*f.effects.mutations.lock().unwrap(), ["disable"]);
+            assert_eq!(f.journal()["in_flight"], 0);
+        }
+
+        #[test]
+        fn b2b_each_owned_leaf_and_prune_has_exact_durable_pending_row() {
+            let f = Flow::new();
+            let (mut m, p, c) = f.prepare(choices());
+            let deltas = p.preview().deltas.clone();
+            let scratch = f.rig.scratch.clone();
+            let journal = f.rig.io.target().installer_dir().join("removal.json");
+            let checked = Arc::new(AtomicU64::default());
+            let observed = checked.clone();
+            *f.rig.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                let _retain = &scratch;
+                if stage == "verified-displace" {
+                    let record: Value =
+                        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+                    let index = record["in_flight"].as_u64().unwrap() as usize;
+                    assert_eq!(deltas[index].path.as_deref(), Some(path));
+                    assert!(matches!(
+                        deltas[index].effect,
+                        RemovalEffect::RemoveOwnedAfterVerification
+                            | RemovalEffect::PruneEmptyOwnedAfterVerification
+                    ));
+                    assert_eq!(record["rows"][index], "Pending");
+                    observed.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(())
+            }));
+            let result = m.apply(&p, &c, Some(f.reader.clone()), &whole(&f)).unwrap();
+            assert!(result.complete, "{result:?}");
+            assert_eq!(
+                checked.load(Ordering::Acquire) as usize,
+                result
+                    .rows
+                    .iter()
+                    .filter(|row| matches!(
+                        row.delta.effect,
+                        RemovalEffect::RemoveOwnedAfterVerification
+                            | RemovalEffect::PruneEmptyOwnedAfterVerification
+                    ))
+                    .count()
+            );
+        }
+        #[test]
+        fn b2b_present_driver_and_previous_share_one_verified_package_attempt() {
+            let f = Flow::new();
+            let driver = f
+                .effects
+                .library
+                .join("Audio/Plug-Ins/HAL/CrosspaneAudio.driver");
+            let previous = f
+                .effects
+                .library
+                .join("Application Support/Crosspane/Installer/previous");
+            f.rig.scratch.directory(&driver);
+            f.rig.scratch.directory(&previous);
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            assert!(result.complete, "{result:?}");
+            assert!(!driver.exists() && !previous.exists());
+            assert_eq!(
+                *f.effects.mutations.lock().unwrap(),
+                ["disable", "bootout", "package"]
+            );
+            assert_eq!(f.journal()["rows"][3], "Completed");
+            assert_eq!(f.journal()["rows"][4], "Completed");
+        }
+        #[test]
+        fn b2b_kept_driver_previous_logs_identity_and_legacy_cli_survive() {
+            let f = Flow::new();
+            let driver = f
+                .effects
+                .library
+                .join("Audio/Plug-Ins/HAL/CrosspaneAudio.driver");
+            let previous = f
+                .effects
+                .library
+                .join("Application Support/Crosspane/Installer/previous");
+            f.rig.scratch.directory(&driver);
+            f.rig.scratch.directory(&previous);
+            let trust = f.rig.io.target().state_dir().join("trust.json");
+            let log = f.rig.io.target().state_dir().join("logs/inert.fixture");
+            let legacy = f
+                .rig
+                .io
+                .target()
+                .paths()
+                .home
+                .join(".cargo/bin/crosspanectl");
+            for path in [&trust, &log, &legacy] {
+                f.rig.put(path, b"inert retained", 0o600);
+            }
+            let result = f.apply(choices());
+            assert!(result.complete, "{result:?}");
+            for path in [trust, log, legacy] {
+                assert_eq!(std::fs::read(path).unwrap(), b"inert retained");
+            }
+            assert!(driver.exists() && previous.exists());
+            assert_eq!(*f.effects.mutations.lock().unwrap(), ["disable", "bootout"]);
+        }
+        #[test]
+        fn b2b_adopted_payload_and_launch_agent_are_kept() {
+            let f = Flow::new();
+            f.rig.edit_payload(|value| {
+                for row in value["receipt"]["resources"].as_array_mut().unwrap() {
+                    row["ownership"] = json!(ResourceOwnership::Adopted);
+                    row["before"] = json!(ResourceObservation::Different);
+                }
+            });
+            let result = f.apply(choices());
+            assert!(result.complete, "{result:?}");
+            assert!(f.rig.io.target().app_path().exists());
+            assert!(f.rig.io.target().agent_path().exists());
+            assert!(
+                f.rig
+                    .io
+                    .target()
+                    .paths()
+                    .home
+                    .join(".local/bin/crosspanectl")
+                    .exists()
+            );
+            assert_eq!(*f.effects.mutations.lock().unwrap(), ["disable", "bootout"]);
+            assert!(
+                result
+                    .rows
+                    .iter()
+                    .filter(|row| row.delta.effect == RemovalEffect::KeepForeign)
+                    .all(|row| row.outcome == RemovalOutcome::Kept)
+            );
+            // Adopted autostart cannot admit the running original through the frozen observer.
+            let adopted = Flow::new();
+            adopted.rig.hints(ResourceOwnership::Adopted);
+            let mut m = MacRemoval::new(adopted.rig.observer());
+            assert!(
+                m.plan(
+                    1,
+                    OperationId(1),
+                    choices(),
+                    Some(adopted.rig.current()),
+                    &adopted.rig.d()
+                )
+                .is_err()
+            );
+            assert!(adopted.effects.mutations.lock().unwrap().is_empty());
+            assert!(adopted.rig.io.target().agent_path().exists());
+        }
+
+        #[test]
+        fn b2b_r1_sibling_edit_during_final_staged_read_refuses_before_any_delete() {
+            use std::os::unix::fs::MetadataExt;
+            let f = Flow::new();
+            let packages = f.rig.io.target().installer_dir().join("packages");
+            let sibling = packages.join("keep.fixture");
+            f.rig.put(&sibling, b"inert sibling A", 0o600);
+            let (mut m, p, c) = f.prepare(RemovalChoices {
+                delete_identity: false,
+                remove_driver: true,
+            });
+            let index = p
+                .preview()
+                .deltas
+                .iter()
+                .position(|row| row.effect == RemovalEffect::RemoveOwnedAfterVerification)
+                .unwrap();
+            let leaf = p.preview().deltas[index].path.clone().unwrap();
+            let journal = f.rig.io.target().installer_dir().join("removal.json");
+            let staged = packages.join("CrosspaneAudio-remove-0.1.0.pkg");
+            let injected = Arc::new(AtomicBool::default());
+            let changed = injected.clone();
+            let deletes = Arc::new(AtomicU64::default());
+            let observed = deletes.clone();
+            let mutating_read = AtomicBool::default();
+            let reads = AtomicU64::default();
+            let sibling_path = sibling.clone();
+            *f.rig.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                if stage == "verified-displace" {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                }
+                if stage == "open-before" && path == staged {
+                    let record: Value =
+                        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+                    if record["in_flight"] == index as u64
+                        && reads.fetch_add(1, Ordering::AcqRel) == 1
+                    {
+                        // The second staging read is the LAST check in final verify_intent.
+                        mutating_read.store(true, Ordering::Release);
+                    }
+                }
+                if stage == "metadata"
+                    && path == staged
+                    && mutating_read.swap(false, Ordering::AcqRel)
+                {
+                    // Native read has read/fstatted its held leaf but has not returned yet.
+                    // In-place sibling bytes change; no directory entry is created/replaced.
+                    let before = std::fs::metadata(&packages).unwrap();
+                    let identity = |m: &std::fs::Metadata| {
+                        (
+                            m.dev(),
+                            m.ino(),
+                            m.mode(),
+                            m.uid(),
+                            m.nlink(),
+                            m.len(),
+                            m.mtime(),
+                            m.mtime_nsec(),
+                            m.ctime(),
+                            m.ctime_nsec(),
+                        )
+                    };
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&sibling_path)
+                        .unwrap();
+                    std::io::Write::write_all(&mut file, b"inert sibling B").unwrap();
+                    assert_eq!(
+                        identity(&before),
+                        identity(&std::fs::metadata(&packages).unwrap())
+                    );
+                    changed.store(true, Ordering::Release);
+                }
+                Ok(())
+            }));
+            let result = m.apply(&p, &c, Some(f.reader.clone()), &whole(&f)).unwrap();
+            assert!(
+                injected.load(Ordering::Acquire),
+                "fixture must edit DURING final read"
+            );
+            assert_eq!(result.error, Some(NativeError::Foreign));
+            assert_eq!(
+                deletes.load(Ordering::Acquire),
+                0,
+                "a changed baseline sibling must retire before the NEXT owned-file dispatch"
+            );
+            assert!(leaf.exists());
+            assert_eq!(std::fs::read(sibling).unwrap(), b"inert sibling B");
+            assert_eq!(
+                *f.effects.mutations.lock().unwrap(),
+                ["disable", "bootout", "package"]
+            );
+            // Renew support for the still-present executable; do not reacquire the EXITED agent.
+            let rule = inventory().files[0].signing.clone().unwrap();
+            let requirement = SigningRequirement {
+                role: ArtifactRole::Agent,
+                identifier: rule.identifier,
+                designated_requirement: rule.designated_requirement,
+                entitlements: rule.entitlements,
+            };
+            let main = f
+                .rig
+                .io
+                .admit_main_signature(&f.rig.io.target().agent_path(), &requirement, &f.rig.d())
+                .unwrap();
+            let support = f.rig.io.admit_support(&main, &f.rig.d()).unwrap();
+            assert!(matches!(
+                f.rig.io.lock(&support, &f.rig.d()),
+                Err(NativeError::Busy)
+            ));
+            assert_eq!(f.journal()["in_flight"], index as u64);
+            assert_eq!(f.journal()["rows"][index], "Pending");
+        }
+    }
 }

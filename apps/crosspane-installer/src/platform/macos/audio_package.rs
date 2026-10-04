@@ -224,13 +224,28 @@ type OutcomeIdentity = (u64, u64, i128, u64);
 fn identity(file: &FileIdentity) -> OutcomeIdentity {
     (file.device, file.inode, file.modified_ns, file.length)
 }
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct StagedPackage {
+    pub(super) leaf: FileIdentity,
+    pub(super) sha256: String,
+    pub(super) parent: (u64, u64),
+}
+impl std::fmt::Debug for StagedPackage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StagedPackage")
+    }
+}
 pub struct AudioPackageAttempt {
     owner: Arc<()>,
     prior: Option<OutcomeIdentity>,
     start_ms: u64,
+    staged: Option<Box<StagedPackage>>,
     facts: AudioPackageFacts,
 }
 impl AudioPackageAttempt {
+    pub(crate) fn staged(&self) -> Option<&StagedPackage> {
+        self.staged.as_deref()
+    }
     pub fn facts(&self) -> &AudioPackageFacts {
         &self.facts
     }
@@ -418,7 +433,8 @@ impl MacAudioPackage {
             preview,
         })
     }
-    fn directories(&self, proof: &SupportProof, deadline: &Deadline) -> NativeResult<()> {
+    fn directories(&self, proof: &SupportProof, deadline: &Deadline) -> NativeResult<FileIdentity> {
+        let mut packages = None;
         for suffix in [
             "Library",
             "Library/Application Support",
@@ -435,11 +451,16 @@ impl MacAudioPackage {
                 {
                     return Err(NativeError::Foreign);
                 }
+                if suffix.ends_with("/packages") {
+                    packages = Some(s);
+                }
+            } else if suffix.ends_with("/packages") {
+                packages = Some(self.io.create_package_staging_directory(proof, deadline)?);
             } else {
                 self.io.create_directory(proof, &path, 0o700, deadline)?;
             }
         }
-        Ok(())
+        packages.ok_or(NativeError::Foreign)
     }
     pub fn open(
         &mut self,
@@ -472,6 +493,7 @@ impl MacAudioPackage {
             owner: self.owner.clone(),
             prior: None,
             start_ms: 0,
+            staged: None,
             facts: AudioPackageFacts {
                 kind: plan.kind,
                 state: PackageState::Unknown,
@@ -480,14 +502,19 @@ impl MacAudioPackage {
             },
         };
         let result = (|| {
-            self.directories(proof, deadline)?;
-            self.io
-                .atomic_write(proof, &path, &bytes, plan.staged.as_ref(), deadline)?;
-            if hash(&self.io.read(&path, MAX_FILE_BYTES, true, deadline)?)
-                != self.package(plan.kind).sha256
-            {
+            let parent = self.directories(proof, deadline)?;
+            let leaf =
+                self.io
+                    .atomic_write(proof, &path, &bytes, plan.staged.as_ref(), deadline)?;
+            let sha256 = hash(&self.io.read(&path, MAX_FILE_BYTES, true, deadline)?);
+            if sha256 != self.package(plan.kind).sha256 {
                 return Err(NativeError::Foreign);
             }
+            attempt.staged = Some(Box::new(StagedPackage {
+                leaf,
+                sha256,
+                parent: (parent.device, parent.inode),
+            }));
             proof.check(&self.io, deadline)?;
             if self.snapshot(deadline)? != plan.snapshot
                 || self.io.support_observation(deadline)? != plan.session

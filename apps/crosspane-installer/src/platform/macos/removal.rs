@@ -1719,6 +1719,7 @@ struct LeaseState {
     exit: Option<ExitEvidence>,
     erased: bool,
     audio: Option<AudioPackageAttempt>,
+    staging: Option<PackageStaging>,
     retained: Vec<(PathBuf, Option<FileIdentity>)>,
 }
 opaque!(MacRemovalLease, RemovalLeaseIntent, RemovalEvidence);
@@ -1769,6 +1770,7 @@ impl MacRemoval {
                     exit: None,
                     erased: false,
                     audio: None,
+                    staging: None,
                     retained: Vec::new(),
                 })),
                 limit: deadline.clone(),
@@ -2402,6 +2404,11 @@ impl LeaseState {
                         .as_ref()
                         .is_some_and(|p| p != &row.path && p.starts_with(&row.path))
             });
+        if row.path == self.sources.io.target().installer_dir().join("packages")
+            && let Some(attempt) = &self.audio
+        {
+            return self.verify_package_staging(attempt, deadline);
+        }
         let own_installer = row.path == self.sources.io.target().installer_dir();
         let directory = row
             .identity
@@ -2520,6 +2527,9 @@ impl LeaseState {
         }
         self.check_exit(deadline)?;
         self.check_audio(deadline)?;
+        if let Some(attempt) = &self.audio {
+            self.verify_package_staging(attempt, deadline)?;
+        }
         for row in &self.inventory.resources {
             let removed = self.preview.deltas.iter().zip(&self.rows).any(|(d, code)| {
                 d.path.as_ref() == Some(&row.path)
@@ -2601,6 +2611,524 @@ impl LeaseState {
             }
         }
         support.check(&self.sources.io, deadline)?;
+        deadline.check()
+    }
+}
+
+// Ordered execution adds no native admission and never reconstructs authority from paths.
+/// Supplies current admitted Status replies for the SAME tracked original and caller clock.
+/// Implementations belong to the caller; this coordinator owns neither an agent port nor clock.
+pub trait RemovalCurrentReader: Send + Sync {
+    fn read(
+        &self,
+        original: &TrackedAgent,
+        deadline: &Deadline,
+    ) -> NativeResult<(SelectedAgent, AgentReply)>;
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalApplyRow {
+    pub delta: RemovalDelta,
+    pub outcome: RemovalOutcome,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalApplyResult {
+    pub operation: OperationId,
+    pub revision: u64,
+    pub rows: Vec<RemovalApplyRow>,
+    pub complete: bool,
+    pub retained_recovery: bool,
+    pub error: Option<NativeError>,
+}
+impl MacRemoval {
+    /// A single explicit attempt. Failure permanently retires the consent/lease, with no resend.
+    pub fn apply(
+        &mut self,
+        plan: &RemovalPlan,
+        consent: &RemovalConsent,
+        reader: Option<Arc<dyn RemovalCurrentReader>>,
+        deadline: &Deadline,
+    ) -> NativeResult<RemovalApplyResult> {
+        let admission = (|| {
+            self.check_plan(plan, deadline)?;
+            if !Arc::ptr_eq(&consent.binding, &plan.binding) {
+                return Err(NativeError::Refused);
+            }
+            Ok(())
+        })();
+        if let Err(error) = admission {
+            self.retire();
+            return Err(error);
+        }
+        let initial = read_removal_current(plan.tracked_original(), reader.clone(), deadline);
+        let current = match initial {
+            Ok(current) => current,
+            Err(error) => {
+                self.retire();
+                return Err(error);
+            }
+        };
+        let preview = plan.preview().clone();
+        let lease = self.begin(plan, consent, current, deadline)?;
+        Ok(lease.apply_ordered(preview, reader, deadline))
+    }
+}
+fn read_removal_current(
+    original: Option<Arc<TrackedAgent>>,
+    reader: Option<Arc<dyn RemovalCurrentReader>>,
+    deadline: &Deadline,
+) -> NativeResult<Option<(SelectedAgent, AgentReply)>> {
+    let Some(original) = original else {
+        deadline.check()?;
+        return Ok(None);
+    };
+    let reader = reader.ok_or(NativeError::Refused)?;
+    let limit = deadline.clone();
+    bounded(deadline, move || {
+        let current = reader.read(&original, &limit)?;
+        limit.check()?;
+        Ok(Some(current))
+    })
+}
+fn removal_order(preview: &RemovalPreview) -> Vec<usize> {
+    use RemovalEffect::*;
+    let mut indices: Vec<_> = (0..preview.deltas.len()).collect();
+    indices.sort_by_key(|&index| {
+        let delta = &preview.deltas[index];
+        let rank = match delta.effect {
+            DisableOwnedAutostart => 0,
+            StopTrackedAgent => 1,
+            EraseOnlyAfterCleanExit => 2,
+            RemoveSharedDriverAfterPackageVerification => 3,
+            RemovePreviousAfterPackageVerification => 4,
+            RemoveOwnedAfterVerification => 5,
+            PruneEmptyOwnedAfterVerification => 6,
+            _ => 7,
+        };
+        let depth = if delta.effect == PruneEmptyOwnedAfterVerification {
+            std::cmp::Reverse(delta.path.as_ref().map_or(0, |p| p.components().count()))
+        } else {
+            std::cmp::Reverse(0)
+        };
+        (rank, depth, index)
+    });
+    indices
+}
+impl MacRemovalLease {
+    fn apply_ordered(
+        mut self,
+        preview: RemovalPreview,
+        reader: Option<Arc<dyn RemovalCurrentReader>>,
+        deadline: &Deadline,
+    ) -> RemovalApplyResult {
+        let mut result = RemovalApplyResult {
+            operation: preview.operation,
+            revision: preview.revision,
+            rows: preview
+                .deltas
+                .iter()
+                .cloned()
+                .map(|delta| RemovalApplyRow {
+                    delta,
+                    outcome: RemovalOutcome::Pending,
+                })
+                .collect(),
+            complete: false,
+            retained_recovery: true,
+            error: None,
+        };
+        for index in removal_order(&preview) {
+            let step = self.apply_step(index, reader.clone(), deadline);
+            match step {
+                Ok(outcome) => result.rows[index].outcome = outcome,
+                Err(error) => {
+                    result.rows[index].outcome = RemovalOutcome::Unknown;
+                    result.error = Some(error);
+                    break;
+                }
+            }
+        }
+        result.complete = result.error.is_none()
+            && result.rows.iter().all(|row| {
+                matches!(
+                    row.outcome,
+                    RemovalOutcome::Completed | RemovalOutcome::Absent | RemovalOutcome::Kept
+                )
+            });
+        // The installer, exact recovery records, logs and configured identity keeps survive.
+        result
+    }
+    fn current_for_dispatch(
+        &mut self,
+        reader: Option<Arc<dyn RemovalCurrentReader>>,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<(SelectedAgent, AgentReply)>> {
+        deadline.check()?;
+        let original = {
+            let state = self.state.try_lock().map_err(|_| NativeError::Busy)?;
+            if state.exit.is_some() {
+                None
+            } else {
+                state.original.clone()
+            }
+        };
+        let current = read_removal_current(original, reader, deadline);
+        if current.is_err() {
+            self.retired = true;
+        }
+        current
+    }
+    fn apply_step(
+        &mut self,
+        index: usize,
+        reader: Option<Arc<dyn RemovalCurrentReader>>,
+        deadline: &Deadline,
+    ) -> NativeResult<RemovalOutcome> {
+        let current = self.current_for_dispatch(reader.clone(), deadline)?;
+        let intent = self.record_intent(index, current, deadline)?;
+        let current = self.current_for_dispatch(reader.clone(), deadline)?;
+        self.verify_intent(&intent, current, deadline)?;
+        let dispatched = self.dispatch_effect(&intent, deadline);
+        let (outcome, evidence) = match dispatched {
+            Ok(Ok(evidence)) => {
+                let outcome = match intent.delta().effect {
+                    RemovalEffect::Absent => RemovalOutcome::Absent,
+                    RemovalEffect::KeepRecovery
+                    | RemovalEffect::KeepIdentity
+                    | RemovalEffect::KeepForeign => RemovalOutcome::Kept,
+                    _ => RemovalOutcome::Completed,
+                };
+                (outcome, evidence)
+            }
+            Ok(Err(error)) => {
+                // A failed native attempt is never inferred harmless from exit code or a path.
+                self.record_outcome(
+                    intent,
+                    RemovalOutcome::Unknown,
+                    RemovalEvidence::None,
+                    None,
+                    deadline,
+                )?;
+                return Err(error);
+            }
+            Err(error) => return Err(error), // Pending durable intent; lease quarantines forever.
+        };
+        let current = if intent.delta().effect == RemovalEffect::StopTrackedAgent {
+            None // Actual native CleanAgentExit was observed, never a timer or bootout exit code.
+        } else {
+            self.current_for_dispatch(reader, deadline)?
+        };
+        self.record_outcome(intent, outcome, evidence, current, deadline)?;
+        Ok(outcome)
+    }
+    fn dispatch_effect(
+        &mut self,
+        intent: &RemovalLeaseIntent,
+        deadline: &Deadline,
+    ) -> NativeResult<NativeResult<RemovalEvidence>> {
+        if !Arc::ptr_eq(&intent.owner, &self.state) {
+            self.retired = true;
+            return Err(NativeError::Foreign);
+        }
+        let clean = if intent.delta.effect == RemovalEffect::EraseOnlyAfterCleanExit {
+            Some(self.clean_exit(intent, deadline)?)
+        } else {
+            None
+        };
+        let (index, delta, original) = (
+            intent.journal.index,
+            intent.delta.clone(),
+            intent.original.clone(),
+        );
+        self.work(deadline, move |state, limit| {
+            state.check_intent(index, &delta)?;
+            state.prerequisites(&delta, limit)?;
+            let support = state.support(limit)?;
+            let io = state.sources.io.clone();
+            let effect = (|| {
+                use RemovalEffect::*;
+                match delta.effect {
+                    KeepRecovery | KeepIdentity | KeepForeign | Absent => Ok(RemovalEvidence::None),
+                    DisableOwnedAutostart => {
+                        let command = CommandSpec::disable_agent(io.target())?;
+                        let output = io.execute(&command, Some(&support), limit)?;
+                        if output.code != Some(0) {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        Ok(RemovalEvidence::None)
+                    }
+                    StopTrackedAgent => {
+                        let original = state.original.clone().ok_or(NativeError::Refused)?;
+                        let command = CommandSpec::new(
+                            io.target(),
+                            NativeOperation::Launchctl(LaunchctlAction::Bootout),
+                        )?;
+                        let output = io.execute(&command, Some(&support), limit)?;
+                        if output.code != Some(0) {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        loop {
+                            limit.check()?;
+                            let support = state.support(limit)?;
+                            if io
+                                .observe_clean_exit(original.clone(), &support, limit)?
+                                .is_some()
+                            {
+                                return Ok(RemovalEvidence::None);
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                    EraseOnlyAfterCleanExit => {
+                        let clean = clean.ok_or(NativeError::Refused)?;
+                        let receipt = io.erase_installed_identity(clean, &support, limit)?;
+                        if !receipt.identity_and_pairings_removed() {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        Ok(RemovalEvidence::Erase(receipt))
+                    }
+                    RemoveSharedDriverAfterPackageVerification
+                    | RemovePreviousAfterPackageVerification => state.dispatch_audio(index, limit),
+                    RemoveOwnedAfterVerification | PruneEmptyOwnedAfterVerification => {
+                        let resource = original.as_ref().ok_or(NativeError::Foreign)?;
+                        if resource.state != ResourceState::Owned
+                            || delta.path.as_ref() != Some(&resource.path)
+                            || resource.id != delta.resource
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        let snapshot = resource.identity.as_ref().ok_or(NativeError::Foreign)?;
+                        io.remove_owned_leaf_verified(
+                            &support,
+                            &resource.path,
+                            snapshot,
+                            resource.sha256,
+                            limit,
+                        )?;
+                        Ok(RemovalEvidence::None)
+                    }
+                }
+            })();
+            // Wrapping an operation error permits a bounded Unknown publication before retirement.
+            Ok(effect)
+        })
+    }
+}
+
+struct PackageStaging {
+    index: usize,
+    original: Option<FileIdentity>,
+    entries: Vec<(String, FileIdentity)>,
+}
+fn digest_hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+impl LeaseState {
+    fn prepare_package_staging(&mut self, index: usize, deadline: &Deadline) -> NativeResult<()> {
+        if self.audio.is_some() || self.staging.is_some() {
+            return Err(NativeError::Refused);
+        }
+        let delta = self.preview.deltas.get(index).ok_or(NativeError::Invalid)?;
+        if !matches!(
+            delta.effect,
+            RemovalEffect::RemoveSharedDriverAfterPackageVerification
+                | RemovalEffect::RemovePreviousAfterPackageVerification
+        ) {
+            return Err(NativeError::Foreign);
+        }
+        self.check_intent(index, delta)?;
+        let root = self.sources.io.target().installer_dir().join("packages");
+        let original = self
+            .inventory
+            .resources
+            .iter()
+            .find(|row| row.path == root)
+            .and_then(|row| row.identity.clone());
+        let actual = self.sources.io.metadata(&root)?;
+        if actual != original {
+            return Err(NativeError::Foreign);
+        }
+        let entries = if original.is_some() {
+            self.sources.io.entries(&root, 4096, deadline)?
+        } else {
+            Vec::new()
+        };
+        if self.sources.io.metadata(&root)? != original {
+            return Err(NativeError::Foreign);
+        }
+        self.staging = Some(PackageStaging {
+            index,
+            original,
+            entries,
+        });
+        Ok(())
+    }
+    fn dispatch_audio(
+        &mut self,
+        index: usize,
+        deadline: &Deadline,
+    ) -> NativeResult<RemovalEvidence> {
+        if self.audio.is_some() {
+            self.check_audio(deadline)?;
+            return Ok(RemovalEvidence::None); // The second root row never opens Installer again.
+        }
+        self.prepare_package_staging(index, deadline)?;
+        let support = self.support(deadline)?;
+        let mut attempt = {
+            let mut package = self
+                .sources
+                .audio
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?;
+            let plan = package.plan(
+                &support,
+                AudioPackageKind::Remove,
+                self.preview.revision,
+                self.preview.operation.0,
+                deadline,
+            )?;
+            if plan.preview() != &self.inventory.audio {
+                return Err(NativeError::Foreign);
+            }
+            let consent = plan.consent(
+                self.preview.revision,
+                self.preview.operation.0,
+                self.choices.remove_driver,
+                self.choices.remove_driver,
+            )?;
+            package.open(plan, consent, &support, deadline)?
+        };
+        let observed = (|| {
+            if let Some(error) = attempt.facts().error {
+                return Err(error);
+            }
+            if attempt.staged().is_none() {
+                return Err(NativeError::Foreign);
+            }
+            loop {
+                deadline.check()?;
+                self.sources
+                    .audio
+                    .lock()
+                    .map_err(|_| NativeError::Unavailable)?
+                    .observe(&mut attempt, deadline)?;
+                match attempt.facts().state {
+                    PackageState::Outcome(AudioOutcome::Removed | AudioOutcome::Absent)
+                        if attempt.facts().error.is_none() =>
+                    {
+                        break;
+                    }
+                    PackageState::Outcome(_) => return Err(NativeError::OutcomeUnknown),
+                    _ if attempt
+                        .facts()
+                        .error
+                        .is_some_and(|error| error != NativeError::OutcomeUnknown) =>
+                    {
+                        return Err(attempt.facts().error.ok_or(NativeError::OutcomeUnknown)?);
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+            self.verify_package_staging(&attempt, deadline)?;
+            Ok(())
+        })();
+        match observed {
+            Ok(()) => Ok(RemovalEvidence::Audio(attempt)),
+            Err(error) => {
+                self.audio = Some(attempt); // Retained with the quarantined source graph.
+                Err(error)
+            }
+        }
+    }
+    fn verify_package_staging(
+        &self,
+        attempt: &AudioPackageAttempt,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let witness = self.staging.as_ref().ok_or(NativeError::Foreign)?;
+        let delta = self
+            .preview
+            .deltas
+            .get(witness.index)
+            .ok_or(NativeError::Foreign)?;
+        if !matches!(
+            delta.effect,
+            RemovalEffect::RemoveSharedDriverAfterPackageVerification
+                | RemovalEffect::RemovePreviousAfterPackageVerification
+        ) || !(self.pending == Some(witness.index)
+            || matches!(
+                self.rows[witness.index],
+                RemovalOutcome::Completed | RemovalOutcome::Absent
+            ))
+        {
+            return Err(NativeError::Foreign);
+        }
+        let staged = attempt.staged().ok_or(NativeError::Foreign)?;
+        if attempt.facts().kind != AudioPackageKind::Remove
+            || staged.sha256 != digest_hex(&self.inventory.package.removal_sha256)
+        {
+            return Err(NativeError::Foreign);
+        }
+        let root = self.sources.io.target().installer_dir().join("packages");
+        let before = self
+            .sources
+            .io
+            .metadata(&root)?
+            .ok_or(NativeError::Foreign)?;
+        if (before.device, before.inode) != staged.parent
+            || before.uid != self.sources.io.target().paths().uid
+            || before.mode != 0o040700
+            || witness.original.as_ref().is_some_and(|original| {
+                (original.device, original.inode, original.mode, original.uid)
+                    != (before.device, before.inode, before.mode, before.uid)
+            })
+        {
+            return Err(NativeError::Foreign);
+        }
+        let name = format!(
+            "CrosspaneAudio-remove-{}.pkg",
+            self.inventory.package.version
+        );
+        let entries = self.sources.io.entries(&root, 4096, deadline)?;
+        if entries.len() != witness.entries.iter().filter(|(n, _)| n != &name).count() + 1 {
+            return Err(NativeError::Foreign);
+        }
+        for (child, identity) in &entries {
+            if child == &name {
+                if identity != &staged.leaf {
+                    return Err(NativeError::Foreign);
+                }
+            } else if !witness
+                .entries
+                .iter()
+                .any(|entry| entry == &(child.clone(), identity.clone()))
+            {
+                return Err(NativeError::Foreign);
+            }
+        }
+        let path = root.join(&name);
+        if self.sources.io.metadata(&path)? != Some(staged.leaf.clone())
+            || digest_hex(&sha(&self.sources.io.read(
+                &path,
+                MAX_FILE_BYTES,
+                true,
+                deadline,
+            )?)) != staged.sha256
+            || self.sources.io.metadata(&path)? != Some(staged.leaf.clone())
+        {
+            return Err(NativeError::Foreign);
+        }
+        // In-place sibling edits do not change directory metadata; recheck after the leaf read.
+        for (child, identity) in &witness.entries {
+            deadline.check()?;
+            if child != &name
+                && self.sources.io.metadata(&root.join(child))? != Some(identity.clone())
+            {
+                return Err(NativeError::Foreign);
+            }
+        }
+        if self.sources.io.metadata(&root)? != Some(before) {
+            return Err(NativeError::Foreign);
+        }
         deadline.check()
     }
 }

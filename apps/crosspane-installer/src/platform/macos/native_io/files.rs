@@ -1128,3 +1128,50 @@ impl MacNativeIo {
         Ok(fd)
     }
 }
+
+impl MacNativeIo {
+    /// This created RETAINED staging directory grants no ownership or pruning authority.
+    /// Residual: an empty same-UID, same-mode swap before the first fd observation is unprovable.
+    pub(crate) fn create_package_staging_directory(
+        &self,
+        proof: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<FileIdentity> {
+        let _serial = self.mutation.try_lock().map_err(|_| NativeError::Busy)?;
+        proof.check(self, deadline)?;
+        let path = self.target.installer_dir().join("packages");
+        let (parent, name) = self.parent(&path)?;
+        self.expected_at(&parent, &name, None)?;
+        self.boundary("mkdir", &path, deadline)?;
+        parent.revalidate(self)?;
+        proof.check(self, deadline)?;
+        deadline.check()?;
+        native(rfs::mkdirat(&parent.fd, &name, Mode::from_raw_mode(0o700)))?;
+        self.boundary("staging-open", &path, deadline)?;
+        let child = native(rfs::openat(
+            &parent.fd,
+            &name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ))?;
+        let identity = self.fd_identity(&child, &path)?;
+        if identity.uid != self.target.paths.uid || identity.mode != 0o040700 {
+            return Err(NativeError::Foreign);
+        }
+        for entry in native(rfs::Dir::read_from(&child))? {
+            deadline.check()?;
+            if !matches!(native(entry)?.file_name().to_bytes(), b"." | b"..") {
+                return Err(NativeError::Foreign);
+            }
+        }
+        if self.fd_identity(&child, &path)? != identity {
+            return Err(NativeError::Foreign);
+        }
+        self.expected_at(&parent, &name, Some(&identity))?;
+        parent.revalidate(self)?;
+        self.filesystem
+            .execute(FilesystemOperation::DirectorySync(parent.fd.as_fd()))?;
+        self.boundary("complete", &path, deadline)?;
+        Ok(identity)
+    }
+}
