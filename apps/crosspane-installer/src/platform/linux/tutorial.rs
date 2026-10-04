@@ -1,4 +1,10 @@
 //! Owned tutorial window facts and inherited pipes; tone remains unavailable until b3.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired to TutorialNative by WP-4.15b3b")
+)]
+mod routing;
+
 use super::native_io::tutorial::{TutorialChild, TutorialIpc};
 use super::native_io::{
     Cancellation, ChildEnvironment, Deadline, LinuxNativeIo, NativeError, SupportProof,

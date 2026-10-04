@@ -43,5 +43,6 @@ objc2-foundation.workspace = true
 # registry-only Wayland read, both on streams from native_io's pinned connections.
 [target.'cfg(target_os = "linux")'.dependencies]
 crosspane-platform-linux.workspace = true
+pipewire.workspace = true
 zbus.workspace = true
 wayland-client.workspace = true

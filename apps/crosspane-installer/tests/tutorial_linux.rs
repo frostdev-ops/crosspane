@@ -8,6 +8,1392 @@ use fixture::*;
 use native_io::tutorial::TutorialIpc;
 use native_io::*;
 use serde_json::{Value, json};
+
+// WP-4.15b3a: the source include exposes only private cfg(test) memory helpers.
+#[path = "../src/platform/linux/tutorial/routing.rs"]
+mod routing;
+use pipewire as pw;
+use routing::test_support::Model as RouteModel;
+fn speakers() -> SpeakersSelection {
+    let peer = crosspane_types::id::NodeId([0x31; 32]);
+    SpeakersSelection {
+        peer,
+        device_key: format!("crosspane.{peer}.speaker"),
+    }
+}
+fn sink(model: &mut RouteModel, id: u32, serial: &str, role: &str, virtual_: &str) {
+    let key = speakers().device_key;
+    let info = [
+        ("object.serial", serial),
+        ("node.name", key.as_str()),
+        ("media.class", role),
+        ("node.virtual", virtual_),
+    ];
+    model.global(pw::types::ObjectType::Node, id, &info[..3]);
+    model.node_info(id, &info);
+}
+fn port(model: &mut RouteModel, id: u32, serial: &str, node: &str, direction: &str, channel: &str) {
+    model.global(
+        pw::types::ObjectType::Port,
+        id,
+        &[
+            ("object.serial", serial),
+            ("node.id", node),
+            ("port.direction", direction),
+            ("audio.channel", channel),
+        ],
+    );
+    // Only the fixture's participating node/direction/channel candidates receive bound info.
+    if !matches!(
+        (node, direction, channel),
+        ("10", "out", "FL" | "FR") | ("20", "in", "FL" | "FR")
+    ) {
+        return;
+    }
+    model.port_info(
+        id,
+        direction == "out",
+        &[
+            ("object.serial", serial),
+            ("node.id", node),
+            ("port.direction", direction),
+            ("audio.channel", channel),
+        ],
+    );
+}
+fn link(model: &mut RouteModel, id: u32, from: &str, to: &str) {
+    model.global(
+        pw::types::ObjectType::Link,
+        id,
+        &[
+            ("object.serial", "800"),
+            ("link.input.port", to),
+            ("link.output.port", from),
+        ],
+    );
+}
+fn route_model() -> RouteModel {
+    let mut model = RouteModel::new(&speakers());
+    sink(&mut model, 20, "200", "Audio/Sink", "true");
+    port(&mut model, 21, "201", "20", "in", "FL");
+    port(&mut model, 22, "202", "20", "in", "FR");
+    port(&mut model, 11, "101", "10", "out", "FL");
+    port(&mut model, 12, "102", "10", "out", "FR");
+    model
+}
+fn establish(model: &mut RouteModel) {
+    model.pin().unwrap();
+    assert_eq!(model.attach().unwrap(), [(11, 21), (12, 22)]);
+    link(model, 30, "11", "21");
+    link(model, 31, "12", "22");
+    model.link_state(0, 11, 21, pw::link::LinkState::Active);
+    model.link_state(1, 12, 22, pw::link::LinkState::Active);
+    assert!(model.established());
+}
+#[test]
+fn b3a_exact_peer_sink_and_two_active_links_are_required() {
+    let mut model = route_model();
+    model.pin().unwrap();
+    assert_eq!(model.attach().unwrap(), [(11, 21), (12, 22)]);
+    assert!(
+        !model.established(),
+        "creation requests are not evidence of linkage"
+    );
+    link(&mut model, 30, "11", "21");
+    link(&mut model, 31, "12", "22");
+    model.link_state(0, 11, 21, pw::link::LinkState::Active);
+    assert!(!model.established(), "both exact links must be active");
+    model.link_state(1, 12, 22, pw::link::LinkState::Active);
+    assert!(model.established());
+}
+
+#[test]
+fn b3a_unrelated_core_serial_zero_is_not_a_route_fact() {
+    let mut model = route_model();
+    model.global(pw::types::ObjectType::Core, 0, &[("object.serial", "0")]);
+    assert!(!model.disabled());
+    establish(&mut model);
+    assert!(model.established());
+}
+#[test]
+fn r1_extra_stream_ports_cannot_escape_foreign_link_detection() {
+    for direction in ["out", "in"] {
+        let mut model = route_model();
+        establish(&mut model);
+        port(&mut model, 13, "103", "10", direction, "FC");
+        if direction == "in" {
+            assert!(
+                !model.disabled(),
+                "an unlinked extra input port is only tracked"
+            );
+            assert!(model.established());
+        }
+        port(&mut model, 99, "990", "90", "in", "FL");
+        link(&mut model, 39, "13", "99");
+        assert!(model.disabled(), "foreign link on extra {direction} port");
+        assert!(!model.established());
+    }
+}
+#[test]
+fn r1_unexpected_stream_output_port_refuses_even_without_a_link() {
+    let mut model = route_model();
+    establish(&mut model);
+    port(&mut model, 13, "103", "10", "out", "FC");
+    assert!(model.disabled());
+    assert!(!model.established());
+}
+#[test]
+fn r1_retained_port_ids_and_active_links_do_not_survive_property_changes() {
+    for (id, serial, node, direction, channel) in [
+        (11, "101", "10", "out", "FL"),
+        (12, "102", "10", "out", "FR"),
+        (21, "201", "20", "in", "FL"),
+        (22, "202", "20", "in", "FR"),
+    ] {
+        let mut model = route_model();
+        establish(&mut model);
+        model.port_property_change(
+            id,
+            direction == "out",
+            &[
+                ("object.serial", serial),
+                ("node.id", node),
+                ("port.direction", direction),
+                ("audio.channel", if channel == "FL" { "FR" } else { "FL" }),
+                ("port.name", "SYNTHETIC_CHANGED_NAME"),
+            ],
+        );
+        assert!(
+            model.disabled(),
+            "port {id} changed with IDs/links retained"
+        );
+        assert!(!model.established());
+    }
+}
+#[test]
+fn r1_unchanged_admitted_port_values_with_reemitted_props_stay_established() {
+    let mut model = route_model();
+    establish(&mut model);
+    model.port_property_change(
+        11,
+        true,
+        &[
+            ("object.serial", "101"),
+            ("node.id", "10"),
+            ("port.direction", "out"),
+            ("audio.channel", "FL"),
+            ("port.name", "SYNTHETIC_UNRELATED_NAME_CHANGE"),
+        ],
+    );
+    assert!(!model.disabled());
+    assert!(model.established());
+}
+#[test]
+fn r1_params_only_empty_dictionary_preserves_the_admitted_baseline() {
+    let mut model = route_model();
+    establish(&mut model);
+    for props in [Some(&[][..]), None] {
+        model.port_receipt(11, 11, true, pw::port::PortChangeMask::PARAMS, props);
+        assert!(!model.disabled());
+        assert!(model.established());
+    }
+}
+#[test]
+fn r1_props_disappearance_or_bad_receipt_identity_still_disables() {
+    for (reported, output, mask, props) in [
+        (11, true, pw::port::PortChangeMask::PROPS, Some(&[][..])),
+        (11, true, pw::port::PortChangeMask::PROPS, None),
+        (99, true, pw::port::PortChangeMask::PARAMS, Some(&[][..])),
+        (11, false, pw::port::PortChangeMask::PARAMS, Some(&[][..])),
+    ] {
+        let mut model = route_model();
+        establish(&mut model);
+        model.port_receipt(11, reported, output, mask, props);
+        assert!(model.disabled());
+        assert!(!model.established());
+    }
+    let baseline = [
+        ("object.serial", "101"),
+        ("node.id", "10"),
+        ("port.direction", "out"),
+        ("audio.channel", "FL"),
+    ];
+    for props in [Some(&[][..]), Some(&baseline[..]), None] {
+        let mut model = RouteModel::new(&speakers());
+        model.global(pw::types::ObjectType::Port, 11, &baseline);
+        model.port_receipt(11, 11, true, pw::port::PortChangeMask::PARAMS, props);
+        assert!(
+            model.disabled(),
+            "partial receipt cannot supply first baseline"
+        );
+    }
+}
+#[test]
+fn r1_each_admitted_port_fact_change_or_disappearance_disables() {
+    let baseline = [
+        ("object.serial", "101"),
+        ("port.id", "0"),
+        ("node.id", "10"),
+        ("port.direction", "out"),
+        ("audio.channel", "FL"),
+        ("format.dsp", "32 bit float mono audio"),
+        ("media.type", "Audio"),
+    ];
+    for (key, replacement) in [
+        ("object.serial", "999"),
+        ("port.id", "1"),
+        ("node.id", "90"),
+        ("port.direction", "in"),
+        ("audio.channel", "FR"),
+        ("format.dsp", "16 bit int mono audio"),
+        ("media.type", "Video"),
+    ] {
+        for replacement in [Some(replacement), None] {
+            let mut model = RouteModel::new(&speakers());
+            sink(&mut model, 20, "200", "Audio/Sink", "true");
+            for (id, serial, node, direction, channel) in [
+                (11, "101", "10", "out", "FL"),
+                (12, "102", "10", "out", "FR"),
+                (21, "201", "20", "in", "FL"),
+                (22, "202", "20", "in", "FR"),
+            ] {
+                let values = [
+                    ("object.serial", serial),
+                    ("port.id", if channel == "FL" { "0" } else { "1" }),
+                    ("node.id", node),
+                    ("port.direction", direction),
+                    ("audio.channel", channel),
+                    ("format.dsp", "32 bit float mono audio"),
+                    ("media.type", "Audio"),
+                ];
+                model.global(pw::types::ObjectType::Port, id, &values[..6]);
+                model.port_info(id, direction == "out", &values);
+            }
+            establish(&mut model);
+            let changed: Vec<_> = baseline
+                .iter()
+                .filter_map(|(name, value)| {
+                    if *name == key {
+                        replacement.map(|value| (*name, value))
+                    } else {
+                        Some((*name, *value))
+                    }
+                })
+                .collect();
+            model.port_property_change(11, true, &changed);
+            assert!(model.disabled(), "admitted {key} changed/disappeared");
+            assert!(!model.established());
+        }
+    }
+}
+#[test]
+fn r1_all_four_initial_port_infos_are_required_before_any_link_request() {
+    let mut model = RouteModel::new(&speakers());
+    sink(&mut model, 20, "200", "Audio/Sink", "true");
+    let cases = [
+        (11, "101", "10", "out", "FL"),
+        (12, "102", "10", "out", "FR"),
+        (21, "201", "20", "in", "FL"),
+        (22, "202", "20", "in", "FR"),
+    ];
+    for (id, serial, node, direction, channel) in cases {
+        model.global(
+            pw::types::ObjectType::Port,
+            id,
+            &[
+                ("object.serial", serial),
+                ("node.id", node),
+                ("port.direction", direction),
+                ("audio.channel", channel),
+            ],
+        );
+    }
+    model.pin().unwrap();
+    for (id, serial, node, direction, channel) in cases {
+        assert!(model.pending_attach().is_none());
+        assert_eq!(model.requests(), 0);
+        model.port_info(
+            id,
+            direction == "out",
+            &[
+                ("object.serial", serial),
+                ("node.id", node),
+                ("port.direction", direction),
+                ("audio.channel", channel),
+            ],
+        );
+    }
+    assert_eq!(
+        model.pending_attach().unwrap().unwrap(),
+        [(11, 21), (12, 22)]
+    );
+    assert_eq!(model.requests(), 2);
+    assert!(!model.established());
+}
+#[test]
+fn b3a_virtual_only_in_bound_info_is_required_before_pinning() {
+    let mut model = RouteModel::new(&speakers());
+    let key = speakers().device_key;
+    model.global(
+        pw::types::ObjectType::Node,
+        20,
+        &[
+            ("object.serial", "200"),
+            ("node.name", &key),
+            ("media.class", "Audio/Sink"),
+        ],
+    );
+    for (id, serial, node, direction, channel) in [
+        (21, "201", "20", "in", "FL"),
+        (22, "202", "20", "in", "FR"),
+        (11, "101", "10", "out", "FL"),
+        (12, "102", "10", "out", "FR"),
+    ] {
+        port(&mut model, id, serial, node, direction, channel);
+    }
+    assert!(
+        !model.disabled(),
+        "header is only a candidate, not full virtual evidence"
+    );
+    assert_eq!(model.pin(), Err(FixtureError::OutputUnavailable));
+    model.node_info(
+        20,
+        &[
+            ("object.serial", "200"),
+            ("node.name", &key),
+            ("media.class", "Audio/Sink"),
+            ("node.virtual", "true"),
+        ],
+    );
+    model.pin().unwrap();
+    assert_eq!(model.attach().unwrap(), [(11, 21), (12, 22)]);
+    assert!(
+        !model.established(),
+        "info and requests alone do not admit samples"
+    );
+}
+
+#[test]
+fn b3a_later_property_event_disables_even_when_identity_keys_are_unchanged() {
+    let mut model = route_model();
+    establish(&mut model);
+    let key = speakers().device_key;
+    model.node_property_change(
+        20,
+        &[
+            ("object.serial", "200"),
+            ("node.name", &key),
+            ("media.class", "Audio/Sink"),
+            ("node.virtual", "true"),
+            ("node.description", "SYNTHETIC_CHANGED_DESCRIPTION"),
+        ],
+    );
+    assert!(model.disabled());
+    assert!(!model.established());
+}
+
+#[test]
+fn b3a_stream_without_its_own_fl_fr_ports_pends_without_link_requests() {
+    let mut model = RouteModel::new(&speakers());
+    sink(&mut model, 20, "200", "Audio/Sink", "true");
+    port(&mut model, 21, "201", "20", "in", "FL");
+    port(&mut model, 22, "202", "20", "in", "FR");
+    model.pin().unwrap();
+    assert!(model.pending_attach().is_none());
+    assert_eq!(model.requests(), 0);
+    port(&mut model, 11, "101", "10", "out", "FL");
+    assert!(model.pending_attach().is_none());
+    port(&mut model, 12, "102", "99", "out", "FR");
+    assert!(model.pending_attach().is_none());
+    assert_eq!(model.requests(), 0);
+    assert!(!model.established());
+    port(&mut model, 12, "102", "10", "out", "FR");
+    assert_eq!(
+        model.pending_attach().unwrap().unwrap(),
+        [(11, 21), (12, 22)]
+    );
+    assert_eq!(model.requests(), 2);
+    assert!(!model.established());
+}
+#[test]
+fn b3a_role_virtuality_full_peer_identity_and_ambiguity_fail_closed() {
+    for (role, virtual_) in [
+        ("Audio/Source", "true"),
+        ("Audio/Sink", "false"),
+        ("Stream/Output/Audio", "true"),
+    ] {
+        let mut model = route_model();
+        model.remove(20);
+        sink(&mut model, 20, "200", role, virtual_);
+        assert!(model.pin().is_err());
+    }
+    let mut other = speakers();
+    other.peer = crosspane_types::id::NodeId([0x32; 32]);
+    other.device_key = format!("crosspane.{}.speaker", other.peer);
+    let mut model = RouteModel::new(&other);
+    sink(&mut model, 20, "200", "Audio/Sink", "true");
+    assert!(model.pin().is_err());
+    let mut model = route_model();
+    sink(&mut model, 23, "203", "Audio/Sink", "true");
+    assert!(model.pin().is_err());
+}
+#[test]
+fn b3a_missing_duplicate_monitor_or_malformed_ports_are_not_playback() {
+    for (direction, channel, parent) in [
+        ("out", "FL", "20"),
+        ("in", "MONO", "20"),
+        ("in", "FL", "+20"),
+        ("in", "FL", "4294967316"),
+        ("in", "FL", "0"),
+    ] {
+        let mut model = route_model();
+        model.remove(21);
+        port(&mut model, 21, "201", parent, direction, channel);
+        assert!(model.pin().is_err());
+    }
+    let mut model = route_model();
+    port(&mut model, 23, "203", "20", "in", "FL");
+    assert!(model.pin().is_err());
+    for serial in ["+200", "-200", "18446744073709551616", "0", "200x", ""] {
+        let mut model = route_model();
+        model.remove(20);
+        sink(&mut model, 20, serial, "Audio/Sink", "true");
+        assert!(
+            model.pin().is_err(),
+            "malformed serial must not identify a sink"
+        );
+    }
+}
+#[test]
+fn b3a_foreign_or_duplicate_link_never_becomes_an_admitted_route() {
+    for (from, to) in [("11", "41"), ("12", "42"), ("50", "11")] {
+        let mut model = route_model();
+        model.pin().unwrap();
+        model.attach().unwrap();
+        link(&mut model, 30, from, to);
+        assert!(model.disabled());
+        assert!(!model.established());
+    }
+    let mut model = route_model();
+    establish(&mut model);
+    link(&mut model, 32, "11", "21");
+    assert!(
+        model.disabled(),
+        "a duplicate exact link is still a foreign third link"
+    );
+}
+#[test]
+fn b3a_foreign_link_before_attachment_is_detected_before_own_requests() {
+    let mut model = route_model();
+    link(&mut model, 50, "11", "41");
+    model.pin().unwrap();
+    assert_eq!(model.attach(), Err(FixtureError::OutputChanged));
+    assert!(model.disabled());
+    assert!(!model.established());
+}
+#[test]
+fn b3a_sink_or_port_incarnation_changes_never_rebind() {
+    for removed in [20, 21, 22, 11, 12, 30] {
+        let mut model = route_model();
+        establish(&mut model);
+        model.remove(removed);
+        assert!(model.disabled());
+        assert!(!model.established());
+    }
+    let mut model = route_model();
+    model.pin().unwrap();
+    model.remove(20);
+    sink(&mut model, 20, "999", "Audio/Sink", "true");
+    assert_eq!(model.attach(), Err(FixtureError::OutputChanged));
+}
+#[test]
+fn b3a_bound_node_property_change_and_link_state_loss_disable_immediately() {
+    let mut model = route_model();
+    establish(&mut model);
+    let key = speakers().device_key;
+    model.node_info(
+        20,
+        &[
+            ("object.serial", "200"),
+            ("node.name", &key),
+            ("media.class", "Audio/Source"),
+            ("node.virtual", "true"),
+        ],
+    );
+    assert!(model.disabled());
+    for state in [
+        pw::link::LinkState::Unlinked,
+        pw::link::LinkState::Error("SYNTHETIC_FIXED_FAILURE"),
+        pw::link::LinkState::Paused,
+    ] {
+        let mut model = route_model();
+        establish(&mut model);
+        model.link_state(0, 11, 21, state);
+        assert!(model.disabled());
+    }
+    let mut model = route_model();
+    model.pin().unwrap();
+    model.attach().unwrap();
+    model.link_state(0, 11, 41, pw::link::LinkState::Active);
+    assert!(model.disabled());
+}
+#[test]
+fn b3a_unrelated_link_removal_is_not_output_replacement() {
+    let mut model = route_model();
+    link(&mut model, 99, "60", "61");
+    establish(&mut model);
+    model.remove(99);
+    assert!(!model.disabled());
+    assert!(model.established());
+}
+#[test]
+fn b3a_missing_or_signed_link_identity_cannot_hide_a_foreign_link() {
+    for serial in [
+        None,
+        Some("+800"),
+        Some("-1"),
+        Some(""),
+        Some("18446744073709551616"),
+    ] {
+        let mut model = route_model();
+        establish(&mut model);
+        let mut props = vec![("link.output.port", "11"), ("link.input.port", "41")];
+        if let Some(serial) = serial {
+            props.push(("object.serial", serial));
+        }
+        model.global(pw::types::ObjectType::Link, 40, &props);
+        assert!(model.disabled());
+        assert!(!model.established());
+    }
+}
+#[test]
+fn b3a_registry_cardinality_limit_fails_closed() {
+    let mut model = RouteModel::new(&speakers());
+    for n in 1..=4097 {
+        port(&mut model, 10000 + n, "900", "50", "in", "FL");
+    }
+    assert!(model.disabled());
+    assert!(!model.established());
+}
+#[test]
+fn b3a_original_absolute_deadline_never_extends() {
+    assert_eq!(
+        routing::remaining(Instant::now() - Duration::from_millis(1)),
+        Err(FixtureError::TimedOut)
+    );
+    let deadline = Instant::now() + Duration::from_millis(10);
+    assert!(routing::remaining(deadline).unwrap() <= Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(12));
+    assert_eq!(routing::remaining(deadline), Err(FixtureError::TimedOut));
+}
+#[test]
+fn b3a_socket_admits_only_private_nofollow_runtime_and_same_uid_peer() {
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixListener;
+    let root = Scratch::new();
+    let listener = UnixListener::bind(root.0.join("pipewire-0")).unwrap();
+    fs::set_permissions(root.0.join("pipewire-0"), fs::Permissions::from_mode(0o600)).unwrap();
+    let fd = routing::socket(&root.0, Instant::now() + Duration::from_millis(100)).unwrap();
+    assert!(
+        rustix::fs::fcntl_getfl(&fd)
+            .unwrap()
+            .contains(rustix::fs::OFlags::NONBLOCK)
+    );
+    assert!(
+        rustix::io::fcntl_getfd(fd.as_fd())
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC)
+    );
+    drop(fd);
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        routing::socket(&root.0, Instant::now() + Duration::from_millis(100)).unwrap_err(),
+        FixtureError::Refused
+    );
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(root.0.join("pipewire-0"), fs::Permissions::from_mode(0o622)).unwrap();
+    assert_eq!(
+        routing::socket(&root.0, Instant::now() + Duration::from_millis(100)).unwrap_err(),
+        FixtureError::Refused
+    );
+    drop(listener);
+}
+#[test]
+fn b3a_socket_rejects_scratch_symlink_ancestors_and_leaf_before_connect() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+    let root = Scratch::new();
+    let runtime = root.0.join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let _listener = UnixListener::bind(runtime.join("pipewire-0")).unwrap();
+    fs::set_permissions(
+        runtime.join("pipewire-0"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let alias = root.0.join("alias");
+    symlink(&runtime, &alias).unwrap();
+    assert!(routing::socket(&alias, Instant::now() + Duration::from_millis(100)).is_err());
+    fs::remove_file(runtime.join("pipewire-0")).unwrap();
+    symlink(
+        root.0.join("absent-owner-endpoint"),
+        runtime.join("pipewire-0"),
+    )
+    .unwrap();
+    assert_eq!(
+        routing::socket(&runtime, Instant::now() + Duration::from_millis(100)).unwrap_err(),
+        FixtureError::Refused
+    );
+    assert!(
+        routing::socket(
+            Path::new("relative"),
+            Instant::now() + Duration::from_millis(100)
+        )
+        .is_err()
+    );
+}
+#[test]
+fn b3a_socket_original_deadline_expires_before_any_scratch_connection() {
+    let root = Scratch::new();
+    assert_eq!(
+        routing::socket(&root.0, Instant::now() - Duration::from_millis(1)).unwrap_err(),
+        FixtureError::TimedOut
+    );
+}
+#[derive(Clone, Debug)]
+struct PrivatePipewire {
+    root: PathBuf,
+    runtime: PathBuf,
+    home: PathBuf,
+    pid: u32,
+    start: u64,
+    socket: (u64, u64),
+}
+impl PrivatePipewire {
+    fn verify(
+        &self,
+        values: &BTreeMap<String, String>,
+        start: Option<u64>,
+        meta: &fs::Metadata,
+    ) -> std::result::Result<(), &'static str> {
+        for (key, expected) in [
+            ("CROSSPANE_PRIVATE_PIPEWIRE", "1"),
+            ("B3A_PRIVATE_CLIENT", "1"),
+            ("PIPEWIRE_REMOTE", "pipewire-0"),
+            ("PIPEWIRE_RUNTIME_DIR", self.runtime.to_str().unwrap()),
+            ("XDG_RUNTIME_DIR", self.runtime.to_str().unwrap()),
+            ("HOME", self.home.to_str().unwrap()),
+            ("PIPEWIRE_CONFIG_DIR", self.root.to_str().unwrap()),
+            ("PIPEWIRE_CONFIG_NAME", "client.conf"),
+            ("PIPEWIRE_CONFIG_PREFIX", ""),
+            ("DBUS_SESSION_BUS_ADDRESS", DEAD_SESSION),
+            ("DBUS_SYSTEM_BUS_ADDRESS", DEAD_SYSTEM),
+            ("PULSE_SERVER", DEAD_PULSE),
+        ] {
+            if values.get(key).map(String::as_str) != Some(expected) {
+                return Err("private environment mismatch");
+            }
+        }
+        for key in [
+            "PIPEWIRE_CORE",
+            "PIPEWIRE_AUTOCONNECT",
+            "PIPEWIRE_ALSA",
+            "PIPEWIRE_PULSE",
+            "CROSSPANE_AUDIO",
+            "CROSSPANE_LIVE_TESTS",
+            "CROSSPANE_REAL_STORE",
+            "CROSSPANE_SECRET_SERVICE_LIVE",
+            "CROSSPANE_AUDIO_OWNER_ATTENDED",
+            "CROSSPANE_NESTED_HYPR",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "WAYLAND_DISPLAY",
+            "WAYLAND_SOCKET",
+            "DISPLAY",
+        ] {
+            if values.contains_key(key) {
+                return Err("owner or live override");
+            }
+        }
+        if start != Some(self.start) || self.pid == 0 || self.start == 0 {
+            return Err("stale owned process");
+        }
+        let uid = rustix::process::geteuid().as_raw();
+        for path in [&self.root, &self.runtime, &self.home] {
+            let m = fs::symlink_metadata(path).map_err(|_| "private directory missing")?;
+            if !m.is_dir() || m.uid() != uid || m.mode() & 0o7777 != 0o700 {
+                return Err("private directory ownership");
+            }
+        }
+        if !self.runtime.starts_with(&self.root)
+            || !self.home.starts_with(&self.root)
+            || !std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type())
+            || meta.uid() != uid
+            || meta.mode() & 0o022 != 0
+            || (meta.dev(), meta.ino()) != self.socket
+        {
+            return Err("private socket replaced");
+        }
+        Ok(())
+    }
+}
+fn private_values(selected: &PrivatePipewire) -> BTreeMap<String, String> {
+    [
+        ("CROSSPANE_PRIVATE_PIPEWIRE", "1"),
+        ("B3A_PRIVATE_CLIENT", "1"),
+        ("PIPEWIRE_REMOTE", "pipewire-0"),
+        ("PIPEWIRE_RUNTIME_DIR", selected.runtime.to_str().unwrap()),
+        ("XDG_RUNTIME_DIR", selected.runtime.to_str().unwrap()),
+        ("HOME", selected.home.to_str().unwrap()),
+        ("PIPEWIRE_CONFIG_DIR", selected.root.to_str().unwrap()),
+        ("PIPEWIRE_CONFIG_NAME", "client.conf"),
+        ("PIPEWIRE_CONFIG_PREFIX", ""),
+        ("DBUS_SESSION_BUS_ADDRESS", DEAD_SESSION),
+        ("DBUS_SYSTEM_BUS_ADDRESS", DEAD_SYSTEM),
+        ("PULSE_SERVER", DEAD_PULSE),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.into(), v.into()))
+    .collect()
+}
+#[test]
+fn b3a_private_guard_refuses_stale_records_owner_handles_and_socket_replacement() {
+    use std::os::unix::{fs::FileTypeExt, net::UnixListener};
+    let root = Scratch::new();
+    let runtime = root.0.join("runtime");
+    let home = root.0.join("home");
+    for p in [&runtime, &home] {
+        fs::create_dir(p).unwrap();
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let socket = runtime.join("pipewire-0");
+    let _first = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let meta = fs::symlink_metadata(&socket).unwrap();
+    assert!(meta.file_type().is_socket());
+    let selected = PrivatePipewire {
+        root: root.0.clone(),
+        runtime,
+        home,
+        pid: 123,
+        start: 456,
+        socket: (meta.dev(), meta.ino()),
+    };
+    let values = private_values(&selected);
+    selected.verify(&values, Some(456), &meta).unwrap();
+    for start in [None, Some(457)] {
+        assert!(selected.verify(&values, start, &meta).is_err());
+    }
+    for (key, value) in [
+        ("PIPEWIRE_REMOTE", "pipewire-0-other"),
+        ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ("PIPEWIRE_RUNTIME_DIR", "/run/user/1000"),
+        ("HOME", "/owner"),
+        ("CROSSPANE_PRIVATE_PIPEWIRE", "01"),
+        ("B3A_PRIVATE_CLIENT", "1-other"),
+        (
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            "unix:path=/run/dbus/system_bus_socket",
+        ),
+        ("PIPEWIRE_AUTOCONNECT", "0"),
+        ("PIPEWIRE_CORE", "owner"),
+        ("WAYLAND_SOCKET", "3"),
+        ("CROSSPANE_AUDIO", "1"),
+    ] {
+        let mut changed = values.clone();
+        changed.insert(key.into(), value.into());
+        assert!(
+            selected.verify(&changed, Some(456), &meta).is_err(),
+            "must refuse {key}"
+        );
+    }
+    fs::remove_file(&socket).unwrap();
+    let _replacement = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        selected
+            .verify(&values, Some(456), &fs::symlink_metadata(&socket).unwrap())
+            .is_err()
+    );
+}
+#[derive(Default)]
+struct PortDiagnostic {
+    events: u32,
+    changes: u32,
+    facts: String,
+    mask: String,
+}
+fn diagnostic_value(value: &str) -> String {
+    value
+        .chars()
+        .take(16)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || " _./-".contains(c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+fn diagnostic_summary(events: &BTreeMap<u32, PortDiagnostic>) -> String {
+    events
+        .iter()
+        .map(|(id, event)| {
+            format!(
+                "{id}: n={} changes={} mask={} {}",
+                event.events, event.changes, event.mask, event.facts
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+#[test]
+fn r1_private_port_diagnostics_fit_the_unchanged_command_pipe_bound() {
+    let value = diagnostic_value("\\\"\n💥ABCDEFGHIJKLMNOPQRSTUV");
+    assert!(value.is_ascii() && value.len() <= 16);
+    let events: BTreeMap<_, _> = (u32::MAX - 7..=u32::MAX)
+        .map(|id| {
+            (
+                id,
+                PortDiagnostic {
+                    events: u32::MAX,
+                    changes: u32::MAX,
+                    facts: "x".repeat(210),
+                    mask: "x".repeat(16),
+                },
+            )
+        })
+        .collect();
+    assert!(diagnostic_summary(&events).len() < 2800);
+}
+fn private_client(selected: &PrivatePipewire) {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    let values: BTreeMap<_, _> = std::env::vars().collect();
+    let path = selected.runtime.join("pipewire-0");
+    selected
+        .verify(
+            &values,
+            owned_start_ticks(selected.pid).unwrap(),
+            &fs::symlink_metadata(&path).unwrap(),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let fd = routing::socket(&selected.runtime, deadline).unwrap();
+    assert_eq!(
+        rustix::net::sockopt::socket_peercred(&fd)
+            .unwrap()
+            .pid
+            .as_raw_nonzero()
+            .get() as u32,
+        selected.pid
+    );
+    selected
+        .verify(
+            &values,
+            owned_start_ticks(selected.pid).unwrap(),
+            &fs::symlink_metadata(&path).unwrap(),
+        )
+        .unwrap();
+    // Private HOME, explicit private client config and held verified descriptor. No default connect.
+    pw::init();
+    let loop_ = pw::main_loop::MainLoopRc::new(None).unwrap();
+    let context=pw::context::ContextRc::new(&loop_,Some(pw::properties::properties!{"config.name"=>selected.root.join("client.conf").to_str().unwrap()})).unwrap();
+    let core = context.connect_fd_rc(fd, None).unwrap();
+    let status = Arc::new(routing::Status::default());
+    let mut route = routing::Route::new(core.clone(), &speakers(), status.clone()).unwrap();
+    let registry = core.get_registry_rc().unwrap();
+    let foreign = Rc::new(RefCell::new(Vec::<u32>::new()));
+    let foreign_ports = Rc::new(RefCell::new(Vec::<u32>::new()));
+    let links = Rc::new(RefCell::new(BTreeMap::<u32, (u32, u32)>::new()));
+    let ports = Rc::new(RefCell::new(Vec::<(u32, String, String, String)>::new()));
+    let f = foreign.clone();
+    let p = foreign_ports.clone();
+    let l = links.clone();
+    let removed = links.clone();
+    let facts = ports.clone();
+    // Read-only diagnostics of this verified synthetic graph, bounded in keys, bytes and events.
+    let port_info = Rc::new(RefCell::new(BTreeMap::<u32, PortDiagnostic>::new()));
+    let events = port_info.clone();
+    let diagnostic_ports = Rc::new(RefCell::new(Vec::<(
+        u32,
+        pw::port::PortListener,
+        pw::port::Port,
+    )>::new()));
+    let watches = diagnostic_ports.clone();
+    let binding = registry.clone();
+    let _inventory = registry
+        .add_listener_local()
+        .global(move |g| {
+            let Some(props) = g.props else { return };
+            if g.type_ == pw::types::ObjectType::Port {
+                assert!(facts.borrow().len() < 16, "synthetic inventory bound");
+                facts.borrow_mut().push((
+                    g.id,
+                    props.get("node.id").unwrap_or("missing").into(),
+                    props.get("port.direction").unwrap_or("missing").into(),
+                    props.get("audio.channel").unwrap_or("missing").into(),
+                ));
+                if !watches.borrow().iter().any(|(id, _, _)| *id == g.id) {
+                    assert!(
+                        watches.borrow().len() < 8,
+                        "synthetic diagnostic port bound"
+                    );
+                    let bound = binding.bind::<pw::port::Port, _>(g).unwrap();
+                    let events = events.clone();
+                    let id = g.id;
+                    let listener = bound
+                        .add_listener_local()
+                        .info(move |info| {
+                            let values: Vec<_> = [
+                                "object.serial",
+                                "port.id",
+                                "node.id",
+                                "port.direction",
+                                "audio.channel",
+                                "format.dsp",
+                                "media.type",
+                                "port.monitor",
+                                "port.physical",
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, key)| {
+                                let value =
+                                    info.props().and_then(|p| p.get(key)).unwrap_or("<absent>");
+                                format!("{index}={}", diagnostic_value(value))
+                            })
+                            .collect();
+                            let mut events = events.borrow_mut();
+                            assert!(events.contains_key(&id) || events.len() < 8);
+                            let event = events.entry(id).or_default();
+                            let facts = format!(
+                                "i={} d={:?} {}",
+                                info.id(),
+                                info.direction(),
+                                values.join(" ")
+                            );
+                            if event.events > 0 && event.facts != facts {
+                                event.changes = event.changes.saturating_add(1);
+                            }
+                            event.events = event.events.saturating_add(1);
+                            event.facts = facts;
+                            event.mask = format!("{}", info.change_mask().bits());
+                        })
+                        .register();
+                    watches.borrow_mut().push((id, listener, bound));
+                }
+            }
+            if g.type_ == pw::types::ObjectType::Node {
+                if props.get("node.name") == Some("crosspane.private.foreign") {
+                    f.borrow_mut().push(g.id);
+                }
+                if let Some(class) = props.get("media.class") {
+                    assert!(
+                        matches!(class, "Audio/Sink" | "Stream/Output/Audio"),
+                        "no source/hardware node"
+                    );
+                }
+            }
+            if g.type_ == pw::types::ObjectType::Port
+                && props
+                    .get("node.id")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .is_some_and(|n| f.borrow().contains(&n))
+            {
+                p.borrow_mut().push(g.id);
+            }
+            if g.type_ == pw::types::ObjectType::Link {
+                l.borrow_mut().insert(
+                    g.id,
+                    (
+                        props.get("link.output.port").unwrap().parse().unwrap(),
+                        props.get("link.input.port").unwrap().parse().unwrap(),
+                    ),
+                );
+            }
+        })
+        .global_remove(move |id| {
+            removed.borrow_mut().remove(&id);
+        })
+        .register();
+    let done = Rc::new(Cell::new(None));
+    let finished = done.clone();
+    let _done = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id == 0 {
+                finished.set(Some(seq));
+            }
+        })
+        .register();
+    // The second barrier includes binds queued by registry callbacks, within the same deadline.
+    for _ in 0..2 {
+        let seq = core.sync(0).unwrap();
+        while done.get() != Some(seq) {
+            routing::remaining(deadline).unwrap();
+            loop_
+                .loop_()
+                .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(2)));
+        }
+    }
+    assert_eq!(foreign.borrow().len(), 1);
+    assert_eq!(foreign_ports.borrow().len(), 2);
+    route.pin_sink().unwrap();
+    let stream = pw::stream::StreamBox::new(
+        &core,
+        "b3a-private-zero",
+        pw::properties::properties! {
+            "media.type"=>"Audio", "media.category"=>"Playback", "media.role"=>"Test",
+            "node.name"=>"crosspane.private.zero-output", "node.virtual"=>"true",
+            "node.dont-fallback"=>"true", "node.dont-move"=>"true", "node.dont-reconnect"=>"true",
+            "adapter.auto-port-config"=>"{ mode=dsp monitor=false position=preserve }",
+        },
+    )
+    .unwrap();
+    let _zero = stream
+        .add_local_listener_with_user_data(())
+        .process(|stream, _| {
+            if let Some(mut buffer) = stream.dequeue_buffer() {
+                for data in buffer.datas_mut() {
+                    let n = if let Some(bytes) = data.data() {
+                        bytes.fill(0);
+                        bytes.len()
+                    } else {
+                        0
+                    };
+                    let chunk = data.chunk_mut();
+                    *chunk.offset_mut() = 0;
+                    *chunk.stride_mut() = 8;
+                    *chunk.size_mut() = n as u32;
+                }
+            }
+        })
+        .register()
+        .unwrap();
+    let mut audio = pw::spa::param::audio::AudioInfoRaw::new();
+    audio.set_format(pw::spa::param::audio::AudioFormat::F32LE);
+    audio.set_rate(48000);
+    audio.set_channels(2);
+    let mut positions = [0; pw::spa::param::audio::MAX_CHANNELS];
+    positions[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
+    positions[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+    audio.set_position(positions);
+    let pod = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(pw::spa::pod::Object {
+            type_: pw::spa::sys::SPA_TYPE_OBJECT_Format,
+            id: pw::spa::sys::SPA_PARAM_EnumFormat,
+            properties: audio.into(),
+        }),
+    )
+    .unwrap()
+    .0
+    .into_inner();
+    let mut params = [pw::spa::pod::Pod::from_bytes(&pod).unwrap()];
+    stream
+        .connect(
+            pw::spa::utils::Direction::Output,
+            None,
+            pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::DONT_RECONNECT,
+            &mut params,
+        )
+        .unwrap();
+    let mut attached = false;
+    while !route.established() {
+        assert!(
+            routing::remaining(deadline).is_ok(),
+            "private exact-link deadline: attached={attached} owned_node={} ports={:?} links={:?}",
+            stream.node_id(),
+            ports.borrow(),
+            links.borrow()
+        );
+        assert!(
+            !status.disabled.load(Ordering::Acquire),
+            "routing failed closed: attached={attached} ports={:?} info={}",
+            ports.borrow(),
+            diagnostic_summary(&port_info.borrow())
+        );
+        if !attached && let Some(result) = route.attach(&stream) {
+            result.unwrap();
+            attached = true;
+        }
+        loop_
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(2)));
+    }
+    assert_eq!(links.borrow().len(), 2, "only the two owned links exist");
+    println!(
+        "private bound-port facts (0=serial 1=local-port 2=node 3=direction 4=channel 5=DSP 6=media 7=monitor 8=physical): {}",
+        diagnostic_summary(&port_info.borrow())
+    );
+    assert!(
+        links
+            .borrow()
+            .values()
+            .all(|(_, to)| !foreign_ports.borrow().contains(to))
+    );
+    assert!(
+        !status.rendered.load(Ordering::Acquire),
+        "zero-output fixture is not tone evidence"
+    );
+    stream.disconnect().unwrap();
+    drop(route);
+    // Flush owned proxy destruction; these events are separate from real tone/drain evidence.
+    let seq = core.sync(0).unwrap();
+    while done.get() != Some(seq) {
+        routing::remaining(deadline).unwrap();
+        loop_
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(2)));
+    }
+    assert!(
+        links.borrow().is_empty(),
+        "owned exact links destroyed after route drop"
+    );
+    println!("private zero-output: exact FL/FR links established, foreign/default sink unlinked");
+}
+fn private_daemon_config() -> String {
+    format!(
+        r#"
+context.properties = {{ core.daemon=true core.name=pipewire-0 support.dbus=false default.clock.rate=48000 default.clock.quantum=480 default.clock.min-quantum=480 default.clock.max-quantum=480 }}
+context.spa-libs = {{ support.*=support/libspa-support audio.convert.*=audioconvert/libspa-audioconvert }}
+context.modules = [
+ {{ name=libpipewire-module-protocol-native }}
+ {{ name=libpipewire-module-access args={{ access.force=unrestricted }} }}
+ {{ name=libpipewire-module-metadata }}
+ {{ name=libpipewire-module-spa-node-factory }}
+ {{ name=libpipewire-module-client-node }}
+ {{ name=libpipewire-module-adapter }}
+ {{ name=libpipewire-module-link-factory }}
+]
+context.objects = [
+ {{ factory=spa-node-factory args={{ factory.name=support.node.driver node.name=crosspane.private.driver priority.driver=20000 }} }}
+ {{ factory=adapter args={{ factory.name=support.null-audio-sink node.name={} node.virtual=true media.class=Audio/Sink audio.format=F32LE audio.rate=48000 audio.channels=2 audio.position=[ FL FR ] adapter.auto-port-config={{ mode=dsp monitor=false position=preserve }} }} }}
+ {{ factory=adapter args={{ factory.name=support.null-audio-sink node.name=crosspane.private.foreign node.virtual=true media.class=Audio/Sink audio.format=F32LE audio.rate=48000 audio.channels=2 audio.position=[ FL FR ] adapter.auto-port-config={{ mode=dsp monitor=false position=preserve }} }} }}
+ {{ factory=metadata args={{ metadata.name=default metadata.values=[ {{ key=default.audio.sink value={{ name=crosspane.private.foreign }} }} ] }} }}
+]
+"#,
+        speakers().device_key
+    )
+}
+
+struct ReportedPrivateServer {
+    owned: Option<OwnedProcess>,
+    pid: u32,
+    start: u64,
+    record: PathBuf,
+    retain: Arc<AtomicBool>,
+}
+impl ReportedPrivateServer {
+    fn child(&mut self) -> &mut Child {
+        self.owned.as_mut().unwrap().child()
+    }
+}
+impl Drop for ReportedPrivateServer {
+    fn drop(&mut self) {
+        drop(self.owned.take());
+        let gone = owned_start_ticks(self.pid).is_ok_and(|current| current != Some(self.start));
+        let reconciled = fs::symlink_metadata(&self.record)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if gone && reconciled && !self.retain.load(Ordering::Acquire) {
+            println!(
+                "private owned pid={} start={} disappeared; record reconciled",
+                self.pid, self.start
+            );
+        } else {
+            self.retain.store(true, Ordering::Release);
+            eprintln!(
+                "private owned cleanup UNCONFIRMED pid={} start={} record={}; retaining scratch",
+                self.pid,
+                self.start,
+                self.record.display()
+            );
+        }
+    }
+}
+#[test]
+fn b3a_private_zero_output_routes_only_exact_sink() {
+    use std::os::unix::fs::FileTypeExt;
+    if std::env::var_os("B3A_PRIVATE_CLIENT").is_some() {
+        let root = PathBuf::from(std::env::var_os("PIPEWIRE_CONFIG_DIR").unwrap());
+        let proof = root.join("server.json");
+        let file = fs::File::from(
+            rustix::fs::open(
+                &proof,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap(),
+        );
+        let meta = file.metadata().unwrap();
+        assert!(
+            meta.is_file()
+                && meta.nlink() == 1
+                && meta.uid() == rustix::process::geteuid().as_raw()
+                && meta.mode() & 0o7777 == 0o600
+                && meta.len() <= 4096
+        );
+        let record: Value = serde_json::from_reader(file.take(4097)).unwrap();
+        let selected = PrivatePipewire {
+            root: root.clone(),
+            runtime: root.join("runtime"),
+            home: root.join("home"),
+            pid: u32::try_from(record["pid"].as_u64().unwrap()).unwrap(),
+            start: record["start"].as_u64().unwrap(),
+            socket: (
+                record["dev"].as_u64().unwrap(),
+                record["ino"].as_u64().unwrap(),
+            ),
+        };
+        private_client(&selected);
+        return;
+    }
+    if std::env::var("CROSSPANE_PRIVATE_PIPEWIRE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "SKIP private PipeWire: exact CROSSPANE_PRIVATE_PIPEWIRE=1 absent; no audio coverage"
+        );
+        return;
+    }
+    if !Path::new("/usr/bin/pipewire").is_file() {
+        eprintln!("SKIP private PipeWire: /usr/bin/pipewire missing; no audio coverage");
+        return;
+    }
+    assert_eq!(
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap(),
+        DEAD_SESSION
+    );
+    assert_eq!(
+        std::env::var("DBUS_SYSTEM_BUS_ADDRESS").unwrap(),
+        DEAD_SYSTEM
+    );
+    assert_eq!(std::env::var("PULSE_SERVER").unwrap(), DEAD_PULSE);
+    for key in [
+        "CROSSPANE_AUDIO",
+        "CROSSPANE_NESTED_HYPR",
+        "PIPEWIRE_AUTOCONNECT",
+        "PIPEWIRE_CORE",
+        "CROSSPANE_LIVE_TESTS",
+        "CROSSPANE_REAL_STORE",
+        "CROSSPANE_SECRET_SERVICE_LIVE",
+    ] {
+        assert!(std::env::var_os(key).is_none(), "unexpected live override");
+    }
+    let root = Scratch::new();
+    let runtime = root.0.join("runtime");
+    let home = root.0.join("home");
+    for p in [&runtime, &home] {
+        fs::create_dir(p).unwrap();
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let daemon = root.0.join("daemon.conf");
+    let client = root.0.join("client.conf");
+    fs::write(&daemon, private_daemon_config()).unwrap();
+    fs::write(&client,"context.properties = { support.dbus=false }\ncontext.spa-libs = { support.*=support/libspa-support audio.convert.*=audioconvert/libspa-audioconvert }\ncontext.modules = [ { name=libpipewire-module-protocol-native } { name=libpipewire-module-client-node } { name=libpipewire-module-adapter } ]\n").unwrap();
+    for p in [&daemon, &client] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut command = private_command(&runtime, &home);
+    let log = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(root.0.join("server.log"))
+        .unwrap();
+    command
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log));
+    command
+        .arg("env")
+        .arg(format!("PIPEWIRE_RUNTIME_DIR={}", runtime.display()))
+        .arg(format!("PIPEWIRE_CONFIG_DIR={}", root.0.display()))
+        .arg("PIPEWIRE_CONFIG_PREFIX=")
+        .arg("PIPEWIRE_CONFIG_NAME=daemon.conf")
+        .args(["/usr/bin/pipewire", "-c"])
+        .arg(&daemon);
+    let mut server = OwnedProcess::spawn(command, root.1.clone());
+    let pid = server.child().id();
+    let start = owned_start_ticks(pid).unwrap().unwrap();
+    println!("private owned server pid={pid} start={start}");
+    let mut server = ReportedPrivateServer {
+        record: server.pending.as_ref().unwrap().record.clone(),
+        owned: Some(server),
+        pid,
+        start,
+        retain: root.1.clone(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let socket = runtime.join("pipewire-0");
+    while !fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket()) {
+        assert!(
+            server.child().try_wait().unwrap().is_none(),
+            "owned private server exited"
+        );
+        assert!(Instant::now() < deadline, "private server socket deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let meta = fs::symlink_metadata(&socket).unwrap();
+    let selected = PrivatePipewire {
+        root: root.0.clone(),
+        runtime,
+        home,
+        pid,
+        start,
+        socket: (meta.dev(), meta.ino()),
+    };
+    let proof = root.0.join("server.json");
+    let mut record = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&proof)
+        .unwrap();
+    writeln!(
+        record,
+        "{}",
+        json!({"pid":pid,"start":start,"dev":meta.dev(),"ino":meta.ino()})
+    )
+    .unwrap();
+    let mut command = private_command(&selected.runtime, &selected.home);
+    command.arg("env");
+    for (key, value) in private_values(&selected) {
+        command.arg(format!("{key}={value}"));
+    }
+    command.arg(std::env::current_exe().unwrap()).args([
+        "--exact",
+        "b3a_private_zero_output_routes_only_exact_sink",
+        "--nocapture",
+    ]);
+    selected
+        .verify(
+            &private_values(&selected),
+            owned_start_ticks(pid).unwrap(),
+            &fs::symlink_metadata(&socket).unwrap(),
+        )
+        .unwrap();
+    let output = run_bounded(command, root.1.clone());
+    assert!(output.contains("private zero-output: exact FL/FR links established"));
+    let record = server.record.clone();
+    drop(server);
+    assert!(
+        !root.1.load(Ordering::Acquire),
+        "owned private server cleanup outstanding"
+    );
+    assert_ne!(
+        owned_start_ticks(pid).unwrap(),
+        Some(start),
+        "owned PID/start still exists"
+    );
+    assert!(!record.exists(), "owned cleanup evidence retained");
+    println!("{output}");
+    println!("private server pid={pid} start={start} gone; owned records reconciled");
+}
+
 use std::{
     collections::BTreeMap,
     collections::VecDeque,
