@@ -6,7 +6,7 @@ mod inventory;
 mod plan;
 use super::{native_io::*, payload::PayloadError, service::ServiceError};
 use crate::agent_contract::ContractError;
-pub use authority::{CleanAuthority, TrackedAgent, admit_erase_output};
+pub use authority::{CleanAuthority, CleanStop, TrackedAgent, admit_erase_output};
 pub use inventory::{ActivityFacts, Inventory, InventoryFacts, InventoryRequest, RemovalPlanner};
 pub use plan::{
     CleanupForm, IdentityChoice, PlanKind, RemovalConsent, RemovalPlan, RemovalSelection,

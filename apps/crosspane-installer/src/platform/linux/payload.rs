@@ -594,6 +594,19 @@ impl Snapshot {
 }
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 impl PayloadInstaller {
+    /// Repair authority is additional to current SupportProof, never cleanup authority.
+    pub fn apply_after_clean_stop(
+        &self,
+        proof: &SupportProof,
+        package: &Package,
+        plan: PayloadPlan,
+        clean: &super::removal::CleanStop,
+        deadline: &Deadline,
+    ) -> Result<InstallReceipt> {
+        proof.check(&self.io)?;
+        clean.revalidate_for(&self.io, deadline)?;
+        self.apply_with(proof, package, plan, Some(clean), deadline)
+    }
     pub fn new(io: Arc<LinuxNativeIo>) -> Result<Self> {
         io.validate_target()?;
         let p = io.target().paths();
@@ -1327,7 +1340,21 @@ impl PayloadInstaller {
         plan: PayloadPlan,
         deadline: &Deadline,
     ) -> Result<InstallReceipt> {
+        self.apply_with(proof, package, plan, None, deadline)
+    }
+    fn apply_with(
+        &self,
+        proof: &SupportProof,
+        package: &Package,
+        plan: PayloadPlan,
+        clean: Option<&super::removal::CleanStop>,
+        deadline: &Deadline,
+    ) -> Result<InstallReceipt> {
         deadline.check()?;
+        if let Some(clean) = clean {
+            proof.check(&self.io)?;
+            clean.revalidate_for(&self.io, deadline)?;
+        }
         self.bind(&plan.journal, package)?;
         self.recheck(proof, &plan.journal, plan.resuming)?;
         if plan.journal.items[0].old.is_none() {
@@ -1358,6 +1385,14 @@ impl PayloadInstaller {
         }
         self.recheck(proof, &plan.journal, plan.resuming)?;
         let mut journal = plan.journal;
+        if let Some(clean) = clean {
+            clean.revalidate_for(&self.io, deadline)?;
+            if plan.resuming && journal.previous_instance != Some(clean.instance_id()) {
+                return Err(PayloadError::Foreign);
+            }
+            // Even matching bytes need a new recovered instance after this clean stop.
+            journal.previous_instance = Some(clean.instance_id());
+        }
         if let Some(existing) = self.load(proof, true)? {
             if !plan.resuming
                 || existing.receipt.operation_id != journal.receipt.operation_id
@@ -1366,6 +1401,9 @@ impl PayloadInstaller {
                 return Err(PayloadError::Pending);
             }
             self.bind(&existing, package)?;
+            if clean.is_some_and(|clean| existing.previous_instance != Some(clean.instance_id())) {
+                return Err(PayloadError::Foreign);
+            }
             journal = existing;
         } else if journal.phase == Phase::Intent {
             self.save(proof, &journal, true)?;
@@ -1375,6 +1413,9 @@ impl PayloadInstaller {
             for i in 0..journal.items.len() {
                 let item = journal.items[i].clone();
                 deadline.check()?;
+                if let Some(clean) = clean {
+                    clean.revalidate_for(&self.io, deadline)?;
+                }
                 let current =
                     self.snapshot(proof, &self.paths[i], Self::mode(i), MAX_MEMBER_BYTES)?;
                 if current.as_ref().map(|s| s.hash) == Some(item.new) {
@@ -1439,7 +1480,7 @@ impl PayloadInstaller {
                 }
                 deadline.check()?;
                 proof.check(&self.io)?;
-                if i == 0 && item.old.is_some() {
+                if i == 0 && item.old.is_some() && clean.is_none() {
                     journal.previous_instance = self.current_instance(deadline)?;
                 }
                 // Only this staged inode in this parent may become our replacement on resume.
@@ -1460,6 +1501,9 @@ impl PayloadInstaller {
                 }
                 deadline.check()?;
                 proof.check(&self.io)?;
+                if let Some(clean) = clean {
+                    clean.revalidate_for(&self.io, deadline)?;
+                }
                 // Linux has no rename-by-fd: same-UID substitution after this check is outside
                 // the threat model (4.12a). The post-rename identity check retains recovery bytes.
                 system(rfs::renameat_with(

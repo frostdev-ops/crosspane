@@ -70,6 +70,9 @@ impl TrackedAgent {
         })
     }
     fn check(&self, deadline: &Deadline) -> Result<LastExitV1> {
+        Ok(self.clean_snapshot(deadline)?.1)
+    }
+    fn clean_snapshot(&self, deadline: &Deadline) -> Result<(BootstrapV1, LastExitV1)> {
         deadline.check()?;
         let (bootstrap_bytes, exit_bytes, observed) =
             self.watch.exit_observation(&self.io, deadline)?;
@@ -89,7 +92,7 @@ impl TrackedAgent {
             return Err(RemovalError::NotClean);
         }
         deadline.check()?;
-        Ok(receipt)
+        Ok((bootstrap, receipt))
     }
 }
 /// Non-cloneable, running-only worker capability; never serialized or caller-constructed.
@@ -124,6 +127,23 @@ impl std::fmt::Debug for CleanAuthority {
     }
 }
 impl CleanAuthority {
+    /// The original watch and literal clean receipt must belong to this exact I/O context.
+    pub fn clean_stop(&self, io: &LinuxNativeIo, deadline: &Deadline) -> Result<CleanStop> {
+        if self.original.target_binding() != io.target_binding() {
+            return Err(NativeError::Foreign.into());
+        }
+        io.validate_target()?;
+        let (bootstrap, receipt) = self.original.clean_snapshot(deadline)?;
+        if receipt != self.receipt {
+            return Err(RemovalError::Stale);
+        }
+        Ok(CleanStop {
+            binding: io.target_binding(),
+            original: self.original.clone(),
+            bootstrap,
+            receipt,
+        })
+    }
     pub fn receipt(&self) -> &LastExitV1 {
         &self.receipt
     }
@@ -148,6 +168,47 @@ impl CleanAuthority {
             environment,
             deadline,
         )?)
+    }
+}
+/// One repair's ephemeral clean exit, retaining the original watch/process and exact bootstrap.
+/// Neither paths nor a receipt reconstructed after exit can create this proof.
+pub struct CleanStop {
+    binding: super::super::native_io::TargetBinding,
+    original: Arc<TrackedAgent>,
+    bootstrap: BootstrapV1,
+    receipt: LastExitV1,
+}
+impl std::fmt::Debug for CleanStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CleanStop { .. }")
+    }
+}
+impl CleanStop {
+    pub fn instance_id(&self) -> u64 {
+        self.bootstrap.instance_id
+    }
+    /// Checks context first, then the original exit and byte-equivalent parsed bootstrap/receipt.
+    /// A new bootstrap invalidates reuse. This makes no old-process liveness admission.
+    pub(crate) fn revalidate_for(
+        &self,
+        io: &LinuxNativeIo,
+        deadline: &Deadline,
+    ) -> std::result::Result<(), NativeError> {
+        if self.binding != io.target_binding() {
+            return Err(NativeError::Foreign);
+        }
+        io.validate_target()?;
+        let (bootstrap, receipt) =
+            self.original
+                .clean_snapshot(deadline)
+                .map_err(|error| match error {
+                    RemovalError::Native(error) => error,
+                    _ => NativeError::Foreign,
+                })?;
+        if bootstrap != self.bootstrap || receipt != self.receipt {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()
     }
 }
 /// Stdout is semantic truth only: refusal/waiting/failed and kept trust remain literal outcomes.

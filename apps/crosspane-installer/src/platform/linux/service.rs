@@ -226,6 +226,28 @@ fn template_record(record: &RenderedResource, template: &[u8], expected: &[Strin
 }
 
 impl LinuxService {
+    pub fn plan_after_clean_stop(
+        &self,
+        proof: &SupportProof,
+        action: ServiceAction,
+        clean: &super::removal::CleanStop,
+        deadline: &Deadline,
+    ) -> Result<ServicePlan> {
+        proof.check(&self.io)?;
+        clean.revalidate_for(&self.io, deadline)?;
+        self.plan_with(proof, action, Some(clean), deadline)
+    }
+    pub fn apply_after_clean_stop(
+        &self,
+        proof: &SupportProof,
+        plan: ServicePlan,
+        clean: &super::removal::CleanStop,
+        deadline: &Deadline,
+    ) -> Result<ServiceResult> {
+        proof.check(&self.io)?;
+        clean.revalidate_for(&self.io, deadline)?;
+        self.apply_with(proof, plan, Some(clean), deadline)
+    }
     pub(crate) fn target_binding(&self) -> super::native_io::TargetBinding {
         self.io.target_binding()
     }
@@ -634,7 +656,22 @@ impl LinuxService {
         action: ServiceAction,
         deadline: &Deadline,
     ) -> Result<ServicePlan> {
+        self.plan_with(proof, action, None, deadline)
+    }
+    fn plan_with(
+        &self,
+        proof: &SupportProof,
+        action: ServiceAction,
+        clean: Option<&super::removal::CleanStop>,
+        deadline: &Deadline,
+    ) -> Result<ServicePlan> {
         proof.check(&self.io)?;
+        if let Some(clean) = clean {
+            if !matches!(action, ServiceAction::Start | ServiceAction::Restart) {
+                return Err(ServiceError::Foreign);
+            }
+            clean.revalidate_for(&self.io, deadline)?;
+        }
         if self
             .pending
             .lock()
@@ -651,7 +688,13 @@ impl LinuxService {
         if before.needs_reload && action != ServiceAction::Reload {
             return Err(ServiceError::Unknown);
         }
-        let previous_instance = if before.main_pid != 0 {
+        let previous_instance = if let Some(clean) = clean {
+            if before.main_pid != 0 || before.active_state != "inactive" {
+                return Err(ServiceError::Foreign);
+            }
+            clean.revalidate_for(&self.io, deadline)?;
+            Some(clean.instance_id())
+        } else if before.main_pid != 0 {
             let (bootstrap, _) = self.io.bootstrap(deadline)?;
             if bootstrap.pid != before.main_pid {
                 return Err(ServiceError::Foreign);
@@ -660,7 +703,7 @@ impl LinuxService {
         } else {
             None
         };
-        if action == ServiceAction::Start && previous_instance.is_some() {
+        if action == ServiceAction::Start && previous_instance.is_some() && clean.is_none() {
             return Err(ServiceError::Foreign);
         }
         if matches!(action, ServiceAction::Start | ServiceAction::Restart)
@@ -705,14 +748,33 @@ impl LinuxService {
         plan: ServicePlan,
         deadline: &Deadline,
     ) -> Result<ServiceResult> {
+        self.apply_with(proof, plan, None, deadline)
+    }
+    fn apply_with(
+        &self,
+        proof: &SupportProof,
+        plan: ServicePlan,
+        clean: Option<&super::removal::CleanStop>,
+        deadline: &Deadline,
+    ) -> Result<ServiceResult> {
         proof.check(&self.io)?;
+        if let Some(clean) = clean {
+            if !matches!(plan.action, ServiceAction::Start | ServiceAction::Restart)
+                || plan.previous_instance != Some(clean.instance_id())
+            {
+                return Err(ServiceError::Foreign);
+            }
+            clean.revalidate_for(&self.io, deadline)?;
+        }
         // Serialize with WP-4.7b replacements. The lock is an admitted private state file,
         // never an installed unit or desktop entry.
         let lease = self.io.install_lease(proof)?;
         if self.observe(deadline)? != plan.before {
             return Err(ServiceError::OutcomeUnknown);
         }
-        if let Some(id) = plan.previous_instance
+        if let Some(clean) = clean {
+            clean.revalidate_for(&self.io, deadline)?;
+        } else if let Some(id) = plan.previous_instance
             && self.io.bootstrap(deadline)?.0.instance_id != id
         {
             return Err(ServiceError::Foreign);
@@ -723,6 +785,9 @@ impl LinuxService {
             self.absent_agent(deadline)?;
         }
         proof.check(&self.io)?;
+        if let Some(clean) = clean {
+            clean.revalidate_for(&self.io, deadline)?;
+        }
         let ManagerMutation {
             result: output,
             pending,
