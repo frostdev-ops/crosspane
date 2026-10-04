@@ -3962,4 +3962,712 @@ mod a2_tests {
             );
         }
     }
+
+    mod b2a1_tests {
+        use super::*;
+        use std::collections::BTreeSet;
+        fn setup(r: &Rig) -> (MacRemoval, RemovalPlan, RemovalConsent) {
+            let mut removal = MacRemoval::new(r.observer());
+            let choices = RemovalChoices::default();
+            let plan = removal
+                .plan(1, OperationId(1), choices, Some(r.current()), &r.d())
+                .unwrap();
+            let consent = removal
+                .consent(&plan, 1, OperationId(1), choices, true, &r.d())
+                .unwrap();
+            (removal, plan, consent)
+        }
+        fn path(r: &Rig) -> PathBuf {
+            r.io.target().installer_dir().join("removal.json")
+        }
+        fn record(r: &Rig) -> Value {
+            serde_json::from_slice(&std::fs::read(path(r)).unwrap()).unwrap()
+        }
+        fn edit(r: &Rig, change: impl FnOnce(&mut Value)) {
+            let mut value = record(r);
+            change(&mut value);
+            r.put(&path(r), &serde_json::to_vec(&value).unwrap(), 0o600);
+        }
+        fn opened(r: &Rig) -> (MacRemoval, RemovalJournal) {
+            let (removal, plan, consent) = setup(r);
+            let journal = removal
+                .open_removal_journal(&plan, &consent, &r.d())
+                .unwrap();
+            journal.publish_initial(&r.d()).unwrap();
+            (removal, journal)
+        }
+        fn assert_no_dispatch(r: &Rig) {
+            assert!(r.runner.calls.lock().unwrap().iter().all(|(_, argv)| {
+                !argv
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "disable" | "bootout" | "erase-identity"))
+            }));
+        }
+        #[test]
+        fn b2a1_red_open_holds_selected_lock_without_dispatch() {
+            let r = Rig::new();
+            let (removal, plan, consent) = setup(&r);
+            let journal = removal
+                .open_removal_journal(&plan, &consent, &r.d())
+                .unwrap();
+            assert!(
+                !path(&r).exists(),
+                "open must precede initial under-lock verification/publication"
+            );
+            let proof = r.selected().support;
+            assert!(r.io.lock(&proof, &r.d()).is_err());
+            journal.publish_initial(&r.d()).unwrap();
+            assert_eq!(
+                r.io.metadata(&path(&r)).unwrap().unwrap().mode & 0o7777,
+                0o600
+            );
+            assert_no_dispatch(&r);
+        }
+        #[test]
+        fn b2a1_red_intent_then_outcome_are_actual_durable_records() {
+            let r = Rig::new();
+            let (_, journal) = opened(&r);
+            assert_eq!(record(&r)["in_flight"], Value::Null);
+            let intent = journal.record_intent(0, &r.d()).unwrap();
+            assert_eq!(record(&r)["in_flight"], 0);
+            assert_eq!(record(&r)["rows"][0], "Pending");
+            journal
+                .record_outcome(intent, RemovalOutcome::Completed, &r.d())
+                .unwrap();
+            assert_eq!(record(&r)["in_flight"], Value::Null);
+            assert_eq!(record(&r)["rows"][0], "Completed");
+            assert_no_dispatch(&r);
+        }
+        #[test]
+        fn b2a1_red_reopen_never_recovers_clean_authority() {
+            let r = Rig::new();
+            let (removal, journal) = opened(&r);
+            let _intent = journal.record_intent(0, &r.d()).unwrap();
+            let hints = removal.removal_recovery(&r.d()).unwrap().unwrap();
+            assert!(hints.original_not_clean && hints.retained_recovery);
+            assert!(hints.rows.iter().all(|row| *row == RemovalOutcome::Unknown));
+            assert_no_dispatch(&r);
+        }
+        #[test]
+        fn b2a1_red_wrong_package_digest_is_foreign() {
+            let r = Rig::new();
+            let (removal, _) = opened(&r);
+            edit(&r, |v| {
+                v["package_sha256"][0] = json!(v["package_sha256"][0].as_u64().unwrap() ^ 1)
+            });
+            assert_eq!(
+                removal.removal_recovery(&r.d()).unwrap_err(),
+                NativeError::Foreign
+            );
+            assert!(path(&r).exists());
+        }
+        #[test]
+        fn b2a1_schema_binds_exact_preview_without_sensitive_facts() {
+            let r = Rig::new();
+            let (removal, plan, consent) = setup(&r);
+            let journal = removal
+                .open_removal_journal(&plan, &consent, &r.d())
+                .unwrap();
+            journal.publish_initial(&r.d()).unwrap();
+            let value = record(&r);
+            let deltas: Vec<_> = plan
+                .preview()
+                .deltas
+                .iter()
+                .map(|delta| (&delta.resource, &delta.path, delta.effect as u8))
+                .collect();
+            let choices = RemovalChoices::default();
+            let digest =
+                sha(
+                    &serde_json::to_vec(&(choices.delete_identity, choices.remove_driver, deltas))
+                        .unwrap(),
+                );
+            assert_eq!(value["schema_version"], 1);
+            assert_eq!(value["uid"], r.io.target().paths().uid);
+            assert_eq!(value["home"], json!(r.io.target().paths().home));
+            assert_eq!(
+                value["manifest_sha256"],
+                json!(plan.inventory().manifest_sha256)
+            );
+            assert_eq!(
+                value["package_sha256"],
+                json!(plan.inventory().package.removal_sha256)
+            );
+            assert_eq!(value["preview_sha256"], json!(digest));
+            assert_eq!(value["operation"], 1);
+            assert_eq!(value["revision"], 1);
+            assert_eq!(
+                value["rows"].as_array().unwrap().len(),
+                plan.preview().deltas.len()
+            );
+            let keys: BTreeSet<_> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                BTreeSet::from([
+                    "schema_version",
+                    "uid",
+                    "home",
+                    "manifest_sha256",
+                    "package_sha256",
+                    "preview_sha256",
+                    "operation",
+                    "revision",
+                    "rows",
+                    "in_flight"
+                ])
+            );
+            assert_no_dispatch(&r);
+        }
+        #[test]
+        fn b2a1_stale_and_foreign_consent_do_zero_work() {
+            let r = Rig::new();
+            let (mut removal, plan, consent) = setup(&r);
+            let (_, _, foreign) = setup(&r);
+            let touched = Arc::new(AtomicU64::new(0));
+            let seen = touched.clone();
+            *r.hook.lock().unwrap() = Some(Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }));
+            let before = r.runner.calls.lock().unwrap().clone();
+            assert_eq!(
+                removal
+                    .open_removal_journal(&plan, &foreign, &r.d())
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+            removal.retire();
+            assert_eq!(
+                removal
+                    .open_removal_journal(&plan, &consent, &r.d())
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+            assert_eq!(r.runner.calls.lock().unwrap().as_slice(), before.as_slice());
+            assert_eq!(touched.load(Ordering::Acquire), 0);
+            assert!(!path(&r).exists());
+        }
+        #[test]
+        fn b2a1_uninitialized_duplicate_and_out_of_bounds_intents_refuse() {
+            let r = Rig::new();
+            let (removal, plan, consent) = setup(&r);
+            let journal = removal
+                .open_removal_journal(&plan, &consent, &r.d())
+                .unwrap();
+            assert_eq!(
+                journal.record_intent(0, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            assert!(!path(&r).exists());
+            let r = Rig::new();
+            let (_, journal) = opened(&r);
+            assert_eq!(journal.publish_initial(&r.d()), Err(NativeError::Refused));
+            let r = Rig::new();
+            let (_, journal) = opened(&r);
+            assert_eq!(
+                journal.record_intent(8192, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            let r = Rig::new();
+            let (_, journal) = opened(&r);
+            let _intent = journal.record_intent(0, &r.d()).unwrap();
+            assert_eq!(
+                journal.record_intent(1, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            assert_eq!(record(&r)["in_flight"], 0);
+        }
+        #[test]
+        fn b2a1_foreign_intent_has_zero_publication() {
+            let a = Rig::new();
+            let b = Rig::new();
+            let (_, first) = opened(&a);
+            let (_, second) = opened(&b);
+            let intent = first.record_intent(0, &a.d()).unwrap();
+            let before = std::fs::read(path(&b)).unwrap();
+            assert_eq!(
+                second.record_outcome(intent, RemovalOutcome::Completed, &b.d()),
+                Err(NativeError::Foreign)
+            );
+            assert_eq!(std::fs::read(path(&b)).unwrap(), before);
+        }
+        #[test]
+        fn b2a1_pending_outcome_and_failed_publication_retire_store() {
+            let r = Rig::new();
+            let (_, journal) = opened(&r);
+            let intent = journal.record_intent(0, &r.d()).unwrap();
+            let before = std::fs::read(path(&r)).unwrap();
+            assert_eq!(
+                journal.record_outcome(intent, RemovalOutcome::Pending, &r.d()),
+                Err(NativeError::Refused)
+            );
+            assert_eq!(std::fs::read(path(&r)).unwrap(), before);
+            assert_eq!(
+                journal.record_intent(1, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+        }
+        #[test]
+        fn b2a1_drift_is_checked_before_every_publish() {
+            for outcome in [false, true] {
+                let r = Rig::new();
+                let (_, journal) = opened(&r);
+                let intent = if outcome {
+                    Some(journal.record_intent(0, &r.d()).unwrap())
+                } else {
+                    None
+                };
+                edit(&r, |v| v["rows"][1] = json!("Kept"));
+                let owner_bytes = std::fs::read(path(&r)).unwrap();
+                let result = if let Some(intent) = intent {
+                    journal.record_outcome(intent, RemovalOutcome::Completed, &r.d())
+                } else {
+                    journal.record_intent(0, &r.d()).map(|_| ())
+                };
+                assert_eq!(result, Err(NativeError::Foreign));
+                assert_eq!(std::fs::read(path(&r)).unwrap(), owner_bytes);
+            }
+        }
+        #[test]
+        fn b2a1_incomplete_record_refuses_new_controller_or_retry() {
+            let r = Rig::new();
+            let (_, journal) = opened(&r);
+            let intent = journal.record_intent(0, &r.d()).unwrap();
+            drop(intent);
+            drop(journal);
+            let mut removal = MacRemoval::new(r.observer());
+            let choices = RemovalChoices::default();
+            let plan = removal
+                .plan(2, OperationId(2), choices, Some(r.current()), &r.d())
+                .unwrap();
+            let consent = removal
+                .consent(&plan, 2, OperationId(2), choices, true, &r.d())
+                .unwrap();
+            assert!(
+                removal
+                    .open_removal_journal(&plan, &consent, &r.d())
+                    .is_err()
+            );
+            assert_eq!(record(&r)["in_flight"], 0);
+            assert_no_dispatch(&r);
+        }
+        #[test]
+        fn b2a1_terminal_uncertainty_refuses_further_intents() {
+            for code in [
+                RemovalOutcome::Unknown,
+                RemovalOutcome::NotClean,
+                RemovalOutcome::Waiting,
+                RemovalOutcome::Refused,
+                RemovalOutcome::Failed,
+                RemovalOutcome::NotDispatched,
+            ] {
+                let r = Rig::new();
+                let (removal, journal) = opened(&r);
+                let intent = journal.record_intent(0, &r.d()).unwrap();
+                journal.record_outcome(intent, code, &r.d()).unwrap();
+                assert_eq!(
+                    journal.record_intent(1, &r.d()).unwrap_err(),
+                    NativeError::Refused
+                );
+                let hint = removal.removal_recovery(&r.d()).unwrap().unwrap();
+                assert_eq!(hint.rows[0], code);
+                assert!(hint.original_not_clean && hint.retained_recovery);
+            }
+        }
+        #[test]
+        fn b2a1_record_integrity_bounds_are_strict() {
+            for invalid in 0..10 {
+                let r = Rig::new();
+                let (removal, _) = opened(&r);
+                edit(&r, |v| match invalid {
+                    0 => v["schema_version"] = json!(2),
+                    1 => v["operation"] = json!(0),
+                    2 => v["revision"] = json!(0),
+                    3 => v["uid"] = json!(r.io.target().paths().uid + 1),
+                    4 => v["home"] = json!("/foreign"),
+                    5 => {
+                        v["manifest_sha256"][0] =
+                            json!(v["manifest_sha256"][0].as_u64().unwrap() ^ 1)
+                    }
+                    6 => v["rows"] = json!([]),
+                    7 => v["rows"] = json!(vec!["Pending"; 8193]),
+                    8 => v["in_flight"] = json!(8192),
+                    _ => v["unknown_field"] = json!(true),
+                });
+                assert_eq!(
+                    removal.removal_recovery(&r.d()).unwrap_err(),
+                    NativeError::Foreign,
+                    "case {invalid}"
+                );
+                assert!(path(&r).exists());
+            }
+        }
+        #[test]
+        fn b2a1_invalid_enum_and_inflight_completed_row_refuse() {
+            for invalid in 0..2 {
+                let r = Rig::new();
+                let (removal, _) = opened(&r);
+                edit(&r, |v| {
+                    if invalid == 0 {
+                        v["rows"][0] = json!("arbitrary");
+                    } else {
+                        v["rows"][0] = json!("Completed");
+                        v["in_flight"] = json!(0);
+                    }
+                });
+                assert_eq!(
+                    removal.removal_recovery(&r.d()).unwrap_err(),
+                    NativeError::Foreign
+                );
+            }
+        }
+        #[test]
+        fn b2a1_private_mode_hardlink_symlink_and_oversize_refuse() {
+            for invalid in 0..4 {
+                let r = Rig::new();
+                let (removal, _) = opened(&r);
+                let bytes = std::fs::read(path(&r)).unwrap();
+                match invalid {
+                    0 => r.put(&path(&r), &bytes, 0o644),
+                    1 => std::fs::hard_link(path(&r), r.scratch.path.join("held-link")).unwrap(),
+                    2 => {
+                        std::fs::rename(path(&r), r.scratch.path.join("original-record")).unwrap();
+                        std::os::unix::fs::symlink(
+                            r.scratch.path.join("original-record"),
+                            path(&r),
+                        )
+                        .unwrap();
+                    }
+                    _ => r.put(&path(&r), &vec![b'x'; 512 * 1024 + 1], 0o600),
+                }
+                assert!(removal.removal_recovery(&r.d()).is_err(), "case {invalid}");
+                assert!(path(&r).symlink_metadata().is_ok());
+            }
+        }
+        #[test]
+        fn b2a1_changed_record_during_read_refuses() {
+            let r = Rig::new();
+            let (removal, _) = opened(&r);
+            let file = path(&r);
+            let hits = Arc::new(AtomicU64::new(0));
+            let seen = hits.clone();
+            let scratch = r.scratch.clone();
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, p| {
+                if stage == "metadata" && p == file && seen.fetch_add(1, Ordering::AcqRel) == 1 {
+                    scratch.put(&file, b"{}", 0o600);
+                }
+                Ok(())
+            }));
+            assert_eq!(
+                removal.removal_recovery(&r.d()).unwrap_err(),
+                NativeError::Foreign
+            );
+            assert!(hits.load(Ordering::Acquire) >= 2);
+        }
+        #[test]
+        fn b2a1_publication_failure_keeps_record_and_refuses_retry() {
+            let r = Rig::new();
+            let (_, journal) = opened(&r);
+            let before = std::fs::read(path(&r)).unwrap();
+            let touched = Arc::new(AtomicBool::new(false));
+            let seen = touched.clone();
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                if stage == "write" {
+                    seen.store(true, Ordering::Release);
+                    return Err(NativeError::Unavailable);
+                }
+                Ok(())
+            }));
+            assert!(journal.record_intent(0, &r.d()).is_err());
+            assert!(touched.load(Ordering::Acquire));
+            assert_eq!(std::fs::read(path(&r)).unwrap(), before);
+            assert_eq!(
+                journal.record_intent(0, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+        }
+        #[test]
+        fn b2a1_session_change_before_publish_refuses() {
+            let r = Rig::new();
+            let (_, journal) = opened(&r);
+            r.support.facts.lock().unwrap().gui.active = false;
+            assert!(journal.record_intent(0, &r.d()).is_err());
+            assert_eq!(record(&r)["in_flight"], Value::Null);
+        }
+        #[test]
+        fn b2a1_opaque_debug_and_missing_recovery_are_safe() {
+            let r = Rig::new();
+            let (removal, plan, consent) = setup(&r);
+            assert!(removal.removal_recovery(&r.d()).unwrap().is_none());
+            let journal = removal
+                .open_removal_journal(&plan, &consent, &r.d())
+                .unwrap();
+            assert_eq!(format!("{journal:?}"), "RemovalJournal");
+            journal.publish_initial(&r.d()).unwrap();
+            let intent = journal.record_intent(0, &r.d()).unwrap();
+            assert_eq!(format!("{intent:?}"), "JournalIntent");
+        }
+
+        #[test]
+        fn b2a1_boundary_size_and_row_count_are_admitted() {
+            for rows in [None, Some(8192)] {
+                let r = Rig::new();
+                let (removal, _) = opened(&r);
+                if let Some(count) = rows {
+                    edit(&r, |v| v["rows"] = json!(vec!["Pending"; count]));
+                }
+                let mut bytes = std::fs::read(path(&r)).unwrap();
+                bytes.resize(512 * 1024, b' ');
+                r.put(&path(&r), &bytes, 0o600);
+                let hints = removal.removal_recovery(&r.d()).unwrap().unwrap();
+                assert!(hints.original_not_clean && hints.retained_recovery);
+                if rows.is_some() {
+                    assert_eq!(hints.rows.len(), 8192);
+                }
+            }
+        }
+        #[test]
+        fn b2a1_duplicate_fields_are_malformed() {
+            let r = Rig::new();
+            let (removal, _) = opened(&r);
+            let bytes = std::fs::read(path(&r)).unwrap();
+            let mut duplicate = b"{\"operation\":1,".to_vec();
+            duplicate.extend_from_slice(&bytes[1..]);
+            r.put(&path(&r), &duplicate, 0o600);
+            assert_eq!(
+                removal.removal_recovery(&r.d()).unwrap_err(),
+                NativeError::Foreign
+            );
+        }
+        /// Actual write/fsync/rename correctness is the frozen native atomic_write contract.
+        /// These existing private hooks interrupt journal publication, retaining old/new records
+        /// and native-owned recovery bytes; they invoke no command or service.
+        #[test]
+        fn b2a1_atomic_publication_interruptions_preserve_recovery() {
+            for stage in ["write", "file-sync", "publish", "parent-sync"] {
+                let r = Rig::new();
+                let (removal, journal) = opened(&r);
+                let before = std::fs::read(path(&r)).unwrap();
+                let touched = Arc::new(AtomicBool::new(false));
+                let seen = touched.clone();
+                let file = path(&r);
+                *r.hook.lock().unwrap() = Some(Arc::new(move |at, p| {
+                    if at == stage && p == file {
+                        seen.store(true, Ordering::Release);
+                        return Err(NativeError::Unavailable);
+                    }
+                    Ok(())
+                }));
+                assert_eq!(
+                    journal.record_intent(0, &r.d()).unwrap_err(),
+                    NativeError::OutcomeUnknown
+                );
+                assert!(touched.load(Ordering::Acquire));
+                let after = std::fs::read(path(&r)).unwrap();
+                let parsed: Value = serde_json::from_slice(&after).unwrap();
+                if stage == "parent-sync" {
+                    assert_eq!(parsed["in_flight"], 0);
+                } else {
+                    assert_eq!(after, before);
+                }
+                let hints = removal.removal_recovery(&r.d()).unwrap().unwrap();
+                assert!(
+                    hints.original_not_clean
+                        && hints.rows.iter().all(|r| *r == RemovalOutcome::Unknown)
+                );
+                let temps =
+                    r.io.entries(&r.io.target().installer_dir(), 4096, &r.d())
+                        .unwrap();
+                assert!(
+                    temps
+                        .iter()
+                        .any(|(n, _)| n.starts_with(".removal.json.crosspane-temp-"))
+                );
+                assert_eq!(
+                    journal.record_intent(0, &r.d()).unwrap_err(),
+                    NativeError::Refused
+                );
+            }
+        }
+        #[test]
+        fn b2a1_noncooperative_write_keeps_lock_after_deadline_or_cancel() {
+            for cancel in [false, true] {
+                let r = Rig::new();
+                let (_, journal) = opened(&r);
+                let journal = Arc::new(journal);
+                let release = Arc::new((Mutex::new(false), Condvar::new()));
+                let wait = release.clone();
+                let (entered, entry) = std::sync::mpsc::sync_channel(1);
+                let first = Arc::new(AtomicBool::new(false));
+                *r.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                    if stage == "write" && !first.swap(true, Ordering::AcqRel) {
+                        entered.send(()).unwrap();
+                        let (lock, cv) = &*wait;
+                        let held = cv
+                            .wait_timeout_while(
+                                lock.lock().unwrap(),
+                                Duration::from_secs(3),
+                                |released| !*released,
+                            )
+                            .unwrap()
+                            .0;
+                        assert!(*held, "owned fixture release must arrive");
+                    }
+                    Ok(())
+                }));
+                let token = Cancellation::default();
+                let d = Deadline::new(5000, r.clock.clone(), token.clone()).unwrap();
+                let writer = journal.clone();
+                let job = std::thread::spawn(move || writer.record_intent(0, &d));
+                entry.recv_timeout(Duration::from_secs(2)).unwrap();
+                if cancel {
+                    token.cancel();
+                } else {
+                    r.clock.0.store(5001, Ordering::Release);
+                }
+                assert_eq!(
+                    job.join().unwrap().unwrap_err(),
+                    if cancel {
+                        NativeError::Cancelled
+                    } else {
+                        NativeError::Timeout
+                    }
+                );
+                let proof = r.selected().support;
+                assert_eq!(r.io.lock(&proof, &r.d()).unwrap_err(), NativeError::Busy);
+                let (lock, cv) = &*release;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                // A second intent waits for the actual bounded worker, then fails closed.
+                assert_eq!(
+                    journal.record_intent(0, &r.d()).unwrap_err(),
+                    NativeError::Refused
+                );
+                assert_no_dispatch(&r);
+            }
+        }
+
+        #[test]
+        fn b2a1_deadline_result_delivery_permanently_retires_publication() {
+            #[derive(Default)]
+            struct DeliveryClock {
+                now: AtomicU64,
+                armed: AtomicBool,
+                fired: AtomicBool,
+            }
+            impl Clock for DeliveryClock {
+                fn now_ms(&self) -> u64 {
+                    let observed = self.now.load(Ordering::Acquire);
+                    if self.armed.load(Ordering::Acquire)
+                        && std::thread::current().name() == Some("removal-inventory")
+                        && !self.fired.swap(true, Ordering::AcqRel)
+                    {
+                        // The last worker check sees time 0; time advances immediately afterward.
+                        // Caller result delivery sees 5001. Every subsequent read stays monotonic.
+                        self.now.store(5001, Ordering::Release);
+                    }
+                    observed
+                }
+            }
+            let mut r = Rig::new();
+            let clock = Arc::new(DeliveryClock::default());
+            r.io = Arc::new(
+                MacNativeIo::new(
+                    r.io.target().clone(),
+                    r.runner.clone(),
+                    r.support.clone(),
+                    r.signatures.clone(),
+                    clock.clone(),
+                )
+                .unwrap(),
+            );
+            let (removal, plan, consent) = setup(&r);
+            let journal = removal
+                .open_removal_journal(&plan, &consent, &r.d())
+                .unwrap();
+            let file = path(&r);
+            let arm = clock.clone();
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, p| {
+                if stage == "complete" && p == file {
+                    arm.armed.store(true, Ordering::Release);
+                }
+                Ok(())
+            }));
+            let deadline = Deadline::new(5000, clock.clone(), Cancellation::default()).unwrap();
+            assert_eq!(
+                journal.publish_initial(&deadline),
+                Err(NativeError::Timeout)
+            );
+            assert!(clock.fired.load(Ordering::Acquire));
+            assert_eq!(record(&r)["in_flight"], Value::Null);
+            let later = Deadline::new(5000, clock.clone(), Cancellation::default()).unwrap();
+            assert_eq!(
+                journal.record_intent(0, &later).unwrap_err(),
+                NativeError::Refused
+            );
+            assert_no_dispatch(&r);
+        }
+
+        #[test]
+        fn b2a1_r1_overlapping_retirement_never_delivers_published_intent() {
+            let r = Rig::new();
+            let (removal, journal) = opened(&r);
+            let journal = Arc::new(journal);
+            let file = path(&r);
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            let wait = release.clone();
+            let (entered, entry) = std::sync::mpsc::sync_channel(1);
+            let first = AtomicBool::new(false);
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, p| {
+                if stage == "publish" && p == file && !first.swap(true, Ordering::AcqRel) {
+                    entered.send(()).unwrap();
+                    let (lock, cv) = &*wait;
+                    let held = cv
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            Duration::from_secs(3),
+                            |released| !*released,
+                        )
+                        .unwrap()
+                        .0;
+                    assert!(*held, "owned fixture release must arrive");
+                }
+                Ok(())
+            }));
+            let valid = r.d();
+            let writer = journal.clone();
+            let job = std::thread::spawn(move || writer.record_intent(0, &valid));
+            entry.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            // Only the overlapping caller's clock expires. The paused publication stays valid.
+            let expired_clock = Arc::new(FakeClock::default());
+            let expired =
+                Deadline::new(5000, expired_clock.clone(), Cancellation::default()).unwrap();
+            expired_clock.0.store(5001, Ordering::Release);
+            let retirement = journal.record_intent(1, &expired);
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+            let publication = job.join().unwrap();
+
+            assert_eq!(retirement.unwrap_err(), NativeError::Timeout);
+            assert_eq!(publication.unwrap_err(), NativeError::Refused);
+            let durable = record(&r);
+            assert_eq!(durable["in_flight"], 0);
+            assert_eq!(durable["rows"][0], "Pending");
+            let recovery = removal.removal_recovery(&r.d()).unwrap().unwrap();
+            assert_eq!(recovery.rows[0], RemovalOutcome::Unknown);
+            assert!(recovery.original_not_clean && recovery.retained_recovery);
+            assert_eq!(
+                journal.record_intent(1, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            assert_no_dispatch(&r);
+        }
+    }
 }

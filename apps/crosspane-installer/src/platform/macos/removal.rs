@@ -1333,3 +1333,331 @@ impl MacRemoval {
         result
     }
 }
+
+const REMOVAL_RECORD_LIMIT: usize = 512 * 1024;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RemovalOutcome {
+    Pending,
+    Completed,
+    Absent,
+    Kept,
+    NotClean,
+    Waiting,
+    Refused,
+    Failed,
+    Unknown,
+    NotDispatched,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalRecovery {
+    pub operation: OperationId,
+    pub revision: u64,
+    pub rows: Vec<RemovalOutcome>,
+    pub original_not_clean: bool,
+    pub retained_recovery: bool,
+}
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemovalRecord {
+    schema_version: u32,
+    uid: u32,
+    home: PathBuf,
+    manifest_sha256: [u8; 32],
+    package_sha256: [u8; 32],
+    preview_sha256: [u8; 32],
+    operation: u64,
+    revision: u64,
+    rows: Vec<RemovalOutcome>,
+    in_flight: Option<usize>,
+}
+pub struct RemovalJournal {
+    state: Arc<Mutex<JournalState>>,
+    live: Arc<std::sync::atomic::AtomicBool>,
+}
+pub struct JournalIntent {
+    owner: Arc<Mutex<JournalState>>,
+    index: usize,
+}
+struct JournalState {
+    path: PathBuf,
+    sources: Arc<Sources>,
+    _lock: InstallerLock,
+    record: RemovalRecord,
+    published: Option<(RemovalRecord, FileIdentity)>,
+}
+opaque!(RemovalJournal, JournalIntent);
+impl MacRemoval {
+    /// Journal admission does not dispatch, verify a completed effect or mint clean authority.
+    /// The lease consumer first performs full revalidation, then checks facts under this lock.
+    pub fn open_removal_journal(
+        &self,
+        plan: &RemovalPlan,
+        consent: &RemovalConsent,
+        deadline: &Deadline,
+    ) -> NativeResult<RemovalJournal> {
+        self.check_plan(plan, deadline)?;
+        if !Arc::ptr_eq(&consent.binding, &plan.binding) {
+            return Err(NativeError::Refused);
+        }
+        let deltas: Vec<_> = plan
+            .preview
+            .deltas
+            .iter()
+            .map(|delta| (&delta.resource, &delta.path, delta.effect as u8))
+            .collect();
+        let bytes = serde_json::to_vec(&(
+            plan.choices.delete_identity,
+            plan.choices.remove_driver,
+            deltas,
+        ))
+        .map_err(|_| NativeError::Invalid)?;
+        if bytes.len() > REMOVAL_RECORD_LIMIT
+            || plan.preview.deltas.is_empty()
+            || plan.preview.deltas.len() > 8192
+        {
+            return Err(NativeError::Oversize);
+        }
+        let record = RemovalRecord {
+            schema_version: 1,
+            uid: self.observer.sources.io.target().paths().uid,
+            home: self.observer.sources.io.target().paths().home.clone(),
+            manifest_sha256: plan.inventory().manifest_sha256,
+            package_sha256: plan.inventory().package.removal_sha256,
+            preview_sha256: sha(&bytes),
+            operation: plan.preview.operation.0,
+            revision: plan.preview.revision,
+            rows: vec![RemovalOutcome::Pending; plan.preview.deltas.len()],
+            in_flight: None,
+        };
+        let (sources, limit) = (self.observer.sources.clone(), deadline.clone());
+        let path = sources.io.target().installer_dir().join("removal.json");
+        bounded(deadline, move || {
+            let proof = sources.io.admit_support(&sources.main, &limit)?;
+            let lock = sources.io.lock(&proof, &limit)?;
+            let published = JournalState::read(&sources, &limit)?;
+            if published.as_ref().is_some_and(|(old, _)| {
+                old.operation >= record.operation
+                    || old.revision >= record.revision
+                    || old.in_flight.is_some()
+                    || old.rows.iter().any(|row| {
+                        !matches!(
+                            row,
+                            RemovalOutcome::Completed
+                                | RemovalOutcome::Absent
+                                | RemovalOutcome::Kept
+                        )
+                    })
+            }) {
+                return Err(NativeError::Refused);
+            }
+            Ok(RemovalJournal {
+                live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                state: Arc::new(Mutex::new(JournalState {
+                    path,
+                    sources,
+                    _lock: lock,
+                    record,
+                    published,
+                })),
+            })
+        })
+    }
+    /// Read-only hints cannot recover an original watch, ownership or a CleanAgentExit.
+    pub fn removal_recovery(&self, deadline: &Deadline) -> NativeResult<Option<RemovalRecovery>> {
+        let (sources, limit) = (self.observer.sources.clone(), deadline.clone());
+        bounded(deadline, move || {
+            let Some((record, _)) = JournalState::read(&sources, &limit)? else {
+                return Ok(None);
+            };
+            Ok(Some(RemovalRecovery {
+                operation: OperationId(record.operation),
+                revision: record.revision,
+                rows: record
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        if row == RemovalOutcome::Pending {
+                            RemovalOutcome::Unknown
+                        } else {
+                            row
+                        }
+                    })
+                    .collect(),
+                original_not_clean: true,
+                retained_recovery: true,
+            }))
+        })
+    }
+}
+impl RemovalJournal {
+    fn work<T: Send + 'static>(
+        &self,
+        deadline: &Deadline,
+        work: impl FnOnce(&mut JournalState, &Deadline) -> NativeResult<T> + Send + 'static,
+    ) -> NativeResult<T> {
+        let (state, live, limit) = (self.state.clone(), self.live.clone(), deadline.clone());
+        let result = bounded(deadline, move || {
+            let mut state = state.lock().map_err(|_| NativeError::Unavailable)?;
+            if !live.load(Ordering::Acquire) {
+                return Err(NativeError::Refused);
+            }
+            let result = work(&mut state, &limit);
+            if result.is_err() {
+                live.store(false, Ordering::Release);
+            }
+            result
+        });
+        if result.is_err() {
+            self.live.store(false, Ordering::Release);
+        }
+        result
+    }
+    /// The lease publishes this only after its under-lock verification. No partial records.
+    pub fn publish_initial(&self, deadline: &Deadline) -> NativeResult<()> {
+        self.work(deadline, |state, deadline| {
+            if state.published.as_ref().map(|(record, _)| record.operation)
+                == Some(state.record.operation)
+            {
+                return Err(NativeError::Refused);
+            }
+            state.publish(deadline)
+        })
+    }
+    /// Brackets one exact preview row; it conveys no permission to mutate that resource.
+    pub fn record_intent(&self, index: usize, deadline: &Deadline) -> NativeResult<JournalIntent> {
+        let owner = self.state.clone();
+        let intent = self.work(deadline, move |state, deadline| {
+            if state.published.as_ref().map(|(record, _)| record.operation)
+                != Some(state.record.operation)
+                || state.record.in_flight.is_some()
+                || state.record.rows.get(index) != Some(&RemovalOutcome::Pending)
+            {
+                return Err(NativeError::Refused);
+            }
+            state.record.in_flight = Some(index);
+            state.publish(deadline)?;
+            Ok(JournalIntent { owner, index })
+        })?;
+        // A usable intent and permanent retirement share one atomic acceptance point.
+        self.live
+            .compare_exchange(true, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| NativeError::Refused)?;
+        Ok(intent)
+    }
+    /// The consumer independently verifies effects before passing any completed outcome.
+    pub fn record_outcome(
+        &self,
+        intent: JournalIntent,
+        outcome: RemovalOutcome,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        if !Arc::ptr_eq(&self.state, &intent.owner) {
+            return Err(NativeError::Foreign);
+        }
+        let live = self.live.clone();
+        self.work(deadline, move |state, deadline| {
+            if state.record.in_flight != Some(intent.index) || outcome == RemovalOutcome::Pending {
+                return Err(NativeError::Refused);
+            }
+            state.record.rows[intent.index] = outcome;
+            state.record.in_flight = None;
+            state.publish(deadline)?;
+            if !matches!(
+                outcome,
+                RemovalOutcome::Completed | RemovalOutcome::Absent | RemovalOutcome::Kept
+            ) {
+                live.store(false, Ordering::Release);
+            }
+            Ok(())
+        })
+    }
+}
+impl JournalState {
+    fn read(
+        sources: &Sources,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<(RemovalRecord, FileIdentity)>> {
+        let path = sources.io.target().installer_dir().join("removal.json");
+        let Some(identity) = sources.io.metadata(&path)? else {
+            return Ok(None);
+        };
+        if identity.mode & 0o7777 != 0o600
+            || identity.uid != sources.io.target().paths().uid
+            || identity.links != 1
+            || identity.length > REMOVAL_RECORD_LIMIT as u64
+        {
+            return Err(NativeError::Foreign);
+        }
+        let bytes = sources
+            .io
+            .read(&path, REMOVAL_RECORD_LIMIT, true, deadline)?;
+        let record: RemovalRecord =
+            serde_json::from_slice(&bytes).map_err(|_| NativeError::Foreign)?;
+        let package = format!(
+            "Crosspane.app/Contents/Resources/audio/CrosspaneAudio-remove-{}.pkg",
+            sources
+                .audio
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .version()
+        );
+        let package_sha = sources
+            .approved
+            .files
+            .iter()
+            .find(|file| file.path == package)
+            .map(|file| file.sha256);
+        if sources.io.metadata(&path)? != Some(identity.clone())
+            || sources
+                .io
+                .read(&path, REMOVAL_RECORD_LIMIT, true, deadline)?
+                != bytes
+            || record.schema_version != 1
+            || record.operation == 0
+            || record.revision == 0
+            || record.uid != sources.io.target().paths().uid
+            || record.home != sources.io.target().paths().home
+            || record.manifest_sha256 != sources.payload.manifest_sha256()
+            || package_sha != Some(record.package_sha256)
+            || record.rows.is_empty()
+            || record.rows.len() > 8192
+            || record.in_flight.is_some_and(|index| {
+                index >= record.rows.len() || record.rows[index] != RemovalOutcome::Pending
+            })
+        {
+            return Err(NativeError::Foreign);
+        }
+        if sources.io.metadata(&path)? != Some(identity.clone()) {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()?;
+        Ok(Some((record, identity)))
+    }
+    fn publish(&mut self, deadline: &Deadline) -> NativeResult<()> {
+        deadline.check()?;
+        if self.sources.io.support_observation(deadline)? != self.sources.session {
+            return Err(NativeError::Foreign);
+        }
+        let proof = self
+            .sources
+            .io
+            .admit_support(&self.sources.main, deadline)?;
+        let actual = Self::read(&self.sources, deadline)?;
+        if actual != self.published {
+            return Err(NativeError::Foreign);
+        }
+        let bytes = serde_json::to_vec(&self.record).map_err(|_| NativeError::Invalid)?;
+        if bytes.len() > REMOVAL_RECORD_LIMIT {
+            return Err(NativeError::Oversize);
+        }
+        let identity = self.sources.io.atomic_write(
+            &proof,
+            &self.path,
+            &bytes,
+            self.published.as_ref().map(|(_, id)| id),
+            deadline,
+        )?;
+        self.published = Some((self.record.clone(), identity));
+        Ok(())
+    }
+}
