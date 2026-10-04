@@ -972,3 +972,159 @@ impl MacNativeIo {
         Ok(Some((fd, chain)))
     }
 }
+/// Verifies the displaced ORIGINAL inode and bounded bytes; caller's typed plan supplies ownership.
+/// Existing remove_owned_leaf stays unchanged. A mismatch never authorizes an unlink.
+impl MacNativeIo {
+    pub fn remove_owned_leaf_verified(
+        &self,
+        proof: &SupportProof,
+        path: &Path,
+        expected: &FileIdentity,
+        hash: Option<[u8; 32]>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let _serial = self.mutation.try_lock().map_err(|_| NativeError::Busy)?;
+        proof.check(self, deadline)?;
+        let path = admitted_spelling(path)?;
+        if !self.target.writable(&path) {
+            return Err(NativeError::Foreign);
+        }
+        let directory = expected.mode & 0o170000 == 0o040000;
+        if !matches!(expected.mode & 0o170000, 0o100000 | 0o040000)
+            || directory == hash.is_some()
+            || expected.length > MAX_FILE_BYTES as u64
+        {
+            return Err(NativeError::Foreign);
+        }
+        let (parent, name) = self.parent(&path)?;
+        self.expected_at(&parent, &name, Some(expected))?;
+        let fd = native(rfs::openat(
+            &parent.fd,
+            &name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ))?;
+        let mut file = File::from(fd);
+        if FileIdentity::from_stat(&native(rfs::fstat(&file))?) != *expected {
+            return Err(NativeError::Foreign);
+        }
+        let temporary = self.temporary_name(&parent, &name)?;
+        self.boundary("verified-displace", &path, deadline)?;
+        proof.check(self, deadline)?;
+        parent.revalidate(self)?;
+        self.expected_at(&parent, &name, Some(expected))?;
+        self.tutorial_proof_current(proof)?;
+        deadline.check()?;
+        self.filesystem.execute(FilesystemOperation::Rename {
+            old_dir: parent.fd.as_fd(),
+            old: &name,
+            new_dir: parent.fd.as_fd(),
+            new: &temporary,
+            flags: rfs::RenameFlags::NOREPLACE,
+        })?;
+        let result = (|| {
+            parent.revalidate(self)?;
+            self.expected_at(&parent, &name, None)?;
+            let displaced =
+                self.verify_displaced(&parent, &temporary, &mut file, expected, hash, deadline)?;
+            // The original signing pathname is intentionally absent after displacement.
+            self.tutorial_proof_current(proof)?;
+            self.boundary("verified-unlink", &path, deadline)?;
+            if self.verify_displaced(&parent, &temporary, &mut file, expected, hash, deadline)?
+                != displaced
+            {
+                return Err(NativeError::Foreign);
+            }
+            self.expected_at(&parent, &name, None)?;
+            self.tutorial_proof_current(proof)?;
+            deadline.check()?;
+            // Residual: a same-UID adversary can replace the private nonce after this check.
+            native(rfs::unlinkat(
+                &parent.fd,
+                &temporary,
+                if directory {
+                    AtFlags::REMOVEDIR
+                } else {
+                    AtFlags::empty()
+                },
+            ))?;
+            self.filesystem
+                .execute(FilesystemOperation::DirectorySync(parent.fd.as_fd()))?;
+            parent.revalidate(self)?;
+            self.boundary("verified-complete", &path, deadline)
+        })();
+        if result.is_err() {
+            // Restore without replacing a new original pathname; both objects survive a conflict.
+            let _ = self.filesystem.execute(FilesystemOperation::Rename {
+                old_dir: parent.fd.as_fd(),
+                old: &temporary,
+                new_dir: parent.fd.as_fd(),
+                new: &name,
+                flags: rfs::RenameFlags::NOREPLACE,
+            });
+            let _ = self
+                .filesystem
+                .execute(FilesystemOperation::DirectorySync(parent.fd.as_fd()));
+            return Err(NativeError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+    fn verify_displaced(
+        &self,
+        parent: &DirectoryAnchor,
+        name: &str,
+        file: &mut File,
+        expected: &FileIdentity,
+        hash: Option<[u8; 32]>,
+        deadline: &Deadline,
+    ) -> NativeResult<FileIdentity> {
+        let observed = FileIdentity::from_stat(&native(rfs::fstat(&file))?);
+        let mut actual = observed.clone();
+        actual.changed_ns = expected.changed_ns;
+        if actual != *expected {
+            return Err(NativeError::Foreign);
+        }
+        if let Some(hash) = hash {
+            native(std::io::Seek::seek(file, std::io::SeekFrom::Start(0)))?;
+            let mut context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+            let mut buffer = [0; 16384];
+            let mut length = 0usize;
+            loop {
+                deadline.check()?;
+                let n = native(file.read(&mut buffer))?;
+                if n == 0 {
+                    break;
+                }
+                length = length.checked_add(n).ok_or(NativeError::Oversize)?;
+                if length > MAX_FILE_BYTES || length as u64 > expected.length {
+                    return Err(NativeError::Oversize);
+                }
+                context.update(&buffer[..n]);
+            }
+            if length as u64 != expected.length || context.finish().as_ref() != hash {
+                return Err(NativeError::Foreign);
+            }
+        } else {
+            for entry in native(rfs::Dir::read_from(&*file))? {
+                deadline.check()?;
+                if !matches!(native(entry)?.file_name().to_bytes(), b"." | b"..") {
+                    return Err(NativeError::Foreign);
+                }
+            }
+        }
+        let fd = FileIdentity::from_stat(&native(rfs::fstat(file))?);
+        let named = FileIdentity::from_stat(&native(rfs::statat(
+            &parent.fd,
+            name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        ))?);
+        let mut stable = fd.clone();
+        stable.changed_ns = expected.changed_ns;
+        if stable != *expected || fd != observed || fd != named {
+            return Err(NativeError::Foreign);
+        }
+        parent.revalidate(self)?;
+        deadline.check()?;
+        Ok(fd)
+    }
+}

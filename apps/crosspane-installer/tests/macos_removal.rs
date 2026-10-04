@@ -3433,4 +3433,533 @@ mod a2_tests {
             assert_read_only(&r);
         }
     }
+    mod b1_tests {
+
+        struct ParentSwap {
+            support: Arc<Support>,
+            scratch: Arc<Scratch>,
+            parent: PathBuf,
+            held: PathBuf,
+            calls: AtomicU64,
+        }
+        impl SupportProbe for ParentSwap {
+            fn observe(&self, deadline: &Deadline) -> NativeResult<SupportObservation> {
+                let facts = self.support.observe(deadline)?;
+                if self.calls.fetch_add(1, Ordering::AcqRel) == 1 {
+                    std::fs::rename(&self.parent, &self.held).unwrap();
+                    self.scratch.directory(&self.parent);
+                }
+                Ok(facts)
+            }
+        }
+        #[test]
+        fn b1_r1_parent_swap_during_final_support_refuses_zero_displacement() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let path = r.io.target().paths().home.join(".local/bin/crosspanectl");
+            let original = r.io.metadata(&path).unwrap().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let parent = path.parent().unwrap().to_path_buf();
+            let held = parent.with_file_name("bin-original");
+            let swap = Arc::new(ParentSwap {
+                support: r.support.clone(),
+                scratch: r.scratch.clone(),
+                parent: parent.clone(),
+                held: held.clone(),
+                calls: AtomicU64::new(0),
+            });
+            let trace = Arc::new(Trace {
+                parent,
+                events: Mutex::new(vec![]),
+                after: Mutex::new(None),
+                fail_sync: AtomicBool::new(false),
+            });
+            let io = MacNativeIo::new(
+                r.io.target().clone(),
+                r.runner.clone(),
+                swap.clone(),
+                r.signatures.clone(),
+                r.clock.clone(),
+            )
+            .unwrap()
+            .with_filesystem(trace.clone());
+            let result =
+                io.remove_owned_leaf_verified(&proof, &path, &original, Some(sha(&bytes)), &r.d());
+            assert_eq!(swap.calls.load(Ordering::Acquire), 2);
+            assert!(
+                trace.events.lock().unwrap().is_empty(),
+                "must reject the changed parent BEFORE even one displacement, not restore afterward"
+            );
+            assert_eq!(result, Err(NativeError::Foreign));
+            assert!(!path.exists());
+            let retained = held.join("crosspanectl");
+            assert_eq!(std::fs::read(&retained).unwrap(), bytes);
+            assert_eq!(io.metadata(&retained).unwrap().unwrap(), original);
+            assert!(temps(&retained).is_empty());
+        }
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        type AfterRename = Box<dyn FnOnce(&Path) + Send>;
+        struct Trace {
+            parent: PathBuf,
+            events: Mutex<Vec<&'static str>>,
+            after: Mutex<Option<AfterRename>>,
+            fail_sync: AtomicBool,
+        }
+        impl FilesystemOps for Trace {
+            fn execute(&self, operation: FilesystemOperation<'_>) -> NativeResult<()> {
+                let (event, renamed) = match &operation {
+                    FilesystemOperation::Rename {
+                        old, new, flags, ..
+                    } => {
+                        assert_eq!(*flags, rustix::fs::RenameFlags::NOREPLACE);
+                        (
+                            "rename",
+                            (!old.contains(".crosspane-temp-")).then(|| self.parent.join(new)),
+                        )
+                    }
+                    FilesystemOperation::DirectorySync(_) => ("parent-fsync", None),
+                    _ => panic!("verified deletion must not write or synchronize file contents"),
+                };
+                self.events.lock().unwrap().push(event);
+                if event == "parent-fsync" && self.fail_sync.swap(false, Ordering::AcqRel) {
+                    return Err(NativeError::Unavailable);
+                }
+                SystemFilesystem.execute(operation)?;
+                if let Some(path) = renamed
+                    && let Some(after) = self.after.lock().unwrap().take()
+                {
+                    after(&path);
+                }
+                Ok(())
+            }
+        }
+        fn leaf(r: &Rig) -> PathBuf {
+            let p = r.io.target().app_path().join("Contents/Resources/b1-owned");
+            r.put(&p, b"original", 0o600);
+            p
+        }
+        fn traced(r: &Rig, p: &Path, after: Option<AfterRename>) -> (MacNativeIo, Arc<Trace>) {
+            let trace = Arc::new(Trace {
+                parent: p.parent().unwrap().into(),
+                events: Mutex::new(vec![]),
+                after: Mutex::new(after),
+                fail_sync: AtomicBool::new(false),
+            });
+            let io = MacNativeIo::new(
+                r.io.target().clone(),
+                r.runner.clone(),
+                r.support.clone(),
+                r.signatures.clone(),
+                r.clock.clone(),
+            )
+            .unwrap()
+            .with_filesystem(trace.clone());
+            (io, trace)
+        }
+        fn temps(p: &Path) -> Vec<PathBuf> {
+            std::fs::read_dir(p.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains(".crosspane-temp-")
+                })
+                .collect()
+        }
+        #[test]
+        fn b1_installed_agent_original_can_be_removed_after_full_admission() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = r.io.target().agent_path();
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let hash = sha(&r.io.read(&p, MAX_FILE_BYTES, false, &r.d()).unwrap());
+            r.io.remove_owned_leaf_verified(&proof, &p, &original, Some(hash), &r.d())
+                .unwrap();
+            assert!(!p.exists());
+            assert!(temps(&p).is_empty());
+        }
+        #[test]
+        fn b1_revocation_during_final_boundary_restores_before_unlink() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = leaf(&r);
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let revoke = proof.clone();
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                if stage == "verified-unlink" {
+                    revoke.revoke();
+                }
+                Ok(())
+            }));
+            assert_eq!(
+                r.io.remove_owned_leaf_verified(
+                    &proof,
+                    &p,
+                    &original,
+                    Some(sha(b"original")),
+                    &r.d()
+                ),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"original");
+            assert!(temps(&p).is_empty());
+        }
+        #[test]
+        fn b1_verified_delete_hash_and_rename_ctime_then_parent_fsync() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = leaf(&r);
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let seen = Arc::new(Mutex::new(None));
+            let capture = seen.clone();
+            let observe = r.io.clone();
+            let (io, trace) = traced(
+                &r,
+                &p,
+                Some(Box::new(move |q| {
+                    *capture.lock().unwrap() = observe.metadata(q).unwrap();
+                })),
+            );
+            io.remove_owned_leaf_verified(&proof, &p, &original, Some(sha(b"original")), &r.d())
+                .unwrap();
+            let displaced = seen.lock().unwrap().clone().unwrap();
+            let mut normalized = displaced;
+            normalized.changed_ns = original.changed_ns;
+            assert_eq!(normalized, original);
+            assert!(!p.exists());
+            assert!(temps(&p).is_empty());
+            assert_eq!(*trace.events.lock().unwrap(), ["rename", "parent-fsync"]);
+        }
+        #[test]
+        fn b1_wrong_bounded_hash_restores_original_without_unlink() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = leaf(&r);
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let (io, trace) = traced(&r, &p, None);
+            assert_eq!(
+                io.remove_owned_leaf_verified(
+                    &proof,
+                    &p,
+                    &original,
+                    Some(sha(b"different")),
+                    &r.d()
+                ),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"original");
+            assert_eq!(io.metadata(&p).unwrap().unwrap().inode, original.inode);
+            assert!(temps(&p).is_empty());
+            assert_eq!(
+                *trace.events.lock().unwrap(),
+                ["rename", "rename", "parent-fsync"]
+            );
+        }
+        #[test]
+        fn b1_post_displacement_mode_change_restores_mismatch() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = leaf(&r);
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let (io, _) = traced(
+                &r,
+                &p,
+                Some(Box::new(|q| {
+                    std::fs::set_permissions(q, std::fs::Permissions::from_mode(0o640)).unwrap();
+                })),
+            );
+            assert_eq!(
+                io.remove_owned_leaf_verified(
+                    &proof,
+                    &p,
+                    &original,
+                    Some(sha(b"original")),
+                    &r.d()
+                ),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"original");
+            assert_eq!(io.metadata(&p).unwrap().unwrap().inode, original.inode);
+            assert_eq!(io.metadata(&p).unwrap().unwrap().mode & 0o777, 0o640);
+        }
+        #[test]
+        fn b1_same_inode_mutation_before_unlink_never_deletes() {
+            for change in ["bytes", "ctime", "links"] {
+                let r = Rig::new();
+                let proof = r.selected().support;
+                let p = leaf(&r);
+                let original = r.io.metadata(&p).unwrap().unwrap();
+                let path = p.clone();
+                let scratch = r.scratch.clone();
+                *r.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                    if stage == "verified-unlink" {
+                        let q = temps(&path).pop().unwrap();
+                        match change {
+                            "bytes" => scratch.put(&q, b"changed!", 0o600),
+                            "ctime" => {
+                                std::fs::set_permissions(
+                                    &q,
+                                    std::fs::Permissions::from_mode(0o640),
+                                )
+                                .unwrap();
+                                std::fs::set_permissions(
+                                    &q,
+                                    std::fs::Permissions::from_mode(0o600),
+                                )
+                                .unwrap();
+                            }
+                            _ => std::fs::hard_link(&q, path.with_file_name("b1-link")).unwrap(),
+                        }
+                    }
+                    Ok(())
+                }));
+                assert_eq!(
+                    r.io.remove_owned_leaf_verified(
+                        &proof,
+                        &p,
+                        &original,
+                        Some(sha(b"original")),
+                        &r.d()
+                    ),
+                    Err(NativeError::OutcomeUnknown),
+                    "{change}"
+                );
+                assert_eq!(r.io.metadata(&p).unwrap().unwrap().inode, original.inode);
+                assert_eq!(
+                    std::fs::read(&p).unwrap(),
+                    if change == "bytes" {
+                        b"changed!"
+                    } else {
+                        b"original"
+                    }
+                );
+            }
+        }
+        #[test]
+        fn b1_replaced_nonce_preserves_both_objects() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = leaf(&r);
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let path = p.clone();
+            let scratch = r.scratch.clone();
+            let held = p.with_file_name("b1-held-original");
+            let held_hook = held.clone();
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                if stage == "verified-unlink" {
+                    let q = temps(&path).pop().unwrap();
+                    std::fs::rename(&q, &held_hook).unwrap();
+                    scratch.put(&q, b"foreign", 0o600);
+                }
+                Ok(())
+            }));
+            assert_eq!(
+                r.io.remove_owned_leaf_verified(
+                    &proof,
+                    &p,
+                    &original,
+                    Some(sha(b"original")),
+                    &r.d()
+                ),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"foreign");
+            assert_eq!(std::fs::read(&held).unwrap(), b"original");
+            assert_eq!(r.io.metadata(&held).unwrap().unwrap().inode, original.inode);
+        }
+        #[test]
+        fn b1_original_path_collision_preserves_original_and_new_object() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = leaf(&r);
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let path = p.clone();
+            let scratch = r.scratch.clone();
+            let (io, trace) = traced(
+                &r,
+                &p,
+                Some(Box::new(move |_| {
+                    scratch.put(&path, b"new owner object", 0o600);
+                })),
+            );
+            assert_eq!(
+                io.remove_owned_leaf_verified(
+                    &proof,
+                    &p,
+                    &original,
+                    Some(sha(b"original")),
+                    &r.d()
+                ),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"new owner object");
+            let q = temps(&p).pop().unwrap();
+            assert_eq!(std::fs::read(&q).unwrap(), b"original");
+            assert_eq!(io.metadata(&q).unwrap().unwrap().inode, original.inode);
+            assert_eq!(
+                *trace.events.lock().unwrap(),
+                ["rename", "rename", "parent-fsync"]
+            );
+        }
+        #[test]
+        fn b1_original_snapshot_change_refuses_before_displacement() {
+            for replace in [false, true] {
+                let r = Rig::new();
+                let proof = r.selected().support;
+                let p = leaf(&r);
+                let original = r.io.metadata(&p).unwrap().unwrap();
+                let path = p.clone();
+                let scratch = r.scratch.clone();
+                *r.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                    if stage == "verified-displace" {
+                        if replace {
+                            scratch.remove(&path);
+                        }
+                        scratch.put(&path, b"modified", 0o600);
+                    }
+                    Ok(())
+                }));
+                assert_eq!(
+                    r.io.remove_owned_leaf_verified(
+                        &proof,
+                        &p,
+                        &original,
+                        Some(sha(b"original")),
+                        &r.d()
+                    ),
+                    Err(NativeError::Foreign)
+                );
+                assert_eq!(std::fs::read(&p).unwrap(), b"modified");
+                assert!(temps(&p).is_empty());
+            }
+        }
+        #[test]
+        fn b1_only_empty_original_directories_are_removed() {
+            for empty in [false, true] {
+                let r = Rig::new();
+                let proof = r.selected().support;
+                let p =
+                    r.io.target()
+                        .app_path()
+                        .join("Contents/Resources/b1-directory");
+                r.scratch.directory(&p);
+                if !empty {
+                    r.put(&p.join("retained"), b"child", 0o600);
+                }
+                let original = r.io.metadata(&p).unwrap().unwrap();
+                let result =
+                    r.io.remove_owned_leaf_verified(&proof, &p, &original, None, &r.d());
+                if empty {
+                    assert_eq!(result, Ok(()));
+                    assert!(!p.exists());
+                } else {
+                    assert_eq!(result, Err(NativeError::OutcomeUnknown));
+                    assert_eq!(std::fs::read(p.join("retained")).unwrap(), b"child");
+                    assert_eq!(r.io.metadata(&p).unwrap().unwrap().inode, original.inode);
+                }
+            }
+        }
+        #[test]
+        fn b1_invalid_hash_kind_bound_and_proof_refuse_zero_displacement() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = leaf(&r);
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let (io, trace) = traced(&r, &p, None);
+            assert_eq!(
+                io.remove_owned_leaf_verified(&proof, &p, &original, None, &r.d()),
+                Err(NativeError::Foreign)
+            );
+            let mut oversized = original.clone();
+            oversized.length = MAX_FILE_BYTES as u64 + 1;
+            assert_eq!(
+                io.remove_owned_leaf_verified(
+                    &proof,
+                    &p,
+                    &oversized,
+                    Some(sha(b"original")),
+                    &r.d()
+                ),
+                Err(NativeError::Foreign)
+            );
+            proof.revoke();
+            assert!(
+                io.remove_owned_leaf_verified(
+                    &proof,
+                    &p,
+                    &original,
+                    Some(sha(b"original")),
+                    &r.d()
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"original");
+            assert!(trace.events.lock().unwrap().is_empty());
+        }
+        #[test]
+        fn b1_expiry_or_cancellation_after_displacement_restores() {
+            for cancel in [false, true] {
+                let r = Rig::new();
+                let proof = r.selected().support;
+                let p = leaf(&r);
+                let original = r.io.metadata(&p).unwrap().unwrap();
+                let cancellation = Cancellation::default();
+                let token = cancellation.clone();
+                let clock = r.clock.clone();
+                let (io, _) = traced(
+                    &r,
+                    &p,
+                    Some(Box::new(move |_| {
+                        if cancel {
+                            token.cancel();
+                        } else {
+                            clock.0.store(5000, Ordering::Release);
+                        }
+                    })),
+                );
+                let deadline = Deadline::new(5000, r.clock.clone(), cancellation).unwrap();
+                assert_eq!(
+                    io.remove_owned_leaf_verified(
+                        &proof,
+                        &p,
+                        &original,
+                        Some(sha(b"original")),
+                        &deadline
+                    ),
+                    Err(NativeError::OutcomeUnknown)
+                );
+                assert_eq!(std::fs::read(&p).unwrap(), b"original");
+                assert!(temps(&p).is_empty());
+            }
+        }
+        #[test]
+        fn b1_parent_fsync_failure_is_uncertain_after_unlink() {
+            let r = Rig::new();
+            let proof = r.selected().support;
+            let p = leaf(&r);
+            let original = r.io.metadata(&p).unwrap().unwrap();
+            let (io, trace) = traced(&r, &p, None);
+            trace.fail_sync.store(true, Ordering::Release);
+            assert_eq!(
+                io.remove_owned_leaf_verified(
+                    &proof,
+                    &p,
+                    &original,
+                    Some(sha(b"original")),
+                    &r.d()
+                ),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert!(!p.exists());
+            assert!(temps(&p).is_empty());
+            assert_eq!(
+                *trace.events.lock().unwrap(),
+                ["rename", "parent-fsync", "rename", "parent-fsync"]
+            );
+        }
+    }
 }
