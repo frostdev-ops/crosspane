@@ -3580,6 +3580,48 @@ fn an_unknown_outcome_offers_a_working_resume_that_reaches_verified() {
 }
 
 #[test]
+fn a_fresh_window_offers_persisted_reassessment_and_shows_only_observed_current_health() {
+    let mut f = flow::Flow::new();
+    {
+        let mut world = f.world().lock().unwrap();
+        world.repair_offer = RepairOffer {
+            repair: Availability::Unavailable("An earlier repair needs checking.".into()),
+            resumable: Some(vec![
+                "Its private record survived the earlier window.".into(),
+            ]),
+        };
+        world.repair_resume = Ok(finish(
+            RepairOutcome::CheckedAfterEarlierRepair,
+            "The installed files match verified receipts and Crosspane reports healthy now.",
+            false,
+        ));
+    }
+    f.open_repair();
+    f.until("the saved repair offer", |f| {
+        f.enabled(live::ids::REPAIR_RESUME)
+    });
+    assert!(!f.enabled(live::ids::REPAIR));
+    assert!(f.message().contains("survived the earlier window"));
+    f.click(live::ids::REPAIR_RESUME);
+    f.until("current health was checked", |f| {
+        f.message()
+            .contains("Crosspane is now verified and healthy")
+    });
+    assert!(!f.message().contains("The new instance reported healthy"));
+    assert!(!f.enabled(live::ids::REPAIR_RESUME));
+    assert!(
+        calls(f.world())
+            .iter()
+            .any(|call| call.starts_with("repair.resume("))
+    );
+    assert!(
+        !calls(f.world())
+            .iter()
+            .any(|call| call.starts_with("repair.confirm("))
+    );
+}
+
+#[test]
 fn an_install_that_cannot_be_confirmed_from_the_running_agent_never_verifies() {
     let mut f = flow::Flow::new();
     f.until("welcome", |f| {

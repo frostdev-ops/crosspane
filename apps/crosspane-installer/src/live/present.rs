@@ -424,13 +424,15 @@ impl LiveController {
                 RepairOutcome::OutcomeUnknown if end.resumable => {
                     "Outcome unknown, resume required."
                 }
-                // No Resume can help here (the Mac keeps no record past this window): don't ask
-                // for one.
+                // No Resume can help here (nothing left to reassess): don't ask for one.
                 RepairOutcome::OutcomeUnknown => {
                     "Outcome unknown: what the repair did can't be proved."
                 }
                 RepairOutcome::RecoveryRetained => {
                     "The repair didn't finish. Backups and recovery files were kept."
+                }
+                RepairOutcome::CheckedAfterEarlierRepair => {
+                    "An earlier repair didn't report back. Crosspane is now verified and healthy."
                 }
             };
             let mut text = vec![head.to_owned()];

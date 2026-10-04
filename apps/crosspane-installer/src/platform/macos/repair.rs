@@ -1,9 +1,34 @@
 //! Receipt-bound full reinstall repair. All I/O methods run on a detached installer worker.
 //! The existing payload lock, real clean stop, staging and backup verifier remain the authorities.
 //! No erase, package, cleanup-authority or identity/config/trust mutation is exposed here.
-use super::{launch_agent::*, native_io::*, payload::ApprovedInventory, transport::SelectedAgent};
-use crate::agent_contract::{AgentReply, DecodedReply, HealthSnapshot, StatusAdmission};
-use std::{path::PathBuf, sync::Arc};
+use super::{
+    launch_agent::*,
+    native_io::*,
+    payload::{ApprovedInventory, MacPayload, PayloadState},
+    transport::SelectedAgent,
+};
+use crate::agent_contract::{
+    AgentReply, BootstrapPhase, DecodedReply, HealthSnapshot, KeyStoreProvenance, StartupRecovery,
+    StatusAdmission,
+};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+#[path = "repair/record.rs"]
+mod record;
+pub(crate) use record::removal_hint;
+pub use record::{RepairBoundary, RepairRecord};
+
+/// Reopening observes the current install. It never resumes a recorded mutation or clean proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairReassessment {
+    CurrentInstallHealthy,
+    CurrentInstallHealthyCleanupIncomplete,
+    AgentStopped,
+    RecoveryRetained,
+}
 
 /// Present but stopped/crashed/incomplete agent installs cannot mint a clean-stop proof.
 pub const UNINSTALL_THEN_INSTALL: &str = "Uninstall (keeping identity by default), then install.";
@@ -103,6 +128,8 @@ pub struct MacRepair {
     last: (u64, u64),
     last_reply: (u64, u64),
     attempted: bool,
+    inventory: ApprovedInventory,
+    record: Mutex<Option<RepairRecord>>,
 }
 macro_rules! opaque { ($($name:ty),+) => { $(impl std::fmt::Debug for $name {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,15 +244,19 @@ impl MacRepair {
         approval: Arc<dyn ApprovalProbe>,
         deadline: &Deadline,
     ) -> NativeResult<Self> {
-        let launch = MacLaunchAgent::admit(io.clone(), inventory, approval, deadline)?;
+        let launch = MacLaunchAgent::admit(io.clone(), inventory.clone(), approval, deadline)?;
+        let record = record::load(&io, &inventory, deadline)?;
+        let watermark = record.as_ref().map_or(0, RepairRecord::status_watermark);
         Ok(Self {
             io,
             launch,
             owner: Arc::new(()),
             active: None,
             last: (0, 0),
-            last_reply: (0, 0),
+            last_reply: (watermark, 0),
             attempted: false,
+            inventory,
+            record: Mutex::new(record),
         })
     }
     /// Only fresh monotonic caller receipts are accepted; watermark survives plan retirement.
@@ -351,10 +382,38 @@ impl MacRepair {
         }
         self.launch
             .revalidate_repair(&plan.launch, current, deadline)?;
+        let saved = record::begin(
+            &self.io,
+            &self.inventory,
+            &plan,
+            self.last_reply.0,
+            deadline,
+        )?;
+        *self.record.lock().map_err(|_| NativeError::Busy)? = Some(saved);
         // An execute error is before its dispatch phase: installed payload/plist stay unchanged.
         // A returned pending Unknown is retained and never re-dispatched by this coordinator.
-        let launch = self.launch.execute(plan.launch, consent.launch, deadline)?;
+        let launch = match self.launch.execute(plan.launch, consent.launch, deadline) {
+            Ok(launch) => launch,
+            Err(error) => {
+                // The frozen executor returns an Err only before its dispatch phase. A record that
+                // can't be retired stays for a later reassessment; the executor's error is kept.
+                let _ = self.retire_record(&self.io, deadline);
+                return Err(error);
+            }
+        };
         let phase = progress(&launch);
+        // After dispatch the boundary is only a hint: a failed update never drops the genuine
+        // pending repair (the before-stop record and reserved Status ids are already durable).
+        let _ = self.update_record(
+            &self.io,
+            match phase {
+                RepairProgress::WaitingForCleanStop => RepairBoundary::Stopped,
+                RepairProgress::Published => RepairBoundary::Applied,
+                _ => RepairBoundary::Applying,
+            },
+            self.last_reply.0,
+            deadline,
+        );
         Ok(PendingRepair {
             owner: self.owner.clone(),
             operation: plan.operation,
@@ -373,11 +432,29 @@ impl MacRepair {
         if pending.progress != RepairProgress::WaitingForCleanStop {
             return Err(NativeError::Refused);
         }
+        // Boundary hints are best effort here: the genuine pending token, not the record, is
+        // the continuation authority, and a fresh window never reads the boundary as one.
+        let _ = self.update_record(
+            &self.io,
+            RepairBoundary::Applying,
+            self.last_reply.0,
+            deadline,
+        );
         if let Err(error) = self.launch.resume_clean_stop(&mut pending.launch, deadline) {
             pending.progress = RepairProgress::RecoveryRetained;
             return Err(error);
         }
         pending.progress = progress(&pending.launch);
+        let _ = self.update_record(
+            &self.io,
+            if pending.progress == RepairProgress::Published {
+                RepairBoundary::Applied
+            } else {
+                RepairBoundary::Stopped
+            },
+            self.last_reply.0,
+            deadline,
+        );
         Ok(())
     }
     fn check_pending(&self, pending: &PendingRepair) -> NativeResult<()> {
@@ -408,6 +485,8 @@ impl MacRepair {
             return Err(NativeError::Refused);
         }
         self.advance_reply(selected, &reply, deadline)?;
+        // The adapter reserved this id durably before sending; the boundary is only a hint.
+        let _ = self.update_record(&selected.io, RepairBoundary::HealthWait, reply.id, deadline);
         let (startup, incomplete) = self.launch.observe_repair(
             &mut pending.launch,
             selected,
@@ -420,9 +499,187 @@ impl MacRepair {
         } else {
             RepairProgress::Verified
         };
+        if self.retire_record(&selected.io, deadline).is_err() {
+            pending.progress = RepairProgress::HealthVerifiedCleanupIncomplete;
+        }
         Ok(RepairCompletion {
             progress: pending.progress,
             startup,
         })
+    }
+
+    /// Strict read only. Saved process information and receipt fingerprints grant no authority.
+    pub fn saved_record(
+        io: &MacNativeIo,
+        inventory: &ApprovedInventory,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<RepairRecord>> {
+        record::load(io, inventory, deadline)
+    }
+
+    /// Reserve a Status id durably before the adapter sends it, including unsuccessful reads.
+    pub fn reserve_status(
+        io: &MacNativeIo,
+        inventory: &ApprovedInventory,
+        id: u64,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        if let Some(record) = record::load(io, inventory, deadline)? {
+            if id <= record.status_watermark() {
+                return Err(NativeError::IdExhausted);
+            }
+            let step = if record.boundary() == RepairBoundary::Applied {
+                RepairBoundary::HealthWait
+            } else {
+                record.boundary()
+            };
+            record::update(io, inventory, &record, step, id, deadline)?;
+        }
+        Ok(())
+    }
+
+    fn update_record(
+        &self,
+        io: &MacNativeIo,
+        step: RepairBoundary,
+        watermark: u64,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let mut held = self.record.lock().map_err(|_| NativeError::Busy)?;
+        let current = record::load(io, &self.inventory, deadline)?.ok_or(NativeError::Foreign)?;
+        // The adapter may have reserved a newer Status while this coordinator was waiting.
+        if held.as_ref().is_none_or(|old| {
+            old.operation_id() != current.operation_id()
+                || old.data_binding() != current.data_binding()
+        }) {
+            return Err(NativeError::Foreign);
+        }
+        let next = record::update(
+            io,
+            &self.inventory,
+            &current,
+            step,
+            watermark.max(current.status_watermark()),
+            deadline,
+        )?;
+        *held = Some(next);
+        Ok(())
+    }
+
+    fn retire_record(&self, io: &MacNativeIo, deadline: &Deadline) -> NativeResult<()> {
+        let mut held = self.record.lock().map_err(|_| NativeError::Busy)?;
+        let current = record::load(io, &self.inventory, deadline)?.ok_or(NativeError::Foreign)?;
+        if held
+            .as_ref()
+            .is_none_or(|old| old.data_binding() != current.data_binding())
+        {
+            return Err(NativeError::Foreign);
+        }
+        record::retire(io, &self.inventory, &current, deadline)?;
+        *held = None;
+        Ok(())
+    }
+
+    /// Record the health-wait boundary hint. A new window reassesses; it never replays a step.
+    pub fn health_wait(&self, pending: &PendingRepair, deadline: &Deadline) -> NativeResult<()> {
+        self.check_pending(pending)?;
+        if pending.progress != RepairProgress::Published {
+            return Err(NativeError::Refused);
+        }
+        self.update_record(
+            &self.io,
+            RepairBoundary::HealthWait,
+            self.last_reply.0,
+            deadline,
+        )
+    }
+
+    /// Re-admitted observations determine the result, independently of the recorded boundary.
+    /// No stop, publication, bootstrap, backup deletion or reconstructed pending token occurs.
+    pub fn resume(
+        &mut self,
+        record: RepairRecord,
+        current: Option<(&SelectedAgent, &AgentReply)>,
+        deadline: &Deadline,
+    ) -> NativeResult<RepairReassessment> {
+        if self.attempted || self.active.is_some() {
+            return Err(NativeError::Refused);
+        }
+        if self
+            .record
+            .lock()
+            .map_err(|_| NativeError::Busy)?
+            .as_ref()
+            .is_none_or(|initial| initial.data_binding() != record.data_binding())
+        {
+            return Err(NativeError::Foreign);
+        }
+        record.check_current(&self.io, &self.inventory, deadline)?;
+        let payload = MacPayload::admit(self.io.clone(), self.inventory.clone(), deadline)?;
+        let verified = payload
+            .plan(1, 1, None, deadline)
+            .is_ok_and(|plan| plan.state() == PayloadState::Matching);
+        if !verified {
+            return Ok(RepairReassessment::RecoveryRetained);
+        }
+        if let Some((selected, reply)) = current {
+            self.advance_reply(selected, reply, deadline)?;
+            let health = status(reply)?.installer();
+            let mut features = health.build.features.clone();
+            features.sort();
+            let mut expected = self.inventory.features.clone();
+            expected.sort();
+            if selected.instance.bootstrap().phase != BootstrapPhase::Ready
+                || health.startup_recovery == StartupRecovery::Failed
+                || health.recovery_pending != 0
+                || health.keystore != KeyStoreProvenance::OsStore
+                || health.build.version != self.inventory.product_version
+                || features != expected
+            {
+                return Ok(RepairReassessment::RecoveryRetained);
+            }
+            // Read-only detection, not `plan_repair`: an interrupted repair's launch journal is
+            // never `Observed`, so only the owned receipt, the exact plist and the admitted
+            // running job are judged here. Nothing is planned for execution.
+            let owned = self
+                .launch
+                .plan(1, 1, current, deadline)
+                .is_ok_and(|plan| plan.state() == LaunchState::Owned);
+            if !owned {
+                return Ok(RepairReassessment::RecoveryRetained);
+            }
+            // Payload `Matching` already proves no previous app/ctl copy is left (an unfinished
+            // payload recovery is never `Matching`); the prior plist is kept by design.
+            *self.record.lock().map_err(|_| NativeError::Busy)? = Some(record);
+            return Ok(if self.retire_record(&selected.io, deadline).is_ok() {
+                RepairReassessment::CurrentInstallHealthy
+            } else {
+                RepairReassessment::CurrentInstallHealthyCleanupIncomplete
+            });
+        }
+        // A successfully read launch snapshot with no supplied agent is necessarily Job::Absent:
+        // the frozen planner rejects Running without a current admission and marks Unknown.
+        let stopped = self.launch.plan(1, 1, None, deadline).is_ok_and(|plan| {
+            matches!(
+                plan.state(),
+                LaunchState::Owned | LaunchState::Absent | LaunchState::AdoptionRequired
+            ) && !plan.interrupts_agent()
+        });
+        let plist = self
+            .io
+            .target()
+            .paths()
+            .home
+            .join("Library/LaunchAgents/io.frostdev.crosspane.agent.plist");
+        // An absent, unreadable or different plist is unverifiable, never an assessment error.
+        let rendered = render_plist(self.io.target()).ok();
+        if stopped
+            && rendered.is_some()
+            && self.io.read(&plist, 64 * 1024, false, deadline).ok() == rendered
+        {
+            Ok(RepairReassessment::AgentStopped)
+        } else {
+            Ok(RepairReassessment::RecoveryRetained)
+        }
     }
 }

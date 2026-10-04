@@ -2,6 +2,9 @@
 #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
 //! Explicit scratch roots, fake GUI/signature/process observations; no real native commands.
 use crosspane_installer::agent_contract;
+use crosspane_installer::{live, view};
+#[path = "../src/platform/macos/repair/test_native.rs"]
+mod native_binding;
 #[path = "../src/platform/macos/native_io.rs"]
 #[allow(dead_code, unused_imports)]
 mod native_io;
@@ -807,6 +810,7 @@ impl Fixture {
 
 #[derive(Default)]
 struct Behavior {
+    require_repair_record: bool,
     job_pid: u32,
     disabled: u8,
     bootstrap: u8,
@@ -917,6 +921,14 @@ impl Runner {
             "bootout" => {
                 assert_eq!(spec.args(), &["bootout", &service]);
                 assert!(spec.is_mutation());
+                if b.require_repair_record {
+                    let repair: Value = serde_json::from_slice(&read_owned(
+                        &home.join("Library/Application Support/Crosspane/Installer/repair.json"),
+                    ))
+                    .unwrap();
+                    assert_eq!(repair["step"], "before_stop");
+                    assert_eq!(repair["status_watermark"], 101);
+                }
                 let intent: Value = serde_json::from_slice(&read_owned(
                     &home.join("Library/Application Support/Crosspane/Installer/launch-agent.json"),
                 ))
@@ -1231,6 +1243,664 @@ fn full_reinstall_from_genuine_producer_receipts_replaces_app_ctl_and_plist() {
         RepairProgress::Verified
     );
     assert_owned_origins(&f);
+}
+#[test]
+fn durable_repair_record_precedes_the_first_stop_and_survives_the_window() {
+    let f = producer_fixture();
+    f.runner.behavior.lock().unwrap().require_repair_record = true;
+    let mut repair = repair_adapter(&f);
+    let plan = repair_plan(&f, &mut repair, 1, 2, 100);
+    let pending = apply_repair(&f, &mut repair, plan, 101);
+    drop(pending);
+    drop(repair);
+    let path = f.io.target().installer_dir().join("repair.json");
+    assert_eq!(owned_stat(&path).st_mode & 0o777, 0o600);
+    let value = record(&f, "repair.json");
+    assert_eq!(value["operation"], 2);
+    assert_eq!(value["step"], "applied");
+    assert_eq!(value["status_watermark"], 101);
+    assert!(!value["backups"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn verified_repair_retires_its_durable_record_only_after_fresh_health() {
+    let f = producer_fixture();
+    let mut repair = repair_adapter(&f);
+    let plan = repair_plan(&f, &mut repair, 1, 2, 100);
+    let mut pending = apply_repair(&f, &mut repair, plan, 101);
+    let path = f.io.target().installer_dir().join("repair.json");
+    assert!(f.io.metadata(&path).unwrap().is_some());
+    assert_eq!(
+        complete_repair(&f, &mut repair, &mut pending, 102).progress,
+        RepairProgress::Verified
+    );
+    assert!(f.io.metadata(&path).unwrap().is_none());
+}
+
+fn completed_with_saved_hint() -> (Fixture, Vec<u8>) {
+    let f = producer_fixture();
+    let mut repair = repair_adapter(&f);
+    let plan = repair_plan(&f, &mut repair, 1, 2, 100);
+    let mut pending = apply_repair(&f, &mut repair, plan, 101);
+    let saved = read_owned(&f.io.target().installer_dir().join("repair.json"));
+    assert_eq!(
+        complete_repair(&f, &mut repair, &mut pending, 102).progress,
+        RepairProgress::Verified
+    );
+    (f, saved)
+}
+
+#[test]
+fn fresh_window_reassesses_every_visible_boundary_without_replaying_any_change() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    let mutations = (f.runner.count("bootout"), f.runner.count("bootstrap"));
+    let inodes = [
+        f.io.target().app_path(),
+        f.home.join(".local/bin/crosspanectl"),
+        launch_plist(&f),
+    ]
+    .map(|path| owned_stat(&path).st_ino);
+    for step in [
+        "before_stop",
+        "stopped",
+        "applying",
+        "applied",
+        "health_wait",
+    ] {
+        let mut value: Value = serde_json::from_slice(&saved).unwrap();
+        value["step"] = json!(step);
+        bytes(&path, &serde_json::to_vec(&value).unwrap(), 0o600);
+        let saved = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.operation_id(), 2);
+        assert_eq!(saved.status_watermark(), 101);
+        assert_eq!(format!("{saved:?}"), "RepairRecord");
+        let mut fresh = repair_adapter(&f);
+        let (selected, reply) = current(&f, 103);
+        assert_eq!(
+            fresh
+                .resume(saved, Some((&selected, &reply)), &f.deadline())
+                .unwrap(),
+            RepairReassessment::CurrentInstallHealthy,
+            "{step}"
+        );
+        assert!(f.io.metadata(&path).unwrap().is_none());
+        assert_eq!(
+            (f.runner.count("bootout"), f.runner.count("bootstrap")),
+            mutations
+        );
+        assert_eq!(
+            [
+                f.io.target().app_path(),
+                f.home.join(".local/bin/crosspanectl"),
+                launch_plist(&f)
+            ]
+            .map(|path| owned_stat(&path).st_ino),
+            inodes
+        );
+    }
+}
+
+#[test]
+fn round_trip_keeps_plan_receipt_bindings_and_only_fixed_backup_hints() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    bytes(&path, &saved, 0o600);
+    let record = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.boundary(), RepairBoundary::Applied);
+    assert_eq!(record.operation_id(), 2);
+    assert_eq!(record.status_watermark(), 101);
+    assert_eq!(record.backups().len(), 3);
+    let value: Value = serde_json::from_slice(&saved).unwrap();
+    for field in [
+        "target",
+        "inventory",
+        "plan_fingerprint",
+        "payload_receipt",
+        "launch_receipt",
+    ] {
+        assert_eq!(value[field].as_array().unwrap().len(), 32);
+    }
+}
+
+#[test]
+fn corrupt_unreadable_foreign_or_unbounded_records_refuse_and_are_never_replaced() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    let mut variants = vec![b"not-json".to_vec(), vec![b' '; 64 * 1024 + 1]];
+    for field in [
+        "schema_version",
+        "operation",
+        "revision",
+        "target",
+        "inventory",
+        "step",
+        "backups",
+        "unexpected",
+    ] {
+        let mut value: Value = serde_json::from_slice(&saved).unwrap();
+        value[field] = match field {
+            "schema_version" => json!(2),
+            "operation" | "revision" => json!(0),
+            "target" | "inventory" => json!(vec![0; 32]),
+            "step" => json!("invented"),
+            "backups" => json!([f.root.join("unrelated")]),
+            _ => json!(true),
+        };
+        variants.push(serde_json::to_vec(&value).unwrap());
+    }
+    let mutations = (f.runner.count("bootout"), f.runner.count("bootstrap"));
+    for data in variants {
+        bytes(&path, &data, 0o600);
+        assert!(MacRepair::saved_record(&f.io, &inventory(), &f.deadline()).is_err());
+        assert!(
+            MacRepair::admit(
+                f.io.clone(),
+                inventory(),
+                Arc::new(ApprovalFixture(Approval::Allowed)),
+                &f.deadline()
+            )
+            .is_err()
+        );
+        assert_eq!(read_owned(&path), data);
+        assert_eq!(
+            (f.runner.count("bootout"), f.runner.count("bootstrap")),
+            mutations
+        );
+    }
+    bytes(&path, &saved, 0o400);
+    assert!(MacRepair::saved_record(&f.io, &inventory(), &f.deadline()).is_err());
+    chmod_owned(&path, 0o600);
+    let link = f.root.join("record-alias");
+    hardlink_owned(&path, &link);
+    assert!(MacRepair::saved_record(&f.io, &inventory(), &f.deadline()).is_err());
+    remove_owned(&link);
+    remove_owned(&path);
+    bytes(&link, &saved, 0o600);
+    symlink_owned(&link, &path);
+    assert!(MacRepair::saved_record(&f.io, &inventory(), &f.deadline()).is_err());
+    assert_eq!(
+        (f.runner.count("bootout"), f.runner.count("bootstrap")),
+        mutations
+    );
+}
+
+#[test]
+fn stopped_original_is_reassessed_without_minting_clean_stop_or_starting_it() {
+    let f = producer_fixture();
+    f.runner.behavior.lock().unwrap().bootout = 2; // Actual fake exit, missing clean receipt.
+    let running = f.runner.behavior.lock().unwrap().job_pid;
+    let mut original = repair_adapter(&f);
+    let plan = repair_plan(&f, &mut original, 1, 2, 100);
+    let pending = apply_repair(&f, &mut original, plan, 101);
+    assert_eq!(pending.progress(), RepairProgress::WaitingForCleanStop);
+    drop(pending);
+    drop(original);
+    let path = f.io.target().installer_dir().join("repair.json");
+    let saved = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.boundary(), RepairBoundary::Stopped);
+    let mutations = (f.runner.count("bootout"), f.runner.count("bootstrap"));
+    let mut fresh = repair_adapter(&f);
+    assert_eq!(
+        fresh.resume(saved, None, &f.deadline()).unwrap(),
+        RepairReassessment::AgentStopped
+    );
+    assert!(f.io.metadata(&path).unwrap().is_some());
+    assert_eq!(
+        (f.runner.count("bootout"), f.runner.count("bootstrap")),
+        mutations
+    );
+    assert!(
+        repair_adapter(&f).plan(1, 3, None, &f.deadline()).is_err(),
+        "stopped app still needs the unchanged live-original gate"
+    );
+    // Crosspane is started again (nothing was replaced). Its launch receipt is still the
+    // interrupted repair's unfinished intent, so a healthy answer alone never retires the record.
+    f.runner.behavior.lock().unwrap().job_pid = running;
+    f.runner.stopped.store(false, Ordering::Release);
+    let saved = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let (selected, reply) = current(&f, 103);
+    assert_eq!(
+        repair_adapter(&f)
+            .resume(saved, Some((&selected, &reply)), &f.deadline())
+            .unwrap(),
+        RepairReassessment::RecoveryRetained
+    );
+    assert!(f.io.metadata(&path).unwrap().is_some());
+    assert_eq!(
+        (f.runner.count("bootout"), f.runner.count("bootstrap")),
+        mutations
+    );
+}
+
+fn interrupted_after_publication(f: &Fixture) -> (Vec<u8>, Vec<PathBuf>) {
+    let mut repair = repair_adapter(f);
+    let plan = repair_plan(f, &mut repair, 1, 2, 100);
+    let pending = apply_repair(f, &mut repair, plan, 101);
+    assert_eq!(pending.progress(), RepairProgress::Published);
+    // The window dies during the health wait: no genuine pending token survives.
+    drop(pending);
+    drop(repair);
+    let path = f.io.target().installer_dir().join("repair.json");
+    let saved = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let backups = saved.backups().to_vec();
+    assert!(!backups.is_empty());
+    (read_owned(&path), backups)
+}
+
+#[test]
+fn interrupted_health_wait_stays_unverified_while_the_payload_receipt_is_unfinished() {
+    let f = producer_fixture();
+    let (original, backups) = interrupted_after_publication(&f);
+    let path = f.io.target().installer_dir().join("repair.json");
+    let saved = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let mutations = (f.runner.count("bootout"), f.runner.count("bootstrap"));
+    let (selected, reply) = current(&f, 103);
+    // A healthy answer alone never verifies: only the genuine pending token could have finished
+    // the payload receipt, so the record and every recovery copy stay.
+    assert_eq!(
+        repair_adapter(&f)
+            .resume(saved, Some((&selected, &reply)), &f.deadline())
+            .unwrap(),
+        RepairReassessment::RecoveryRetained
+    );
+    assert_eq!(read_owned(&path), original);
+    for backup in backups {
+        assert!(f.io.metadata(&backup).unwrap().is_some(), "{backup:?}");
+    }
+    assert_eq!(
+        (f.runner.count("bootout"), f.runner.count("bootstrap")),
+        mutations
+    );
+}
+
+#[test]
+fn a_running_job_that_did_not_answer_is_unverifiable_and_never_treated_as_stopped() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    bytes(&path, &saved, 0o600);
+    let record = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repair_adapter(&f)
+            .resume(record, None, &f.deadline())
+            .unwrap(),
+        RepairReassessment::RecoveryRetained
+    );
+    assert_eq!(read_owned(&path), saved);
+}
+
+#[test]
+fn partial_publication_and_unverified_health_keep_all_material_without_replay() {
+    let f = producer_fixture();
+    let (original, backups) = interrupted_after_publication(&f);
+    let path = f.io.target().installer_dir().join("repair.json");
+    let mutations = (f.runner.count("bootout"), f.runner.count("bootstrap"));
+    // A partially present payload is unverifiable even with a healthy answer.
+    remove_owned(&f.home.join(".local/bin/crosspanectl"));
+    let saved = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let (selected, reply) = current(&f, 103);
+    assert_eq!(
+        repair_adapter(&f)
+            .resume(saved, Some((&selected, &reply)), &f.deadline())
+            .unwrap(),
+        RepairReassessment::RecoveryRetained
+    );
+    assert_eq!(read_owned(&path), original);
+    for backup in backups {
+        assert!(f.io.metadata(&backup).unwrap().is_some());
+    }
+    assert_eq!(
+        (f.runner.count("bootout"), f.runner.count("bootstrap")),
+        mutations
+    );
+}
+
+#[test]
+fn an_earlier_record_blocks_a_new_apply_and_is_never_overwritten() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    bytes(&path, &saved, 0o600);
+    let identity = f.io.metadata(&path).unwrap();
+    let mutations = (f.runner.count("bootout"), f.runner.count("bootstrap"));
+    let mut repair = repair_adapter(&f);
+    let plan = repair_plan(&f, &mut repair, 1, 3, 103);
+    let consent = plan.consent(1, 3, true).unwrap();
+    let (selected, reply) = current(&f, 104);
+    assert_eq!(
+        repair
+            .apply(plan, consent, Some((&selected, &reply)), &f.deadline())
+            .unwrap_err(),
+        NativeError::Refused
+    );
+    assert_eq!(read_owned(&path), saved);
+    assert_eq!(f.io.metadata(&path).unwrap(), identity);
+    assert_eq!(
+        (f.runner.count("bootout"), f.runner.count("bootstrap")),
+        mutations
+    );
+}
+
+#[test]
+fn resumed_status_watermark_rejects_old_ids_and_records_failed_observation_reservations() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    bytes(&path, &saved, 0o600);
+    MacRepair::reserve_status(&f.io, &inventory(), 500, &f.deadline()).unwrap();
+    assert_eq!(
+        MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+            .unwrap()
+            .unwrap()
+            .status_watermark(),
+        500
+    );
+    assert!(MacRepair::reserve_status(&f.io, &inventory(), 500, &f.deadline()).is_err());
+    let mut fresh = repair_adapter(&f);
+    let record = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let (selected, old) = current(&f, 500);
+    assert_eq!(
+        fresh
+            .resume(record, Some((&selected, &old)), &f.deadline())
+            .unwrap_err(),
+        NativeError::Foreign
+    );
+    let mut fresh = repair_adapter(&f);
+    let record = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let (_, new) = current(&f, 501);
+    assert_eq!(
+        fresh
+            .resume(record, Some((&selected, &new)), &f.deadline())
+            .unwrap(),
+        RepairReassessment::CurrentInstallHealthy
+    );
+}
+
+#[test]
+fn record_flush_failure_before_stop_refuses_without_mutation() {
+    let f = producer_fixture();
+    let record = f.io.target().installer_dir().join("repair.json");
+    let io = f.hooked(Arc::new(move |stage, path, identity| {
+        if stage == "file-sync" && path == record {
+            Err(NativeError::Unavailable)
+        } else {
+            Ok(identity)
+        }
+    }));
+    let mut repair = repair_on(&f, io);
+    let plan = repair_plan(&f, &mut repair, 1, 2, 100);
+    let consent = plan.consent(1, 2, true).unwrap();
+    let (selected, reply) = current(&f, 101);
+    assert!(
+        repair
+            .apply(plan, consent, Some((&selected, &reply)), &f.deadline())
+            .is_err()
+    );
+    assert_eq!(f.runner.count("bootout"), 0);
+    assert_eq!(f.runner.count("bootstrap"), 1); // Original fixture install only.
+}
+
+#[test]
+fn post_dispatch_record_failure_keeps_the_genuine_pending_repair_and_the_pre_dispatch_hint() {
+    let f = producer_fixture();
+    let record = f.io.target().installer_dir().join("repair.json");
+    let writes = Arc::new(AtomicU64::new(0));
+    let count = writes.clone();
+    let io = f.hooked(Arc::new(move |stage, path, identity| {
+        if stage == "file-sync" && path == record && count.fetch_add(1, Ordering::Relaxed) > 0 {
+            Err(NativeError::Unavailable)
+        } else {
+            Ok(identity)
+        }
+    }));
+    let mut repair = repair_on(&f, io);
+    let plan = repair_plan(&f, &mut repair, 1, 2, 100);
+    let consent = plan.consent(1, 2, true).unwrap();
+    let (selected, reply) = current(&f, 101);
+    // The boundary after dispatch is only a hint: losing it never drops the same-window repair.
+    let pending = repair
+        .apply(plan, consent, Some((&selected, &reply)), &f.deadline())
+        .unwrap();
+    assert_eq!(pending.progress(), RepairProgress::Published);
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert!(
+        writes.load(Ordering::Relaxed) > 1,
+        "the post-dispatch update was attempted"
+    );
+    let hint = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    assert_eq!(hint.boundary(), RepairBoundary::BeforeStop);
+    assert!(
+        f.io.metadata(
+            &f.home
+                .join("Applications/.Crosspane.app.crosspane-previous")
+        )
+        .unwrap()
+        .is_some()
+    );
+}
+
+#[test]
+fn changed_record_and_different_context_do_not_resume_or_delete_anything() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    bytes(&path, &saved, 0o600);
+    let captured = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let mut fresh = repair_adapter(&f);
+    change_record(&f, "repair.json", |value| value["operation"] = json!(99));
+    let changed = read_owned(&path);
+    let (selected, reply) = current(&f, 103);
+    assert_eq!(
+        fresh
+            .resume(captured, Some((&selected, &reply)), &f.deadline())
+            .unwrap_err(),
+        NativeError::Foreign
+    );
+    assert_eq!(read_owned(&path), changed);
+    bytes(&path, &saved, 0o600);
+    let captured = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let other = producer_fixture();
+    assert_eq!(
+        repair_adapter(&other)
+            .resume(captured, None, &other.deadline())
+            .unwrap_err(),
+        NativeError::Foreign
+    );
+    assert_eq!(read_owned(&path), saved);
+    assert_eq!(other.runner.count("bootout"), 0);
+}
+
+#[test]
+fn fallback_identity_recovery_pending_and_incompatible_health_never_retire_saved_record() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    let (selected, _) = current(&f, 103);
+    for mutation in [
+        "keystore",
+        "recovery_pending",
+        "startup_recovery",
+        "version",
+        "features",
+    ] {
+        bytes(&path, &saved, 0o600);
+        let mut value = f.status(selected.instance.bootstrap().instance_id);
+        let health = &mut value["result"]["installer"];
+        match mutation {
+            "keystore" => health["keystore"] = json!("file"),
+            "recovery_pending" => health["recovery_pending"] = json!(1),
+            "startup_recovery" => health["startup_recovery"] = json!("failed"),
+            "version" => health["build"]["version"] = json!("different-version"),
+            "features" => health["build"]["features"] = json!([]),
+            _ => unreachable!(),
+        }
+        let reply = f.reply(&value, 103);
+        let record = MacRepair::saved_record(&f.io, &inventory(), &f.deadline())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repair_adapter(&f)
+                .resume(record, Some((&selected, &reply)), &f.deadline())
+                .unwrap(),
+            RepairReassessment::RecoveryRetained,
+            "{mutation}"
+        );
+        assert_eq!(read_owned(&path), saved);
+    }
+}
+
+#[test]
+fn healthy_current_install_reports_failed_record_retirement_without_claiming_a_new_repair() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    bytes(&path, &saved, 0o600);
+    let target = path.clone();
+    let io = f.hooked(Arc::new(move |stage, path, identity| {
+        if stage == "quarantine" && path == target {
+            Err(NativeError::Unavailable)
+        } else {
+            Ok(identity)
+        }
+    }));
+    let record = MacRepair::saved_record(&io, &inventory(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let (_, reply) = current(&f, 103);
+    // Retirement uses the fresh selected I/O, so that context must carry the same injected failure.
+    let selected = f.selected_on(io.clone());
+    let mut repair = repair_on(&f, io);
+    assert_eq!(
+        repair
+            .resume(record, Some((&selected, &reply)), &f.deadline())
+            .unwrap(),
+        RepairReassessment::CurrentInstallHealthyCleanupIncomplete
+    );
+    assert_eq!(read_owned(&path), saved);
+}
+
+#[test]
+fn removal_classifies_only_a_strict_record_and_keeps_existing_clean_and_consent_gates() {
+    let (f, saved) = completed_with_saved_hint();
+    let path = f.io.target().installer_dir().join("repair.json");
+    let observe = || {
+        removal::MacRemovalObserver::admit(
+            f.io.clone(),
+            inventory(),
+            f.source.join("Crosspane.app/Contents/Resources/audio"),
+            f.clock.clone(),
+            &f.deadline(),
+        )
+        .unwrap()
+    };
+    bytes(&path, &saved, 0o600);
+    let mut removal = removal::MacRemoval::new(observe());
+    let plan = removal
+        .plan(
+            1,
+            crosspane_installer_core::OperationId(3),
+            removal::RemovalChoices {
+                delete_identity: false,
+                remove_driver: false,
+            },
+            Some(current(&f, 103)),
+            &f.deadline(),
+        )
+        .unwrap();
+    assert_eq!(
+        plan.preview()
+            .deltas
+            .iter()
+            .find(|row| row.resource == "mac.repair-record")
+            .unwrap()
+            .effect,
+        removal::RemovalEffect::RemoveOwnedAfterVerification
+    );
+    assert_eq!(
+        read_owned(&path),
+        saved,
+        "a preview is never deletion authority"
+    );
+    drop(plan);
+    drop(removal);
+    f.runner.behavior.lock().unwrap().job_pid = 0;
+    f.runner.stopped.store(true, Ordering::Release);
+    let mut removal = removal::MacRemoval::new(observe());
+    let plan = removal
+        .plan(
+            1,
+            crosspane_installer_core::OperationId(3),
+            removal::RemovalChoices {
+                delete_identity: false,
+                remove_driver: false,
+            },
+            None,
+            &f.deadline(),
+        )
+        .unwrap();
+    assert_eq!(
+        plan.preview()
+            .deltas
+            .iter()
+            .find(|row| row.resource == "mac.repair-record")
+            .unwrap()
+            .effect,
+        removal::RemovalEffect::KeepRecovery
+    );
+    drop(plan);
+    drop(removal);
+    bytes(&path, b"corrupt", 0o600);
+    let mut removal = removal::MacRemoval::new(observe());
+    let plan = removal
+        .plan(
+            1,
+            crosspane_installer_core::OperationId(3),
+            removal::RemovalChoices {
+                delete_identity: false,
+                remove_driver: false,
+            },
+            None,
+            &f.deadline(),
+        )
+        .unwrap();
+    assert!(
+        !plan
+            .preview()
+            .deltas
+            .iter()
+            .any(|row| row.resource == "mac.repair-record")
+    );
+    assert_eq!(
+        plan.preview()
+            .deltas
+            .iter()
+            .find(|row| row.path.as_ref() == Some(&path))
+            .unwrap()
+            .effect,
+        removal::RemovalEffect::KeepRecovery
+    );
+    assert_eq!(read_owned(&path), b"corrupt");
 }
 #[test]
 fn missing_owned_ctl_ui_and_data_are_recreated_by_full_reinstall() {

@@ -699,6 +699,19 @@ impl Sources {
         ] {
             rows.push(resource(&self.io, id.into(), path, None, None, deadline));
         }
+        // A strictly validated repair hint is this one owned bookkeeping leaf, never authority.
+        // Corrupt/foreign records fall through to the unchanged recovery-retention policy.
+        if let Ok(Some((path, identity, sha256))) =
+            super::repair::removal_hint(&self.io, &self.approved, deadline)
+        {
+            rows.push(UserResource {
+                id: "mac.repair-record".into(),
+                path,
+                state: ResourceState::Owned,
+                identity: Some(identity),
+                sha256: Some(sha256),
+            });
+        }
         // Include exact recovery records and every bounded unknown installer/launch remnant.
         for (id, root) in [
             ("keep.installer-entry", self.io.target().installer_dir()),

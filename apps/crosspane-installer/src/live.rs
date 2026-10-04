@@ -248,6 +248,9 @@ pub enum RepairOutcome {
     OutcomeUnknown,
     /// A change was attempted and could not be completed. Backups and recovery files are kept.
     RecoveryRetained,
+    /// Reopening checked current verified receipts and fresh health, without attributing them
+    /// to a new instance or reconstructing the interrupted repair's individual effects.
+    CheckedAfterEarlierRepair,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -1259,6 +1259,9 @@ mod payload;
 #[path = "../src/platform/macos/removal.rs"]
 #[allow(dead_code, unused_imports)]
 mod removal;
+#[path = "../src/platform/macos/repair.rs"]
+#[allow(dead_code, unused_imports)]
+mod repair;
 #[path = "../src/platform/macos/transport.rs"]
 #[allow(dead_code, unused_imports)]
 mod transport;

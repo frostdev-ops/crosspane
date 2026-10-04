@@ -789,7 +789,7 @@ impl Worker {
                     repair: repair.repair,
                     choices: offer.choices,
                 });
-                // A repair that is still unfinished in this window is offered for resume.
+                // In-memory continuation and persisted read-only reassessment share this offer.
                 if let Some(lines) = repair.resumable {
                     self.maint(MaintenanceReport::RepairResumable { id, lines });
                 }

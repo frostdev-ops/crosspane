@@ -40,7 +40,7 @@ use super::super::removal::{
 };
 use super::super::repair::{
     MacRepair, PendingRepair, RepairActivity, RepairEffect, RepairGuidance, RepairPreview,
-    RepairProgress, plan_guidance,
+    RepairProgress, RepairReassessment, plan_guidance,
 };
 use super::super::transport::{CallerClock, MacAgentPort, SelectedAgent, SelectedLink};
 use super::domains::{
@@ -1184,6 +1184,15 @@ impl NativeRepairer {
 
     fn admit(&self, deadline: &Deadline) -> Result<MacRepair, String> {
         let io = self.env.io().map_err(admission_text)?;
+        if let Some(record) = MacRepair::saved_record(&io, &self.env.inventory, deadline)
+            .map_err(|_| unreadable_record_text())?
+        {
+            let next = record
+                .status_watermark()
+                .checked_add(1)
+                .ok_or_else(|| admission_text(NativeError::IdExhausted))?;
+            self.ids.fetch_max(next, Ordering::Relaxed);
+        }
         MacRepair::admit(
             io,
             self.env.inventory.clone(),
@@ -1199,19 +1208,67 @@ impl NativeRepairer {
         status: Option<&AgentReply>,
         deadline: &Deadline,
     ) -> Option<(SelectedAgent, AgentReply)> {
+        let floor = self
+            .env
+            .io()
+            .ok()
+            .and_then(|io| {
+                MacRepair::saved_record(&io, &self.env.inventory, deadline)
+                    .ok()
+                    .flatten()
+            })
+            .map_or(0, |record| record.status_watermark());
         match status.filter(|r| {
-            matches!(
-                r.result,
-                Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
-            )
+            r.id > floor
+                && matches!(
+                    r.result,
+                    Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+                )
         }) {
             Some(reply) => {
                 let selected = admit_selected(&self.env, None, deadline).ok()?;
                 Some((selected, reply.clone()))
             }
-            None => read_status(&self.env, &self.ids, deadline).ok(),
+            None => self.read_current(deadline).ok(),
         }
     }
+
+    /// A persisted record (or one that can't be read) blocks a new plan or apply: it is
+    /// reassessed through Resume, never overwritten by a stale or replayed request.
+    fn no_saved_record(&self, deadline: &Deadline) -> Result<(), String> {
+        let io = self.env.io().map_err(admission_text)?;
+        match MacRepair::saved_record(&io, &self.env.inventory, deadline) {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(unfinished_text()),
+            Err(_) => Err(unreadable_record_text()),
+        }
+    }
+
+    fn read_current(&self, deadline: &Deadline) -> NativeResult<(SelectedAgent, AgentReply)> {
+        let io = self.env.io()?;
+        if let Some(record) = MacRepair::saved_record(&io, &self.env.inventory, deadline)? {
+            self.ids.fetch_max(
+                record
+                    .status_watermark()
+                    .checked_add(1)
+                    .ok_or(NativeError::IdExhausted)?,
+                Ordering::Relaxed,
+            );
+        }
+        let id = self
+            .ids
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| NativeError::IdExhausted)?;
+        MacRepair::reserve_status(&io, &self.env.inventory, id, deadline)?;
+        // Allocate once from the adapter counter; the generic reader consumes this one reserved id.
+        read_status(&self.env, &AtomicU64::new(id), deadline)
+    }
+}
+
+fn unreadable_record_text() -> String {
+    "The earlier repair record can't be read safely. Nothing was retried; removal and reinstall \
+     remain available."
+        .to_owned()
 }
 
 fn admission_text(error: NativeError) -> String {
@@ -1281,7 +1338,7 @@ fn render_repair(preview: &RepairPreview) -> String {
 }
 
 fn unfinished_text() -> String {
-    "A repair is still unfinished in this window. Resume it first. Nothing was changed.".to_owned()
+    "A repair is still unfinished. Resume checks it before anything is retried.".to_owned()
 }
 
 fn unknown_finish(detail: &str, resumable: bool) -> RepairFinish {
@@ -1370,8 +1427,9 @@ fn health_finish(progress: RepairProgress, pending: &PendingRepair) -> RepairFin
 }
 
 impl NativeRepairer {
-    /// A Mac repair is never closeable while it waits: its pending state lives only in this
-    /// window (nothing on disk resumes it), and the old agent may already be stopped.
+    /// A Mac repair is never closeable while it waits. The private record lets a new window
+    /// reassess, but only this window's genuine pending token can verify the new payload, so a
+    /// closed wait would end as "remove, then install" even when the new instance is healthy.
     fn waiting(&self, detail: &str, if_timed_out: RepairFinish) -> RepairStep {
         RepairStep::Waiting {
             detail: detail.to_owned(),
@@ -1427,6 +1485,15 @@ impl Repairer for NativeRepairer {
             Ok(repair) => repair,
             Err(text) => return unavailable(text),
         };
+        // Discovery is read-only: a saved boundary is an offer to reassess, never a replay plan.
+        match self.env.io().and_then(|io| MacRepair::saved_record(&io, &self.env.inventory, deadline)) {
+            Ok(Some(_)) => return RepairOffer {
+                repair: Availability::Unavailable(unfinished_text()),
+                resumable: Some(vec!["Its private repair record was kept on this Mac. Here Resume only checks the installed files and the running Crosspane; it never continues the earlier repair's steps.".to_owned()]),
+            },
+            Err(_) => return unavailable(unreadable_record_text()),
+            Ok(None) => {}
+        }
         // Repair needs the running agent: it is read now, and judged by the coordinator's plan.
         let current = read_status(&self.env, &self.ids, deadline).ok();
         let current_ref = current.as_ref().map(|(agent, reply)| (agent, reply));
@@ -1450,6 +1517,7 @@ impl Repairer for NativeRepairer {
             return Err(unfinished_text());
         }
         let mut repair = self.admit(deadline)?;
+        self.no_saved_record(deadline)?;
         let current = self.current(status, deadline);
         let current_ref = current.as_ref().map(|(agent, reply)| (agent, reply));
         let plan = repair
@@ -1487,6 +1555,7 @@ impl Repairer for NativeRepairer {
         // A preview's evidence lives seconds and a person takes longer to read it, so everything
         // is observed again now and the repair starts only if it still previews what was shown.
         let mut repair = self.admit(deadline)?;
+        self.no_saved_record(deadline)?;
         let not_answering = || {
             "Crosspane's running agent didn't answer just now, so the repair can't start. Nothing \
              was changed. Review the repair again."
@@ -1515,15 +1584,16 @@ impl Repairer for NativeRepairer {
             .consent(operation.0, operation.0, true)
             .map_err(guidance_text)?;
         // The apply takes a Status newer than the one the plan used: read the next one now.
-        let (selected, reply) =
-            read_status(&self.env, &self.ids, deadline).map_err(|_| not_answering())?;
+        let (selected, reply) = self.read_current(deadline).map_err(|_| not_answering())?;
         let mut pending = match repair.apply(fresh, consent, Some((&selected, &reply)), deadline) {
             Ok(pending) => pending,
             // A call that ran out of time may have dispatched: it is never assumed unchanged.
             Err(NativeError::Timeout | NativeError::Cancelled | NativeError::OutcomeUnknown) => {
+                // A surviving private record can be reassessed by Resume (never replayed).
+                let saved = self.no_saved_record(deadline).is_err();
                 return Ok(RepairStep::Finished(unknown_finish(
                     "The repair was cut short, and what it did can't be proved.",
-                    false,
+                    saved,
                 )));
             }
             // Stale or foreign events are refused before any probe, command or file change.
@@ -1555,6 +1625,8 @@ impl Repairer for NativeRepairer {
                 Ok(step)
             }
             RepairProgress::Published => {
+                // The boundary is only a hint; the genuine pending token continues either way.
+                let _ = repair.health_wait(&pending, deadline);
                 let step = self.wait_for_health();
                 self.running = Some(ActiveRepair { repair, pending });
                 Ok(step)
@@ -1594,15 +1666,13 @@ impl Repairer for NativeRepairer {
         }
         // The new instance is judged from a Status read now, newer than every earlier receipt.
         // The controller's own call ids sit below the coordinator's watermark, so they are not used.
-        let looked = read_status(&self.env, &self.ids, deadline)
-            .ok()
-            .and_then(|(agent, reply)| {
-                active
-                    .repair
-                    .expect_health(&mut active.pending, reply.id)
-                    .ok()?;
-                Some((agent, reply))
-            });
+        let looked = self.read_current(deadline).ok().and_then(|(agent, reply)| {
+            active
+                .repair
+                .expect_health(&mut active.pending, reply.id)
+                .ok()?;
+            Some((agent, reply))
+        });
         let Some((selected, reply)) = looked else {
             let step = self.wait_for_health();
             self.running = Some(active);
@@ -1630,12 +1700,45 @@ impl Repairer for NativeRepairer {
         deadline: &Deadline,
     ) -> Result<RepairFinish, String> {
         if self.running.is_none() {
-            return Err(
-                "There is no earlier repair to resume in this window. Closing and \
-                        reopening setup checks the install again; removing Crosspane and \
-                        installing it again is always available. Nothing was changed."
-                    .to_owned(),
-            );
+            let mut repair = self.admit(deadline)?;
+            let io = self.env.io().map_err(admission_text)?;
+            if MacRepair::saved_record(&io, &self.env.inventory, deadline)
+                .map_err(admission_text)?
+                .is_none()
+            {
+                return Err(
+                    "There is no earlier repair record to reassess. Nothing was changed."
+                        .to_owned(),
+                );
+            }
+            let current = self.read_current(deadline).ok();
+            let io = self.env.io().map_err(admission_text)?;
+            let record = MacRepair::saved_record(&io, &self.env.inventory, deadline)
+                .map_err(admission_text)?
+                .ok_or_else(unfinished_text)?;
+            let result = repair.resume(record, current.as_ref().map(|(agent, reply)| (agent, reply)), deadline).map_err(|_| "The earlier repair couldn't be assessed safely. Recovery material was kept; nothing was retried.".to_owned())?;
+            return Ok(match result {
+                RepairReassessment::CurrentInstallHealthy => RepairFinish {
+                    outcome: Shown::CheckedAfterEarlierRepair,
+                    lines: vec!["The installed files match verified receipts and the running Crosspane reports healthy. The earlier repair record was cleared after these checks.".to_owned()],
+                    resumable: false,
+                },
+                RepairReassessment::CurrentInstallHealthyCleanupIncomplete => RepairFinish {
+                    outcome: Shown::CheckedAfterEarlierRepair,
+                    lines: vec!["The installed files match verified receipts and the running Crosspane reports healthy, but the earlier repair record couldn't be cleared. No repair step was repeated.".to_owned()],
+                    resumable: false,
+                },
+                RepairReassessment::AgentStopped => RepairFinish {
+                    outcome: Shown::RecoveryRetained,
+                    lines: vec!["Crosspane's installed files still match their verified receipts, but Crosspane didn't answer and its launch agent isn't loaded. Start Crosspane from Applications, or sign out and in, to run it again. The earlier repair can't be confirmed from here: to clear it, remove Crosspane (keeping identity by default) and install it again. The repair record and recovery files were kept.".to_owned()],
+                    resumable: true,
+                },
+                RepairReassessment::RecoveryRetained => RepairFinish {
+                    outcome: Shown::RecoveryRetained,
+                    lines: vec!["Crosspane couldn't be verified as installed and healthy after the earlier repair. Nothing was retried; recovery files and the repair record were kept. Remove Crosspane, keeping identity by default, then install it again.".to_owned()],
+                    resumable: true,
+                },
+            });
         }
         Ok(match self.verify(status, deadline) {
             RepairStep::Finished(finish) => finish,

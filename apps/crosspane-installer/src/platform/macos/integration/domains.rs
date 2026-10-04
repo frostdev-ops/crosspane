@@ -181,7 +181,7 @@ pub struct RepairOffer {
     /// `Available` only when the producer's admission and plan say the install is compatible;
     /// otherwise the typed guidance (for example "uninstall, then install").
     pub repair: Availability,
-    /// A repair that is still unfinished in this window and can be resumed, as lines.
+    /// An in-memory repair or a strictly read persisted record that can be checked, as lines.
     pub resumable: Option<Vec<String>>,
 }
 
@@ -236,7 +236,8 @@ pub trait Repairer: Send {
     ) -> Result<RepairStep, String>;
     /// Look again for the new instance's health.
     fn verify(&mut self, status: Option<&AgentReply>, deadline: &Deadline) -> RepairStep;
-    /// Resume a repair that is still unfinished in this window; one attempt, never a replay.
+    /// Continue a genuine in-memory repair, or reassess a persisted record in a new window.
+    /// A persisted hint never authorizes replaying a mutation or reconstructing a clean proof.
     fn resume(
         &mut self,
         status: Option<&AgentReply>,
