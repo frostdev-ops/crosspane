@@ -251,10 +251,22 @@ impl Fixture {
             .unwrap();
     }
     fn tracked(&self) -> Arc<TrackedAgent> {
-        Arc::new(
-            TrackedAgent::scratch_capture(self.io.clone(), self.probe.clone(), &deadline())
-                .unwrap(),
-        )
+        self.tracked_with(self.probe.clone())
+    }
+    fn tracked_with(&self, reader: Arc<dyn ExitReader>) -> Arc<TrackedAgent> {
+        let deadline = deadline();
+        loop {
+            match TrackedAgent::scratch_capture(self.io.clone(), reader.clone(), &deadline) {
+                Ok(tracked) => return Arc::new(tracked),
+                // Read-only fixture acquisition can race the previous worker's slot release.
+                // Retry only Busy under this same deadline; mutations are never retried.
+                Err(RemovalError::Native(NativeError::Busy)) => {
+                    deadline.check().unwrap();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("fixture capture failed: {error:?}"),
+            }
+        }
     }
     fn planner(&self) -> RemovalPlanner {
         let mut planner = RemovalPlanner::new(self.io.clone());
@@ -525,10 +537,18 @@ mod uninstall_tests {
             RuleKind::Mdns,
             admitted,
             OperationId(101),
-            &Deadline::new(50, Cancellation::default()).unwrap(),
+            // Allow intent preparation to finish; the injected read stall consumes the budget.
+            &Deadline::new(2000, Cancellation::default()).unwrap(),
         );
         f.auth.detect_stall.store(false, Ordering::Release);
-        assert!(result.is_err());
+        assert!(f.auth.detect_entered.load(Ordering::Acquire));
+        assert!(f.auth.detect_expired.load(Ordering::Acquire));
+        assert!(matches!(
+            result,
+            Err(UninstallError::Firewall(FirewallError::Native(
+                NativeError::Timeout
+            )))
+        ));
         assert_eq!(run.stage(), UninstallStage::Stop);
         assert_eq!(run.report().progress.mdns, CleanupResult::Unknown);
         let path =
@@ -539,7 +559,7 @@ mod uninstall_tests {
         let record =
             CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
         assert_eq!(record.progress.mdns, CleanupResult::Pending);
-        finish(&f, &mut run);
+        finish_clean(&f, &mut run);
         let record =
             CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
         assert_eq!(record.progress.mdns, CleanupResult::Unknown);
@@ -566,6 +586,7 @@ mod uninstall_tests {
             run.disable(&deadline()).unwrap();
             run.stop(&deadline()).unwrap();
             run.observe_exit(&deadline()).unwrap();
+            assert_clean_prerequisite(&run);
             run.identity([0; 32], f.environment(), &deadline()).unwrap();
             let path =
                 f.io.target()
@@ -668,6 +689,7 @@ mod uninstall_tests {
         run.disable(&deadline()).unwrap();
         run.stop(&deadline()).unwrap();
         run.observe_exit(&deadline()).unwrap();
+        assert_clean_prerequisite(&run);
         {
             let mut manager = f.runner.manager.lock().unwrap();
             let properties = &mut manager.as_mut().unwrap().properties;
@@ -730,7 +752,9 @@ mod uninstall_tests {
         run.disable(&deadline()).unwrap();
         run.stop(&deadline()).unwrap();
         run.observe_exit(&deadline()).unwrap();
+        assert_clean_prerequisite(&run);
         run.identity([0; 32], f.environment(), &deadline()).unwrap();
+        let prerequisite = run.report();
         let before = PayloadInstaller::new(f.io.clone())
             .unwrap()
             .targets()
@@ -743,7 +767,29 @@ mod uninstall_tests {
             })
             .collect::<Vec<_>>();
         f.bootstrap(10);
-        assert!(run.remove_files(&deadline()).is_err());
+        let result = run.remove_files(&deadline());
+        let changed = before
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (path, bytes))| {
+                (f.io.read(path, 4 * 1024 * 1024, false).ok().as_ref() != Some(bytes))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            result.is_err(),
+            "result={result:?}; prerequisite stop={:?}; clean Busy={}; stop Busy={}; changed members={changed:?}; erases={}",
+            prerequisite.progress.stop,
+            prerequisite.issues.iter().any(|issue| matches!(
+                issue,
+                UninstallIssue::CleanExit(RemovalError::Native(NativeError::Busy))
+            )),
+            prerequisite.issues.iter().any(|issue| matches!(
+                issue,
+                UninstallIssue::Stop(RemovalError::Native(NativeError::Busy))
+            )),
+            f.erase_count(),
+        );
         assert_eq!(run.report().form, UninstallForm::NotClean);
         for (path, bytes) in before {
             assert_eq!(f.io.read(&path, 4 * 1024 * 1024, false).unwrap(), bytes);
@@ -765,6 +811,7 @@ mod uninstall_tests {
             run.disable(&deadline()).unwrap();
             run.stop(&deadline()).unwrap();
             run.observe_exit(&deadline()).unwrap();
+            assert_clean_prerequisite(&run);
             let other = Fixture::new(false);
             let hash = if wrong_environment {
                 sha256(&f.io.read(&f.io.target().agent_path(), 4096, false).unwrap())
@@ -852,10 +899,20 @@ mod uninstall_tests {
                 &mut ctx,
                 plan,
                 consent,
-                &Deadline::new(100, Cancellation::default()).unwrap()
+                &Deadline::new(2000, Cancellation::default()).unwrap()
             )
             .is_ok()
         );
+        // Caller timeout precedes retained-worker termination/reaping. Observe completion,
+        // rather than racing its cleanup or releasing the injected child stall early.
+        let cleanup = deadline();
+        while !f.auth.apply_finished.load(Ordering::Acquire) {
+            cleanup.check().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        f.auth.stall.store(false, Ordering::Release);
+        assert!(f.auth.apply_entered.load(Ordering::Acquire));
+        assert!(f.auth.apply_expired.load(Ordering::Acquire));
         let path =
             f.io.target()
                 .paths()
@@ -867,7 +924,7 @@ mod uninstall_tests {
         assert_eq!(durable.progress.mdns, CleanupResult::Pending);
         assert_eq!(old.stage(), UninstallStage::Stop);
         assert_eq!(old.report().progress.mdns, CleanupResult::Unknown);
-        finish(&f, &mut old);
+        finish_clean(&f, &mut old);
         let durable =
             CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
         assert_eq!(durable.progress.mdns, CleanupResult::Unknown);
@@ -899,6 +956,7 @@ mod uninstall_tests {
             }
             if cut >= 3 {
                 old.observe_exit(&deadline()).unwrap();
+                assert_clean_prerequisite(&old);
                 old.identity([0; 32], f.environment(), &deadline()).unwrap();
             }
             drop(old);
@@ -952,6 +1010,7 @@ mod uninstall_tests {
         run.disable(&deadline()).unwrap();
         run.stop(&deadline()).unwrap();
         run.observe_exit(&deadline()).unwrap();
+        assert_clean_prerequisite(&run);
         let gate = lease_dispatch_tests::Gate::new();
         let _release = Release(gate.clone());
         *f.runner.erase_gate.lock().unwrap() = Some(gate.clone());
@@ -1022,7 +1081,7 @@ mod uninstall_tests {
         );
         *f.runner.output.lock().unwrap()=Ok((Some(0),br#"{"schema_version":1,"result":"already_absent","reason":null,"key":"absent","trust":"absent"}"#.to_vec(),vec![]));
         run.disable(&deadline()).unwrap();
-        finish(&f, &mut run);
+        finish_clean(&f, &mut run);
         assert_eq!(run.report().form, UninstallForm::Complete);
         assert_eq!(f.erase_count(), 1);
         assert!(run.identity([0; 32], f.environment(), &deadline()).is_err());
@@ -1209,6 +1268,11 @@ mod uninstall_tests {
         unknown: AtomicBool,
         stall: AtomicBool,
         detect_stall: AtomicBool,
+        detect_entered: AtomicBool,
+        detect_expired: AtomicBool,
+        apply_entered: AtomicBool,
+        apply_expired: AtomicBool,
+        apply_finished: AtomicBool,
         trace: Mutex<Vec<String>>,
         reads: AtomicU64,
     }
@@ -1217,6 +1281,12 @@ mod uninstall_tests {
         auth: Arc<Auth>,
         outcome: Option<PkexecOutcome>,
         kind: usize,
+        deadline: Deadline,
+    }
+    impl Drop for AuthChild {
+        fn drop(&mut self) {
+            self.auth.apply_finished.store(true, Ordering::Release);
+        }
     }
     impl PkexecRunner for AuthRunner {
         fn spawn(
@@ -1257,12 +1327,14 @@ mod uninstall_tests {
                 auth: self.0.clone(),
                 outcome: Some(outcome),
                 kind,
+                deadline: d.clone(),
             }))
         }
     }
     impl PkexecChild for AuthChild {
         fn poll(&mut self) -> Result<Option<PkexecOutcome>, NativeError> {
             if self.auth.stall.load(Ordering::Acquire) {
+                self.auth.apply_entered.store(true, Ordering::Release);
                 return Ok(None);
             }
             if matches!(&self.outcome, Some(PkexecOutcome::Exited { code: 0, .. })) {
@@ -1271,6 +1343,10 @@ mod uninstall_tests {
             Ok(self.outcome.take())
         }
         fn terminate(&mut self) {
+            self.auth.apply_expired.store(
+                self.deadline.check() == Err(NativeError::Timeout),
+                Ordering::Release,
+            );
             self.auth.trace.lock().unwrap().push("terminate".into());
             self.outcome = None;
         }
@@ -1281,8 +1357,16 @@ mod uninstall_tests {
     struct RuleReads(Arc<Auth>);
     impl FirewallReader for RuleReads {
         fn file(&self, r: SystemRead, d: &Deadline) -> Result<Vec<u8>, NativeError> {
+            if self.0.detect_stall.load(Ordering::Acquire) {
+                self.0.detect_entered.store(true, Ordering::Release);
+            }
             while self.0.detect_stall.load(Ordering::Acquire) {
-                d.check()?;
+                if let Err(error) = d.check() {
+                    self.0
+                        .detect_expired
+                        .store(error == NativeError::Timeout, Ordering::Release);
+                    return Err(error);
+                }
                 thread::sleep(Duration::from_millis(1));
             }
             d.check()?;
@@ -1475,7 +1559,7 @@ mod uninstall_tests {
             ["current", "ufw", "current", "ufw"]
         );
         assert!(f.probe.0.lock().unwrap().as_ref().unwrap().is_some());
-        finish(&f, &mut run);
+        finish_clean(&f, &mut run);
         assert_eq!(run.report().form, UninstallForm::Complete);
         assert_eq!(run.report().progress.lan, CleanupResult::AlreadyAbsent);
         assert_eq!(run.report().progress.mdns, CleanupResult::AlreadyAbsent);
@@ -1524,7 +1608,7 @@ mod uninstall_tests {
             CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
         assert_eq!(durable.progress.mdns, CleanupResult::Unknown);
         assert_eq!(run.stage(), UninstallStage::Stop);
-        finish(&f, &mut run);
+        finish_clean(&f, &mut run);
         assert_eq!(run.report().form, UninstallForm::NotClean);
         assert!(run.report().issues.iter().any(|i| matches!(
             i,
@@ -1665,7 +1749,7 @@ mod uninstall_tests {
             );
             *f.runner.output.lock().unwrap() = Ok((Some(0), bytes.as_bytes().to_vec(), vec![]));
             run.disable(&deadline()).unwrap();
-            finish(&f, &mut run);
+            finish_clean(&f, &mut run);
             assert_eq!(f.erase_count(), 1);
             assert_eq!(run.report().progress.identity, CleanupResult::Refused);
             assert_eq!(run.report().form, UninstallForm::NotClean);
@@ -1698,6 +1782,7 @@ mod uninstall_tests {
             run.disable(&deadline()).unwrap();
             run.stop(&deadline()).unwrap();
             run.observe_exit(&deadline()).unwrap();
+            assert_clean_prerequisite(&run);
             let hash = sha256(&f.io.read(&f.io.target().agent_path(), 4096, false).unwrap());
             assert!(run.identity(hash, f.environment(), &deadline()).is_err());
             assert!(run.identity(hash, f.environment(), &deadline()).is_err());
@@ -1725,6 +1810,7 @@ mod uninstall_tests {
         old.disable(&deadline()).unwrap();
         old.stop(&deadline()).unwrap();
         old.observe_exit(&deadline()).unwrap();
+        assert_clean_prerequisite(&old);
         drop(old);
         let service = Arc::new(f.service(&package()));
         let (plan, consent) = planned(
@@ -2118,6 +2204,40 @@ mod uninstall_tests {
     fn finish(f: &Fixture, run: &mut UninstallRun) {
         run.stop(&deadline()).unwrap();
         run.observe_exit(&deadline()).unwrap();
+        finish_files(f, run);
+    }
+    fn finish_clean(f: &Fixture, run: &mut UninstallRun) {
+        run.stop(&deadline()).unwrap();
+        run.observe_exit(&deadline()).unwrap();
+        assert_clean_prerequisite(run);
+        finish_files(f, run);
+    }
+    fn assert_clean_prerequisite(run: &UninstallRun) {
+        let report = run.report();
+        let failures = report
+            .issues
+            .iter()
+            .filter_map(|issue| match issue {
+                UninstallIssue::Stop(error) => Some(format!("stop:{error:?}")),
+                UninstallIssue::CleanExit(error) => Some(format!("clean:{error:?}")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // observe_exit changes stop to Unknown whenever no genuine clean token was obtained.
+        assert!(
+            matches!(
+                report.progress.stop,
+                CleanupResult::Removed | CleanupResult::AlreadyAbsent
+            ),
+            "clean prerequisite absent: stop={:?}; failures={failures:?}",
+            report.progress.stop
+        );
+        assert!(
+            failures.is_empty(),
+            "clean prerequisite failures={failures:?}"
+        );
+    }
+    fn finish_files(f: &Fixture, run: &mut UninstallRun) {
         let bytes =
             f.io.read(&f.io.target().agent_path(), 4 * 1024 * 1024, false)
                 .unwrap();
@@ -2130,7 +2250,7 @@ mod uninstall_tests {
         let f = Fixture::new(false);
         let mut run = start(&f, RemovalSelection::default(), true, true);
         run.disable(&deadline()).unwrap();
-        finish(&f, &mut run);
+        finish_clean(&f, &mut run);
         let report = run.report();
         assert_eq!(report.form, UninstallForm::Complete);
         assert_eq!(report.progress.identity, CleanupResult::Kept);
@@ -2216,8 +2336,23 @@ mod uninstall_tests {
             true,
         );
         run.disable(&deadline()).unwrap();
-        finish(&f, &mut run);
-        assert_eq!(f.erase_count(), 1);
+        finish_clean(&f, &mut run);
+        let report = run.report();
+        assert_eq!(
+            f.erase_count(),
+            1,
+            "stop={:?}; clean Busy={}; stop Busy={}; recovery retained={}",
+            report.progress.stop,
+            report.issues.iter().any(|issue| matches!(
+                issue,
+                UninstallIssue::CleanExit(RemovalError::Native(NativeError::Busy))
+            )),
+            report.issues.iter().any(|issue| matches!(
+                issue,
+                UninstallIssue::Stop(RemovalError::Native(NativeError::Busy))
+            )),
+            report.recovery_retained,
+        );
         assert!(
             run.report()
                 .identity_receipt
@@ -2248,6 +2383,126 @@ mod uninstall_tests {
             run.report().progress.resources[..6]
                 .iter()
                 .all(|r| *r == CleanupResult::Kept)
+        );
+    }
+    #[test]
+    fn busy_at_clean_acquisition_is_unknown_without_erase_or_recovery_deletion() {
+        struct PausedExit {
+            base: Arc<Probe>,
+            entered: std::sync::atomic::AtomicUsize,
+            paused: Mutex<bool>,
+            changed: std::sync::Condvar,
+        }
+        impl ExitReader for PausedExit {
+            fn snapshot(
+                &self,
+                pid: u32,
+                d: &Deadline,
+            ) -> Result<Option<ProcessFacts>, NativeError> {
+                d.check()?;
+                let mut paused = self.paused.lock().unwrap();
+                if *paused {
+                    self.entered.fetch_add(1, Ordering::Release);
+                    while *paused {
+                        d.check()?;
+                        paused = self
+                            .changed
+                            .wait_timeout(paused, Duration::from_millis(1))
+                            .unwrap()
+                            .0;
+                    }
+                }
+                ExitReader::snapshot(self.base.as_ref(), pid, d)
+            }
+        }
+        struct ReadLoad {
+            reader: Arc<PausedExit>,
+            workers: Vec<thread::JoinHandle<()>>,
+        }
+        impl Drop for ReadLoad {
+            fn drop(&mut self) {
+                *self.reader.paused.lock().unwrap() = false;
+                self.reader.changed.notify_all();
+                for worker in self.workers.drain(..) {
+                    let _ = worker.join();
+                }
+            }
+        }
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let service = known_manager(&f, &package(), true);
+        let reader = Arc::new(PausedExit {
+            base: f.probe.clone(),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            paused: Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        });
+        let original = f.tracked_with(reader.clone());
+        let (plan, consent) = planned(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            Some(original.clone()),
+            1,
+            100,
+        );
+        let mut run = plan.begin(consent, service, &deadline()).unwrap();
+        run.disable(&deadline()).unwrap();
+        run.stop(&deadline()).unwrap();
+        assert_eq!(run.report().progress.stop, CleanupResult::Removed);
+        // Fill the actual four-slot read pool with paused, read-only exit observations.
+        // Reader errors themselves become ProcessExit::Unknown, not acquisition Busy.
+        *reader.paused.lock().unwrap() = true;
+        let mut load = ReadLoad {
+            reader: reader.clone(),
+            workers: Vec::new(),
+        };
+        for _ in 0..4 {
+            let original = original.clone();
+            load.workers.push(thread::spawn(move || {
+                let d = deadline();
+                loop {
+                    match original.clean_authority(&d) {
+                        Err(RemovalError::Native(NativeError::Busy)) => {
+                            d.check().unwrap();
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        result => {
+                            result.unwrap();
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+        let acquisition = deadline();
+        while reader.entered.load(Ordering::Acquire) != 4 {
+            acquisition.check().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        run.observe_exit(&deadline()).unwrap();
+        assert_eq!(run.report().progress.stop, CleanupResult::Unknown);
+        assert!(run.report().issues.iter().any(|issue| matches!(
+            issue,
+            UninstallIssue::CleanExit(RemovalError::Native(NativeError::Busy))
+        )));
+        drop(load);
+        finish_files(&f, &mut run);
+        assert_eq!(f.erase_count(), 0);
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        assert!(run.report().identity_retained);
+        assert!(run.report().recovery_retained);
+        assert!(
+            run.report().progress.resources[..6]
+                .iter()
+                .all(|r| *r == CleanupResult::Kept)
+        );
+        assert!(
+            run.report().progress.resources[6..]
+                .iter()
+                .all(|r| *r == CleanupResult::Removed)
         );
     }
     #[test]

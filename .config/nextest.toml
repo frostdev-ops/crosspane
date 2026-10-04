@@ -1,0 +1,8 @@
+# Owned uninstall fixtures exercise nested bounded read workers. Keep their clean-phase
+# prerequisites independent of competing fixture load; no test or mutation retries.
+[test-groups.removal-original-authority]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(linux_repair) and test(uninstall_tests::)'
+test-group = 'removal-original-authority'
