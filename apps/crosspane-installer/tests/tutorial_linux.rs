@@ -374,7 +374,7 @@ fn b3a_virtual_only_in_bound_info_is_required_before_pinning() {
 }
 
 #[test]
-fn b3a_later_property_event_disables_even_when_identity_keys_are_unchanged() {
+fn b3b_unrelated_node_description_change_preserves_admitted_identity() {
     let mut model = route_model();
     establish(&mut model);
     let key = speakers().device_key;
@@ -388,8 +388,8 @@ fn b3a_later_property_event_disables_even_when_identity_keys_are_unchanged() {
             ("node.description", "SYNTHETIC_CHANGED_DESCRIPTION"),
         ],
     );
-    assert!(model.disabled());
-    assert!(!model.established());
+    assert!(!model.disabled());
+    assert!(model.established());
 }
 
 #[test]
@@ -3010,7 +3010,7 @@ fn b2_ipc_stall_is_bounded_and_signature_or_writable_socket_refused() {
     assert!(started.elapsed() < Duration::from_millis(650));
 }
 #[test]
-fn b2_native_tone_stays_explicitly_unavailable_until_b3() {
+fn b3b_invalid_selector_and_unowned_stop_refuse_without_output() {
     let mut native = tutorial::native(Path::new("/inert/font"));
     assert_eq!(
         native.play_tone(
@@ -3020,11 +3020,11 @@ fn b2_native_tone_stays_explicitly_unavailable_until_b3() {
                 device_key: "inert".into()
             }
         ),
-        Some(Err(FixtureError::Unavailable))
+        Some(Err(FixtureError::NotOwned))
     );
     assert_eq!(
         native.stop_tone(ToneId(1)),
-        Some(Err(FixtureError::Unavailable))
+        Some(Err(FixtureError::NotOwned))
     );
     assert_eq!(native.tone_state(), OwnToneState::Stopped);
 }
@@ -3477,4 +3477,954 @@ fn b2_written_close_then_eof_completes_once_without_parent_confirmation_queue() 
         })
     );
     assert!(port.poll_receipts().is_empty());
+}
+
+#[test]
+fn b3b_native_invalid_tone_and_selector_refuse_before_any_audio_connection() {
+    assert!(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none());
+    let mut native = tutorial::native(Path::new("/nonexistent/inert-font"));
+    assert_eq!(
+        native.play_tone(ToneId(0), &speakers()),
+        Some(Err(FixtureError::NotOwned))
+    );
+    let mut wrong = speakers();
+    wrong.device_key.push_str("-other");
+    assert_eq!(
+        native.play_tone(ToneId(1), &wrong),
+        Some(Err(FixtureError::NotOwned))
+    );
+    assert_eq!(native.tone_state(), OwnToneState::Stopped);
+}
+#[test]
+fn b3b_production_constructs_no_input_stream() {
+    for (name, source) in [
+        (
+            "tutorial",
+            include_str!("../src/platform/linux/tutorial.rs"),
+        ),
+        (
+            "routing",
+            include_str!("../src/platform/linux/tutorial/routing.rs"),
+        ),
+        (
+            "tone",
+            include_str!("../src/platform/linux/tutorial/tone.rs"),
+        ),
+    ] {
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let tokens: String = production
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            !tokens.contains("Direction::Input"),
+            "{name} constructed a product input stream"
+        );
+    }
+}
+#[test]
+fn b3b_native_missing_selected_runtime_is_not_a_default_output() {
+    assert!(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none());
+    let mut native = tutorial::native(Path::new("/nonexistent/inert-font"));
+    assert_eq!(
+        native.play_tone(ToneId(1), &speakers()),
+        Some(Err(FixtureError::OutputUnavailable))
+    );
+    assert_eq!(
+        native.play_tone(ToneId(1), &speakers()),
+        Some(Err(FixtureError::OutputUnavailable))
+    );
+    assert_eq!(native.tone_state(), OwnToneState::Stopped);
+}
+
+#[path = "../src/platform/linux/tutorial/tone.rs"]
+mod tone;
+use tone::test_support as tone_test;
+fn b3b_private_fd(selected: &PrivatePipewire, deadline: Instant) -> std::os::fd::OwnedFd {
+    let fd = routing::socket(&selected.runtime, deadline).unwrap();
+    tone_test::verify_fd(&fd).unwrap();
+    fd
+}
+fn b3b_exact_capture_format(pod: Option<&pw::spa::pod::Pod>) -> bool {
+    let Some(pod) = pod else { return false };
+    let mut info = pw::spa::param::audio::AudioInfoRaw::new();
+    pw::spa::param::format_utils::parse_format(pod).is_ok_and(|media| {
+        media
+            == (
+                pw::spa::param::format::MediaType::Audio,
+                pw::spa::param::format::MediaSubtype::Raw,
+            )
+    }) && info.parse(pod).is_ok()
+        && info.format() == pw::spa::param::audio::AudioFormat::F32LE
+        && info.rate() == 48000
+        && info.channels() == 2
+        && !info
+            .flags()
+            .contains(pw::spa::param::audio::AudioInfoRawFlags::UNPOSITIONED)
+        && info.position()[..2]
+            == [
+                pw::spa::sys::SPA_AUDIO_CHANNEL_FL,
+                pw::spa::sys::SPA_AUDIO_CHANNEL_FR,
+            ]
+}
+fn b3b_capture_pod() -> Vec<u8> {
+    pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(pw::spa::pod::Object {
+            type_: pw::spa::sys::SPA_TYPE_OBJECT_Format,
+            id: pw::spa::sys::SPA_PARAM_EnumFormat,
+            properties: tone_test::fixed_format().into(),
+        }),
+    )
+    .unwrap()
+    .0
+    .into_inner()
+}
+#[derive(Default)]
+struct SyntheticSamples {
+    frames: usize,
+    nonsilent: usize,
+    peak: f64,
+    first: Option<Instant>,
+    last: Option<Instant>,
+    invalid: bool,
+}
+impl SyntheticSamples {
+    fn add(&mut self, bytes: &[u8], now: Instant) {
+        if bytes.len() > 16_384 || !bytes.len().is_multiple_of(8) || self.frames > 48000 * 6 {
+            self.invalid = true;
+            return;
+        }
+        self.frames += bytes.len() / 8;
+        for frame in bytes.as_chunks::<8>().0.iter() {
+            let left = f32::from_le_bytes(frame[..4].try_into().unwrap());
+            let right = f32::from_le_bytes(frame[4..].try_into().unwrap());
+            if !left.is_finite() || !right.is_finite() || left != right {
+                self.invalid = true;
+                continue;
+            }
+            self.peak = self.peak.max(f64::from(left.abs()));
+            if left != 0.0 {
+                self.nonsilent += 1;
+                self.first.get_or_insert(now);
+                self.last = Some(now);
+            }
+        }
+    }
+}
+#[test]
+fn b3b_synthetic_capture_statistics_reject_wrong_finite_shape_and_bound() {
+    let mut samples = SyntheticSamples::default();
+    samples.add(&[0; 16_385], Instant::now());
+    assert!(samples.invalid);
+    let mut samples = SyntheticSamples::default();
+    let mut bytes = [0; 8];
+    bytes[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+    samples.add(&bytes, Instant::now());
+    assert!(samples.invalid);
+    let mut samples = SyntheticSamples::default();
+    bytes[..4].copy_from_slice(&0.001f32.to_le_bytes());
+    bytes[4..].copy_from_slice(&0.001f32.to_le_bytes());
+    samples.add(&bytes, Instant::now());
+    assert_eq!(samples.nonsilent, 1);
+    assert!(samples.peak < 0.0316228);
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SyntheticPort {
+    node: u32,
+    serial: u64,
+    output: bool,
+    channel: String,
+    monitor: bool,
+}
+type NodeReceipt = (u32, u64, bool, bool, String, String, Option<u64>);
+#[derive(Default)]
+struct SyntheticGraph {
+    node_receipts: VecDeque<NodeReceipt>,
+    nodes: BTreeMap<u32, (String, u64, bool)>,
+    ports: BTreeMap<u32, SyntheticPort>,
+    links: BTreeMap<u32, (u32, u32)>,
+    invalid: bool,
+}
+impl SyntheticGraph {
+    fn ports(&self, node: u32, output: bool, monitor: bool) -> Option<[u32; 2]> {
+        let mut pair = [0; 2];
+        for (id, port) in &self.ports {
+            if port.node != node || port.output != output || port.monitor != monitor {
+                continue;
+            }
+            let channel = match port.channel.as_str() {
+                "FL" => 0,
+                "FR" => 1,
+                _ => panic!("unexpected synthetic channel"),
+            };
+            assert_eq!(pair[channel], 0, "ambiguous synthetic port");
+            pair[channel] = *id;
+        }
+        pair.iter().all(|id| *id != 0).then_some(pair)
+    }
+    fn node(&self, name: &str) -> u32 {
+        let nodes: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|(_, (n, _, confirmed))| n == name && *confirmed)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(nodes.len(), 1, "only the exact synthetic node");
+        nodes[0]
+    }
+}
+fn b3b_private_tone_client(selected: &PrivatePipewire) {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    let proof = selected.clone();
+    tone_test::install_guard(Box::new(move |fd| {
+        let values = std::env::vars().collect();
+        let path = proof.runtime.join("pipewire-0");
+        let verify = || {
+            proof
+                .verify(
+                    &values,
+                    owned_start_ticks(proof.pid).map_err(|_| FixtureError::Refused)?,
+                    &fs::symlink_metadata(&path).map_err(|_| FixtureError::Refused)?,
+                )
+                .map_err(|_| FixtureError::Refused)
+        };
+        verify()?;
+        let peer = rustix::net::sockopt::socket_peercred(fd).map_err(|_| FixtureError::Refused)?;
+        if peer.pid.as_raw_nonzero().get() as u32 != proof.pid {
+            return Err(FixtureError::Refused);
+        }
+        verify()
+    }));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let fd = b3b_private_fd(selected, deadline);
+    pw::init();
+    let loop_ = pw::main_loop::MainLoopRc::new(None).unwrap();
+    let context = pw::context::ContextRc::new(
+        &loop_,
+        Some(pw::properties::properties! {
+            "config.name" => selected.root.join("client.conf").to_str().unwrap()
+        }),
+    )
+    .unwrap();
+    let core = context.connect_fd_rc(fd, None).unwrap();
+    let registry = core.get_registry_rc().unwrap();
+    let graph = Rc::new(RefCell::new(SyntheticGraph::default()));
+    let node_watches = Rc::new(RefCell::new(
+        Vec::<(pw::node::NodeListener, pw::node::Node)>::new(),
+    ));
+    let port_watches = Rc::new(RefCell::new(
+        Vec::<(pw::port::PortListener, pw::port::Port)>::new(),
+    ));
+    let globals = graph.clone();
+    let nodes = node_watches.clone();
+    let ports = port_watches.clone();
+    let bind = registry.clone();
+    let removed = graph.clone();
+    let exact = speakers().device_key;
+    let exact_name = exact.clone();
+    let _inventory = registry
+        .add_listener_local()
+        .global(move |g| {
+            let Some(props) = g.props else { return };
+            if g.type_ == pw::types::ObjectType::Node {
+                let name = props.get("node.name").unwrap_or("");
+                let class = props.get("media.class").unwrap_or("");
+                let admitted = match class {
+                    "Audio/Sink" => name == exact_name || name == "crosspane.private.foreign",
+                    "Stream/Input/Audio" => matches!(
+                        name,
+                        "crosspane.private.capture.exact" | "crosspane.private.capture.foreign"
+                    ),
+                    "Stream/Output/Audio" => name == "crosspane.practice.tone",
+                    "" => name == "crosspane.private.driver",
+                    _ => false,
+                };
+                if !admitted {
+                    globals.borrow_mut().invalid = true;
+                    return;
+                }
+                if class.is_empty() {
+                    return;
+                }
+                let serial = props.get("object.serial").unwrap().parse::<u64>().unwrap();
+                assert!(serial > 0 && globals.borrow().nodes.len() < 8);
+                globals
+                    .borrow_mut()
+                    .nodes
+                    .insert(g.id, (name.to_owned(), serial, false));
+                let bound = bind.bind::<pw::node::Node, _>(g).unwrap();
+                let facts = globals.clone();
+                let id = g.id;
+                let name = name.to_owned();
+                let class = class.to_owned();
+                let exact_sink = name == exact_name;
+                let listener = bound
+                    .add_listener_local()
+                    .info(move |info| {
+                        if exact_sink {
+                            let props = info.props();
+                            let receipt = (
+                                info.id(),
+                                info.change_mask().bits(),
+                                props.is_some_and(|p| p.iter().next().is_some()),
+                                props
+                                    .and_then(|p| p.get("node.name"))
+                                    .is_some_and(|v| v == name),
+                                props
+                                    .and_then(|p| p.get("media.class"))
+                                    .unwrap_or("absent")
+                                    .chars()
+                                    .take(32)
+                                    .collect(),
+                                props
+                                    .and_then(|p| p.get("node.virtual"))
+                                    .unwrap_or("absent")
+                                    .chars()
+                                    .take(8)
+                                    .collect(),
+                                props
+                                    .and_then(|p| p.get("object.serial"))
+                                    .and_then(|v| v.parse().ok()),
+                            );
+                            let mut graph = facts.borrow_mut();
+                            if graph.node_receipts.len() == 8 {
+                                graph.node_receipts.pop_front();
+                            }
+                            graph.node_receipts.push_back(receipt);
+                        }
+                        if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
+                            return;
+                        }
+                        let valid = info.props().is_some_and(|p| {
+                            p.get("node.name") == Some(name.as_str())
+                                && p.get("media.class") == Some(class.as_str())
+                                && p.get("node.virtual") == Some("true")
+                                && p.get("object.serial").and_then(|s| s.parse::<u64>().ok())
+                                    == Some(serial)
+                        });
+                        if !valid {
+                            facts.borrow_mut().invalid = true;
+                        }
+                        if let Some(node) = facts.borrow_mut().nodes.get_mut(&id) {
+                            node.2 = valid;
+                        }
+                    })
+                    .register();
+                nodes.borrow_mut().push((listener, bound));
+            } else if g.type_ == pw::types::ObjectType::Port {
+                assert!(globals.borrow().ports.len() < 24);
+                let id = g.id;
+                let bound = bind.bind::<pw::port::Port, _>(g).unwrap();
+                let facts = globals.clone();
+                let listener = bound
+                    .add_listener_local()
+                    .info(move |info| {
+                        if !info.change_mask().contains(pw::port::PortChangeMask::PROPS) {
+                            return;
+                        }
+                        let p = info.props().unwrap();
+                        let port = SyntheticPort {
+                            node: p.get("node.id").unwrap().parse().unwrap(),
+                            serial: p.get("object.serial").unwrap().parse().unwrap(),
+                            output: info.direction() == pw::spa::utils::Direction::Output,
+                            channel: p.get("audio.channel").unwrap_or("").into(),
+                            monitor: p.get("port.monitor") == Some("true"),
+                        };
+                        let valid = info.id() == id
+                            && port.serial > 0
+                            && matches!(port.channel.as_str(), "FL" | "FR")
+                            && p.get("format.dsp") == Some("32 bit float mono audio")
+                            && p.get("port.physical").is_none_or(|v| v == "false");
+                        if !valid
+                            || facts
+                                .borrow()
+                                .ports
+                                .get(&id)
+                                .is_some_and(|old| old != &port)
+                        {
+                            facts.borrow_mut().invalid = true;
+                        }
+                        facts.borrow_mut().ports.insert(id, port);
+                    })
+                    .register();
+                ports.borrow_mut().push((listener, bound));
+            } else if g.type_ == pw::types::ObjectType::Link {
+                assert!(globals.borrow().links.len() < 8);
+                let from = props.get("link.output.port").unwrap().parse().unwrap();
+                let to = props.get("link.input.port").unwrap().parse().unwrap();
+                globals.borrow_mut().links.insert(g.id, (from, to));
+            }
+        })
+        .global_remove(move |id| {
+            let mut graph = removed.borrow_mut();
+            graph.links.remove(&id);
+            graph.nodes.remove(&id);
+            graph.ports.remove(&id);
+        })
+        .register();
+    let done = Rc::new(Cell::new(None));
+    let arrived = done.clone();
+    let error = Rc::new(Cell::new(false));
+    let failed = error.clone();
+    let _core_events = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id == 0 {
+                arrived.set(Some(seq));
+            }
+        })
+        .error(move |_, _, _, _| failed.set(true))
+        .register();
+    let step = || {
+        assert!(
+            !error.get() && !graph.borrow().invalid,
+            "private synthetic graph refused"
+        );
+        assert!(
+            loop_
+                .loop_()
+                .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(2)))
+                >= 0
+        );
+    };
+    let sync = |deadline: Instant| {
+        let seq = core.sync(0).unwrap();
+        while done.get() != Some(seq) {
+            routing::remaining(deadline).unwrap();
+            step();
+        }
+    };
+    for _ in 0..2 {
+        sync(deadline);
+    }
+    let sinks = [
+        graph.borrow().node(&exact),
+        graph.borrow().node("crosspane.private.foreign"),
+    ];
+    let samples: Vec<_> = (0..2)
+        .map(|_| Rc::new(RefCell::new(SyntheticSamples::default())))
+        .collect();
+    let mut captures = Vec::new();
+    for (channel, name) in [
+        "crosspane.private.capture.exact",
+        "crosspane.private.capture.foreign",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let stream = pw::stream::StreamBox::new(
+            &core,
+            name,
+            pw::properties::properties! {
+                "media.type" => "Audio", "media.category" => "Capture", "media.role" => "Test",
+                "node.name" => name, "node.virtual" => "true", "node.dont-fallback" => "true",
+                "node.dont-move" => "true", "node.dont-reconnect" => "true",
+                "adapter.auto-port-config" => "{ mode=dsp monitor=false position=preserve }",
+            },
+        )
+        .unwrap();
+        let evidence = samples[channel].clone();
+        let format = Rc::new(Cell::new(false));
+        let changed = format.clone();
+        let listener = stream
+            .add_local_listener_with_user_data(())
+            .param_changed(move |_, _, id, pod| {
+                if id == pw::spa::sys::SPA_PARAM_Format {
+                    let valid = b3b_exact_capture_format(pod);
+                    changed.set(valid);
+                    if !valid {
+                        evidence.borrow_mut().invalid = true;
+                    }
+                }
+            })
+            .process({
+                let evidence = samples[channel].clone();
+                move |stream, _| {
+                    let Some(mut buffer) = stream.dequeue_buffer() else {
+                        return;
+                    };
+                    if !format.get() || buffer.datas_mut().len() != 1 {
+                        evidence.borrow_mut().invalid = true;
+                        return;
+                    }
+                    let data = &mut buffer.datas_mut()[0];
+                    let offset = data.chunk().offset() as usize;
+                    let size = data.chunk().size() as usize;
+                    let stride = data.chunk().stride();
+                    if stride != 8 {
+                        evidence.borrow_mut().invalid = true;
+                        return;
+                    }
+                    if let Some(bytes) = data.data() {
+                        if let Some(part) = offset
+                            .checked_add(size)
+                            .filter(|end| *end <= bytes.len())
+                            .map(|end| &bytes[offset..end])
+                        {
+                            evidence.borrow_mut().add(part, Instant::now());
+                        } else {
+                            evidence.borrow_mut().invalid = true;
+                        }
+                    } else {
+                        evidence.borrow_mut().invalid = true;
+                    }
+                }
+            })
+            .register()
+            .unwrap();
+        let pod = b3b_capture_pod();
+        let mut params = [pw::spa::pod::Pod::from_bytes(&pod).unwrap()];
+        stream
+            .connect(
+                pw::spa::utils::Direction::Input,
+                None,
+                pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::DONT_RECONNECT,
+                &mut params,
+            )
+            .unwrap();
+        captures.push((listener, stream));
+    }
+    for _ in 0..2 {
+        sync(deadline);
+    }
+    let mut links = Vec::new();
+    let active = Rc::new(Cell::new(0u8));
+    for sink in 0..2 {
+        let (from, to) = loop {
+            let from = graph.borrow().ports(sinks[sink], true, true);
+            let to = graph
+                .borrow()
+                .ports(captures[sink].1.node_id(), false, false);
+            if let Some(pair) = from.zip(to) {
+                break pair;
+            }
+            assert!(
+                routing::remaining(deadline).is_ok(),
+                "synthetic capture pending: sink={} capture={} from={from:?} to={to:?} ports={:?}",
+                sinks[sink],
+                captures[sink].1.node_id(),
+                graph.borrow().ports
+            );
+            step();
+        };
+        for channel in 0..2 {
+            // Only this independently verified synthetic node's monitor -> our own capture.
+            let properties = pw::properties::properties! {
+                "link.output.node" => sinks[sink].to_string(),
+                "link.output.port" => from[channel].to_string(),
+                "link.input.node" => captures[sink].1.node_id().to_string(),
+                "link.input.port" => to[channel].to_string(),
+                "link.passive" => "false", "object.linger" => "false",
+            };
+            let link: pw::link::Link = core.create_object("link-factory", &properties).unwrap();
+            let arrived = active.clone();
+            let channel_bit = 1 << (sink * 2 + channel);
+            let expected = (
+                sinks[sink],
+                from[channel],
+                captures[sink].1.node_id(),
+                to[channel],
+            );
+            let listener = link
+                .add_listener_local()
+                .info(move |info| {
+                    assert_eq!(
+                        (
+                            info.output_node_id(),
+                            info.output_port_id(),
+                            info.input_node_id(),
+                            info.input_port_id()
+                        ),
+                        expected
+                    );
+                    if matches!(info.state(), pw::link::LinkState::Active) {
+                        arrived.set(arrived.get() | channel_bit);
+                    }
+                })
+                .register();
+            links.push((listener, link));
+        }
+    }
+    while active.get() != 15 {
+        routing::remaining(deadline).unwrap();
+        step();
+    }
+    sync(deadline);
+    assert_eq!(graph.borrow().links.len(), 4);
+    let mut output = tone::Output::new(Some(selected.runtime.clone()), false);
+    for (id, natural) in [(1, true), (2, false)] {
+        for evidence in &samples {
+            *evidence.borrow_mut() = SyntheticSamples::default();
+        }
+        let opened = Instant::now();
+        let mut started = false;
+        while !started {
+            match output.play(ToneId(id), &speakers()) {
+                None => (),
+                Some(result) => {
+                    assert!(
+                        result.is_ok(),
+                        "private tone failed={result:?} phase={} format-buffer={:?} exact-node-mask receipts={:?}",
+                        tone_test::phase(),
+                        tone_test::diagnostic(),
+                        graph.borrow().node_receipts
+                    );
+                    started = true;
+                }
+            }
+            assert!(Instant::now().duration_since(opened) < Duration::from_secs(2));
+            step();
+        }
+        assert_eq!(output.state(), OwnToneState::Running { tone: ToneId(id) });
+        let running = Instant::now();
+        while if natural {
+            output.state() != OwnToneState::Stopped
+        } else {
+            samples[0].borrow().nonsilent == 0
+        } {
+            assert!(
+                running.elapsed() < Duration::from_millis(2050),
+                "bounded own tone/cleanup"
+            );
+            step();
+        }
+        if !natural {
+            let stopped = Instant::now();
+            while output.stop(ToneId(id)).is_none() {
+                assert!(
+                    stopped.elapsed() < Duration::from_millis(50),
+                    "stop release bound"
+                );
+                step();
+            }
+            assert_eq!(output.stop(ToneId(id)), Some(Ok(())));
+            assert!(stopped.elapsed() <= Duration::from_millis(50));
+        }
+        sync(Instant::now() + Duration::from_millis(50));
+        let exact = samples[0].borrow();
+        let foreign = samples[1].borrow();
+        assert!(!exact.invalid && !foreign.invalid);
+        assert!(
+            exact.frames > 0 && foreign.frames > 0,
+            "both captures must actually observe samples"
+        );
+        assert!(exact.nonsilent > 0 && exact.nonsilent <= 96000 && exact.peak <= 0.0316228);
+        assert_eq!(
+            foreign.nonsilent, 0,
+            "foreign/default synthetic sink receives only silence"
+        );
+        if natural {
+            assert!(
+                exact.last.unwrap().duration_since(exact.first.unwrap())
+                    <= Duration::from_millis(2050)
+            );
+        }
+        assert!(
+            !graph
+                .borrow()
+                .nodes
+                .values()
+                .any(|(name, _, _)| name == "crosspane.practice.tone")
+        );
+        assert_eq!(
+            graph.borrow().links.len(),
+            4,
+            "all production output links removed"
+        );
+        println!(
+            "private exact-node-mask receipts={:?}",
+            graph.borrow().node_receipts
+        );
+        println!(
+            "private synthetic sink: tone={id} natural={natural} nonsilent={} peak={:.9} foreign_nonsilent=0 own_output_removed=true",
+            exact.nonsilent, exact.peak
+        );
+    }
+    drop(output);
+    drop(links);
+    for (listener, stream) in captures {
+        stream.set_active(false).unwrap();
+        stream.flush(false).unwrap();
+        stream.disconnect().unwrap();
+        drop(listener);
+        drop(stream);
+    }
+    sync(Instant::now() + Duration::from_millis(50));
+    assert!(
+        graph.borrow().links.is_empty(),
+        "all owned monitor/capture links gone"
+    );
+    assert!(!graph.borrow().nodes.values().any(|(name, _, _)| {
+        name.starts_with("crosspane.private.capture.") || name == "crosspane.practice.tone"
+    }));
+    println!(
+        "private tone: exact synthetic delivery bounded; foreign/default silent; all client nodes/links removed"
+    );
+}
+
+#[test]
+fn b3b_private_tone_reaches_only_exact_synthetic_sink() {
+    use std::os::unix::fs::FileTypeExt;
+    if std::env::var_os("B3A_PRIVATE_CLIENT").is_some() {
+        let root = PathBuf::from(std::env::var_os("PIPEWIRE_CONFIG_DIR").unwrap());
+        let proof = root.join("server.json");
+        let file = fs::File::from(
+            rustix::fs::open(
+                &proof,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap(),
+        );
+        let meta = file.metadata().unwrap();
+        assert!(
+            meta.is_file()
+                && meta.nlink() == 1
+                && meta.uid() == rustix::process::geteuid().as_raw()
+                && meta.mode() & 0o7777 == 0o600
+                && meta.len() <= 4096
+        );
+        let record: Value = serde_json::from_reader(file.take(4097)).unwrap();
+        let selected = PrivatePipewire {
+            root: root.clone(),
+            runtime: root.join("runtime"),
+            home: root.join("home"),
+            pid: u32::try_from(record["pid"].as_u64().unwrap()).unwrap(),
+            start: record["start"].as_u64().unwrap(),
+            socket: (
+                record["dev"].as_u64().unwrap(),
+                record["ino"].as_u64().unwrap(),
+            ),
+        };
+        b3b_private_tone_client(&selected);
+        return;
+    }
+    if std::env::var("CROSSPANE_PRIVATE_PIPEWIRE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "SKIP private PipeWire: exact CROSSPANE_PRIVATE_PIPEWIRE=1 absent; no audio coverage"
+        );
+        return;
+    }
+    if !Path::new("/usr/bin/pipewire").is_file() {
+        eprintln!("SKIP private PipeWire: /usr/bin/pipewire missing; no audio coverage");
+        return;
+    }
+    assert_eq!(
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap(),
+        DEAD_SESSION
+    );
+    assert_eq!(
+        std::env::var("DBUS_SYSTEM_BUS_ADDRESS").unwrap(),
+        DEAD_SYSTEM
+    );
+    assert_eq!(std::env::var("PULSE_SERVER").unwrap(), DEAD_PULSE);
+    for key in [
+        "CROSSPANE_AUDIO",
+        "CROSSPANE_NESTED_HYPR",
+        "PIPEWIRE_AUTOCONNECT",
+        "PIPEWIRE_CORE",
+        "CROSSPANE_LIVE_TESTS",
+        "CROSSPANE_REAL_STORE",
+        "CROSSPANE_SECRET_SERVICE_LIVE",
+    ] {
+        assert!(std::env::var_os(key).is_none(), "unexpected live override");
+    }
+    let root = Scratch::new();
+    let runtime = root.0.join("runtime");
+    let home = root.0.join("home");
+    for p in [&runtime, &home] {
+        fs::create_dir(p).unwrap();
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let daemon = root.0.join("daemon.conf");
+    let client = root.0.join("client.conf");
+    fs::write(
+        &daemon,
+        private_daemon_config().replace(
+            "mode=dsp monitor=false position=preserve",
+            "mode=dsp monitor=true position=preserve",
+        ),
+    )
+    .unwrap();
+    fs::write(&client,"context.properties = { support.dbus=false }\ncontext.spa-libs = { support.*=support/libspa-support audio.convert.*=audioconvert/libspa-audioconvert }\ncontext.modules = [ { name=libpipewire-module-protocol-native } { name=libpipewire-module-client-node } { name=libpipewire-module-adapter } ]\n").unwrap();
+    for p in [&daemon, &client] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut command = private_command(&runtime, &home);
+    let log = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(root.0.join("server.log"))
+        .unwrap();
+    command
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log));
+    command
+        .arg("env")
+        .arg(format!("PIPEWIRE_RUNTIME_DIR={}", runtime.display()))
+        .arg(format!("PIPEWIRE_CONFIG_DIR={}", root.0.display()))
+        .arg("PIPEWIRE_CONFIG_PREFIX=")
+        .arg("PIPEWIRE_CONFIG_NAME=daemon.conf")
+        .args(["/usr/bin/pipewire", "-c"])
+        .arg(&daemon);
+    let mut server = OwnedProcess::spawn(command, root.1.clone());
+    let pid = server.child().id();
+    let start = owned_start_ticks(pid).unwrap().unwrap();
+    println!("private owned server pid={pid} start={start}");
+    let mut server = ReportedPrivateServer {
+        record: server.pending.as_ref().unwrap().record.clone(),
+        owned: Some(server),
+        pid,
+        start,
+        retain: root.1.clone(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let socket = runtime.join("pipewire-0");
+    while !fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket()) {
+        assert!(
+            server.child().try_wait().unwrap().is_none(),
+            "owned private server exited"
+        );
+        assert!(Instant::now() < deadline, "private server socket deadline");
+        thread::sleep(Duration::from_millis(2));
+    }
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let meta = fs::symlink_metadata(&socket).unwrap();
+    let selected = PrivatePipewire {
+        root: root.0.clone(),
+        runtime,
+        home,
+        pid,
+        start,
+        socket: (meta.dev(), meta.ino()),
+    };
+    let proof = root.0.join("server.json");
+    let mut record = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&proof)
+        .unwrap();
+    writeln!(
+        record,
+        "{}",
+        json!({"pid":pid,"start":start,"dev":meta.dev(),"ino":meta.ino()})
+    )
+    .unwrap();
+    let mut command = private_command(&selected.runtime, &selected.home);
+    command.arg("env");
+    for (key, value) in private_values(&selected) {
+        command.arg(format!("{key}={value}"));
+    }
+    command.arg(std::env::current_exe().unwrap()).args([
+        "--exact",
+        "b3b_private_tone_reaches_only_exact_synthetic_sink",
+        "--nocapture",
+    ]);
+    selected
+        .verify(
+            &private_values(&selected),
+            owned_start_ticks(pid).unwrap(),
+            &fs::symlink_metadata(&socket).unwrap(),
+        )
+        .unwrap();
+    let output = run_bounded(command, root.1.clone());
+    assert!(output.contains("private tone: exact synthetic delivery bounded"));
+    let record = server.record.clone();
+    drop(server);
+    assert!(
+        !root.1.load(Ordering::Acquire),
+        "owned private server cleanup outstanding"
+    );
+    assert_ne!(
+        owned_start_ticks(pid).unwrap(),
+        Some(start),
+        "owned PID/start still exists"
+    );
+    assert!(!record.exists(), "owned cleanup evidence retained");
+    println!("{output}");
+    println!("private server pid={pid} start={start} gone; owned records reconciled");
+}
+
+#[test]
+fn b3b_private_capture_pairs_wait_for_bound_facts_before_linking() {
+    let mut graph = SyntheticGraph::default();
+    assert_eq!(graph.ports(20, true, true), None);
+    for (id, channel) in [(21, "FL"), (22, "FR")] {
+        graph.ports.insert(
+            id,
+            SyntheticPort {
+                node: 20,
+                serial: id as u64,
+                output: true,
+                channel: channel.into(),
+                monitor: true,
+            },
+        );
+    }
+    assert_eq!(graph.ports(20, true, true), Some([21, 22]));
+    assert_eq!(graph.ports(20, true, false), None);
+    assert_eq!(graph.ports(20, false, true), None);
+}
+
+#[test]
+fn b3b_node_partial_params_and_state_receipts_preserve_full_baseline() {
+    for mask in [
+        pw::node::NodeChangeMask::PARAMS,
+        pw::node::NodeChangeMask::STATE,
+    ] {
+        for props in [Some(&[][..]), None] {
+            let mut model = route_model();
+            establish(&mut model);
+            model.node_receipt(20, 20, mask, props);
+            assert!(!model.disabled());
+            assert!(model.established());
+        }
+    }
+}
+#[test]
+fn b3b_node_props_empty_missing_or_wrong_receipt_id_disable() {
+    for (reported, mask, props) in [
+        (20, pw::node::NodeChangeMask::PROPS, Some(&[][..])),
+        (20, pw::node::NodeChangeMask::PROPS, None),
+        (21, pw::node::NodeChangeMask::PARAMS, None),
+    ] {
+        let mut model = route_model();
+        establish(&mut model);
+        model.node_receipt(20, reported, mask, props);
+        assert!(model.disabled());
+        assert!(!model.established());
+    }
+}
+#[test]
+fn b3b_each_admitted_node_value_change_or_disappearance_disables() {
+    let key = speakers().device_key;
+    let baseline = [
+        ("object.serial", "200"),
+        ("node.name", key.as_str()),
+        ("media.class", "Audio/Sink"),
+        ("node.virtual", "true"),
+    ];
+    for index in 0..baseline.len() {
+        for removed in [false, true] {
+            let mut props = baseline.to_vec();
+            if removed {
+                props.remove(index);
+            } else {
+                props[index].1 = "SYNTHETIC_CHANGED";
+            }
+            let mut model = route_model();
+            establish(&mut model);
+            model.node_receipt(20, 20, pw::node::NodeChangeMask::PROPS, Some(&props));
+            assert!(model.disabled(), "admitted value {index} removed={removed}");
+            assert!(!model.established());
+        }
+    }
 }

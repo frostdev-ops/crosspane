@@ -274,12 +274,37 @@ impl Graph {
         }
         self.check_links();
     }
-    fn observe_node(&mut self, id: u32, props: &spa::utils::dict::DictRef, changed: bool) {
+    fn observe_node(&mut self, id: u32, props: &spa::utils::dict::DictRef) {
         let identity = node(props, &self.key, id);
-        if changed && self.confirmed.is_some() || identity != self.nodes.get(&id).copied() {
+        if identity != self.nodes.get(&id).copied()
+            || self
+                .confirmed
+                .is_some_and(|baseline| Some(baseline) != identity)
+        {
             self.status.fail(3);
         }
         self.confirmed = identity;
+    }
+    fn node_receipt(
+        &mut self,
+        id: u32,
+        reported: u32,
+        mask: pw::node::NodeChangeMask,
+        props: Option<&spa::utils::dict::DictRef>,
+    ) {
+        if reported != id {
+            self.status.fail(3);
+            return;
+        }
+        if mask.contains(pw::node::NodeChangeMask::PROPS) {
+            match props {
+                Some(props) => self.observe_node(id, props),
+                None => self.status.fail(3),
+            }
+        } else if self.confirmed.is_none() {
+            // A partial STATE/PARAMS receipt cannot establish the first identity baseline.
+            self.status.fail(3);
+        }
     }
     fn observe_port(
         &mut self,
@@ -582,13 +607,12 @@ impl Route {
                     let watch = bound
                         .add_listener_local()
                         .info(move |info| {
-                            if let Some(props) = info.props() {
-                                observed.borrow_mut().observe_node(
-                                    id,
-                                    props,
-                                    info.change_mask().contains(pw::node::NodeChangeMask::PROPS),
-                                );
-                            }
+                            observed.borrow_mut().node_receipt(
+                                id,
+                                info.id(),
+                                info.change_mask(),
+                                info.props(),
+                            );
                         })
                         .register();
                     watched.borrow_mut().push((watch, bound));
@@ -859,12 +883,7 @@ pub(super) mod test_support {
             self.graph.status.disabled.load(Ordering::Acquire)
         }
         pub(crate) fn node_info(&mut self, id: u32, props: &[(&str, &str)]) {
-            let mut properties = pw::properties::PropertiesBox::new();
-            for (key, value) in props {
-                properties.insert(*key, *value);
-            }
-            let dict: &spa::utils::dict::DictRef = properties.as_ref();
-            self.graph.observe_node(id, dict, false);
+            self.node_receipt(id, id, pw::node::NodeChangeMask::PROPS, Some(props));
         }
         pub(crate) fn port_info(&mut self, id: u32, output: bool, props: &[(&str, &str)]) {
             self.port_receipt(id, id, output, pw::port::PortChangeMask::PROPS, Some(props));
@@ -904,13 +923,25 @@ pub(super) mod test_support {
                 properties.as_ref().map(|properties| properties.as_ref()),
             );
         }
+        pub(crate) fn node_receipt(
+            &mut self,
+            id: u32,
+            reported: u32,
+            mask: pw::node::NodeChangeMask,
+            props: Option<&[(&str, &str)]>,
+        ) {
+            let properties = props.map(|props| {
+                let mut properties = pw::properties::PropertiesBox::new();
+                for (key, value) in props {
+                    properties.insert(*key, *value);
+                }
+                properties
+            });
+            self.graph
+                .node_receipt(id, reported, mask, properties.as_ref().map(|p| p.as_ref()));
+        }
         pub(crate) fn node_property_change(&mut self, id: u32, props: &[(&str, &str)]) {
-            let mut properties = pw::properties::PropertiesBox::new();
-            for (key, value) in props {
-                properties.insert(*key, *value);
-            }
-            let dict: &spa::utils::dict::DictRef = properties.as_ref();
-            self.graph.observe_node(id, dict, true);
+            self.node_receipt(id, id, pw::node::NodeChangeMask::PROPS, Some(props));
         }
     }
 
@@ -1004,6 +1035,19 @@ pub(super) mod test_support {
             ],
         );
         assert!(!model.disabled());
+        model.node_property_change(
+            20,
+            &[
+                ("object.serial", "200"),
+                ("node.name", &key),
+                ("media.class", "Audio/Sink"),
+                ("node.virtual", "true"),
+            ],
+        );
+        assert!(
+            model.established(),
+            "unchanged admitted node properties remain established"
+        );
         model.remove(30);
         model.port_property_change(
             11,
@@ -1013,15 +1057,6 @@ pub(super) mod test_support {
                 ("node.id", "10"),
                 ("port.direction", "out"),
                 ("audio.channel", "FL"),
-            ],
-        );
-        model.node_property_change(
-            20,
-            &[
-                ("object.serial", "200"),
-                ("node.name", &key),
-                ("media.class", "Audio/Sink"),
-                ("node.virtual", "true"),
             ],
         );
         assert!(model.disabled());

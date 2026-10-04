@@ -1,9 +1,6 @@
-//! Owned tutorial window facts and inherited pipes; tone remains unavailable until b3.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to TutorialNative by WP-4.15b3b")
-)]
+//! Owned tutorial window facts, inherited pipes and bounded exact-sink fixture output.
 mod routing;
+mod tone;
 
 use super::native_io::tutorial::{TutorialChild, TutorialIpc};
 use super::native_io::{
@@ -146,16 +143,22 @@ impl Drop for ObserverSlot {
     }
 }
 struct LinuxTutorial {
+    tone: tone::Output,
     backend: Arc<Mutex<Backend>>,
     stopped: Arc<AtomicBool>,
     pending: Option<(u64, mpsc::Receiver<WindowObservation>)>,
 }
-/// Infallible child factory. Only the two explicitly inherited selected-session values are read.
+/// Infallible child factory. Captures the inherited selected session and rejects audio autoconnect.
 pub fn native(_: &Path) -> Box<dyn TutorialNative> {
     let endpoint = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
         .ok()
         .zip(std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from));
+    let tone = tone::Output::new(
+        endpoint.as_ref().map(|(_, runtime)| runtime.clone()),
+        std::env::var_os("PIPEWIRE_AUTOCONNECT").is_some(),
+    );
     Box::new(LinuxTutorial {
+        tone,
         backend: Arc::new(Mutex::new(Backend {
             endpoint,
             ipc: None,
@@ -231,14 +234,14 @@ impl TutorialNative for LinuxTutorial {
         self.pending = Some((call, receive));
         None
     }
-    fn play_tone(&mut self, _: ToneId, _: &SpeakersSelection) -> Option<Result<()>> {
-        Some(Err(FixtureError::Unavailable))
+    fn play_tone(&mut self, tone: ToneId, output: &SpeakersSelection) -> Option<Result<()>> {
+        self.tone.play(tone, output)
     }
-    fn stop_tone(&mut self, _: ToneId) -> Option<Result<()>> {
-        Some(Err(FixtureError::Unavailable))
+    fn stop_tone(&mut self, tone: ToneId) -> Option<Result<()>> {
+        self.tone.stop(tone)
     }
     fn tone_state(&self) -> OwnToneState {
-        OwnToneState::Stopped
+        self.tone.state()
     }
 }
 impl Drop for LinuxTutorial {
