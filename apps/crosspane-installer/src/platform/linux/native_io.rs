@@ -3,6 +3,7 @@ mod cleanup;
 pub use cleanup::CleanupLease;
 pub use cleanup::CleanupProof;
 mod removal;
+pub mod tutorial;
 use crate::agent_contract::{BootstrapV1, InstanceStatus, ObservationSource, parse_bootstrap};
 pub use removal::{ExitReader, ProcessExit, ProcessWatch};
 use rustix::fs::{self as rfs, AtFlags, FlockOperation, Mode, OFlags, ResolveFlags};

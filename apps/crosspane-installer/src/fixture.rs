@@ -851,13 +851,16 @@ fn worker(
                 }
             };
             check()?;
-            let complete = |child: &mut ChildGuard| -> Result<bool, FixtureError> {
+            let complete = |child: &mut ChildGuard, eof: bool| -> Result<bool, FixtureError> {
                 check()?;
-                let queued = state
-                    .lock()
-                    .map_err(|_| FixtureError::ChannelClosed)?
-                    .close_confirmation;
-                if !queued || !child.0.cleanup_confirmed()? {
+                let queued = {
+                    let s = state.lock().map_err(|_| FixtureError::ChannelClosed)?;
+                    s.close_confirmation || (eof && (s.close_requested || s.pending.values().any(|p| {
+                        p.2.is_some() && matches!(p.0.command, FixtureCommand::Close { fixture } if Some(fixture) == s.fixture)
+                    })))
+                };
+                // Unavailable cleanup is unconfirmed evidence; EOF remains ChildExited.
+                if !queued || !child.0.cleanup_confirmed().unwrap_or(false) {
                     return Ok(false);
                 }
                 check()?;
@@ -880,7 +883,8 @@ fn worker(
                 s.accept(message, clock(), child.0.pid())?;
                 Ok(true)
             };
-            if held.is_none() && bytes.is_empty() && write.is_none() && complete(&mut child)? {
+            if held.is_none() && bytes.is_empty() && write.is_none() && complete(&mut child, false)?
+            {
                 return Ok(true);
             }
             let mut progress = false;
@@ -908,7 +912,7 @@ fn worker(
                 let mut byte = [0];
                 if let Some(n) = pipe_progress(child.0.read(&mut byte))? {
                     if n == 0 {
-                        if bytes.is_empty() && write.is_none() && complete(&mut child)? {
+                        if bytes.is_empty() && write.is_none() && complete(&mut child, true)? {
                             return Ok(true);
                         }
                         return Err(FixtureError::ChildExited);

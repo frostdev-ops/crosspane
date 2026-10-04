@@ -87,9 +87,28 @@ fn normal_entry_stays_disconnected_and_cannot_become_a_demo_or_production_job() 
     // The installer core is a dependency since WP-4.4a (its codec); the shell itself still
     // constructs no production port or job, which the assertions above prove.
     let manifest = include_str!("../Cargo.toml");
-    for dependency in ["crosspane-agent", "crosspane-platform", "crosspane-ctl"] {
-        assert!(!manifest.contains(dependency));
+    let mut section = "";
+    let mut linux_adapters = 0;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line;
+        }
+        if let Some((name, _)) = line.split_once('=') {
+            let name = name.trim().split('.').next().unwrap_or("");
+            for forbidden in ["crosspane-agent", "crosspane-platform", "crosspane-ctl"] {
+                assert_ne!(name, forbidden);
+            }
+            if name == "crosspane-platform-linux" {
+                assert_eq!(
+                    section,
+                    "[target.'cfg(target_os = \"linux\")'.dependencies]"
+                );
+                linux_adapters += 1;
+            }
+        }
     }
+    assert_eq!(linux_adapters, 1);
+    assert_eq!(manifest.matches("crosspane-platform-linux").count(), 1);
 }
 
 #[test]

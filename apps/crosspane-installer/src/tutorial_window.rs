@@ -696,8 +696,7 @@ impl eframe::App for PracticeApp {
 fn platform_native(font: &std::path::Path) -> Box<dyn TutorialNative> {
     #[cfg(target_os = "linux")]
     {
-        let _ = font;
-        Box::new(UnavailableTutorial)
+        crate::platform::linux::tutorial::native(font)
     }
     #[cfg(target_os = "macos")]
     {

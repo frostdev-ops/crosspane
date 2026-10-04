@@ -6,3 +6,4 @@ pub mod payload;
 pub mod removal;
 pub mod service;
 pub mod transport;
+pub mod tutorial;

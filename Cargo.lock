@@ -861,6 +861,7 @@ dependencies = [
  "aws-lc-rs",
  "clap",
  "crosspane-installer-core",
+ "crosspane-platform-linux",
  "crosspane-types",
  "crosspane-ui-kit",
  "eframe",
