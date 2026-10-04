@@ -226,6 +226,9 @@ fn template_record(record: &RenderedResource, template: &[u8], expected: &[Strin
 }
 
 impl LinuxService {
+    pub(crate) fn target_binding(&self) -> super::native_io::TargetBinding {
+        self.io.target_binding()
+    }
     /// Consumes only WP-4.7b rendered records; neither a record nor this adapter authorizes file writes.
     pub fn new(
         io: Arc<LinuxNativeIo>,

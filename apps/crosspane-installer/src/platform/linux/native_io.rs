@@ -1797,6 +1797,18 @@ fn validate_target(target: &LinuxTarget) -> Result<()> {
 }
 #[cfg(test)]
 type CommandAdmission = dyn Fn(&LinuxTarget) -> Result<()> + Send + Sync;
+/// Authenticated context equality only; descriptor freshness is checked separately.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TargetBinding {
+    nonce: u64,
+    paths: TargetPaths,
+    runtime: PathBuf,
+}
+impl std::fmt::Debug for TargetBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TargetBinding(..)")
+    }
+}
 pub struct LinuxNativeIo {
     pkexec_runner: Option<Arc<dyn PkexecRunner>>,
     target: LinuxTarget,
@@ -1820,6 +1832,85 @@ impl std::fmt::Debug for LinuxNativeIo {
     }
 }
 impl LinuxNativeIo {
+    pub(crate) fn target_binding(&self) -> TargetBinding {
+        TargetBinding {
+            nonce: self.target.nonce,
+            paths: self.target.paths.clone(),
+            runtime: self.target.runtime.clone(),
+        }
+    }
+    /// A bounded original-watch check, not a new watch or clean-exit authority.
+    pub(crate) fn revalidate_original_running(
+        self: &Arc<Self>,
+        watch: &ProcessWatch,
+        original: &BootstrapV1,
+        deadline: &Deadline,
+    ) -> Result<()> {
+        let (io, watch, original, d) = (
+            self.clone(),
+            watch.clone(),
+            original.clone(),
+            deadline.clone(),
+        );
+        bounded_launch(&READ_WORKERS, deadline, move || {
+            if watch.observe(&io, &d)? != ProcessExit::Running {
+                return Err(NativeError::Foreign);
+            }
+            let (current, process) = io.bootstrap(&d)?;
+            if current.instance_id != original.instance_id
+                || current.pid != original.pid
+                || current.started_unix_ms != original.started_unix_ms
+                || current.runtime_dir != original.runtime_dir
+                || current.phase_seq < original.phase_seq
+                || current.phase != crate::agent_contract::BootstrapPhase::Ready
+                || process != *watch.original()
+                || watch.observe(&io, &d)? != ProcessExit::Running
+            {
+                return Err(NativeError::Foreign);
+            }
+            d.check()
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn second_scratch_context(&self, proof: &SupportProof) -> Arc<Self> {
+        assert!(self.target.scratch);
+        proof.check(self).unwrap();
+        let root = self
+            .walk_dir(&self.target.paths.home, false)
+            .unwrap()
+            .unwrap();
+        rfs::mkdirat(&root, "second-context", Mode::RWXU).unwrap();
+        let context = self.target.paths.home.join("second-context");
+        let mut paths = self.target.paths.clone();
+        paths.config_home = context.join("config");
+        paths.state_home = context.join("state");
+        paths.data_home = context.join("data");
+        paths.runtime_home = context.join("run");
+        paths.runtime_override = None;
+        let io = Arc::new(Self {
+            target: LinuxTarget::make(paths, true).unwrap(),
+            runner: self.runner.clone(),
+            probe: self.probe.clone(),
+            files: self.files.clone(),
+            pkexec_runner: None,
+            command_admission: None,
+            command_workers: self.command_workers,
+            socket_uid: std::sync::Mutex::new(None),
+            peer_uid: std::sync::Mutex::new(None),
+            read_interleave: None,
+        });
+        let proof = io.scratch_support(proof.facts.clone()).unwrap();
+        for path in [
+            io.target.paths.config_home.join("crosspane"),
+            io.target.paths.state_home.join("crosspane/installer"),
+            io.target.paths.data_home.join("crosspane"),
+            io.target.runtime.clone(),
+        ] {
+            io.create_private_dir(&proof, &path).unwrap();
+        }
+        io.validate_target().unwrap();
+        io
+    }
     /// Root-owned, no-link reads in fixed namespaces. Scratch targets cannot probe the host.
     /// Font candidates stay within /usr/share/fonts and reject every link in the original path.
     /// ELF data is a bounded prefix only.

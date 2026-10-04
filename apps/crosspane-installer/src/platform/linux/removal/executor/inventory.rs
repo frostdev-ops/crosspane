@@ -22,6 +22,9 @@ pub struct CleanupInventory {
     pub(super) digest: [u8; 32],
 }
 impl CleanupInventory {
+    pub(super) fn target_binding(&self) -> crate::platform::linux::native_io::TargetBinding {
+        self.proof.target_binding()
+    }
     pub fn admit(proof: CleanupProof, deadline: &Deadline) -> Result<Self> {
         proof.revalidate(deadline)?;
         let digest =

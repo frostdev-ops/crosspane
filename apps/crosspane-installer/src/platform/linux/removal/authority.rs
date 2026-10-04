@@ -16,6 +16,23 @@ impl std::fmt::Debug for TrackedAgent {
     }
 }
 impl TrackedAgent {
+    /// A running-only original binding for a retained worker; grants no clean/erase capability.
+    pub(crate) fn running_check(&self) -> OriginalRunning {
+        OriginalRunning {
+            io: self.io.clone(),
+            bootstrap: self.bootstrap.clone(),
+            watch: self.watch.clone(),
+        }
+    }
+    pub(crate) fn target_binding(&self) -> super::super::native_io::TargetBinding {
+        self.io.target_binding()
+    }
+    /// The original process and bootstrap must still agree immediately before stop dispatch.
+    pub(crate) fn revalidate_running(&self, deadline: &Deadline) -> Result<()> {
+        Ok(self
+            .io
+            .revalidate_original_running(&self.watch, &self.bootstrap, deadline)?)
+    }
     pub fn capture(io: Arc<LinuxNativeIo>, deadline: &Deadline) -> Result<Self> {
         Self::capture_with(io, None, deadline)
     }
@@ -73,6 +90,27 @@ impl TrackedAgent {
         }
         deadline.check()?;
         Ok(receipt)
+    }
+}
+/// Non-cloneable, running-only worker capability; never serialized or caller-constructed.
+pub(crate) struct OriginalRunning {
+    io: Arc<LinuxNativeIo>,
+    bootstrap: BootstrapV1,
+    watch: ProcessWatch,
+}
+impl std::fmt::Debug for OriginalRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OriginalRunning(..)")
+    }
+}
+impl OriginalRunning {
+    pub(crate) fn pid(&self) -> u32 {
+        self.watch.original().pid
+    }
+    pub(crate) fn revalidate(&self, deadline: &Deadline) -> Result<()> {
+        Ok(self
+            .io
+            .revalidate_original_running(&self.watch, &self.bootstrap, deadline)?)
     }
 }
 /// Ephemeral original-process and literal-receipt authority; never serialized or caller-constructed.

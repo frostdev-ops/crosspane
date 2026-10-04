@@ -38,6 +38,9 @@ impl std::fmt::Debug for CleanupProof {
     }
 }
 impl CleanupProof {
+    pub(crate) fn target_binding(&self) -> TargetBinding {
+        self.0.io.target_binding()
+    }
     pub fn receipt(&self) -> &InstallReceipt {
         &self.0.receipt
     }
