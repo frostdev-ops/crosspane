@@ -35,8 +35,8 @@ impl TwinOrMirror {
 }
 
 impl WindowParking for TwinOrMirror {
-    fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("fullscreen is not implemented"))
+    fn set_fullscreen(&mut self, window: WindowId, fullscreen: bool) -> Result<(), PlatformError> {
+        self.backend(window).set_fullscreen(window, fullscreen)
     }
 
     fn park(
@@ -161,7 +161,8 @@ mod tests {
     }
 
     impl WindowParking for Fake {
-        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+        fn set_fullscreen(&mut self, w: WindowId, fullscreen: bool) -> Result<(), PlatformError> {
+            self.log(&format!("fullscreen {fullscreen}"), w);
             Err(PlatformError::Unsupported("fullscreen is not implemented"))
         }
 
@@ -240,6 +241,31 @@ mod tests {
                 "mirror restore 7"
             ]
         );
+    }
+
+    #[test]
+    fn fullscreen_routes_to_the_backend_that_parked_the_window() {
+        for mirrored in [false, true] {
+            let (mut parking, calls) = parking(mirrored);
+            parking
+                .park(WindowId(8), PixelSize::new(800, 600), 1.0)
+                .unwrap();
+            calls.lock().unwrap().clear();
+            for fullscreen in [true, false] {
+                assert!(matches!(
+                    parking.set_fullscreen(WindowId(8), fullscreen),
+                    Err(PlatformError::Unsupported(_))
+                ));
+            }
+            let backend = if mirrored { "mirror" } else { "twin" };
+            assert_eq!(
+                *calls.lock().unwrap(),
+                [
+                    format!("{backend} fullscreen true 8"),
+                    format!("{backend} fullscreen false 8")
+                ]
+            );
+        }
     }
 
     #[test]

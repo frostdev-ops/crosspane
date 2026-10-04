@@ -2242,7 +2242,7 @@ impl Agent {
                 });
             }
             Output::ResizeParked {
-                fullscreen: _,
+                fullscreen,
                 window,
                 size,
                 scale,
@@ -2251,6 +2251,7 @@ impl Agent {
                     window,
                     size,
                     scale,
+                    fullscreen,
                 });
             }
             Output::Restore { window, place } => {
@@ -2492,7 +2493,9 @@ impl Agent {
                 }
             }
             Output::ProxyFullscreen { key, fullscreen } => {
-                tracing::debug!(?key, fullscreen, "proxy fullscreen is not implemented");
+                if let (Some(host), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
+                    let _ = host.send(HostCommand::SetFullscreen { id, fullscreen });
+                }
             }
             Output::ProxyGeometry {
                 key,
@@ -4428,10 +4431,10 @@ impl Agent {
                 (id, Box::new(|key| proxy(key, ProxyEvent::CloseRequested)))
             }
             HostEvent::Lost { id } => (id, Box::new(|key| proxy(key, ProxyEvent::Lost))),
-            HostEvent::Fullscreen { id, fullscreen } => {
-                tracing::debug!(id, fullscreen, "proxy fullscreen event is not implemented");
-                return;
-            }
+            HostEvent::Fullscreen { id, fullscreen } => (
+                id,
+                Box::new(move |key| proxy(key, ProxyEvent::Fullscreen(fullscreen))),
+            ),
             HostEvent::Presented { id, frames } => {
                 if let Some(key) = self.proxy_ids.key(id) {
                     self.proxy_ids.presented(key, frames);
@@ -18812,5 +18815,252 @@ mod home_tests {
             .agent
             .execute(vec![Output::RemoveAudioPeer { peer: b }]);
         assert_eq!(audio(&h)["active_peers"], json!([]));
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_wiring_tests {
+    use super::*;
+    use crosspane_platform::ParkingKind;
+    use crosspane_platform::{Parked, WindowParking};
+    use crosspane_types::geom::PixelRect;
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+
+    struct Host(Arc<Mutex<Vec<HostCommand>>>);
+    impl ProxyCommands for Host {
+        fn send(&self, command: HostCommand) -> Result<(), crosspane_render::proxy::HostError> {
+            self.0.lock().unwrap().push(command);
+            Ok(())
+        }
+    }
+    #[test]
+    fn fullscreen_host_commands_and_events_use_the_current_proxy_mapping() {
+        let mut rig = super::audio_tests::rig(false);
+        let key = ProjectionKey {
+            source: rig.peer,
+            projection: ProjectionId(41),
+        };
+        let id = rig.agent.proxy_ids.open(key);
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        rig.agent.host = Some(Box::new(Host(commands.clone())));
+        for fullscreen in [true, false] {
+            rig.agent
+                .execute_one(Output::ProxyFullscreen { key, fullscreen });
+        }
+        assert!(matches!(commands.lock().unwrap().as_slice(),
+            [HostCommand::SetFullscreen { id: a, fullscreen: true },
+             HostCommand::SetFullscreen { id: b, fullscreen: false }] if *a == id && *b == id));
+        let before = rig.agent.fed.len();
+        rig.agent.on_host(HostEvent::Fullscreen {
+            id,
+            fullscreen: true,
+        });
+        rig.agent.on_host(HostEvent::Resized {
+            id,
+            size: PixelSize::new(900, 600),
+            scale: 2.0,
+        });
+        assert!(matches!(&rig.agent.fed[before..],
+            [Input::Proxy { key: a, event: ProxyEvent::Fullscreen(true) },
+             Input::Proxy { key: b, event: ProxyEvent::Resized { .. } }] if *a == key && *b == key));
+        rig.agent.proxy_ids.close(key);
+        let before = rig.agent.fed.len();
+        rig.agent.on_host(HostEvent::Fullscreen {
+            id,
+            fullscreen: false,
+        });
+        rig.agent.on_host(HostEvent::Fullscreen {
+            id: u64::MAX,
+            fullscreen: true,
+        });
+        rig.agent.execute_one(Output::ProxyFullscreen {
+            key,
+            fullscreen: true,
+        });
+        assert_eq!(rig.agent.fed.len(), before);
+        assert_eq!(commands.lock().unwrap().len(), 2);
+    }
+
+    type ParkingCall = (std::thread::ThreadId, &'static str, bool);
+
+    struct Parking {
+        calls: Arc<Mutex<Vec<ParkingCall>>>,
+        attempts: u8,
+        fullscreen: bool,
+        pause: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+    impl Parking {
+        fn parked(&self, window: WindowId, size: PixelSize) -> Parked {
+            Parked {
+                window,
+                kind: ParkingKind::Twin,
+                display: DisplayId(7),
+                content: PixelRect::from_size(size.cast()),
+                fullscreen: self.fullscreen,
+            }
+        }
+    }
+    impl WindowParking for Parking {
+        fn set_fullscreen(&mut self, _: WindowId, fullscreen: bool) -> Result<(), PlatformError> {
+            if let Some((entered, release)) = self.pause.take() {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push((std::thread::current().id(), "set", fullscreen));
+            self.attempts += 1;
+            match self.attempts {
+                1 => Err(PlatformError::Unsupported("fixture")),
+                2 => Err(PlatformError::Timeout),
+                _ => {
+                    self.fullscreen = fullscreen;
+                    Ok(())
+                }
+            }
+        }
+        fn park(&mut self, w: WindowId, s: PixelSize, _: f64) -> Result<Parked, PlatformError> {
+            Ok(self.parked(w, s))
+        }
+        fn resize(&mut self, w: WindowId, s: PixelSize, _: f64) -> Result<Parked, PlatformError> {
+            self.calls.lock().unwrap().push((
+                std::thread::current().id(),
+                "resize",
+                self.fullscreen,
+            ));
+            Ok(self.parked(w, s))
+        }
+        fn geometry(&self, w: WindowId) -> Result<Parked, PlatformError> {
+            Ok(self.parked(w, PixelSize::new(1, 1)))
+        }
+        fn restore(&mut self, _: WindowId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn restore_at(
+            &mut self,
+            _: WindowId,
+            _: DisplayId,
+            _: PointDevice,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+    #[test]
+    fn blocked_fullscreen_backend_does_not_block_the_engine_loop() {
+        let mut rig = super::audio_tests::rig(false);
+        let (entered, inside) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        rig.agent.platform.parking = Some(Box::new(Parking {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            attempts: 2,
+            fullscreen: false,
+            pause: Some((entered, resume)),
+        }));
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        rig.agent.host = Some(Box::new(Host(commands.clone())));
+        let key = ProjectionKey {
+            source: rig.peer,
+            projection: ProjectionId(41),
+        };
+        let id = rig.agent.proxy_ids.open(key);
+        let before = rig.agent.fed.len();
+        rig.agent.execute_one(Output::ResizeParked {
+            window: WindowId(10),
+            size: PixelSize::new(400, 300),
+            scale: 1.0,
+            fullscreen: true,
+        });
+        inside.recv_timeout(Duration::from_secs(2)).unwrap();
+        rig.agent.execute_one(Output::ProxyFullscreen {
+            key,
+            fullscreen: true,
+        });
+        assert!(matches!(commands.lock().unwrap().as_slice(),
+            [HostCommand::SetFullscreen { id: actual, fullscreen: true }] if *actual==id));
+        assert!(
+            !rig.agent.fed[before..]
+                .iter()
+                .any(|input| matches!(input, Input::Parked { .. }))
+        );
+        release.send(()).unwrap();
+        while !rig.agent.fed[before..]
+            .iter()
+            .any(|input| matches!(input, Input::Parked { .. }))
+        {
+            let event = rig.events.recv_timeout(Duration::from_secs(2)).unwrap();
+            rig.agent.on_event(event);
+        }
+        assert_eq!(
+            rig.agent.parking_shutdown(Duration::from_secs(1)),
+            crate::lifecycle::Parking::NothingParked
+        );
+        assert_eq!(rig.agent.fed[before..].iter()
+            .filter(|input| matches!(input,Input::Parked { result: Ok(parked), .. } if parked.fullscreen)).count(),1);
+    }
+
+    #[test]
+    fn resize_parked_ensures_fullscreen_off_loop_and_answers_once_with_actual_state() {
+        let mut rig = super::audio_tests::rig(false);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        rig.agent.platform.parking = Some(Box::new(Parking {
+            calls: calls.clone(),
+            attempts: 0,
+            fullscreen: false,
+            pause: None,
+        }));
+        let owner = std::thread::current().id();
+        for actual in [false, false, true] {
+            let before = rig.agent.fed.len();
+            rig.agent.execute_one(Output::ResizeParked {
+                window: WindowId(10),
+                size: PixelSize::new(400, 300),
+                scale: 1.0,
+                fullscreen: true,
+            });
+            while !rig.agent.fed[before..]
+                .iter()
+                .any(|input| matches!(input, Input::Parked { .. }))
+            {
+                let event = rig.events.recv_timeout(Duration::from_secs(2)).unwrap();
+                rig.agent.on_event(event);
+            }
+            let answers: Vec<_> = rig.agent.fed[before..]
+                .iter()
+                .filter_map(|input| {
+                    if let Input::Parked { result, .. } = input {
+                        Some(result)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(answers.len(), 1);
+            assert_eq!(answers[0].as_ref().unwrap().fullscreen, actual);
+        }
+        assert_eq!(
+            rig.agent.parking_shutdown(Duration::from_secs(1)),
+            crate::lifecycle::Parking::NothingParked
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(_, name, flag)| (*name, *flag))
+                .collect::<Vec<_>>(),
+            [
+                ("set", true),
+                ("resize", false),
+                ("set", true),
+                ("resize", false),
+                ("set", true),
+                ("resize", true)
+            ]
+        );
+        assert!(calls.iter().all(|(thread, _, _)| *thread != owner));
     }
 }

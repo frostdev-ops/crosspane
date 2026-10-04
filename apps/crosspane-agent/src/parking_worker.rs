@@ -33,6 +33,7 @@ pub(crate) enum Command {
         window: WindowId,
         size: PixelSize,
         scale: f64,
+        fullscreen: bool,
     },
     Restore {
         window: WindowId,
@@ -429,10 +430,30 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
             window,
             size,
             scale,
+            ..
         } => {
             let result = match job.command {
                 Command::Park { .. } => backend.park(window, size, scale),
-                _ => backend.resize(window, size, scale),
+                Command::Resize { fullscreen, .. } => {
+                    tracing::debug!(
+                        operation = job.id,
+                        window = window.0,
+                        fullscreen,
+                        ?size,
+                        scale,
+                        cause = "ResizeParked",
+                        "ensuring parked fullscreen before resize"
+                    );
+                    match backend.set_fullscreen(window, fullscreen) {
+                        Ok(()) => backend.resize(window, size, scale),
+                        Err(error @ (PlatformError::Unsupported(_) | PlatformError::Timeout)) => {
+                            tracing::debug!(%error, "parked fullscreen request was not confirmed");
+                            backend.resize(window, size, scale)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                _ => unreachable!(),
             }
             .map_err(|error| {
                 tracing::warn!(%error, operation = job.id, "parking operation failed");
@@ -678,6 +699,7 @@ pub(crate) mod tests {
 
     fn resize(window: u64, width: u32) -> Command {
         Command::Resize {
+            fullscreen: false,
             window: WindowId(window),
             size: PixelSize::new(width, 100),
             scale: 1.0,
