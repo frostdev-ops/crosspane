@@ -1180,8 +1180,7 @@ fn r1_target_clones_and_support_renewal_keep_shared_latch() {
 #[test]
 fn r1_target_lifetime_latch_admission_is_bounded_without_eviction() {
     let f = Fixture::new();
-    let mut handles = Vec::new();
-    for id in 100..100 + MAX_NATIVE_CALLS as u64 {
+    let admit = |id| {
         f.root.put(
             &f.io.target().runtime_dir().join("bootstrap.json"),
             &serde_json::to_vec(&json!({
@@ -1192,34 +1191,52 @@ fn r1_target_lifetime_latch_admission_is_bounded_without_eviction() {
             .unwrap(),
             0o600,
         );
+        // Each observation has fresh genuine support; the Arc/io target never changes.
+        let proof = f.io.admit_support(&f.signature, &f.deadline()).unwrap();
         let instance = Arc::new(
-            f.io.admit_instance(&f.proof, &f.signature, &f.deadline())
+            f.io.admit_instance(&proof, &f.signature, &f.deadline())
                 .unwrap(),
         );
+        (instance, proof)
+    };
+    let mut handles = Vec::new();
+    for id in 100..100 + MAX_NATIVE_CALLS as u64 {
+        let (instance, proof) = admit(id);
         handles.push(
-            f.io.track_original(&f.proof, &f.signature, instance, &f.deadline())
+            f.io.track_original(&proof, &f.signature, instance, &f.deadline())
                 .unwrap(),
         );
+        // Capacity must remain independent of the whole loop's support-proof lifetime.
+        f.clock
+            .0
+            .fetch_add(SUPPORT_LIFETIME_MS + 1, Ordering::Release);
     }
+    assert_eq!(handles.len(), MAX_NATIVE_CALLS);
     drop(handles);
-    f.root.put(
-        &f.io.target().runtime_dir().join("bootstrap.json"),
-        &serde_json::to_vec(&json!({
-            "schema_version":1,"instance_id":999,"pid":4242,"started_unix_ms":0,
-            "phase":"ready","phase_seq":1,"keystore":"os_store","reason":null,
-            "runtime_dir":f.io.target().runtime_dir()
-        }))
-        .unwrap(),
-        0o600,
-    );
-    let instance = Arc::new(
-        f.io.admit_instance(&f.proof, &f.signature, &f.deadline())
-            .unwrap(),
-    );
     assert_eq!(
-        f.io.track_original(&f.proof, &f.signature, instance, &f.deadline())
+        f.proof.check(&f.io, &f.deadline()),
+        Err(NativeError::Unsupported),
+        "expired support is distinct from the target-lifetime latch budget"
+    );
+    let (instance, proof) = admit(999);
+    assert_eq!(
+        f.io.track_original(&proof, &f.signature, instance, &f.deadline())
             .unwrap_err(),
         NativeError::Busy
+    );
+    // A retained key remains admissible after dropping all handles and renewing support.
+    let (instance, proof) = admit(100);
+    let retained =
+        f.io.track_original(&proof, &f.signature, instance, &f.deadline())
+            .unwrap();
+    assert_eq!(retained.instance_id(), 100);
+    assert_eq!(retained.process(), f.instance.process());
+    let (instance, proof) = admit(999);
+    assert_eq!(
+        f.io.track_original(&proof, &f.signature, instance, &f.deadline())
+            .unwrap_err(),
+        NativeError::Busy,
+        "reusing an old key must not reset or evict the full target budget"
     );
     assert_eq!(f.dispatches(), 0);
 }
