@@ -34,6 +34,31 @@ use objc2_core_graphics::{
 
 use crate::{clock, permissions};
 
+mod drag;
+
+struct PreparedBegin {
+    tap_ready: bool,
+    tap: Option<CFRetained<CFMachPort>>,
+    display: Display,
+    location: CGPoint,
+    held_keys: Vec<crosspane_types::hid::HidUsage>,
+    locks: LockKeys,
+}
+
+fn drag_allowed(
+    button: MouseButton,
+    held: HeldButtons,
+    detected: bool,
+) -> Result<(), PlatformError> {
+    if button != MouseButton::PRIMARY {
+        return Err(PlatformError::Unsupported("begin_drag button"));
+    }
+    if !detected || !held.get(0) || (1..HeldButtons::CAPACITY).any(|n| held.get(n)) {
+        return Err(PlatformError::PointerButtonHeld);
+    }
+    Ok(())
+}
+
 const CALL_BUDGET: Duration = Duration::from_millis(50);
 const DELIVERY_LIMIT: usize = 4_096;
 const INJECTED: i64 = 0x0043_5049_4E4A;
@@ -937,6 +962,13 @@ enum Command {
         Arc<Request>,
         Sender<Result<CaptureStart, PlatformError>>,
     ),
+    BeginDrag(
+        CaptureId,
+        PortalId,
+        u64,
+        Arc<Request>,
+        Sender<Result<CaptureStart, PlatformError>>,
+    ),
     Monitor(bool, Arc<Request>, Sender<Result<(), PlatformError>>),
 }
 
@@ -947,7 +979,7 @@ impl Command {
             Self::Subscribe(_, _, reply) | Self::Monitor(_, _, reply) => {
                 let _ = reply.send(Err(error));
             }
-            Self::Begin(_, _, _, _, reply) => {
+            Self::Begin(_, _, _, _, reply) | Self::BeginDrag(_, _, _, _, reply) => {
                 let _ = reply.send(Err(error));
             }
         }
@@ -1157,6 +1189,43 @@ impl InputCapture for MacCapture {
         self.shared.finish(EndReason::Requested, warp_to)
     }
 
+    fn begin_drag(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        button: MouseButton,
+    ) -> Result<CaptureStart, PlatformError> {
+        if button != MouseButton::PRIMARY {
+            return Err(PlatformError::Unsupported("begin_drag button"));
+        }
+        if !self.shared.gate.is_open() {
+            return Err(PlatformError::Locked);
+        }
+        self.shared.available()?;
+        if secure_input() {
+            return Err(PlatformError::SecureInput);
+        }
+        let request = self.request();
+        let token = self.next_token;
+        self.next_token = token
+            .checked_add(1)
+            .filter(|value| *value <= u64::MAX >> 2)
+            .ok_or_else(|| PlatformError::Backend("capture generation exhausted".into()))?;
+        let (reply, receiver) = mpsc::channel();
+        self.send(Command::BeginDrag(
+            id,
+            portal,
+            token,
+            request.clone(),
+            reply,
+        ))?;
+        let result = self.wait(receiver, &request);
+        if result.is_err() {
+            let _ = self.shared.finish_token(EndReason::Lost, token);
+        }
+        result
+    }
+
     fn abort_handle(&self) -> Arc<dyn CaptureAbort> {
         Arc::new(Abort(self.shared.clone()))
     }
@@ -1200,6 +1269,12 @@ struct TapState {
     suppressed_buttons: [u64; 256],
     /// Every button the tap saw go down and not yet up, whether or not capture suppressed it.
     held_buttons: HeldButtons,
+    drag: drag::Move,
+    window_at: Box<dyn Fn(CGPoint) -> Result<Option<drag::WindowFact>, PlatformError>>,
+    tiling_busy: Arc<AtomicBool>,
+    settled_primary: bool,
+    settled_capture: u64,
+    settled_tail_until: Option<Instant>,
 }
 
 impl TapState {
@@ -1295,9 +1370,19 @@ impl TapState {
         });
         self.portal_config = portals.clone();
         self.portals = portals;
+        for event in self.drag.clear(at) {
+            self.shared.event(0, event);
+        }
     }
 
     fn release_edges(&mut self, at: MonoTime) {
+        self.release_plain_edges(at);
+        for event in self.drag.clear(at) {
+            self.shared.event(0, event);
+        }
+    }
+
+    fn release_plain_edges(&mut self, at: MonoTime) {
         for portal in self.pressed.drain() {
             self.shared
                 .event(0, CaptureEvent::EdgeReleased { portal, at });
@@ -1309,11 +1394,27 @@ impl TapState {
         id: CaptureId,
         portal: PortalId,
         token: u64,
+        dragging: bool,
         request: Arc<Request>,
         reply: Sender<Result<CaptureStart, PlatformError>>,
     ) {
         self.sync_portals();
-        let result = self.prepare_begin(portal, token, &request);
+        self.begin_with(id, token, request, reply, |state, request| {
+            state.prepare_begin(portal, token, request, dragging)
+        });
+    }
+
+    /// The complete production commit/rollback path, with native preparation injected by the
+    /// caller so fake tests exercise recovery and delivery rather than manually repairing state.
+    fn begin_with(
+        &mut self,
+        id: CaptureId,
+        token: u64,
+        request: Arc<Request>,
+        reply: Sender<Result<CaptureStart, PlatformError>>,
+        prepare: impl FnOnce(&mut Self, &Request) -> Result<CaptureStart, PlatformError>,
+    ) {
+        let result = prepare(self, &request);
         match result {
             Ok(start) => {
                 let _ = self.shared.queue(Delivery::Activate {
@@ -1343,6 +1444,7 @@ impl TapState {
         portal: PortalId,
         token: u64,
         request: &Request,
+        dragging: bool,
     ) -> Result<CaptureStart, PlatformError> {
         if !request.valid(&self.shared) {
             return Err(PlatformError::Timeout);
@@ -1353,7 +1455,7 @@ impl TapState {
         if secure_input() {
             return Err(PlatformError::SecureInput);
         }
-        if (0..=4).any(|b| CGEventSource::button_state(SESSION, CGMouseButton(b))) {
+        if !dragging && (0..=4).any(|b| CGEventSource::button_state(SESSION, CGMouseButton(b))) {
             return Err(PlatformError::PointerButtonHeld);
         }
         check_permissions()?;
@@ -1363,17 +1465,61 @@ impl TapState {
         if self.shared.active.load(Ordering::Acquire) != 0 {
             return Err(PlatformError::Backend("capture already active".into()));
         }
-        self.shared.restore_cursor()?;
         let portal = self
             .portals
             .iter()
             .find(|p| p.portal.id == portal)
             .ok_or(PlatformError::NotFound)?;
+        let dragged = if dragging {
+            let mut held = self.held_buttons;
+            // Dragged proves left was held even if setup missed its down; refresh every other
+            // known held button, plus the standard buttons, before authorizing settlement.
+            for number in 0..HeldButtons::CAPACITY {
+                if number <= 4 || held.get(number) {
+                    held.set(
+                        number,
+                        CGEventSource::button_state(SESSION, CGMouseButton(number as u32)),
+                    );
+                }
+            }
+            drag_allowed(
+                MouseButton::PRIMARY,
+                held,
+                self.drag.at_edge(portal.portal.id).is_some(),
+            )?;
+            self.drag.at_edge(portal.portal.id)
+        } else {
+            None
+        };
         // Refresh geometry at activation, rather than assuming the portal's display is unchanged.
         let display = Display::read(portal.display.id)?;
         let current = CGEvent::new(None)
             .ok_or_else(|| PlatformError::Backend("read frozen cursor location".into()))?;
         let location = CGEvent::location(Some(&current));
+        let up = if let Some((window, _)) = dragged {
+            if drag::distance(*portal, location) > 1.0
+                || (location.x - self.drag.pointer.x).hypot(location.y - self.drag.pointer.y) > 1.0
+                || !(self.window_at)(location)?
+                    .is_some_and(|now| now.window == window.window && now.pid == window.pid)
+            {
+                return Err(PlatformError::PointerButtonHeld);
+            }
+            let up = CGEvent::new_mouse_event(
+                None,
+                CGEventType::LeftMouseUp,
+                location,
+                CGMouseButton::Left,
+            )
+            .ok_or_else(|| PlatformError::Backend("create drag settlement up".into()))?;
+            CGEvent::set_integer_value_field(
+                Some(&up),
+                CGEventField::EventSourceUserData,
+                INJECTED,
+            );
+            Some(up)
+        } else {
+            None
+        };
         let display = if location.x >= display.bounds.origin.x
             && location.x <= display.bounds.origin.x + display.bounds.size.width
             && location.y >= display.bounds.origin.y
@@ -1413,8 +1559,67 @@ impl TapState {
             }
         }
         self.lock_keys = locks(CGEventSource::flags_state(SESSION));
-        self.display = Some(display);
-        self.release_edges(clock::now());
+        let prepared = PreparedBegin {
+            tap_ready: true,
+            tap: self.tap.clone(),
+            display,
+            location,
+            held_keys,
+            locks: self.lock_keys,
+        };
+        let result = self.activate_begin(
+            token,
+            request,
+            prepared,
+            up.as_ref().map(|up| {
+                move || {
+                    CGEvent::post(CGEventTapLocation::SessionEventTap, Some(up));
+                }
+            }),
+        );
+        if result.is_ok()
+            && let Some((window, before)) = dragged
+        {
+            if let Some(before) = before {
+                drag::correct_tiling(window, before, display.id, self.tiling_busy.clone());
+            } else {
+                tracing::warn!(
+                    window = window.window.0,
+                    "drag tiling correction skipped: no observed pre-edge frame"
+                );
+            }
+        }
+        result
+    }
+
+    /// Shared native/fake activation sequence. The installed tap was validated by preparation;
+    /// all fallible cursor setup precedes the irreversible session up. Delivery may still fail
+    /// afterward, in which case the suppressed-button ledger outlives that capture generation.
+    fn activate_begin(
+        &mut self,
+        token: u64,
+        request: &Request,
+        prepared: PreparedBegin,
+        post_up: Option<impl FnOnce()>,
+    ) -> Result<CaptureStart, PlatformError> {
+        if !request.valid(&self.shared) {
+            return Err(PlatformError::Timeout);
+        }
+        if !self.shared.gate.is_open() {
+            return Err(PlatformError::Locked);
+        }
+        if !prepared.tap_ready {
+            return Err(PlatformError::Backend("event tap unavailable".into()));
+        }
+        self.shared.restore_cursor()?;
+        self.display = Some(prepared.display);
+        if post_up.is_some() {
+            // This crossing owns the detected drag. Keep it until settlement commits, and do
+            // not emit a cancellation to the engine between its command and Started.
+            self.release_plain_edges(clock::now());
+        } else {
+            self.release_edges(clock::now());
+        }
         self.shared
             .active
             .compare_exchange(0, token << 2 | PENDING, Ordering::AcqRel, Ordering::Acquire)
@@ -1423,7 +1628,7 @@ impl TapState {
         if !request.valid(&self.shared) || !self.shared.gate.is_open() {
             return Err(PlatformError::Locked);
         }
-        self.start_pin(token, request.epoch, display, location)?;
+        self.start_pin(token, request.epoch, prepared.display, prepared.location)?;
         (self.shared.cursor.associate)(false)?;
         self.shared.detached.store(true, Ordering::Release);
         if !request.valid(&self.shared)
@@ -1439,15 +1644,44 @@ impl TapState {
         self.shared.hidden.store(true, Ordering::Release);
         if !request.valid(&self.shared)
             || self.shared.active.load(Ordering::Acquire) != token << 2 | PENDING
+            || !self.shared.gate.is_open()
         {
             let _ = self.shared.finish(EndReason::Lost, None);
-            return Err(PlatformError::Timeout);
+            return Err(if self.shared.gate.is_open() {
+                PlatformError::Timeout
+            } else {
+                PlatformError::Locked
+            });
+        }
+        if let Some(post_up) = post_up {
+            if prepared
+                .tap
+                .as_ref()
+                .is_some_and(|tap| !CGEvent::tap_is_enabled(tap))
+            {
+                return Err(PlatformError::Backend(
+                    "event tap unavailable before settlement".into(),
+                ));
+            }
+            // Record suppression BEFORE posting, just as injection owns a down before exposing
+            // it. This up owes no synthetic mate, including on panic/abort/activation timeout.
+            self.suppressed_buttons[0] = token;
+            self.held_buttons.set(0, true);
+            self.settled_primary = true;
+            self.settled_capture = token;
+            self.settled_tail_until = None;
+            self.drag = drag::Move::default();
+            post_up();
+            tracing::info!(
+                token,
+                "native window move settled: one session primary up posted"
+            );
         }
         // Disassociation and hiding are best-effort foreground behavior (WP-1.19).
         // Background capture also pins swallowed motion with public warps on this tap thread.
         Ok(CaptureStart {
-            held_keys,
-            lock_keys: self.lock_keys,
+            held_keys: prepared.held_keys,
+            lock_keys: prepared.locks,
         })
     }
 
@@ -1496,7 +1730,10 @@ impl TapState {
                     let _ = reply.send(result);
                 }
                 Command::Begin(id, portal, token, request, reply) => {
-                    self.begin(id, portal, token, request, reply)
+                    self.begin(id, portal, token, false, request, reply)
+                }
+                Command::BeginDrag(id, portal, token, request, reply) => {
+                    self.begin(id, portal, token, true, request, reply)
                 }
                 Command::Monitor(on, request, reply) => {
                     let result = if request.valid(&self.shared) {
@@ -1589,18 +1826,78 @@ impl TapState {
                     *token = 0;
                 }
             }
-            for (number, token) in self.suppressed_buttons.iter_mut().enumerate() {
-                if *token != 0
-                    && !CGEventSource::button_state(SESSION, CGMouseButton(number as u32))
-                {
-                    *token = 0;
-                }
-            }
+            self.reconcile_buttons(Instant::now(), |source, number| {
+                CGEventSource::button_state(source, CGMouseButton(number as u32))
+            });
         }
         if self.shared.stop.load(Ordering::Acquire) {
             // Dropping ends capture immediately, but the tap remains for suppressed ups.
             self.stop_when_released();
         }
+    }
+
+    fn reconcile_buttons(
+        &mut self,
+        now: Instant,
+        mut held: impl FnMut(CGEventSourceStateID, usize) -> bool,
+    ) {
+        if self.settled_primary && self.suppressed_buttons[0] != 0 {
+            let released = !held(CGEventSourceStateID::HIDSystemState, 0);
+            // HID can report released before the session callback is queued. Keep ownership
+            // until that callback consumes the up; one second bounds a genuinely missed up.
+            self.pending_settled_tail(now, released);
+        }
+        for (number, token) in self.suppressed_buttons.iter_mut().enumerate() {
+            if number == 0 && self.settled_primary {
+                continue;
+            }
+            if *token != 0 && !held(SESSION, number) {
+                *token = 0;
+            }
+        }
+    }
+
+    fn pending_settled_tail(&mut self, now: Instant, start_timeout: bool) -> bool {
+        if !self.settled_primary || self.suppressed_buttons[0] == 0 {
+            return false;
+        }
+        if start_timeout {
+            self.settled_tail_until
+                .get_or_insert(now + Duration::from_secs(1));
+        }
+        if self.settled_tail_until.is_some_and(|until| now >= until) {
+            self.suppressed_buttons[0] = 0;
+            self.settled_primary = false;
+            self.settled_tail_until = None;
+            return false;
+        }
+        true
+    }
+
+    /// Minimal terminal path: no delivery, capture, lookup or cursor work. Keep owning this
+    /// irreversible physical tail while the existing tap lives, even if its consumer is dead.
+    fn swallow_settled_tail(&mut self, kind: CGEventType, event: &CGEvent) -> bool {
+        if !self.owns_settled_tail(kind, event) {
+            return false;
+        }
+        if kind == CGEventType::LeftMouseUp {
+            self.suppressed_buttons[0] = 0;
+            self.settled_primary = false;
+            self.settled_tail_until = None;
+            self.held_buttons.set(0, false);
+        }
+        true
+    }
+
+    fn owns_settled_tail(&self, kind: CGEventType, event: &CGEvent) -> bool {
+        self.settled_primary
+            && self.suppressed_buttons[0] != 0
+            && matches!(
+                kind,
+                CGEventType::LeftMouseDragged | CGEventType::LeftMouseUp
+            )
+            && CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUserData)
+                != INJECTED
     }
 
     fn stop_when_released(&self) {
@@ -1617,7 +1914,21 @@ impl TapState {
         while let Ok(command) = self.commands.try_recv() {
             command.fail();
         }
-        if let Some(run_loop) = CFRunLoop::current() {
+        // Keep the settled tail for as long as the physical button is down. The one-second bound
+        // starts only once HID reports the release, as in reconcile_buttons.
+        let released = self.settled_primary
+            && !CGEventSource::button_state(
+                CGEventSourceStateID::HIDSystemState,
+                CGMouseButton::Left,
+            );
+        if self.pending_settled_tail(Instant::now(), released) {
+            // Dead callbacks never re-enable the tap; the tail still needs it.
+            if let Some(tap) = &self.tap
+                && !CGEvent::tap_is_enabled(tap)
+            {
+                CGEvent::tap_enable(tap, true);
+            }
+        } else if let Some(run_loop) = CFRunLoop::current() {
             run_loop.stop();
         }
     }
@@ -1663,7 +1974,7 @@ impl TapState {
     /// Returns true only when the OS should receive this event.
     fn event(&mut self, kind: CGEventType, event: &CGEvent) -> bool {
         if self.shared.dead.load(Ordering::Acquire) {
-            return true;
+            return !self.swallow_settled_tail(kind, event);
         }
         if matches!(
             kind,
@@ -1743,8 +2054,33 @@ impl TapState {
                     PointerInput::Dragged
                 };
                 self.edge_input(input, &hits, at);
+                if kind == CGEventType::LeftMouseDragged && self.suppressed_buttons[0] == 0 {
+                    if self.drag.should_lookup(true, &self.portals, location) {
+                        match (self.window_at)(location) {
+                            Ok(window) => self.drag.sample(window, location, &self.portals),
+                            Err(error) => {
+                                tracing::debug!(%error, "drag window lookup unavailable");
+                                self.drag.sample(None, location, &self.portals);
+                            }
+                        }
+                    } else {
+                        for event in self.drag.clear(at) {
+                            self.shared.event(0, event);
+                        }
+                    }
+                    for event in self.drag.update(&self.portals, &hits, at) {
+                        self.shared.event(0, event);
+                    }
+                } else {
+                    for event in self.drag.clear(at) {
+                        self.shared.event(0, event);
+                    }
+                }
             }
-            return !capturing || self.shared.dead.load(Ordering::Acquire);
+            let settled_tail = kind == CGEventType::LeftMouseDragged
+                && self.settled_primary
+                && self.suppressed_buttons[0] != 0;
+            return (!capturing && !settled_tail) || self.shared.dead.load(Ordering::Acquire);
         }
         if matches!(
             kind,
@@ -1823,6 +2159,11 @@ impl TapState {
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp | CGEventType::OtherMouseUp
         );
         if button_down || button_up {
+            if matches!(kind, CGEventType::LeftMouseDown | CGEventType::LeftMouseUp) {
+                for event in self.drag.clear(at) {
+                    self.shared.event(0, event);
+                }
+            }
             let number = match kind {
                 CGEventType::LeftMouseDown | CGEventType::LeftMouseUp => 0,
                 CGEventType::RightMouseDown | CGEventType::RightMouseUp => 1,
@@ -1849,6 +2190,10 @@ impl TapState {
                 if button_up {
                     let pressed_in = self.suppressed_buttons[index];
                     self.suppressed_buttons[index] = 0;
+                    if index == 0 {
+                        self.settled_primary = false;
+                        self.settled_tail_until = None;
+                    }
                     if capturing
                         && pressed_in == token
                         && let Some(button) = button(number)
@@ -1864,6 +2209,12 @@ impl TapState {
                     }
                 }
                 return self.shared.dead.load(Ordering::Acquire);
+            }
+            if index == 0 && self.settled_capture == token && capturing {
+                if button_up {
+                    return false;
+                }
+                self.settled_capture = 0;
             }
             if capturing {
                 if button_down {
@@ -1926,8 +2277,25 @@ unsafe extern "C-unwind" fn tap_callback(
     // SAFETY: TapGuard owns this Box until after all callback sources are invalidated, even
     // during unwinding. Callbacks run serially on this thread and never recurse into the loop.
     let state = unsafe { &mut *info.cast::<TapState>() };
+    // Record ownership before event() consumes the up, including a concurrent delivery failure.
+    let owned_tail = if matches!(
+        kind,
+        CGEventType::LeftMouseDragged | CGEventType::LeftMouseUp
+    ) {
+        // SAFETY: known mouse callbacks borrow a non-null CGEvent for this invocation only.
+        unsafe { event.as_ref() }.is_some_and(|input| state.owns_settled_tail(kind, input))
+    } else {
+        false
+    };
     let result = catch_unwind(AssertUnwindSafe(|| {
         if state.shared.dead.load(Ordering::Acquire) {
+            // SAFETY: callback borrows a non-null CGEvent only for this invocation; disabled
+            // notifications may be null and never enter the settled-tail matcher.
+            if let Some(input) = unsafe { event.as_ref() }
+                && state.swallow_settled_tail(kind, input)
+            {
+                return ptr::null_mut();
+            }
             return event;
         }
         if matches!(
@@ -1948,11 +2316,15 @@ unsafe extern "C-unwind" fn tap_callback(
         }
     }));
     match result {
+        // event() may see delivery die during a pin and request the ordinary fail-open path.
+        // A settled physical tail is still ours, including the up that already cleared its ledger.
+        Ok(_) if owned_tail => ptr::null_mut(),
         Ok(result) if !state.shared.dead.load(Ordering::Acquire) => result,
         Ok(_) => event,
         Err(_) => {
             state.failed_callback();
-            event
+            // A panic while handling the settled tail must not hand the seat a second up.
+            if owned_tail { ptr::null_mut() } else { event }
         }
     }
 }
@@ -2052,6 +2424,12 @@ fn run_tap(
         suppressed_keys: [0; 128],
         suppressed_buttons: [0; 256],
         held_buttons: HeldButtons::default(),
+        drag: drag::Move::default(),
+        window_at: Box::new(drag::under_pointer),
+        tiling_busy: Arc::new(AtomicBool::new(false)),
+        settled_primary: false,
+        settled_capture: 0,
+        settled_tail_until: None,
     }));
     let mut guard = TapGuard {
         state,
@@ -2190,6 +2568,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCursor {
         calls: Mutex<Vec<(CursorCall, u64)>>,
+        fail_hide: AtomicBool,
         owner: Mutex<std::sync::Weak<Shared>>,
         position: Mutex<Option<CGPoint>>,
         pause: Mutex<Option<(Sender<()>, Receiver<()>)>>,
@@ -2220,6 +2599,9 @@ mod tests {
                 }),
                 hide: Box::new(move || {
                     hide.record(CursorCall::Hide);
+                    if hide.fail_hide.load(Ordering::Acquire) {
+                        return Err(PlatformError::Backend("fake hide refused".into()));
+                    }
                     Ok(())
                 }),
                 show: Box::new(move || {
@@ -2815,6 +3197,607 @@ mod tests {
         (tap, receiver)
     }
 
+    #[test]
+    fn settled_primary_tail_is_swallowed_after_early_end() {
+        let (mut tap, receiver, _) = tap_cursor_fixture(true);
+        let request = drag_request(&tap);
+        tap.activate_begin(1, &request, drag_prepared(), Some(|| {}))
+            .unwrap();
+        tap.shared.finish(EndReason::Requested, None).unwrap();
+        assert!(!tap.event(
+            CGEventType::LeftMouseDragged,
+            &pointer(CGEventType::LeftMouseDragged, 0, false)
+        ));
+        assert!(!tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, false)
+        ));
+        assert!(receiver.try_iter().all(|message| !matches!(
+            message,
+            Delivery::Event(_, CaptureEvent::Button { .. } | CaptureEvent::Motion { .. })
+        )));
+    }
+
+    fn drag_request(tap: &TapState) -> Request {
+        Request {
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancelled: AtomicBool::new(false),
+            epoch: tap.shared.epoch.load(Ordering::Acquire),
+        }
+    }
+
+    fn drag_prepared() -> PreparedBegin {
+        PreparedBegin {
+            tap_ready: true,
+            tap: None,
+            display: Display {
+                id: DisplayId(1),
+                bounds: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(100.0, 100.0)),
+                scale: 2.0,
+            },
+            location: CGPoint::new(99.0, 40.0),
+            held_keys: vec![],
+            locks: LockKeys::default(),
+        }
+    }
+
+    #[test]
+    fn drag_refusal_requires_detected_portal_and_primary_only_without_actions() {
+        let (mut tap, _, cursor) = tap_cursor_fixture(true);
+        let mut held = HeldButtons::default();
+        held.set(0, true);
+        assert!(matches!(
+            drag_allowed(MouseButton(2), held, true),
+            Err(PlatformError::Unsupported("begin_drag button"))
+        ));
+        assert!(matches!(
+            drag_allowed(MouseButton::PRIMARY, held, false),
+            Err(PlatformError::PointerButtonHeld)
+        ));
+        held.set(1, true);
+        assert!(matches!(
+            drag_allowed(MouseButton::PRIMARY, held, true),
+            Err(PlatformError::PointerButtonHeld)
+        ));
+        assert!(cursor.calls.lock().unwrap().is_empty());
+        let posted = std::cell::Cell::new(0);
+        let mut prepared = drag_prepared();
+        prepared.tap_ready = false;
+        assert!(
+            tap.activate_begin(
+                1,
+                &drag_request(&tap),
+                prepared,
+                Some(|| posted.set(posted.get() + 1))
+            )
+            .is_err()
+        );
+        assert_eq!(posted.get(), 0);
+        assert!(cursor.calls.lock().unwrap().is_empty());
+        tap.shared.gate.set_engine_permits(false);
+        assert!(matches!(
+            tap.activate_begin(
+                1,
+                &drag_request(&tap),
+                drag_prepared(),
+                Some(|| posted.set(1))
+            ),
+            Err(PlatformError::Locked)
+        ));
+        assert_eq!(posted.get(), 0);
+        assert!(cursor.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn drag_cursor_setup_failure_rolls_back_before_any_up() {
+        let (mut tap, _, cursor) = tap_cursor_fixture(true);
+        cursor.fail_hide.store(true, Ordering::Release);
+        let posted = std::cell::Cell::new(0);
+        let request = Arc::new(drag_request(&tap));
+        let (reply, answer) = mpsc::channel();
+        tap.begin_with(CaptureId(1), 1, request, reply, |tap, request| {
+            tap.activate_begin(1, request, drag_prepared(), Some(|| posted.set(1)))
+        });
+        assert!(answer.recv().unwrap().is_err());
+        assert_eq!(posted.get(), 0);
+        assert_eq!(tap.suppressed_buttons[0], 0);
+        assert_eq!(tap.shared.active.load(Ordering::Acquire), 0);
+        assert!(!tap.shared.detached.load(Ordering::Acquire));
+        assert!(!tap.shared.hidden.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drag_settlement_follows_installed_tap_and_cursor_setup_and_delivers_one_up() {
+        let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+        let posted = std::cell::Cell::new(0);
+        let request = drag_request(&tap);
+        let start = tap
+            .activate_begin(
+                1,
+                &request,
+                drag_prepared(),
+                Some(|| {
+                    assert_eq!(
+                        cursor
+                            .calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|(call, _)| call.clone())
+                            .collect::<Vec<_>>(),
+                        [CursorCall::Associate(false), CursorCall::Hide]
+                    );
+                    posted.set(posted.get() + 1);
+                }),
+            )
+            .unwrap();
+        assert_eq!(posted.get(), 1);
+        assert!(start.held_keys.is_empty());
+        assert!(tap.settled_primary);
+        assert!(!tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, false)
+        ));
+        // A duplicate physical up is swallowed in capture, but never emitted twice.
+        assert!(!tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, false)
+        ));
+        let ups = receiver
+            .try_iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Delivery::Event(
+                        1,
+                        CaptureEvent::Button {
+                            button: MouseButton::PRIMARY,
+                            down: false,
+                            ..
+                        }
+                    )
+                )
+            })
+            .count();
+        assert_eq!(ups, 1);
+    }
+
+    #[test]
+    fn drag_begin_sequence_delivers_start_one_up_and_end_without_late_events() {
+        let (mut tap, receiver, _) = tap_cursor_fixture(true);
+        let shared = tap.shared.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        shared
+            .queue(Delivery::Subscribe(
+                Arc::new(move |event| out.lock().unwrap().push(event)),
+                LockKeys::default(),
+                false,
+            ))
+            .unwrap();
+        let worker = std::thread::spawn(move || deliver(shared, receiver));
+        let posted = std::cell::Cell::new(0);
+        let request = Arc::new(drag_request(&tap));
+        let (reply, answer) = mpsc::channel();
+        tap.begin_with(CaptureId(1), 1, request, reply, |tap, request| {
+            tap.activate_begin(
+                1,
+                request,
+                drag_prepared(),
+                Some(|| posted.set(posted.get() + 1)),
+            )
+        });
+        answer
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            assert!(!tap.event(
+                CGEventType::LeftMouseUp,
+                &pointer(CGEventType::LeftMouseUp, 0, false)
+            ));
+        }
+        tap.shared.finish(EndReason::Requested, None).unwrap();
+        // Model an event already queued by the tap while end was taking ownership. The delivery
+        // generation check must drop it after Ended, even though the queue accepts the message.
+        tap.shared.event(
+            1,
+            CaptureEvent::Button {
+                button: MouseButton::PRIMARY,
+                down: false,
+                at: clock::now(),
+            },
+        );
+        tap.shared.queue(Delivery::Stop).unwrap();
+        worker.join().unwrap();
+        assert_eq!(posted.get(), 1);
+        let events = events.lock().unwrap();
+        let sequence: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    CaptureEvent::Started { .. }
+                        | CaptureEvent::Button { .. }
+                        | CaptureEvent::Ended { .. }
+                )
+            })
+            .collect();
+        assert!(matches!(
+            sequence.as_slice(),
+            [
+                CaptureEvent::Started { id: CaptureId(1) },
+                CaptureEvent::Button {
+                    button: MouseButton::PRIMARY,
+                    down: false,
+                    ..
+                },
+                CaptureEvent::Ended {
+                    id: CaptureId(1),
+                    reason: EndReason::Requested
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn detected_pressed_drag_begin_does_not_release_consumed_edge_before_started() {
+        let (mut tap, receiver, _) = tap_cursor_fixture(true);
+        for x in [40.0, 45.0, 99.0] {
+            tap.drag.sample(
+                Some(drag::WindowFact {
+                    window: crosspane_types::id::WindowId(42),
+                    pid: 7,
+                    scale: 1.0,
+                    frame: crosspane_types::geom::RectLogical::new(
+                        crosspane_types::geom::PointLogical::new(x - 80.0, 38.0),
+                        crosspane_types::geom::SizeLogical::new(400.0, 300.0),
+                    ),
+                }),
+                CGPoint::new(x, 50.0),
+                &tap.portals,
+            );
+        }
+        for event in tap
+            .drag
+            .update(&tap.portals, &[(PortalId(1), 50.0)], clock::now())
+        {
+            tap.shared.event(0, event);
+        }
+        assert!(tap.drag.at_edge(PortalId(1)).is_some());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        tap.shared
+            .queue(Delivery::Subscribe(
+                Arc::new(move |event| out.lock().unwrap().push(event)),
+                LockKeys::default(),
+                false,
+            ))
+            .unwrap();
+        let request = Arc::new(drag_request(&tap));
+        let (reply, answer) = mpsc::channel();
+        tap.begin_with(CaptureId(1), 1, request, reply, |tap, request| {
+            tap.activate_begin(1, request, drag_prepared(), Some(|| {}))
+        });
+        tap.shared.queue(Delivery::Stop).unwrap();
+        deliver(tap.shared.clone(), receiver);
+        answer.recv().unwrap().unwrap();
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CaptureEvent::Started { .. }))
+        );
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            CaptureEvent::EdgeReleased {
+                portal: PortalId(1),
+                ..
+            }
+        )));
+        assert!(tap.drag.at_edge(PortalId(1)).is_none());
+    }
+
+    #[test]
+    fn failed_activation_enqueue_keeps_settled_tail_in_native_callback() {
+        for failure in 0..3 {
+            let (mut tap, receiver, _) = tap_cursor_fixture(true);
+            let mut receiver = Some(receiver);
+            match failure {
+                0 => drop(receiver.take()),
+                1 => {
+                    for _ in 0..DELIVERY_LIMIT {
+                        tap.shared
+                            .output
+                            .try_send(Delivery::Event(
+                                0,
+                                CaptureEvent::LockKeys(LockKeys::default()),
+                            ))
+                            .unwrap();
+                    }
+                }
+                _ => tap
+                    .shared
+                    .queue(Delivery::Subscribe(
+                        Arc::new(|event| {
+                            if matches!(event, CaptureEvent::Started { .. }) {
+                                panic!("fake sink refused Started");
+                            }
+                        }),
+                        LockKeys::default(),
+                        false,
+                    ))
+                    .unwrap(),
+            }
+            let posted = std::cell::Cell::new(0);
+            let request = Arc::new(drag_request(&tap));
+            let (reply, answer) = mpsc::channel();
+            tap.begin_with(CaptureId(1), 1, request, reply, |tap, request| {
+                tap.activate_begin(1, request, drag_prepared(), Some(|| posted.set(1)))
+            });
+            if failure == 2 {
+                deliver(tap.shared.clone(), receiver.take().unwrap());
+            }
+            assert!(!answer.recv().is_ok_and(|reply| reply.is_ok()));
+            assert_eq!(posted.get(), 1);
+            assert!(tap.shared.dead.load(Ordering::Acquire));
+            assert!(tap.pending_settled_tail(Instant::now(), true));
+            for kind in [CGEventType::LeftMouseDragged, CGEventType::LeftMouseUp] {
+                let event = pointer(kind, 0, false);
+                // SAFETY: fake tap state remains alive; CGEvent is borrowed, never posted, and no
+                // native tap exists. This invokes the production callback's terminal branch only.
+                let result = unsafe {
+                    tap_callback(
+                        ptr::null_mut(),
+                        kind,
+                        (&*event as *const CGEvent).cast_mut(),
+                        (&mut tap as *mut TapState).cast(),
+                    )
+                };
+                assert!(
+                    result.is_null(),
+                    "settled physical tail passed after delivery failed"
+                );
+            }
+            assert_eq!(tap.suppressed_buttons[0], 0);
+            assert!(!tap.pending_settled_tail(Instant::now(), true));
+        }
+    }
+
+    #[test]
+    fn settled_tail_callback_keeps_ownership_when_delivery_fails_mid_event() {
+        let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+        tap.shared
+            .queue(Delivery::Subscribe(
+                Arc::new(|_| {}),
+                LockKeys::default(),
+                false,
+            ))
+            .unwrap();
+        let shared = tap.shared.clone();
+        let delivery = std::thread::spawn(move || deliver(shared, receiver));
+        let request = Arc::new(drag_request(&tap));
+        let (reply, answer) = mpsc::channel();
+        tap.begin_with(CaptureId(1), 1, request, reply, |tap, request| {
+            tap.activate_begin(1, request, drag_prepared(), Some(|| {}))
+        });
+        answer
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let (entered, resume) = cursor.pause_next_warp();
+        let shared = tap.shared.clone();
+        let failure = std::thread::spawn(move || {
+            entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            shared.fail();
+            resume.send(()).unwrap();
+        });
+        let event = pointer(CGEventType::LeftMouseDragged, 0, false);
+        CGEvent::set_location(Some(&event), CGPoint::new(70.0, 40.0));
+        // SAFETY: the production callback borrows an unposted test event and fake tap state;
+        // every cursor operation is injected, so there is no real tap or native mutation.
+        let result = unsafe {
+            tap_callback(
+                ptr::null_mut(),
+                CGEventType::LeftMouseDragged,
+                (&*event as *const CGEvent).cast_mut(),
+                (&mut tap as *mut TapState).cast(),
+            )
+        };
+        failure.join().unwrap();
+        let _ = tap.shared.output.send(Delivery::Stop);
+        delivery.join().unwrap();
+        assert!(tap.shared.dead.load(Ordering::Acquire));
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn settled_tail_survives_a_panic_while_handling_it() {
+        let (mut tap, _receiver, cursor) = tap_cursor_fixture(true);
+        tap.activate_begin(1, &drag_request(&tap), drag_prepared(), Some(|| {}))
+            .unwrap();
+        // The fake warp panics when its pause receiver is gone: a panic inside event() while it
+        // handles one of the settled tail's drags.
+        let (paused, _resume) = cursor.pause_next_warp();
+        drop(paused);
+        let event = pointer(CGEventType::LeftMouseDragged, 0, false);
+        CGEvent::set_location(Some(&event), CGPoint::new(70.0, 40.0));
+        // SAFETY: the production callback borrows an unposted test event and fake tap state;
+        // every cursor operation is injected, so there is no real tap or native mutation.
+        let result = unsafe {
+            tap_callback(
+                ptr::null_mut(),
+                CGEventType::LeftMouseDragged,
+                (&*event as *const CGEvent).cast_mut(),
+                (&mut tap as *mut TapState).cast(),
+            )
+        };
+        assert!(tap.shared.dead.load(Ordering::Acquire));
+        assert!(result.is_null(), "a panic passed a settled drag to the OS");
+        assert_eq!(tap.suppressed_buttons[0], 1);
+    }
+
+    #[test]
+    fn dead_settled_tail_is_kept_while_the_button_is_held() {
+        let (mut tap, _, _) = tap_cursor_fixture(true);
+        tap.activate_begin(1, &drag_request(&tap), drag_prepared(), Some(|| {}))
+            .unwrap();
+        tap.shared.fail();
+        let now = Instant::now();
+        // Still held (HID down): no bound, however long the hold.
+        assert!(tap.pending_settled_tail(now, false));
+        assert!(tap.pending_settled_tail(now + Duration::from_secs(60), false));
+        // Released in HID without the callback: one second, then the tap may go.
+        let released = now + Duration::from_secs(61);
+        assert!(tap.pending_settled_tail(released, true));
+        assert!(!tap.pending_settled_tail(released + Duration::from_millis(1000), false));
+        assert_eq!(tap.suppressed_buttons[0], 0);
+    }
+
+    #[test]
+    fn hid_released_before_up_callback_does_not_retire_settled_suppression() {
+        let (mut tap, _, _) = tap_cursor_fixture(true);
+        tap.activate_begin(1, &drag_request(&tap), drag_prepared(), Some(|| {}))
+            .unwrap();
+        tap.shared.finish(EndReason::Requested, None).unwrap();
+        let mut queries = Vec::new();
+        tap.reconcile_buttons(Instant::now(), |source, number| {
+            queries.push((source, number));
+            false
+        });
+        assert_eq!(queries, [(CGEventSourceStateID::HIDSystemState, 0)]);
+        assert!(tap.settled_primary);
+        assert_eq!(tap.suppressed_buttons[0], 1);
+        assert!(!tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, false)
+        ));
+        assert_eq!(tap.suppressed_buttons[0], 0);
+        tap.activate_begin(2, &drag_request(&tap), drag_prepared(), Some(|| {}))
+            .unwrap();
+        tap.shared.finish(EndReason::Requested, None).unwrap();
+        let now = Instant::now();
+        tap.reconcile_buttons(now, |_, _| false);
+        tap.reconcile_buttons(now + Duration::from_millis(1001), |_, _| false);
+        assert_eq!(
+            tap.suppressed_buttons[0], 0,
+            "a missed callback is bounded to one second"
+        );
+    }
+
+    #[test]
+    fn drag_post_up_abort_preserves_tail_and_never_posts_another_up() {
+        let (mut tap, receiver, _) = tap_cursor_fixture(true);
+        let shared = tap.shared.clone();
+        let request = Arc::new(drag_request(&tap));
+        let posted = std::cell::Cell::new(0);
+        let start = tap
+            .activate_begin(
+                1,
+                &request,
+                drag_prepared(),
+                Some(|| {
+                    posted.set(posted.get() + 1);
+                    shared.finish(EndReason::Aborted, None).unwrap();
+                }),
+            )
+            .unwrap();
+        assert!(!tap.event(
+            CGEventType::LeftMouseDragged,
+            &pointer(CGEventType::LeftMouseDragged, 0, false)
+        ));
+        assert!(!tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, false)
+        ));
+        assert_eq!(tap.suppressed_buttons[0], 0);
+        let (reply, answer) = mpsc::channel();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        shared
+            .queue(Delivery::Subscribe(
+                Arc::new(move |event| out.lock().unwrap().push(event)),
+                LockKeys::default(),
+                false,
+            ))
+            .unwrap();
+        shared
+            .queue(Delivery::Activate {
+                token: 1,
+                id: CaptureId(1),
+                start,
+                request,
+                reply,
+            })
+            .unwrap();
+        shared.queue(Delivery::Stop).unwrap();
+        deliver(shared, receiver);
+        assert!(answer.recv().unwrap().is_err());
+        assert_eq!(posted.get(), 1);
+    }
+
+    #[test]
+    fn tap_detector_wiring_uses_fake_window_facts_and_releases_on_physical_up() {
+        let (mut tap, receiver, _) = tap_cursor_fixture(true);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        tap.window_at = Box::new(move |point| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(drag::WindowFact {
+                window: crosspane_types::id::WindowId(42),
+                pid: 98126,
+                scale: 1.0,
+                frame: crosspane_types::geom::RectLogical::new(
+                    crosspane_types::geom::PointLogical::new(point.x - 80.0, point.y - 12.0),
+                    crosspane_types::geom::SizeLogical::new(400.0, 300.0),
+                ),
+            }))
+        });
+        for x in [40.0, 45.0, 99.0] {
+            let event = pointer(CGEventType::LeftMouseDragged, 0, false);
+            CGEvent::set_location(Some(&event), CGPoint::new(x, 50.0));
+            assert!(tap.event(CGEventType::LeftMouseDragged, &event));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let events: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(events.iter().filter(|event| matches!(event,
+            Delivery::Event(0, CaptureEvent::DragAtEdge { window: crosspane_types::id::WindowId(42), grab, .. }) if *grab == PointDevice::new(80.0, 12.0)
+        )).count(), 1);
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                Delivery::Event(0, CaptureEvent::EdgePressed { .. })
+            ))
+        );
+        assert!(tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, false)
+        ));
+        assert!(receiver.try_iter().any(|event| matches!(
+            event,
+            Delivery::Event(
+                0,
+                CaptureEvent::EdgeReleased {
+                    portal: PortalId(1),
+                    ..
+                }
+            )
+        )));
+    }
+
+    #[test]
+    fn marked_settlement_up_passes_without_consuming_physical_tail() {
+        let (mut tap, _, _) = tap_cursor_fixture(true);
+        tap.activate_begin(1, &drag_request(&tap), drag_prepared(), Some(|| {}))
+            .unwrap();
+        assert!(tap.event(
+            CGEventType::LeftMouseUp,
+            &pointer(CGEventType::LeftMouseUp, 0, true)
+        ));
+        assert!(tap.settled_primary);
+        assert_eq!(tap.suppressed_buttons[0], 1);
+    }
+
     fn tap_cursor_fixture(pin_enabled: bool) -> (TapState, Receiver<Delivery>, Arc<FakeCursor>) {
         let (shared, receiver, cursor) = shared_cursor_fixture(pin_enabled);
         let display = Display {
@@ -2855,6 +3838,12 @@ mod tests {
                 suppressed_keys: [0; 128],
                 suppressed_buttons: [0; 256],
                 held_buttons: HeldButtons::default(),
+                drag: drag::Move::default(),
+                window_at: Box::new(|_| Ok(None)),
+                tiling_busy: Arc::new(AtomicBool::new(false)),
+                settled_primary: false,
+                settled_capture: 0,
+                settled_tail_until: None,
             },
             receiver,
             cursor,

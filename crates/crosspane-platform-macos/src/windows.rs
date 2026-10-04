@@ -644,6 +644,8 @@ enum AxPolicy {
     /// window is another window unless its title or its frame says it is this one.
     #[cfg_attr(not(feature = "private-vdisplay"), allow(dead_code))]
     Twin,
+    /// Strict geometry verification for the drag's observed native tile.
+    VerifiedFrame,
 }
 
 /// The slack between the Quartz frame and an AX frame of the same window, in points.
@@ -666,6 +668,17 @@ fn match_ax_window(
     match policy {
         AxPolicy::Mirror => match_mirror(title, frame, candidates),
         AxPolicy::Twin => match_twin(title, frame, candidates),
+        AxPolicy::VerifiedFrame => {
+            let mut hits = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| ax_frame_matches(candidate.frame, frame));
+            match (hits.next(), hits.next()) {
+                (Some((index, _)), None) => AxMatch::One(index),
+                (Some(_), Some(_)) => AxMatch::Ambiguous,
+                _ => AxMatch::Missing,
+            }
+        }
     }
 }
 
@@ -676,7 +689,7 @@ fn match_fullscreen_ax(
     candidates: &[AxCandidate],
     fullscreen: bool,
 ) -> AxMatch {
-    if !fullscreen {
+    if !fullscreen || policy == AxPolicy::VerifiedFrame {
         return match_ax_window(policy, title, frame, candidates);
     }
     let framed = |c: &AxCandidate| ax_frame_matches(c.frame, frame);
@@ -920,9 +933,17 @@ impl AxWindow {
     /// on another Space (or one covered by a title-less fullscreen stand-in) has no AX
     /// counterpart: that is [`AxLookup::Missing`], not an error, and callers decide whether it
     /// matters.
-    #[cfg(feature = "private-vdisplay")]
     pub(crate) fn lookup(raw: &RawWindow, deadline: Instant) -> Result<AxLookup, PlatformError> {
         Self::lookup_with(raw, deadline, AxPolicy::Twin)
+    }
+
+    /// Drag tiling may write only a unique AX window at the observed Quartz frame. No title,
+    /// lone-window or fullscreen fallback admits a different frame.
+    pub(crate) fn lookup_verified_frame(
+        raw: &RawWindow,
+        deadline: Instant,
+    ) -> Result<AxLookup, PlatformError> {
+        Self::lookup_with(raw, deadline, AxPolicy::VerifiedFrame)
     }
 
     fn lookup_with(
@@ -955,7 +976,7 @@ impl AxWindow {
             };
             // Only worth a round trip when Quartz has a title. Mirror reads it as it always did,
             // failing on a window whose title can't be read; the twin treats that as untitled.
-            let title = if raw.title.is_empty() {
+            let title = if raw.title.is_empty() || policy == AxPolicy::VerifiedFrame {
                 None
             } else if policy == AxPolicy::Mirror && !fullscreen {
                 Some(
@@ -1070,6 +1091,23 @@ impl AxWindow {
         self.restore_guarded(frame, &mut || true).map(|_| ())
     }
 
+    /// Position only: a successful parking restore owns size, which may be read-only or newer
+    /// than Quartz. Recheck caller authority immediately before attempting this public AX write.
+    pub(crate) fn position_guarded(
+        &self,
+        origin: PointLogical,
+        allowed: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, PlatformError> {
+        position_with(origin, allowed, |attribute, origin| {
+            let mut position = CGPoint::new(origin.x, origin.y);
+            // SAFETY: public CGPoint AXValue type and initialized storage; AX copies the value.
+            let value =
+                unsafe { AXValue::new(AXValueType::CGPoint, NonNull::from(&mut position).cast()) }
+                    .ok_or_else(|| PlatformError::Backend("create AX position".into()))?;
+            self.set(attribute, &value)
+        })
+    }
+
     /// [`AxWindow::restore`], but `allowed` is asked immediately before each of the two writes
     /// (size, then position). `Ok(false)`: it said no, and nothing further was written (a no
     /// after the size write leaves the new size). The twin uses it to re-read Quartz after the AX
@@ -1103,10 +1141,99 @@ impl AxWindow {
     }
 }
 
+fn position_with(
+    origin: PointLogical,
+    allowed: &mut dyn FnMut() -> bool,
+    position: impl FnOnce(&str, PointLogical) -> Result<(), PlatformError>,
+) -> Result<bool, PlatformError> {
+    if !origin.x.is_finite() || !origin.y.is_finite() {
+        return Err(PlatformError::Backend("invalid AX position".into()));
+    }
+    if !allowed() {
+        return Ok(false);
+    }
+    position("AXPosition", origin)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use objc2_core_graphics::CGRectCreateDictionaryRepresentation;
+
+    #[test]
+    fn drag_verified_frame_lookup_refuses_lone_unrelated_and_equal_candidates() {
+        let tile = rect(900.0, 0.0, 900.0, 1100.0);
+        let unrelated = rect(100.0, 100.0, 400.0, 300.0);
+        assert_eq!(
+            match_ax_window(
+                AxPolicy::VerifiedFrame,
+                "",
+                tile,
+                &[candidate(None, unrelated)]
+            ),
+            AxMatch::Missing
+        );
+        assert_eq!(
+            match_fullscreen_ax(
+                AxPolicy::VerifiedFrame,
+                "Tile",
+                tile,
+                &[candidate(Some("Tile"), unrelated)],
+                true
+            ),
+            AxMatch::Missing
+        );
+        assert_eq!(
+            match_ax_window(
+                AxPolicy::VerifiedFrame,
+                "Tile",
+                tile,
+                &[candidate(Some("Other"), tile)]
+            ),
+            AxMatch::One(0)
+        );
+        assert_eq!(
+            match_ax_window(
+                AxPolicy::VerifiedFrame,
+                "Tile",
+                tile,
+                &[
+                    candidate(Some("Tile"), tile),
+                    candidate(Some("Other"), tile)
+                ]
+            ),
+            AxMatch::Ambiguous
+        );
+    }
+
+    #[test]
+    fn drag_position_only_accepts_read_only_size_and_rechecks_before_write() {
+        use std::cell::Cell;
+        let writes = Cell::new(0);
+        assert!(
+            position_with(
+                PointLogical::new(40.0, 50.0),
+                &mut || true,
+                |attribute, _| {
+                    if attribute == "AXSize" {
+                        return Err(PlatformError::Unsupported("read-only size"));
+                    }
+                    assert_eq!(attribute, "AXPosition");
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(writes.get(), 1);
+        assert!(
+            !position_with(PointLogical::new(40.0, 50.0), &mut || false, |_, _| panic!(
+                "position must not be written"
+            ))
+            .unwrap()
+        );
+    }
 
     #[test]
     #[allow(clippy::unwrap_used)]

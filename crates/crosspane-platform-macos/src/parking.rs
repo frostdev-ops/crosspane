@@ -9,14 +9,16 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{Parked, ParkingKind, PlatformError, WindowParking};
-use crosspane_types::geom::{PixelRect, PixelSize, PointLogical, RectLogical, SizeLogical, euclid};
+use crosspane_types::geom::{
+    PixelRect, PixelSize, PointDevice, PointLogical, RectLogical, SizeLogical, euclid,
+};
 use crosspane_types::id::{DisplayId, WindowId};
 use objc2_core_graphics::{
     CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplayRotation,
 };
 
 use crate::windows::{
-    AxWindow, FULLSCREEN_WAIT, RawWindow, WindowQuery, bounds_equal, display_for_frame,
+    AxLookup, AxWindow, FULLSCREEN_WAIT, RawWindow, WindowQuery, bounds_equal, display_for_frame,
     ensure_fullscreen_with, fullscreen_pause, fullscreen_press_needed, quartz_fullscreen,
     require_accessibility, valid_frame,
 };
@@ -390,6 +392,18 @@ impl WindowParking for MacMirrorParking {
         }
     }
 
+    fn restore_at(
+        &mut self,
+        window: WindowId,
+        display: DisplayId,
+        origin: PointDevice,
+    ) -> Result<(), PlatformError> {
+        restore_and_place(
+            || self.restore(window),
+            || place_restored_window(window, display, origin, false),
+        )
+    }
+
     fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
         match self.request(Command::Recover)? {
             Reply::Restored(windows) => Ok(windows),
@@ -397,6 +411,178 @@ impl WindowParking for MacMirrorParking {
         }
     }
 }
+
+/// Public AX placement shared with twin parking. Restore/journal ownership stays with callers;
+/// a placement refusal after successful restore never turns that restore into a failure.
+pub(crate) fn restore_and_place(
+    restore: impl FnOnce() -> Result<(), PlatformError>,
+    place: impl FnOnce() -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    restore()?;
+    if let Err(error) = place() {
+        tracing::warn!(%error, "restored window placement refused; restore remains successful");
+    }
+    Ok(())
+}
+
+pub(crate) fn place_restored_window(
+    window: WindowId,
+    display: DisplayId,
+    origin: PointDevice,
+    twin: bool,
+) -> Result<(), PlatformError> {
+    let deadline = Instant::now() + CALL_WAIT;
+    let (bounds, scale) = display_metrics(display)?;
+    let visible = crate::displays::visible_frame(display)?;
+    let query = frame_query()?;
+    let raw = query
+        .list_until(false, deadline)?
+        .into_iter()
+        .find(|raw| raw.id == window)
+        .ok_or(PlatformError::NotFound)?;
+    let ax = placement_lookup_with(
+        twin,
+        || AxWindow::find(&raw, deadline),
+        || match AxWindow::lookup(&raw, deadline)? {
+            AxLookup::Found(ax) => Ok(ax),
+            AxLookup::Missing(_) => Err(PlatformError::NotFound),
+        },
+    )?;
+    placement_with(
+        raw.frame,
+        bounds,
+        visible,
+        scale,
+        origin,
+        || ax.frame(),
+        || {
+            query.list_until(false, deadline).map(|windows| {
+                windows
+                    .iter()
+                    .any(|now| now.id == raw.id && now.pid == raw.pid && now.on_screen)
+            })
+        },
+        |frame| {
+            if ax.position_guarded(frame.origin, &mut || {
+                Instant::now() < deadline
+                    && query.list_until(false, deadline).is_ok_and(|windows| {
+                        windows
+                            .iter()
+                            .any(|now| now.id == raw.id && now.pid == raw.pid && now.on_screen)
+                    })
+            })? {
+                Ok(())
+            } else {
+                Err(PlatformError::Timeout)
+            }
+        },
+    )
+}
+
+fn placement_lookup_with<T>(
+    twin: bool,
+    mirror: impl FnOnce() -> Result<T, PlatformError>,
+    conservative: impl FnOnce() -> Result<T, PlatformError>,
+) -> Result<T, PlatformError> {
+    if twin { conservative() } else { mirror() }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn placement_with(
+    _quartz: RectLogical,
+    bounds: RectLogical,
+    visible: RectLogical,
+    scale: f64,
+    origin: PointDevice,
+    current_ax: impl FnOnce() -> Result<RectLogical, PlatformError>,
+    still_visible: impl FnOnce() -> Result<bool, PlatformError>,
+    place: impl FnOnce(RectLogical) -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
+    let frame = placement_frame(current_ax()?, bounds, visible, scale, origin)?;
+    if !still_visible()? {
+        return Err(PlatformError::NotFound);
+    }
+    place(frame)
+}
+
+/// Share one read worker across placement/tiling cleanup, including after a WindowServer read
+/// times out. A late native read must not create a new blocked query thread on every gesture.
+pub(crate) fn frame_query() -> Result<WindowQuery, PlatformError> {
+    static QUERY: std::sync::Mutex<Option<WindowQuery>> = std::sync::Mutex::new(None);
+    let mut query = QUERY
+        .lock()
+        .map_err(|_| PlatformError::Backend("frame query store poisoned".into()))?;
+    if query.is_none() {
+        *query = Some(WindowQuery::new()?);
+    }
+    query
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| PlatformError::Backend("frame query unavailable".into()))
+}
+
+pub(crate) fn set_window_frame(
+    raw: &RawWindow,
+    frame: RectLogical,
+    deadline: Instant,
+    mut allowed: impl FnMut() -> bool,
+) -> Result<(), PlatformError> {
+    if !valid_frame(frame) {
+        return Err(PlatformError::Backend("invalid AX placement frame".into()));
+    }
+    let ax = match AxWindow::lookup_verified_frame(raw, deadline)? {
+        AxLookup::Found(ax) => ax,
+        AxLookup::Missing(_) => return Err(PlatformError::NotFound),
+    };
+    if !bounds_equal(ax.frame()?, raw.frame) {
+        return Err(PlatformError::NotFound);
+    }
+    if ax.restore_guarded(frame, &mut allowed)? {
+        Ok(())
+    } else {
+        Err(PlatformError::Timeout)
+    }
+}
+
+fn placement_frame(
+    frame: RectLogical,
+    bounds: RectLogical,
+    visible: RectLogical,
+    scale: f64,
+    origin: PointDevice,
+) -> Result<RectLogical, PlatformError> {
+    if !valid_frame(frame)
+        || !valid_frame(bounds)
+        || !valid_frame(visible)
+        || !scale.is_finite()
+        || scale <= 0.0
+        || !origin.x.is_finite()
+        || !origin.y.is_finite()
+    {
+        return Err(PlatformError::Backend(
+            "invalid restore placement geometry".into(),
+        ));
+    }
+    let x = bounds.min_x() + origin.x / scale;
+    let y = bounds.min_y() + origin.y / scale;
+    Ok(RectLogical::new(
+        PointLogical::new(
+            x.clamp(
+                visible.min_x(),
+                (visible.max_x() - frame.size.width).max(visible.min_x()),
+            ),
+            y.clamp(
+                visible.min_y(),
+                (visible.max_y() - frame.size.height).max(visible.min_y()),
+            ),
+        ),
+        frame.size,
+    ))
+}
+
+#[cfg(test)]
+#[path = "../tests/drag/placement.rs"]
+mod placement_tests;
 
 fn check_size(size: PixelSize) -> Result<(), PlatformError> {
     if size.width == 0 || size.height == 0 {

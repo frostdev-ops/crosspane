@@ -1696,6 +1696,18 @@ impl WindowParking for MacTwinParking {
         self.state()?.restore(window).map(|_| ())
     }
 
+    fn restore_at(
+        &mut self,
+        window: WindowId,
+        display: DisplayId,
+        origin: crosspane_types::geom::PointDevice,
+    ) -> Result<(), PlatformError> {
+        crate::parking::restore_and_place(
+            || self.restore(window),
+            || crate::parking::place_restored_window(window, display, origin, true),
+        )
+    }
+
     fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
         let mut state = self.state()?;
         let mut restored = Vec::new();
