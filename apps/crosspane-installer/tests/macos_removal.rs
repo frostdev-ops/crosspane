@@ -32,12 +32,13 @@ impl Scratch {
         let root = rfs::open("/", DIR, rfs::Mode::empty()).unwrap();
         let private = rfs::openat(root, "private", DIR, rfs::Mode::empty()).unwrap();
         let parent = rfs::openat(private, "tmp", DIR, rfs::Mode::empty()).unwrap();
-        let name = format!(
-            "cp-remove-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        rfs::mkdirat(&parent, name.as_str(), rfs::Mode::RWXU).unwrap();
+        let name = Self::create_directory(&parent, || {
+            format!(
+                "cp-remove-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )
+        });
         let fd = rfs::openat(&parent, name.as_str(), DIR, rfs::Mode::empty()).unwrap();
         let stat = rfs::fstat(&fd).unwrap();
         assert_eq!(stat.st_uid, rustix::process::geteuid().as_raw());
@@ -48,6 +49,17 @@ impl Scratch {
             fd,
             name,
         })
+    }
+    fn create_directory(parent: &OwnedFd, mut next: impl FnMut() -> String) -> String {
+        for _ in 0..64 {
+            let name = next();
+            match rfs::mkdirat(parent, name.as_str(), rfs::Mode::RWXU) {
+                Ok(()) => return name,
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => panic!("scratch directory creation failed: {error}"),
+            }
+        }
+        panic!("scratch directory names exhausted after 64 attempts")
     }
     fn directory(&self, path: &Path) -> OwnedFd {
         let mut fd = rustix::io::dup(&self.fd).unwrap();
@@ -4668,6 +4680,1419 @@ mod a2_tests {
                 NativeError::Refused
             );
             assert_no_dispatch(&r);
+        }
+    }
+
+    // API-scaffold red stage: baseline has no lease API. All operations below are scratch/fake.
+    mod b2a2_tests {
+        use super::*;
+        use crate::{rfs, same};
+
+        #[test]
+        fn b2a2_scratch_collision_uses_fresh_name_and_preserves_existing() {
+            let scratch = Scratch::new();
+            let occupied = scratch.path.join("occupied");
+            scratch.put(&occupied.join("marker"), b"keep", 0o600);
+            let before =
+                rfs::statat(&scratch.fd, "occupied", rfs::AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            let mut calls = 0;
+            let name = Scratch::create_directory(&scratch.fd, || {
+                calls += 1;
+                if calls == 1 { "occupied" } else { "fresh" }.into()
+            });
+            assert_eq!(calls, 2);
+            assert_eq!(name, "fresh");
+            assert!(same(
+                &before,
+                &rfs::statat(&scratch.fd, "occupied", rfs::AtFlags::SYMLINK_NOFOLLOW).unwrap()
+            ));
+            assert_eq!(std::fs::read(occupied.join("marker")).unwrap(), b"keep");
+            let created =
+                rfs::statat(&scratch.fd, "fresh", rfs::AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            assert_eq!(created.st_mode & 0o777, 0o700);
+            assert_eq!(created.st_uid, rustix::process::geteuid().as_raw());
+        }
+
+        #[test]
+        fn b2a2_scratch_collision_retry_is_bounded_and_preserves_existing() {
+            let scratch = Scratch::new();
+            let marker = scratch.path.join("occupied/marker");
+            scratch.put(&marker, b"keep", 0o600);
+            let mut calls = 0;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Scratch::create_directory(&scratch.fd, || {
+                    calls += 1;
+                    "occupied".into()
+                })
+            }));
+            assert!(result.is_err());
+            assert_eq!(calls, 64);
+            assert_eq!(std::fs::read(marker).unwrap(), b"keep");
+        }
+
+        #[derive(Default)]
+        struct Counts {
+            filesystem: AtomicU64,
+            support: AtomicU64,
+            signature: AtomicU64,
+        }
+        struct CountSupport(Arc<Support>, Arc<Counts>);
+        impl SupportProbe for CountSupport {
+            fn observe(&self, d: &Deadline) -> NativeResult<SupportObservation> {
+                self.1.support.fetch_add(1, Ordering::AcqRel);
+                self.0.observe(d)
+            }
+        }
+        struct CountSignature(Arc<Signatures>, Arc<Counts>);
+        impl SignatureProbe for CountSignature {
+            fn observe(
+                &self,
+                p: &Path,
+                requirement: &SigningRequirement,
+                d: &Deadline,
+            ) -> NativeResult<SignatureObservation> {
+                self.1.signature.fetch_add(1, Ordering::AcqRel);
+                self.0.observe(p, requirement, d)
+            }
+        }
+        fn counted() -> (Rig, Arc<Counts>) {
+            let mut r = Rig::new();
+            let counts = Arc::new(Counts::default());
+            let mut target = r.io.target().clone();
+            let previous = target.test_hook.take().unwrap();
+            let tracked = counts.clone();
+            target.test_hook = Some(Arc::new(move |stage, path, identity| {
+                tracked.filesystem.fetch_add(1, Ordering::AcqRel);
+                previous(stage, path, identity)
+            }));
+            r.io = Arc::new(
+                MacNativeIo::new(
+                    target,
+                    r.runner.clone(),
+                    Arc::new(CountSupport(r.support.clone(), counts.clone())),
+                    Arc::new(CountSignature(r.signatures.clone(), counts.clone())),
+                    r.clock.clone(),
+                )
+                .unwrap(),
+            );
+            (r, counts)
+        }
+        fn all_counts(r: &Rig, c: &Counts) -> (usize, u64, u64, u64) {
+            (
+                counters(r),
+                c.filesystem.load(Ordering::Acquire),
+                c.support.load(Ordering::Acquire),
+                c.signature.load(Ordering::Acquire),
+            )
+        }
+
+        fn assert_read_only(r: &Rig) {
+            assert!(r.runner.calls.lock().unwrap().iter().all(|c| {
+                !c.1.iter()
+                    .any(|a| matches!(a.as_str(), "disable" | "bootout" | "erase-identity"))
+            }));
+        }
+
+        fn current(r: &Rig, id: u64) -> (SelectedAgent, AgentReply) {
+            let mut reply = r.current();
+            reply.1.id = id;
+            reply
+        }
+        fn setup(r: &Rig, choices: RemovalChoices) -> (MacRemoval, RemovalPlan, RemovalConsent) {
+            let mut m = MacRemoval::new(r.observer());
+            let p = m
+                .plan(1, OperationId(1), choices, Some(current(r, 1)), &r.d())
+                .unwrap();
+            let c = m
+                .consent(&p, 1, OperationId(1), choices, true, &r.d())
+                .unwrap();
+            (m, p, c)
+        }
+        fn begin(r: &Rig) -> (MacRemoval, RemovalPlan, MacRemovalLease) {
+            let (mut m, p, c) = setup(
+                r,
+                RemovalChoices {
+                    delete_identity: false,
+                    remove_driver: false,
+                },
+            );
+            let whole = Deadline::new(120_000, r.clock.clone(), Cancellation::default()).unwrap();
+            let lease = m.begin(&p, &c, Some(current(r, 2)), &whole).unwrap();
+            (m, p, lease)
+        }
+        fn row(p: &RemovalPlan, id: &str) -> usize {
+            p.preview()
+                .deltas
+                .iter()
+                .position(|d| d.resource == id)
+                .unwrap()
+        }
+        fn record(r: &Rig) -> Value {
+            serde_json::from_slice(
+                &std::fs::read(r.io.target().installer_dir().join("removal.json")).unwrap(),
+            )
+            .unwrap()
+        }
+        fn lock_result(r: &Rig) -> NativeResult<InstallerLock> {
+            let selected = r.selected();
+            r.io.lock(&selected.support, &r.d())
+        }
+        #[test]
+        fn b2a2_red_begin_publishes_initial_and_holds_exact_lock() {
+            let r = Rig::new();
+            let (_, p, lease) = begin(&r);
+            assert_eq!(
+                record(&r)["rows"].as_array().unwrap().len(),
+                p.preview().deltas.len()
+            );
+            assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+            drop(lease);
+            assert!(lock_result(&r).is_ok());
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_red_begin_permanently_retires_consent_generation() {
+            let r = Rig::new();
+            let (mut m, p, c) = setup(&r, RemovalChoices::default());
+            let lease = m.begin(&p, &c, Some(current(&r, 2)), &r.d()).unwrap();
+            assert_eq!(
+                m.revalidate(&p, &c, Some(current(&r, 3)), &r.d())
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+            drop(lease);
+        }
+        #[test]
+        fn b2a2_red_intent_is_durable_and_exact_preview_bound() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            let index = row(&p, "mac.identity-pairings");
+            let intent = lease
+                .record_intent(index, Some(current(&r, 3)), &r.d())
+                .unwrap();
+            assert_eq!(intent.delta(), &p.preview().deltas[index]);
+            assert!(intent.original_resource().is_none());
+            assert_eq!(record(&r)["in_flight"], index);
+            assert_eq!(record(&r)["rows"][index], "Pending");
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_red_final_check_and_kept_completion_preserve_identity() {
+            let r = Rig::new();
+            r.put(
+                &r.io.target().state_dir().join("trust.json"),
+                b"inert trust fixture",
+                0o600,
+            );
+            let (_, p, mut lease) = begin(&r);
+            let index = row(&p, "mac.identity-pairings");
+            let intent = lease
+                .record_intent(index, Some(current(&r, 3)), &r.d())
+                .unwrap();
+            lease
+                .verify_intent(&intent, Some(current(&r, 4)), &r.d())
+                .unwrap();
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Kept,
+                    RemovalEvidence::None,
+                    Some(current(&r, 5)),
+                    &r.d(),
+                )
+                .unwrap();
+            assert_eq!(record(&r)["rows"][index], "Kept");
+            assert!(record(&r)["in_flight"].is_null());
+            assert_eq!(
+                std::fs::read(r.io.target().state_dir().join("trust.json")).unwrap(),
+                b"inert trust fixture"
+            );
+            drop(lease);
+            assert!(lock_result(&r).is_ok());
+            assert_read_only(&r);
+        }
+
+        fn started(r: &Rig, choices: RemovalChoices) -> (MacRemoval, RemovalPlan, MacRemovalLease) {
+            let (mut m, p, c) = setup(r, choices);
+            let whole = Deadline::new(120_000, r.clock.clone(), Cancellation::default()).unwrap();
+            let lease = m.begin(&p, &c, Some(current(r, 2)), &whole).unwrap();
+            (m, p, lease)
+        }
+        fn disable(r: &Rig, p: &RemovalPlan, lease: &mut MacRemovalLease) {
+            let intent = lease
+                .record_intent(row(p, "mac.autostart"), Some(current(r, 3)), &r.d())
+                .unwrap();
+            *r.runner.disabled.lock().unwrap() = Ok(out(
+                0,
+                "disabled services = {\n \"io.frostdev.crosspane.agent\" => true\n}\n",
+                "",
+            ));
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Completed,
+                    RemovalEvidence::None,
+                    Some(current(r, 4)),
+                    &r.d(),
+                )
+                .unwrap();
+        }
+        fn stopped(r: &Rig, choices: RemovalChoices) -> (RemovalPlan, MacRemovalLease) {
+            let (_, p, mut lease) = started(r, choices);
+            disable(r, &p, &mut lease);
+            let intent = lease
+                .record_intent(row(&p, "mac.agent"), Some(current(r, 5)), &r.d())
+                .unwrap();
+            r.runner.pid.store(0, Ordering::Release);
+            *r.runner.print.lock().unwrap() = Ok(out(
+                113,
+                "",
+                &format!(
+                    "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                    r.runner.uid
+                ),
+            ));
+            r.put(
+                &r.io.target().state_dir().join("last_exit.json"),
+                &serde_json::to_vec(&json!({
+                    "schema_version":1, "instance_id":1, "stopped_unix_ms":1, "clean":true,
+                    "parking":"restored", "input_journals_empty":true, "audio_stopped":true
+                }))
+                .unwrap(),
+                0o600,
+            );
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Completed,
+                    RemovalEvidence::None,
+                    None,
+                    &r.d(),
+                )
+                .unwrap();
+            (p, lease)
+        }
+        fn kept() -> RemovalChoices {
+            RemovalChoices {
+                delete_identity: false,
+                remove_driver: false,
+            }
+        }
+        fn counters(r: &Rig) -> usize {
+            r.runner.calls.lock().unwrap().len()
+        }
+        #[test]
+        fn b2a2_begin_stale_or_foreign_consent_performs_zero_work() {
+            let (r, counts) = counted();
+            let (mut m, p, c) = setup(&r, kept());
+            let prepared = current(&r, 2);
+            m.retire();
+            let count = all_counts(&r, &counts);
+            assert_eq!(
+                m.begin(&p, &c, Some(prepared), &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            assert_eq!(all_counts(&r, &counts), count);
+            assert!(!r.io.target().installer_dir().join("removal.json").exists());
+
+            let (mut other, p2, _) = setup(&r, kept());
+            let prepared = current(&r, 2);
+            let count = all_counts(&r, &counts);
+            assert_eq!(
+                other.begin(&p2, &c, Some(prepared), &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            assert_eq!(all_counts(&r, &counts), count);
+        }
+        #[test]
+        fn b2a2_under_lock_drift_refuses_initial_publication() {
+            let r = Rig::new();
+            let (mut m, p, c) = setup(&r, kept());
+            let prepared = current(&r, 2);
+            let cli = r.io.target().paths().home.join(".local/bin/crosspanectl");
+            let scratch = r.scratch.clone();
+            let once = Arc::new(AtomicBool::new(false));
+            let flag = once.clone();
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                if stage == "lock" && !flag.swap(true, Ordering::AcqRel) {
+                    scratch.put(&cli, b"inert changed at lock", 0o755);
+                }
+                Ok(())
+            }));
+            assert_eq!(
+                m.begin(&p, &c, Some(prepared), &r.d()).unwrap_err(),
+                NativeError::Foreign
+            );
+            assert!(once.load(Ordering::Acquire));
+            assert!(!r.io.target().installer_dir().join("removal.json").exists());
+            assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_under_lock_activity_expiry_refuses_publication() {
+            let r = Rig::new();
+            let (mut m, p, c) = setup(&r, kept());
+            let prepared = current(&r, 2);
+            let clock = r.clock.clone();
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, _| {
+                if stage == "lock" {
+                    clock.0.store(5001, Ordering::Release);
+                }
+                Ok(())
+            }));
+            assert!(m.begin(&p, &c, Some(prepared), &r.d()).is_err());
+            assert!(!r.io.target().installer_dir().join("removal.json").exists());
+        }
+        #[test]
+        fn b2a2_replayed_receipt_and_backwards_time_refuse_continuation() {
+            for backwards in [false, true] {
+                let r = Rig::new();
+                r.clock.0.store(10, Ordering::Release);
+                let (_, p, mut lease) = begin(&r);
+                let mut reply = current(&r, if backwards { 3 } else { 2 });
+                if backwards {
+                    reply.1.observed_at_ms = 9;
+                }
+                assert_eq!(
+                    lease
+                        .record_intent(row(&p, "mac.identity-pairings"), Some(reply), &r.d())
+                        .unwrap_err(),
+                    NativeError::Foreign
+                );
+                assert!(record(&r)["in_flight"].is_null());
+                assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+            }
+        }
+        #[test]
+        fn b2a2_activity_epoch_and_selected_source_drift_refuse() {
+            for foreign in [false, true] {
+                let r = Rig::new();
+                let (_, p, mut lease) = begin(&r);
+                let mut reply = current(&r, 3);
+                if foreign {
+                    reply.1.source = crosspane_installer::agent_contract::ObservationSource::Live;
+                } else {
+                    let mut value: Value = serde_json::from_slice(STATUS).unwrap();
+                    value["result"]["installer"]["instance"] = json!({"id":1,"pid":4242,"uid":r.runner.uid,
+                        "exe":r.runner.exe,"runtime_dir":r.io.target().runtime_dir(),"started_unix_ms":0});
+                    value["result"]["installer"]["epochs"]["gate"] = json!(2);
+                    reply.1.result = Ok(DecodedReply::Status(
+                        parse_status(&serde_json::to_vec(&value).unwrap(), AgentPlatform::Macos)
+                            .unwrap(),
+                    ));
+                }
+                assert_eq!(
+                    lease
+                        .record_intent(row(&p, "mac.identity-pairings"), Some(reply), &r.d())
+                        .unwrap_err(),
+                    NativeError::Foreign
+                );
+                assert!(record(&r)["in_flight"].is_null());
+            }
+        }
+        #[test]
+        fn b2a2_untouched_resource_and_new_app_member_are_never_reowned() {
+            for extra in [false, true] {
+                let r = Rig::new();
+                let (_, p, mut lease) = begin(&r);
+                let path = if extra {
+                    r.io.target().app_path().join("inert-owner-extra")
+                } else {
+                    r.io.target().paths().home.join(".local/bin/crosspanectl")
+                };
+                r.put(
+                    &path,
+                    b"inert owner material",
+                    if extra { 0o644 } else { 0o755 },
+                );
+                assert_eq!(
+                    lease
+                        .record_intent(
+                            row(&p, "mac.identity-pairings"),
+                            Some(current(&r, 3)),
+                            &r.d()
+                        )
+                        .unwrap_err(),
+                    NativeError::Foreign
+                );
+                assert_eq!(std::fs::read(path).unwrap(), b"inert owner material");
+            }
+        }
+        #[test]
+        fn b2a2_session_signing_and_package_drift_refuse_without_dispatch() {
+            for kind in 0..3 {
+                let r = Rig::new();
+                let (_, p, mut lease) = begin(&r);
+                let prepared = current(&r, 3);
+                match kind {
+                    0 => {
+                        r.support.facts.lock().unwrap().gui.console_session =
+                            "changed fixture".into()
+                    }
+                    1 => r.put(
+                        &r.io
+                            .target()
+                            .paths()
+                            .payload_root
+                            .join("Crosspane.app/Contents/MacOS/Crosspane"),
+                        b"inert changed admitted signing artifact",
+                        0o755,
+                    ),
+                    _ => r.put(
+                        &r.audio().join("CrosspaneAudio-remove-0.1.0.pkg"),
+                        b"inert changed package",
+                        0o644,
+                    ),
+                }
+                assert!(
+                    lease
+                        .record_intent(row(&p, "mac.identity-pairings"), Some(prepared), &r.d())
+                        .is_err()
+                );
+                assert!(record(&r)["in_flight"].is_null());
+                assert_read_only(&r);
+            }
+        }
+        #[test]
+        fn b2a2_journal_drift_is_detected_before_next_intent() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            let path = r.io.target().installer_dir().join("removal.json");
+            let mut value = record(&r);
+            value["revision"] = json!(8);
+            r.put(&path, &serde_json::to_vec(&value).unwrap(), 0o600);
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                lease
+                    .record_intent(
+                        row(&p, "mac.identity-pairings"),
+                        Some(current(&r, 3)),
+                        &r.d()
+                    )
+                    .unwrap_err(),
+                NativeError::Foreign
+            );
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        #[test]
+        fn b2a2_only_one_intent_and_foreign_token_cannot_complete() {
+            let a = Rig::new();
+            let (_, pa, mut la) = begin(&a);
+            let ia = la
+                .record_intent(
+                    row(&pa, "mac.identity-pairings"),
+                    Some(current(&a, 3)),
+                    &a.d(),
+                )
+                .unwrap();
+            let count = counters(&a);
+            assert_eq!(
+                la.record_intent(0, Some(current(&a, 4)), &a.d())
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+            // The current fixture is prepared before measuring refusal's zero work.
+            let b = Rig::new();
+            let (_, _, mut lb) = begin(&b);
+            let prepared = current(&b, 3);
+            let before = counters(&b);
+            assert_eq!(
+                lb.record_outcome(
+                    ia,
+                    RemovalOutcome::Kept,
+                    RemovalEvidence::None,
+                    Some(prepared),
+                    &b.d()
+                )
+                .unwrap_err(),
+                NativeError::Foreign
+            );
+            assert_eq!(counters(&b), before);
+            assert!(counters(&a) >= count);
+            assert_eq!(record(&a)["in_flight"], row(&pa, "mac.identity-pairings"));
+        }
+        #[test]
+        fn b2a2_passive_rows_cannot_be_claimed_completed() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            let index = row(&p, "mac.identity-pairings");
+            let intent = lease
+                .record_intent(index, Some(current(&r, 3)), &r.d())
+                .unwrap();
+            assert_eq!(
+                lease
+                    .record_outcome(
+                        intent,
+                        RemovalOutcome::Completed,
+                        RemovalEvidence::None,
+                        Some(current(&r, 4)),
+                        &r.d()
+                    )
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+            assert_eq!(record(&r)["rows"][index], "Pending");
+        }
+        #[test]
+        fn b2a2_disable_expected_poststate_and_original_stop_order() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            // The unresolved disable blocks stop even though the original is tracked.
+            assert_eq!(
+                lease
+                    .record_intent(row(&p, "mac.agent"), Some(current(&r, 3)), &r.d())
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+            assert_eq!(record(&r)["rows"][0], "Pending");
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_disable_zero_without_changed_state_keeps_pending() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            let intent = lease
+                .record_intent(row(&p, "mac.autostart"), Some(current(&r, 3)), &r.d())
+                .unwrap();
+            assert_eq!(
+                lease
+                    .record_outcome(
+                        intent,
+                        RemovalOutcome::Completed,
+                        RemovalEvidence::None,
+                        Some(current(&r, 4)),
+                        &r.d()
+                    )
+                    .unwrap_err(),
+                NativeError::Foreign
+            );
+            assert_eq!(record(&r)["rows"][0], "Pending");
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_tracked_clean_exit_changes_expected_states_without_new_authority() {
+            let r = Rig::new();
+            let (p, mut lease) = stopped(&r, kept());
+            let index = row(&p, "mac.identity-pairings");
+            let intent = lease.record_intent(index, None, &r.d()).unwrap();
+            lease.verify_intent(&intent, None, &r.d()).unwrap();
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Kept,
+                    RemovalEvidence::None,
+                    None,
+                    &r.d(),
+                )
+                .unwrap();
+            assert_eq!(record(&r)["rows"][row(&p, "mac.agent")], "Completed");
+            assert_eq!(record(&r)["rows"][index], "Kept");
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_unclean_stop_retains_recovery_and_cannot_erase() {
+            let r = Rig::new();
+            let (_, p, mut lease) = started(
+                &r,
+                RemovalChoices {
+                    delete_identity: true,
+                    remove_driver: false,
+                },
+            );
+            disable(&r, &p, &mut lease);
+            let index = row(&p, "mac.agent");
+            let intent = lease
+                .record_intent(index, Some(current(&r, 5)), &r.d())
+                .unwrap();
+            r.runner.pid.store(0, Ordering::Release);
+            *r.runner.print.lock().unwrap() = Ok(out(
+                113,
+                "",
+                &format!(
+                    "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                    r.runner.uid
+                ),
+            ));
+            r.put(
+                &r.io.target().state_dir().join("last_exit.json"),
+                b"{}",
+                0o600,
+            );
+            assert!(
+                lease
+                    .record_outcome(
+                        intent,
+                        RemovalOutcome::Completed,
+                        RemovalEvidence::None,
+                        None,
+                        &r.d()
+                    )
+                    .is_err()
+            );
+            assert_eq!(record(&r)["rows"][index], "Pending");
+            assert_eq!(std::fs::read(r.io.target().agent_path()).unwrap(), macho());
+            assert_eq!(
+                lease
+                    .record_intent(row(&p, "mac.identity-pairings"), None, &r.d())
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+        }
+        #[test]
+        fn b2a2_clean_receipt_changed_or_original_pid_returns_refuse() {
+            for restart in [false, true] {
+                let r = Rig::new();
+                let (p, mut lease) = stopped(&r, kept());
+                if restart {
+                    r.runner.pid.store(4242, Ordering::Release);
+                } else {
+                    r.put(
+                        &r.io.target().state_dir().join("last_exit.json"),
+                        b"{}",
+                        0o600,
+                    );
+                }
+                assert_eq!(
+                    lease
+                        .record_intent(row(&p, "mac.identity-pairings"), None, &r.d())
+                        .unwrap_err(),
+                    NativeError::Foreign
+                );
+                assert_eq!(std::fs::read(r.io.target().agent_path()).unwrap(), macho());
+            }
+        }
+        #[test]
+        fn b2a2_clean_authority_requires_exact_erase_intent_and_explicit_choice() {
+            let r = Rig::new();
+            let (p, mut lease) = stopped(&r, kept());
+            let intent = lease
+                .record_intent(row(&p, "mac.identity-pairings"), None, &r.d())
+                .unwrap();
+            assert_eq!(
+                lease.clean_exit(&intent, &r.d()).unwrap_err(),
+                NativeError::Foreign
+            );
+            assert_read_only(&r);
+
+            let r = Rig::new();
+            let (p, mut lease) = stopped(
+                &r,
+                RemovalChoices {
+                    delete_identity: true,
+                    remove_driver: false,
+                },
+            );
+            let intent = lease
+                .record_intent(row(&p, "mac.identity-pairings"), None, &r.d())
+                .unwrap();
+            let clean = lease.clean_exit(&intent, &r.d()).unwrap();
+            assert_eq!(clean.receipt().instance_id, 1);
+            assert!(clean.receipt().clean);
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_removed_executable_never_yields_cached_clean_authority() {
+            let r = Rig::new();
+            let (p, mut lease) = stopped(
+                &r,
+                RemovalChoices {
+                    delete_identity: true,
+                    remove_driver: false,
+                },
+            );
+            let intent = lease
+                .record_intent(row(&p, "mac.identity-pairings"), None, &r.d())
+                .unwrap();
+            std::fs::remove_file(r.io.target().agent_path()).unwrap(); // Exclusively test-owned scratch.
+            assert_eq!(
+                lease.clean_exit(&intent, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            let recovery = MacRemoval::new(r.observer())
+                .removal_recovery(&r.d())
+                .unwrap()
+                .unwrap();
+            assert!(recovery.original_not_clean && recovery.retained_recovery);
+            assert_eq!(
+                recovery.rows[row(&p, "mac.identity-pairings")],
+                RemovalOutcome::Unknown
+            );
+        }
+        #[test]
+        fn b2a2_erase_semantic_refusal_or_absent_metadata_never_means_success() {
+            let r = Rig::new();
+            let (p, mut lease) = stopped(
+                &r,
+                RemovalChoices {
+                    delete_identity: true,
+                    remove_driver: false,
+                },
+            );
+            let intent = lease
+                .record_intent(row(&p, "mac.identity-pairings"), None, &r.d())
+                .unwrap();
+            assert_eq!(
+                lease
+                    .record_outcome(
+                        intent,
+                        RemovalOutcome::Completed,
+                        RemovalEvidence::None,
+                        None,
+                        &r.d()
+                    )
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+            assert_eq!(
+                record(&r)["rows"][row(&p, "mac.identity-pairings")],
+                "Pending"
+            );
+        }
+        #[test]
+        fn b2a2_opaque_debug_never_exposes_paths_receipts_or_activity() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            let intent = lease
+                .record_intent(
+                    row(&p, "mac.identity-pairings"),
+                    Some(current(&r, 3)),
+                    &r.d(),
+                )
+                .unwrap();
+            assert_eq!(format!("{lease:?}"), "MacRemovalLease");
+            assert_eq!(format!("{intent:?}"), "RemovalLeaseIntent");
+            assert_eq!(format!("{:?}", RemovalEvidence::None), "RemovalEvidence");
+        }
+        #[test]
+        fn b2a2_original_owned_leaf_snapshot_survives_hints() {
+            let r = Rig::new();
+            let (p, mut lease) = stopped(&r, kept());
+            let index = row(&p, "crosspanectl");
+            let intent = lease.record_intent(index, None, &r.d()).unwrap();
+            let old = p
+                .inventory()
+                .resources
+                .iter()
+                .find(|r| r.id == "crosspanectl")
+                .unwrap();
+            assert_eq!(intent.original_resource(), Some(old));
+            assert_eq!(
+                intent.original_resource().unwrap().state,
+                ResourceState::Owned
+            );
+        }
+        #[test]
+        fn b2a2_foreign_adopted_and_recovery_rows_only_keep() {
+            let r = Rig::new();
+            r.edit_payload(|value| {
+                for row in value["receipt"]["resources"].as_array_mut().unwrap() {
+                    row["ownership"] = json!(ResourceOwnership::Adopted);
+                    row["before"] = json!(ResourceObservation::Different);
+                }
+            });
+            let (_, p, mut lease) = begin(&r);
+            let index = row(&p, "crosspanectl");
+            assert_eq!(p.preview().deltas[index].effect, RemovalEffect::KeepForeign);
+            let intent = lease
+                .record_intent(index, Some(current(&r, 3)), &r.d())
+                .unwrap();
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Kept,
+                    RemovalEvidence::None,
+                    Some(current(&r, 4)),
+                    &r.d(),
+                )
+                .unwrap();
+            assert_eq!(
+                std::fs::read(r.io.target().paths().home.join(".local/bin/crosspanectl")).unwrap(),
+                macho()
+            );
+        }
+        #[test]
+        fn b2a2_missing_original_never_mints_clean_exit() {
+            let r = Rig::new();
+            r.runner.pid.store(0, Ordering::Release);
+            *r.runner.print.lock().unwrap() = Ok(out(
+                113,
+                "",
+                &format!(
+                    "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                    r.runner.uid
+                ),
+            ));
+            let mut m = MacRemoval::new(r.observer());
+            let p = m.plan(1, OperationId(1), kept(), None, &r.d()).unwrap();
+            assert!(p.tracked_original().is_none());
+            let c = m
+                .consent(&p, 1, OperationId(1), kept(), true, &r.d())
+                .unwrap();
+            let mut lease = m.begin(&p, &c, None, &r.d()).unwrap();
+            let index = row(&p, "mac.identity-pairings");
+            let intent = lease.record_intent(index, None, &r.d()).unwrap();
+            assert_eq!(
+                lease.clean_exit(&intent, &r.d()).unwrap_err(),
+                NativeError::Foreign
+            );
+            assert_eq!(std::fs::read(r.io.target().agent_path()).unwrap(), macho());
+        }
+        #[test]
+        fn b2a2_unknown_result_latches_lifetime_quarantine_and_recovery() {
+            let r = Rig::new();
+            let (m, p, mut lease) = begin(&r);
+            let index = row(&p, "mac.identity-pairings");
+            let intent = lease
+                .record_intent(index, Some(current(&r, 3)), &r.d())
+                .unwrap();
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Unknown,
+                    RemovalEvidence::None,
+                    None,
+                    &r.d(),
+                )
+                .unwrap();
+            assert_eq!(record(&r)["rows"][index], "Unknown");
+            assert_eq!(
+                lease.record_intent(0, None, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            drop(lease);
+            assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+            let recovery = m.removal_recovery(&r.d()).unwrap().unwrap();
+            assert!(recovery.original_not_clean && recovery.retained_recovery);
+        }
+        #[test]
+        fn b2a2_four_quarantines_never_reset_on_late_work_or_handle_drop() {
+            let mut retained = Vec::new();
+            for _ in 0..4 {
+                let r = Rig::new();
+                let (_, p, mut lease) = begin(&r);
+                let _intent = lease
+                    .record_intent(
+                        row(&p, "mac.identity-pairings"),
+                        Some(current(&r, 3)),
+                        &r.d(),
+                    )
+                    .unwrap();
+                drop(lease);
+                retained.push(r);
+            }
+            let r = Rig::new();
+            let (mut m, p, c) = setup(&r, kept());
+            assert_eq!(
+                m.begin(&p, &c, Some(current(&r, 2)), &r.d()).unwrap_err(),
+                NativeError::Busy
+            );
+            assert!(!r.io.target().installer_dir().join("removal.json").exists());
+            for r in retained {
+                assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+            }
+        }
+        #[test]
+        fn b2a2_pending_drop_keeps_flock_for_process_lifetime() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            let _intent = lease
+                .record_intent(
+                    row(&p, "mac.identity-pairings"),
+                    Some(current(&r, 3)),
+                    &r.d(),
+                )
+                .unwrap();
+            drop(lease);
+            assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+            assert_eq!(record(&r)["in_flight"], row(&p, "mac.identity-pairings"));
+        }
+
+        fn erased(r: &Rig) -> (RemovalPlan, MacRemovalLease) {
+            let (p, mut lease) = stopped(
+                r,
+                RemovalChoices {
+                    delete_identity: true,
+                    remove_driver: false,
+                },
+            );
+            let intent = lease
+                .record_intent(row(&p, "mac.identity-pairings"), None, &r.d())
+                .unwrap();
+            let clean = lease.clean_exit(&intent, &r.d()).unwrap();
+            assert!(clean.receipt().clean);
+            // Inject the one-shot's semantic result; no erase command or keystore is executed.
+            let receipt = parse_erase_identity(br#"{"schema_version":1,"result":"already_absent","reason":null,"key":"absent","trust":"absent"}"#).unwrap();
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Absent,
+                    RemovalEvidence::Erase(receipt),
+                    None,
+                    &r.d(),
+                )
+                .unwrap();
+            (p, lease)
+        }
+        #[test]
+        fn b2a2_owned_leaf_removed_then_cached_exit_is_evidence_only() {
+            let r = Rig::new();
+            let (p, mut lease) = erased(&r);
+            let rule = inventory().files[0].signing.clone().unwrap();
+            let signature =
+                r.io.admit_main_signature(
+                    &r.io
+                        .target()
+                        .paths()
+                        .payload_root
+                        .join("Crosspane.app/Contents/MacOS/Crosspane"),
+                    &SigningRequirement {
+                        role: ArtifactRole::Agent,
+                        identifier: rule.identifier,
+                        designated_requirement: rule.designated_requirement,
+                        entitlements: rule.entitlements,
+                    },
+                    &r.d(),
+                )
+                .unwrap();
+            let proof = r.io.admit_support(&signature, &r.d()).unwrap();
+            let index = row(&p, "Crosspane.app/Contents/MacOS/Crosspane");
+            let intent = lease.record_intent(index, None, &r.d()).unwrap();
+            let original = intent.original_resource().unwrap();
+            r.io.remove_owned_leaf_verified(
+                &proof,
+                &original.path,
+                original.identity.as_ref().unwrap(),
+                original.sha256,
+                &r.d(),
+            )
+            .unwrap();
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Completed,
+                    RemovalEvidence::None,
+                    None,
+                    &r.d(),
+                )
+                .unwrap();
+            let index = row(&p, "keep.config.toml");
+            let intent = lease.record_intent(index, None, &r.d()).unwrap();
+            lease.verify_intent(&intent, None, &r.d()).unwrap();
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Absent,
+                    RemovalEvidence::None,
+                    None,
+                    &r.d(),
+                )
+                .unwrap();
+            assert!(!r.io.target().agent_path().exists());
+            assert!(r.io.target().state_dir().join("last_exit.json").exists());
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_replacement_at_removed_path_is_foreign_not_reowned() {
+            let r = Rig::new();
+            let (p, mut lease) = erased(&r);
+            let index = row(&p, "crosspanectl");
+            let intent = lease.record_intent(index, None, &r.d()).unwrap();
+            let path = intent.original_resource().unwrap().path.clone();
+            std::fs::remove_file(&path).unwrap(); // Test-owned scratch effect.
+            lease
+                .record_outcome(
+                    intent,
+                    RemovalOutcome::Completed,
+                    RemovalEvidence::None,
+                    None,
+                    &r.d(),
+                )
+                .unwrap();
+            r.put(&path, b"inert replacement from owner", 0o755);
+            assert_eq!(
+                lease
+                    .record_intent(row(&p, "keep.config.toml"), None, &r.d())
+                    .unwrap_err(),
+                NativeError::Foreign
+            );
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                b"inert replacement from owner"
+            );
+        }
+        #[test]
+        fn b2a2_nonempty_owned_directory_is_not_pruned() {
+            let r = Rig::new();
+            let (p, mut lease) = stopped(&r, kept());
+            let index = row(&p, "mac.app-directory");
+            assert!(lease.record_intent(index, None, &r.d()).is_err());
+            assert!(r.io.target().app_path().exists());
+            assert!(r.io.target().agent_path().exists());
+        }
+
+        fn empty_owned_mac_os(r: &Rig) -> (RemovalPlan, MacRemovalLease, PathBuf, usize) {
+            let (p, mut lease) = stopped(r, kept());
+            let directory = r.io.target().app_path().join("Contents/MacOS");
+            let leaves: Vec<_> = p
+                .preview()
+                .deltas
+                .iter()
+                .enumerate()
+                .filter_map(|(index, delta)| {
+                    (delta.effect == RemovalEffect::RemoveOwnedAfterVerification
+                        && delta
+                            .path
+                            .as_ref()
+                            .is_some_and(|p| p.starts_with(&directory)))
+                    .then_some(index)
+                })
+                .collect();
+            assert!(!leaves.is_empty());
+            for index in leaves {
+                let intent = lease.record_intent(index, None, &r.d()).unwrap();
+                let original = intent.original_resource().unwrap();
+                assert_eq!(r.io.metadata(&original.path).unwrap(), original.identity);
+                std::fs::remove_file(&original.path).unwrap(); // Only admitted scratch leaves.
+                lease
+                    .record_outcome(
+                        intent,
+                        RemovalOutcome::Completed,
+                        RemovalEvidence::None,
+                        None,
+                        &r.d(),
+                    )
+                    .unwrap();
+            }
+            assert!(std::fs::read_dir(&directory).unwrap().next().is_none());
+            let index = p
+                .preview()
+                .deltas
+                .iter()
+                .position(|d| {
+                    d.effect == RemovalEffect::PruneEmptyOwnedAfterVerification
+                        && d.path.as_ref() == Some(&directory)
+                })
+                .unwrap();
+            (p, lease, directory, index)
+        }
+
+        fn lock_after_original_exit(r: &Rig) -> NativeResult<InstallerLock> {
+            // Ordinary lock admission uses staged-main support, never cached clean authority.
+            let rule = inventory()
+                .files
+                .into_iter()
+                .find(|f| f.path == "Crosspane.app/Contents/MacOS/Crosspane")
+                .unwrap()
+                .signing
+                .unwrap();
+            let signature = r.io.admit_main_signature(
+                &r.io
+                    .target()
+                    .paths()
+                    .payload_root
+                    .join("Crosspane.app/Contents/MacOS/Crosspane"),
+                &SigningRequirement {
+                    role: ArtifactRole::Agent,
+                    identifier: rule.identifier,
+                    designated_requirement: rule.designated_requirement,
+                    entitlements: rule.entitlements,
+                },
+                &r.d(),
+            )?;
+            let proof = r.io.admit_support(&signature, &r.d())?;
+            r.io.lock(&proof, &r.d())
+        }
+
+        #[test]
+        fn b2a2_r1_prune_ancestor_swap_never_refreshes_foreign_inode() {
+            let r = Rig::new();
+            let home = &r.io.target().paths().home;
+            let foreign = home.join("foreign-contents");
+            r.scratch.directory(&foreign.join("MacOS"));
+            let original_parent = home.join("original-contents");
+            let parent = r.io.target().app_path().join("Contents");
+            let (_, mut lease, directory, index) = empty_owned_mac_os(&r);
+            let original = r.io.metadata(&directory).unwrap().unwrap();
+            let foreign_fd = r.scratch.directory(&foreign.join("MacOS"));
+            let foreign_inode = rfs::fstat(foreign_fd).unwrap().st_ino;
+            assert_ne!(original.inode, foreign_inode);
+            let metadata = Arc::new(AtomicU64::new(0));
+            let empty_walks = Arc::new(AtomicU64::new(0));
+            let swapped = Arc::new(AtomicBool::new(false));
+            let saw_foreign = Arc::new(AtomicBool::new(false));
+            let (seen, walks, flag, seen_foreign) = (
+                metadata.clone(),
+                empty_walks.clone(),
+                swapped.clone(),
+                saw_foreign.clone(),
+            );
+            let (watched, old, replacement, installed) = (
+                directory.clone(),
+                original_parent.clone(),
+                foreign.clone(),
+                parent.clone(),
+            );
+            *r.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                if path != watched {
+                    return Ok(());
+                }
+                if stage == "metadata" {
+                    seen.fetch_add(1, Ordering::AcqRel);
+                    if flag.load(Ordering::Acquire) {
+                        seen_foreign.store(true, Ordering::Release);
+                    }
+                }
+                // Four metadata observations reach the final original-resource check:
+                // inventory, tree before/after listing, then the prune-specific check.
+                // The second following walk is empty-list anchor revalidation, after read.
+                if stage == "walk"
+                    && seen.load(Ordering::Acquire) == 4
+                    && walks.fetch_add(1, Ordering::AcqRel) == 1
+                {
+                    std::fs::rename(&installed, &old).unwrap();
+                    std::fs::rename(&replacement, &installed).unwrap();
+                    flag.store(true, Ordering::Release);
+                }
+                Ok(())
+            }));
+            let result = lease.record_intent(index, None, &r.d());
+            *r.hook.lock().unwrap() = None;
+            assert!(
+                swapped.load(Ordering::Acquire),
+                "race must occur after empty read"
+            );
+            assert!(saw_foreign.load(Ordering::Acquire));
+            assert_eq!(
+                r.io.metadata(&directory).unwrap().unwrap().inode,
+                foreign_inode
+            );
+            if let Ok(intent) = &result {
+                // Reproduce the full authority leak on the unfixed code, without deletion:
+                // foreign snapshot acquired, original tree restored for final validation.
+                assert_eq!(
+                    intent
+                        .original_resource()
+                        .unwrap()
+                        .identity
+                        .as_ref()
+                        .unwrap()
+                        .inode,
+                    foreign_inode
+                );
+                std::fs::rename(&parent, &foreign).unwrap();
+                std::fs::rename(&original_parent, &parent).unwrap();
+                lease.verify_intent(intent, None, &r.d()).unwrap();
+                std::fs::rename(&parent, &original_parent).unwrap();
+                std::fs::rename(&foreign, &parent).unwrap();
+            }
+            assert_eq!(result.unwrap_err(), NativeError::Foreign);
+            assert_eq!(record(&r)["in_flight"], Value::Null);
+            assert_eq!(record(&r)["rows"][index], "Pending");
+            // Restoring the original tree cannot revive this permanently quarantined lease.
+            std::fs::rename(&parent, &foreign).unwrap();
+            std::fs::rename(&original_parent, &parent).unwrap();
+            assert_eq!(
+                r.io.metadata(&directory).unwrap().unwrap().inode,
+                original.inode
+            );
+            assert_eq!(
+                lease.record_intent(index, None, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            drop(lease);
+            assert!(matches!(
+                lock_after_original_exit(&r),
+                Err(NativeError::Busy)
+            ));
+            assert!(directory.exists() && foreign.join("MacOS").exists());
+            assert_read_only(&r);
+        }
+
+        #[test]
+        fn b2a2_r1_same_original_directory_accepts_mutable_metadata_refresh() {
+            let r = Rig::new();
+            let (p, mut lease, directory, index) = empty_owned_mac_os(&r);
+            let original = p
+                .inventory()
+                .resources
+                .iter()
+                .find(|r| r.path == directory)
+                .unwrap()
+                .identity
+                .clone()
+                .unwrap();
+            let intent = lease.record_intent(index, None, &r.d()).unwrap();
+            let refreshed = intent
+                .original_resource()
+                .unwrap()
+                .identity
+                .clone()
+                .unwrap();
+            assert_eq!(
+                (original.device, original.inode, original.mode, original.uid),
+                (
+                    refreshed.device,
+                    refreshed.inode,
+                    refreshed.mode,
+                    refreshed.uid
+                )
+            );
+            assert_eq!(Some(refreshed), r.io.metadata(&directory).unwrap());
+            lease.verify_intent(&intent, None, &r.d()).unwrap();
+            assert!(directory.exists());
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_package_absence_without_admitted_attempt_is_not_verification() {
+            let r = Rig::new();
+            let (p, mut lease) = stopped(
+                &r,
+                RemovalChoices {
+                    delete_identity: false,
+                    remove_driver: true,
+                },
+            );
+            let index = row(&p, "mac.shared-audio");
+            let intent = lease.record_intent(index, None, &r.d()).unwrap();
+            assert_eq!(
+                lease
+                    .record_outcome(
+                        intent,
+                        RemovalOutcome::Absent,
+                        RemovalEvidence::None,
+                        None,
+                        &r.d()
+                    )
+                    .unwrap_err(),
+                NativeError::Refused
+            );
+            assert_eq!(record(&r)["rows"][index], "Pending");
+            assert_eq!(std::fs::read(r.io.target().agent_path()).unwrap(), macho());
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_final_guard_refuses_drift_after_durable_intent() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            let index = row(&p, "mac.identity-pairings");
+            let intent = lease
+                .record_intent(index, Some(current(&r, 3)), &r.d())
+                .unwrap();
+            r.put(
+                &r.io.target().paths().home.join(".local/bin/crosspanectl"),
+                b"inert late owner edit",
+                0o755,
+            );
+            assert_eq!(
+                lease
+                    .verify_intent(&intent, Some(current(&r, 4)), &r.d())
+                    .unwrap_err(),
+                NativeError::Foreign
+            );
+            assert_eq!(record(&r)["in_flight"], index);
+            assert_eq!(record(&r)["rows"][index], "Pending");
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_actual_write_interruption_retains_pending_and_no_retry() {
+            let r = Rig::new();
+            let (_, p, mut lease) = begin(&r);
+            *r.hook.lock().unwrap() = Some(Arc::new(|stage, _| {
+                if stage == "write" {
+                    Err(NativeError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            }));
+            assert!(
+                lease
+                    .record_intent(
+                        row(&p, "mac.identity-pairings"),
+                        Some(current(&r, 3)),
+                        &r.d()
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                lease.record_intent(0, None, &r.d()).unwrap_err(),
+                NativeError::Refused
+            );
+            drop(lease);
+            assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+            assert_read_only(&r);
+        }
+        #[test]
+        fn b2a2_stalled_intent_keeps_whole_lease_after_deadline_or_cancel() {
+            for cancel in [false, true] {
+                let r = Rig::new();
+                let (_, p, mut lease) = begin(&r);
+                let reply = current(&r, 3);
+                let index = row(&p, "mac.identity-pairings");
+                let release = Arc::new((Mutex::new(false), Condvar::new()));
+                let wait = release.clone();
+                let (entered, entry) = std::sync::mpsc::sync_channel(1);
+                let (finished, finish) = std::sync::mpsc::sync_channel(1);
+                let first = Arc::new(AtomicBool::new(false));
+                let once = first.clone();
+                let (done, completion) = std::sync::mpsc::sync_channel(1);
+                *r.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                    if stage == "write" && !once.swap(true, Ordering::AcqRel) {
+                        entered.send(()).unwrap();
+                        let (lock, cv) = &*wait;
+                        let held = cv
+                            .wait_timeout_while(
+                                lock.lock().unwrap(),
+                                Duration::from_secs(3),
+                                |released| !*released,
+                            )
+                            .unwrap()
+                            .0;
+                        assert!(*held, "owned fixture release must arrive");
+                        finished.send(()).unwrap();
+                    }
+                    if stage == "complete" && path.file_name().is_some_and(|n| n == "removal.json")
+                    {
+                        let _ = done.try_send(());
+                    }
+                    Ok(())
+                }));
+                let token = Cancellation::default();
+                let d = Deadline::new(5000, r.clock.clone(), token.clone()).unwrap();
+                let (result_send, result_recv) = std::sync::mpsc::sync_channel(1);
+                let job = std::thread::spawn(move || {
+                    let result = lease.record_intent(index, Some(reply), &d);
+                    result_send.send(result.map(|_| ())).unwrap();
+                    drop(lease);
+                });
+                entry.recv_timeout(Duration::from_secs(2)).unwrap();
+                if cancel {
+                    token.cancel();
+                } else {
+                    r.clock.0.store(5001, Ordering::Release);
+                }
+                let result = result_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(
+                    result.unwrap_err(),
+                    if cancel {
+                        NativeError::Cancelled
+                    } else {
+                        NativeError::Timeout
+                    }
+                );
+                job.join().unwrap(); // Result publication above proves this owned caller finished.
+                assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+                let (lock, cv) = &*release;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                finish.recv_timeout(Duration::from_secs(2)).unwrap();
+                if cancel {
+                    completion.recv_timeout(Duration::from_secs(2)).unwrap();
+                    assert_eq!(record(&r)["in_flight"], index);
+                }
+                // Even actual late completion cannot release a process-lifetime quarantine.
+                assert!(matches!(lock_result(&r), Err(NativeError::Busy)));
+                assert_read_only(&r);
+            }
         }
     }
 }

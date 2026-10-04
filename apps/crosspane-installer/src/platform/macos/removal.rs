@@ -1661,3 +1661,946 @@ impl JournalState {
         Ok(())
     }
 }
+static REMOVAL_LEASES: AtomicUsize = AtomicUsize::new(0);
+struct LeaseSlot(bool);
+impl LeaseSlot {
+    fn acquire() -> NativeResult<Self> {
+        REMOVAL_LEASES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < 4).then_some(n + 1)
+            })
+            .map_err(|_| NativeError::Busy)?;
+        Ok(Self(true))
+    }
+}
+impl Drop for LeaseSlot {
+    fn drop(&mut self) {
+        if self.0 {
+            REMOVAL_LEASES.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+/// An active lease owns the original snapshots and selected flock, never new path ownership.
+pub struct MacRemovalLease {
+    state: Arc<Mutex<LeaseState>>,
+    limit: Deadline,
+    pending: bool,
+    retired: bool,
+    slot: LeaseSlot,
+}
+pub struct RemovalLeaseIntent {
+    owner: Arc<Mutex<LeaseState>>,
+    journal: JournalIntent,
+    delta: RemovalDelta,
+    original: Option<UserResource>,
+}
+/// Successful effects still require native receipts; this enum cannot mint clean authority.
+pub enum RemovalEvidence {
+    None,
+    Erase(crate::agent_contract::EraseIdentityV1),
+    Audio(AudioPackageAttempt),
+}
+struct ExitEvidence {
+    receipt: crate::agent_contract::LastExitV1,
+    identity: FileIdentity,
+    bytes: Vec<u8>,
+    bootstrap: Option<(FileIdentity, Vec<u8>)>,
+}
+struct LeaseState {
+    sources: Arc<Sources>,
+    journal: RemovalJournal,
+    original: Option<Arc<TrackedAgent>>,
+    inventory: RemovalInventory,
+    preview: RemovalPreview,
+    choices: RemovalChoices,
+    rows: Vec<RemovalOutcome>,
+    pending: Option<usize>,
+    activity_floor: (u64, u64),
+    exit: Option<ExitEvidence>,
+    erased: bool,
+    audio: Option<AudioPackageAttempt>,
+    retained: Vec<(PathBuf, Option<FileIdentity>)>,
+}
+opaque!(MacRemovalLease, RemovalLeaseIntent, RemovalEvidence);
+impl RemovalLeaseIntent {
+    pub fn delta(&self) -> &RemovalDelta {
+        &self.delta
+    }
+    /// The dispatcher must give this exact snapshot/hash to verified native leaf removal.
+    pub fn original_resource(&self) -> Option<&UserResource> {
+        self.original.as_ref()
+    }
+}
+impl Drop for MacRemovalLease {
+    fn drop(&mut self) {
+        if self.pending || self.retired {
+            // No timer/reaper completion can undo quarantine. Process exit releases flock.
+            // Four acquired slots bound these deliberately retained original-source graphs.
+            std::mem::forget(self.state.clone());
+            self.slot.0 = false;
+        }
+    }
+}
+impl MacRemoval {
+    /// Full frozen revalidation once, then source verification under the journal's flock.
+    /// Construction dispatches nothing; every future intent checks current facts again.
+    pub fn begin(
+        &mut self,
+        plan: &RemovalPlan,
+        consent: &RemovalConsent,
+        current: Option<(SelectedAgent, AgentReply)>,
+        deadline: &Deadline,
+    ) -> NativeResult<MacRemovalLease> {
+        let prepared = (|| {
+            self.revalidate(plan, consent, current.clone(), deadline)?;
+            let slot = LeaseSlot::acquire()?;
+            let journal = self.open_removal_journal(plan, consent, deadline)?;
+            Ok(MacRemovalLease {
+                state: Arc::new(Mutex::new(LeaseState {
+                    sources: self.observer.sources.clone(),
+                    journal,
+                    original: plan.tracked_original(),
+                    inventory: plan.inventory().clone(),
+                    preview: plan.preview.clone(),
+                    choices: plan.choices,
+                    rows: vec![RemovalOutcome::Pending; plan.preview.deltas.len()],
+                    pending: None,
+                    activity_floor: self.activity_floor,
+                    exit: None,
+                    erased: false,
+                    audio: None,
+                    retained: Vec::new(),
+                })),
+                limit: deadline.clone(),
+                pending: false,
+                retired: false,
+                slot,
+            })
+        })();
+        self.retire(); // A failed begin never revives its consent generation.
+        let mut lease = prepared?;
+        lease.work(deadline, move |state, limit| {
+            state.verify(current, true, limit)?;
+            state.journal.publish_initial(limit)
+        })?;
+        lease.pending = false;
+        Ok(lease)
+    }
+}
+impl MacRemovalLease {
+    fn work<T: Send + 'static>(
+        &mut self,
+        deadline: &Deadline,
+        work: impl FnOnce(&mut LeaseState, &Deadline) -> NativeResult<T> + Send + 'static,
+    ) -> NativeResult<T> {
+        if self.retired {
+            return Err(NativeError::Refused);
+        }
+        // Caller flags alone settle acceptance. A late worker cannot release quarantine.
+        self.pending = true;
+        let (state, limit) = (self.state.clone(), self.limit.clone());
+        let result = bounded(deadline, move || {
+            limit.check()?;
+            let mut state = state.lock().map_err(|_| NativeError::Unavailable)?;
+            let result = work(&mut state, &limit)?;
+            limit.check()?;
+            Ok(result)
+        })
+        .and_then(|value| {
+            self.limit.check()?; // Delivery cannot extend the original lease deadline.
+            Ok(value)
+        });
+        if result.is_err() {
+            self.retired = true;
+        }
+        result
+    }
+    /// Durable, preview-bound preparation only; the future coordinator supplies execution.
+    pub fn record_intent(
+        &mut self,
+        index: usize,
+        current: Option<(SelectedAgent, AgentReply)>,
+        deadline: &Deadline,
+    ) -> NativeResult<RemovalLeaseIntent> {
+        if self.pending || self.retired {
+            return Err(NativeError::Refused);
+        }
+        let owner = self.state.clone();
+        self.work(deadline, move |state, limit| {
+            let delta = state
+                .preview
+                .deltas
+                .get(index)
+                .cloned()
+                .ok_or(NativeError::Invalid)?;
+            if state.pending.is_some() || state.rows[index] != RemovalOutcome::Pending {
+                return Err(NativeError::Refused);
+            }
+            state.prerequisites(&delta, limit)?;
+            state.verify(current, false, limit)?;
+            let mut original = state
+                .inventory
+                .resources
+                .iter()
+                .find(|r| Some(&r.path) == delta.path.as_ref() && r.id == delta.resource)
+                .cloned();
+            if delta.effect == RemovalEffect::PruneEmptyOwnedAfterVerification {
+                let row = original.as_mut().ok_or(NativeError::Foreign)?;
+                // Only our verified child removals can refresh this ORIGINAL directory inode.
+                state.resource_identity(row, false, limit)?;
+                if !state.sources.io.entries(&row.path, 1, limit)?.is_empty() {
+                    return Err(NativeError::Refused);
+                }
+                let original_identity = row.identity.as_ref().ok_or(NativeError::Foreign)?;
+                let refreshed = state
+                    .sources
+                    .io
+                    .metadata(&row.path)?
+                    .ok_or(NativeError::Foreign)?;
+                if (
+                    original_identity.device,
+                    original_identity.inode,
+                    original_identity.mode,
+                    original_identity.uid,
+                ) != (
+                    refreshed.device,
+                    refreshed.inode,
+                    refreshed.mode,
+                    refreshed.uid,
+                ) {
+                    return Err(NativeError::Foreign);
+                }
+                row.identity = Some(refreshed);
+            }
+            let journal = state.journal.record_intent(index, limit)?;
+            state.pending = Some(index);
+            Ok(RemovalLeaseIntent {
+                owner,
+                journal,
+                delta,
+                original,
+            })
+        })
+    }
+    /// Final continuation check after durable intent publication, before any future dispatch.
+    pub fn verify_intent(
+        &mut self,
+        intent: &RemovalLeaseIntent,
+        current: Option<(SelectedAgent, AgentReply)>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        if !Arc::ptr_eq(&intent.owner, &self.state) {
+            return Err(NativeError::Foreign);
+        }
+        let (index, delta) = (intent.journal.index, intent.delta.clone());
+        self.work(deadline, move |state, limit| {
+            state.check_intent(index, &delta)?;
+            state.prerequisites(&delta, limit)?;
+            state.verify(current, false, limit)
+        })
+    }
+    /// Verifies expected post-states, then publishes the native consumer's result.
+    pub fn record_outcome(
+        &mut self,
+        intent: RemovalLeaseIntent,
+        outcome: RemovalOutcome,
+        evidence: RemovalEvidence,
+        current: Option<(SelectedAgent, AgentReply)>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        if !Arc::ptr_eq(&intent.owner, &self.state) {
+            return Err(NativeError::Foreign);
+        }
+        let terminal = matches!(
+            outcome,
+            RemovalOutcome::Completed | RemovalOutcome::Absent | RemovalOutcome::Kept
+        );
+        let result = self.work(deadline, move |state, limit| {
+            let index = intent.journal.index;
+            state.check_intent(index, &intent.delta)?;
+            if terminal {
+                state.accept_effect(&intent.delta, outcome, evidence, limit)?;
+                state.rows[index] = outcome;
+                state.verify(current, false, limit)?;
+            }
+            state
+                .journal
+                .record_outcome(intent.journal, outcome, limit)?;
+            state.rows[index] = outcome;
+            state.pending = None;
+            Ok(())
+        });
+        if result.is_ok() && terminal {
+            self.pending = false;
+        }
+        if !terminal {
+            self.retired = true;
+        }
+        result
+    }
+    /// Re-observes only the retained original. Never returns authority once its executable is gone.
+    /// The existing one-shot erase must still check original support and receipt at dispatch.
+    pub fn clean_exit(
+        &mut self,
+        intent: &RemovalLeaseIntent,
+        deadline: &Deadline,
+    ) -> NativeResult<CleanAgentExit> {
+        if !Arc::ptr_eq(&intent.owner, &self.state)
+            || intent.delta.effect != RemovalEffect::EraseOnlyAfterCleanExit
+        {
+            return Err(NativeError::Foreign);
+        }
+        let (index, delta) = (intent.journal.index, intent.delta.clone());
+        self.work(deadline, move |state, limit| {
+            state.check_intent(index, &delta)?;
+            if !state.choices.delete_identity
+                || state.erased
+                || state
+                    .sources
+                    .io
+                    .metadata(&state.sources.io.target().agent_path())?
+                    .is_none()
+            {
+                return Err(NativeError::Refused);
+            }
+            let original = state.original.clone().ok_or(NativeError::Refused)?;
+            let support = state.support(limit)?;
+            let clean = state
+                .sources
+                .io
+                .observe_clean_exit(original, &support, limit)?
+                .ok_or(NativeError::Refused)?;
+            if state
+                .exit
+                .as_ref()
+                .is_none_or(|cached| cached.receipt != *clean.receipt())
+            {
+                return Err(NativeError::Foreign);
+            }
+            Ok(clean)
+        })
+    }
+}
+impl LeaseState {
+    fn check_intent(&self, index: usize, delta: &RemovalDelta) -> NativeResult<()> {
+        if self.pending != Some(index) || self.preview.deltas.get(index) != Some(delta) {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+    fn support(&self, deadline: &Deadline) -> NativeResult<SupportProof> {
+        if self.sources.io.support_observation(deadline)? != self.sources.session {
+            return Err(NativeError::Foreign);
+        }
+        let proof = self
+            .sources
+            .io
+            .admit_support(&self.sources.main, deadline)?;
+        proof.check(&self.sources.io, deadline)?;
+        Ok(proof)
+    }
+    fn completed(&self, effect: RemovalEffect) -> bool {
+        self.preview
+            .deltas
+            .iter()
+            .zip(&self.rows)
+            .filter(|(d, _)| d.effect == effect)
+            .all(|(_, row)| matches!(row, RemovalOutcome::Completed | RemovalOutcome::Absent))
+    }
+    fn prerequisites(&self, delta: &RemovalDelta, deadline: &Deadline) -> NativeResult<()> {
+        use RemovalEffect::*;
+        let allowed = match delta.effect {
+            StopTrackedAgent => self.completed(DisableOwnedAutostart),
+            EraseOnlyAfterCleanExit => {
+                self.choices.delete_identity
+                    && !self.erased
+                    && self.exit.is_some()
+                    && self
+                        .sources
+                        .io
+                        .metadata(&self.sources.io.target().agent_path())?
+                        .is_some()
+            }
+            RemoveSharedDriverAfterPackageVerification | RemovePreviousAfterPackageVerification => {
+                (self.original.is_none() && self.inventory.service == ServiceState::Absent
+                    || self.exit.is_some() && self.completed(StopTrackedAgent))
+                    && self.completed(EraseOnlyAfterCleanExit)
+            }
+            RemoveOwnedAfterVerification | PruneEmptyOwnedAfterVerification => {
+                self.exit.is_some()
+                    && self.completed(EraseOnlyAfterCleanExit)
+                    && self.completed(RemoveSharedDriverAfterPackageVerification)
+                    && self.completed(RemovePreviousAfterPackageVerification)
+            }
+            _ => true,
+        };
+        deadline.check()?;
+        if allowed {
+            Ok(())
+        } else {
+            Err(NativeError::Refused)
+        }
+    }
+    fn accept_effect(
+        &mut self,
+        delta: &RemovalDelta,
+        outcome: RemovalOutcome,
+        evidence: RemovalEvidence,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        use RemovalEffect::*;
+        if !matches!(
+            delta.effect,
+            KeepRecovery | KeepIdentity | KeepForeign | Absent
+        ) && !matches!(outcome, RemovalOutcome::Completed | RemovalOutcome::Absent)
+        {
+            return Err(NativeError::Refused);
+        }
+        match delta.effect {
+            KeepRecovery | KeepIdentity | KeepForeign | Absent => {
+                if outcome
+                    != if delta.effect == Absent {
+                        RemovalOutcome::Absent
+                    } else {
+                        RemovalOutcome::Kept
+                    }
+                {
+                    return Err(NativeError::Refused);
+                }
+            }
+            DisableOwnedAutostart => {
+                if self.disabled(deadline)? != Some(true) {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            StopTrackedAgent => {
+                let original = self.original.clone().ok_or(NativeError::Refused)?;
+                let support = self.support(deadline)?;
+                let clean = self
+                    .sources
+                    .io
+                    .observe_clean_exit(original, &support, deadline)?
+                    .ok_or(NativeError::Refused)?;
+                self.exit = Some(self.capture_exit(clean.receipt().clone(), deadline)?);
+                // These paths are retained, never promoted to owned deletion rows.
+                self.capture_retained(
+                    &[
+                        "keep.input.journal",
+                        "keep.projection-input.journal",
+                        "keep.agent.lock",
+                        "keep.agent-log",
+                        "keep.logs",
+                    ],
+                    deadline,
+                )?;
+            }
+            EraseOnlyAfterCleanExit => {
+                if !self.choices.delete_identity
+                    || self.exit.is_none()
+                    || self
+                        .sources
+                        .io
+                        .metadata(&self.sources.io.target().agent_path())?
+                        .is_none()
+                {
+                    return Err(NativeError::Refused);
+                }
+                let RemovalEvidence::Erase(receipt) = evidence else {
+                    return Err(NativeError::Refused);
+                };
+                if !receipt.identity_and_pairings_removed() {
+                    return Err(NativeError::Refused);
+                }
+                self.erased = true;
+                self.capture_retained(&["keep.identity.lock"], deadline)?;
+            }
+            RemoveSharedDriverAfterPackageVerification | RemovePreviousAfterPackageVerification => {
+                if !self.choices.remove_driver {
+                    return Err(NativeError::Refused);
+                }
+                if let RemovalEvidence::Audio(attempt) = evidence {
+                    self.audio = Some(attempt);
+                }
+                self.check_audio(deadline)?;
+                if self.audio.is_none() {
+                    return Err(NativeError::Refused);
+                }
+            }
+            RemoveOwnedAfterVerification | PruneEmptyOwnedAfterVerification => {
+                if self.exit.is_none()
+                    || self
+                        .sources
+                        .io
+                        .metadata(delta.path.as_ref().ok_or(NativeError::Invalid)?)?
+                        .is_some()
+                {
+                    return Err(NativeError::Foreign);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn capture_retained(&mut self, ids: &[&str], deadline: &Deadline) -> NativeResult<()> {
+        for row in self
+            .inventory
+            .resources
+            .iter()
+            .filter(|r| ids.contains(&r.id.as_str()))
+        {
+            let identity = self.sources.io.metadata(&row.path)?;
+            if let Some(id) = &identity
+                && (id.uid != self.sources.io.target().paths().uid
+                    || id.mode & 0o022 != 0
+                    || !matches!(id.mode & 0o170000, 0o040000 | 0o100000))
+            {
+                return Err(NativeError::Foreign);
+            }
+            self.retained.push((row.path.clone(), identity));
+        }
+        deadline.check()
+    }
+    fn disabled(&self, deadline: &Deadline) -> NativeResult<Option<bool>> {
+        Ok(disabled(&self.sources.io.execute(
+            &CommandSpec::new(
+                self.sources.io.target(),
+                NativeOperation::Launchctl(LaunchctlAction::PrintDisabled),
+            )?,
+            None,
+            deadline,
+        )?))
+    }
+    fn service(&self, deadline: &Deadline) -> NativeResult<ServiceState> {
+        Ok(job(
+            &self.sources.io,
+            &self.sources.io.execute(
+                &CommandSpec::new(
+                    self.sources.io.target(),
+                    NativeOperation::Launchctl(LaunchctlAction::Print),
+                )?,
+                None,
+                deadline,
+            )?,
+        ))
+    }
+    fn capture_exit(
+        &self,
+        receipt: crate::agent_contract::LastExitV1,
+        deadline: &Deadline,
+    ) -> NativeResult<ExitEvidence> {
+        let path = self.sources.io.target().state_dir().join("last_exit.json");
+        let identity = self
+            .sources
+            .io
+            .metadata(&path)?
+            .ok_or(NativeError::Foreign)?;
+        let bytes = self.sources.io.read(&path, 4096, true, deadline)?;
+        if crate::agent_contract::parse_last_exit(&bytes).map_err(|_| NativeError::Invalid)?
+            != receipt
+            || self.sources.io.metadata(&path)? != Some(identity.clone())
+        {
+            return Err(NativeError::Foreign);
+        }
+        let bootstrap = self.bootstrap(deadline)?;
+        Ok(ExitEvidence {
+            receipt,
+            identity,
+            bytes,
+            bootstrap,
+        })
+    }
+    fn bootstrap(&self, deadline: &Deadline) -> NativeResult<Option<(FileIdentity, Vec<u8>)>> {
+        let path = self
+            .sources
+            .io
+            .target()
+            .runtime_dir()
+            .join("bootstrap.json");
+        let Some(identity) = self.sources.io.metadata(&path)? else {
+            return Ok(None);
+        };
+        let bytes = self.sources.io.read(&path, 4096, true, deadline)?;
+        if self.sources.io.metadata(&path)? != Some(identity.clone()) {
+            return Err(NativeError::Foreign);
+        }
+        Ok(Some((identity, bytes)))
+    }
+    fn check_exit(&self, deadline: &Deadline) -> NativeResult<()> {
+        let Some(cached) = &self.exit else {
+            return Ok(());
+        };
+        let original = self.original.as_ref().ok_or(NativeError::Foreign)?;
+        // After executable removal these are evidence checks only, never a new CleanAgentExit.
+        for _ in 0..2 {
+            let output = self.sources.io.execute(
+                &CommandSpec::new(
+                    self.sources.io.target(),
+                    NativeOperation::Process {
+                        pid: original.process().pid,
+                        field: PsField::Uid,
+                    },
+                )?,
+                None,
+                deadline,
+            )?;
+            if output.code != Some(1) || !output.stdout.is_empty() || !output.stderr.is_empty() {
+                return Err(NativeError::Foreign);
+            }
+        }
+        let path = self.sources.io.target().state_dir().join("last_exit.json");
+        if self.sources.io.metadata(&path)? != Some(cached.identity.clone())
+            || self.sources.io.read(&path, 4096, true, deadline)? != cached.bytes
+            || self.sources.io.metadata(&path)? != Some(cached.identity.clone())
+            || self.bootstrap(deadline)? != cached.bootstrap
+        {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()
+    }
+    fn check_audio(&mut self, deadline: &Deadline) -> NativeResult<()> {
+        if let Some(attempt) = &mut self.audio {
+            self.sources
+                .audio
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .observe(attempt, deadline)?;
+            if attempt.facts().kind != AudioPackageKind::Remove
+                || attempt.facts().error.is_some()
+                || !matches!(
+                    attempt.facts().state,
+                    PackageState::Outcome(AudioOutcome::Removed | AudioOutcome::Absent)
+                )
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            for path in [
+                "/Library/Audio/Plug-Ins/HAL/CrosspaneAudio.driver",
+                "/Library/Application Support/Crosspane/Installer/previous",
+            ] {
+                if self
+                    .sources
+                    .io
+                    .audio_metadata(std::path::Path::new(path), deadline)?
+                    .is_some()
+                {
+                    return Err(NativeError::Foreign);
+                }
+            }
+        } else {
+            let support = self.support(deadline)?;
+            let plan = self
+                .sources
+                .audio
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .plan(
+                    &support,
+                    AudioPackageKind::Remove,
+                    self.preview.revision,
+                    self.preview.operation.0,
+                    deadline,
+                )?;
+            if plan.preview() != &self.inventory.audio {
+                return Err(NativeError::Foreign);
+            }
+        }
+        Ok(())
+    }
+    fn activity(
+        &mut self,
+        current: Option<(SelectedAgent, AgentReply)>,
+        initial: bool,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        if self.exit.is_some() {
+            return if current.is_none() {
+                Ok(())
+            } else {
+                Err(NativeError::Foreign)
+            };
+        }
+        let Some(expected) = &self.inventory.activity else {
+            return if current.is_none() {
+                Ok(())
+            } else {
+                Err(NativeError::Foreign)
+            };
+        };
+        let (selected, reply) = current.ok_or(NativeError::Refused)?;
+        let now = self.sources.io.clock().now_ms();
+        let fresh_id = if initial {
+            reply.id == self.activity_floor.0
+        } else {
+            reply.id > self.activity_floor.0
+        };
+        if !fresh_id
+            || reply.observed_at_ms < self.activity_floor.1
+            || reply.observed_at_ms > now
+            || now - reply.observed_at_ms >= SUPPORT_LIFETIME_MS
+            || reply.source != self.sources.io.target().source()
+            || selected.io.target().paths() != self.sources.io.target().paths()
+        {
+            return Err(NativeError::Foreign);
+        }
+        let DecodedReply::Status(StatusAdmission::Supported(health)) =
+            reply.result.map_err(|_| NativeError::Unavailable)?
+        else {
+            return Err(NativeError::Unavailable);
+        };
+        let original = self.original.as_ref().ok_or(NativeError::Foreign)?;
+        if selected.instance.process() != original.process()
+            || selected.instance.bootstrap().instance_id != expected.instance
+        {
+            return Err(NativeError::Foreign);
+        }
+        selected
+            .instance
+            .admit_status(&health.installer().instance)?;
+        selected
+            .instance
+            .revalidate(&selected.io, &selected.support, deadline)?;
+        if expected.input
+            != (health.terminal().controlling.is_some()
+                || health.terminal().controlled_by.is_some())
+            || expected.projections != health.terminal().projections.len()
+            || expected.audio != !health.installer().audio.active_peers.is_empty()
+            || expected.recovery_pending != health.installer().recovery_pending
+            || expected.epochs
+                != [
+                    health.installer().epochs.gate,
+                    health.installer().epochs.grants,
+                    health.installer().epochs.layout,
+                    health.installer().epochs.backends,
+                ]
+        {
+            return Err(NativeError::Foreign);
+        }
+        self.activity_floor = (reply.id, reply.observed_at_ms);
+        deadline.check()
+    }
+    fn resource_identity(
+        &self,
+        row: &UserResource,
+        removed: bool,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let actual = self.sources.io.metadata(&row.path)?;
+        if removed {
+            return if actual.is_none() {
+                Ok(())
+            } else {
+                Err(NativeError::Foreign)
+            };
+        }
+        let changed_parent = self
+            .preview
+            .deltas
+            .iter()
+            .zip(&self.rows)
+            .any(|(d, outcome)| {
+                *outcome == RemovalOutcome::Completed
+                    && d.path
+                        .as_ref()
+                        .is_some_and(|p| p != &row.path && p.starts_with(&row.path))
+            });
+        let own_installer = row.path == self.sources.io.target().installer_dir();
+        let directory = row
+            .identity
+            .as_ref()
+            .is_some_and(|id| id.mode & 0o170000 == 0o040000);
+        if directory && (changed_parent || own_installer) {
+            if let (Some(old), Some(now)) = (&row.identity, &actual) {
+                if (old.device, old.inode, old.mode, old.uid)
+                    != (now.device, now.inode, now.mode, now.uid)
+                {
+                    return Err(NativeError::Foreign);
+                }
+            } else {
+                return Err(NativeError::Foreign);
+            }
+        } else if actual != row.identity {
+            return Err(NativeError::Foreign);
+        }
+        if let Some(hash) = row.sha256
+            && (sha(&self
+                .sources
+                .io
+                .read(&row.path, MAX_FILE_BYTES, false, deadline)?)
+                != hash
+                || self.sources.io.metadata(&row.path)? != actual)
+        {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()
+    }
+    fn removed(&self, path: &std::path::Path) -> bool {
+        self.preview.deltas.iter().zip(&self.rows).any(|(d, row)| {
+            d.path.as_deref() == Some(path)
+                && *row == RemovalOutcome::Completed
+                && matches!(
+                    d.effect,
+                    RemovalEffect::RemoveOwnedAfterVerification
+                        | RemovalEffect::PruneEmptyOwnedAfterVerification
+                )
+        })
+    }
+    fn check_tree(&self, deadline: &Deadline) -> NativeResult<()> {
+        let root = self.sources.io.target().app_path();
+        if self.sources.io.metadata(&root)?.is_none() {
+            return if self.removed(&root)
+                || self
+                    .inventory
+                    .resources
+                    .iter()
+                    .all(|r| r.path != root || r.identity.is_none())
+            {
+                Ok(())
+            } else {
+                Err(NativeError::Foreign)
+            };
+        }
+        let mut pending = vec![(root, 0usize)];
+        let mut count = 0usize;
+        while let Some((path, depth)) = pending.pop() {
+            if depth > 32 {
+                return Err(NativeError::Oversize);
+            }
+            let before = self
+                .sources
+                .io
+                .metadata(&path)?
+                .ok_or(NativeError::Foreign)?;
+            for (name, identity) in self.sources.io.entries(&path, 4096, deadline)? {
+                count += 1;
+                if count > 4096 {
+                    return Err(NativeError::Oversize);
+                }
+                let child = path.join(name);
+                if self.removed(&child) || !self.inventory.resources.iter().any(|r| r.path == child)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                if identity.mode & 0o170000 == 0o040000 {
+                    pending.push((child, depth + 1));
+                }
+            }
+            if self.sources.io.metadata(&path)? != Some(before) {
+                return Err(NativeError::Foreign);
+            }
+        }
+        deadline.check()
+    }
+    fn verify(
+        &mut self,
+        current: Option<(SelectedAgent, AgentReply)>,
+        initial: bool,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let support = self.support(deadline)?;
+        self.activity(current, initial, deadline)?;
+        let expected_service = if self.exit.is_some() {
+            ServiceState::Absent
+        } else {
+            self.inventory.service
+        };
+        let expected_disabled = if self.completed(RemovalEffect::DisableOwnedAutostart)
+            && self
+                .preview
+                .deltas
+                .iter()
+                .any(|d| d.effect == RemovalEffect::DisableOwnedAutostart)
+        {
+            Some(true)
+        } else {
+            self.inventory.disabled
+        };
+        if self.service(deadline)? != expected_service
+            || self.disabled(deadline)? != expected_disabled
+        {
+            return Err(NativeError::Foreign);
+        }
+        self.check_exit(deadline)?;
+        self.check_audio(deadline)?;
+        for row in &self.inventory.resources {
+            let removed = self.preview.deltas.iter().zip(&self.rows).any(|(d, code)| {
+                d.path.as_ref() == Some(&row.path)
+                    && d.resource == row.id
+                    && *code == RemovalOutcome::Completed
+                    && matches!(
+                        d.effect,
+                        RemovalEffect::RemoveOwnedAfterVerification
+                            | RemovalEffect::PruneEmptyOwnedAfterVerification
+                    )
+            });
+            if row.path
+                == self
+                    .sources
+                    .io
+                    .target()
+                    .installer_dir()
+                    .join("removal.json")
+            {
+                continue; // Managed only by the frozen strict journal below, never path ownership.
+            }
+            if self.exit.is_some() && row.id == "keep.last_exit.json" {
+                continue;
+            }
+            if let Some((_, expected)) = self.retained.iter().find(|(p, _)| p == &row.path) {
+                if self.sources.io.metadata(&row.path)? != *expected {
+                    return Err(NativeError::Foreign);
+                }
+                continue;
+            }
+            if self.erased
+                && matches!(
+                    row.id.as_str(),
+                    "keep.trust.json" | "keep.revocations.json" | "keep.device-key.pk8"
+                )
+            {
+                if self.sources.io.metadata(&row.path)?.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+            } else {
+                self.resource_identity(row, removed, deadline)?;
+            }
+        }
+        self.check_tree(deadline)?;
+        let source = self.sources.audio_source.join(format!(
+            "CrosspaneAudio-remove-{}.pkg",
+            self.inventory.package.version
+        ));
+        if self.sources.io.metadata(&source)? != Some(self.inventory.package.source.clone())
+            || sha(&self
+                .sources
+                .io
+                .read(&source, MAX_FILE_BYTES, false, deadline)?)
+                != self.inventory.package.removal_sha256
+            || sha(&self.sources.io.read(
+                &self.sources.audio_source.join("packages.json"),
+                1024,
+                false,
+                deadline,
+            )?) != self.inventory.package.manifest_sha256
+        {
+            return Err(NativeError::Foreign);
+        }
+        let actual = JournalState::read(&self.sources, deadline)?;
+        let journal = self
+            .journal
+            .state
+            .lock()
+            .map_err(|_| NativeError::Unavailable)?;
+        if actual != journal.published {
+            return Err(NativeError::Foreign);
+        }
+        drop(journal);
+        self.check_exit(deadline)?;
+        if self.exit.is_none() && self.inventory.activity.is_some() {
+            let now = self.sources.io.clock().now_ms();
+            if now < self.activity_floor.1 || now - self.activity_floor.1 >= SUPPORT_LIFETIME_MS {
+                return Err(NativeError::Foreign);
+            }
+        }
+        support.check(&self.sources.io, deadline)?;
+        deadline.check()
+    }
+}
