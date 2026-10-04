@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crosspane_engine::io::{AudioKey, HomeFailure, HomeOp, PortalsFailure, Warp};
+use crosspane_engine::io::{AudioKey, ClipBytes, HomeFailure, HomeOp, PortalsFailure, Warp};
 use crosspane_engine::{
     Command, Engine, Failure, InjectCmd, Input, Notice, Output, ProjectionKey, ProxyEvent,
 };
@@ -20,9 +20,11 @@ use crosspane_platform::{
     PlatformError, StreamId, WindowEvent, WindowInfo, WindowRole, WindowState,
 };
 use crosspane_protocol::audio::AudioPacket;
+use crosspane_protocol::clip::{CLIP_FEATURE, ClipDataHeader};
 use crosspane_protocol::link::{LinkEvent, PeerLink};
 use crosspane_protocol::msg::{
-    Capability, ControlMessage, Hello, Placement, Refusal, RevocationNotice,
+    Capability, ClipFailure, ClipFetchFailed, ControlMessage, Hello, Placement, Refusal,
+    RevocationNotice,
 };
 use crosspane_protocol::projection::{DRAG_FEATURE, ProjectionMessage, ProxyPlacement};
 use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
@@ -154,6 +156,7 @@ struct PeerInfo {
     /// What the engine was last told about audio with this peer (`Input::AudioPeer`).
     audio: bool,
     drag: bool,
+    clip: bool,
 }
 
 impl PeerInfo {
@@ -645,6 +648,10 @@ pub struct Agent {
     revocations: crate::revocations::Issued,
     /// The audio worker (WP-3.6d); `None` when audio sharing is off or has no backend.
     audio: Option<Box<dyn AudioPlane>>,
+    clipboard: Option<crate::clipboard::Worker>,
+    /// Accepted local promises only, to retire this connection's transport work on withdrawal.
+    clip_promises: BTreeMap<u64, NodeId>,
+    clip_readers: BTreeSet<NodeId>,
     /// The features this node advertised in its `Hello`.
     features: Vec<String>,
     /// Sessions playing on this machine's speakers now: the engine's `AudioIndicators`.
@@ -908,6 +915,9 @@ impl Agent {
             port: e2.port,
             revocations: e2.revocations,
             audio,
+            clipboard: None,
+            clip_promises: BTreeMap::new(),
+            clip_readers: BTreeSet::new(),
             features,
             speakers: Vec::new(),
             home: HomeAgent::new(),
@@ -1059,7 +1069,48 @@ impl Agent {
         window.pid.is_some_and(|pid| pid != self.placement.pid)
     }
 
+    pub(crate) fn set_clipboard(&mut self, worker: Option<crate::clipboard::Worker>) {
+        self.clipboard = worker;
+    }
+
+    fn cancel_clip(&self, peer: NodeId) {
+        if let Some(worker) = &self.clipboard {
+            worker.cancel_peer(peer);
+        }
+        self.net.transport().cancel_clip(peer);
+    }
+
     fn feed(&mut self, mut input: Input) {
+        let offering = match &input {
+            Input::Link(LinkEvent::Control {
+                peer,
+                msg: ControlMessage::ClipOffer(_),
+            }) => Some(*peer),
+            _ => None,
+        };
+        match &input {
+            Input::Grants(grants) => {
+                let readers: BTreeSet<_> = grants
+                    .iter()
+                    .filter_map(|(peer, caps)| {
+                        caps.contains(&Capability::ClipboardRead).then_some(*peer)
+                    })
+                    .collect();
+                for peer in self.clip_readers.difference(&readers) {
+                    self.cancel_clip(*peer);
+                }
+                self.clip_readers = readers;
+            }
+            Input::Session(event)
+                if !matches!(event,
+                crosspane_platform::SessionEvent::State(state) if state.permits_io()) =>
+            {
+                for peer in self.peers.keys() {
+                    self.cancel_clip(*peer);
+                }
+            }
+            _ => {}
+        }
         self.revalidate_proxy_observation(&mut input);
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_input(&input);
@@ -1094,6 +1145,13 @@ impl Agent {
             self.engine.controlled_by(),
         );
         let outputs = self.engine.handle(input, now);
+        if let Some(peer) = offering {
+            for output in &outputs {
+                if let Output::ClipPromise { offer, .. } = output {
+                    self.clip_promises.insert(*offer, peer);
+                }
+            }
+        }
         let after = (
             self.engine.control_established(),
             self.engine.controlled_by(),
@@ -1569,6 +1627,21 @@ impl Agent {
     }
 
     fn on_link(&mut self, event: LinkEvent) {
+        if let LinkEvent::ClipData {
+            peer,
+            fetch,
+            kind,
+            data,
+        } = event
+        {
+            self.feed(Input::ClipData {
+                peer,
+                fetch,
+                kind,
+                data: ClipBytes(data.0.to_vec()),
+            });
+            return;
+        }
         if let LinkEvent::Media { peer, data } = event {
             let _ = self.dest_media.send(DestCmd::Media { peer, data });
             return;
@@ -1646,6 +1719,7 @@ impl Agent {
                 _ => {}
             },
             LinkEvent::Closed { peer, error } => {
+                self.cancel_clip(*peer);
                 tracing::info!(peer = %peer.short(), ?error, "peer disconnected");
                 // Audio with this peer stops before the engine hears of the close, so nothing is
                 // still sent to or played for a connection that is gone (its devices go when the
@@ -1660,6 +1734,7 @@ impl Agent {
                     info.rtt = None;
                     // The engine drops its audio availability with the link.
                     info.audio = false;
+                    info.clip = false;
                 }
                 // Projections from this peer stay open through the grace period (WP-2.15); a
                 // resumed one starts a new stream whose sequence numbers start again, so the
@@ -1710,6 +1785,7 @@ impl Agent {
         // After `PeerUp`: the engine ignores audio availability for a peer that isn't up.
         self.sync_audio_peer(peer);
         self.sync_drag_peer(peer);
+        self.sync_clip_peer(peer);
         self.feed(Input::PeerDisplays {
             peer,
             displays: hello.displays.clone(),
@@ -1768,9 +1844,17 @@ impl Agent {
         if let Some(audio) = &self.audio {
             audio.cancel_peer(peer);
         }
+        self.cancel_clip(peer);
+        self.peers.entry(peer).or_default().clip = false;
+        // A replacement invalidates old promises even when both Hellos still carry clip/0.
+        self.feed(Input::ClipPeer {
+            peer,
+            available: false,
+        });
         self.feed(Input::AudioConnectionReplaced { peer });
         self.sync_audio_peer(peer);
         self.sync_drag_peer(peer);
+        self.sync_clip_peer(peer);
         self.peer_features_changed(peer);
         if displays_changed {
             self.feed(Input::PeerDisplays {
@@ -1811,6 +1895,21 @@ impl Agent {
         if info.drag != available {
             info.drag = available;
             self.feed(Input::DragPeer { peer, available });
+        }
+    }
+
+    fn sync_clip_peer(&mut self, peer: NodeId) {
+        let Some(info) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        let has = |features: &[String]| features.iter().any(|feature| feature == CLIP_FEATURE);
+        let available = info.connected
+            && self.clipboard.is_some()
+            && has(&self.features)
+            && has(&info.features);
+        if info.clip != available {
+            info.clip = available;
+            self.feed(Input::ClipPeer { peer, available });
         }
     }
 
@@ -2047,11 +2146,77 @@ impl Agent {
                 }
             }
             Output::SendControl { peer, msg } => {
-                if let Some(link) = self.links.get_mut(&peer) {
-                    let _ = link.send_control(&msg);
+                if matches!(&msg, ControlMessage::ClipWithdraw(_)) {
+                    self.cancel_clip(peer);
+                }
+                let expected = match &msg {
+                    ControlMessage::ClipFetch(fetch) => self
+                        .net
+                        .transport()
+                        .expect_clip(peer, fetch.fetch, fetch.kind)
+                        .is_ok(),
+                    _ => true,
+                };
+                // Transport retains its global overflow policy; local fetch failure adds no agent teardown.
+                let sent = expected
+                    && self
+                        .links
+                        .get_mut(&peer)
+                        .is_some_and(|link| link.send_control(&msg).is_ok());
+                if !sent && let ControlMessage::ClipFetch(fetch) = msg {
+                    // Locally synthesized failure: no wire message or link teardown. It retires
+                    // only this engine-admitted paste through the frozen completion path.
+                    self.pending.push_back(Input::Link(LinkEvent::Control {
+                        peer,
+                        msg: ControlMessage::ClipFetchFailed(ClipFetchFailed {
+                            fetch: fetch.fetch,
+                            reason: ClipFailure::Unavailable,
+                        }),
+                    }));
+                }
+            }
+            output @ (Output::ClipPromise { .. }
+            | Output::ClipWithdraw { .. }
+            | Output::ClipFulfil { .. }
+            | Output::ClipRead { .. }) => {
+                if let Output::ClipWithdraw { offer } = &output
+                    && let Some(peer) = self.clip_promises.remove(offer)
+                {
+                    self.cancel_clip(peer);
+                }
+                if let Some(worker) = &self.clipboard {
+                    self.pending.extend(worker.submit(output));
+                }
+            }
+            Output::SendClipData {
+                peer,
+                fetch,
+                kind,
+                data,
+            } => {
+                let header =
+                    u32::try_from(data.0.len())
+                        .ok()
+                        .map(|len| ClipDataHeader { fetch, kind, len });
+                if header.is_none_or(|header| {
+                    self.net
+                        .transport()
+                        .send_clip_data(peer, header, data.0.into())
+                        .is_err()
+                }) && let Some(link) = self.links.get_mut(&peer)
+                {
+                    let _ = link.send_control(&ControlMessage::ClipFetchFailed(ClipFetchFailed {
+                        fetch,
+                        reason: ClipFailure::Unavailable,
+                    }));
                 }
             }
             Output::EngineGate(open) => {
+                if !open {
+                    for peer in self.peers.keys() {
+                        self.cancel_clip(*peer);
+                    }
+                }
                 self.tracker.engine_permits = open;
                 self.platform.gate.set_engine_permits(open);
             }
@@ -3784,6 +3949,7 @@ impl Agent {
         // Likewise a node without an audio worker grants neither the speakers nor the microphone:
         // it never advertised `audio`, so nothing could be admitted anyway.
         let can_play = self.audio.is_some();
+        let can_clip = self.clipboard.is_some();
         let grants: BTreeMap<NodeId, BTreeSet<Capability>> = self.trust.with(|t| {
             t.peers()
                 .into_iter()
@@ -3795,6 +3961,10 @@ impl Agent {
                     if !can_play {
                         granted.remove(&Capability::AudioSpeaker);
                         granted.remove(&Capability::AudioMic);
+                    }
+                    if !can_clip {
+                        granted.remove(&Capability::ClipboardRead);
+                        granted.remove(&Capability::ClipboardWrite);
                     }
                     (e.node, granted)
                 })
@@ -4576,6 +4746,8 @@ impl Agent {
         // A panic's first restore may fail while the final journal recovery succeeds. Only a
         // fresh physical read-back after that recovery permits the remaining bind cleanup.
         self.home_shutdown();
+        // Panic has retired promises; the worker finishes only its current bounded call.
+        drop(self.clipboard.take());
         self.net.shutdown();
         // Last: peers already heard of the close, and the worker's stop is bounded (2.5 s) but
         // can be slower than the rest of this.
@@ -8818,6 +8990,874 @@ mod home_tests {
     use super::audio_tests::{Rig, rig};
     use super::*;
     use crate::platform::HomeSeat;
+
+    mod clipboard_e2e {
+        use super::*;
+        use crosspane_engine::EngineConfig;
+        use crosspane_input::journal::MemoryJournal;
+        use crosspane_platform::{ClipKinds, ClipboardEvent, ClipboardHost, LocalPasteId};
+        use crosspane_platform::{LockState, SessionEvent, SessionState};
+        use crosspane_security::trust::PeerEntry;
+        use crosspane_types::ClipKind;
+
+        fn features(names: &[&str]) -> Vec<String> {
+            names.iter().map(|s| (*s).to_owned()).collect()
+        }
+        use std::sync::Condvar;
+
+        #[derive(Default)]
+        struct BoardState {
+            sink: Option<Arc<dyn EventSink<ClipboardEvent>>>,
+            native: Vec<u8>,
+            promise: Option<u64>,
+            answers: BTreeMap<u64, Option<ClipBytes>>,
+            reads: usize,
+            installs: usize,
+            blocked: bool,
+            fail_promise: bool,
+        }
+        #[derive(Clone, Default)]
+        struct Board(Arc<(Mutex<BoardState>, Condvar)>);
+        impl Board {
+            fn copy(&self, data: &[u8]) {
+                let sink = {
+                    let mut state = self.0.0.lock().unwrap();
+                    state.native = data.to_vec();
+                    state.promise = None;
+                    state.sink.clone().unwrap()
+                };
+                sink.send(ClipboardEvent::Changed {
+                    kinds: ClipKinds {
+                        text: true,
+                        image: false,
+                    },
+                });
+            }
+            fn paste(&self, id: u64) {
+                let state = self.0.0.lock().unwrap();
+                let event = ClipboardEvent::PasteRequested {
+                    paste: LocalPasteId(id),
+                    offer: state.promise.unwrap(),
+                    kind: ClipKind::Text,
+                };
+                let sink = state.sink.clone().unwrap();
+                drop(state);
+                sink.send(event);
+            }
+            fn unblock(&self) {
+                self.0.0.lock().unwrap().blocked = false;
+                self.0.1.notify_all();
+            }
+            fn reads(&self) -> usize {
+                self.0.0.lock().unwrap().reads
+            }
+            fn installed(&self) -> bool {
+                self.0.0.lock().unwrap().promise.is_some()
+            }
+            fn answered(&self, id: u64) -> bool {
+                self.0.0.lock().unwrap().answers.contains_key(&id)
+            }
+            fn answer_is(&self, id: u64, expected: Option<&[u8]>) -> bool {
+                self.0
+                    .0
+                    .lock()
+                    .unwrap()
+                    .answers
+                    .get(&id)
+                    .is_some_and(|answer| {
+                        answer.as_ref().map(|bytes| bytes.0.as_slice()) == expected
+                    })
+            }
+        }
+        struct FakeClipboard {
+            board: Board,
+            gate: Arc<IoGate>,
+        }
+        impl ClipboardHost for FakeClipboard {
+            fn subscribe(
+                &mut self,
+                sink: Arc<dyn EventSink<ClipboardEvent>>,
+            ) -> Result<(), PlatformError> {
+                self.board.0.0.lock().unwrap().sink = Some(sink);
+                Ok(())
+            }
+            fn kinds(&self) -> Result<ClipKinds, PlatformError> {
+                Ok(ClipKinds {
+                    text: !self.board.0.0.lock().unwrap().native.is_empty(),
+                    image: false,
+                })
+            }
+            fn read(&mut self, _: ClipKind, max: usize) -> Result<Vec<u8>, PlatformError> {
+                let epoch = self.gate.epoch();
+                if !self.gate.is_open() {
+                    return Err(PlatformError::Locked);
+                }
+                let until = Instant::now() + Duration::from_millis(1500);
+                let mut state = self.board.0.0.lock().unwrap();
+                state.reads += 1;
+                while state.blocked {
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(PlatformError::Timeout);
+                    }
+                    state = self.board.0.1.wait_timeout(state, left).unwrap().0;
+                }
+                if !self.gate.is_open() || self.gate.epoch() != epoch {
+                    return Err(PlatformError::Locked);
+                }
+                if state.native.len() > max {
+                    return Err(PlatformError::TooLarge);
+                }
+                if state.native.is_empty() || state.promise.is_some() {
+                    return Err(PlatformError::NotFound);
+                }
+                Ok(state.native.clone())
+            }
+            fn promise(&mut self, offer: u64, _: ClipKinds) -> Result<(), PlatformError> {
+                if !self.gate.is_open() {
+                    return Err(PlatformError::Locked);
+                }
+                let mut state = self.board.0.0.lock().unwrap();
+                if state.fail_promise {
+                    return Err(PlatformError::Backend("fake unavailable".into()));
+                }
+                state.native.clear();
+                state.promise = Some(offer);
+                state.installs += 1;
+                Ok(())
+            }
+            fn fulfil(&mut self, paste: LocalPasteId, data: Option<Vec<u8>>) {
+                self.board
+                    .0
+                    .0
+                    .lock()
+                    .unwrap()
+                    .answers
+                    .insert(paste.0, data.map(ClipBytes));
+            }
+            fn withdraw(&mut self, offer: u64) -> Result<(), PlatformError> {
+                let mut state = self.board.0.0.lock().unwrap();
+                if state.promise == Some(offer) {
+                    state.promise = None;
+                }
+                Ok(())
+            }
+        }
+        struct Visible(Sender<Event>);
+        impl OverlayHost for Visible {
+            fn subscribe(
+                &mut self,
+                _: Arc<dyn EventSink<crosspane_platform::OverlayEvent>>,
+            ) -> Result<(), PlatformError> {
+                Ok(())
+            }
+            fn show(&mut self, id: OverlayId, _: &Overlay) -> Result<(), PlatformError> {
+                self.0
+                    .send(Event::Input(Input::Overlay(
+                        crosspane_platform::OverlayEvent::Visible(id),
+                    )))
+                    .unwrap();
+                Ok(())
+            }
+            fn hide(&mut self, _: OverlayId) -> Result<(), PlatformError> {
+                Ok(())
+            }
+        }
+        struct Proxy(Sender<Event>);
+        impl ProxyCommands for Proxy {
+            fn send(&self, command: HostCommand) -> Result<(), crosspane_render::proxy::HostError> {
+                if let HostCommand::Open { id, size, .. } = command {
+                    self.0
+                        .send(Event::Host(HostEvent::Opened {
+                            id,
+                            size,
+                            scale: 1.0,
+                        }))
+                        .unwrap();
+                }
+                Ok(())
+            }
+        }
+        struct RefuseFetch(Box<dyn PeerLink>);
+        impl PeerLink for RefuseFetch {
+            fn peer(&self) -> NodeId {
+                self.0.peer()
+            }
+            fn send_input(
+                &mut self,
+                msg: &crosspane_protocol::msg::InputMessage,
+            ) -> Result<(), crosspane_protocol::link::LinkError> {
+                self.0.send_input(msg)
+            }
+            fn send_motion(
+                &mut self,
+                msg: &crosspane_protocol::msg::PointerMessage,
+            ) -> Result<(), crosspane_protocol::link::LinkError> {
+                self.0.send_motion(msg)
+            }
+            fn send_control(
+                &mut self,
+                msg: &ControlMessage,
+            ) -> Result<(), crosspane_protocol::link::LinkError> {
+                if matches!(msg, ControlMessage::ClipFetch(_)) {
+                    Err(crosspane_protocol::link::LinkError::Congested)
+                } else {
+                    self.0.send_control(msg)
+                }
+            }
+            fn rtt(&self) -> Option<Duration> {
+                self.0.rtt()
+            }
+            fn close(&mut self, reason: &str) {
+                self.0.close(reason);
+            }
+        }
+        struct Windows(Sender<Event>);
+        impl crosspane_platform::WindowSource for Windows {
+            fn windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
+                Ok(Vec::new())
+            }
+            fn focused(&self) -> Result<Option<WindowId>, PlatformError> {
+                Ok(None)
+            }
+            fn subscribe(
+                &mut self,
+                _: Arc<dyn EventSink<WindowEvent>>,
+            ) -> Result<(), PlatformError> {
+                Ok(())
+            }
+            fn activate(&mut self, window: WindowId) -> Result<(), PlatformError> {
+                self.0
+                    .send(Event::Input(Input::Windows(WindowEvent::Focused(Some(
+                        window,
+                    )))))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        struct Parking;
+        impl crosspane_platform::WindowParking for Parking {
+            fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+                Ok(())
+            }
+            fn park(
+                &mut self,
+                window: WindowId,
+                size: PixelSize,
+                _: f64,
+            ) -> Result<crosspane_platform::Parked, PlatformError> {
+                Ok(crosspane_platform::Parked {
+                    window,
+                    kind: crosspane_platform::ParkingKind::Mirror,
+                    display: DisplayId(1),
+                    content: crosspane_types::geom::PixelRect::new(
+                        crosspane_types::geom::euclid::Point2D::new(0, 0),
+                        crosspane_types::geom::euclid::Point2D::new(
+                            size.width as i32,
+                            size.height as i32,
+                        ),
+                    ),
+                    fullscreen: false,
+                })
+            }
+            fn resize(
+                &mut self,
+                window: WindowId,
+                size: PixelSize,
+                scale: f64,
+            ) -> Result<crosspane_platform::Parked, PlatformError> {
+                self.park(window, size, scale)
+            }
+            fn geometry(&self, _: WindowId) -> Result<crosspane_platform::Parked, PlatformError> {
+                Err(PlatformError::NotFound)
+            }
+            fn restore(&mut self, _: WindowId) -> Result<(), PlatformError> {
+                Ok(())
+            }
+            fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+                Ok(Vec::new())
+            }
+        }
+
+        /// Two real agent loops and authenticated QUIC links, dialing only ::1. All platform
+        /// operations, including clipboard, capture, proxy and parking, are Rust fakes.
+        struct Pair {
+            homes: [Home; 2],
+            boards: [Board; 2],
+        }
+        impl Pair {
+            fn new(feature: bool, granted: bool) -> Self {
+                let mut homes = [home(), home()];
+                let boards = [Board::default(), Board::default()];
+                let identities = [
+                    homes[0].rig.agent.identity.clone(),
+                    homes[1].rig.agent.identity.clone(),
+                ];
+                let mut d = display(1, 1.0, (0.0, 0.0), (1000, 1000));
+                d.geometry.physical_size = SizeMm::new(100.0, 100.0);
+                for n in 0..2 {
+                    let h = &mut homes[n];
+                    let peer = identities[1 - n].node();
+                    h.rig.peer = peer;
+                    let a = &mut h.rig.agent;
+                    a.features = features(&["e1", "cursor"]);
+                    if feature {
+                        a.features.push(CLIP_FEATURE.into());
+                    }
+                    let mut caps = BTreeSet::from([
+                        Capability::InputAccept,
+                        Capability::WindowShare,
+                        Capability::WindowPresent,
+                    ]);
+                    if granted {
+                        caps.extend([Capability::ClipboardRead, Capability::ClipboardWrite]);
+                    }
+                    a.trust
+                        .update(|t| {
+                            t.pin(PeerEntry {
+                                node: peer,
+                                spki: identities[1 - n].spki().to_vec(),
+                                name: "loopback peer".into(),
+                                granted: caps,
+                                paired_at_ms: 1,
+                            })
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                        })
+                        .unwrap();
+                    let mut config = EngineConfig::new(a.node);
+                    config.push_to_cross = Duration::ZERO;
+                    a.engine = Engine::new(
+                        config,
+                        Box::new(MemoryJournal::default()),
+                        Box::new(MemoryJournal::default()),
+                        platform::now(),
+                    )
+                    .unwrap()
+                    .0;
+                    a.feed(Input::Session(SessionEvent::State(SessionState {
+                        lock: LockState::Unlocked,
+                        active: Some(true),
+                    })));
+                    a.local_displays = vec![d.clone()];
+                    h.compositor.lock().unwrap().physical = vec![d.clone()];
+                    h.capture.lock().unwrap().lifecycle = true;
+                    a.platform.overlay = Some(Box::new(Visible(a.events.clone())));
+                    a.platform.windows = Some(Box::new(Windows(a.events.clone())));
+                    a.platform.frames = Some(Box::new(FakeFrames));
+                    a.parking_available = true;
+                    a.parking = Some(
+                        crate::parking_worker::Worker::start(Box::new(Parking), a.events.clone())
+                            .unwrap(),
+                    );
+                    a.host = Some(Box::new(Proxy(a.events.clone())));
+                    let worker = crate::clipboard::Worker::start(
+                        Box::new(FakeClipboard {
+                            board: boards[n].clone(),
+                            gate: a.platform.gate.clone(),
+                        }),
+                        a.events.clone(),
+                    )
+                    .unwrap();
+                    a.set_clipboard(Some(worker));
+                    a.feed(Input::LocalDisplays(vec![d.clone()]));
+                    a.net.shutdown();
+                    a.net = Net::start(
+                        0,
+                        identities[n].clone(),
+                        Arc::new(a.trust.clone()),
+                        Hello {
+                            minor: crosspane_protocol::PROTOCOL_MINOR,
+                            name: "clipboard loopback".into(),
+                            features: a.features.clone(),
+                            displays: vec![d.clone()],
+                        },
+                        a.events.clone(),
+                    )
+                    .unwrap();
+                }
+                let mut pair = Self { homes, boards };
+                let addr = std::net::SocketAddr::from((
+                    std::net::Ipv6Addr::LOCALHOST,
+                    pair.homes[1].rig.agent.net.local_addr().port(),
+                ));
+                pair.homes[0].rig.agent.net.dial_once(addr);
+                pair.until(|w| {
+                    w.homes.iter().all(|h| {
+                        h.rig
+                            .agent
+                            .peers
+                            .get(&h.rig.peer)
+                            .is_some_and(|p| p.connected)
+                    })
+                });
+                pair.pump(Duration::from_millis(40));
+                let layout: Vec<_> = identities
+                    .iter()
+                    .enumerate()
+                    .map(|(n, id)| Placement {
+                        node: id.node(),
+                        display: DisplayId(1),
+                        origin: crosspane_types::geom::PointMm::new(n as f64 * 100.0, 0.0),
+                        version: 1,
+                    })
+                    .collect();
+                for n in 0..2 {
+                    pair.feed(n, Input::Layout(layout.clone()));
+                }
+                pair
+            }
+            fn pump(&mut self, duration: Duration) {
+                let until = Instant::now() + duration;
+                loop {
+                    for h in &mut self.homes {
+                        while let Ok(event) = h.rig.events.try_recv() {
+                            h.rig.agent.on_event(event);
+                        }
+                        h.rig.agent.feed(Input::Tick);
+                        h.rig.agent.settle();
+                    }
+                    if Instant::now() >= until {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            fn until(&mut self, check: impl Fn(&Self) -> bool) {
+                let until = Instant::now() + Duration::from_secs(4);
+                while !check(self) {
+                    assert!(
+                        Instant::now() < until,
+                        "fake loopback did not reach expected metadata state"
+                    );
+                    self.pump(Duration::from_millis(2));
+                }
+            }
+            fn feed(&mut self, n: usize, input: Input) {
+                self.homes[n].rig.agent.feed(input);
+                self.homes[n].rig.agent.settle();
+                self.pump(Duration::from_millis(10));
+            }
+            fn cross(&mut self) {
+                let portal = self.homes[0]
+                    .rig
+                    .agent
+                    .emitted
+                    .iter()
+                    .rev()
+                    .find_map(|o| match o {
+                        Output::SetPortals(portals) => portals
+                            .iter()
+                            .find(|p| p.edge == crosspane_platform::Edge::Right)
+                            .map(|p| p.id),
+                        _ => None,
+                    })
+                    .unwrap();
+                self.feed(
+                    0,
+                    Input::Capture(CaptureEvent::EdgePressed {
+                        portal,
+                        position: 0.5,
+                        at: platform::now(),
+                    }),
+                );
+                self.until(|w| {
+                    w.homes[0].rig.agent.engine.control_established() == Some(w.homes[1].rig.local)
+                });
+            }
+            fn copy(&mut self, n: usize, bytes: &[u8]) {
+                self.boards[n].copy(bytes);
+                self.pump(Duration::from_millis(10));
+            }
+            fn paste(&mut self, n: usize, id: u64) {
+                self.boards[n].paste(id);
+                self.until(|w| w.boards[n].answered(id));
+            }
+            fn revoke(&mut self, n: usize, capability: Capability) {
+                let peer = self.homes[n].rig.peer;
+                self.homes[n]
+                    .rig
+                    .agent
+                    .trust
+                    .update(|t| {
+                        t.set_grant(peer, capability, false)
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                    })
+                    .unwrap();
+                self.homes[n].rig.agent.send_grants();
+                self.pump(Duration::from_millis(10));
+            }
+            fn lock(&mut self, n: usize) {
+                self.homes[n].gate.set_session_permits(false);
+                self.feed(
+                    n,
+                    Input::Session(SessionEvent::State(SessionState {
+                        lock: LockState::Locked,
+                        active: Some(true),
+                    })),
+                );
+            }
+            fn project(&mut self) -> ProjectionKey {
+                self.feed(
+                    0,
+                    Input::Windows(WindowEvent::Added(WindowInfo {
+                        id: WindowId(44),
+                        title: "clipboard fake window".into(),
+                        app_id: "fake".into(),
+                        pid: Some(123),
+                        display: Some(DisplayId(1)),
+                        frame: crosspane_types::geom::RectLogical::new(
+                            crosspane_types::geom::PointLogical::zero(),
+                            crosspane_types::geom::SizeLogical::new(400.0, 300.0),
+                        ),
+                        state: WindowState::Normal,
+                        role: WindowRole::Toplevel,
+                        parent: None,
+                    })),
+                );
+                let peer = self.homes[1].rig.local;
+                self.feed(
+                    0,
+                    Input::Command(Command::Project {
+                        window: WindowId(44),
+                        to: peer,
+                        place: None,
+                    }),
+                );
+                self.until(|w| {
+                    w.homes[1]
+                        .rig
+                        .agent
+                        .emitted
+                        .iter()
+                        .any(|o| matches!(o, Output::OpenProxy { .. }))
+                });
+                self.homes[1]
+                    .rig
+                    .agent
+                    .emitted
+                    .iter()
+                    .find_map(|o| match o {
+                        Output::OpenProxy { key, .. } => Some(*key),
+                        _ => None,
+                    })
+                    .unwrap()
+            }
+        }
+        impl Drop for Pair {
+            fn drop(&mut self) {
+                for board in &self.boards {
+                    board.unblock();
+                }
+                for h in &mut self.homes {
+                    h.rig.agent.shutdown();
+                }
+            }
+        }
+
+        #[test]
+        fn clipboard_private_loopback_e1_text_round_trip_is_lazy() {
+            let mut w = Pair::new(true, true);
+            w.copy(0, b"first fixture");
+            w.cross();
+            w.until(|w| w.boards[1].installed());
+            assert_eq!(w.boards[0].reads(), 0);
+            w.paste(1, 1);
+            assert!(w.boards[1].answer_is(1, Some(b"first fixture")));
+            assert_eq!(w.boards[0].reads(), 1);
+            w.copy(1, b"return fixture");
+            w.feed(0, Input::Command(Command::ReleaseControl));
+            w.until(|w| w.boards[0].installed());
+            assert_eq!(w.boards[1].reads(), 0);
+            w.paste(0, 2);
+            assert!(w.boards[0].answer_is(2, Some(b"return fixture")));
+            assert_eq!(w.boards[1].reads(), 1);
+        }
+        #[test]
+        fn clipboard_private_loopback_e2_focus_text_round_trip_is_lazy() {
+            let mut w = Pair::new(true, true);
+            let key = w.project();
+            w.copy(1, b"destination fixture");
+            w.feed(
+                1,
+                Input::Proxy {
+                    key,
+                    event: ProxyEvent::Focus(true),
+                },
+            );
+            w.until(|w| w.boards[0].installed());
+            assert_eq!(w.boards[1].reads(), 0);
+            w.paste(0, 3);
+            assert!(w.boards[0].answer_is(3, Some(b"destination fixture")));
+            w.copy(0, b"source fixture");
+            w.feed(
+                1,
+                Input::Proxy {
+                    key,
+                    event: ProxyEvent::Focus(false),
+                },
+            );
+            w.until(|w| w.boards[1].installed());
+            assert_eq!(w.boards[0].reads(), 0);
+            w.paste(1, 4);
+            assert!(w.boards[1].answer_is(4, Some(b"source fixture")));
+        }
+        #[test]
+        fn clipboard_private_loopback_grants_off_and_unnegotiated_feature_do_no_io() {
+            for (feature, grants) in [(true, false), (false, true)] {
+                let mut w = Pair::new(feature, grants);
+                w.copy(0, b"private fixture");
+                w.cross();
+                w.pump(Duration::from_millis(50));
+                assert!(!w.boards[1].installed());
+                assert_eq!(w.boards[0].reads(), 0);
+                assert!(
+                    !w.homes
+                        .iter()
+                        .any(|h| h.rig.agent.emitted.iter().any(|o| matches!(
+                            o,
+                            Output::SendControl {
+                                msg: ControlMessage::ClipOffer(_),
+                                ..
+                            }
+                        )))
+                );
+            }
+        }
+        #[test]
+        fn clipboard_private_loopback_revoke_mid_fetch_answers_empty() {
+            let mut w = Pair::new(true, true);
+            w.copy(0, b"held fixture");
+            w.cross();
+            w.until(|w| w.boards[1].installed());
+            w.boards[0].0.0.lock().unwrap().blocked = true;
+            w.boards[1].paste(5);
+            w.until(|w| w.boards[0].reads() == 1);
+            w.revoke(0, Capability::ClipboardRead);
+            w.until(|w| w.boards[1].answered(5));
+            assert!(w.boards[1].answer_is(5, None));
+            w.boards[0].unblock();
+            w.pump(Duration::from_millis(20));
+            assert!(w.boards[1].answer_is(5, None));
+        }
+        #[test]
+        fn clipboard_private_loopback_lock_either_side_stops_offers_and_fetches() {
+            for side in 0..2 {
+                let mut w = Pair::new(true, true);
+                w.copy(0, b"lock fixture");
+                w.cross();
+                w.until(|w| w.boards[1].installed());
+                w.boards[0].0.0.lock().unwrap().blocked = true;
+                w.boards[1].paste(6);
+                w.until(|w| w.boards[0].reads() == 1);
+                w.lock(side);
+                w.until(|w| w.boards[1].answered(6));
+                assert!(w.boards[1].answer_is(6, None));
+                w.boards[0].unblock();
+                w.pump(Duration::from_millis(20));
+                let before = w.homes[side].rig.agent.emitted.len();
+                w.copy(side, b"locked changed fixture");
+                assert!(
+                    !w.homes[side].rig.agent.emitted[before..]
+                        .iter()
+                        .any(|o| matches!(
+                            o,
+                            Output::SendControl {
+                                msg: ControlMessage::ClipOffer(_),
+                                ..
+                            }
+                        ))
+                );
+                assert_eq!(w.boards[0].reads(), 1);
+            }
+        }
+        #[test]
+        fn clipboard_private_loopback_failed_promise_retires_without_fetch() {
+            let mut w = Pair::new(true, true);
+            w.boards[1].0.0.lock().unwrap().fail_promise = true;
+            w.copy(0, b"promise fixture");
+            w.cross();
+            w.until(|w| {
+                w.homes[1]
+                    .rig
+                    .agent
+                    .fed
+                    .iter()
+                    .any(|i| matches!(i, Input::Clipboard(ClipboardEvent::PromiseLost { .. })))
+            });
+            assert!(!w.boards[1].installed());
+            assert_eq!(w.boards[0].reads(), 0);
+        }
+        #[test]
+        fn clipboard_private_loopback_blocked_read_leaves_capture_and_ticks_responsive() {
+            let mut w = Pair::new(true, true);
+            w.copy(0, b"responsive fixture");
+            w.cross();
+            w.until(|w| w.boards[1].installed());
+            w.boards[0].0.0.lock().unwrap().blocked = true;
+            w.boards[1].paste(8);
+            w.until(|w| w.boards[0].reads() == 1);
+            let first = w.homes[0].rig.agent.fed.len();
+            let emitted = w.homes[0].rig.agent.emitted.len();
+            let began = Instant::now();
+            w.feed(
+                0,
+                Input::Capture(CaptureEvent::Motion {
+                    dx: 1.0,
+                    dy: 0.0,
+                    kind: crosspane_platform::MotionKind::Unaccelerated,
+                    at: platform::now(),
+                }),
+            );
+            assert!(began.elapsed() < Duration::from_millis(100));
+            let fed = &w.homes[0].rig.agent.fed[first..];
+            assert!(fed.iter().any(|i| matches!(i, Input::Tick)));
+            assert!(
+                fed.iter()
+                    .any(|i| matches!(i, Input::Capture(CaptureEvent::Motion { .. })))
+            );
+            assert!(
+                w.homes[0].rig.agent.emitted[emitted..]
+                    .iter()
+                    .any(|o| matches!(o, Output::SendMotion { .. }))
+            );
+            assert!(!w.boards[1].answered(8));
+            w.boards[0].unblock();
+            w.until(|w| w.boards[1].answered(8));
+            assert!(w.boards[1].answer_is(8, Some(b"responsive fixture")));
+        }
+        #[test]
+        fn clipboard_absent_worker_removes_capabilities_and_never_announces_availability() {
+            let mut r = rig(false);
+            r.agent.features.push(CLIP_FEATURE.into());
+            let peer = r.peer;
+            for cap in [Capability::ClipboardRead, Capability::ClipboardWrite] {
+                r.agent
+                    .trust
+                    .update(|t| {
+                        t.set_grant(peer, cap, true)
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                    })
+                    .unwrap();
+            }
+            r.agent.on_hello(
+                peer,
+                &Hello {
+                    minor: crosspane_protocol::PROTOCOL_MINOR,
+                    name: "fake peer".into(),
+                    features: features(&["e1", CLIP_FEATURE]),
+                    displays: Vec::new(),
+                },
+            );
+            r.agent.send_grants();
+            assert!(!r.agent.fed.iter().any(|i| matches!(
+                i,
+                Input::ClipPeer {
+                    available: true,
+                    ..
+                }
+            )));
+            let caps = r
+                .agent
+                .fed
+                .iter()
+                .rev()
+                .find_map(|i| match i {
+                    Input::Grants(grants) => grants.get(&peer),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(!caps.contains(&Capability::ClipboardRead));
+            assert!(!caps.contains(&Capability::ClipboardWrite));
+        }
+        #[test]
+        fn clipboard_private_loopback_failed_local_expectation_answers_empty() {
+            let mut w = Pair::new(true, true);
+            w.copy(0, b"expectation fixture");
+            w.cross();
+            w.until(|w| w.boards[1].installed());
+            let peer = w.homes[0].rig.local;
+            for fetch in 100..108 {
+                w.homes[1]
+                    .rig
+                    .agent
+                    .net
+                    .transport()
+                    .expect_clip(
+                        peer,
+                        crosspane_protocol::msg::ClipFetchId(fetch),
+                        ClipKind::Text,
+                    )
+                    .unwrap();
+            }
+            w.paste(1, 7);
+            assert!(w.boards[1].answer_is(7, None));
+            assert_eq!(w.boards[0].reads(), 0);
+            assert!(w.homes[1].rig.agent.fed.iter().any(|i| matches!(
+                i,
+                Input::Link(LinkEvent::Control {
+                    msg: ControlMessage::ClipFetchFailed(_),
+                    ..
+                })
+            )));
+        }
+        #[test]
+        fn clipboard_private_loopback_connection_refresh_retires_old_promise() {
+            let mut w = Pair::new(true, true);
+            w.copy(0, b"connection fixture");
+            w.cross();
+            w.until(|w| w.boards[1].installed());
+            let peer = w.homes[1].rig.peer;
+            let hello = Hello {
+                minor: crosspane_protocol::PROTOCOL_MINOR,
+                name: "replacement".into(),
+                features: features(&["e1", CLIP_FEATURE]),
+                displays: w.homes[0].rig.agent.local_displays.clone(),
+            };
+            let before = w.homes[1].rig.agent.fed.len();
+            w.homes[1]
+                .rig
+                .agent
+                .on_link(LinkEvent::HelloRefresh { peer, hello });
+            w.until(|w| !w.boards[1].installed());
+            let fed = &w.homes[1].rig.agent.fed[before..];
+            assert!(matches!(
+                fed.iter().find(|i| matches!(i, Input::ClipPeer { .. })),
+                Some(Input::ClipPeer {
+                    available: false,
+                    ..
+                })
+            ));
+            assert!(fed.iter().any(|i| matches!(
+                i,
+                Input::ClipPeer {
+                    available: true,
+                    ..
+                }
+            )));
+            assert!(!fed.iter().any(|i| matches!(
+                i,
+                Input::PeerUp { .. } | Input::Link(LinkEvent::Closed { .. })
+            )));
+        }
+        #[test]
+        fn clipboard_private_loopback_failed_fetch_send_answers_empty_without_link_teardown() {
+            let mut w = Pair::new(true, true);
+            w.copy(0, b"send fixture");
+            w.cross();
+            w.until(|w| w.boards[1].installed());
+            let peer = w.homes[1].rig.peer;
+            let link = w.homes[1].rig.agent.links.remove(&peer).unwrap();
+            w.homes[1]
+                .rig
+                .agent
+                .links
+                .insert(peer, Box::new(RefuseFetch(link)));
+            w.paste(1, 9);
+            assert!(w.boards[1].answer_is(9, None));
+            assert_eq!(w.boards[0].reads(), 0);
+            assert!(w.homes[1].rig.agent.peers[&peer].connected);
+        }
+    }
 
     const KEYS: &str = "CTRL + SHIFT + ALT + Escape";
     const TARGET: (DisplayId, PointDevice) = (DisplayId(7), PointDevice::new(100.0, 50.0));

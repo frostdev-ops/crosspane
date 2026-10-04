@@ -410,6 +410,31 @@ pub fn audio_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::Audio
     }
 }
 
+/// Called on the process main thread during startup: AppKit construction must not wait on
+/// a main thread blocked in the agent factory. All subsequent host calls belong to the worker.
+pub fn clipboard_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::ClipboardHost>> {
+    #[cfg(target_os = "linux")]
+    let host = std::env::var_os("WAYLAND_DISPLAY")
+        .ok_or(PlatformError::NotFound)
+        .and_then(|display| {
+            crosspane_platform_linux::hyprland::clipboard::HyprlandClipboard::new(gate, display)
+        })
+        .map(|host| Box::new(host) as Box<dyn crosspane_platform::ClipboardHost>);
+    #[cfg(target_os = "macos")]
+    let host = crosspane_platform_macos::clipboard::MacClipboard::new(
+        gate,
+        crosspane_platform_macos::clipboard::PasteboardName::General,
+    )
+    .map(|host| Box::new(host) as Box<dyn crosspane_platform::ClipboardHost>);
+    match host {
+        Ok(host) => Some(host),
+        Err(error) => {
+            tracing::info!(reason = ?crate::clipboard::failure(&error), "clipboard backend unavailable");
+            None
+        }
+    }
+}
+
 /// The video codecs for E2's motion path (WP-2.14), if this build and machine have them. With the
 /// source GPU, NVENC takes NV12 straight from GPU memory (WP-2.29).
 pub fn video_codecs(

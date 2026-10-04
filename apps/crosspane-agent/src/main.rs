@@ -2,6 +2,7 @@
 
 mod agent;
 mod audio;
+mod clipboard;
 mod config;
 mod ctl;
 mod keys;
@@ -422,6 +423,20 @@ fn start_agent(
     if audio.is_some() {
         features.push("audio".to_owned());
     }
+    // `start_agent` runs on process MAIN before AppKit's loop; construct the facade here,
+    // then transfer its Rust handle to the serialized worker. Advertise only after readiness.
+    let clipboard = platform::clipboard_host(platform.gate.clone()).and_then(|host| {
+        match clipboard::Worker::start(host, tx.clone()) {
+            Ok(worker) => Some(worker),
+            Err(reason) => {
+                tracing::info!(?reason, "clipboard worker unavailable");
+                None
+            }
+        }
+    });
+    if clipboard.is_some() {
+        features.push(crosspane_protocol::clip::CLIP_FEATURE.to_owned());
+    }
     let hello = Hello {
         minor: crosspane_protocol::PROTOCOL_MINOR,
         name: config.name.clone(),
@@ -504,6 +519,7 @@ fn start_agent(
         features,
         audio.map(|worker| Box::new(worker) as Box<dyn agent::AudioPlane>),
     );
+    agent.set_clipboard(clipboard);
     agent.set_startup(startup_facts);
     agent.set_lifecycle_paths(paths.clone());
     agent.start_discovery();
