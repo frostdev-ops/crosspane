@@ -380,3 +380,138 @@ fn query_disabled(output: &CommandOutput) -> NativeResult<Disabled> {
     }
     Ok(found.unwrap_or(Disabled::No))
 }
+
+impl MacLaunchAgent {
+    /// Receipt-bound full reinstall; run on a detached worker with the caller's shared deadline.
+    pub fn plan_repair(
+        &mut self,
+        revision: u64,
+        operation: u64,
+        current: Option<(&SelectedAgent, &AgentReply)>,
+        deadline: &Deadline,
+    ) -> NativeResult<LaunchPlan> {
+        // A present app needs the unchanged executor's tracked, live original clean-stop gate.
+        if self.io.metadata(&self.io.target().app_path())?.is_some()
+            && (current.is_none() || self.io.metadata(&self.io.target().agent_path())?.is_none())
+        {
+            return Err(NativeError::Refused);
+        }
+        let mut plan = self.plan(revision, operation, current, deadline)?;
+        match plan.state {
+            LaunchState::UserDisabled => return Err(NativeError::Unsupported),
+            LaunchState::Unobservable | LaunchState::Conflict => {
+                return Err(NativeError::Unavailable);
+            }
+            _ => {}
+        }
+        if let Some((_, reply)) = current {
+            let DecodedReply::Status(StatusAdmission::Supported(health)) = reply
+                .result
+                .as_ref()
+                .map_err(|_| NativeError::Unavailable)?
+            else {
+                return Err(NativeError::Unavailable);
+            };
+            let mut actual = health.installer().build.features.clone();
+            let mut expected = self.inventory.features.clone();
+            actual.sort();
+            expected.sort();
+            if health.installer().build.version != self.version || actual != expected {
+                return Err(NativeError::Refused);
+            }
+        }
+        let path = Self::record(&self.io);
+        let identity = self.io.metadata(&path)?.ok_or(NativeError::Refused)?;
+        let bytes = self.io.read(&path, 512 * 1024, true, deadline)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| NativeError::Invalid)?;
+        let record: Record =
+            serde_json::from_value(value.clone()).map_err(|_| NativeError::Invalid)?;
+        let operation = record.receipt.operation_id;
+        let expected = InstallReceipt {
+            schema_version: 1,
+            operation_id: operation,
+            product_version: self.version.clone(),
+            manifest_sha256: self.payload.manifest_sha256(),
+            payload_sha256: digest(&self.xml),
+            resources: vec![ResourceReceipt {
+                resource_id: "mac.launch-agent".into(),
+                resolved_path: Self::plist(&self.io).to_string_lossy().into_owned(),
+                ownership: ResourceOwnership::Created,
+                before: ResourceObservation::Absent,
+                after: ResourceObservation::Matching,
+                outcome: MutationOutcome::Unknown,
+            }],
+            unfinished: vec![StepId(12)],
+        };
+        let prior = self
+            .io
+            .target()
+            .installer_dir()
+            .join(format!("launch-agent-prior-{}.plist", operation.0));
+        if operation.0 == 0
+            || record.phase != LaunchPhase::Observed
+            || record.stop_attempted
+            || record.session != plan.session
+            || record
+                .prior
+                .as_ref()
+                .is_some_and(|p| Some(p.as_str()) != prior.to_str())
+            || record.receipt != expected
+            || value != serde_json::to_value(&record).map_err(|_| NativeError::Invalid)?
+            || (plan.snapshot.identity.is_some() && plan.snapshot.bytes != self.xml)
+            || self.io.metadata(&path)? != Some(identity.clone())
+        {
+            return Err(NativeError::Foreign);
+        }
+        let origin = (
+            identity,
+            bytes,
+            plan.snapshot.identity.clone(),
+            plan.snapshot.bytes.clone(),
+        );
+        plan.payload = Some(self.payload.plan_repair(
+            revision,
+            plan.operation,
+            plan.original.clone(),
+            origin,
+            deadline,
+        )?);
+        plan.matching = false;
+        plan.state = if plan.snapshot.identity.is_some() {
+            LaunchState::Owned
+        } else {
+            LaunchState::Absent
+        };
+        Ok(plan)
+    }
+    pub(crate) fn revalidate_repair(
+        &self,
+        plan: &LaunchPlan,
+        current: Option<(&SelectedAgent, &AgentReply)>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        if !Arc::ptr_eq(&self.owner, &plan.owner)
+            || (plan.revision, plan.operation) != self.last
+            || self.snapshot(&self.io, deadline)? != plan.snapshot
+        {
+            return Err(NativeError::Foreign);
+        }
+        if let Some(expected) = &plan.selected {
+            let (selected, reply) = current.ok_or(NativeError::Unavailable)?;
+            checked_reply(&self.io, selected, reply, deadline)?;
+            if selected.instance.bootstrap().instance_id
+                != expected.instance.bootstrap().instance_id
+                || selected.instance.process() != expected.instance.process()
+            {
+                return Err(NativeError::Foreign);
+            }
+        } else if current.is_some() {
+            return Err(NativeError::Foreign);
+        }
+        self.payload
+            .check_repair_plan(plan.payload.as_ref().ok_or(NativeError::Invalid)?, deadline)?;
+        self.refreshed(plan, plan.installed_main.as_ref(), deadline)?;
+        deadline.check()
+    }
+}

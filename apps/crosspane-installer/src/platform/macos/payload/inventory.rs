@@ -555,3 +555,171 @@ impl MacPayload {
         Ok((app, ctl, matching))
     }
 }
+
+// Repair authority is carried from an exact literal receipt, never inferred from a present root.
+pub(super) type LaunchOrigin = (FileIdentity, Vec<u8>, Option<FileIdentity>, Vec<u8>);
+#[derive(Clone)]
+pub(super) struct RepairOrigins {
+    pub(super) payload_identity: FileIdentity,
+    pub(super) payload_bytes: Vec<u8>,
+    pub(super) launch: LaunchOrigin,
+}
+impl RepairOrigins {
+    pub(super) fn check_payload(
+        &self,
+        payload: &MacPayload,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let path = payload.record_path();
+        if payload.io.metadata(&path)? != Some(self.payload_identity.clone())
+            || payload.io.read(&path, 64 * 1024, true, deadline)? != self.payload_bytes
+            || payload.io.metadata(&path)? != Some(self.payload_identity.clone())
+        {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()
+    }
+    pub(super) fn check_launch(
+        &self,
+        payload: &MacPayload,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let record = payload
+            .io
+            .target()
+            .installer_dir()
+            .join("launch-agent.json");
+        let plist = payload
+            .io
+            .target()
+            .paths()
+            .home
+            .join("Library/LaunchAgents/io.frostdev.crosspane.agent.plist");
+        let (identity, bytes, plist_identity, plist_bytes) = &self.launch;
+        if payload.io.metadata(&record)? != Some(identity.clone())
+            || payload.io.read(&record, 512 * 1024, true, deadline)? != *bytes
+            || payload.io.metadata(&record)? != Some(identity.clone())
+            || payload.io.metadata(&plist)? != *plist_identity
+            || (plist_identity.is_some()
+                && payload.io.read(&plist, 64 * 1024, false, deadline)? != *plist_bytes)
+            || payload.io.metadata(&plist)? != *plist_identity
+        {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()
+    }
+}
+
+impl MacPayload {
+    pub(super) fn repair_origins(
+        &self,
+        launch: LaunchOrigin,
+        deadline: &Deadline,
+    ) -> NativeResult<Arc<RepairOrigins>> {
+        let path = self.record_path();
+        let identity = self.io.metadata(&path)?.ok_or(NativeError::Refused)?;
+        let bytes = self.io.read(&path, 64 * 1024, true, deadline)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| NativeError::Invalid)?;
+        let record: PayloadRecord =
+            serde_json::from_value(value.clone()).map_err(|_| NativeError::Invalid)?;
+        let expected = self.receipt(
+            record.receipt.operation_id.0,
+            PayloadPhase::Verified,
+            false,
+            false,
+        );
+        if record.receipt.operation_id.0 == 0
+            || record != expected
+            || value != serde_json::to_value(&expected).map_err(|_| NativeError::Invalid)?
+            || self.io.metadata(&path)? != Some(identity.clone())
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(Arc::new(RepairOrigins {
+            payload_identity: identity,
+            payload_bytes: bytes,
+            launch,
+        }))
+    }
+    // Missing declared members are repairable; unknown members, modes or edited data are not.
+    // Existing signed code still needs its approved signature and architecture. With all members
+    // present the whole seal must verify too; absence never pretends the damaged bundle is signed.
+    pub(super) fn installed_repair(&self, deadline: &Deadline) -> NativeResult<(Tree, Tree)> {
+        let app = tree(&self.io, &self.io.target().app_path(), deadline)?;
+        let ctl = tree(&self.io, &self.ctl(), deadline)?;
+        let expected: BTreeMap<_, _> = self
+            .approved
+            .files
+            .iter()
+            .filter_map(|file| {
+                file.path
+                    .strip_prefix("Crosspane.app/")
+                    .map(|relative| (relative.to_owned(), file))
+            })
+            .collect();
+        let dirs = directories(expected.keys().cloned());
+        if app.hashes.keys().any(|key| !expected.contains_key(key))
+            || app.nodes.iter().any(|(key, id)| {
+                if id.mode & 0o170000 == 0o040000 {
+                    !dirs.contains(key)
+                } else {
+                    !expected.contains_key(key)
+                }
+            })
+        {
+            return Err(NativeError::Foreign);
+        }
+        for (relative, file) in &expected {
+            let Some(identity) = app.nodes.get(relative) else {
+                continue;
+            };
+            if identity.mode & 0o777 != file.mode {
+                return Err(NativeError::Foreign);
+            }
+            if let Some(rule) = &file.signing {
+                let path = self.io.target().app_path().join(relative);
+                architecture(
+                    &self.io.read(&path, MAX_FILE_BYTES, false, deadline)?,
+                    rule.role == PayloadRole::EmbeddedCode,
+                )?;
+                self.io
+                    .admit_artifact_signature(&path, &rule.native(), &self.main, deadline)?;
+            } else if identity.length != file.size || app.hashes.get(relative) != Some(&file.sha256)
+            {
+                return Err(NativeError::Foreign);
+            }
+        }
+        if app.root.is_some() && app.hashes.len() == expected.len() {
+            self.bundle(&self.io.target().app_path(), deadline)?;
+        }
+        if let Some(identity) = &ctl.root {
+            let file = self
+                .approved
+                .files
+                .iter()
+                .find(|file| file.path == CTL)
+                .ok_or(NativeError::Invalid)?;
+            if identity.mode & 0o777 != file.mode {
+                return Err(NativeError::Foreign);
+            }
+            architecture(
+                &self.io.read(&self.ctl(), MAX_FILE_BYTES, false, deadline)?,
+                false,
+            )?;
+            self.io.admit_artifact_signature(
+                &self.ctl(),
+                &file.signing.as_ref().ok_or(NativeError::Invalid)?.native(),
+                &self.main,
+                deadline,
+            )?;
+        }
+        if tree(&self.io, &self.io.target().app_path(), deadline)? != app
+            || tree(&self.io, &self.ctl(), deadline)? != ctl
+        {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()?;
+        Ok((app, ctl))
+    }
+}
