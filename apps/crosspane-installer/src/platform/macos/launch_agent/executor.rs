@@ -327,3 +327,87 @@ impl MacLaunchAgent {
         })
     }
 }
+
+impl MacLaunchAgent {
+    /// Repair alone reports verified health separately from subsequent cleanup/publication.
+    /// A true second tuple field means health verified but cleanup is incomplete, with no resend.
+    pub(crate) fn observe_repair(
+        &self,
+        pending: &mut PendingLaunch,
+        selected: &SelectedAgent,
+        reply: AgentReply,
+        returned_revision: Option<&str>,
+        deadline: &Deadline,
+    ) -> NativeResult<(Option<StartupFacts>, bool)> {
+        if !pending.requested
+            || pending.health_call != Some(reply.id)
+            || reply.observed_at_ms < pending.requested_at
+            || !Arc::ptr_eq(&self.owner, &pending.plan.owner)
+            || pending
+                .payload
+                .as_ref()
+                .is_none_or(|p| !p.repair_launch_owned())
+        {
+            return Err(NativeError::Invalid);
+        }
+        checked_reply(&self.io, selected, &reply, deadline)?;
+        if pending.plan.baseline == Some(selected.instance.bootstrap().instance_id) {
+            return Err(NativeError::Refused);
+        }
+        let snapshot = self.snapshot(&selected.io, deadline)?;
+        if snapshot.bytes != self.xml
+            || snapshot.job != Job::Running(selected.instance.process().pid)
+        {
+            return Err(NativeError::Foreign);
+        }
+        let approval = self.approval.observe(selected.io.target(), deadline)?;
+        selected
+            .instance
+            .revalidate(&selected.io, &selected.support, deadline)?;
+        let session = selected
+            .io
+            .support_observation(deadline)?
+            .gui
+            .console_session;
+        let payload = pending.payload.as_mut().ok_or(NativeError::Invalid)?;
+        let verified =
+            match self
+                .payload
+                .verify(payload, selected, &reply, returned_revision, deadline)
+            {
+                Ok(verified) => verified,
+                Err(error) if payload.phase() == PayloadPhase::Unknown => {
+                    pending.phase = LaunchPhase::Unknown;
+                    pending.error = Some(error);
+                    pending.health_call = None;
+                    return Ok((None, true));
+                }
+                Err(error) => return Err(error),
+            };
+        pending.health_call = None;
+        pending.phase = LaunchPhase::Observed;
+        pending.error = None;
+        // Keep the private origin through the final LaunchAgent receipt publication.
+        if let Err(error) = self.persist(pending, &selected.io, &selected.support, deadline) {
+            pending.phase = LaunchPhase::Unknown;
+            pending.error = Some(error);
+            return Ok((None, true));
+        }
+        pending.payload = None;
+        Ok((
+            Some(StartupFacts {
+                reply,
+                approval,
+                disabled: snapshot.disabled,
+                login: if session == pending.plan.session {
+                    LoginEvidence::SameSession
+                } else {
+                    LoginEvidence::DifferentInteractiveSession
+                },
+                payload_verified: Some(verified),
+                retained_prior: pending.prior.clone(),
+            }),
+            false,
+        ))
+    }
+}

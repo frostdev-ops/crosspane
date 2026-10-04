@@ -26,8 +26,15 @@ pub struct PayloadPlan {
     pub(super) state: PayloadState,
     pub(super) manifest: [u8; 32],
     pub(super) target: TargetPaths,
+    pub(super) repair: Option<Arc<inventory::RepairOrigins>>,
 }
 impl PayloadPlan {
+    /// Initial LaunchAgent publication must use the genuine receipt captured by this repair.
+    pub(crate) fn repair_launch_origin(&self) -> Option<(&FileIdentity, &[u8])> {
+        self.repair
+            .as_ref()
+            .map(|origin| (&origin.launch.0, origin.launch.1.as_slice()))
+    }
     pub fn state(&self) -> PayloadState {
         self.state
     }
@@ -183,6 +190,7 @@ impl MacPayload {
             state,
             manifest: self.digest,
             target: self.io.target().paths().clone(),
+            repair: None,
         })
     }
     pub fn install(
@@ -209,7 +217,7 @@ impl MacPayload {
         {
             return Err(NativeError::Foreign);
         }
-        if plan.state == PayloadState::Matching {
+        if plan.state == PayloadState::Matching && plan.repair.is_none() {
             return Ok(None);
         }
         if plan.app.root.is_some() {
@@ -226,12 +234,19 @@ impl MacPayload {
         if recovery.unfinished() {
             return Err(NativeError::OutcomeUnknown);
         }
-        let mut record = self.receipt(
-            plan.operation,
-            PayloadPhase::Intent,
-            plan.app.root.is_some(),
-            plan.ctl.root.is_some(),
-        );
+        if let Some(origins) = &plan.repair {
+            origins.check_payload(self, deadline)?;
+        }
+        let mut record = if plan.repair.is_some() {
+            self.repair_receipt(plan.operation, PayloadPhase::Intent)
+        } else {
+            self.receipt(
+                plan.operation,
+                PayloadPhase::Intent,
+                plan.app.root.is_some(),
+                plan.ctl.root.is_some(),
+            )
+        };
         self.persist(&record, deadline)?;
         let result = (|| {
             self.parents(
@@ -357,6 +372,7 @@ impl MacPayload {
                 published_at: self.io.clock().now_ms(),
                 health_call: None,
                 phase: PayloadPhase::Published,
+                repair: plan.repair,
             })
         })();
         match result {
@@ -421,5 +437,43 @@ impl MacPayload {
             return Err(NativeError::Foreign);
         }
         Ok((staged, ctl))
+    }
+}
+
+impl MacPayload {
+    pub(crate) fn plan_repair(
+        &self,
+        revision: u64,
+        operation: u64,
+        original: Option<Arc<OriginalAgent>>,
+        launch: inventory::LaunchOrigin,
+        deadline: &Deadline,
+    ) -> NativeResult<PayloadPlan> {
+        let mut plan = self.plan(revision, operation, original, deadline)?;
+        let origins = self.repair_origins(launch, deadline)?;
+        let (app, ctl) = self.installed_repair(deadline)?;
+        if app.root.is_some() && plan.original.is_none() {
+            return Err(NativeError::Refused);
+        }
+        plan.app = app;
+        plan.ctl = ctl;
+        plan.state = PayloadState::Matching;
+        plan.repair = Some(origins);
+        Ok(plan)
+    }
+    pub(crate) fn check_repair_plan(
+        &self,
+        plan: &PayloadPlan,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let origins = plan.repair.as_ref().ok_or(NativeError::Invalid)?;
+        origins.check_payload(self, deadline)?;
+        origins.check_launch(self, deadline)?;
+        if tree(&self.io, &self.io.target().app_path(), deadline)? != plan.app
+            || tree(&self.io, &self.ctl(), deadline)? != plan.ctl
+        {
+            return Err(NativeError::Foreign);
+        }
+        deadline.check()
     }
 }

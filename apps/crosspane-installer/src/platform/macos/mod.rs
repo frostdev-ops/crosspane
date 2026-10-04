@@ -6,5 +6,6 @@ pub mod native_io;
 pub mod payload;
 pub mod permissions;
 pub mod removal;
+pub mod repair;
 pub mod transport;
 pub mod tutorial;

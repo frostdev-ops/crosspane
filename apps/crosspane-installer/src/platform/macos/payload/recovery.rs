@@ -206,3 +206,10 @@ impl MacPayload {
             .remove_owned_leaf(&self.support, path, &identity, deadline)
     }
 }
+
+impl MacPayload {
+    // Only the private repair context can select this; its genuine prior origins are Created/Absent.
+    pub(super) fn repair_receipt(&self, operation: u64, phase: PayloadPhase) -> PayloadRecord {
+        self.receipt(operation, phase, false, false)
+    }
+}

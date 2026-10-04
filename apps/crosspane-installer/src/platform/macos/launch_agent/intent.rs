@@ -87,6 +87,13 @@ impl MacLaunchAgent {
         deadline: &Deadline,
     ) -> NativeResult<()> {
         let applied = pending.requested || pending.phase == LaunchPhase::Published;
+        // A genuine private repair origin survives the matching plist rewrite. Only the final
+        // observed repair publication uses it; generic installation keeps its original semantics.
+        let repair_owned = pending.phase == LaunchPhase::Observed
+            && pending
+                .payload
+                .as_ref()
+                .is_some_and(PendingPayload::repair_launch_owned);
         let record = Record {
             phase: pending.phase,
             stop_attempted: pending.stop_attempted,
@@ -105,12 +112,12 @@ impl MacLaunchAgent {
                 resources: vec![ResourceReceipt {
                     resource_id: "mac.launch-agent".into(),
                     resolved_path: Self::plist(io).to_string_lossy().into_owned(),
-                    ownership: if pending.plan.snapshot.identity.is_some() {
+                    ownership: if pending.plan.snapshot.identity.is_some() && !repair_owned {
                         ResourceOwnership::Adopted
                     } else {
                         ResourceOwnership::Created
                     },
-                    before: if pending.plan.snapshot.identity.is_some() {
+                    before: if pending.plan.snapshot.identity.is_some() && !repair_owned {
                         ResourceObservation::Different
                     } else {
                         ResourceObservation::Absent
@@ -127,7 +134,25 @@ impl MacLaunchAgent {
         };
         let bytes = serde_json::to_vec(&record).map_err(|_| NativeError::Invalid)?;
         let path = Self::record(io);
-        io.atomic_write(proof, &path, &bytes, io.metadata(&path)?.as_ref(), deadline)
+        let captured = pending
+            .plan
+            .payload
+            .as_ref()
+            .filter(|_| pending.phase == LaunchPhase::Intent)
+            .and_then(PayloadPlan::repair_launch_origin);
+        let expected = if let Some((identity, original)) = captured {
+            // Called under the executor's existing lock, before its first publication/dispatch.
+            if io.metadata(&path)? != Some(identity.clone())
+                || io.read(&path, 512 * 1024, true, deadline)? != original
+                || io.metadata(&path)? != Some(identity.clone())
+            {
+                return Err(NativeError::Foreign);
+            }
+            Some(identity.clone())
+        } else {
+            io.metadata(&path)?
+        };
+        io.atomic_write(proof, &path, &bytes, expected.as_ref(), deadline)
             .map(|_| ())
     }
 }

@@ -518,7 +518,17 @@ impl Sources {
             &self.io,
             "mac.launch-agent".into(),
             plist.clone(),
-            Some((xml.len() as u64, 0o644, sha(&xml))),
+            Some((
+                xml.len() as u64,
+                self.io.metadata(&plist)?.map_or(0o644, |identity| {
+                    if identity.mode & 0o7777 == 0o600 {
+                        0o600
+                    } else {
+                        0o644
+                    }
+                }),
+                sha(&xml),
+            )),
             record
                 .as_ref()
                 .filter(|r| matches!(r.phase, super::launch_agent::LaunchPhase::Observed))

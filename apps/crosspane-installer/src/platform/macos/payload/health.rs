@@ -12,8 +12,12 @@ pub struct PendingPayload {
     pub(super) published_at: u64,
     pub(super) health_call: Option<u64>,
     pub(super) phase: PayloadPhase,
+    pub(super) repair: Option<Arc<inventory::RepairOrigins>>,
 }
 impl PendingPayload {
+    pub(crate) fn repair_launch_owned(&self) -> bool {
+        self.repair.is_some()
+    }
     pub fn phase(&self) -> PayloadPhase {
         self.phase
     }
@@ -151,12 +155,16 @@ impl MacPayload {
                 deadline,
             )?;
             replacement.check(deadline)?;
-            let record = current.receipt(
-                pending.operation,
-                PayloadPhase::Verified,
-                pending.previous_app.root.is_some(),
-                pending.previous_ctl.root.is_some(),
-            );
+            let record = if pending.repair.is_some() {
+                current.repair_receipt(pending.operation, PayloadPhase::Verified)
+            } else {
+                current.receipt(
+                    pending.operation,
+                    PayloadPhase::Verified,
+                    pending.previous_app.root.is_some(),
+                    pending.previous_ctl.root.is_some(),
+                )
+            };
             current.persist(&record, deadline)?;
             Ok(record.receipt)
         })();
