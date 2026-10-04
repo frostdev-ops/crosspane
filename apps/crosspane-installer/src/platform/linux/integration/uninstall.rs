@@ -621,7 +621,8 @@ fn describe(
     }
     if report.recovery_retained {
         lines.push(
-            "Recovery tools were kept, because a clean exit of the original agent wasn't proved."
+            "Recovery tools were kept, because removing them couldn't be proved safe (the original \
+             agent's clean exit, or an earlier repair record, couldn't be confirmed)."
                 .into(),
         );
     }
