@@ -25,6 +25,10 @@ pub(super) struct InstalledExecutable {
     identity: Identity,
 }
 impl InstalledExecutable {
+    pub(super) fn cleanup_matches(&self, target: &LinuxTarget, digest: [u8; 32]) -> bool {
+        self.nonce == target.nonce && self.digest == digest
+    }
+
     fn open(
         target: &LinuxTarget,
         digest: [u8; 32],
@@ -84,6 +88,35 @@ impl InstalledExecutable {
             return Err(NativeError::Foreign);
         }
         Ok(fd)
+    }
+}
+#[cfg(test)]
+mod cleanup_target_tests {
+    use super::*;
+    #[test]
+    fn cleanup_erase_same_paths_different_target_nonce_and_digest_are_independent_refusals() {
+        let home = PathBuf::from("/tmp/cp419-pure-target-no-io");
+        let paths = TargetPaths {
+            uid: rustix::process::geteuid().as_raw(),
+            prefix: home.join("prefix"),
+            config_home: home.join("config"),
+            state_home: home.join("state"),
+            data_home: home.join("data"),
+            runtime_home: home.join("run"),
+            runtime_override: None,
+            home,
+        };
+        let selected = LinuxTarget::make(paths.clone(), true).unwrap();
+        let unrelated = LinuxTarget::make(paths, true).unwrap();
+        assert_eq!(selected.agent_path(), unrelated.agent_path());
+        let proof = InstalledExecutable {
+            nonce: selected.nonce,
+            digest: [7; 32],
+            identity: (0, 0, 0, 0, 0, 0, 0, 0, 0),
+        };
+        assert!(proof.cleanup_matches(&selected, [7; 32]));
+        assert!(!proof.cleanup_matches(&unrelated, [7; 32]));
+        assert!(!proof.cleanup_matches(&selected, [8; 32]));
     }
 }
 impl CommandSpec {

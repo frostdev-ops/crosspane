@@ -43,6 +43,7 @@ struct Runner {
     calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
     output: Mutex<FakeOutput>,
     stall: Mutex<bool>,
+    erase_gate: Mutex<Option<Arc<lease_dispatch_tests::Gate>>>,
 }
 impl CommandRunner for Runner {
     fn run(&self, c: &CommandSpec, d: &Deadline) -> Result<CommandOutput, NativeError> {
@@ -71,11 +72,16 @@ impl CommandRunner for Runner {
             });
         }
         assert_eq!(c.argv(), ["erase-identity"]);
+        let gate = self.erase_gate.lock().unwrap().clone();
+        if let Some(gate) = &gate {
+            gate.pause();
+        }
         while *self.stall.lock().unwrap() {
             d.check()?;
             thread::sleep(Duration::from_millis(1));
         }
-        self.output
+        let result = self
+            .output
             .lock()
             .unwrap()
             .clone()
@@ -83,7 +89,11 @@ impl CommandRunner for Runner {
                 code,
                 stdout,
                 stderr,
-            })
+            });
+        if let Some(gate) = gate {
+            gate.finished.store(true, Ordering::Release);
+        }
+        result
     }
 }
 struct Probe(Mutex<Result<Option<ProcessFacts>, NativeError>>);
@@ -144,7 +154,7 @@ impl Fixture {
             executable: root.join(".local/bin/crosspane-agent"),
             generation: 77,
         })))));
-        let runner = Arc::new(Runner { calls: Mutex::default(), stall: Mutex::new(false),
+        let runner = Arc::new(Runner { calls: Mutex::default(), stall: Mutex::new(false), erase_gate: Mutex::default(),
             output: Mutex::new(Ok((Some(0),br#"{"schema_version":1,"result":"removed","reason":null,"key":"removed","trust":"removed"}"#.to_vec(), vec![]))) });
         // Exclusive mkdir: collision is an error. No helper initializes a pre-existing root.
         let io = Arc::new(LinuxNativeIo::scratch(&root, runner.clone(), probe.clone()).unwrap());
@@ -2416,4 +2426,203 @@ fn restored_detection_cannot_revive_permanently_retired_consent() {
     );
     assert_eq!(f.runner.calls.lock().unwrap().len(), before);
     assert_eq!(fs::read(icon).unwrap(), original);
+}
+
+mod lease_dispatch_tests {
+    use super::*;
+    use std::sync::{Condvar, atomic::AtomicBool};
+    use std::time::Instant;
+
+    pub(super) struct Gate {
+        entered: AtomicBool,
+        release: (Mutex<bool>, Condvar),
+        pub(super) finished: AtomicBool,
+    }
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: AtomicBool::new(false),
+                release: (Mutex::new(false), Condvar::new()),
+                finished: AtomicBool::new(false),
+            })
+        }
+        pub(super) fn pause(&self) {
+            self.entered.store(true, Ordering::Release);
+            let mut released = self.release.0.lock().unwrap();
+            while !*released {
+                released = self.release.1.wait(released).unwrap();
+            }
+        }
+        fn release(&self) {
+            *self.release.0.lock().unwrap() = true;
+            self.release.1.notify_all();
+        }
+        fn wait(&self, condition: impl Fn() -> bool) {
+            let end = Instant::now() + Duration::from_secs(2);
+            while !condition() && Instant::now() < end {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(condition());
+        }
+    }
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+            if self.0.entered.load(Ordering::Acquire) {
+                self.0.wait(|| self.0.finished.load(Ordering::Acquire));
+            }
+        }
+    }
+    fn clean_command(f: &Fixture, digest: [u8; 32]) -> CommandSpec {
+        let original = f.tracked();
+        f.exit(|_| {});
+        *f.probe.0.lock().unwrap() = Ok(None);
+        original
+            .clean_authority(&deadline())
+            .unwrap()
+            .erase_command(digest, f.environment(), &deadline())
+            .unwrap()
+    }
+    fn lease(f: &Fixture) -> (CleanupProof, CleanupLease) {
+        let proof = f.io.admit_cleanup(&deadline()).unwrap();
+        let lease = proof.lease(&deadline()).unwrap();
+        (proof, lease)
+    }
+    fn digest(p: &Package) -> [u8; 32] {
+        std::array::from_fn(|index| {
+            u8::from_str_radix(
+                &p.manifest().members[0].sha256[index * 2..index * 2 + 2],
+                16,
+            )
+            .unwrap()
+        })
+    }
+    fn dispatch(
+        _f: &Fixture,
+        lease: CleanupLease,
+        command: CommandSpec,
+        d: &Deadline,
+    ) -> ManagerMutation {
+        lease.erase_identity(command, d)
+    }
+    #[test]
+    fn cleanup_stop_unverified_effective_service_refuses_without_mutation() {
+        let f = Fixture::new(false);
+        let p = package();
+        installed(&f, &p);
+        let (_, lease) = lease(&f);
+        assert_eq!(
+            lease
+                .stop(Arc::new(f.service(&p)), &deadline())
+                .result
+                .unwrap_err(),
+            NativeError::Foreign
+        );
+        assert!(
+            f.runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, argv)| argv != &["--user", "stop", UNIT])
+        );
+    }
+    #[test]
+    fn cleanup_erase_wrong_target_refuses_without_spawn() {
+        let selected = Fixture::new(false);
+        let unrelated = Fixture::new(false);
+        let p = package();
+        installed(&selected, &p);
+        installed(&unrelated, &p);
+        let (_, lease) = lease(&unrelated);
+        let command = clean_command(&selected, digest(&p));
+        let result = dispatch(&selected, lease, command, &deadline());
+        assert_eq!(result.result.unwrap_err(), NativeError::Foreign);
+        assert_eq!(selected.erase_count(), 0);
+        assert_eq!(unrelated.erase_count(), 0);
+    }
+    #[test]
+    fn cleanup_erase_exact_selected_command_returns_literal_receipt_without_file_mutation() {
+        let f = Fixture::new(false);
+        let p = package();
+        installed(&f, &p);
+        let (proof, lease) = lease(&f);
+        let command = clean_command(&f, digest(&p));
+        let result = lease.erase_identity(command, &deadline());
+        assert!(result.pending.is_none());
+        let output = result.result.unwrap();
+        assert_eq!(
+            admit_erase_output(&output).unwrap(),
+            parse_erase_identity(&output.stdout).unwrap()
+        );
+        assert_eq!(f.erase_count(), 1);
+        proof.revalidate(&deadline()).unwrap();
+        assert_eq!(lease.read_intent(&deadline()).unwrap(), None);
+        assert!(matches!(proof.lease(&deadline()), Err(NativeError::Busy)));
+        drop(lease);
+        assert!(proof.lease(&deadline()).is_ok());
+    }
+    #[test]
+    fn cleanup_erase_cancelled_before_dispatch_sends_no_request() {
+        let f = Fixture::new(false);
+        let p = package();
+        installed(&f, &p);
+        let (_, lease) = lease(&f);
+        let command = clean_command(&f, digest(&p));
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let result = lease.erase_identity(command, &Deadline::new(5000, cancellation).unwrap());
+        assert_eq!(result.result.unwrap_err(), NativeError::OutcomeUnknown);
+        assert!(result.pending.is_none());
+        assert_eq!(f.erase_count(), 0);
+    }
+    #[test]
+    fn cleanup_erase_changed_installed_hash_refuses_without_spawn() {
+        let f = Fixture::new(false);
+        let p = package();
+        installed(&f, &p);
+        let (_, lease) = lease(&f);
+        f.executable(b"different inert executable after ledger capture");
+        let command = clean_command(
+            &f,
+            sha256(b"different inert executable after ledger capture"),
+        );
+        assert_eq!(
+            dispatch(&f, lease, command, &deadline())
+                .result
+                .unwrap_err(),
+            NativeError::Foreign
+        );
+        assert_eq!(f.erase_count(), 0);
+    }
+    #[test]
+    fn cleanup_erase_cancelled_noncooperative_worker_retains_original_flock() {
+        let f = Fixture::new(false);
+        let p = package();
+        installed(&f, &p);
+        let (proof, lease) = lease(&f);
+        let command = clean_command(&f, digest(&p));
+        let gate = Gate::new();
+        let release = Release(gate.clone());
+        *f.runner.erase_gate.lock().unwrap() = Some(gate.clone());
+        let cancellation = Cancellation::default();
+        let d = Deadline::new(5000, cancellation.clone()).unwrap();
+        let result = thread::scope(|scope| {
+            let call = scope.spawn(|| dispatch(&f, lease.clone(), command, &d));
+            gate.wait(|| gate.entered.load(Ordering::Acquire));
+            cancellation.cancel();
+            call.join().unwrap()
+        });
+        assert_eq!(result.result.unwrap_err(), NativeError::OutcomeUnknown);
+        assert_eq!(f.erase_count(), 1);
+        drop(lease);
+        assert!(matches!(proof.lease(&deadline()), Err(NativeError::Busy)));
+        let pending = result.pending.unwrap();
+        assert!(!pending.completed());
+        gate.release();
+        gate.wait(|| pending.completed());
+        assert!(proof.lease(&deadline()).is_ok());
+        drop(release);
+    }
 }

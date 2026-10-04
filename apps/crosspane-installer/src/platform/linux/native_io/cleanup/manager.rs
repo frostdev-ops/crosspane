@@ -1,7 +1,17 @@
 use super::*;
 use crate::platform::linux::service::{LinuxService, ServiceFacts};
 pub(super) const UNIT_INDEX: usize = 5;
+pub(super) enum ManagerAction {
+    Disable,
+    Stop,
+}
 impl CleanupLease {
+    /// Output is progress only; the original process watch supplies clean-exit evidence.
+    pub fn stop(&self, service: Arc<LinuxService>, d: &Deadline) -> ManagerMutation {
+        self.manager_observing(ManagerAction::Stop, d, move |d| {
+            service.observe(d).map_err(|_| NativeError::Foreign)
+        })
+    }
     /// One exact disable. Output is progress; effective state and clean exit are separate facts.
     pub fn disable(&self, service: Arc<LinuxService>, d: &Deadline) -> ManagerMutation {
         self.disable_observing(d, move |d| {
@@ -12,6 +22,90 @@ impl CleanupLease {
         &self,
         d: &Deadline,
         observe: impl FnOnce(&Deadline) -> Result<ServiceFacts> + Send + 'static,
+    ) -> ManagerMutation {
+        self.manager_observing(ManagerAction::Disable, d, observe)
+    }
+    pub(super) fn manager_observing(
+        &self,
+        action: ManagerAction,
+        d: &Deadline,
+        observe: impl FnOnce(&Deadline) -> Result<ServiceFacts> + Send + 'static,
+    ) -> ManagerMutation {
+        self.dispatch(d, move |state, d| {
+            let verb = match action {
+                ManagerAction::Disable => "disable",
+                ManagerAction::Stop => "stop",
+            };
+            let io = &state.proof.0.io;
+            let environment = io.manager_environment(BTreeMap::new(), d)?;
+            let before = observe(d)?;
+            environment
+                .manager
+                .as_ref()
+                .ok_or(NativeError::Foreign)?
+                .revalidate(&io.target)?;
+            let entries = state
+                .proof
+                .0
+                .entries
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?;
+            let unit = &entries[UNIT_INDEX];
+            if !unit.owned
+                || unit.snapshot.hash() != Some(unit.hash)
+                || before.fragment != unit.snapshot.path
+                || before.source != io.target.source()
+            {
+                return Err(NativeError::Foreign);
+            }
+            CommandSpec::new(
+                "/usr/bin/systemctl".into(),
+                vec![
+                    "--user".into(),
+                    verb.into(),
+                    "crosspane-agent.service".into(),
+                ],
+                environment,
+                MAX_COMMAND_BYTES,
+            )
+        })
+    }
+    /// Only a genuine CleanAuthority command after explicit identity-deletion consent is permitted.
+    /// Dispatch proves target/lifetime binding; it creates no clean-exit or deletion authority.
+    pub fn erase_identity(&self, command: CommandSpec, d: &Deadline) -> ManagerMutation {
+        self.dispatch(d, move |state, d| {
+            let io = &state.proof.0.io;
+            let entries = state
+                .proof
+                .0
+                .entries
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?;
+            let agent = entries.first().ok_or(NativeError::Foreign)?;
+            if !agent.owned
+                || agent.snapshot.hash() != Some(agent.hash)
+                || command.executable != io.target.agent_path()
+                || command.argv != ["erase-identity"]
+                || command.output_limit != 4096
+                || !command
+                    .agent
+                    .as_ref()
+                    .is_some_and(|a| a.cleanup_matches(&io.target, agent.hash))
+            {
+                return Err(NativeError::Foreign);
+            }
+            command
+                .agent
+                .as_ref()
+                .ok_or(NativeError::Foreign)?
+                .revalidate(&io.target, d)?;
+            Ok(command)
+        })
+    }
+    fn dispatch(
+        &self,
+        d: &Deadline,
+        prepare: impl FnOnce(&mutation::State, &Deadline) -> Result<CommandSpec> + Send + 'static,
     ) -> ManagerMutation {
         let binding = match self.binding() {
             Ok(binding) => binding,
@@ -28,44 +122,10 @@ impl CleanupLease {
         let deadline = d.clone();
         let result = bounded_launch(&PROCESS_LAUNCHES, d, move || {
             let result = (|| {
-                let state = &lease.0;
-                let d = &deadline;
-                worker_binding.check(d)?;
-                let io = &state.proof.0.io;
-                let environment = io.manager_environment(BTreeMap::new(), d)?;
-                let before = observe(d)?;
-                environment
-                    .manager
-                    .as_ref()
-                    .ok_or(NativeError::Foreign)?
-                    .revalidate(&io.target)?;
-                let entries = state
-                    .proof
-                    .0
-                    .entries
-                    .lock()
-                    .map_err(|_| NativeError::Unavailable)?;
-                let unit = &entries[UNIT_INDEX];
-                if !unit.owned
-                    || unit.snapshot.hash() != Some(unit.hash)
-                    || before.fragment != unit.snapshot.path
-                    || before.source != state.proof.0.io.target.source()
-                {
-                    return Err(NativeError::Foreign);
-                }
-                drop(entries);
-                let mut command = CommandSpec::new(
-                    "/usr/bin/systemctl".into(),
-                    vec![
-                        "--user".into(),
-                        "disable".into(),
-                        "crosspane-agent.service".into(),
-                    ],
-                    environment,
-                    MAX_COMMAND_BYTES,
-                )?;
+                worker_binding.check(&deadline)?;
+                let mut command = prepare(&lease.0, &deadline)?;
                 command.cleanup = Some(worker_binding.clone());
-                io.execute(&command, d, None)
+                lease.0.proof.0.io.execute(&command, &deadline, None)
             })();
             if matches!(result, Err(NativeError::OutcomeUnknown)) {
                 lease.0.unknown.store(true, Ordering::Release);

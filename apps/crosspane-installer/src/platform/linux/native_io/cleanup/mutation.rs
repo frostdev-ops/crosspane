@@ -1472,4 +1472,139 @@ pub(crate) mod tests {
         assert_eq!(runner.calls.load(Ordering::Acquire), 0);
         assert!(f.files.steps.lock().unwrap().is_empty());
     }
+
+    struct StopRunner {
+        calls: AtomicUsize,
+        gate: Option<Arc<Gate>>,
+    }
+    impl CommandRunner for StopRunner {
+        fn run(&self, spec: &CommandSpec, _: &Deadline) -> Result<CommandOutput> {
+            assert_eq!(spec.executable(), Path::new("/usr/bin/systemctl"));
+            assert_eq!(spec.argv(), ["--user", "stop", "crosspane-agent.service"]);
+            assert!(spec.cleanup.is_some());
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(gate) = &self.gate {
+                gate.pause();
+            }
+            Ok(CommandOutput {
+                code: Some(0),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }
+    }
+    struct GateRelease(Arc<Gate>);
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            self.0.resume();
+        }
+    }
+    fn stop_runner(f: &mut Fixture, gate: Option<Arc<Gate>>) -> Arc<StopRunner> {
+        let runner = Arc::new(StopRunner {
+            calls: AtomicUsize::new(0),
+            gate,
+        });
+        Arc::get_mut(&mut Arc::get_mut(&mut f.proof.0).unwrap().io)
+            .unwrap()
+            .runner = runner.clone();
+        runner
+    }
+    #[test]
+    fn cleanup_stop_exact_recorded_unit_is_progress_and_keeps_files() {
+        let mut f = Fixture::new(None, false, false);
+        let (_, _listener, _dir) = manager_fixture(&mut f, false);
+        let runner = stop_runner(&mut f, None);
+        let facts = observed(&f);
+        let lease = f.proof.lease(&deadline()).unwrap();
+        let result = lease.manager_observing(
+            super::super::manager::ManagerAction::Stop,
+            &deadline(),
+            move |_| Ok(facts),
+        );
+        assert_eq!(result.result.unwrap().code, Some(0));
+        assert!(result.pending.is_none());
+        assert_eq!(runner.calls.load(Ordering::Acquire), 1);
+        assert!(f.files.steps.lock().unwrap().is_empty());
+        f.proof.revalidate(&deadline()).unwrap();
+        assert_eq!(lease.read_intent(&deadline()).unwrap(), None);
+    }
+    #[test]
+    fn cleanup_stop_changed_manager_and_foreign_fragment_never_dispatch() {
+        for change in 0..3 {
+            let mut f = Fixture::new(None, false, false);
+            let (_, _listener, dir) = manager_fixture(&mut f, false);
+            let runner = stop_runner(&mut f, None);
+            let mut facts = observed(&f);
+            if change == 1 {
+                facts.fragment = f.root.join("unrelated.service");
+            }
+            if change == 2 {
+                facts.source = crosspane_installer_core::ObservationSource::Live;
+            }
+            let path = f.root.join("run/systemd/private");
+            let replacement = Arc::new(Mutex::new(None));
+            let keep = replacement.clone();
+            let lease = f.proof.lease(&deadline()).unwrap();
+            let result = lease.manager_observing(
+                super::super::manager::ManagerAction::Stop,
+                &deadline(),
+                move |_| {
+                    if change == 0 {
+                        rfs::renameat(&dir, "private", &dir, "owned-original-manager").unwrap();
+                        *keep.lock().unwrap() =
+                            Some(std::os::unix::net::UnixListener::bind(path).unwrap());
+                    }
+                    Ok(facts)
+                },
+            );
+            assert_eq!(result.result.unwrap_err(), NativeError::Foreign);
+            assert_eq!(runner.calls.load(Ordering::Acquire), 0);
+            assert!(f.files.steps.lock().unwrap().is_empty());
+            assert_eq!(replacement.lock().unwrap().is_some(), change == 0);
+        }
+    }
+    #[test]
+    fn cleanup_stop_cancelled_worker_retains_flock_and_prevents_second_stop() {
+        let mut f = Fixture::new(None, false, false);
+        let (_, _listener, _dir) = manager_fixture(&mut f, false);
+        let gate = Gate::new();
+        let release = GateRelease(gate.clone());
+        let runner = stop_runner(&mut f, Some(gate.clone()));
+        let facts = observed(&f);
+        let lease = f.proof.lease(&deadline()).unwrap();
+        let cancellation = Cancellation::default();
+        let d = Deadline::new(5000, cancellation.clone()).unwrap();
+        let result = thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                lease.manager_observing(super::super::manager::ManagerAction::Stop, &d, move |_| {
+                    Ok(facts)
+                })
+            });
+            f.wait(|| gate.entered.load(Ordering::Acquire));
+            cancellation.cancel();
+            worker.join().unwrap()
+        });
+        assert_eq!(result.result.unwrap_err(), NativeError::OutcomeUnknown);
+        let pending = result.pending.unwrap();
+        assert!(!pending.completed());
+        let facts = observed(&f);
+        assert_eq!(
+            lease
+                .manager_observing(
+                    super::super::manager::ManagerAction::Stop,
+                    &deadline(),
+                    move |_| Ok(facts)
+                )
+                .result
+                .unwrap_err(),
+            NativeError::Busy
+        );
+        assert_eq!(runner.calls.load(Ordering::Acquire), 1);
+        drop(lease);
+        assert!(matches!(f.proof.lease(&deadline()), Err(NativeError::Busy)));
+        gate.resume();
+        f.wait(|| pending.completed());
+        assert!(f.proof.lease(&deadline()).is_ok());
+        drop(release);
+    }
 }
