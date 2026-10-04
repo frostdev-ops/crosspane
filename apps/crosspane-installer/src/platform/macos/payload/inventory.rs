@@ -73,7 +73,7 @@ pub(super) fn hash(bytes: &[u8]) -> [u8; 32] {
     result
 }
 impl ApprovedInventory {
-    pub(super) fn validate(&mut self) -> NativeResult<()> {
+    pub fn validate(&mut self) -> NativeResult<()> {
         if !bounded(&self.product_version, 128)
             || self.features.len() > 32
             || self.features.iter().any(|f| !bounded(f, 64))
