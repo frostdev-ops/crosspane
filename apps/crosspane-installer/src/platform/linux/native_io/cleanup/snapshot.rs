@@ -269,6 +269,47 @@ impl Snapshot {
     }
 }
 
+impl Snapshot {
+    pub(super) fn read_captured(
+        &self,
+        io: &LinuxNativeIo,
+        d: &Deadline,
+    ) -> Result<Option<Vec<u8>>> {
+        self.parent_revalidate(io, d)?;
+        let (current, bytes) = Self::open(io, &self.path, self.mode, self.limit, d)?;
+        if self.directories.len() != current.directories.len() {
+            return Err(NativeError::Foreign);
+        }
+        for ((fd, admitted), (_, observed)) in self.directories.iter().zip(&current.directories) {
+            if admitted != observed || *admitted != directory_identity(&native(rfs::fstat(fd))?) {
+                return Err(NativeError::Foreign);
+            }
+        }
+        match (&self.file, &current.file) {
+            (None, None) => {
+                self.parent_revalidate(io, d)?;
+                Ok(None)
+            }
+            (Some((fd, a, h)), Some((current_fd, b, k)))
+                if a == b && h == k && *a == identity(&native(rfs::fstat(fd))?) =>
+            {
+                self.stable_displaced(
+                    current_fd,
+                    self.path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .ok_or(NativeError::Invalid)?,
+                    *a,
+                    d,
+                )?;
+                self.parent_revalidate(io, d)?;
+                Ok(Some(bytes))
+            }
+            _ => Err(NativeError::Foreign),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

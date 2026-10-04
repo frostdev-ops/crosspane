@@ -220,6 +220,23 @@ impl CleanupLease {
     }
 }
 
+impl CleanupLease {
+    /// Reads only the captured intent under the lease's worker exclusion; absence grants no authority.
+    pub fn read_intent(&self, d: &Deadline) -> Result<Option<Vec<u8>>> {
+        let binding = self.binding()?;
+        let deadline = d.clone();
+        bounded_launch(&READ_WORKERS, d, move || {
+            binding.check(&deadline)?;
+            let state = &binding.lease.0;
+            state
+                .intent
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .read_captured(&state.proof.0.io, &deadline)
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -460,6 +477,57 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             self.files.unblock();
             fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+    #[test]
+    fn cleanup_intent_read_timeout_cancel_retains_exclusion_until_worker_finishes() {
+        for cancelled in [false, true] {
+            let f = Fixture::new(None, false, true);
+            let lease = f.proof.lease(&deadline()).unwrap();
+            let held = lease.0.proof.0.entries.lock().unwrap();
+            let entered = Arc::new(AtomicBool::new(false));
+            let seen = entered.clone();
+            *lease.0.after_intent_validation.lock().unwrap() = Some(Arc::new(move || {
+                seen.store(true, Ordering::Release);
+            }));
+            let cancellation = Cancellation::default();
+            let d =
+                Deadline::new(if cancelled { 5000 } else { 1000 }, cancellation.clone()).unwrap();
+            let start = Instant::now();
+            thread::scope(|scope| {
+                if cancelled {
+                    scope.spawn(|| {
+                        f.wait(|| entered.load(Ordering::Acquire));
+                        cancellation.cancel();
+                    });
+                }
+                assert_eq!(
+                    lease.read_intent(&d),
+                    Err(if cancelled {
+                        NativeError::Cancelled
+                    } else {
+                        NativeError::Timeout
+                    })
+                );
+            });
+            assert!(entered.load(Ordering::Acquire));
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert_eq!(READ_WORKERS.load(Ordering::Acquire), 1);
+            assert_eq!(
+                lease.write_intent(b"must not dispatch", &deadline()),
+                Err(NativeError::Busy)
+            );
+            assert!(f.files.steps.lock().unwrap().is_empty());
+            assert!(!lease.0.unknown.load(Ordering::Acquire));
+            drop(held);
+            f.wait(|| {
+                READ_WORKERS.load(Ordering::Acquire) == 0 && !lease.0.busy.load(Ordering::Acquire)
+            });
+            assert_eq!(
+                lease.read_intent(&deadline()).unwrap(),
+                Some(b"old complete intent".to_vec())
+            );
+            assert_eq!(f.intent(), b"old complete intent");
         }
     }
     #[test]

@@ -545,6 +545,960 @@ fn cleanup_ledger(f: &Fixture) -> (PathBuf, Value) {
     (path, value)
 }
 
+mod cleanup_consent_tests {
+    use super::*;
+    use crosspane_installer::platform::linux::removal::executor::*;
+
+    fn inventory(f: &Fixture) -> CleanupInventory {
+        CleanupInventory::admit(f.io.admit_cleanup(&deadline()).unwrap(), &deadline()).unwrap()
+    }
+    fn edit_owned(f: &Fixture, path: &Path, bytes: &[u8]) {
+        f.io.validate_target().unwrap();
+        assert!(path.starts_with(&f.root));
+        let parent = rustix::fs::open(
+            path.parent().unwrap(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let mut file = fs::File::from(
+            rustix::fs::openat(
+                &parent,
+                path.file_name().unwrap(),
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::TRUNC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap(),
+        );
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+    fn progress() -> CleanupProgress {
+        CleanupProgress {
+            stage: CleanupStage::Prepared,
+            resources: [CleanupResult::Pending; FILES.len()],
+            autostart: CleanupResult::Pending,
+            stop: CleanupResult::Pending,
+            identity: CleanupResult::Kept,
+            lan: CleanupResult::Kept,
+            mdns: CleanupResult::Kept,
+        }
+    }
+    fn cancelled() -> Deadline {
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        Deadline::new(5000, cancellation).unwrap()
+    }
+
+    #[test]
+    fn genuine_cleanup_inventory_retains_recovery_and_never_uses_receipt_ownership_alone() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let first = inventory(&f);
+        assert_eq!(first.resources().len(), FILES.len());
+        for (row, name) in first.resources().iter().zip(FILES) {
+            assert_eq!(row.receipt.resource_id, name);
+            assert_eq!(row.observation, ResourceObservation::Matching);
+            assert!(row.owned);
+            assert_eq!(
+                row.action,
+                if name.starts_with("bin/") || name.ends_with(".service") {
+                    ResourceAction::RetainRecovery
+                } else {
+                    ResourceAction::Remove
+                }
+            );
+        }
+        let installer = PayloadInstaller::new(f.io.clone()).unwrap();
+        let p = package();
+        let repeat = installer
+            .plan(&f.proof, &p, OperationId(48), MatchingFiles::Preserve)
+            .unwrap();
+        installer.apply(&f.proof, &p, repeat, &deadline()).unwrap();
+        installer
+            .verify(&f.proof, &p, 19, 100, &f.reply(), &deadline())
+            .unwrap();
+        for row in inventory(&f).resources() {
+            assert_eq!(row.receipt.ownership, ResourceOwnership::Created);
+            assert_eq!(row.observation, ResourceObservation::Matching);
+            assert!(!row.owned);
+            assert_eq!(row.action, ResourceAction::Retain);
+        }
+        assert!(
+            f.io.metadata(
+                &f.io
+                    .target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/installer/cleanup-intent.json")
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cleanup_plan_is_immutable_and_absent_or_modified_rows_do_not_authorize_removal() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let targets = PayloadInstaller::new(f.io.clone()).unwrap();
+        let path = &targets.targets()[8];
+        edit_owned(&f, path, b"owned test edit");
+        let changed = inventory(&f);
+        assert_eq!(
+            changed.resources()[8].observation,
+            ResourceObservation::Different
+        );
+        assert_eq!(changed.resources()[8].action, ResourceAction::Retain);
+        let parent = rustix::fs::open(
+            path.parent().unwrap(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        rustix::fs::unlinkat(
+            &parent,
+            path.file_name().unwrap(),
+            rustix::fs::AtFlags::empty(),
+        )
+        .unwrap();
+        let planner = CleanupPlanner::default();
+        let admitted = inventory(&f);
+        for (revision, operation) in [(0, 0), (0, 1), (1, 0)] {
+            assert!(
+                planner
+                    .plan(
+                        admitted.clone(),
+                        revision,
+                        OperationId(operation),
+                        RemovalSelection::default()
+                    )
+                    .is_err()
+            );
+        }
+        let plan = planner
+            .plan(admitted, 1, OperationId(1), RemovalSelection::default())
+            .unwrap();
+        assert_eq!(plan.resources()[8].observation, ResourceObservation::Absent);
+        assert_eq!(plan.resources()[8].action, ResourceAction::AlreadyAbsent);
+        let mut detached = plan.resources()[0].clone();
+        detached.action = ResourceAction::Remove;
+        assert_eq!(plan.resources()[0].action, ResourceAction::RetainRecovery);
+        assert_eq!(plan.selection(), RemovalSelection::default());
+        assert_eq!(plan.form(), CleanupForm::NotCleanRetainIdentityAndRecovery);
+        assert_eq!(plan.revision(), 1);
+        assert_eq!(plan.operation(), OperationId(1));
+    }
+
+    #[test]
+    fn superseded_coherent_consent_refuses_before_deadline_io_and_releases_cached_lease() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let planner = CleanupPlanner::default();
+        let old = planner
+            .plan(
+                inventory(&f),
+                1,
+                OperationId(1),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        let consent = planner
+            .consent(&old, 1, OperationId(1), &deadline())
+            .unwrap();
+        assert!(old.read_intent(&consent, &deadline()).unwrap().is_none());
+        let written = old.write_intent(&consent, progress(), &deadline()).unwrap();
+        let new = planner
+            .plan(
+                inventory(&f),
+                2,
+                OperationId(2),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        let path =
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/cleanup-intent.json");
+        let before = f.io.read(&path, MAX_RECORD_BYTES, true).unwrap();
+        let commands = f.runner.calls.lock().unwrap().len();
+        assert!(matches!(
+            old.read_intent(&consent, &cancelled()),
+            Err(RemovalError::Stale)
+        ));
+        assert!(matches!(
+            old.write_intent(&consent, progress(), &cancelled()),
+            Err(RemovalError::Stale)
+        ));
+        assert!(matches!(
+            planner.consent(&old, 1, OperationId(1), &cancelled()),
+            Err(RemovalError::Stale)
+        ));
+        assert_eq!(f.io.read(&path, MAX_RECORD_BYTES, true).unwrap(), before);
+        assert_eq!(f.runner.calls.lock().unwrap().len(), commands);
+        let renewed = planner
+            .consent(&new, 2, OperationId(2), &deadline())
+            .unwrap();
+        // The old record remains diagnostic data; it never supplies this new consent.
+        assert_eq!(
+            new.read_intent(&renewed, &deadline()).unwrap(),
+            Some(written)
+        );
+        assert_eq!(
+            new.write_intent(&renewed, progress(), &deadline())
+                .unwrap()
+                .operation,
+            OperationId(2)
+        );
+    }
+
+    #[test]
+    fn cross_controller_and_wrong_view_consents_never_open_native_lease() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let a = CleanupPlanner::default();
+        let b = CleanupPlanner::default();
+        let plan = a
+            .plan(
+                inventory(&f),
+                1,
+                OperationId(1),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        let other = b
+            .plan(
+                inventory(&f),
+                1,
+                OperationId(1),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            b.consent(&plan, 1, OperationId(1), &cancelled()),
+            Err(RemovalError::Stale)
+        ));
+        for (revision, op) in [(2, 1), (1, 2)] {
+            assert!(matches!(
+                a.consent(&plan, revision, OperationId(op), &cancelled()),
+                Err(RemovalError::Stale)
+            ));
+        }
+        let other_consent = b.consent(&other, 1, OperationId(1), &deadline()).unwrap();
+        assert!(matches!(
+            plan.write_intent(&other_consent, progress(), &cancelled()),
+            Err(RemovalError::Stale)
+        ));
+        let parent = f.io.target().paths().state_home.join("crosspane/installer");
+        assert!(
+            f.io.metadata(&parent.join("cleanup-intent.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_consent_permanently_retires_cached_inventory_and_last_ids_survive() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let cached = inventory(&f);
+        let planner = CleanupPlanner::default();
+        let plan = planner
+            .plan(
+                cached.clone(),
+                1,
+                OperationId(1),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        let target = PayloadInstaller::new(f.io.clone()).unwrap().targets()[8].clone();
+        let original = f.io.read(&target, MAX_MEMBER_BYTES, false).unwrap();
+        edit_owned(&f, &target, b"changed test state");
+        assert!(matches!(
+            planner.consent(&plan, 1, OperationId(1), &deadline()),
+            Err(RemovalError::Native(NativeError::Foreign))
+        ));
+        edit_owned(&f, &target, &original);
+        assert!(matches!(
+            planner.consent(&plan, 1, OperationId(1), &cancelled()),
+            Err(RemovalError::Stale)
+        ));
+        for (revision, op) in [(1, 1), (1, 2), (2, 1)] {
+            assert!(
+                planner
+                    .plan(
+                        cached.clone(),
+                        revision,
+                        OperationId(op),
+                        RemovalSelection::default()
+                    )
+                    .is_err()
+            );
+        }
+        let fresh = planner
+            .plan(
+                inventory(&f),
+                2,
+                OperationId(2),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        assert!(
+            planner
+                .consent(&fresh, 2, OperationId(2), &deadline())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn failed_native_access_retires_before_retry_and_new_consent_is_required() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let planner = CleanupPlanner::default();
+        let plan = planner
+            .plan(
+                inventory(&f),
+                1,
+                OperationId(1),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        let consent = planner
+            .consent(&plan, 1, OperationId(1), &deadline())
+            .unwrap();
+        assert!(matches!(
+            plan.read_intent(&consent, &cancelled()),
+            Err(RemovalError::Native(NativeError::Cancelled))
+        ));
+        assert!(matches!(
+            plan.write_intent(&consent, progress(), &deadline()),
+            Err(RemovalError::Stale)
+        ));
+        assert!(matches!(
+            planner.consent(&plan, 1, OperationId(1), &deadline()),
+            Err(RemovalError::Stale)
+        ));
+        let renewed = planner
+            .plan(
+                inventory(&f),
+                2,
+                OperationId(2),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        let consent = planner
+            .consent(&renewed, 2, OperationId(2), &deadline())
+            .unwrap();
+        assert!(
+            renewed
+                .read_intent(&consent, &deadline())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn guarded_intent_binds_selection_operation_and_ledger_without_recreating_clean_exit() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let planner = CleanupPlanner::default();
+        let selection = RemovalSelection {
+            identity: IdentityChoice::DeleteIdentityAndPairings,
+            lan_rule: true,
+            mdns_rule: true,
+        };
+        let admitted = inventory(&f);
+        let plan = planner
+            .plan(admitted.clone(), u64::MAX, OperationId(u64::MAX), selection)
+            .unwrap();
+        for (revision, operation) in [
+            (u64::MAX, u64::MAX),
+            (u64::MAX - 1, u64::MAX),
+            (u64::MAX, u64::MAX - 1),
+        ] {
+            assert!(
+                planner
+                    .plan(
+                        admitted.clone(),
+                        revision,
+                        OperationId(operation),
+                        selection
+                    )
+                    .is_err()
+            );
+        }
+        let consent = planner
+            .consent(&plan, u64::MAX, OperationId(u64::MAX), &deadline())
+            .unwrap();
+        let record = plan
+            .write_intent(&consent, progress(), &deadline())
+            .unwrap();
+        assert!(record.delete_identity && record.lan_rule && record.mdns_rule);
+        assert_eq!(record.revision, u64::MAX);
+        assert_eq!(record.operation, OperationId(u64::MAX));
+        assert_eq!(
+            record.form(),
+            CleanupForm::NotCleanRetainIdentityAndRecovery
+        );
+        assert_eq!(
+            plan.read_intent(&consent, &deadline()).unwrap(),
+            Some(record.clone())
+        );
+        // A live plan retains its native installation lock and rejects file drift.
+        let lease = f.io.admit_cleanup(&deadline()).unwrap().lease(&deadline());
+        assert!(matches!(lease, Err(NativeError::Busy))); // current plan retains the installation lock.
+        let parent = f.io.target().paths().state_home.join("crosspane/installer");
+        let mut wrong = record;
+        wrong.ledger_digest[0] ^= 1;
+        f.io.atomic_write(
+            &f.proof,
+            &parent.join("cleanup-intent.json"),
+            &wrong.encode().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.read_intent(&consent, &deadline()),
+            Err(RemovalError::Native(NativeError::Foreign))
+        ));
+        assert!(matches!(
+            plan.read_intent(&consent, &deadline()),
+            Err(RemovalError::Stale)
+        ));
+        assert_eq!(f.erase_count(), 0);
+    }
+
+    #[test]
+    fn observed_wrong_ledger_digest_retires_guard_even_when_native_snapshot_matches() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let wrong = CleanupIntent {
+            revision: 77,
+            operation: OperationId(88),
+            ledger_digest: [0; 32],
+            delete_identity: false,
+            lan_rule: false,
+            mdns_rule: false,
+            progress: progress(),
+        };
+        let path =
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/cleanup-intent.json");
+        // Persist BEFORE capturing the lease: native identity validation must succeed.
+        f.io.atomic_write(&f.proof, &path, &wrong.encode().unwrap())
+            .unwrap();
+        let planner = CleanupPlanner::default();
+        let plan = planner
+            .plan(
+                inventory(&f),
+                1,
+                OperationId(1),
+                RemovalSelection::default(),
+            )
+            .unwrap();
+        let consent = planner
+            .consent(&plan, 1, OperationId(1), &deadline())
+            .unwrap();
+        let bytes = f.io.read(&path, MAX_RECORD_BYTES, true).unwrap();
+        assert!(matches!(
+            plan.read_intent(&consent, &deadline()),
+            Err(RemovalError::Stale)
+        ));
+        assert!(matches!(
+            plan.write_intent(&consent, progress(), &deadline()),
+            Err(RemovalError::Stale)
+        ));
+        assert_eq!(f.io.read(&path, MAX_RECORD_BYTES, true).unwrap(), bytes);
+        assert_eq!(f.erase_count(), 0);
+    }
+
+    #[test]
+    fn each_cleanup_policy_debug_is_type_only_with_live_and_retired_binding() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let admitted = inventory(&f);
+        let planner = CleanupPlanner::default();
+        let selection = RemovalSelection {
+            identity: IdentityChoice::DeleteIdentityAndPairings,
+            lan_rule: true,
+            mdns_rule: true,
+        };
+        let plan = planner
+            .plan(
+                admitted.clone(),
+                8877665544,
+                OperationId(1122334455),
+                selection,
+            )
+            .unwrap();
+        let consent = planner
+            .consent(&plan, plan.revision(), plan.operation(), &deadline())
+            .unwrap();
+        plan.write_intent(&consent, progress(), &deadline())
+            .unwrap();
+        for (name, debug) in [
+            ("CleanupResource", format!("{:?}", plan.resources()[0])),
+            ("CleanupInventory", format!("{admitted:?}")),
+            ("CleanupPlanner", format!("{planner:?}")),
+            ("CleanupPlan", format!("{plan:?}")),
+            ("CleanupConsent", format!("{consent:?}")),
+        ] {
+            assert_eq!(debug, format!("{name}(..)"));
+            for forbidden in [
+                f.root.to_str().unwrap(),
+                "resources",
+                "ledger_digest",
+                "DeleteIdentityAndPairings",
+                "1122334455",
+                "8877665544",
+                "active",
+                "lease",
+            ] {
+                assert!(!debug.contains(forbidden), "{name} exposed {forbidden}");
+            }
+        }
+        assert!(plan.read_intent(&consent, &cancelled()).is_err());
+        assert_eq!(format!("{planner:?}"), "CleanupPlanner(..)");
+        assert_eq!(format!("{plan:?}"), "CleanupPlan(..)");
+        assert_eq!(format!("{consent:?}"), "CleanupConsent(..)");
+    }
+}
+
+mod cleanup_intent_tests {
+    use super::*;
+    use crosspane_installer::platform::linux::removal::executor::*;
+
+    fn literal() -> Vec<u8> {
+        br#"{"schema_version":1,"revision":3,"operation":4,"ledger_digest":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"delete_identity":false,"lan_rule":true,"mdns_rule":false,"stage":0,"resources":[0,1,2,3,4,5,6,0,0,0],"autostart":1,"stop":6,"identity":3,"lan":4,"mdns":2}"#.to_vec()
+    }
+    fn record() -> CleanupIntent {
+        CleanupIntent::decode(&literal()).unwrap()
+    }
+    fn lease(f: &Fixture) -> CleanupLease {
+        installed(f, &package());
+        f.io.admit_cleanup(&deadline())
+            .unwrap()
+            .lease(&deadline())
+            .unwrap()
+    }
+
+    #[test]
+    fn literal_results_roundtrip_and_resume_never_recreate_clean_authority() {
+        let intent = record();
+        assert_eq!(intent.revision, 3);
+        assert_eq!(intent.operation, OperationId(4));
+        assert!(!intent.delete_identity);
+        assert!(intent.lan_rule);
+        assert!(!intent.mdns_rule);
+        assert_eq!(intent.progress.stage, CleanupStage::Prepared);
+        assert_eq!(
+            intent.progress.resources,
+            [
+                CleanupResult::Pending,
+                CleanupResult::Removed,
+                CleanupResult::AlreadyAbsent,
+                CleanupResult::Kept,
+                CleanupResult::Refused,
+                CleanupResult::Failed,
+                CleanupResult::Unknown,
+                CleanupResult::Pending,
+                CleanupResult::Pending,
+                CleanupResult::Pending
+            ]
+        );
+        assert_eq!(intent.progress.autostart, CleanupResult::Removed);
+        assert_eq!(intent.progress.stop, CleanupResult::Unknown);
+        assert_eq!(intent.progress.identity, CleanupResult::Kept);
+        assert_eq!(intent.progress.lan, CleanupResult::Refused);
+        assert_eq!(intent.progress.mdns, CleanupResult::AlreadyAbsent);
+        assert_eq!(
+            intent.form(),
+            CleanupForm::NotCleanRetainIdentityAndRecovery
+        );
+        assert_eq!(
+            CleanupIntent::decode(&intent.encode().unwrap()).unwrap(),
+            intent
+        );
+        let mut explicit = intent.clone();
+        explicit.delete_identity = true;
+        assert_eq!(
+            CleanupIntent::decode(&explicit.encode().unwrap())
+                .unwrap()
+                .form(),
+            CleanupForm::NotCleanRetainIdentityAndRecovery
+        );
+    }
+
+    #[test]
+    fn intent_requires_every_field_unique_object_and_exact_fixed_array_types() {
+        let original: Value = serde_json::from_slice(&literal()).unwrap();
+        for field in original.as_object().unwrap().keys() {
+            let mut value = original.clone();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(
+                matches!(
+                    CleanupIntent::decode(&serde_json::to_vec(&value).unwrap()),
+                    Err(RemovalError::Invalid)
+                ),
+                "missing {field}"
+            );
+            let member = format!("\"{field}\":{}", original[field]);
+            let text = serde_json::to_string(&original).unwrap();
+            let duplicate = text.replacen(&member, &format!("{member},{member}"), 1);
+            let _: Value = serde_json::from_str(&duplicate).unwrap();
+            assert!(
+                matches!(
+                    CleanupIntent::decode(duplicate.as_bytes()),
+                    Err(RemovalError::Invalid)
+                ),
+                "duplicate {field}"
+            );
+        }
+        let mut variants = vec![json!([]), Value::Null];
+        let mut unknown = original.clone();
+        unknown["unknown"] = json!(true);
+        variants.push(unknown);
+        for field in ["ledger_digest", "resources"] {
+            for invalid in [json!([]), json!({}), Value::Null, json!([256]), json!([-1])] {
+                let mut value = original.clone();
+                value[field] = invalid;
+                variants.push(value);
+            }
+            let mut extra = original.clone();
+            extra[field].as_array_mut().unwrap().push(json!(0));
+            variants.push(extra);
+            for invalid in [
+                json!(-1),
+                json!(256),
+                json!(0.5),
+                json!("0"),
+                json!(true),
+                Value::Null,
+                json!({}),
+            ] {
+                let mut element = original.clone();
+                element[field][0] = invalid;
+                variants.push(element);
+            }
+        }
+        for value in variants {
+            assert!(matches!(
+                CleanupIntent::decode(&serde_json::to_vec(&value).unwrap()),
+                Err(RemovalError::Invalid)
+            ));
+        }
+        let mut two = literal();
+        two.extend(literal());
+        assert!(matches!(
+            CleanupIntent::decode(&two),
+            Err(RemovalError::Invalid)
+        ));
+        assert!(matches!(
+            CleanupIntent::decode(&vec![b' '; MAX_RECORD_BYTES + 1]),
+            Err(RemovalError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn intent_scalar_boundaries_and_each_closed_result_and_stage_are_exact() {
+        let original: Value = serde_json::from_slice(&literal()).unwrap();
+        for field in [
+            "schema_version",
+            "revision",
+            "operation",
+            "stage",
+            "autostart",
+            "stop",
+            "identity",
+            "lan",
+            "mdns",
+        ] {
+            for invalid in [
+                json!(-1),
+                json!(1.5),
+                json!(true),
+                json!("1"),
+                Value::Null,
+                json!({"Prepared":null}),
+            ] {
+                let mut value = original.clone();
+                value[field] = invalid;
+                assert!(
+                    matches!(
+                        CleanupIntent::decode(&serde_json::to_vec(&value).unwrap()),
+                        Err(RemovalError::Invalid)
+                    ),
+                    "{field}"
+                );
+            }
+        }
+        for field in ["delete_identity", "lan_rule", "mdns_rule"] {
+            for invalid in [json!(0), json!("false"), Value::Null] {
+                let mut value = original.clone();
+                value[field] = invalid;
+                assert!(
+                    matches!(
+                        CleanupIntent::decode(&serde_json::to_vec(&value).unwrap()),
+                        Err(RemovalError::Invalid)
+                    ),
+                    "{field}"
+                );
+            }
+        }
+        for (field, invalid) in [
+            ("schema_version", 2),
+            ("revision", 0),
+            ("operation", 0),
+            ("stage", 7),
+            ("autostart", 7),
+            ("stop", 7),
+            ("identity", 7),
+            ("lan", 7),
+            ("mdns", 7),
+        ] {
+            let mut value = original.clone();
+            value[field] = json!(invalid);
+            assert!(
+                matches!(
+                    CleanupIntent::decode(&serde_json::to_vec(&value).unwrap()),
+                    Err(RemovalError::Invalid)
+                ),
+                "{field}"
+            );
+        }
+        let mut value = original.clone();
+        value["resources"][9] = json!(7);
+        assert!(matches!(
+            CleanupIntent::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(RemovalError::Invalid)
+        ));
+        value = original.clone();
+        value["revision"] = json!(u64::MAX);
+        value["operation"] = json!(u64::MAX);
+        let decoded = CleanupIntent::decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.revision, u64::MAX);
+        assert_eq!(decoded.operation, OperationId(u64::MAX));
+        for (code, stage) in [
+            CleanupStage::Prepared,
+            CleanupStage::Disabled,
+            CleanupStage::StopObserved,
+            CleanupStage::IdentityObserved,
+            CleanupStage::FirewallObserved,
+            CleanupStage::FilesObserved,
+            CleanupStage::Finished,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            value["stage"] = json!(code);
+            assert_eq!(
+                CleanupIntent::decode(&serde_json::to_vec(&value).unwrap())
+                    .unwrap()
+                    .progress
+                    .stage,
+                stage
+            );
+        }
+        let overflow = String::from_utf8(literal())
+            .unwrap()
+            .replace("\"operation\":4", "\"operation\":18446744073709551616");
+        assert!(matches!(
+            CleanupIntent::decode(overflow.as_bytes()),
+            Err(RemovalError::Invalid)
+        ));
+        let mut invalid = record();
+        invalid.revision = 0;
+        assert!(matches!(invalid.encode(), Err(RemovalError::Invalid)));
+    }
+
+    #[test]
+    fn lease_store_reads_fresh_absence_and_atomic_replacements_without_commands() {
+        let f = Fixture::new(false);
+        let lease = lease(&f);
+        let commands = f.runner.calls.lock().unwrap().len();
+        assert_eq!(lease.read_intent(&deadline()).unwrap(), None);
+        let store = CleanupStore::new(lease.clone());
+        assert_eq!(store.read(&deadline()).unwrap(), None);
+        let mut intent = record();
+        store.write(&intent, &deadline()).unwrap();
+        assert_eq!(store.read(&deadline()).unwrap(), Some(intent.clone()));
+        intent.progress.stage = CleanupStage::Disabled;
+        intent.progress.autostart = CleanupResult::Unknown;
+        store.write(&intent, &deadline()).unwrap();
+        assert_eq!(store.read(&deadline()).unwrap(), Some(intent.clone()));
+        assert_eq!(
+            lease.read_intent(&deadline()).unwrap(),
+            Some(intent.encode().unwrap())
+        );
+        assert_eq!(f.runner.calls.lock().unwrap().len(), commands);
+        for target in PayloadInstaller::new(f.io.clone()).unwrap().targets() {
+            assert!(target.is_file());
+        }
+        assert_eq!(
+            intent.form(),
+            CleanupForm::NotCleanRetainIdentityAndRecovery
+        );
+    }
+
+    #[test]
+    fn lease_read_rejects_intent_swap_symlink_mode_hardlink_and_oversize() {
+        for change in 0..5 {
+            let f = Fixture::new(false);
+            let lease = lease(&f);
+            lease.write_intent(&literal(), &deadline()).unwrap();
+            let path =
+                f.io.target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/installer/cleanup-intent.json");
+            let parent = rustix::fs::open(
+                path.parent().unwrap(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap();
+            let file = rustix::fs::openat(
+                &parent,
+                "cleanup-intent.json",
+                rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap();
+            match change {
+                0 => {
+                    rustix::fs::renameat(
+                        &parent,
+                        "cleanup-intent.json",
+                        &parent,
+                        "kept-old-intent",
+                    )
+                    .unwrap();
+                    let fd = rustix::fs::openat(
+                        &parent,
+                        "cleanup-intent.json",
+                        rustix::fs::OFlags::WRONLY
+                            | rustix::fs::OFlags::CREATE
+                            | rustix::fs::OFlags::EXCL
+                            | rustix::fs::OFlags::NOFOLLOW,
+                        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                    )
+                    .unwrap();
+                    fs::File::from(fd).write_all(&literal()).unwrap();
+                }
+                1 => {
+                    rustix::fs::renameat(
+                        &parent,
+                        "cleanup-intent.json",
+                        &parent,
+                        "kept-old-intent",
+                    )
+                    .unwrap();
+                    rustix::fs::symlinkat("kept-old-intent", &parent, "cleanup-intent.json")
+                        .unwrap();
+                }
+                2 => {
+                    rustix::fs::fchmod(&file, rustix::fs::Mode::from_bits_truncate(0o644)).unwrap()
+                }
+                3 => rustix::fs::linkat(
+                    &parent,
+                    "cleanup-intent.json",
+                    &parent,
+                    "other-link",
+                    rustix::fs::AtFlags::empty(),
+                )
+                .unwrap(),
+                4 => fs::File::from(file)
+                    .write_all(&vec![b' '; MAX_RECORD_BYTES + 1])
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                lease.read_intent(&deadline()).unwrap_err(),
+                NativeError::Foreign,
+                "change {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn store_invalid_record_and_cancelled_read_preserve_last_durable_bytes() {
+        let f = Fixture::new(false);
+        let lease = lease(&f);
+        let store = CleanupStore::new(lease.clone());
+        store.write(&record(), &deadline()).unwrap();
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        assert!(matches!(
+            store.read(&Deadline::new(5000, cancellation).unwrap()),
+            Err(RemovalError::Native(NativeError::Cancelled))
+        ));
+        let mut invalid = record();
+        invalid.operation = OperationId(0);
+        assert!(matches!(
+            store.write(&invalid, &deadline()),
+            Err(RemovalError::Invalid)
+        ));
+        assert_eq!(
+            lease.read_intent(&deadline()).unwrap(),
+            Some(record().encode().unwrap())
+        );
+        lease
+            .write_intent(b"malformed observations", &deadline())
+            .unwrap();
+        assert!(matches!(
+            store.read(&deadline()),
+            Err(RemovalError::Invalid)
+        ));
+        assert_eq!(
+            lease.read_intent(&deadline()).unwrap(),
+            Some(b"malformed observations".to_vec())
+        );
+    }
+
+    #[test]
+    fn lease_read_preserves_captured_ancestry_and_refuses_new_uncaptured_intent() {
+        for replace_parent in [false, true] {
+            let f = Fixture::new(false);
+            let lease = lease(&f);
+            let path =
+                f.io.target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/installer/cleanup-intent.json");
+            if replace_parent {
+                lease.write_intent(&literal(), &deadline()).unwrap();
+                let ancestor = path.parent().unwrap().parent().unwrap();
+                let root = rustix::fs::open(
+                    ancestor.parent().unwrap(),
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW,
+                    rustix::fs::Mode::empty(),
+                )
+                .unwrap();
+                rustix::fs::renameat(&root, "crosspane", &root, "retained-crosspane").unwrap();
+                rustix::fs::mkdirat(&root, "crosspane", rustix::fs::Mode::RWXU).unwrap();
+            } else {
+                f.io.atomic_write(&f.proof, &path, &literal()).unwrap();
+            }
+            assert_eq!(
+                lease.read_intent(&deadline()).unwrap_err(),
+                NativeError::Foreign
+            );
+        }
+    }
+}
+
 #[test]
 fn cleanup_requires_each_nullable_field_and_strict_nested_objects_and_enums() {
     let f = Fixture::new(false);
