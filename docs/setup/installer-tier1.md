@@ -32,7 +32,17 @@ Use the installer's approved templates: the stager validates the complete placeh
 ELF architecture, hashes and bounded sizes. Inputs must be ordinary user-owned files without
 symlinks or hard links. A fixture or a guessed manifest is not a release input.
 
-From the Linux checkout, with the prepared input under `/home/<user>/build-input`:
+Prepare that input from a clean checkout with `scripts/installer/prepare-linux-input.sh`. It
+builds the release binaries (the agent with `video`), strips their debug info (the release
+profile keeps it, and the stager refuses any file over 64 MiB), copies the approved templates,
+records the runtime libraries the binaries link against and writes `provenance.json`. It builds
+only and refuses a dirty tree or an existing output:
+
+```sh
+scripts/installer/prepare-linux-input.sh "$HOME/build-input"
+```
+
+Then, from the Linux checkout, with the prepared input under `/home/<user>/build-input`:
 
 ```sh
 mkdir -p -m 700 "$HOME/installer-builds"
