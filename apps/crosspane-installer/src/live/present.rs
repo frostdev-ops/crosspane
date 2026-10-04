@@ -1,0 +1,1158 @@
+//! View building and action handling. The revision changes only when meaning changes: screen,
+//! buttons, fields, consent previews, the SAS or layout geometry and busy state.
+
+use crosspane_installer_core::{JobStage, Milestone, StepId, StepState};
+
+use super::controller::{LiveController, bounded};
+use super::graph::{self, StepKind, steps};
+use super::practice::{CONFIRMATIONS, confirmation_label, confirmations};
+use super::shared::{CAPABILITIES, PairMode, capability_label};
+use super::{
+    Availability, Consent, MaintenanceId, MaintenanceOutcome, MaintenanceReport,
+    MaintenanceRequest, NativeJob, RemovalChoice, ids,
+};
+use crate::agent_contract::{InstallerRequest, PairPhase};
+use crate::tutorial_flow::{TutorialRole, TutorialState, TutorialUserAction};
+use crate::view::{
+    ButtonKind, ButtonRole, ButtonView, EscapeMapping, FieldView, IllustrationView, LayoutPreview,
+    PracticeIllustration, ProgressGroup, ProgressView, RowState, RowView, ScreenId, SummaryView,
+    ToggleRole, WizardView,
+};
+
+const MAX_PROGRESS_LINES: usize = 24;
+
+/// The R9.4 attribution limit, shown with both audio rows.
+const AUDIO_LIMIT: &str = "Audio counters are computer-wide, not per computer, and are only \
+sampled: other sound between checks might not be noticed. Crosspane relies on you hearing the \
+test sound.";
+
+#[derive(Default)]
+pub(super) struct MaintenanceState {
+    pub next_id: u64,
+    pub current: Option<MaintenanceId>,
+    pub uninstall: Option<Availability>,
+    pub repair: Option<Availability>,
+    pub choices: Vec<RemovalChoice>,
+    pub preview: Option<String>,
+    pub planning: bool,
+    pub confirmed: bool,
+    pub progress: Vec<String>,
+    pub follow_ups: Vec<(u16, String, String)>,
+    pub finished: Option<(MaintenanceOutcome, Vec<String>)>,
+    pub refused: Option<String>,
+    pub return_to: Option<ScreenId>,
+}
+
+impl MaintenanceState {
+    pub fn running(&self) -> bool {
+        self.confirmed && self.finished.is_none() && self.refused.is_none()
+    }
+}
+
+fn row_state(state: StepState) -> RowState {
+    match state {
+        StepState::NotChecked | StepState::Stale => RowState::Unchecked,
+        StepState::Checking | StepState::Planning | StepState::Running | StepState::Verifying => {
+            RowState::Working
+        }
+        StepState::NeedsAction => RowState::NeedsAction,
+        StepState::WaitingForUser | StepState::WaitingForPeer | StepState::PendingContract => {
+            RowState::Waiting
+        }
+        StepState::Satisfied => RowState::Verified,
+        StepState::Failed => RowState::Failed,
+        StepState::Unsupported => RowState::Unsupported,
+    }
+}
+
+fn button(id: u16, role: ButtonRole, label: &str, enabled: bool, kind: ButtonKind) -> ButtonView {
+    ButtonView {
+        id,
+        role,
+        label: label.into(),
+        enabled,
+        kind,
+    }
+}
+
+fn group_of(screen: ScreenId) -> Option<ProgressGroup> {
+    Some(match screen {
+        ScreenId::Welcome
+        | ScreenId::Compatibility
+        | ScreenId::InstallPlan
+        | ScreenId::Installing => ProgressGroup::Install,
+        ScreenId::Permissions
+        | ScreenId::AudioComponent
+        | ScreenId::Network
+        | ScreenId::HidingChoice => ProgressGroup::PermissionsNetwork,
+        ScreenId::Connect | ScreenId::MatchNumbers => ProgressGroup::Connect,
+        ScreenId::Grants | ScreenId::Layout => ProgressGroup::Arrange,
+        ScreenId::Practice => ProgressGroup::Practice,
+        ScreenId::Summary => ProgressGroup::Ready,
+        ScreenId::RepairRemove => return None,
+    })
+}
+
+fn retryable(state: StepState) -> bool {
+    matches!(
+        state,
+        StepState::Failed
+            | StepState::WaitingForUser
+            | StepState::WaitingForPeer
+            | StepState::PendingContract
+            | StepState::Stale
+    )
+}
+
+impl LiveController {
+    fn pairing_phase(&self) -> Option<PairPhase> {
+        self.job(steps::PAIR, JobStage::Apply)?;
+        self.connect.pairing.as_ref().map(|p| p.phase)
+    }
+
+    fn display_screen(&self) -> ScreenId {
+        if self.screen == ScreenId::Connect
+            && matches!(
+                self.pairing_phase(),
+                Some(PairPhase::Confirm | PairPhase::Pick)
+            )
+        {
+            ScreenId::MatchNumbers
+        } else {
+            self.screen
+        }
+    }
+
+    pub(super) fn row(&self, step: StepId) -> RowView {
+        let state = self.step_state(step);
+        let meta = self.graph.meta(step);
+        let detail = self
+            .details
+            .get(&step)
+            .cloned()
+            .unwrap_or_else(|| match state {
+                StepState::NeedsAction => self.previews.get(&step).cloned().unwrap_or_default(),
+                StepState::Stale => "Needs checking again.".into(),
+                StepState::NotChecked => "Not checked yet.".into(),
+                StepState::Satisfied => "Done.".into(),
+                _ => String::new(),
+            });
+        let detail = if matches!(
+            graph::role_of(step),
+            Some(TutorialRole::AudioSender | TutorialRole::AudioReceiver)
+        ) {
+            bounded(format!("{detail} {AUDIO_LIMIT}").trim().to_owned())
+        } else {
+            detail
+        };
+        RowView {
+            id: step.0,
+            label: meta.map_or_else(String::new, |m| m.label.clone()),
+            detail,
+            state: row_state(state),
+            human_confirmed: graph::role_of(step).is_some() && state == StepState::Satisfied,
+        }
+    }
+
+    fn screen_rows(&self, screen: ScreenId) -> Vec<RowView> {
+        let screen = if screen == ScreenId::MatchNumbers {
+            ScreenId::Connect
+        } else {
+            screen
+        };
+        match screen {
+            ScreenId::Summary => self.rows(),
+            ScreenId::Welcome | ScreenId::RepairRemove => Vec::new(),
+            other => self
+                .graph
+                .on_screen(other)
+                .map(|m| self.row(m.id))
+                .collect(),
+        }
+    }
+
+    fn progress(&self, screen: ScreenId) -> ProgressView {
+        let mut completed = Vec::new();
+        for group in [
+            ProgressGroup::Install,
+            ProgressGroup::PermissionsNetwork,
+            ProgressGroup::Connect,
+            ProgressGroup::Arrange,
+            ProgressGroup::Practice,
+            ProgressGroup::Ready,
+        ] {
+            let mut members = self
+                .graph
+                .metas
+                .iter()
+                .filter(|m| m.group == group)
+                .peekable();
+            if members.peek().is_some() && members.all(|m| self.satisfied(m.id)) {
+                completed.push(group);
+            }
+        }
+        ProgressView {
+            current: group_of(screen),
+            completed,
+        }
+    }
+
+    fn title_and_message(&self, screen: ScreenId) -> (String, String) {
+        let consent_preview = self
+            .graph
+            .on_screen(screen)
+            .filter(|m| self.step_state(m.id) == StepState::NeedsAction)
+            .filter_map(|m| self.previews.get(&m.id).cloned())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (title, message) = match screen {
+            ScreenId::Welcome => ("Set up Crosspane", {
+                let intro = "Crosspane lets this computer and another one share a keyboard, \
+                                 mouse, windows and sound. Setup checks this computer, installs \
+                                 Crosspane for your account, pairs the two computers and walks \
+                                 you through each feature once.";
+                match &self.desc.resume_note {
+                    Some(note) => format!("{intro}\n\n{note}"),
+                    None => intro.to_owned(),
+                }
+            }),
+            ScreenId::Compatibility => (
+                "Checking this computer",
+                "Nothing changes on this computer during these checks.".to_owned(),
+            ),
+            ScreenId::InstallPlan => ("What will be installed", consent_preview.clone()),
+            ScreenId::Installing => ("Installing Crosspane", consent_preview.clone()),
+            ScreenId::Permissions => ("Permissions", consent_preview.clone()),
+            ScreenId::AudioComponent => ("Sound", consent_preview.clone()),
+            ScreenId::Network => ("Network access", consent_preview.clone()),
+            ScreenId::HidingChoice => ("Windows you send", consent_preview.clone()),
+            ScreenId::Connect => ("Pair with the other computer", consent_preview.clone()),
+            ScreenId::MatchNumbers => (
+                "Check the numbers",
+                match self.pairing_phase() {
+                    Some(PairPhase::Pick) => {
+                        "Choose the number shown on the other computer.".to_owned()
+                    }
+                    _ => "Make sure the other computer shows the same numbers.".to_owned(),
+                },
+            ),
+            ScreenId::Grants => ("What the other computer may do", consent_preview.clone()),
+            ScreenId::Layout => ("Arrange your screens", consent_preview.clone()),
+            ScreenId::Practice => ("Try each feature once", self.practice_message()),
+            ScreenId::Summary => (
+                match self.summary.milestone {
+                    Milestone::WorkspaceReady => "Your workspace is ready",
+                    Milestone::InstalledWaiting => "Crosspane is installed",
+                    Milestone::NotInstalled => "Crosspane isn't installed yet",
+                },
+                match self.summary.milestone {
+                    Milestone::WorkspaceReady => {
+                        "Every step was checked just now on this computer.".to_owned()
+                    }
+                    Milestone::InstalledWaiting => {
+                        "Some steps still need to be finished before the workspace is ready."
+                            .to_owned()
+                    }
+                    Milestone::NotInstalled => {
+                        "Finish the installation steps to start using Crosspane.".to_owned()
+                    }
+                },
+            ),
+            ScreenId::RepairRemove => ("Remove or repair Crosspane", self.maintenance_message()),
+        };
+        let mut message = message;
+        if let Some(notice) = &self.notice {
+            message = format!("{notice}\n\n{message}");
+        }
+        (title.to_owned(), bounded(message.trim().to_owned()))
+    }
+
+    fn practice_message(&self) -> String {
+        let Some(run) = self
+            .practice
+            .run
+            .as_ref()
+            .filter(|_| self.practice.active())
+        else {
+            return "Each practice uses a small Crosspane practice window and checks that it \
+                    really worked. Choose one to start."
+                .into();
+        };
+        let mut text = format!("Practising: {}.", graph::role_label(run.role));
+        if let Some(note) = &run.note {
+            text.push(' ');
+            text.push_str(note);
+        }
+        if self.practice.tutorial.state() == TutorialState::WaitingUser {
+            text.push_str(" Follow the practice window, then confirm what you saw.");
+        }
+        text
+    }
+
+    fn maintenance_message(&self) -> String {
+        let m = &self.maintenance;
+        if let Some((outcome, lines)) = &m.finished {
+            let head = match outcome {
+                MaintenanceOutcome::Removed => "Crosspane was removed.",
+                MaintenanceOutcome::Partial => "Some parts of Crosspane are still here.",
+                MaintenanceOutcome::Refused => "Removal didn't start.",
+                MaintenanceOutcome::Failed => "Removal didn't finish.",
+            };
+            return format!("{head}\n{}", lines.join("\n"));
+        }
+        if let Some(reason) = &m.refused {
+            return reason.clone();
+        }
+        let mut text = Vec::new();
+        match &m.uninstall {
+            None => text.push("Checking what can be removed…".to_owned()),
+            Some(Availability::Unavailable(reason) | Availability::NotAvailableYet(reason)) => {
+                text.push(reason.clone())
+            }
+            Some(Availability::Available) => {}
+        }
+        if let Some(preview) = &m.preview {
+            text.push(preview.clone());
+        }
+        for (_, label, preview) in &m.follow_ups {
+            text.push(format!("{label}: {preview}"));
+        }
+        text.extend(m.progress.iter().cloned());
+        text.join("\n\n")
+    }
+
+    fn buttons_and_fields(&self, screen: ScreenId) -> (Vec<ButtonView>, Vec<FieldView>) {
+        let mut buttons = Vec::new();
+        let mut fields = Vec::new();
+        let busy = self.mutation_in_flight();
+        let secondary = ButtonKind::Secondary;
+        // Step-level consent and retry buttons for native steps on this screen.
+        for meta in self.graph.on_screen(screen) {
+            let state = self.step_state(meta.id);
+            if meta.kind == StepKind::Native
+                && state == StepState::NeedsAction
+                && self.previews.contains_key(&meta.id)
+                && self.job(meta.id, JobStage::Plan).is_some()
+            {
+                buttons.push(button(
+                    ids::consent(meta.id),
+                    ButtonRole::Confirm,
+                    &meta.action_label,
+                    true,
+                    ButtonKind::Primary,
+                ));
+            }
+            if retryable(state) && !matches!(meta.kind, StepKind::Practice(_) | StepKind::Final) {
+                buttons.push(button(
+                    ids::retry(meta.id),
+                    ButtonRole::Retry,
+                    "Check again",
+                    true,
+                    secondary,
+                ));
+            }
+        }
+        match screen {
+            ScreenId::Welcome => {
+                buttons.push(button(
+                    ids::REMOVE_OR_REPAIR,
+                    ButtonRole::Ordinary,
+                    "Remove or repair Crosspane…",
+                    true,
+                    secondary,
+                ));
+                buttons.push(button(
+                    ids::CLOSE,
+                    ButtonRole::Cancel,
+                    "Close",
+                    true,
+                    secondary,
+                ));
+            }
+            ScreenId::Connect => self.connect_controls(&mut buttons, &mut fields),
+            ScreenId::MatchNumbers => match self.pairing_phase() {
+                Some(PairPhase::Pick) => {
+                    let candidates = self
+                        .connect
+                        .pairing
+                        .as_ref()
+                        .map(|p| p.candidates.clone())
+                        .unwrap_or_default();
+                    for (i, number) in candidates.iter().take(8).enumerate() {
+                        buttons.push(button(
+                            ids::pair_pick(i),
+                            ButtonRole::Confirm,
+                            &bounded(number.clone()),
+                            true,
+                            ButtonKind::Primary,
+                        ));
+                    }
+                }
+                _ => {
+                    buttons.push(button(
+                        ids::PAIR_CONFIRM,
+                        ButtonRole::Confirm,
+                        "The numbers match",
+                        true,
+                        ButtonKind::Primary,
+                    ));
+                    buttons.push(button(
+                        ids::PAIR_REJECT,
+                        ButtonRole::Cancel,
+                        "They don't match",
+                        true,
+                        ButtonKind::Destructive,
+                    ));
+                }
+            },
+            ScreenId::Grants => {
+                if self.step_state(steps::GRANTS) == StepState::NeedsAction {
+                    for (i, c) in CAPABILITIES.iter().enumerate() {
+                        fields.push(FieldView::Toggle {
+                            id: ids::grant_field(i),
+                            role: ToggleRole::Grant,
+                            label: capability_label(*c).into(),
+                            checked: self.connect.grants[i],
+                            enabled: true,
+                        });
+                    }
+                    buttons.push(button(
+                        ids::GRANTS_APPLY,
+                        ButtonRole::Confirm,
+                        "Apply",
+                        true,
+                        ButtonKind::Primary,
+                    ));
+                }
+            }
+            ScreenId::Layout => {
+                if self.step_state(steps::LAYOUT) == StepState::NeedsAction
+                    && !self.connect.layout_busy
+                {
+                    buttons.push(button(
+                        ids::LAYOUT_ACCEPT,
+                        ButtonRole::Confirm,
+                        "Use this layout",
+                        true,
+                        ButtonKind::Primary,
+                    ));
+                }
+            }
+            ScreenId::HidingChoice => {
+                if self.step_state(steps::HIDING) == StepState::NeedsAction {
+                    buttons.push(button(
+                        ids::HIDING_APPLY,
+                        ButtonRole::Confirm,
+                        "Apply and continue",
+                        self.connect.hiding.is_some(),
+                        ButtonKind::Primary,
+                    ));
+                }
+                if self.hiding_restart_pending() {
+                    buttons.push(button(
+                        ids::HIDING_RESTART,
+                        ButtonRole::Confirm,
+                        "Restart Crosspane now",
+                        true,
+                        ButtonKind::Primary,
+                    ));
+                }
+            }
+            ScreenId::Practice => self.practice_controls(&mut buttons),
+            ScreenId::Summary => {
+                buttons.push(button(
+                    ids::FINAL_CHECK,
+                    ButtonRole::Retry,
+                    "Check again",
+                    self.graph
+                        .practice_steps()
+                        .iter()
+                        .all(|s| self.satisfied(*s)),
+                    secondary,
+                ));
+                buttons.push(button(
+                    ids::REMOVE_OR_REPAIR,
+                    ButtonRole::Ordinary,
+                    "Remove or repair Crosspane…",
+                    !busy,
+                    secondary,
+                ));
+                buttons.push(button(
+                    ids::CLOSE,
+                    ButtonRole::Cancel,
+                    "Close",
+                    true,
+                    secondary,
+                ));
+            }
+            ScreenId::RepairRemove => self.maintenance_controls(&mut buttons, &mut fields),
+            _ => {}
+        }
+        if !matches!(
+            screen,
+            ScreenId::Welcome | ScreenId::Summary | ScreenId::RepairRemove | ScreenId::MatchNumbers
+        ) {
+            if self.previous_screen().is_some() {
+                buttons.push(button(
+                    ids::BACK,
+                    ButtonRole::Back,
+                    "Back",
+                    !busy,
+                    secondary,
+                ));
+            }
+            if self.next_screen().is_some() {
+                let enabled = !self.practice.engaged(self.now)
+                    && (screen == ScreenId::Practice || self.screen_complete(screen));
+                let label = if screen == ScreenId::Practice {
+                    "Continue"
+                } else {
+                    "Next"
+                };
+                buttons.push(button(
+                    ids::NEXT,
+                    ButtonRole::Next,
+                    label,
+                    enabled,
+                    ButtonKind::Primary,
+                ));
+            }
+        }
+        if screen == ScreenId::Welcome {
+            buttons.push(button(
+                ids::NEXT,
+                ButtonRole::Next,
+                "Get started",
+                true,
+                ButtonKind::Primary,
+            ));
+        }
+        (buttons, fields)
+    }
+
+    fn connect_controls(&self, buttons: &mut Vec<ButtonView>, fields: &mut Vec<FieldView>) {
+        if self.step_state(steps::PAIR) != StepState::NeedsAction {
+            return;
+        }
+        let address = self.parsed_address().is_some();
+        fields.push(FieldView::PeerAddress {
+            id: ids::PEER_ADDRESS,
+            value: self.connect.address.clone(),
+            enabled: true,
+        });
+        buttons.push(button(
+            ids::PAIR_LISTEN,
+            ButtonRole::Ordinary,
+            "Let the other computer join",
+            true,
+            ButtonKind::Primary,
+        ));
+        buttons.push(button(
+            ids::PAIR_JOIN,
+            ButtonRole::Ordinary,
+            "Join the address above",
+            address,
+            ButtonKind::Secondary,
+        ));
+        buttons.push(button(
+            ids::PAIR_DIAL,
+            ButtonRole::Ordinary,
+            "Reconnect a computer paired before",
+            address,
+            ButtonKind::Secondary,
+        ));
+        buttons.push(button(
+            ids::PAIR_SCAN,
+            ButtonRole::Ordinary,
+            "Look for computers nearby",
+            true,
+            ButtonKind::Secondary,
+        ));
+        for (i, candidate) in self.connect.candidates.iter().enumerate() {
+            buttons.push(button(
+                ids::pair_candidate(i),
+                ButtonRole::Ordinary,
+                &bounded(format!("Pair with {}", candidate.name)),
+                true,
+                ButtonKind::Secondary,
+            ));
+        }
+        let connected = self.connected_peers();
+        if connected.len() > 1 {
+            for (i, (_, name)) in connected.iter().take(8).enumerate() {
+                buttons.push(button(
+                    ids::select_peer(i),
+                    ButtonRole::Ordinary,
+                    &bounded(format!("Use {name}")),
+                    true,
+                    ButtonKind::Secondary,
+                ));
+            }
+        }
+    }
+
+    fn practice_controls(&self, buttons: &mut Vec<ButtonView>) {
+        if let Some(run) = self
+            .practice
+            .run
+            .as_ref()
+            .filter(|_| self.practice.active())
+        {
+            let waiting = self.practice.tutorial.state() == TutorialState::WaitingUser
+                || self.practice.tutorial.state() == TutorialState::Running;
+            let private = self.source_policy()
+                == crate::tutorial_flow::TutorialSourcePolicy::MacPrivateDisplay;
+            for c in confirmations(run.role, private) {
+                if run.confirmed.contains(&c) {
+                    continue;
+                }
+                buttons.push(button(
+                    ids::confirm(c),
+                    ButtonRole::Confirm,
+                    confirmation_label(c),
+                    waiting,
+                    ButtonKind::Primary,
+                ));
+            }
+            if run.role == TutorialRole::AudioSender {
+                buttons.push(button(
+                    ids::PLAY_TONE,
+                    ButtonRole::Ordinary,
+                    "Play the test sound",
+                    waiting,
+                    ButtonKind::Secondary,
+                ));
+            }
+            if run.role == TutorialRole::E2DestinationPull {
+                for (i, w) in run.remote_windows.iter().enumerate() {
+                    buttons.push(button(
+                        ids::remote_window(i),
+                        ButtonRole::Ordinary,
+                        &bounded(format!("Take “{}” ({})", w.title, w.app)),
+                        waiting,
+                        ButtonKind::Secondary,
+                    ));
+                }
+            }
+            buttons.push(button(
+                ids::PRACTICE_CANCEL,
+                ButtonRole::Stop,
+                "Stop this practice",
+                true,
+                ButtonKind::Secondary,
+            ));
+            return;
+        }
+        for role in graph::ROLES {
+            let step = steps::practice(role);
+            if self.satisfied(step) {
+                continue;
+            }
+            buttons.push(button(
+                ids::practice_start(role),
+                ButtonRole::Ordinary,
+                &format!("Start: {}", graph::role_label(role)),
+                self.prerequisites_valid(step) && !self.practice.engaged(self.now),
+                ButtonKind::Secondary,
+            ));
+        }
+    }
+
+    fn maintenance_controls(&self, buttons: &mut Vec<ButtonView>, fields: &mut Vec<FieldView>) {
+        let m = &self.maintenance;
+        let available = m.uninstall == Some(Availability::Available);
+        let open = available && !m.confirmed && m.finished.is_none() && m.refused.is_none();
+        for choice in &m.choices {
+            fields.push(FieldView::Toggle {
+                id: ids::removal_field(choice.id),
+                role: choice.role,
+                label: choice.label.clone(),
+                checked: choice.checked,
+                enabled: open && !m.planning && choice.enabled,
+            });
+        }
+        if open && m.preview.is_none() {
+            buttons.push(button(
+                ids::REMOVE_REVIEW,
+                ButtonRole::Ordinary,
+                "Review what will be removed",
+                !m.planning,
+                ButtonKind::Secondary,
+            ));
+        }
+        if open && m.preview.is_some() {
+            buttons.push(button(
+                ids::REMOVE_CONFIRM,
+                ButtonRole::Confirm,
+                "Remove Crosspane",
+                true,
+                ButtonKind::Destructive,
+            ));
+        }
+        if m.confirmed && m.finished.is_none() {
+            for (id, label, _) in &m.follow_ups {
+                buttons.push(button(
+                    ids::follow_up_confirm(*id),
+                    ButtonRole::Confirm,
+                    label,
+                    true,
+                    ButtonKind::Destructive,
+                ));
+                buttons.push(button(
+                    ids::follow_up_decline(*id),
+                    ButtonRole::Ordinary,
+                    "Keep it",
+                    true,
+                    ButtonKind::Secondary,
+                ));
+            }
+        }
+        let repair = m.repair == Some(Availability::Available);
+        buttons.push(button(
+            ids::REPAIR,
+            ButtonRole::Ordinary,
+            "Repair Crosspane",
+            repair && !m.confirmed,
+            ButtonKind::Secondary,
+        ));
+        if !m.running() {
+            if m.finished.is_none() {
+                buttons.push(button(
+                    ids::BACK,
+                    ButtonRole::Back,
+                    "Back",
+                    true,
+                    ButtonKind::Secondary,
+                ));
+            }
+            buttons.push(button(
+                ids::CLOSE,
+                ButtonRole::Cancel,
+                "Close",
+                true,
+                ButtonKind::Secondary,
+            ));
+        }
+    }
+
+    pub(super) fn rebuild_view(&mut self) {
+        let screen = self.display_screen();
+        let (title, message) = self.title_and_message(screen);
+        let (buttons, fields) = self.buttons_and_fields(screen);
+        let layout = (screen == ScreenId::Layout).then(|| {
+            let (confirmed, local_node, peer_order) = self.layout_rects();
+            LayoutPreview {
+                confirmed,
+                local_node,
+                peer_order,
+                busy: self.connect.layout_busy,
+            }
+        });
+        let practice = self
+            .practice
+            .run
+            .as_ref()
+            .filter(|_| self.practice.active())
+            .map(|run| match run.role {
+                TutorialRole::E1Controller | TutorialRole::E1Target => {
+                    PracticeIllustration::Pointer
+                }
+                TutorialRole::AudioSender | TutorialRole::AudioReceiver => {
+                    PracticeIllustration::Tone
+                }
+                _ => PracticeIllustration::Window,
+            });
+        let sas = (screen == ScreenId::MatchNumbers)
+            .then(|| self.connect.pairing.as_ref().and_then(|p| p.sas.clone()))
+            .flatten()
+            .map(bounded);
+        let escape = if self.mutation_in_flight() {
+            EscapeMapping::None
+        } else {
+            match screen {
+                ScreenId::Welcome | ScreenId::Summary => EscapeMapping::Close,
+                ScreenId::MatchNumbers => EscapeMapping::None,
+                _ => EscapeMapping::Back,
+            }
+        };
+        let mut view = WizardView {
+            revision: self.view.revision,
+            escape,
+            fields,
+            screen,
+            title,
+            message,
+            machine: Some(bounded(self.desc.machine_label.clone())),
+            peer: self.peer_name(),
+            rows: self.screen_rows(screen),
+            buttons,
+            summary: match self.summary.milestone {
+                Milestone::NotInstalled => SummaryView::NotInstalled,
+                Milestone::InstalledWaiting => SummaryView::InstalledWaiting,
+                Milestone::WorkspaceReady => SummaryView::WorkspaceReady,
+            },
+            hiding_choice: (screen == ScreenId::HidingChoice)
+                .then_some(self.connect.hiding)
+                .flatten(),
+            motion: self.motion,
+            system_reduced_motion: None,
+            layout,
+            progress: self.progress(screen),
+            illustration: IllustrationView {
+                permission_row: None,
+                traffic_observed: false,
+                sas,
+                practice,
+            },
+            demo: false,
+        };
+        let previews: Vec<&String> = self
+            .graph
+            .on_screen(screen)
+            .filter(|m| self.step_state(m.id) == StepState::NeedsAction)
+            .filter_map(|m| self.previews.get(&m.id))
+            .collect();
+        let signature = format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            view.screen,
+            view.buttons
+                .iter()
+                .map(|b| (b.id, b.role, b.enabled, b.kind, &b.label))
+                .collect::<Vec<_>>(),
+            view.fields
+                .iter()
+                .map(|f| match f {
+                    FieldView::PeerAddress { id, enabled, .. } => (*id, *enabled, String::new()),
+                    FieldView::Toggle {
+                        id, enabled, label, ..
+                    } => (*id, *enabled, label.clone()),
+                })
+                .collect::<Vec<_>>(),
+            previews,
+            view.illustration.sas,
+            view.layout.as_ref().map(|l| (&l.confirmed, l.busy)),
+            view.hiding_choice,
+            self.maintenance.preview,
+        );
+        if signature != self.signature {
+            view.revision = self.view.revision.saturating_add(1);
+            self.signature = signature;
+        }
+        self.view = view;
+    }
+
+    pub(super) fn back(&mut self) {
+        if self.mutation_in_flight() {
+            return;
+        }
+        if self.screen == ScreenId::RepairRemove {
+            let to = self
+                .maintenance
+                .return_to
+                .take()
+                .unwrap_or(ScreenId::Welcome);
+            self.go(to);
+        } else if let Some(previous) = self.previous_screen() {
+            self.go(previous);
+        }
+    }
+
+    /// Returns true when the window should close.
+    pub(super) fn button(&mut self, id: u16) -> bool {
+        match id {
+            ids::NEXT => {
+                if let Some(next) = self.next_screen() {
+                    self.go(next);
+                }
+            }
+            ids::BACK => self.back(),
+            ids::CLOSE => return self.try_close(),
+            ids::REMOVE_OR_REPAIR => {
+                self.maintenance.return_to = Some(self.screen);
+                self.go(ScreenId::RepairRemove);
+            }
+            ids::PAIR_LISTEN => self.pair_action(PairMode::Listen),
+            ids::PAIR_JOIN => {
+                if let Some(addr) = self.parsed_address() {
+                    self.pair_action(PairMode::Join(addr));
+                }
+            }
+            ids::PAIR_DIAL => {
+                if let Some(addr) = self.parsed_address() {
+                    self.pair_action(PairMode::Dial(addr));
+                }
+            }
+            ids::PAIR_SCAN => self.scan(),
+            ids::PAIR_CONFIRM => self.pair_answer(InstallerRequest::PairConfirm { accept: true }),
+            ids::PAIR_REJECT => self.pair_answer(InstallerRequest::PairConfirm { accept: false }),
+            ids::GRANTS_APPLY => self.request_apply(steps::GRANTS),
+            ids::LAYOUT_ACCEPT => self.accept_layout(),
+            ids::HIDING_APPLY => self.request_apply(steps::HIDING),
+            ids::HIDING_RESTART => self.hiding_restart(),
+            ids::PLAY_TONE => self.practice_user(TutorialUserAction::PlayTestSound),
+            ids::PRACTICE_CANCEL => self.practice_user(TutorialUserAction::Cancel),
+            ids::FINAL_CHECK => self.begin(steps::FINAL),
+            ids::REMOVE_REVIEW => self.plan_uninstall(),
+            ids::REMOVE_CONFIRM => self.confirm_uninstall(),
+            ids::REPAIR => {}
+            other => self.ranged_button(other),
+        }
+        false
+    }
+
+    fn ranged_button(&mut self, id: u16) {
+        match id {
+            110..=190 => self.begin(StepId(id - 100)),
+            1010..=1090 => self.consent_click(StepId(id - 1000)),
+            2010..=2025 => {
+                if let Some(c) = self.connect.candidates.get(usize::from(id - 2010)) {
+                    let addr = c.addr;
+                    self.pair_action(PairMode::Join(addr));
+                }
+            }
+            2030..=2045 => {
+                if let Some((node, _)) = self.connected_peers().get(usize::from(id - 2030)) {
+                    let node = *node;
+                    self.pair_action(PairMode::Existing(node));
+                }
+            }
+            2110..=2125 => self.pair_answer(InstallerRequest::PairPick {
+                index: usize::from(id - 2110),
+            }),
+            3000..=3008 => {
+                if let Some(role) = graph::ROLES.get(usize::from(id - 3000)) {
+                    self.start_practice(*role);
+                }
+            }
+            3100..=3110 => {
+                if let Some(c) = CONFIRMATIONS.get(usize::from(id - 3100)) {
+                    self.practice_user(TutorialUserAction::Confirm(*c));
+                }
+            }
+            3300..=3315 => {
+                let window = self
+                    .practice
+                    .run
+                    .as_ref()
+                    .and_then(|r| r.remote_windows.get(usize::from(id - 3300)))
+                    .map(|w| w.id);
+                if let Some(window) = window {
+                    self.practice_user(TutorialUserAction::SelectRemoteWindow { window });
+                }
+            }
+            5100..=5190 => self.follow_up(id - 5100, true),
+            5200..=5290 => self.follow_up(id - 5200, false),
+            _ => {}
+        }
+    }
+
+    fn consent_click(&mut self, step: StepId) {
+        if self.graph.kind(step) != Some(StepKind::Native)
+            || self.step_state(step) != StepState::NeedsAction
+            || !self.previews.contains_key(&step)
+        {
+            return;
+        }
+        let Some(plan) = self.job(step, JobStage::Plan) else {
+            return;
+        };
+        self.consents.insert(
+            step,
+            Consent {
+                plan: plan.operation,
+                operation: plan.operation,
+                revision: self.view.revision,
+            },
+        );
+        if self
+            .reduce(crosspane_installer_core::FlowEvent::ApplyRequested {
+                step,
+                operation: plan.operation,
+            })
+            .is_err()
+        {
+            self.consents.remove(&step);
+        }
+    }
+
+    pub(super) fn toggle(&mut self, field: u16, checked: bool) {
+        if let Some(i) = (0..5).find(|i| ids::grant_field(*i) == field) {
+            self.grant_toggle(i, checked);
+            return;
+        }
+        let m = &mut self.maintenance;
+        // While a plan is being prepared the choices are frozen, so the preview that comes back
+        // always describes exactly the choices that will be confirmed.
+        if m.confirmed || m.planning || m.finished.is_some() {
+            return;
+        }
+        if let Some(choice) = m
+            .choices
+            .iter_mut()
+            .find(|c| ids::removal_field(c.id) == field && c.enabled)
+        {
+            choice.checked = checked;
+            // A changed selection retires the reviewed plan.
+            m.preview = None;
+        }
+    }
+
+    pub(super) fn inspect_maintenance(&mut self) {
+        let return_to = self.maintenance.return_to;
+        let next_id = self.maintenance.next_id.saturating_add(1);
+        self.maintenance = MaintenanceState {
+            next_id,
+            current: Some(MaintenanceId(next_id)),
+            return_to,
+            ..MaintenanceState::default()
+        };
+        self.submit_maintenance(MaintenanceRequest::Inspect {
+            id: MaintenanceId(next_id),
+        });
+    }
+
+    fn submit_maintenance(&mut self, request: MaintenanceRequest) {
+        if let Err(refusal) = self.platform.submit(NativeJob::Maintenance(request)) {
+            self.maintenance.refused = Some(bounded(refusal.to_string()));
+        }
+    }
+
+    fn plan_uninstall(&mut self) {
+        let Some(id) = self.maintenance.current else {
+            return;
+        };
+        if self.maintenance.uninstall != Some(Availability::Available) || self.maintenance.confirmed
+        {
+            return;
+        }
+        self.maintenance.planning = true;
+        let choices = self
+            .maintenance
+            .choices
+            .iter()
+            .map(|c| (c.id, c.checked))
+            .collect();
+        let status = self.fresh_status();
+        self.submit_maintenance(MaintenanceRequest::PlanUninstall {
+            id,
+            choices,
+            status,
+        });
+    }
+
+    /// The latest Status, handed over only while it is fresh enough to plan against.
+    fn fresh_status(&self) -> Option<super::StatusEvidence> {
+        self.health
+            .as_ref()
+            .filter(|h| self.now.saturating_sub(h.observed_at_ms) <= 3_000)
+            .map(|h| super::StatusEvidence(h.reply.clone()))
+    }
+
+    fn confirm_uninstall(&mut self) {
+        let Some(id) = self.maintenance.current else {
+            return;
+        };
+        if self.maintenance.preview.is_none() || self.maintenance.confirmed {
+            return;
+        }
+        self.maintenance.confirmed = true;
+        let revision = self.view.revision;
+        let status = self.fresh_status();
+        self.submit_maintenance(MaintenanceRequest::ConfirmUninstall {
+            id,
+            revision,
+            status,
+        });
+    }
+
+    fn follow_up(&mut self, follow_up: u16, confirm: bool) {
+        let Some(id) = self.maintenance.current else {
+            return;
+        };
+        if !self
+            .maintenance
+            .follow_ups
+            .iter()
+            .any(|(f, ..)| *f == follow_up)
+        {
+            return;
+        }
+        self.maintenance
+            .follow_ups
+            .retain(|(f, ..)| *f != follow_up);
+        let revision = self.view.revision;
+        self.submit_maintenance(if confirm {
+            MaintenanceRequest::ConfirmFollowUp {
+                id,
+                follow_up,
+                revision,
+            }
+        } else {
+            MaintenanceRequest::DeclineFollowUp { id, follow_up }
+        });
+    }
+
+    pub(super) fn maintenance_report(&mut self, report: MaintenanceReport) {
+        let id = match &report {
+            MaintenanceReport::Inspected { id, .. }
+            | MaintenanceReport::Planned { id, .. }
+            | MaintenanceReport::Progress { id, .. }
+            | MaintenanceReport::FollowUp { id, .. }
+            | MaintenanceReport::Finished { id, .. }
+            | MaintenanceReport::Refused { id, .. } => *id,
+        };
+        if self.maintenance.current != Some(id) {
+            return;
+        }
+        let m = &mut self.maintenance;
+        match report {
+            MaintenanceReport::Inspected {
+                uninstall,
+                repair,
+                choices,
+                ..
+            } => {
+                m.uninstall = Some(uninstall);
+                m.repair = Some(repair);
+                m.choices = choices.into_iter().take(8).collect();
+            }
+            // Only the answer to the outstanding review request is shown as the plan.
+            MaintenanceReport::Planned { preview, .. } if m.planning && !m.confirmed => {
+                m.planning = false;
+                m.preview = Some(bounded(preview));
+            }
+            MaintenanceReport::Planned { .. } => {}
+            MaintenanceReport::Progress { detail, .. } => {
+                if m.progress.len() < MAX_PROGRESS_LINES {
+                    m.progress.push(bounded(detail));
+                }
+            }
+            MaintenanceReport::FollowUp {
+                follow_up,
+                label,
+                preview,
+                ..
+            } => {
+                if !m.follow_ups.iter().any(|(f, ..)| *f == follow_up) {
+                    m.follow_ups
+                        .push((follow_up, bounded(label), bounded(preview)));
+                }
+            }
+            MaintenanceReport::Finished { outcome, lines, .. } => {
+                m.follow_ups.clear();
+                m.finished = Some((
+                    outcome,
+                    lines
+                        .into_iter()
+                        .take(MAX_PROGRESS_LINES)
+                        .map(bounded)
+                        .collect(),
+                ));
+            }
+            MaintenanceReport::Refused { reason, .. } => {
+                m.planning = false;
+                m.refused = Some(bounded(reason));
+            }
+        }
+    }
+}

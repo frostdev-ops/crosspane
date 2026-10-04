@@ -18,7 +18,7 @@ use eframe::egui;
 
 use crate::WizardShell;
 use crate::demo::{self, DisconnectedController};
-use crate::view::{ScreenId, WizardAction};
+use crate::view::{ScreenId, WizardAction, WizardView};
 
 pub const MAX_FONT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -40,6 +40,9 @@ pub struct ReviewOptions {
     /// Explicit, absolute path to a readable system font (maximum 16 MiB).
     #[arg(long)]
     pub font: Option<PathBuf>,
+    /// Linux production: directory holding `payload.tar` and `payload.sha256`.
+    #[arg(long, value_name = "DIR")]
+    pub payload: Option<PathBuf>,
 }
 
 impl ReviewOptions {
@@ -51,6 +54,10 @@ impl ReviewOptions {
         ensure!(
             self.demo || self.screenshot.is_none(),
             "--screenshot requires --demo"
+        );
+        ensure!(
+            !(self.demo && self.payload.is_some()),
+            "--payload cannot be used with --demo"
         );
         if let Some(path) = &self.screenshot {
             ensure!(
@@ -76,6 +83,64 @@ impl ReviewOptions {
         } else {
             None
         })
+    }
+}
+
+/// Layout reconciliation applied by the GUI frame after `tick`, never by the controller itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShellEffect {
+    #[default]
+    FollowLayout,
+    RevertLayout,
+    CancelLayoutDrag,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ControllerTick {
+    pub effects: Vec<ShellEffect>,
+    pub wake_after_ms: Option<u64>,
+}
+
+/// One selected mode for the life of the process. Demo never becomes production.
+pub trait InstallerController {
+    fn view(&self) -> &WizardView;
+    /// Returns true when the window should close.
+    fn accept(&mut self, action: WizardAction) -> bool;
+    fn tick(&mut self) -> ControllerTick;
+    fn close(&mut self);
+    /// The window manager asked to close the window. Returns false, and keeps the window open,
+    /// while closing now would cut a running change short; otherwise closes and returns true.
+    fn request_close(&mut self) -> bool {
+        self.close();
+        true
+    }
+}
+
+impl InstallerController for DisconnectedController {
+    fn view(&self) -> &WizardView {
+        DisconnectedController::view(self)
+    }
+    fn accept(&mut self, action: WizardAction) -> bool {
+        DisconnectedController::accept(self, action)
+    }
+    fn tick(&mut self) -> ControllerTick {
+        ControllerTick::default()
+    }
+    fn close(&mut self) {}
+}
+
+fn apply_effects(shell: &mut WizardShell, view: &WizardView, effects: Vec<ShellEffect>) {
+    let confirmed = view
+        .layout
+        .as_ref()
+        .map(|layout| layout.confirmed.as_slice())
+        .unwrap_or(&[]);
+    for effect in effects {
+        match effect {
+            ShellEffect::FollowLayout => shell.follow_layout(confirmed),
+            ShellEffect::RevertLayout => shell.revert_layout(confirmed),
+            ShellEffect::CancelLayoutDrag => shell.cancel_layout_drag(),
+        }
     }
 }
 
@@ -131,14 +196,102 @@ pub fn font_definitions(bytes: Vec<u8>) -> Result<egui::FontDefinitions> {
     Ok(fonts)
 }
 
+/// The one mode a launch runs in, chosen from the flags before anything else is constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// Permanently disconnected review fixtures: no production port, probe or receipt reader.
+    Demo,
+    /// The live installer for this operating system, with its own system font.
+    Production,
+    /// Review flags without `--demo`: refused with the validation error.
+    Refused,
+}
+
+impl ReviewOptions {
+    pub fn mode(&self) -> LaunchMode {
+        if self.demo {
+            LaunchMode::Demo
+        } else if self.screen.is_some() || self.screenshot.is_some() || self.font.is_some() {
+            LaunchMode::Refused
+        } else {
+            LaunchMode::Production
+        }
+    }
+}
+
 pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
-    let screen = options.validate()?;
-    let font = options
-        .font
-        .as_deref()
-        .context("Missing explicit review font")?;
-    let fonts = load_review_font(font)?;
-    let screenshot = options.screenshot;
+    match options.mode() {
+        LaunchMode::Demo => {
+            let screen = options
+                .validate()?
+                .context("--demo needs a screen to review")?;
+            let font = options
+                .font
+                .as_deref()
+                .context("Missing explicit review font")?;
+            run_gui(
+                options.screenshot,
+                brand,
+                load_review_font(font)?,
+                Box::new(DisconnectedController::new(Some(screen))),
+            )
+        }
+        LaunchMode::Refused => {
+            options.validate()?;
+            // A font without --demo: production reads the system font itself and takes no
+            // override. Other operating systems keep today's disconnected normal entry.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            bail!("--font is only valid with --demo; production uses the system font");
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let font = options.font.as_deref().context("Missing explicit font")?;
+                run_gui(
+                    None,
+                    brand,
+                    load_review_font(font)?,
+                    Box::new(DisconnectedController::new(None)),
+                )
+            }
+        }
+        LaunchMode::Production => {
+            let (fonts, controller) = production_controller(options.payload)?;
+            run_gui(None, brand, fonts, controller)
+        }
+    }
+}
+
+fn production_controller(
+    payload: Option<PathBuf>,
+) -> Result<(egui::FontDefinitions, Box<dyn InstallerController>)> {
+    // The installer never runs elevated: it refuses before reading a font or building any port.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    ensure!(
+        !rustix::process::geteuid().is_root(),
+        "The installer refuses to run as root or with sudo. Run it from your own account."
+    );
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::linux::integration::open(payload)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // The Mac installs from a signed payload embedded in this build, never a directory.
+        ensure!(payload.is_none(), "--payload is only used on Linux");
+        crate::platform::macos::integration::open()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = payload;
+        bail!("Installation is not available on this operating system yet.");
+    }
+}
+
+fn run_gui(
+    screenshot: Option<PathBuf>,
+    brand: BrandBytes<'static>,
+    fonts: egui::FontDefinitions,
+    controller: Box<dyn InstallerController>,
+) -> Result<()> {
     let capture_requested = screenshot.is_some();
     // The deadline starts before native viewport setup, not when capture is requested.
     let capture_timing = screenshot
@@ -161,7 +314,7 @@ pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
             cc.egui_ctx.set_style_of(egui::Theme::Dark, theme::style());
             let art = Art::load(&cc.egui_ctx, brand);
             Ok(Box::new(InstallerGui {
-                controller: DisconnectedController::new(screen),
+                controller,
                 shell: WizardShell::default(),
                 art,
                 started: Instant::now(),
@@ -236,7 +389,7 @@ impl CaptureTiming {
 }
 
 struct InstallerGui {
-    controller: DisconnectedController,
+    controller: Box<dyn InstallerController>,
     shell: WizardShell,
     art: Art,
     started: Instant,
@@ -247,6 +400,12 @@ struct InstallerGui {
     completion: Arc<Mutex<CaptureCompletion>>,
     pending_actions: Vec<WizardAction>,
     pending_frame: Option<u64>,
+}
+
+impl Drop for InstallerGui {
+    fn drop(&mut self) {
+        self.controller.close();
+    }
 }
 
 impl InstallerGui {
@@ -268,6 +427,13 @@ impl InstallerGui {
 
 impl eframe::App for InstallerGui {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A window-manager close during a running change is refused, so the change is never cut
+        // short by the process exiting; the view explains why.
+        if ctx.input(|input| input.viewport().close_requested()) && !self.controller.request_close()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.request_repaint();
+        }
         // A multi-pass render keeps one immutable view. Apply its intents next frame.
         if self
             .pending_frame
@@ -332,6 +498,11 @@ impl eframe::App for InstallerGui {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let tick = self.controller.tick();
+        apply_effects(&mut self.shell, self.controller.view(), tick.effects);
+        if let Some(ms) = tick.wake_after_ms {
+            ui.ctx().request_repaint_after(Duration::from_millis(ms));
+        }
         let actions = egui::Frame::new()
             .inner_margin(24)
             .show(ui, |ui| {
@@ -419,6 +590,43 @@ mod tests {
         assert_eq!(
             timing.poll(start + Duration::from_secs(15), 4),
             CaptureNext::Timeout
+        );
+    }
+
+    fn options(args: &[&str]) -> ReviewOptions {
+        ReviewOptions::parse_from(
+            std::iter::once("crosspane-installer").chain(args.iter().copied()),
+        )
+    }
+
+    #[test]
+    fn the_launch_mode_comes_from_the_flags_alone_and_demo_never_becomes_production() {
+        assert_eq!(options(&[]).mode(), LaunchMode::Production);
+        assert_eq!(
+            options(&["--payload", "/stage"]).mode(),
+            LaunchMode::Production
+        );
+        assert_eq!(
+            options(&["--demo", "--font", "/f.ttf"]).mode(),
+            LaunchMode::Demo
+        );
+        assert_eq!(
+            options(&["--demo", "--screen", "welcome", "--font", "/f.ttf"]).mode(),
+            LaunchMode::Demo
+        );
+        // Review flags without --demo are refused rather than quietly running production.
+        for args in [
+            &["--font", "/f.ttf"][..],
+            &["--screen", "welcome"],
+            &["--screenshot", "/x.png"],
+        ] {
+            assert_eq!(options(args).mode(), LaunchMode::Refused, "{args:?}");
+        }
+        // The staged payload belongs to production only.
+        assert!(
+            options(&["--demo", "--font", "/f.ttf", "--payload", "/stage"])
+                .validate()
+                .is_err()
         );
     }
 

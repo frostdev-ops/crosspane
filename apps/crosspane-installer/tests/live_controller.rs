@@ -1,0 +1,1991 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! The shared live controller against fake platform ports. Fakes are test-only construction;
+//! there is no production fake mode.
+
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crosspane_installer::agent_contract::*;
+use crosspane_installer::fixture::{
+    FixtureCall, FixtureCommand, FixtureError, FixtureEvent, FixtureId, FixtureMessage,
+    FixtureReceipt, FixtureSnapshot, OwnToneState, OwnWindowFacts, PhaseId, ToneId,
+};
+use crosspane_installer::gui::{InstallerController, ShellEffect};
+use crosspane_installer::live::{
+    self, Clock, FixtureReadiness, LiveController, MaintenanceReport, MaintenanceRequest,
+    NativeJob, NativeOutcome, NativeRefusal, NativeReport, NativeStep, Platform,
+    PlatformDescription, PracticeFixtures, StepReport, ids,
+};
+use crosspane_installer::tutorial_flow::{HumanConfirmation, TutorialRole, TutorialSourcePolicy};
+use crosspane_installer::view::*;
+use crosspane_installer_core::*;
+use crosspane_types::id::{NodeId, WindowId};
+use crosspane_ui_kit::layout::{LayoutAction, PlacementIntent};
+use serde_json::{Value, json};
+
+const STATUS: &str = r#"{"ok":true,"result":{"controlling":null,"controlled_by":null,"projections":[],
+"displays":[{"id":1,"name":"local panel","pixels":[2560,1440],"scale":1.0,"mm":[600.0,340.0],"origin":[0.0,0.0]}],
+"peers":[],"layout":[],"installer":{"schema_version":1,
+"build":{"version":"0.0.0","features":[]},"instance":{"id":99,"pid":1,"uid":1000,"exe":"fixture","runtime_dir":"fixture","started_unix_ms":1},
+"config_revision":"1111111111111111","node":"1111111111111111111111111111111111111111111111111111111111111111",
+"recovery_pending":0,"startup_recovery":"restored","gate":{"open":true,"session":"unlocked","active":true,"armed":true,"panic":false},
+"epochs":{"gate":1,"grants":1,"layout":1,"backends":1},"keystore":"os_store","permissions":[],
+"backends":[{"name":"capture","state":"ready","reason":null},{"name":"keys","state":"ready","reason":null},{"name":"pointer","state":"ready","reason":null},
+{"name":"overlay","state":"ready","reason":null},{"name":"hotkeys","state":"ready","reason":null},{"name":"keystore","state":"ready","reason":null},
+{"name":"windows","state":"ready","reason":null},{"name":"parking","state":"ready","reason":null},{"name":"frames","state":"ready","reason":null},
+{"name":"tray","state":"ready","reason":null},{"name":"links","state":"ready","reason":null},{"name":"gpu","state":"ready","reason":null},
+{"name":"home","state":"ready","reason":null},{"name":"audio","state":"ready","reason":null},{"name":"discovery","state":"ready","reason":null}],
+"discovery":{"enabled":true,"running":true,"candidates":0,"error":null},"tray":{"created":true},
+"audio":{"enabled":true,"active_peers":[],"frames_sent":0,"frames_played":0},"settings_opened":0,
+"peers":[]}}}"#;
+
+fn local() -> NodeId {
+    NodeId([0x11; 32])
+}
+fn peer() -> NodeId {
+    NodeId([0x22; 32])
+}
+fn peer_json(grants: &[&str]) -> Value {
+    json!({"node": peer().to_string(), "name": "sensitive peer", "connected": true,
+        "link_generation": 2, "features": [], "grants_given": grants, "last_source_parking": null,
+        "counters": {"e1_controller_started":0,"e1_controller_ended":0,"e1_target_started":0,
+        "e1_target_ended":0,"e1_injections_ok":0,"e1_hud_shows":0,"e1_chord_releases":0,
+        "e1_command_releases":0,"e2_source_started":0,"e2_source_returned":0,"e2_dest_started":0,
+        "e2_dest_returned":0,"e2_frames_presented":0,"e2_returns_failed":0}})
+}
+
+const SUPPORT: StepId = StepId(10);
+const PAYLOAD: StepId = StepId(20);
+const AGENT: StepId = StepId(22);
+
+fn native(id: StepId, prerequisites: &[StepId], screen: ScreenId, installed: bool) -> NativeStep {
+    NativeStep {
+        id,
+        prerequisites: prerequisites.to_vec(),
+        required_for_installed: installed,
+        required_for_ready: true,
+        screen,
+        group: ProgressGroup::Install,
+        label: format!("native {}", id.0),
+        action_label: format!("Do {}", id.0),
+        uses_status: false,
+        settles_with_peer: false,
+        agent_apply: None,
+    }
+}
+
+fn description() -> PlatformDescription {
+    PlatformDescription {
+        platform: AgentPlatform::Linux,
+        machine_label: "own fixture A".into(),
+        steps: vec![
+            native(SUPPORT, &[], ScreenId::Compatibility, true),
+            native(PAYLOAD, &[SUPPORT], ScreenId::InstallPlan, true),
+            native(AGENT, &[PAYLOAD], ScreenId::Installing, true),
+        ],
+        connect_after: vec![AGENT],
+        practice_after: vec![AGENT],
+        hiding_choice: false,
+        source_policy: TutorialSourcePolicy::Native,
+        speakers_device: Some("validated virtual output".into()),
+        resume_note: None,
+    }
+}
+
+#[derive(Default)]
+struct Native {
+    jobs: Vec<NativeJob>,
+    reports: Vec<NativeReport>,
+    refuse: bool,
+    shutdown: bool,
+}
+
+struct SharedAgent(Rc<RefCell<AgentQueue>>);
+impl AgentPort for SharedAgent {
+    fn submit(&mut self, call: AgentCall) -> Result<(), CallFailure> {
+        self.0.borrow_mut().submit(call)
+    }
+    fn poll(&mut self) -> Vec<AgentReply> {
+        self.0.borrow_mut().poll()
+    }
+}
+
+#[derive(Default)]
+struct FixtureState {
+    launches: Vec<AttemptId>,
+    readiness: Option<FixtureReadiness>,
+    calls: Vec<FixtureCall>,
+    receipts: Vec<FixtureReceipt>,
+    closed: Vec<(AttemptId, FixtureId)>,
+    retired: u32,
+}
+struct SharedFixtures(Rc<RefCell<FixtureState>>);
+impl PracticeFixtures for SharedFixtures {
+    fn launch(&mut self, attempt: AttemptId) -> Result<(), FixtureError> {
+        let mut s = self.0.borrow_mut();
+        s.launches.push(attempt);
+        s.readiness = Some(FixtureReadiness::Launching);
+        Ok(())
+    }
+    fn readiness(&mut self) -> FixtureReadiness {
+        self.0.borrow().readiness.unwrap_or(FixtureReadiness::Idle)
+    }
+    fn submit(&mut self, call: FixtureCall) -> Result<(), FixtureError> {
+        self.0.borrow_mut().calls.push(call);
+        Ok(())
+    }
+    fn poll(&mut self) -> Vec<FixtureReceipt> {
+        std::mem::take(&mut self.0.borrow_mut().receipts)
+    }
+    fn complete_closed(
+        &mut self,
+        attempt: AttemptId,
+        fixture: FixtureId,
+    ) -> Result<(), FixtureError> {
+        self.0.borrow_mut().closed.push((attempt, fixture));
+        Ok(())
+    }
+    fn retire(&mut self) {
+        let mut s = self.0.borrow_mut();
+        s.retired += 1;
+        s.readiness = None;
+    }
+}
+
+struct Fake {
+    description: PlatformDescription,
+    native: Rc<RefCell<Native>>,
+    agent: SharedAgent,
+    fixtures: SharedFixtures,
+}
+impl Platform for Fake {
+    fn describe(&self) -> PlatformDescription {
+        self.description.clone()
+    }
+    fn submit(&mut self, job: NativeJob) -> Result<(), NativeRefusal> {
+        let mut n = self.native.borrow_mut();
+        if n.refuse {
+            return Err(NativeRefusal::Busy);
+        }
+        n.jobs.push(job);
+        Ok(())
+    }
+    fn poll(&mut self) -> Vec<NativeReport> {
+        std::mem::take(&mut self.native.borrow_mut().reports)
+    }
+    fn agent(&mut self) -> &mut dyn AgentPort {
+        &mut self.agent
+    }
+    fn fixtures(&mut self) -> &mut dyn PracticeFixtures {
+        &mut self.fixtures
+    }
+    fn shutdown(&mut self) {
+        self.native.borrow_mut().shutdown = true;
+    }
+}
+
+struct H {
+    c: LiveController,
+    native: Rc<RefCell<Native>>,
+    agent: Rc<RefCell<AgentQueue>>,
+    fixtures: Rc<RefCell<FixtureState>>,
+    clock: Arc<AtomicU64>,
+    status: Value,
+    calls: Vec<AgentCall>,
+    effects: Vec<ShellEffect>,
+    fixture_sequence: u64,
+}
+
+impl H {
+    fn new() -> Self {
+        Self::with(description())
+    }
+    fn with(description: PlatformDescription) -> Self {
+        let native = Rc::new(RefCell::new(Native::default()));
+        let agent = Rc::new(RefCell::new(AgentQueue::default()));
+        let fixtures = Rc::new(RefCell::new(FixtureState::default()));
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let time = clock.clone();
+        let clock_fn: Clock = Arc::new(move || time.load(Ordering::SeqCst));
+        let c = LiveController::new(
+            Box::new(Fake {
+                description,
+                native: native.clone(),
+                agent: SharedAgent(agent.clone()),
+                fixtures: SharedFixtures(fixtures.clone()),
+            }),
+            clock_fn,
+        )
+        .unwrap();
+        Self {
+            c,
+            native,
+            agent,
+            fixtures,
+            clock,
+            status: serde_json::from_str(STATUS).unwrap(),
+            calls: Vec::new(),
+            effects: Vec::new(),
+            fixture_sequence: 0,
+        }
+    }
+    fn advance(&mut self, ms: u64) {
+        self.clock.fetch_add(ms, Ordering::SeqCst);
+    }
+    fn now(&self) -> u64 {
+        self.clock.load(Ordering::SeqCst)
+    }
+    fn tick(&mut self) {
+        self.advance(1);
+        let tick = self.c.tick();
+        self.effects.extend(tick.effects);
+        self.calls.extend(self.agent.borrow_mut().take_calls());
+    }
+    fn view(&self) -> &WizardView {
+        self.c.view()
+    }
+    fn button(&self, id: u16) -> Option<&ButtonView> {
+        self.view().buttons.iter().find(|b| b.id == id)
+    }
+    fn click(&mut self, id: u16) {
+        let b = self
+            .button(id)
+            .unwrap_or_else(|| panic!("button {id} missing on {:?}", self.view().screen));
+        assert!(
+            b.enabled,
+            "button {id} disabled on {:?}",
+            self.view().screen
+        );
+        let revision = self.view().revision;
+        self.act(revision, WizardIntent::Button(id));
+    }
+    fn act(&mut self, revision: u64, intent: WizardIntent) -> bool {
+        let closed = self.c.accept(WizardAction { revision, intent });
+        self.tick();
+        closed
+    }
+    fn next(&mut self) {
+        self.click(ids::NEXT);
+    }
+    fn row(&self, step: StepId) -> RowView {
+        let wanted = step.0;
+        let mut seen = self.view().rows.clone();
+        if let Some(r) = seen.iter().find(|r| r.id == wanted) {
+            return r.clone();
+        }
+        seen.clear();
+        self.c
+            .rows()
+            .into_iter()
+            .find(|r| r.id == wanted)
+            .unwrap_or_else(|| panic!("row {wanted} missing"))
+    }
+    fn take_jobs(&mut self) -> Vec<NativeJob> {
+        std::mem::take(&mut self.native.borrow_mut().jobs)
+    }
+    fn job(&mut self, step: StepId, stage: JobStage) -> (JobIntent, Option<live::Consent>) {
+        let jobs = self.take_jobs();
+        jobs.into_iter()
+            .find_map(|j| match j {
+                NativeJob::Step { job, consent, .. } if job.step == step && job.stage == stage => {
+                    Some((job, consent))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {stage:?} job for step {}", step.0))
+    }
+    fn report(&mut self, job: &JobIntent, outcome: NativeOutcome) {
+        self.native
+            .borrow_mut()
+            .reports
+            .push(NativeReport::Step(StepReport {
+                job: job.clone(),
+                outcome,
+                detail: "fake detail".into(),
+            }));
+        self.tick();
+    }
+    fn live(&self) -> NativeOutcome {
+        NativeOutcome::Verified {
+            source: ObservationSource::Live,
+            observed_at_ms: self.now(),
+        }
+    }
+    /// Detection finds nothing to do; verification is Live.
+    fn pass(&mut self, step: StepId) {
+        let (detect, _) = self.job(step, JobStage::Detect);
+        self.report(
+            &detect,
+            NativeOutcome::Detected {
+                needs_action: false,
+            },
+        );
+        let (verify, _) = self.job(step, JobStage::Verify);
+        let live = self.live();
+        self.report(&verify, live);
+        assert_eq!(self.row(step).state, RowState::Verified);
+    }
+    fn install(&mut self) {
+        self.tick();
+        self.next();
+        assert_eq!(self.view().screen, ScreenId::Compatibility);
+        self.pass(SUPPORT);
+        self.next();
+        assert_eq!(self.view().screen, ScreenId::InstallPlan);
+        self.pass(PAYLOAD);
+        self.next();
+        assert_eq!(self.view().screen, ScreenId::Installing);
+        self.pass(AGENT);
+    }
+    fn call(&mut self, matches: impl Fn(&InstallerRequest) -> bool) -> AgentCall {
+        self.calls.extend(self.agent.borrow_mut().take_calls());
+        let i = self
+            .calls
+            .iter()
+            .position(|c| matches(&c.request))
+            .unwrap_or_else(|| panic!("missing call; have {}", self.calls.len()));
+        self.calls.remove(i)
+    }
+    fn has_call(&mut self, matches: impl Fn(&InstallerRequest) -> bool) -> bool {
+        self.calls.extend(self.agent.borrow_mut().take_calls());
+        self.calls.iter().any(|c| matches(&c.request))
+    }
+    fn reply(&mut self, call: &AgentCall, result: Result<DecodedReply, CallFailure>) {
+        self.reply_from(call, result, ObservationSource::Live);
+    }
+    fn reply_from(
+        &mut self,
+        call: &AgentCall,
+        result: Result<DecodedReply, CallFailure>,
+        source: ObservationSource,
+    ) {
+        self.advance(1);
+        self.agent
+            .borrow_mut()
+            .push_reply(AgentReply {
+                id: call.id,
+                observed_at_ms: self.now(),
+                source,
+                result,
+            })
+            .unwrap();
+        self.tick();
+    }
+    fn health(&self) -> Box<HealthSnapshot> {
+        match parse_status(
+            &serde_json::to_vec(&self.status).unwrap(),
+            AgentPlatform::Linux,
+        )
+        .unwrap()
+        {
+            StatusAdmission::Supported(h) => h,
+            _ => panic!("fixture status not admitted"),
+        }
+    }
+    /// Answer every outstanding Status call, ticking until one is issued if none is pending.
+    fn status_reply(&mut self) {
+        for _ in 0..40 {
+            if self.has_call(|r| *r == InstallerRequest::Status) {
+                break;
+            }
+            self.advance(100);
+            self.tick();
+        }
+        let call = self.call(|r| *r == InstallerRequest::Status);
+        let h = self.health();
+        self.reply(
+            &call,
+            Ok(DecodedReply::Status(StatusAdmission::Supported(h))),
+        );
+    }
+    fn ack(&mut self, call: &AgentCall) {
+        let ack = decode_reply(
+            &call.request,
+            br#"{"ok":true,"result":"arbitrary producer prose"}"#,
+            AgentPlatform::Linux,
+        )
+        .unwrap();
+        self.reply(call, Ok(ack));
+    }
+    fn pair_status(&mut self, call: &AgentCall, body: &str) {
+        let decoded = decode_reply(&call.request, body.as_bytes(), AgentPlatform::Linux).unwrap();
+        self.reply(call, Ok(decoded));
+    }
+    fn paired_peer(&mut self, grants: &[&str]) {
+        self.status["result"]["installer"]["peers"] = json!([peer_json(grants)]);
+        self.status["result"]["peers"] = json!([{"node": peer().to_string(),
+            "displays": [{"id":1,"name":"peer panel","pixels":[1920,1080],"scale":1.0,"mm":[530.0,300.0],"origin":[0.0,0.0]}]}]);
+    }
+    fn placements(&mut self) {
+        self.status["result"]["layout"] = json!([
+            {"node": local().short(), "display": 1, "origin_mm": [0.0, 0.0], "version": 1},
+            {"node": peer().short(), "display": 1, "origin_mm": [600.0, 0.0], "version": 1}
+        ]);
+    }
+    fn summary(&self) -> SummaryView {
+        self.view().summary
+    }
+}
+
+const ALL_GRANTS: [&str; 5] = ["browse", "input", "present", "share", "speaker"];
+
+#[test]
+fn graph_rejects_platform_steps_outside_the_reserved_range_or_shared_anchors() {
+    let mut bad = description();
+    bad.steps
+        .push(native(StepId(60), &[], ScreenId::Network, false));
+    let err = LiveController::new(
+        Box::new(Fake {
+            description: bad,
+            native: Rc::default(),
+            agent: SharedAgent(Rc::default()),
+            fixtures: SharedFixtures(Rc::default()),
+        }),
+        Arc::new(|| 1),
+    );
+    assert!(err.is_err());
+    let mut unknown = description();
+    unknown.connect_after = vec![StepId(55)];
+    assert!(
+        LiveController::new(
+            Box::new(Fake {
+                description: unknown,
+                native: Rc::default(),
+                agent: SharedAgent(Rc::default()),
+                fixtures: SharedFixtures(Rc::default()),
+            }),
+            Arc::new(|| 1),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn welcome_starts_nothing_and_detection_begins_only_on_its_screen() {
+    let mut h = H::new();
+    h.tick();
+    assert_eq!(h.view().screen, ScreenId::Welcome);
+    assert!(!h.view().demo);
+    assert!(
+        h.take_jobs().is_empty(),
+        "no native work before the person starts"
+    );
+    assert!(
+        h.calls.is_empty(),
+        "no agent traffic before the agent is installed"
+    );
+    assert_eq!(h.summary(), SummaryView::NotInstalled);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Compatibility);
+    let (detect, consent) = h.job(SUPPORT, JobStage::Detect);
+    assert!(consent.is_none(), "detection never carries consent");
+    assert_eq!(detect.step, SUPPORT);
+    assert!(h.take_jobs().is_empty(), "PAYLOAD waits for SUPPORT");
+}
+
+#[test]
+fn next_is_disabled_until_every_step_on_the_screen_is_verified() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    assert!(!h.button(ids::NEXT).unwrap().enabled);
+    let (detect, _) = h.job(SUPPORT, JobStage::Detect);
+    h.report(
+        &detect,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    assert!(!h.button(ids::NEXT).unwrap().enabled);
+    let (verify, _) = h.job(SUPPORT, JobStage::Verify);
+    let live = h.live();
+    h.report(&verify, live);
+    assert!(h.button(ids::NEXT).unwrap().enabled);
+}
+
+#[test]
+fn demo_or_scratch_verification_reaches_core_and_never_verifies() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    let (detect, _) = h.job(SUPPORT, JobStage::Detect);
+    h.report(
+        &detect,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    let (verify, _) = h.job(SUPPORT, JobStage::Verify);
+    let now = h.now();
+    h.report(
+        &verify,
+        NativeOutcome::Verified {
+            source: ObservationSource::Demo,
+            observed_at_ms: now,
+        },
+    );
+    assert_ne!(h.row(SUPPORT).state, RowState::Verified);
+    assert!(!h.button(ids::NEXT).unwrap().enabled);
+}
+
+#[test]
+fn stale_wrong_stage_and_retired_reports_are_dropped() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    let (detect, _) = h.job(SUPPORT, JobStage::Detect);
+    // Wrong operation.
+    let forged = JobIntent {
+        operation: OperationId(detect.operation.0 + 50),
+        ..detect.clone()
+    };
+    h.report(
+        &forged,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    assert!(h.take_jobs().is_empty());
+    // Wrong stage for the live operation.
+    let wrong_stage = JobIntent {
+        stage: JobStage::Verify,
+        ..detect.clone()
+    };
+    let live = h.live();
+    h.report(&wrong_stage, live);
+    assert_ne!(h.row(SUPPORT).state, RowState::Verified);
+    // The genuine report still works, exactly once.
+    h.report(
+        &detect,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    let (verify, _) = h.job(SUPPORT, JobStage::Verify);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    assert!(
+        h.take_jobs().is_empty(),
+        "a retired detect report schedules nothing"
+    );
+    let live = h.live();
+    h.report(&verify, live);
+    assert_eq!(h.row(SUPPORT).state, RowState::Verified);
+}
+
+#[test]
+fn consent_is_bound_to_the_plan_preview_revision_and_operation() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    h.next();
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    assert!(
+        h.button(ids::consent(PAYLOAD)).is_none(),
+        "no consent before the preview exists"
+    );
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "Copy 4 files into ~/.local".into(),
+        },
+    );
+    assert_eq!(h.row(PAYLOAD).state, RowState::NeedsAction);
+    assert!(h.view().message.contains("Copy 4 files"));
+    let old = h.view().revision;
+    // A stale revision is ignored.
+    h.act(old - 1, WizardIntent::Button(ids::consent(PAYLOAD)));
+    assert!(h.take_jobs().is_empty());
+    h.click(ids::consent(PAYLOAD));
+    let (apply, consent) = h.job(PAYLOAD, JobStage::Apply);
+    let consent = consent.expect("apply carries consent");
+    assert_eq!(consent.operation, apply.operation);
+    assert_eq!(consent.revision, old);
+    // A double click cannot start a second mutation.
+    let revision = h.view().revision;
+    h.act(revision, WizardIntent::Button(ids::consent(PAYLOAD)));
+    assert!(h.take_jobs().is_empty());
+    h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Applied));
+    let (verify, _) = h.job(PAYLOAD, JobStage::Verify);
+    let live = h.live();
+    h.report(&verify, live);
+    assert_eq!(h.row(PAYLOAD).state, RowState::Verified);
+}
+
+#[test]
+fn refused_and_unknown_mutations_wait_or_redetect_before_any_retry() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    h.next();
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "p".into(),
+        },
+    );
+    h.click(ids::consent(PAYLOAD));
+    let (apply, _) = h.job(PAYLOAD, JobStage::Apply);
+    h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Unknown));
+    // Unknown always re-detects; nothing is retried blindly.
+    let (redetect, consent) = h.job(PAYLOAD, JobStage::Detect);
+    assert!(consent.is_none());
+    h.report(&redetect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "p2".into(),
+        },
+    );
+    h.click(ids::consent(PAYLOAD));
+    let (apply, _) = h.job(PAYLOAD, JobStage::Apply);
+    h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Refused));
+    assert_eq!(h.row(PAYLOAD).state, RowState::Waiting);
+    assert!(h.take_jobs().is_empty());
+    h.click(ids::retry(PAYLOAD));
+    let _ = h.job(PAYLOAD, JobStage::Detect);
+}
+
+#[test]
+fn a_platform_refusal_fails_the_job_instead_of_hanging() {
+    let mut h = H::new();
+    h.tick();
+    h.native.borrow_mut().refuse = true;
+    h.next();
+    h.tick();
+    assert_eq!(h.row(SUPPORT).state, RowState::Failed);
+    h.native.borrow_mut().refuse = false;
+    h.click(ids::retry(SUPPORT));
+    let _ = h.job(SUPPORT, JobStage::Detect);
+}
+
+#[test]
+fn installed_milestone_comes_only_from_core_and_status_polling_follows_the_agent() {
+    let mut h = H::new();
+    h.install();
+    assert_eq!(h.summary(), SummaryView::InstalledWaiting);
+    // The agent step is verified, so status polling starts.
+    h.status_reply();
+    assert_eq!(h.summary(), SummaryView::InstalledWaiting);
+}
+
+#[test]
+fn passive_status_updates_keep_the_view_revision() {
+    let mut h = H::new();
+    h.install();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Connect);
+    h.status_reply();
+    h.tick();
+    let revision = h.view().revision;
+    h.status_reply();
+    h.advance(600);
+    h.tick();
+    h.status_reply();
+    assert_eq!(h.view().revision, revision);
+}
+
+fn to_connect(h: &mut H) {
+    h.install();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Connect);
+    h.status_reply();
+}
+
+#[test]
+fn pairing_never_offers_input_and_the_sas_is_display_only_until_explicit_confirmation() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::NeedsAction);
+    let revision = h.view().revision;
+    h.act(
+        revision,
+        WizardIntent::EditPeerAddress {
+            field: ids::PEER_ADDRESS,
+            value: "192.0.2.7:7878".into(),
+        },
+    );
+    h.click(ids::PAIR_JOIN);
+    let join = h.call(|r| matches!(r, InstallerRequest::PairJoin { .. }));
+    let InstallerRequest::PairJoin { addr, allow_input } = &join.request else {
+        unreachable!()
+    };
+    assert_eq!(addr.to_string(), "192.0.2.7:7878");
+    assert!(!allow_input, "pairing never grants input implicitly");
+    h.ack(&join);
+    h.advance(600);
+    h.tick();
+    let poll = h.call(|r| *r == InstallerRequest::PairStatus);
+    h.pair_status(
+        &poll,
+        r#"{"ok":true,"result":{"phase":"confirm","sas":"482 913","candidates":[],"peer":"sensitive peer","error":null}}"#,
+    );
+    assert_eq!(h.view().screen, ScreenId::MatchNumbers);
+    assert_eq!(h.view().illustration.sas.as_deref(), Some("482 913"));
+    assert!(!h.has_call(|r| matches!(r, InstallerRequest::PairConfirm { .. })));
+    h.click(ids::PAIR_CONFIRM);
+    let confirm = h.call(|r| matches!(r, InstallerRequest::PairConfirm { .. }));
+    assert_eq!(
+        confirm.request,
+        InstallerRequest::PairConfirm { accept: true }
+    );
+    h.ack(&confirm);
+    h.advance(600);
+    h.tick();
+    let poll = h.call(|r| *r == InstallerRequest::PairStatus);
+    h.pair_status(
+        &poll,
+        r#"{"ok":true,"result":{"phase":"paired","sas":null,"candidates":[],"peer":"sensitive peer","error":null}}"#,
+    );
+    assert_ne!(
+        h.row(live::steps::PAIR).state,
+        RowState::Verified,
+        "an acknowledgement or pair phase never verifies"
+    );
+    h.paired_peer(&[]);
+    // A Status call issued before verification began cannot verify it, even if it carries the
+    // new peer.
+    h.status_reply();
+    assert_ne!(
+        h.row(live::steps::PAIR).state,
+        RowState::Verified,
+        "a status issued before the verify job began is not evidence"
+    );
+    h.status_reply();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Verified);
+    assert_eq!(h.view().peer.as_deref(), Some("sensitive peer"));
+}
+
+#[test]
+fn listener_picks_the_matching_number_explicitly() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    h.click(ids::PAIR_LISTEN);
+    let listen = h.call(|r| matches!(r, InstallerRequest::PairListen { .. }));
+    assert_eq!(
+        listen.request,
+        InstallerRequest::PairListen { allow_input: false }
+    );
+    h.ack(&listen);
+    h.advance(600);
+    h.tick();
+    let poll = h.call(|r| *r == InstallerRequest::PairStatus);
+    h.pair_status(
+        &poll,
+        r#"{"ok":true,"result":{"phase":"pick","sas":null,"candidates":["11","42","97"],"peer":null,"error":null}}"#,
+    );
+    assert_eq!(h.view().screen, ScreenId::MatchNumbers);
+    h.click(ids::pair_pick(1));
+    let pick = h.call(|r| matches!(r, InstallerRequest::PairPick { .. }));
+    assert_eq!(pick.request, InstallerRequest::PairPick { index: 1 });
+}
+
+#[test]
+fn a_refused_pairing_waits_for_the_person_and_an_unknown_one_redetects() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    h.click(ids::PAIR_LISTEN);
+    let listen = h.call(|r| matches!(r, InstallerRequest::PairListen { .. }));
+    h.reply(&listen, Err(CallFailure::Refused(AgentRefusal::Other)));
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Waiting);
+    h.click(ids::retry(live::steps::PAIR));
+    h.status_reply();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::NeedsAction);
+    h.click(ids::PAIR_LISTEN);
+    let listen = h.call(|r| matches!(r, InstallerRequest::PairListen { .. }));
+    h.reply(&listen, Err(CallFailure::TimeoutOutcomeUnknown));
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Working);
+    // Re-detection reads status before anything else is offered.
+    h.paired_peer(&[]);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Verified);
+}
+
+fn to_grants(h: &mut H) {
+    to_connect(h);
+    h.paired_peer(&[]);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Verified);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Grants);
+    h.status_reply();
+}
+
+#[test]
+fn grants_are_explicit_toggles_and_verify_only_from_a_later_status() {
+    let mut h = H::new();
+    to_grants(&mut h);
+    assert_eq!(h.row(live::steps::GRANTS).state, RowState::NeedsAction);
+    let toggles: Vec<_> = h
+        .view()
+        .fields
+        .iter()
+        .filter_map(|f| match f {
+            FieldView::Toggle {
+                id,
+                role: ToggleRole::Grant,
+                checked,
+                ..
+            } => Some((*id, *checked)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(toggles.len(), 5);
+    assert!(
+        toggles.iter().all(|(_, checked)| !checked),
+        "never pre-checked"
+    );
+    for (id, _) in &toggles {
+        let revision = h.view().revision;
+        h.act(
+            revision,
+            WizardIntent::SetToggle {
+                field: *id,
+                checked: true,
+            },
+        );
+    }
+    h.click(ids::GRANTS_APPLY);
+    let mut allowed = BTreeSet::new();
+    for _ in 0..5 {
+        let call = h.call(|r| matches!(r, InstallerRequest::Allow { .. }));
+        let InstallerRequest::Allow {
+            peer: p,
+            capability,
+            allow,
+        } = call.request.clone()
+        else {
+            unreachable!()
+        };
+        assert_eq!(p, peer());
+        assert!(allow);
+        allowed.insert(format!("{capability:?}"));
+        h.ack(&call);
+    }
+    assert_eq!(allowed.len(), 5);
+    assert_ne!(h.row(live::steps::GRANTS).state, RowState::Verified);
+    h.paired_peer(&ALL_GRANTS);
+    h.status_reply();
+    assert_eq!(h.row(live::steps::GRANTS).state, RowState::Verified);
+}
+
+#[test]
+fn layout_apply_is_busy_until_committed_status_and_failure_reverts() {
+    let mut h = H::new();
+    to_grants(&mut h);
+    h.paired_peer(&ALL_GRANTS);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::GRANTS).state, RowState::Verified);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Layout);
+    h.placements();
+    h.status_reply();
+    let layout = h.view().layout.clone().expect("layout preview");
+    assert_eq!(layout.confirmed.len(), 2);
+    assert!(!layout.busy);
+    let peer_key = layout.peer_order[0].clone();
+    let revision = h.view().revision;
+    h.act(
+        revision,
+        WizardIntent::Layout(LayoutAction::Apply(vec![PlacementIntent {
+            node: peer_key.clone(),
+            display: 1,
+            origin_mm: [0.0, 340.0],
+        }])),
+    );
+    let place = h.call(|r| matches!(r, InstallerRequest::Place { .. }));
+    let InstallerRequest::Place { placements } = &place.request else {
+        unreachable!()
+    };
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].node, peer());
+    assert!(h.view().layout.as_ref().unwrap().busy);
+    h.reply(&place, Err(CallFailure::Unavailable));
+    assert!(h.effects.contains(&ShellEffect::RevertLayout));
+    assert!(!h.view().layout.as_ref().unwrap().busy);
+    h.effects.clear();
+    h.click(ids::retry(live::steps::LAYOUT));
+    h.status_reply();
+    let revision = h.view().revision;
+    h.act(
+        revision,
+        WizardIntent::Layout(LayoutAction::Apply(vec![PlacementIntent {
+            node: peer_key,
+            display: 1,
+            origin_mm: [0.0, 340.0],
+        }])),
+    );
+    let place = h.call(|r| matches!(r, InstallerRequest::Place { .. }));
+    h.ack(&place);
+    assert!(
+        h.view().layout.as_ref().unwrap().busy,
+        "ack is not commitment"
+    );
+    h.status["result"]["layout"][1]["origin_mm"] = json!([0.0, 340.0]);
+    h.status["result"]["layout"][1]["version"] = json!(2);
+    h.status["result"]["installer"]["epochs"]["layout"] = json!(2);
+    h.status_reply();
+    assert_eq!(h.row(live::steps::LAYOUT).state, RowState::Verified);
+    assert!(!h.view().layout.as_ref().unwrap().busy);
+    assert!(h.effects.contains(&ShellEffect::FollowLayout));
+}
+
+#[test]
+fn unknown_layout_keys_are_refused_without_a_place_call() {
+    let mut h = H::new();
+    to_grants(&mut h);
+    h.paired_peer(&ALL_GRANTS);
+    h.status_reply();
+    h.status_reply();
+    h.next();
+    h.placements();
+    h.status_reply();
+    let revision = h.view().revision;
+    h.act(
+        revision,
+        WizardIntent::Layout(LayoutAction::Apply(vec![PlacementIntent {
+            node: "forged".into(),
+            display: 1,
+            origin_mm: [0.0, 0.0],
+        }])),
+    );
+    assert!(!h.has_call(|r| matches!(r, InstallerRequest::Place { .. })));
+    assert!(h.effects.contains(&ShellEffect::RevertLayout));
+}
+
+#[test]
+fn removal_screen_inspects_and_never_mutates_without_a_previewed_confirmation() {
+    let mut h = H::new();
+    h.tick();
+    h.click(ids::REMOVE_OR_REPAIR);
+    assert_eq!(h.view().screen, ScreenId::RepairRemove);
+    let jobs = h.take_jobs();
+    let inspect = jobs
+        .iter()
+        .find_map(|j| match j {
+            NativeJob::Maintenance(MaintenanceRequest::Inspect { id }) => Some(*id),
+            _ => None,
+        })
+        .expect("inspect");
+    h.native
+        .borrow_mut()
+        .reports
+        .push(NativeReport::Maintenance(MaintenanceReport::Inspected {
+            id: inspect,
+            uninstall: live::Availability::Available,
+            repair: live::Availability::NotAvailableYet(
+                "Repair isn't available in this build yet.".into(),
+            ),
+            choices: vec![live::RemovalChoice {
+                id: 1,
+                role: ToggleRole::DeleteIdentity,
+                label: "Also forget this computer's pairings".into(),
+                checked: false,
+                enabled: true,
+            }],
+        }));
+    h.tick();
+    assert!(!h.button(ids::REPAIR).unwrap().enabled);
+    assert!(h.button(ids::REMOVE_CONFIRM).is_none());
+    h.click(ids::REMOVE_REVIEW);
+    let plan = h
+        .take_jobs()
+        .into_iter()
+        .find_map(|j| match j {
+            NativeJob::Maintenance(MaintenanceRequest::PlanUninstall { id, choices, .. }) => {
+                Some((id, choices))
+            }
+            _ => None,
+        })
+        .expect("plan");
+    assert_eq!(plan.1, vec![(1, false)]);
+    h.native
+        .borrow_mut()
+        .reports
+        .push(NativeReport::Maintenance(MaintenanceReport::Planned {
+            id: plan.0,
+            preview: "Stop and remove the agent; keep pairings".into(),
+        }));
+    h.tick();
+    assert!(h.view().message.contains("keep pairings"));
+    let revision = h.view().revision;
+    h.click(ids::REMOVE_CONFIRM);
+    let confirm = h
+        .take_jobs()
+        .into_iter()
+        .find_map(|j| match j {
+            NativeJob::Maintenance(MaintenanceRequest::ConfirmUninstall {
+                id, revision, ..
+            }) => Some((id, revision)),
+            _ => None,
+        })
+        .expect("confirm");
+    assert_eq!(confirm, (plan.0, revision));
+}
+
+#[test]
+fn close_shuts_the_platform_down() {
+    let mut h = H::new();
+    h.tick();
+    let revision = h.view().revision;
+    assert!(h.act(revision, WizardIntent::Close));
+    assert!(h.native.borrow().shutdown);
+}
+
+// ---- practice -------------------------------------------------------------------------------
+
+impl H {
+    fn counter(&mut self, name: &str, value: u64) {
+        self.status["result"]["installer"]["peers"][0]["counters"][name] = json!(value);
+    }
+    fn bump(&mut self, name: &str, by: u64) {
+        let now = self.status["result"]["installer"]["peers"][0]["counters"][name]
+            .as_u64()
+            .unwrap_or(0);
+        self.counter(name, now + by);
+    }
+    fn practice_row(&self, role: TutorialRole) -> RowView {
+        self.row(live::steps::practice(role))
+    }
+    fn confirm(&mut self, c: HumanConfirmation) {
+        self.click(ids::confirm(c));
+    }
+    fn begin_practice(&mut self, role: TutorialRole) {
+        self.click(ids::practice_start(role));
+        // The first answer may belong to a poll that was already in flight; the second is the
+        // sequencer's own baseline.
+        self.status_reply();
+        self.status_reply();
+    }
+    /// The fixture command the controller submitted, if any.
+    fn fixture_command(
+        &mut self,
+        matches: impl Fn(&FixtureCommand) -> bool,
+    ) -> Option<FixtureCall> {
+        let mut state = self.fixtures.borrow_mut();
+        let i = state.calls.iter().position(|c| matches(&c.command))?;
+        Some(state.calls.remove(i))
+    }
+    /// Let the fixture child "start" and deliver its receipt for `call`.
+    fn fixture_reply(&mut self, call: &FixtureCall, result: Result<FixtureEvent, FixtureError>) {
+        self.fixture_sequence += 1;
+        let receipt = FixtureReceipt {
+            received_at_ms: self.now() + 1,
+            message: FixtureMessage {
+                call_id: Some(call.id),
+                attempt: call.attempt,
+                sequence: self.fixture_sequence,
+                result,
+            },
+        };
+        self.fixtures.borrow_mut().receipts.push(receipt);
+        self.advance(2);
+        self.tick();
+    }
+    fn fixture_event(&mut self, attempt: AttemptId, event: FixtureEvent) {
+        self.fixture_sequence += 1;
+        let receipt = FixtureReceipt {
+            received_at_ms: self.now() + 1,
+            message: FixtureMessage {
+                call_id: None,
+                attempt,
+                sequence: self.fixture_sequence,
+                result: Ok(event),
+            },
+        };
+        self.fixtures.borrow_mut().receipts.push(receipt);
+        self.advance(2);
+        self.tick();
+    }
+    /// Make the fixture ready and run until the sequencer submits the Open command.
+    fn fixture_open(&mut self) -> FixtureCall {
+        self.fixtures.borrow_mut().readiness = Some(FixtureReadiness::Ready);
+        for _ in 0..8 {
+            self.advance(100);
+            self.tick();
+            if let Some(call) = self.fixture_command(|c| matches!(c, FixtureCommand::Open { .. })) {
+                self.fixture_reply(
+                    &call,
+                    Ok(FixtureEvent::Opened {
+                        fixture: FixtureId(10),
+                        pid: 123,
+                        window: WindowId(100),
+                        label: "own fixture A".into(),
+                    }),
+                );
+                return call;
+            }
+        }
+        panic!("the sequencer never asked the fixture to open");
+    }
+}
+
+fn to_practice(h: &mut H) {
+    to_grants(h);
+    h.paired_peer(&ALL_GRANTS);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::GRANTS).state, RowState::Verified);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Layout);
+    h.placements();
+    h.status_reply();
+    h.click(ids::LAYOUT_ACCEPT);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::LAYOUT).state, RowState::Verified);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Practice);
+}
+
+#[test]
+fn practice_starts_only_on_an_explicit_click_and_never_before_prerequisites() {
+    let mut h = H::new();
+    to_grants(&mut h);
+    h.paired_peer(&ALL_GRANTS);
+    h.status_reply();
+    h.status_reply();
+    h.next();
+    h.placements();
+    h.status_reply();
+    // Layout is not committed yet, so Next is blocked and no practice can start.
+    assert!(!h.button(ids::NEXT).unwrap().enabled);
+    let mut h = H::new();
+    to_practice(&mut h);
+    for _ in 0..6 {
+        h.advance(600);
+        h.tick();
+    }
+    assert!(h.fixtures.borrow().launches.is_empty());
+    assert!(
+        !h.has_call(|r| matches!(
+            r,
+            InstallerRequest::Project { .. }
+                | InstallerRequest::Pull { .. }
+                | InstallerRequest::Release
+        )),
+        "nothing is projected or released until the person starts a practice"
+    );
+    assert_eq!(h.summary(), SummaryView::InstalledWaiting);
+}
+
+#[test]
+fn menu_practice_needs_the_spawn_counter_the_tray_and_the_human() {
+    let mut h = H::new();
+    to_practice(&mut h);
+    h.begin_practice(TutorialRole::Menu);
+    h.confirm(HumanConfirmation::TrayAndSettingsVisible);
+    assert_ne!(h.practice_row(TutorialRole::Menu).state, RowState::Verified);
+    h.status["result"]["installer"]["settings_opened"] = json!(1);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.practice_row(TutorialRole::Menu).state, RowState::Verified);
+    assert!(h.practice_row(TutorialRole::Menu).human_confirmed);
+}
+
+#[test]
+fn e1_controller_passes_with_the_chord_release_and_not_with_a_command_release() {
+    let mut command = H::new();
+    to_practice(&mut command);
+    command.begin_practice(TutorialRole::E1Controller);
+    command.bump("e1_controller_started", 1);
+    command.bump("e1_controller_ended", 1);
+    command.bump("e1_command_releases", 1);
+    command.status_reply();
+    let _ = command
+        .view()
+        .buttons
+        .iter()
+        .find(|b| b.id == ids::confirm(HumanConfirmation::RemotePracticeAndHud));
+    if command
+        .button(ids::confirm(HumanConfirmation::RemotePracticeAndHud))
+        .is_some_and(|b| b.enabled)
+    {
+        command.confirm(HumanConfirmation::RemotePracticeAndHud);
+    }
+    assert_ne!(
+        command.practice_row(TutorialRole::E1Controller).state,
+        RowState::Verified,
+        "a command release is not the chord"
+    );
+
+    let mut h = H::new();
+    to_practice(&mut h);
+    h.begin_practice(TutorialRole::E1Controller);
+    h.bump("e1_controller_started", 1);
+    h.bump("e1_controller_ended", 1);
+    h.bump("e1_chord_releases", 1);
+    h.status_reply();
+    h.confirm(HumanConfirmation::RemotePracticeAndHud);
+    assert_eq!(
+        h.practice_row(TutorialRole::E1Controller).state,
+        RowState::Verified
+    );
+}
+
+fn snapshot(phase: Option<u64>, clicks: u64, facts: OwnWindowFacts) -> FixtureEvent {
+    FixtureEvent::Snapshot {
+        snapshot: FixtureSnapshot {
+            fixture: FixtureId(10),
+            window: WindowId(100),
+            phase: phase.map(PhaseId),
+            pattern_ticks: 10,
+            target_clicks: clicks,
+            window_facts: facts,
+            tone: OwnToneState::Stopped,
+        },
+    }
+}
+
+fn home() -> OwnWindowFacts {
+    OwnWindowFacts::Present {
+        visible_on_user_workspace: Some(true),
+        on_initial_display: Some(true),
+    }
+}
+
+impl H {
+    fn attempt(&self) -> AttemptId {
+        *self
+            .fixtures
+            .borrow()
+            .launches
+            .last()
+            .expect("a launched attempt")
+    }
+    fn windows_reply(&mut self, request: InstallerRequest, body: &str) {
+        let call = self.call(|r| *r == request);
+        let decoded = decode_reply(&request, body.as_bytes(), AgentPlatform::Linux).unwrap();
+        self.reply(&call, Ok(decoded));
+    }
+    fn projection(&mut self, source: NodeId, on: bool) {
+        self.status["result"]["projections"] = if on {
+            json!([{"source": source.short(), "projection": 55, "text": "sensitive title",
+                "received": {"frames": 999999, "bytes": 999999}}])
+        } else {
+            json!([])
+        };
+    }
+    fn set(&mut self, path: &[&str], value: Value) {
+        let mut at = &mut self.status["result"];
+        for key in path {
+            at = &mut at[*key];
+        }
+        *at = value;
+    }
+    fn fixture_close(&mut self) {
+        let call = self
+            .fixture_command(|c| matches!(c, FixtureCommand::Close { .. }))
+            .expect("the owned fixture is closed");
+        self.fixture_reply(
+            &call,
+            Ok(FixtureEvent::Closed {
+                fixture: FixtureId(10),
+            }),
+        );
+    }
+    fn fixture_home(&mut self) {
+        let call = self
+            .fixture_command(|c| matches!(c, FixtureCommand::ObserveWindow { .. }))
+            .expect("the controller observes the fixture's home window");
+        self.fixture_reply(&call, Ok(snapshot(None, 0, home())));
+    }
+}
+
+fn run_e1_target(h: &mut H) {
+    h.begin_practice(TutorialRole::E1Target);
+    h.fixture_open();
+    let arm = h
+        .fixture_command(|c| matches!(c, FixtureCommand::ArmTarget { .. }))
+        .expect("the target is armed");
+    let FixtureCommand::ArmTarget { phase, .. } = arm.command.clone() else {
+        unreachable!()
+    };
+    h.fixture_reply(
+        &arm,
+        Ok(FixtureEvent::TargetArmed {
+            fixture: FixtureId(10),
+            phase,
+        }),
+    );
+    let attempt = h.attempt();
+    h.fixture_event(attempt, snapshot(Some(phase.0), 1, OwnWindowFacts::Unknown));
+    for name in [
+        "e1_target_started",
+        "e1_target_ended",
+        "e1_injections_ok",
+        "e1_hud_shows",
+    ] {
+        h.bump(name, 1);
+    }
+    h.status_reply();
+    h.confirm(HumanConfirmation::ControllerCrossingAndRelease);
+    h.fixture_close();
+}
+
+fn e2_start(h: &mut H, role: TutorialRole) {
+    let source = matches!(
+        role,
+        TutorialRole::E2SourcePush | TutorialRole::E2SourcePull
+    );
+    h.begin_practice(role);
+    match role {
+        TutorialRole::E2SourcePush => {
+            h.fixture_open();
+            h.windows_reply(
+                InstallerRequest::Windows,
+                r#"{"ok":true,"result":[{"id":100,"app":"fixture","title":"sensitive","display":null,"size":[20.5,30.5]}]}"#,
+            );
+            let project = h.call(|r| matches!(r, InstallerRequest::Project { .. }));
+            assert_eq!(
+                project.request,
+                InstallerRequest::Project {
+                    window: WindowId(100),
+                    peer: peer()
+                },
+                "only the owned fixture window is ever projected"
+            );
+            h.ack(&project);
+        }
+        TutorialRole::E2SourcePull => {
+            h.fixture_open();
+            h.confirm(HumanConfirmation::SourceMachineAndAttempt);
+        }
+        TutorialRole::E2DestinationPull => {
+            h.windows_reply(
+                InstallerRequest::WindowsFrom { peer: peer() },
+                r#"{"ok":true,"result":[{"id":100,"app":"fixture","title":"advisory","size":[20,30]}]}"#,
+            );
+            h.click(ids::remote_window(0));
+            h.confirm(HumanConfirmation::SourceMachineAndAttempt);
+            let pull = h.call(|r| matches!(r, InstallerRequest::Pull { .. }));
+            h.ack(&pull);
+        }
+        TutorialRole::E2DestinationPush => h.confirm(HumanConfirmation::SourceMachineAndAttempt),
+        _ => unreachable!(),
+    }
+    h.projection(if source { local() } else { peer() }, true);
+    let metric = if source {
+        "e2_source_started"
+    } else {
+        "e2_dest_started"
+    };
+    h.bump(metric, 1);
+    if source {
+        h.set(&["installer", "recovery_pending"], json!(1));
+        h.set(&["installer", "peers"], {
+            let mut peers = h.status["result"]["installer"]["peers"].clone();
+            peers[0]["last_source_parking"] = json!("twin");
+            peers
+        });
+    }
+    h.status_reply();
+}
+
+fn e2_end(h: &mut H, role: TutorialRole) {
+    let source = matches!(
+        role,
+        TutorialRole::E2SourcePush | TutorialRole::E2SourcePull
+    );
+    h.confirm(HumanConfirmation::DestinationPatternInteractionAndClose);
+    let ret = h.call(|r| matches!(r, InstallerRequest::Return { .. }));
+    assert_eq!(
+        ret.request,
+        InstallerRequest::Return {
+            projection: 55,
+            source: (!source).then_some(peer()),
+        }
+    );
+    h.ack(&ret);
+    assert_ne!(
+        h.practice_row(role).state,
+        RowState::Verified,
+        "the return acknowledgement is not completion"
+    );
+    h.projection(local(), false);
+    h.bump(
+        if source {
+            "e2_source_returned"
+        } else {
+            "e2_dest_returned"
+        },
+        1,
+    );
+    h.set(&["installer", "recovery_pending"], json!(0));
+    if !source {
+        h.bump("e2_frames_presented", 10);
+    }
+    h.status_reply();
+    if source {
+        h.fixture_home();
+        if h.fixtures
+            .borrow()
+            .calls
+            .iter()
+            .any(|c| matches!(c.command, FixtureCommand::Close { .. }))
+        {
+            h.fixture_close();
+        }
+    } else {
+        h.confirm(HumanConfirmation::SourceRestored);
+    }
+}
+
+fn run_e2(h: &mut H, role: TutorialRole) {
+    e2_start(h, role);
+    e2_end(h, role);
+}
+
+fn run_audio_sender(h: &mut H) {
+    h.begin_practice(TutorialRole::AudioSender);
+    h.fixture_open();
+    h.click(ids::PLAY_TONE);
+    let play = h
+        .fixture_command(|c| matches!(c, FixtureCommand::PlayTone { .. }))
+        .expect("the owned fixture plays its own tone");
+    let FixtureCommand::PlayTone { output, .. } = &play.command else {
+        unreachable!()
+    };
+    assert_eq!(output.peer, peer());
+    h.fixture_reply(
+        &play,
+        Ok(FixtureEvent::ToneStarted {
+            fixture: FixtureId(10),
+            tone: ToneId(33),
+        }),
+    );
+    h.set(&["installer", "audio", "active_peers"], json!([peer()]));
+    h.status_reply();
+    h.set(&["installer", "audio", "frames_sent"], json!(10));
+    h.status_reply();
+    let stop = h
+        .fixture_command(|c| matches!(c, FixtureCommand::StopTone { .. }))
+        .expect("the tone is stopped");
+    h.fixture_reply(
+        &stop,
+        Ok(FixtureEvent::ToneStopped {
+            fixture: FixtureId(10),
+            tone: ToneId(33),
+        }),
+    );
+    h.confirm(HumanConfirmation::FarSpeakerHeard);
+    h.confirm(HumanConfirmation::ExclusiveAudioInterval);
+    h.fixture_close();
+}
+
+fn run_audio_receiver(h: &mut H) {
+    h.begin_practice(TutorialRole::AudioReceiver);
+    h.confirm(HumanConfirmation::SelectedSourceToneStarted);
+    h.set(&["installer", "audio", "active_peers"], json!([peer()]));
+    h.status_reply();
+    h.set(&["installer", "audio", "frames_played"], json!(10));
+    h.status_reply();
+    h.confirm(HumanConfirmation::LocalSpeakerHeard);
+    h.confirm(HumanConfirmation::ExclusiveAudioInterval);
+}
+
+fn run_menu(h: &mut H) {
+    h.begin_practice(TutorialRole::Menu);
+    h.set(&["installer", "settings_opened"], json!(1));
+    h.status_reply();
+    h.confirm(HumanConfirmation::TrayAndSettingsVisible);
+}
+
+fn run_e1_controller(h: &mut H) {
+    h.begin_practice(TutorialRole::E1Controller);
+    h.bump("e1_controller_started", 1);
+    h.bump("e1_controller_ended", 1);
+    h.bump("e1_chord_releases", 1);
+    h.status_reply();
+    h.confirm(HumanConfirmation::RemotePracticeAndHud);
+}
+
+fn with_extra_step(mut extra: NativeStep) -> H {
+    let mut d = description();
+    extra.prerequisites = vec![AGENT];
+    d.steps.push(extra);
+    d.connect_after.push(StepId(30));
+    d.practice_after.push(StepId(30));
+    H::with(d)
+}
+
+#[test]
+fn a_status_step_holds_its_native_job_until_a_status_issued_after_it_arrives() {
+    let mut extra = native(StepId(30), &[], ScreenId::Permissions, false);
+    extra.uses_status = true;
+    let mut h = with_extra_step(extra);
+    h.install();
+    h.status_reply();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Permissions);
+    // The Detect job is not handed to the platform until a fresh Status rides with it.
+    h.tick();
+    assert!(
+        !h.native.borrow().jobs.iter().any(|j| matches!(
+            j,
+            NativeJob::Step { job, .. } if job.step == StepId(30)
+        )),
+        "held for status"
+    );
+    h.status_reply();
+    let jobs = h.take_jobs();
+    let (job, status) = jobs
+        .into_iter()
+        .find_map(|j| match j {
+            NativeJob::Step { job, status, .. } if job.step == StepId(30) => Some((job, status)),
+            _ => None,
+        })
+        .expect("the held job is released");
+    assert_eq!(job.stage, JobStage::Detect);
+    assert!(status.is_some(), "the Status that released it rides along");
+    // A status that was already in flight when the job began is not evidence for it.
+    h.report(
+        &job,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    h.tick();
+    let before = h.take_jobs();
+    assert!(before.iter().all(|j| !matches!(j, NativeJob::Step { status: Some(_), job, .. } if job.step == StepId(30) && job.stage == JobStage::Verify)));
+}
+
+#[test]
+fn an_agent_applied_step_sends_its_request_after_consent_and_is_verified_only_from_status() {
+    let mut extra = native(StepId(30), &[], ScreenId::Permissions, false);
+    extra.uses_status = true;
+    extra.agent_apply = Some(live::AgentApply::AskPermissions);
+    let mut h = with_extra_step(extra);
+    h.install();
+    h.status_reply();
+    h.next();
+    h.status_reply();
+    let (detect, status) = loop_for_job(&mut h, StepId(30), JobStage::Detect);
+    assert!(status.is_some());
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    // Planning against a running agent also waits for a Status issued after it began.
+    let (plan, plan_status) = loop_for_job(&mut h, StepId(30), JobStage::Plan);
+    assert!(plan_status.is_some());
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "Crosspane asks macOS for permissions".into(),
+        },
+    );
+    assert!(
+        !h.has_call(|r| *r == InstallerRequest::AskPermissions),
+        "nothing is asked before consent"
+    );
+    h.click(ids::consent(StepId(30)));
+    let ask = h.call(|r| *r == InstallerRequest::AskPermissions);
+    assert!(
+        h.take_jobs().iter().all(|j| !matches!(
+            j,
+            NativeJob::Step { job, .. } if job.step == StepId(30) && job.stage == JobStage::Apply
+        )),
+        "the platform never sees an agent-applied Apply"
+    );
+    h.ack(&ask);
+    assert_ne!(
+        h.row(StepId(30)).state,
+        RowState::Verified,
+        "the acknowledgement is not completion"
+    );
+    // Only a later status verifies, and only through the platform's own Verify.
+    h.status_reply();
+    let (verify, evidence) = loop_for_job(&mut h, StepId(30), JobStage::Verify);
+    assert!(evidence.is_some());
+    let live = h.live();
+    h.report(&verify, live);
+    assert_eq!(h.row(StepId(30)).state, RowState::Verified);
+}
+
+#[test]
+fn a_refused_agent_request_waits_for_the_person_and_an_unknown_one_is_detected_again() {
+    for (failure, wait) in [
+        (CallFailure::Refused(AgentRefusal::Other), true),
+        (CallFailure::TimeoutOutcomeUnknown, false),
+    ] {
+        let mut extra = native(StepId(30), &[], ScreenId::Permissions, false);
+        extra.agent_apply = Some(live::AgentApply::Restart);
+        let mut h = with_extra_step(extra);
+        h.install();
+        h.status_reply();
+        h.next();
+        let (detect, _) = loop_for_job(&mut h, StepId(30), JobStage::Detect);
+        h.report(&detect, NativeOutcome::Detected { needs_action: true });
+        let (plan, _) = h.job(StepId(30), JobStage::Plan);
+        h.report(
+            &plan,
+            NativeOutcome::Planned {
+                preview: "restart".into(),
+            },
+        );
+        h.click(ids::consent(StepId(30)));
+        let call = h.call(|r| *r == InstallerRequest::Restart);
+        h.reply(&call, Err(failure));
+        if wait {
+            assert_eq!(h.row(StepId(30)).state, RowState::Waiting);
+        } else {
+            // Unknown outcome re-detects before anything is offered again.
+            let _ = loop_for_job(&mut h, StepId(30), JobStage::Detect);
+        }
+    }
+}
+
+/// Tick until the platform has been handed `step`'s job for `stage`; return it with its status.
+fn loop_for_job(
+    h: &mut H,
+    step: StepId,
+    stage: JobStage,
+) -> (JobIntent, Option<live::StatusEvidence>) {
+    for _ in 0..40 {
+        let found = {
+            let mut native = h.native.borrow_mut();
+            let at = native.jobs.iter().position(|j| {
+                matches!(j, NativeJob::Step { job, .. } if job.step == step && job.stage == stage)
+            });
+            at.map(|i| native.jobs.remove(i))
+        };
+        if let Some(NativeJob::Step { job, status, .. }) = found {
+            return (job, status);
+        }
+        h.advance(100);
+        h.tick();
+        if h.has_call(|r| *r == InstallerRequest::Status) {
+            h.status_reply();
+        }
+    }
+    panic!("no {stage:?} job for step {}", step.0);
+}
+
+#[test]
+fn e1_target_needs_its_armed_click_counters_and_human_confirmation() {
+    let mut h = H::new();
+    to_practice(&mut h);
+    run_e1_target(&mut h);
+    h.status_reply();
+    assert_eq!(
+        h.practice_row(TutorialRole::E1Target).state,
+        RowState::Verified
+    );
+    assert!(
+        h.fixtures.borrow().retired >= 1,
+        "the owned fixture is retired"
+    );
+}
+
+#[test]
+fn all_four_e2_roles_pass_with_distinct_owned_attempts_and_verified_returns() {
+    for role in [
+        TutorialRole::E2SourcePush,
+        TutorialRole::E2DestinationPush,
+        TutorialRole::E2SourcePull,
+        TutorialRole::E2DestinationPull,
+    ] {
+        let mut h = H::new();
+        to_practice(&mut h);
+        run_e2(&mut h, role);
+        h.status_reply();
+        assert_eq!(
+            h.practice_row(role).state,
+            RowState::Verified,
+            "{role:?}: {}",
+            h.practice_row(role).detail
+        );
+    }
+}
+
+#[test]
+fn audio_sender_and_receiver_pass_with_hearing_and_the_global_counter_limit_is_shown() {
+    let mut h = H::new();
+    to_practice(&mut h);
+    run_audio_sender(&mut h);
+    h.status_reply();
+    assert_eq!(
+        h.practice_row(TutorialRole::AudioSender).state,
+        RowState::Verified,
+        "{}",
+        h.practice_row(TutorialRole::AudioSender).detail
+    );
+    let mut h = H::new();
+    to_practice(&mut h);
+    run_audio_receiver(&mut h);
+    h.status_reply();
+    assert_eq!(
+        h.practice_row(TutorialRole::AudioReceiver).state,
+        RowState::Verified
+    );
+    // Audio counters are global and sampled; both audio rows say so even before practice.
+    for role in [TutorialRole::AudioSender, TutorialRole::AudioReceiver] {
+        let detail = h.practice_row(role).detail;
+        assert!(
+            detail.contains("computer-wide") && detail.contains("hear"),
+            "audio rows carry the attribution limit: {detail}"
+        );
+    }
+}
+
+#[test]
+fn all_nine_roles_then_fresh_final_health_reach_ready_and_readiness_lapses_after_five_seconds() {
+    let mut h = H::new();
+    to_practice(&mut h);
+    run_e1_controller(&mut h);
+    run_e1_target(&mut h);
+    run_e2(&mut h, TutorialRole::E2SourcePush);
+    run_e2(&mut h, TutorialRole::E2DestinationPush);
+    run_e2(&mut h, TutorialRole::E2SourcePull);
+    run_e2(&mut h, TutorialRole::E2DestinationPull);
+    run_audio_sender(&mut h);
+    // Each role is verified before the next starts; the summary is still waiting until the last.
+    assert_eq!(h.summary(), SummaryView::InstalledWaiting);
+    run_audio_receiver(&mut h);
+    assert_eq!(h.summary(), SummaryView::InstalledWaiting);
+    run_menu(&mut h);
+    for role in live::PRACTICE_ROLES {
+        assert_eq!(h.practice_row(role).state, RowState::Verified, "{role:?}");
+    }
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Summary);
+    // The final fresh-health step is checked only by a status issued after every role passed.
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.summary(), SummaryView::WorkspaceReady);
+    assert_eq!(h.row(live::steps::FINAL).state, RowState::Verified);
+    // Without a fresh observation, readiness lapses honestly after five seconds.
+    h.advance(5_500);
+    h.c.tick();
+    assert_ne!(
+        h.summary(),
+        SummaryView::WorkspaceReady,
+        "stale health is never green"
+    );
+    // Renewing it needs a new status, not a button.
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.summary(), SummaryView::WorkspaceReady);
+}
+
+// ---- review (Opus) regressions ---------------------------------------------------------------
+
+fn other_peer() -> NodeId {
+    NodeId([0x33; 32])
+}
+
+fn other_peer_json(connected: bool) -> Value {
+    let mut p = peer_json(&[]);
+    p["node"] = json!(other_peer().to_string());
+    p["name"] = json!("older peer");
+    p["connected"] = json!(connected);
+    p
+}
+
+#[test]
+fn a_new_pairing_never_selects_an_older_peer_that_happens_to_reconnect() {
+    let mut h = H::new();
+    // An older, already-paired computer is known but offline when pairing starts.
+    h.status["result"]["installer"]["peers"] = json!([other_peer_json(false)]);
+    to_connect(&mut h);
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::NeedsAction);
+    h.click(ids::PAIR_LISTEN);
+    let listen = h.call(|r| matches!(r, InstallerRequest::PairListen { .. }));
+    h.ack(&listen);
+    h.advance(600);
+    h.tick();
+    let poll = h.call(|r| *r == InstallerRequest::PairStatus);
+    h.pair_status(
+        &poll,
+        r#"{"ok":true,"result":{"phase":"paired","sas":null,"candidates":[],"peer":"sensitive peer","error":null}}"#,
+    );
+    // The older peer reconnects before the newly paired one does.
+    h.status["result"]["installer"]["peers"] = json!([other_peer_json(true)]);
+    h.status_reply();
+    h.status_reply();
+    assert_ne!(
+        h.row(live::steps::PAIR).state,
+        RowState::Verified,
+        "the older peer is not the computer that was just paired"
+    );
+    // The newly paired computer connects: it, and only it, is selected.
+    let mut fresh = peer_json(&[]);
+    fresh["connected"] = json!(true);
+    h.status["result"]["installer"]["peers"] = json!([other_peer_json(true), fresh]);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Verified);
+    assert_eq!(h.view().peer.as_deref(), Some("sensitive peer"));
+}
+
+#[test]
+fn removal_choices_are_frozen_while_their_plan_is_prepared() {
+    let mut h = H::new();
+    h.tick();
+    h.click(ids::REMOVE_OR_REPAIR);
+    let inspect = h
+        .take_jobs()
+        .iter()
+        .find_map(|j| match j {
+            NativeJob::Maintenance(MaintenanceRequest::Inspect { id }) => Some(*id),
+            _ => None,
+        })
+        .expect("inspect");
+    h.native
+        .borrow_mut()
+        .reports
+        .push(NativeReport::Maintenance(MaintenanceReport::Inspected {
+            id: inspect,
+            uninstall: live::Availability::Available,
+            repair: live::Availability::NotAvailableYet("not yet".into()),
+            choices: vec![live::RemovalChoice {
+                id: 1,
+                role: ToggleRole::DeleteIdentity,
+                label: "Also forget this computer's pairings".into(),
+                checked: false,
+                enabled: true,
+            }],
+        }));
+    h.tick();
+    h.click(ids::REMOVE_REVIEW);
+    let plan = h
+        .take_jobs()
+        .into_iter()
+        .find_map(|j| match j {
+            NativeJob::Maintenance(MaintenanceRequest::PlanUninstall { id, .. }) => Some(id),
+            _ => None,
+        })
+        .expect("plan");
+    // The person flips a choice while the plan for the old choices is still being prepared.
+    let field = ids::removal_field(1);
+    let toggle_enabled = h
+        .view()
+        .fields
+        .iter()
+        .any(|f| matches!(f, FieldView::Toggle { id, enabled: true, .. } if *id == field));
+    assert!(!toggle_enabled, "choices are frozen while planning");
+    let revision = h.view().revision;
+    h.act(
+        revision,
+        WizardIntent::SetToggle {
+            field,
+            checked: true,
+        },
+    );
+    h.native
+        .borrow_mut()
+        .reports
+        .push(NativeReport::Maintenance(MaintenanceReport::Planned {
+            id: plan,
+            preview: "Remove the agent; keep pairings".into(),
+        }));
+    h.tick();
+    let checked = h
+        .view()
+        .fields
+        .iter()
+        .any(|f| matches!(f, FieldView::Toggle { id, checked: true, .. } if *id == field));
+    assert!(
+        !checked,
+        "the shown plan always describes the choices that will be confirmed"
+    );
+    assert!(h.button(ids::REMOVE_CONFIRM).is_some());
+    // A second, unrequested plan report never replaces the reviewed one.
+    h.native
+        .borrow_mut()
+        .reports
+        .push(NativeReport::Maintenance(MaintenanceReport::Planned {
+            id: plan,
+            preview: "something else entirely".into(),
+        }));
+    h.tick();
+    assert!(!h.view().message.contains("something else"));
+}
+
+#[test]
+fn a_window_close_is_refused_while_a_native_change_runs_and_allowed_after() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    h.next();
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "Install".into(),
+        },
+    );
+    h.click(ids::consent(PAYLOAD));
+    let (apply, _) = h.job(PAYLOAD, JobStage::Apply);
+    assert!(!h.c.request_close(), "closing would cut the install short");
+    assert!(!h.native.borrow().shutdown);
+    assert!(h.view().message.contains("Wait for the current change"));
+    // Progress keeps the guard; a platform that goes silent past every deadline can be closed.
+    h.advance(100_000);
+    h.report(&apply, NativeOutcome::Progress);
+    h.advance(100_000);
+    h.tick();
+    assert!(!h.c.request_close(), "progress was reported recently");
+    h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Applied));
+    assert!(h.c.request_close(), "nothing is running any more");
+    assert!(h.native.borrow().shutdown);
+}
+
+#[test]
+fn a_silent_platform_never_makes_the_window_unclosable() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    h.next();
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "Install".into(),
+        },
+    );
+    h.click(ids::consent(PAYLOAD));
+    let _ = h.job(PAYLOAD, JobStage::Apply);
+    assert!(!h.c.request_close());
+    h.advance(151_000);
+    h.tick();
+    assert!(h.c.request_close());
+}
+
+#[test]
+fn an_answer_that_does_not_belong_to_the_jobs_stage_fails_it_instead_of_hanging() {
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    h.next();
+    let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+    // A platform fault: a detection answer for a Plan job.
+    h.report(
+        &plan,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    assert_eq!(h.row(PAYLOAD).state, RowState::Failed);
+    assert!(h.button(ids::retry(PAYLOAD)).is_some_and(|b| b.enabled));
+}

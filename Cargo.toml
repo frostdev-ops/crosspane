@@ -99,6 +99,8 @@ objc2-io-surface = "0.3.2"
 ash = "0.38.0"
 libloading = "0.8.9"
 objc2-screen-capture-kit = "0.3.2"
+# Installer (WP-4.21/4.22, lead ruling 2026-10-04): static code-signature checks only.
+objc2-security = { version = "0.3.2", default-features = false, features = ["std", "CSCommon", "SecCode", "SecRequirement", "SecStaticCode"] }
 security-framework = "3.7.0"
 
 # Windows bindings (Phase 3 Lane W); runtime claims require a real Windows machine.

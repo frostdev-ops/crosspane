@@ -4,6 +4,7 @@ pub mod agent_contract;
 pub mod demo;
 pub mod fixture;
 pub mod gui;
+pub mod live;
 pub mod motion;
 pub mod platform;
 mod screens;

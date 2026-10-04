@@ -481,6 +481,53 @@ impl Package {
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
+
+    /// Bounded prefix of the already hash-validated agent bytes. No archive re-parse.
+    pub(crate) fn agent_elf_prefix(&self) -> &[u8] {
+        let Some(bytes) = self.files.get(FILES[0]) else {
+            return &[];
+        };
+        let end = bytes.len().min(super::native_io::MAX_ELF_PREFIX_BYTES);
+        &bytes[..end]
+    }
+}
+
+#[cfg(test)]
+mod elf_prefix_tests {
+    use super::*;
+
+    fn package_with_agent(bytes: Vec<u8>) -> Package {
+        let mut files = BTreeMap::new();
+        files.insert(FILES[0].to_owned(), bytes);
+        Package {
+            manifest: Manifest {
+                schema_version: 1,
+                product_version: "0.0.0".into(),
+                architecture: Architecture::X86_64,
+                source_revision: "0".repeat(40),
+                profile: "dev".into(),
+                libraries: Vec::new(),
+                members: Vec::new(),
+            },
+            files,
+            manifest_hash: [0; 32],
+            archive_hash: [0; 32],
+        }
+    }
+
+    #[test]
+    fn agent_elf_prefix_is_a_bounded_slice_of_the_validated_agent() {
+        use super::super::native_io::MAX_ELF_PREFIX_BYTES;
+        let agent = vec![0x7f; MAX_ELF_PREFIX_BYTES + 64];
+        let package = package_with_agent(agent.clone());
+        let prefix = package.agent_elf_prefix();
+        assert_eq!(prefix.len(), MAX_ELF_PREFIX_BYTES);
+        assert_eq!(prefix, &agent[..MAX_ELF_PREFIX_BYTES]);
+        assert_eq!(
+            package_with_agent(b"\x7fELF".to_vec()).agent_elf_prefix(),
+            b"\x7fELF"
+        );
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

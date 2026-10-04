@@ -15,6 +15,11 @@ path = "src/tutorial.rs"
 [lints]
 workspace = true
 
+[features]
+# The injected-parts seam (`LinuxPlatform::compose`, `MacPlatform::compose`) for this crate's own
+# integration tests. Never enabled by a build of the installer itself.
+test-hooks = []
+
 [dependencies]
 crosspane-installer-core.workspace = true
 crosspane-types.workspace = true
@@ -38,6 +43,8 @@ objc2-app-kit.workspace = true
 objc2-core-foundation.workspace = true
 objc2-core-graphics.workspace = true
 objc2-foundation.workspace = true
+# Lead ruling 2026-10-04: the production SignatureProbe (public Security framework, read-only).
+objc2-security.workspace = true
 
 # WP-4.8b/c (Linux detection): logind/Secret Service/PipeWire names over the admitted buses, and a
 # registry-only Wayland read, both on streams from native_io's pinned connections.
@@ -46,3 +53,7 @@ crosspane-platform-linux.workspace = true
 pipewire.workspace = true
 zbus.workspace = true
 wayland-client.workspace = true
+
+# This crate's integration tests turn on its own test seam; normal builds never do.
+[dev-dependencies]
+crosspane-installer = { path = ".", features = ["test-hooks"] }
