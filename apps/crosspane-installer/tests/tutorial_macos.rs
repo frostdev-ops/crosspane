@@ -750,7 +750,8 @@ fn noncooperative_launch_deadline_and_cancellation_retain_bounded_slots_until_fi
             Err(NativeError::Timeout | NativeError::Cancelled)
         ));
         assert!(before.elapsed() < Duration::from_millis(200));
-        assert!(!rig.spawner.commands.lock().unwrap().is_empty());
+        // The 20 ms deadline can fire before the blocked spawner thread records its command.
+        wait(|| !rig.spawner.commands.lock().unwrap().is_empty());
     }
     let extra = Rig::new();
     assert_eq!(extra.launch().err(), Some(NativeError::Busy));
