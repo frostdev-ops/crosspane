@@ -1,0 +1,6 @@
+# Temporary quarantine (lead, 2026-10-03): the e2_resize fullscreen-convergence proptest fails
+# about 1 run in 6 on master and blocks merge gates. WP-2.46f fixes or explains it; remove this
+# override when WP-2.46f merges.
+[[profile.default.overrides]]
+filter = 'binary(e2_resize) and test(resize_exchanges_converge_without_oscillation)'
+retries = 3
