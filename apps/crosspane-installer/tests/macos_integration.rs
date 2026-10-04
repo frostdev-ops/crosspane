@@ -5,6 +5,7 @@
 //! composes only `Blocked` domains. No real agent, fixture, GUI session, launchd, TCC, Keychain,
 //! installer package or audio device is used.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,13 +15,13 @@ use crosspane_installer::fixture::{FixtureCall, FixtureError, FixtureId, Fixture
 use crosspane_installer::live::{
     self, Availability, Consent, FixtureReadiness, LiveController, MaintenanceId,
     MaintenanceOutcome, MaintenanceReport, MaintenanceRequest, NativeJob, NativeOutcome,
-    NativeReport, Platform, PracticeFixtures, StatusEvidence, StepReport,
+    NativeReport, Platform, PracticeFixtures, RepairOutcome, StatusEvidence, StepReport,
 };
 use crosspane_installer::platform::macos::integration::{
     Admitted, AgentBackend, AgentSource, Agents, AudioError, AudioPackages, AudioPreview,
     AudioState, Blocked, DomainFactory, Domains, FixtureSource, InstallApplied, InstallError,
-    InstallPreview, InstallState, Installs, MacPlatform, Parts, Support, SupportOutcome,
-    UninstallOffer, UninstallResult, Uninstaller,
+    InstallPreview, InstallState, Installs, MacPlatform, Parts, RepairFinish, RepairOffer,
+    RepairStep, Repairer, Support, SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
 };
 use crosspane_installer::platform::macos::native_io::{Deadline, NativeError};
 use crosspane_installer::platform::macos::transport::SelectedLink;
@@ -65,6 +66,17 @@ struct World {
     offer: UninstallOffer,
     uninstall_plan: Result<String, String>,
     uninstall_apply: Result<UninstallResult, String>,
+    /// What repair offers, and the scripted answers of each repair stage.
+    repair_offer: RepairOffer,
+    repair_plan: Result<String, String>,
+    repair_confirm: VecDeque<Result<RepairStep, String>>,
+    repair_verify: VecDeque<RepairStep>,
+    repair_resume: Result<RepairFinish, String>,
+    repair_confirmed: Vec<(u64, u64)>,
+    repair_verified: Vec<Option<u64>>,
+    /// Verification keeps waiting while set; a confirmation blocks (a slow stage) while set.
+    repair_hold: bool,
+    repair_hold_confirm: bool,
     calls: Vec<String>,
     /// The Status id each domain call was given, by call name.
     seen_status: Vec<(String, Option<u64>)>,
@@ -114,6 +126,25 @@ impl World {
                 outcome: MaintenanceOutcome::Removed,
                 lines: vec!["Crosspane was removed from this account.".into()],
             }),
+            repair_offer: RepairOffer {
+                repair: Availability::Available,
+                resumable: None,
+            },
+            repair_plan: Ok(
+                "Repair puts back Crosspane's app, its command-line tool and its sign-in item."
+                    .into(),
+            ),
+            repair_confirm: VecDeque::new(),
+            repair_verify: VecDeque::new(),
+            repair_resume: Ok(finish(
+                RepairOutcome::Verified,
+                "Resumed and verified.",
+                false,
+            )),
+            repair_confirmed: Vec::new(),
+            repair_verified: Vec::new(),
+            repair_hold: false,
+            repair_hold_confirm: false,
             calls: Vec::new(),
             seen_status: Vec::new(),
             links: Vec::new(),
@@ -327,6 +358,115 @@ impl Uninstaller for FakeUninstaller {
     }
 }
 
+fn finish(outcome: RepairOutcome, line: &str, resumable: bool) -> RepairFinish {
+    RepairFinish {
+        outcome,
+        lines: vec![line.into()],
+        resumable,
+    }
+}
+
+fn status_id(status: Option<&AgentReply>) -> Option<u64> {
+    status
+        .filter(|r| {
+            matches!(
+                r.result,
+                Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+            )
+        })
+        .map(|r| r.id)
+}
+
+struct FakeRepairer(Shared);
+
+impl Repairer for FakeRepairer {
+    fn inspect(&mut self, _: &Deadline) -> RepairOffer {
+        note(&self.0, "repair.inspect");
+        self.0.lock().unwrap().repair_offer.clone()
+    }
+
+    fn plan(
+        &mut self,
+        status: Option<&AgentReply>,
+        operation: OperationId,
+        _: &Deadline,
+    ) -> Result<String, String> {
+        note(
+            &self.0,
+            format!(
+                "repair.plan(op={},status={:?})",
+                operation.0,
+                status_id(status)
+            ),
+        );
+        self.0.lock().unwrap().repair_plan.clone()
+    }
+
+    fn confirm(
+        &mut self,
+        status: Option<&AgentReply>,
+        plan: OperationId,
+        operation: OperationId,
+        _: &Deadline,
+    ) -> Result<RepairStep, String> {
+        let end = Instant::now() + Duration::from_secs(30);
+        while self.0.lock().unwrap().repair_hold_confirm && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut w = self.0.lock().unwrap();
+        w.calls.push(format!(
+            "repair.confirm(plan={},status={:?})",
+            plan.0,
+            status_id(status)
+        ));
+        w.repair_confirmed.push((plan.0, operation.0));
+        w.repair_confirm.pop_front().unwrap_or_else(|| {
+            Ok(RepairStep::Waiting {
+                detail: "Crosspane was started again. Waiting for the new instance…".into(),
+                if_timed_out: finish(
+                    RepairOutcome::OutcomeUnknown,
+                    "The new Crosspane didn't report healthy in time.",
+                    true,
+                ),
+                closeable: false,
+            })
+        })
+    }
+
+    fn verify(&mut self, status: Option<&AgentReply>, _: &Deadline) -> RepairStep {
+        let mut w = self.0.lock().unwrap();
+        w.calls
+            .push(format!("repair.verify(status={:?})", status_id(status)));
+        w.repair_verified.push(status_id(status));
+        if w.repair_hold {
+            return RepairStep::Waiting {
+                detail: "Waiting for the new instance to report healthy…".into(),
+                if_timed_out: finish(RepairOutcome::OutcomeUnknown, "No health in time.", true),
+                closeable: false,
+            };
+        }
+        w.repair_verify.pop_front().unwrap_or_else(|| {
+            RepairStep::Finished(finish(
+                RepairOutcome::Verified,
+                "The new Crosspane reported healthy.",
+                false,
+            ))
+        })
+    }
+
+    fn resume(
+        &mut self,
+        status: Option<&AgentReply>,
+        _: &Deadline,
+    ) -> Result<RepairFinish, String> {
+        note(
+            &self.0,
+            format!("repair.resume(status={:?})", status_id(status)),
+        );
+        self.0.lock().unwrap().repair_resume.clone()
+    }
+}
+
 fn fake_domains(w: &Shared) -> DomainFactory {
     let shared = w.clone();
     Box::new(move || Domains {
@@ -334,7 +474,8 @@ fn fake_domains(w: &Shared) -> DomainFactory {
         installs: Box::new(FakeInstalls(shared.clone())),
         audio: Box::new(FakeAudio(shared.clone())),
         agents: Box::new(FakeAgents(shared.clone())),
-        uninstaller: Box::new(FakeUninstaller(shared)),
+        uninstaller: Box::new(FakeUninstaller(shared.clone())),
+        repairer: Box::new(FakeRepairer(shared)),
         fixtures: None,
     })
 }
@@ -1352,7 +1493,7 @@ fn removal_is_inspected_planned_confirmed_and_given_the_fresh_status() {
             ..
         } => {
             assert_eq!(*uninstall, Availability::Available);
-            assert!(matches!(repair, Availability::NotAvailableYet(_)));
+            assert_eq!(*repair, Availability::Available);
             assert_eq!(choices.len(), 2);
         }
         other => panic!("{other:?}"),
@@ -1560,11 +1701,13 @@ fn a_blocked_build_refuses_every_step_with_the_typed_reason_and_changes_nothing(
     match &rig.maintenance[0] {
         MaintenanceReport::Inspected {
             uninstall: Availability::Unavailable(text),
-            repair: Availability::NotAvailableYet(_),
+            repair: Availability::Unavailable(repair_text),
             choices,
             ..
         } => {
             assert!(text.contains("no approved inventory"));
+            // Repair is gated like install: the same typed reason, never a callable repair.
+            assert_eq!(repair_text, text);
             assert!(choices.is_empty());
         }
         other => panic!("{other:?}"),
@@ -1579,6 +1722,273 @@ fn a_blocked_build_refuses_every_step_with_the_typed_reason_and_changes_nothing(
         &rig.maintenance[1],
         MaintenanceReport::Refused { .. }
     ));
+}
+
+// ---- repair -----------------------------------------------------------------------------------
+
+impl Rig {
+    fn maint(&mut self, request: MaintenanceRequest) -> Vec<MaintenanceReport> {
+        let before = self.maintenance.len();
+        self.send(NativeJob::Maintenance(request));
+        self.pump(|r| r.maintenance.len() > before);
+        self.maintenance[before..].to_vec()
+    }
+
+    fn inspect(&mut self, id: u64) -> Vec<MaintenanceReport> {
+        let before = self.maintenance.len();
+        self.send(NativeJob::Maintenance(MaintenanceRequest::Inspect {
+            id: MaintenanceId(id),
+        }));
+        self.pump(|r| r.maintenance.len() > before);
+        std::thread::sleep(Duration::from_millis(30));
+        self.pump(|_| true);
+        self.maintenance[before..].to_vec()
+    }
+
+    fn plan_repair(&mut self, id: u64) -> u64 {
+        let reports = self.maint(MaintenanceRequest::PlanRepair {
+            id: MaintenanceId(id),
+            status: Some(StatusEvidence(healthy(31))),
+        });
+        match &reports[0] {
+            MaintenanceReport::RepairPlanned { plan, .. } => *plan,
+            other => panic!("expected a repair preview, got {other:?}"),
+        }
+    }
+
+    fn confirm_repair(&mut self, id: u64, plan: u64) -> MaintenanceReport {
+        self.maint(MaintenanceRequest::ConfirmRepair {
+            id: MaintenanceId(id),
+            plan,
+            revision: 7,
+            status: Some(StatusEvidence(healthy(32))),
+        })
+        .remove(0)
+    }
+
+    fn verify_repair(&mut self, id: u64, call: u64) -> MaintenanceReport {
+        self.maint(MaintenanceRequest::VerifyRepair {
+            id: MaintenanceId(id),
+            status: Some(StatusEvidence(healthy(call))),
+        })
+        .remove(0)
+    }
+}
+
+#[test]
+fn repair_is_offered_only_when_the_adapters_admission_says_the_install_is_compatible() {
+    let mut rig = Rig::new();
+    let reports = rig.inspect(1);
+    assert!(matches!(
+        &reports[0],
+        MaintenanceReport::Inspected {
+            repair: Availability::Available,
+            ..
+        }
+    ));
+    assert_eq!(reports.len(), 1, "nothing to resume");
+    // An incompatible install says why, with the next step, and nothing can be planned.
+    let reason = "Repair needs the Crosspane that setup installed to be running. \
+                  Uninstall (keeping identity by default), then install. Nothing was changed.";
+    rig.w.lock().unwrap().repair_offer = RepairOffer {
+        repair: Availability::Unavailable(reason.into()),
+        resumable: None,
+    };
+    rig.w.lock().unwrap().repair_plan = Err(reason.into());
+    let reports = rig.inspect(2);
+    let MaintenanceReport::Inspected { repair, .. } = &reports[0] else {
+        panic!("{reports:?}")
+    };
+    assert_eq!(*repair, Availability::Unavailable(reason.into()));
+    let reports = rig.maint(MaintenanceRequest::PlanRepair {
+        id: MaintenanceId(2),
+        status: None,
+    });
+    let MaintenanceReport::Refused { reason: text, .. } = &reports[0] else {
+        panic!("{reports:?}")
+    };
+    assert!(text.contains("Uninstall (keeping identity by default), then install."));
+    assert_eq!(rig.count("repair.confirm"), 0);
+}
+
+#[test]
+fn a_blocked_build_cannot_repair_for_the_same_reason_it_cannot_install() {
+    let w = World::new();
+    let reason = "This build has no approved inventory (unsigned or dev build), so nothing will \
+                  be copied, started or removed.";
+    let mut rig = Rig::with(w, Box::new(move || Blocked::domains(reason)));
+    let reports = rig.inspect(1);
+    let MaintenanceReport::Inspected { repair, .. } = &reports[0] else {
+        panic!("{reports:?}")
+    };
+    assert_eq!(*repair, Availability::Unavailable(reason.into()));
+    assert_eq!(reports.len(), 1);
+    for request in [
+        MaintenanceRequest::PlanRepair {
+            id: MaintenanceId(1),
+            status: Some(StatusEvidence(healthy(31))),
+        },
+        MaintenanceRequest::ConfirmRepair {
+            id: MaintenanceId(1),
+            plan: 1,
+            revision: 7,
+            status: Some(StatusEvidence(healthy(32))),
+        },
+        MaintenanceRequest::ResumeRepair {
+            id: MaintenanceId(1),
+            status: Some(StatusEvidence(healthy(33))),
+        },
+    ] {
+        let reports = rig.maint(request);
+        assert!(
+            matches!(&reports[0], MaintenanceReport::Refused { .. }),
+            "{reports:?}"
+        );
+    }
+}
+
+#[test]
+fn a_repair_is_confirmed_only_for_the_numbered_preview_and_only_once() {
+    let mut rig = Rig::new();
+    rig.inspect(1);
+    let report = rig.confirm_repair(1, 1);
+    assert!(
+        matches!(report, MaintenanceReport::Refused { .. }),
+        "{report:?}"
+    );
+    assert_eq!(rig.count("repair.confirm"), 0);
+
+    let plan = rig.plan_repair(1);
+    let report = rig.confirm_repair(1, plan + 1);
+    assert!(
+        matches!(report, MaintenanceReport::Refused { .. }),
+        "{report:?}"
+    );
+    assert_eq!(rig.count("repair.confirm"), 0);
+    let report = rig.confirm_repair(1, plan);
+    assert!(
+        matches!(report, MaintenanceReport::Refused { .. }),
+        "a refused confirmation retires the preview: {report:?}"
+    );
+
+    let plan = rig.plan_repair(1);
+    let report = rig.confirm_repair(1, plan);
+    assert!(
+        matches!(report, MaintenanceReport::RepairWaiting { .. }),
+        "{report:?}"
+    );
+    {
+        let w = rig.w.lock().unwrap();
+        assert_eq!(w.repair_confirmed.len(), 1);
+        assert_eq!(w.repair_confirmed[0].0, plan);
+        assert!(w.repair_confirmed[0].1 > plan);
+    }
+    assert!(calls(&rig.w).contains(&format!("repair.confirm(plan={plan},status=Some(32))")));
+    let report = rig.confirm_repair(1, plan);
+    assert!(
+        matches!(report, MaintenanceReport::Refused { .. }),
+        "{report:?}"
+    );
+    assert_eq!(rig.count("repair.confirm"), 1);
+}
+
+#[test]
+fn a_repair_waits_for_the_new_agent_and_the_wait_ends_with_the_adapters_typed_result() {
+    let mut rig = Rig::new();
+    rig.inspect(1);
+    let plan = rig.plan_repair(1);
+    assert!(matches!(
+        rig.confirm_repair(1, plan),
+        MaintenanceReport::RepairWaiting { .. }
+    ));
+    rig.w.lock().unwrap().repair_hold = true;
+    assert!(matches!(
+        rig.verify_repair(1, 41),
+        MaintenanceReport::RepairWaiting { .. }
+    ));
+    // Past the bound the repair ends as unknown, never as a guess at success or failure.
+    rig.advance(100_000);
+    let report = rig.verify_repair(1, 42);
+    let MaintenanceReport::RepairFinished {
+        outcome, resumable, ..
+    } = report
+    else {
+        panic!("{report:?}")
+    };
+    assert_eq!(outcome, RepairOutcome::OutcomeUnknown);
+    assert!(resumable);
+    // A resume (in this window) asks the adapter again.
+    let reports = rig.maint(MaintenanceRequest::ResumeRepair {
+        id: MaintenanceId(1),
+        status: Some(StatusEvidence(healthy(51))),
+    });
+    assert!(matches!(
+        &reports[0],
+        MaintenanceReport::RepairFinished {
+            outcome: RepairOutcome::Verified,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn every_typed_repair_outcome_is_reported_and_none_is_invented() {
+    for (outcome, resumable) in [
+        (RepairOutcome::Verified, false),
+        (RepairOutcome::HealthVerifiedCleanupIncomplete, false),
+        (RepairOutcome::OutcomeUnknown, true),
+        (RepairOutcome::RecoveryRetained, false),
+    ] {
+        let mut rig = Rig::new();
+        rig.inspect(1);
+        rig.w
+            .lock()
+            .unwrap()
+            .repair_confirm
+            .push_back(Ok(RepairStep::Finished(finish(
+                outcome,
+                "The adapter's own words.",
+                resumable,
+            ))));
+        let plan = rig.plan_repair(1);
+        let report = rig.confirm_repair(1, plan);
+        assert_eq!(
+            report,
+            MaintenanceReport::RepairFinished {
+                id: MaintenanceId(1),
+                outcome,
+                lines: vec!["The adapter's own words.".into()],
+                resumable,
+            }
+        );
+    }
+}
+
+#[test]
+fn removal_cannot_be_planned_while_a_repair_is_active_and_a_stale_verify_is_ignored() {
+    let mut rig = Rig::new();
+    rig.inspect(1);
+    let plan = rig.plan_repair(1);
+    assert!(matches!(
+        rig.confirm_repair(1, plan),
+        MaintenanceReport::RepairWaiting { .. }
+    ));
+    let reports = rig.maint(MaintenanceRequest::PlanUninstall {
+        id: MaintenanceId(1),
+        choices: Vec::new(),
+        status: None,
+    });
+    assert!(matches!(&reports[0], MaintenanceReport::Refused { .. }));
+    assert_eq!(rig.count("uninstall.plan"), 0);
+    let before = rig.maintenance.len();
+    rig.send(NativeJob::Maintenance(MaintenanceRequest::VerifyRepair {
+        id: MaintenanceId(9),
+        status: Some(StatusEvidence(healthy(43))),
+    }));
+    std::thread::sleep(Duration::from_millis(60));
+    rig.pump(|_| true);
+    assert_eq!(rig.maintenance.len(), before);
+    assert_eq!(rig.count("repair.verify"), 0);
 }
 
 #[test]
@@ -2426,6 +2836,55 @@ mod flow {
             })
         }
 
+        /// Open "Remove or repair" and wait for the inspection to be answered.
+        pub fn open_repair(&mut self) {
+            self.until("the welcome screen", |f| {
+                f.view().screen == ScreenId::Welcome
+            });
+            self.click(live::ids::REMOVE_OR_REPAIR);
+            assert_eq!(self.view().screen, ScreenId::RepairRemove);
+            self.until("the inspection", |f| {
+                !f.view().message.contains("Checking what can be removed")
+                    && f.view().buttons.iter().any(|b| b.id == live::ids::REPAIR)
+            });
+        }
+
+        pub fn message(&self) -> String {
+            self.view().message.clone()
+        }
+
+        pub fn enabled(&self, id: u16) -> bool {
+            self.has_button(id)
+        }
+
+        pub fn shown(&self, id: u16) -> bool {
+            self.view().buttons.iter().any(|b| b.id == id)
+        }
+
+        /// A click that carries a view revision the person is no longer looking at.
+        pub fn click_stale(&mut self, id: u16) {
+            let revision = self.view().revision.saturating_sub(1);
+            self.c.accept(WizardAction {
+                revision,
+                intent: WizardIntent::Button(id),
+            });
+            self.tick();
+        }
+
+        /// An action sent as is, whether or not the view offers it.
+        pub fn c_accept(&mut self, intent: WizardIntent, revision: u64) {
+            self.c.accept(WizardAction { revision, intent });
+            self.tick();
+        }
+
+        pub fn request_close(&mut self) -> bool {
+            self.c.request_close()
+        }
+
+        pub fn advance_clock(&self, ms: u64) {
+            self.advance(ms);
+        }
+
         // ---- practice ----
 
         fn confirm(&mut self, c: HumanConfirmation) {
@@ -2883,6 +3342,240 @@ fn a_build_that_cannot_prove_the_mac_stops_at_compatibility_and_never_installs()
             .calls
             .iter()
             .any(|c| c.starts_with("install."))
+    );
+}
+
+#[test]
+fn repair_is_not_callable_in_a_production_launch_that_cannot_build_a_native_io() {
+    // The same gate as install: a build with no approved inventory is honestly non-mutating, and
+    // repair shows that reason and nothing else.
+    let reason = "This build has no approved inventory (unsigned or dev build), so nothing will \
+                  be copied, started or removed.";
+    let mut f = flow::Flow::blocked(reason);
+    f.open_repair();
+    assert!(
+        f.message().contains("no approved inventory"),
+        "{}",
+        f.message()
+    );
+    assert!(!f.enabled(live::ids::REPAIR));
+    assert!(!f.shown(live::ids::REPAIR_CONFIRM));
+    assert!(!f.shown(live::ids::REPAIR_RESUME));
+    // Even a forced click starts nothing.
+    let revision = f.view().revision;
+    f.c_accept(
+        crosspane_installer::view::WizardIntent::Button(live::ids::REPAIR),
+        revision,
+    );
+    f.advance_clock(13_000);
+    for _ in 0..5 {
+        f.until("a tick", |_| true);
+    }
+    assert_eq!(
+        f.view().screen,
+        crosspane_installer::view::ScreenId::RepairRemove
+    );
+    assert!(!f.shown(live::ids::REPAIR_CONFIRM));
+}
+
+#[test]
+fn repair_is_reviewed_confirmed_and_verified_from_the_view() {
+    let mut f = flow::Flow::new();
+    f.world().lock().unwrap().repair_verify.extend([
+        RepairStep::Waiting {
+            detail: "Waiting for the new instance to report healthy…".into(),
+            if_timed_out: finish(RepairOutcome::OutcomeUnknown, "No health.", true),
+            closeable: false,
+        },
+        RepairStep::Waiting {
+            detail: "Waiting for the new instance to report healthy…".into(),
+            if_timed_out: finish(RepairOutcome::OutcomeUnknown, "No health.", true),
+            closeable: false,
+        },
+    ]);
+    f.open_repair();
+    assert!(f.enabled(live::ids::REPAIR));
+    assert!(
+        !f.shown(live::ids::REPAIR_CONFIRM),
+        "no consent without a preview"
+    );
+    f.click(live::ids::REPAIR);
+    f.until("the repair preview", |f| f.shown(live::ids::REPAIR_CONFIRM));
+    assert!(f.message().contains("Repair puts back Crosspane's app"));
+    assert!(!f.enabled(live::ids::REPAIR));
+    assert!(
+        !f.shown(live::ids::REMOVE_REVIEW),
+        "removal isn't offered over a repair"
+    );
+    assert!(
+        calls(f.world())
+            .iter()
+            .any(|c| c.starts_with("repair.plan(") && c.contains("status=Some(")),
+        "{:?}",
+        calls(f.world())
+    );
+    f.click(live::ids::REPAIR_CONFIRM);
+    f.until("the wait for the new agent", |f| {
+        f.message().contains("Waiting for the new instance")
+    });
+    assert!(!f.enabled(live::ids::BACK));
+    f.until("the verified repair", |f| {
+        f.message().contains("Crosspane was repaired")
+    });
+    assert!(f.message().contains("The new Crosspane reported healthy."));
+    assert!(f.enabled(live::ids::BACK));
+    let w = f.world().lock().unwrap();
+    assert_eq!(w.repair_verified.len(), 3);
+    assert!(w.repair_verified.iter().all(|s| s.is_some()));
+    assert_eq!(w.repair_confirmed.len(), 1);
+}
+
+#[test]
+fn each_typed_repair_outcome_reaches_the_view_text() {
+    for (outcome, head, resume) in [
+        (RepairOutcome::Verified, "Crosspane was repaired", false),
+        (
+            RepairOutcome::HealthVerifiedCleanupIncomplete,
+            "Repaired: health verified, cleanup incomplete.",
+            false,
+        ),
+        (
+            RepairOutcome::OutcomeUnknown,
+            "Outcome unknown, resume required.",
+            true,
+        ),
+        (
+            RepairOutcome::RecoveryRetained,
+            "The repair didn't finish. Backups and recovery files were kept.",
+            false,
+        ),
+    ] {
+        let mut f = flow::Flow::new();
+        f.world()
+            .lock()
+            .unwrap()
+            .repair_confirm
+            .push_back(Ok(RepairStep::Finished(finish(
+                outcome,
+                "Kept: the previous copy.",
+                resume,
+            ))));
+        f.open_repair();
+        f.click(live::ids::REPAIR);
+        f.until("the repair preview", |f| f.shown(live::ids::REPAIR_CONFIRM));
+        f.click(live::ids::REPAIR_CONFIRM);
+        f.until("the outcome", |f| f.message().contains(head));
+        assert!(
+            f.message().contains("Kept: the previous copy."),
+            "{outcome:?}: {}",
+            f.message()
+        );
+        assert_eq!(f.enabled(live::ids::REPAIR_RESUME), resume, "{outcome:?}");
+        assert!(
+            f.enabled(live::ids::CLOSE),
+            "nothing is left working: {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn closing_mid_repair_is_refused_until_it_ends_since_nothing_on_disk_resumes_it() {
+    let mut f = flow::Flow::new();
+    let world = f.world().clone();
+    {
+        let mut w = world.lock().unwrap();
+        w.repair_hold = true;
+        w.repair_hold_confirm = true;
+    }
+    f.open_repair();
+    f.click(live::ids::REPAIR);
+    f.until("the repair preview", |f| f.shown(live::ids::REPAIR_CONFIRM));
+    f.click(live::ids::REPAIR_CONFIRM);
+    f.until("the change to be running", |f| {
+        f.message().contains("Repairing Crosspane")
+    });
+    assert!(!f.shown(live::ids::CLOSE));
+    assert!(!f.request_close());
+    assert!(f.message().contains("Wait for the current change"));
+    world.lock().unwrap().repair_hold_confirm = false;
+    f.until("the wait for the new agent", |f| {
+        f.message().contains("Waiting for the new instance")
+    });
+    // A Mac repair keeps its pending state only in this window: closing now would leave nothing
+    // to resume, so the wait isn't closeable either.
+    assert!(!f.shown(live::ids::CLOSE));
+    assert!(!f.request_close());
+    world.lock().unwrap().repair_hold = false;
+    f.until("the verified repair", |f| {
+        f.message().contains("Crosspane was repaired")
+    });
+    assert!(f.enabled(live::ids::CLOSE));
+    assert!(f.close());
+}
+
+#[test]
+fn an_incompatible_install_shows_the_guidance_and_cannot_be_repaired() {
+    let mut f = flow::Flow::new();
+    let guidance = "Repair needs the Crosspane that setup installed to be running. Uninstall \
+                    (keeping identity by default), then install. Nothing was changed.";
+    f.world().lock().unwrap().repair_offer = RepairOffer {
+        repair: Availability::Unavailable(guidance.into()),
+        resumable: None,
+    };
+    f.open_repair();
+    assert!(
+        f.message()
+            .contains("Uninstall (keeping identity by default), then install.")
+    );
+    assert!(!f.enabled(live::ids::REPAIR));
+    assert!(
+        f.enabled(live::ids::REMOVE_REVIEW),
+        "removal stays available"
+    );
+}
+
+#[test]
+fn a_stale_view_revision_never_confirms_a_repair() {
+    let mut f = flow::Flow::new();
+    f.open_repair();
+    f.click(live::ids::REPAIR);
+    f.until("the repair preview", |f| f.shown(live::ids::REPAIR_CONFIRM));
+    f.click_stale(live::ids::REPAIR_CONFIRM);
+    for _ in 0..5 {
+        f.until("a tick", |_| true);
+    }
+    assert!(
+        !calls(f.world())
+            .iter()
+            .any(|c| c.starts_with("repair.confirm"))
+    );
+    assert!(f.shown(live::ids::REPAIR_CONFIRM));
+}
+
+#[test]
+fn an_unknown_outcome_offers_a_working_resume_that_reaches_verified() {
+    let mut f = flow::Flow::new();
+    f.world().lock().unwrap().repair_hold = true;
+    f.open_repair();
+    f.click(live::ids::REPAIR);
+    f.until("the repair preview", |f| f.shown(live::ids::REPAIR_CONFIRM));
+    f.click(live::ids::REPAIR_CONFIRM);
+    f.until("the wait for the new agent", |f| {
+        f.message().contains("Waiting for the new instance")
+    });
+    f.advance_clock(100_000);
+    f.until("the unknown outcome", |f| {
+        f.message().contains("Outcome unknown, resume required.")
+    });
+    assert!(f.enabled(live::ids::REPAIR_RESUME));
+    f.click(live::ids::REPAIR_RESUME);
+    f.until("the verified resume", |f| {
+        f.message().contains("Crosspane was repaired")
+    });
+    assert!(
+        calls(f.world())
+            .iter()
+            .any(|c| c.starts_with("repair.resume(status=Some("))
     );
 }
 

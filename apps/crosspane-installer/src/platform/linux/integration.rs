@@ -21,6 +21,7 @@ macro_rules! opaque_debug {
 
 mod domains;
 mod ports;
+mod repair;
 mod resume;
 mod uninstall;
 mod worker;
@@ -53,11 +54,12 @@ use crate::view::{ProgressGroup, ScreenId};
 
 pub use domains::{
     DomainFactory, Domains, FirewallReading, Firewalls, NativeFirewalls, NativePayloads,
-    NativeServices, NativeSupport, NoUninstaller, PayloadPreview, Payloads, RuleApply,
-    RulePresence, Services, Support, SupportOutcome, UninstallOffer, UninstallProgress,
-    Uninstaller,
+    NativeServices, NativeSupport, NoRepairer, NoUninstaller, PayloadPreview, Payloads,
+    RepairFinish, RepairOffer, RepairStep, Repairer, RuleApply, RulePresence, Services, Support,
+    SupportOutcome, UninstallOffer, UninstallProgress, Uninstaller,
 };
 pub use ports::{AgentSlot, Command, LinuxPractice, ProofBroker, SupportedAgentPort};
+pub use repair::NativeRepairer;
 pub use uninstall::NativeUninstaller;
 
 pub const SUPPORT: StepId = StepId(10);
@@ -355,9 +357,14 @@ impl LinuxPlatform {
             services: Box::new(NativeServices::new(native_io.clone(), native_env.clone())),
             firewalls: Box::new(NativeFirewalls::new(native_io.clone())),
             uninstaller: Box::new(uninstall::NativeUninstaller::new(
+                native_io.clone(),
+                native_env.clone(),
+                native_clock,
+                native_support.clone(),
+            )),
+            repairer: Box::new(repair::NativeRepairer::new(
                 native_io,
                 native_env,
-                native_clock,
                 native_support,
             )),
         });

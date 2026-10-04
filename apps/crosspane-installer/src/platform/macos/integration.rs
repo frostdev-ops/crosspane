@@ -46,7 +46,8 @@ use crate::view::{ProgressGroup, ScreenId};
 pub use domains::{
     Admitted, Agents, AudioError, AudioPackages, AudioPreview, AudioState, Blocked, DomainFactory,
     Domains, FixtureChild, FixtureLauncher, InstallApplied, InstallError, InstallPreview,
-    InstallState, Installs, Support, SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
+    InstallState, Installs, RepairFinish, RepairOffer, RepairStep, Repairer, Support,
+    SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
 };
 pub use native::MacProbes;
 use native::NativeEnv;

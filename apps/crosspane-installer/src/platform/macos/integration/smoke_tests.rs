@@ -357,3 +357,57 @@ fn removal_is_not_offered_when_the_install_cannot_be_read() {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
+
+fn maintenance_answer(s: &mut Setup, request: MaintenanceRequest) -> Vec<MaintenanceReport> {
+    s.platform.submit(NativeJob::Maintenance(request)).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let found: Vec<MaintenanceReport> = s
+            .platform
+            .poll()
+            .into_iter()
+            .filter_map(|r| match r {
+                NativeReport::Maintenance(m) => Some(m),
+                NativeReport::Step(_) => None,
+            })
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+        assert!(Instant::now() < end, "the worker never answered");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn repair_over_the_production_adapter_is_refused_with_guidance_when_the_install_cannot_be_read() {
+    let mut s = setup(26);
+    let id = MaintenanceId(1);
+    let reports = maintenance_answer(&mut s, MaintenanceRequest::Inspect { id });
+    let MaintenanceReport::Inspected {
+        repair: Availability::Unavailable(text),
+        ..
+    } = &reports[0]
+    else {
+        panic!("{reports:?}")
+    };
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert_eq!(reports.len(), 1, "no earlier repair to resume");
+    // A plan, a confirmation and a resume are refused the same way, and change nothing.
+    for request in [
+        MaintenanceRequest::PlanRepair { id, status: None },
+        MaintenanceRequest::ConfirmRepair {
+            id,
+            plan: 1,
+            revision: 3,
+            status: None,
+        },
+        MaintenanceRequest::ResumeRepair { id, status: None },
+    ] {
+        let reports = maintenance_answer(&mut s, request);
+        let MaintenanceReport::Refused { reason, .. } = &reports[0] else {
+            panic!("{reports:?}")
+        };
+        assert!(reason.contains("Nothing was changed"), "{reason}");
+    }
+}

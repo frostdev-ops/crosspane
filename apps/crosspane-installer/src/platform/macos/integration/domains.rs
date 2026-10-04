@@ -175,6 +175,75 @@ pub trait Uninstaller: Send {
     ) -> Result<UninstallResult, String>;
 }
 
+/// What compatible repair offers for the install on this Mac.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RepairOffer {
+    /// `Available` only when the producer's admission and plan say the install is compatible;
+    /// otherwise the typed guidance (for example "uninstall, then install").
+    pub repair: Availability,
+    /// A repair that is still unfinished in this window and can be resumed, as lines.
+    pub resumable: Option<Vec<String>>,
+}
+
+/// How a repair that went past planning ended, as the adapter proved it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairFinish {
+    pub outcome: crate::live::RepairOutcome,
+    pub lines: Vec<String>,
+    /// A resume can still make progress.
+    pub resumable: bool,
+}
+
+/// Where a repair stands after a stage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepairStep {
+    /// Everything that changes something is done; the new agent's health isn't proved yet. The
+    /// worker keeps asking for it, and ends the wait with `if_timed_out`.
+    Waiting {
+        detail: String,
+        if_timed_out: RepairFinish,
+        /// Closing the window now can't cut a change short, and what is left can still be
+        /// settled later: only the new agent's health is being watched, and an interrupted
+        /// repair is found again on the next visit. `false` while the old agent is stopped and
+        /// files are still to be replaced, or when nothing would be left to resume.
+        closeable: bool,
+    },
+    Finished(RepairFinish),
+}
+
+/// Receipt-bound compatible repair of an existing Crosspane install. Every call re-reads what it
+/// needs, and an adapter never repeats a change whose outcome is uncertain. An `Err` is a
+/// refusal with guidance: it means nothing was changed.
+pub trait Repairer: Send {
+    fn inspect(&mut self, deadline: &Deadline) -> RepairOffer;
+    /// Plan for `operation`, returning exactly the preview the person is asked to consent to.
+    fn plan(
+        &mut self,
+        status: Option<&AgentReply>,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<String, String>;
+    /// Consent to the plan made for `plan`. The adapter observes everything again (a preview's
+    /// evidence lives seconds), starts only if it still previews exactly what was shown, and
+    /// then runs every stage up to starting the new agent. `operation` is a fresh id for that
+    /// second observation.
+    fn confirm(
+        &mut self,
+        status: Option<&AgentReply>,
+        plan: OperationId,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<RepairStep, String>;
+    /// Look again for the new instance's health.
+    fn verify(&mut self, status: Option<&AgentReply>, deadline: &Deadline) -> RepairStep;
+    /// Resume a repair that is still unfinished in this window; one attempt, never a replay.
+    fn resume(
+        &mut self,
+        status: Option<&AgentReply>,
+        deadline: &Deadline,
+    ) -> Result<RepairFinish, String>;
+}
+
 /// Where the shared sound driver stands. Advisory: nothing here proves working audio, which only
 /// the practice steps (a real tone, heard) can show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +303,7 @@ pub struct Domains {
     pub audio: Box<dyn AudioPackages>,
     pub agents: Box<dyn Agents>,
     pub uninstaller: Box<dyn Uninstaller>,
+    pub repairer: Box<dyn Repairer>,
     /// The tutorial executable's admitted launcher, when the build can launch one.
     pub fixtures: Option<Box<dyn FixtureLauncher>>,
 }
@@ -347,6 +417,46 @@ impl Uninstaller for Blocked {
     }
 }
 
+impl Repairer for Blocked {
+    fn inspect(&mut self, _deadline: &Deadline) -> RepairOffer {
+        RepairOffer {
+            repair: Availability::Unavailable(self.reason.clone()),
+            resumable: None,
+        }
+    }
+    fn plan(
+        &mut self,
+        _status: Option<&AgentReply>,
+        _operation: OperationId,
+        _deadline: &Deadline,
+    ) -> Result<String, String> {
+        Err(self.reason.clone())
+    }
+    fn confirm(
+        &mut self,
+        _status: Option<&AgentReply>,
+        _plan: OperationId,
+        _operation: OperationId,
+        _deadline: &Deadline,
+    ) -> Result<RepairStep, String> {
+        Err(self.reason.clone())
+    }
+    fn verify(&mut self, _status: Option<&AgentReply>, _deadline: &Deadline) -> RepairStep {
+        RepairStep::Finished(RepairFinish {
+            outcome: crate::live::RepairOutcome::OutcomeUnknown,
+            lines: vec![self.reason.clone()],
+            resumable: false,
+        })
+    }
+    fn resume(
+        &mut self,
+        _status: Option<&AgentReply>,
+        _deadline: &Deadline,
+    ) -> Result<RepairFinish, String> {
+        Err(self.reason.clone())
+    }
+}
+
 impl AudioPackages for Blocked {
     fn detect(&mut self, _deadline: &Deadline) -> Result<AudioState, AudioError> {
         Err(AudioError::Blocked(self.reason.clone()))
@@ -376,7 +486,8 @@ impl Blocked {
             installs: Box::new(blocked.clone()),
             audio: Box::new(blocked.clone()),
             agents: Box::new(blocked.clone()),
-            uninstaller: Box::new(blocked),
+            uninstaller: Box::new(blocked.clone()),
+            repairer: Box::new(blocked),
             fixtures: None,
         }
     }

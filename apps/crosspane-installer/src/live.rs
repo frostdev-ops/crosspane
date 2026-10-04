@@ -125,6 +125,33 @@ pub enum MaintenanceRequest {
         id: MaintenanceId,
         follow_up: u16,
     },
+    /// Plan a compatible repair. `status` is a Status issued after the person asked for the
+    /// review, so the plan names what is running right now.
+    PlanRepair {
+        id: MaintenanceId,
+        status: Option<StatusEvidence>,
+    },
+    /// Confirm the repair preview numbered `plan` (the number its `RepairPlanned` report carried),
+    /// on view `revision`. The platform observes everything again with this `status` and starts
+    /// only if it still previews exactly what was shown; a stale `plan` is refused.
+    ConfirmRepair {
+        id: MaintenanceId,
+        plan: u64,
+        revision: u64,
+        status: Option<StatusEvidence>,
+    },
+    /// One more look at a repair that has started the new agent and waits for it to report
+    /// healthy. `status` is a Status issued after the previous attempt.
+    VerifyRepair {
+        id: MaintenanceId,
+        status: Option<StatusEvidence>,
+    },
+    /// Resume a repair that was interrupted or whose outcome is unknown: it re-checks what is
+    /// really there and never replays an uncertain change.
+    ResumeRepair {
+        id: MaintenanceId,
+        status: Option<StatusEvidence>,
+    },
 }
 
 /// A complete Status reply, delivered unchanged: its call id, original receipt time and source
@@ -202,6 +229,19 @@ pub enum MaintenanceOutcome {
     Failed,
 }
 
+/// How a repair that went past planning ended. Each variant says what is known, no more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairOutcome {
+    /// The new instance reported healthy and the repair is complete.
+    Verified,
+    /// The new instance reported healthy, but some backup or record cleanup is still left.
+    HealthVerifiedCleanupIncomplete,
+    /// What the last step did can't be proved. Nothing was retried; resume is required.
+    OutcomeUnknown,
+    /// A change was attempted and could not be completed. Backups and recovery files are kept.
+    RecoveryRetained,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MaintenanceReport {
     Inspected {
@@ -233,6 +273,34 @@ pub enum MaintenanceReport {
     Refused {
         id: MaintenanceId,
         reason: String,
+    },
+    /// The answer to `PlanRepair`: what a repair would replace and interrupt. `plan` numbers this
+    /// preview; only a confirmation naming it can start the repair.
+    RepairPlanned {
+        id: MaintenanceId,
+        plan: u64,
+        preview: String,
+    },
+    /// An earlier repair left a record that can be resumed (sent right after `Inspected`).
+    RepairResumable {
+        id: MaintenanceId,
+        lines: Vec<String>,
+    },
+    /// The repair waits for its next stage: the old agent's clean exit, or the new agent's
+    /// health. The controller keeps asking with `VerifyRepair` (with a fresh Status when it has
+    /// one) until this ends. `closeable` says closing the window now cuts no change short and
+    /// leaves an interrupted repair that the next visit can resume.
+    RepairWaiting {
+        id: MaintenanceId,
+        detail: String,
+        closeable: bool,
+    },
+    /// The repair ended. `resumable` says a Resume can still make progress.
+    RepairFinished {
+        id: MaintenanceId,
+        outcome: RepairOutcome,
+        lines: Vec<String>,
+        resumable: bool,
     },
 }
 
@@ -321,6 +389,8 @@ pub mod ids {
     pub const REMOVE_REVIEW: u16 = 5001;
     pub const REMOVE_CONFIRM: u16 = 5002;
     pub const REPAIR: u16 = 5005;
+    pub const REPAIR_CONFIRM: u16 = 5006;
+    pub const REPAIR_RESUME: u16 = 5007;
 
     pub fn retry(step: StepId) -> u16 {
         100 + step.0

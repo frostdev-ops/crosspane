@@ -38,17 +38,21 @@ use super::super::removal::{
     MacRemoval, MacRemovalObserver, RemovalApplyResult, RemovalChoices, RemovalCurrentReader,
     RemovalEffect, RemovalOutcome, RemovalPlan, RemovalPreview,
 };
+use super::super::repair::{
+    MacRepair, PendingRepair, RepairActivity, RepairEffect, RepairGuidance, RepairPreview,
+    RepairProgress, plan_guidance,
+};
 use super::super::transport::{CallerClock, MacAgentPort, SelectedAgent, SelectedLink};
 use super::domains::{
     Admitted, AdmittedInner, Agents, AudioError, AudioPackages, AudioPreview, AudioState,
     DomainFactory, Domains, FixtureChild, FixtureChildInner, FixtureLauncher, InstallApplied,
-    InstallError, InstallPreview, InstallState, Installs, Support, SupportOutcome, UninstallOffer,
-    UninstallResult, Uninstaller,
+    InstallError, InstallPreview, InstallState, Installs, RepairFinish, RepairOffer, RepairStep,
+    Repairer, Support, SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
 };
 use crate::agent_contract::{
     AgentCall, AgentPort, AgentReply, DecodedReply, InstallerRequest, StatusAdmission,
 };
-use crate::live::{Availability, MaintenanceOutcome, RemovalChoice};
+use crate::live::{Availability, MaintenanceOutcome, RemovalChoice, RepairOutcome as Shown};
 use crate::view::ToggleRole;
 
 /// The probes a production build must bring: the foundation provides none of the first two.
@@ -161,6 +165,7 @@ pub fn domains(env: NativeEnv) -> DomainFactory {
         audio: Box::new(NativeAudio::new(env.clone())),
         agents: Box::new(NativeAgents { env: env.clone() }),
         uninstaller: Box::new(NativeUninstaller::new(env.clone())),
+        repairer: Box::new(NativeRepairer::new(env.clone())),
         fixtures: Some(Box::new(NativeFixtures { env })),
     })
 }
@@ -853,28 +858,39 @@ impl RemovalCurrentReader for NativeReader {
         _original: &TrackedAgent,
         deadline: &Deadline,
     ) -> NativeResult<(SelectedAgent, AgentReply)> {
-        let selected = admit_selected(&self.env, None, deadline)?;
-        let mut port = MacAgentPort::new(selected.clone(), self.env.caller_clock())?;
-        let id = self.ids.fetch_add(1, Ordering::Relaxed);
-        let timeout_ms = deadline.remaining_ms()?.clamp(1, 5_000);
-        port.submit(AgentCall {
-            id,
-            request: InstallerRequest::Status,
-            timeout_ms,
-        })
-        .map_err(|_| NativeError::Unavailable)?;
-        loop {
-            deadline.check()?;
-            for reply in port.poll() {
-                if reply.id == id {
-                    return match reply.result {
-                        Ok(_) => Ok((selected, reply)),
-                        Err(_) => Err(NativeError::Unavailable),
-                    };
-                }
+        read_status(&self.env, &self.ids, deadline)
+    }
+}
+
+/// A fresh Status from the running agent, through a port admitted just for this read. The call
+/// ids come from `ids` and only ever increase, so the coordinators' monotonic receipts accept
+/// each read after the one before it.
+fn read_status(
+    env: &NativeEnv,
+    ids: &AtomicU64,
+    deadline: &Deadline,
+) -> NativeResult<(SelectedAgent, AgentReply)> {
+    let selected = admit_selected(env, None, deadline)?;
+    let mut port = MacAgentPort::new(selected.clone(), env.caller_clock())?;
+    let id = ids.fetch_add(1, Ordering::Relaxed);
+    let timeout_ms = deadline.remaining_ms()?.clamp(1, 5_000);
+    port.submit(AgentCall {
+        id,
+        request: InstallerRequest::Status,
+        timeout_ms,
+    })
+    .map_err(|_| NativeError::Unavailable)?;
+    loop {
+        deadline.check()?;
+        for reply in port.poll() {
+            if reply.id == id {
+                return match reply.result {
+                    Ok(_) => Ok((selected, reply)),
+                    Err(_) => Err(NativeError::Unavailable),
+                };
             }
-            thread::sleep(Duration::from_millis(5));
         }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1129,6 +1145,508 @@ impl Uninstaller for NativeUninstaller {
     }
 }
 
+// ---- repair -----------------------------------------------------------------------------------
+
+/// The coordinator's monotonic receipts need every Status to be newer than the one before it,
+/// across plan, apply and the later health look. All of a repair's own reads come from one
+/// counter, far above anything the controller issues.
+const REPAIR_IDS_BASE: u64 = 1 << 41;
+
+/// What the person was shown: the repair starts only if a fresh plan still has this basis.
+struct KeptRepair {
+    operation: OperationId,
+    effects: Vec<RepairEffect>,
+    activity: Option<RepairActivity>,
+}
+
+/// A repair whose change was dispatched and which waits for the next stage.
+struct ActiveRepair {
+    repair: MacRepair,
+    pending: PendingRepair,
+}
+
+pub struct NativeRepairer {
+    env: Arc<NativeEnv>,
+    kept: Option<KeptRepair>,
+    running: Option<ActiveRepair>,
+    ids: Arc<AtomicU64>,
+}
+
+impl NativeRepairer {
+    pub fn new(env: Arc<NativeEnv>) -> Self {
+        Self {
+            env,
+            kept: None,
+            running: None,
+            ids: Arc::new(AtomicU64::new(REPAIR_IDS_BASE)),
+        }
+    }
+
+    fn admit(&self, deadline: &Deadline) -> Result<MacRepair, String> {
+        let io = self.env.io().map_err(admission_text)?;
+        MacRepair::admit(
+            io,
+            self.env.inventory.clone(),
+            self.env.probes.approval.clone(),
+            deadline,
+        )
+        .map_err(admission_text)
+    }
+
+    /// The Status the click carried when it is usable, else one read now.
+    fn current(
+        &self,
+        status: Option<&AgentReply>,
+        deadline: &Deadline,
+    ) -> Option<(SelectedAgent, AgentReply)> {
+        match status.filter(|r| {
+            matches!(
+                r.result,
+                Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+            )
+        }) {
+            Some(reply) => {
+                let selected = admit_selected(&self.env, None, deadline).ok()?;
+                Some((selected, reply.clone()))
+            }
+            None => read_status(&self.env, &self.ids, deadline).ok(),
+        }
+    }
+}
+
+fn admission_text(error: NativeError) -> String {
+    match error {
+        NativeError::Invalid
+        | NativeError::Foreign
+        | NativeError::Unsupported
+        | NativeError::Oversize => {
+            "The Crosspane files next to this installer don't match what this build approved, or \
+             this Mac can't install them. Nothing was changed."
+                .to_owned()
+        }
+        _ => "Crosspane's install can't be read just now. Nothing was changed.".to_owned(),
+    }
+}
+
+/// Why nothing was changed, with the coordinator's own next step.
+fn guidance_text(error: NativeError) -> String {
+    let guidance = plan_guidance(error);
+    let lead = match guidance {
+        RepairGuidance::EnableManually => {
+            "Crosspane's sign-in item is turned off, and repair never turns it back on."
+        }
+        RepairGuidance::RestoreOrRemoveFileOrUninstallThenInstall => {
+            "Something where Crosspane installs wasn't put there by Crosspane, or no longer \
+             matches what setup created."
+        }
+        RepairGuidance::UninstallThenInstall => {
+            "Repair needs the Crosspane that setup installed to be running, with its files as \
+             setup left them. It isn't, or they aren't."
+        }
+        RepairGuidance::ReDetect => "Crosspane's install couldn't be read just now.",
+    };
+    format!("{lead} {} Nothing was changed.", guidance.message())
+}
+
+/// The person-readable preview of the typed full-reinstall effects.
+fn render_repair(preview: &RepairPreview) -> String {
+    let activity = match &preview.activity {
+        Some(a) => {
+            let mut busy = Vec::new();
+            if a.input_active {
+                busy.push("shared keyboard and mouse".to_owned());
+            }
+            if a.projections > 0 {
+                busy.push(format!("{} shared window(s)", a.projections));
+            }
+            if a.audio_peers > 0 {
+                busy.push("shared sound".to_owned());
+            }
+            if busy.is_empty() {
+                "nothing was in use when this was checked".to_owned()
+            } else {
+                format!("this ends: {}", busy.join(", "))
+            }
+        }
+        None => "whether anything is in use couldn't be checked, so anything in progress may end"
+            .to_owned(),
+    };
+    format!(
+        "Repair puts back Crosspane's app, its command-line tool and its sign-in item as this \
+         installer ships them. Crosspane is stopped, then started again; {activity}. Your \
+         settings, identity, pairings and permissions are kept, and files Crosspane didn't \
+         create are left alone. The previous copy is kept until the new Crosspane reports \
+         healthy."
+    )
+}
+
+fn unfinished_text() -> String {
+    "A repair is still unfinished in this window. Resume it first. Nothing was changed.".to_owned()
+}
+
+fn unknown_finish(detail: &str, resumable: bool) -> RepairFinish {
+    RepairFinish {
+        outcome: Shown::OutcomeUnknown,
+        lines: vec![
+            detail.to_owned(),
+            "Nothing was retried. Closing and reopening setup checks the install again, and \
+             removing Crosspane then installing it again is always available."
+                .to_owned(),
+        ],
+        resumable,
+    }
+}
+
+/// A repair that was dispatched and can't be finished: the previous copy is kept.
+fn retained_finish(pending: &PendingRepair) -> RepairFinish {
+    let mut lines = vec![
+        "The repair stopped before it could finish. Nothing already settled was repeated."
+            .to_owned(),
+    ];
+    if let Some(error) = pending.error() {
+        lines.push(
+            match error {
+                NativeError::Timeout | NativeError::Cancelled => "A step ran out of time.",
+                NativeError::OutcomeUnknown => "A step may have completed, so it was not repeated.",
+                NativeError::Refused | NativeError::Foreign => {
+                    "What was checked changed before it could be used."
+                }
+                _ => "A step couldn't be completed.",
+            }
+            .to_owned(),
+        );
+    }
+    lines.push("The previous copy of Crosspane is kept so nothing is lost.".to_owned());
+    if let Some(path) = pending.retained_prior() {
+        lines.push(format!("Kept: {}", path.display()));
+    }
+    RepairFinish {
+        outcome: Shown::RecoveryRetained,
+        lines,
+        resumable: false,
+    }
+}
+
+/// The old agent was booted out and its clean exit couldn't be settled: nothing was replaced,
+/// and Crosspane may be down.
+fn stopped_retained(pending: &PendingRepair) -> RepairFinish {
+    let mut finish = retained_finish(pending);
+    finish.lines.insert(
+        1,
+        "Crosspane was stopped and may not be running. Start it again from your Applications \
+         folder, or sign out and in again."
+            .to_owned(),
+    );
+    finish
+}
+
+fn health_finish(progress: RepairProgress, pending: &PendingRepair) -> RepairFinish {
+    match progress {
+        RepairProgress::Verified => RepairFinish {
+            outcome: Shown::Verified,
+            lines: vec![
+                "The new Crosspane reported healthy, and the previous copy was retired.".to_owned(),
+                "Crosspane's app, command-line tool and sign-in item were put back.".to_owned(),
+            ],
+            resumable: false,
+        },
+        RepairProgress::HealthVerifiedCleanupIncomplete => {
+            let mut lines = vec![
+                "The new Crosspane reported healthy. Some cleanup of the previous copy is still \
+                 left; it does no harm."
+                    .to_owned(),
+            ];
+            if let Some(path) = pending.retained_prior() {
+                lines.push(format!("Kept: {}", path.display()));
+            }
+            RepairFinish {
+                outcome: Shown::HealthVerifiedCleanupIncomplete,
+                lines,
+                resumable: false,
+            }
+        }
+        _ => retained_finish(pending),
+    }
+}
+
+impl NativeRepairer {
+    /// A Mac repair is never closeable while it waits: its pending state lives only in this
+    /// window (nothing on disk resumes it), and the old agent may already be stopped.
+    fn waiting(&self, detail: &str, if_timed_out: RepairFinish) -> RepairStep {
+        RepairStep::Waiting {
+            detail: detail.to_owned(),
+            if_timed_out,
+            closeable: false,
+        }
+    }
+
+    /// The old agent was booted out and hasn't been seen to exit cleanly: nothing was replaced.
+    fn wait_for_clean_stop(&self, detail: &str) -> RepairStep {
+        let mut if_timed_out = unknown_finish(
+            "The old Crosspane didn't exit cleanly in time, so nothing was replaced.",
+            true,
+        );
+        if_timed_out.lines.insert(
+            1,
+            "Crosspane was stopped and may not be running. Start it again from your \
+             Applications folder, or sign out and in again."
+                .to_owned(),
+        );
+        self.waiting(detail, if_timed_out)
+    }
+
+    fn wait_for_health(&self) -> RepairStep {
+        self.waiting(
+            "Crosspane was started again. Waiting for the new instance to report healthy…",
+            unknown_finish(
+                "The new Crosspane didn't report healthy in time, so what the repair did can't be \
+                 proved.",
+                true,
+            ),
+        )
+    }
+}
+
+impl Repairer for NativeRepairer {
+    fn inspect(&mut self, deadline: &Deadline) -> RepairOffer {
+        self.kept = None;
+        if self.running.is_some() {
+            return RepairOffer {
+                repair: Availability::Unavailable(unfinished_text()),
+                resumable: Some(vec![
+                    "A repair started the new Crosspane and is waiting for it to report healthy."
+                        .to_owned(),
+                ]),
+            };
+        }
+        let unavailable = |text: String| RepairOffer {
+            repair: Availability::Unavailable(text),
+            resumable: None,
+        };
+        let mut repair = match self.admit(deadline) {
+            Ok(repair) => repair,
+            Err(text) => return unavailable(text),
+        };
+        // Repair needs the running agent: it is read now, and judged by the coordinator's plan.
+        let current = read_status(&self.env, &self.ids, deadline).ok();
+        let current_ref = current.as_ref().map(|(agent, reply)| (agent, reply));
+        match repair.plan(1, 1, current_ref, deadline) {
+            Ok(_) => RepairOffer {
+                repair: Availability::Available,
+                resumable: None,
+            },
+            Err(error) => unavailable(guidance_text(error)),
+        }
+    }
+
+    fn plan(
+        &mut self,
+        status: Option<&AgentReply>,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<String, String> {
+        self.kept = None;
+        if self.running.is_some() {
+            return Err(unfinished_text());
+        }
+        let mut repair = self.admit(deadline)?;
+        let current = self.current(status, deadline);
+        let current_ref = current.as_ref().map(|(agent, reply)| (agent, reply));
+        let plan = repair
+            .plan(operation.0, operation.0, current_ref, deadline)
+            .map_err(guidance_text)?;
+        let preview = plan.preview();
+        let text = render_repair(preview);
+        self.kept = Some(KeptRepair {
+            operation,
+            effects: preview.effects.clone(),
+            activity: preview.activity.clone(),
+        });
+        Ok(text)
+    }
+
+    fn confirm(
+        &mut self,
+        status: Option<&AgentReply>,
+        plan: OperationId,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<RepairStep, String> {
+        let kept = self
+            .kept
+            .take()
+            .filter(|k| k.operation == plan)
+            .ok_or_else(|| {
+                "That repair preview is no longer current. Review the repair again. Nothing was \
+                 changed."
+                    .to_owned()
+            })?;
+        if self.running.is_some() {
+            return Err(unfinished_text());
+        }
+        // A preview's evidence lives seconds and a person takes longer to read it, so everything
+        // is observed again now and the repair starts only if it still previews what was shown.
+        let mut repair = self.admit(deadline)?;
+        let not_answering = || {
+            "Crosspane's running agent didn't answer just now, so the repair can't start. Nothing \
+             was changed. Review the repair again."
+                .to_owned()
+        };
+        let (selected, reply) = self.current(status, deadline).ok_or_else(not_answering)?;
+        let fresh = repair
+            .plan(
+                operation.0,
+                operation.0,
+                Some((&selected, &reply)),
+                deadline,
+            )
+            .map_err(guidance_text)?;
+        let preview = fresh.preview();
+        if preview.effects != kept.effects
+            || (kept.activity.is_some() && preview.activity != kept.activity)
+        {
+            return Err(
+                "Things changed since the preview was shown. Nothing was changed; review the \
+                 repair again."
+                    .to_owned(),
+            );
+        }
+        let consent = fresh
+            .consent(operation.0, operation.0, true)
+            .map_err(guidance_text)?;
+        // The apply takes a Status newer than the one the plan used: read the next one now.
+        let (selected, reply) =
+            read_status(&self.env, &self.ids, deadline).map_err(|_| not_answering())?;
+        let mut pending = match repair.apply(fresh, consent, Some((&selected, &reply)), deadline) {
+            Ok(pending) => pending,
+            // A call that ran out of time may have dispatched: it is never assumed unchanged.
+            Err(NativeError::Timeout | NativeError::Cancelled | NativeError::OutcomeUnknown) => {
+                return Ok(RepairStep::Finished(unknown_finish(
+                    "The repair was cut short, and what it did can't be proved.",
+                    false,
+                )));
+            }
+            // Stale or foreign events are refused before any probe, command or file change.
+            Err(_) => {
+                return Err("Things changed since the preview was shown. Nothing was \
+                                changed; review the repair again."
+                    .to_owned());
+            }
+        };
+        // The old agent stops first; wait for that within this same bounded stage.
+        let mut stop_failed = false;
+        while pending.progress() == RepairProgress::WaitingForCleanStop {
+            if deadline.check().is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+            if repair.continue_clean_stop(&mut pending, deadline).is_err() {
+                stop_failed = true;
+                break;
+            }
+        }
+        match pending.progress() {
+            RepairProgress::WaitingForCleanStop => {
+                let step = self.wait_for_clean_stop(
+                    "Crosspane was stopped. Waiting for it to exit cleanly before any file is \
+                     replaced…",
+                );
+                self.running = Some(ActiveRepair { repair, pending });
+                Ok(step)
+            }
+            RepairProgress::Published => {
+                let step = self.wait_for_health();
+                self.running = Some(ActiveRepair { repair, pending });
+                Ok(step)
+            }
+            _ if stop_failed => Ok(RepairStep::Finished(stopped_retained(&pending))),
+            progress => Ok(RepairStep::Finished(health_finish(progress, &pending))),
+        }
+    }
+
+    fn verify(&mut self, _status: Option<&AgentReply>, deadline: &Deadline) -> RepairStep {
+        let Some(mut active) = self.running.take() else {
+            return RepairStep::Finished(unknown_finish(
+                "No repair is running in this window any more.",
+                false,
+            ));
+        };
+        if active.pending.progress() == RepairProgress::WaitingForCleanStop {
+            if active
+                .repair
+                .continue_clean_stop(&mut active.pending, deadline)
+                .is_err()
+            {
+                return RepairStep::Finished(stopped_retained(&active.pending));
+            }
+            if active.pending.progress() == RepairProgress::WaitingForCleanStop {
+                let step = self.wait_for_clean_stop(
+                    "Waiting for the stopped Crosspane to exit cleanly before any file is \
+                     replaced…",
+                );
+                self.running = Some(active);
+                return step;
+            }
+        }
+        if active.pending.progress() != RepairProgress::Published {
+            let progress = active.pending.progress();
+            return RepairStep::Finished(health_finish(progress, &active.pending));
+        }
+        // The new instance is judged from a Status read now, newer than every earlier receipt.
+        // The controller's own call ids sit below the coordinator's watermark, so they are not used.
+        let looked = read_status(&self.env, &self.ids, deadline)
+            .ok()
+            .and_then(|(agent, reply)| {
+                active
+                    .repair
+                    .expect_health(&mut active.pending, reply.id)
+                    .ok()?;
+                Some((agent, reply))
+            });
+        let Some((selected, reply)) = looked else {
+            let step = self.wait_for_health();
+            self.running = Some(active);
+            return step;
+        };
+        match active
+            .repair
+            .observe(&mut active.pending, &selected, reply, deadline)
+        {
+            Ok(completion) => {
+                RepairStep::Finished(health_finish(completion.progress, &active.pending))
+            }
+            // An old instance still answering, or a Status that isn't health yet: look again.
+            Err(_) => {
+                let step = self.wait_for_health();
+                self.running = Some(active);
+                step
+            }
+        }
+    }
+
+    fn resume(
+        &mut self,
+        status: Option<&AgentReply>,
+        deadline: &Deadline,
+    ) -> Result<RepairFinish, String> {
+        if self.running.is_none() {
+            return Err(
+                "There is no earlier repair to resume in this window. Closing and \
+                        reopening setup checks the install again; removing Crosspane and \
+                        installing it again is always available. Nothing was changed."
+                    .to_owned(),
+            );
+        }
+        Ok(match self.verify(status, deadline) {
+            RepairStep::Finished(finish) => finish,
+            RepairStep::Waiting { .. } => unknown_finish(
+                "The new Crosspane hasn't reported healthy yet, and nothing was repeated.",
+                true,
+            ),
+        })
+    }
+}
+
 // ---- practice fixture -------------------------------------------------------------------------
 
 pub struct NativeFixtures {
@@ -1176,5 +1694,72 @@ impl std::fmt::Debug for MacProbes {
 impl std::fmt::Debug for NativeEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("NativeEnv")
+    }
+}
+
+#[cfg(test)]
+mod repair_wording_tests {
+    use super::*;
+
+    #[test]
+    fn every_refusal_carries_the_coordinators_own_next_step_and_says_nothing_changed() {
+        for (error, tail) in [
+            (
+                NativeError::Unsupported,
+                "Enable the agent manually before repair",
+            ),
+            (
+                NativeError::Foreign,
+                "Restore or remove the file, or uninstall then install.",
+            ),
+            (
+                NativeError::Refused,
+                "Uninstall (keeping identity by default), then install.",
+            ),
+            (
+                NativeError::Timeout,
+                "Inspect the retained installation and obtain fresh observations.",
+            ),
+        ] {
+            let text = guidance_text(error);
+            assert!(text.contains(tail), "{error:?}: {text}");
+            assert!(text.ends_with("Nothing was changed."), "{error:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn the_preview_names_the_interruption_and_fits_the_view() {
+        let effects = vec![RepairEffect::BootstrapSelectedAgent];
+        let idle = render_repair(&RepairPreview {
+            effects: effects.clone(),
+            activity: Some(RepairActivity {
+                input_active: false,
+                projections: 0,
+                audio_peers: 0,
+            }),
+        });
+        assert!(idle.contains("nothing was in use"), "{idle}");
+        let busy = render_repair(&RepairPreview {
+            effects: effects.clone(),
+            activity: Some(RepairActivity {
+                input_active: true,
+                projections: 2,
+                audio_peers: 1,
+            }),
+        });
+        assert!(
+            busy.contains("this ends: shared keyboard and mouse, 2 shared window(s), shared sound"),
+            "{busy}"
+        );
+        let blind = render_repair(&RepairPreview {
+            effects,
+            activity: None,
+        });
+        assert!(blind.contains("couldn't be checked"), "{blind}");
+        for text in [idle, busy, blind] {
+            assert!(text.len() <= 600, "{} bytes: {text}", text.len());
+            assert!(text.contains("stopped, then started again"));
+            assert!(text.contains("pairings and permissions are kept"));
+        }
     }
 }

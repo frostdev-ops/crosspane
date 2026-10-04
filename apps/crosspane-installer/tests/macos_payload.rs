@@ -460,8 +460,12 @@ struct Fixture {
 }
 impl Fixture {
     fn new(installed: bool) -> Self {
+        // The start time keeps names unique when a reused pid meets a leftover directory.
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         let scratch = Scratch::create(format!(
-            "cp-c1-{}-{}",
+            "cp-c1-{}-{started}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))

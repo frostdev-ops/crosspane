@@ -15,9 +15,9 @@ use crosspane_installer::fixture::{
 };
 use crosspane_installer::gui::{InstallerController, ShellEffect};
 use crosspane_installer::live::{
-    self, Clock, FixtureReadiness, LiveController, MaintenanceReport, MaintenanceRequest,
-    NativeJob, NativeOutcome, NativeRefusal, NativeReport, NativeStep, Platform,
-    PlatformDescription, PracticeFixtures, StepReport, ids,
+    self, Clock, FixtureReadiness, LiveController, MaintenanceId, MaintenanceReport,
+    MaintenanceRequest, NativeJob, NativeOutcome, NativeRefusal, NativeReport, NativeStep,
+    Platform, PlatformDescription, PracticeFixtures, RepairOutcome, StepReport, ids,
 };
 use crosspane_installer::tutorial_flow::{HumanConfirmation, TutorialRole, TutorialSourcePolicy};
 use crosspane_installer::view::*;
@@ -1988,4 +1988,702 @@ fn an_answer_that_does_not_belong_to_the_jobs_stage_fails_it_instead_of_hanging(
     );
     assert_eq!(h.row(PAYLOAD).state, RowState::Failed);
     assert!(h.button(ids::retry(PAYLOAD)).is_some_and(|b| b.enabled));
+}
+
+// ---- compatible repair ------------------------------------------------------------------------
+
+fn maintenance_jobs(h: &mut H) -> Vec<MaintenanceRequest> {
+    h.take_jobs()
+        .into_iter()
+        .filter_map(|j| match j {
+            NativeJob::Maintenance(m) => Some(m),
+            _ => None,
+        })
+        .collect()
+}
+
+fn platform_says(h: &mut H, report: MaintenanceReport) {
+    h.native
+        .borrow_mut()
+        .reports
+        .push(NativeReport::Maintenance(report));
+    h.tick();
+}
+
+/// Open "Remove or repair" and answer its inspection with `repair`.
+fn open_repair(h: &mut H, repair: live::Availability) -> MaintenanceId {
+    h.tick();
+    h.click(ids::REMOVE_OR_REPAIR);
+    let id = maintenance_jobs(h)
+        .into_iter()
+        .find_map(|m| match m {
+            MaintenanceRequest::Inspect { id } => Some(id),
+            _ => None,
+        })
+        .expect("inspect");
+    platform_says(
+        h,
+        MaintenanceReport::Inspected {
+            id,
+            uninstall: live::Availability::Available,
+            repair,
+            choices: Vec::new(),
+        },
+    );
+    id
+}
+
+/// Click Review, answer the Status it waits for, and show the platform's preview.
+fn review_repair(h: &mut H, id: MaintenanceId, plan: u64) {
+    h.click(ids::REPAIR);
+    assert!(
+        maintenance_jobs(h).is_empty(),
+        "the review waits for a Status issued after the click"
+    );
+    h.status_reply();
+    let requests = maintenance_jobs(h);
+    assert!(
+        requests.iter().any(
+            |m| matches!(m, MaintenanceRequest::PlanRepair { id: i, status: Some(_) } if *i == id)
+        ),
+        "{requests:?}"
+    );
+    platform_says(
+        h,
+        MaintenanceReport::RepairPlanned {
+            id,
+            plan,
+            preview: "Repair puts back bin/crosspane-agent (different). Crosspane is stopped, then started again.".into(),
+        },
+    );
+}
+
+#[test]
+fn repair_is_not_callable_unless_the_platform_says_it_is_available() {
+    for repair in [
+        live::Availability::NotAvailableYet("Not in this build.".into()),
+        live::Availability::Unavailable(
+            "Some files weren't put there by Crosspane. Remove Crosspane and install it again."
+                .into(),
+        ),
+    ] {
+        let mut h = H::new();
+        let reason = match &repair {
+            live::Availability::NotAvailableYet(r) | live::Availability::Unavailable(r) => {
+                r.clone()
+            }
+            live::Availability::Available => unreachable!(),
+        };
+        open_repair(&mut h, repair);
+        assert!(!h.button(ids::REPAIR).unwrap().enabled);
+        assert!(h.view().message.contains(&reason), "{}", h.view().message);
+        // Even a forced click starts nothing.
+        let revision = h.view().revision;
+        h.act(revision, WizardIntent::Button(ids::REPAIR));
+        h.advance(13_000);
+        h.tick();
+        assert!(
+            maintenance_jobs(&mut h)
+                .iter()
+                .all(|m| !matches!(m, MaintenanceRequest::PlanRepair { .. }))
+        );
+        assert!(h.button(ids::REPAIR_CONFIRM).is_none());
+        assert!(h.button(ids::REPAIR_RESUME).is_none());
+    }
+}
+
+#[test]
+fn repair_is_planned_previewed_and_confirmed_by_plan_and_view_revision() {
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    assert!(h.button(ids::REPAIR).unwrap().enabled);
+    assert!(
+        h.button(ids::REPAIR_CONFIRM).is_none(),
+        "no consent without a preview"
+    );
+    review_repair(&mut h, id, 77);
+    assert!(
+        h.view()
+            .message
+            .contains("Repair puts back bin/crosspane-agent")
+    );
+    assert!(!h.button(ids::REPAIR).unwrap().enabled);
+    assert!(
+        h.button(ids::REMOVE_REVIEW).is_none(),
+        "removal isn't offered over a repair"
+    );
+    let revision = h.view().revision;
+    // A click on a view that is no longer current is dropped.
+    h.act(revision - 1, WizardIntent::Button(ids::REPAIR_CONFIRM));
+    h.advance(13_000);
+    h.tick();
+    assert!(
+        maintenance_jobs(&mut h)
+            .iter()
+            .all(|m| !matches!(m, MaintenanceRequest::ConfirmRepair { .. }))
+    );
+    // The real click carries the plan number and the revision, and a Status issued after it.
+    h.click(ids::REPAIR_CONFIRM);
+    assert!(
+        maintenance_jobs(&mut h).is_empty(),
+        "the confirmation waits for a fresh Status"
+    );
+    h.status_reply();
+    let requests = maintenance_jobs(&mut h);
+    assert!(
+        requests.iter().any(|m| matches!(
+            m,
+            MaintenanceRequest::ConfirmRepair { id: i, plan: 77, revision: r, status: Some(_) }
+                if *i == id && *r == revision
+        )),
+        "{requests:?}"
+    );
+    // While the change runs, nothing can be repeated or abandoned.
+    assert!(h.view().message.contains("Repairing Crosspane"));
+    assert!(h.button(ids::REPAIR_CONFIRM).is_none());
+    assert!(h.button(ids::CLOSE).is_none());
+    assert!(h.button(ids::BACK).is_none());
+    assert!(!h.c.request_close());
+    assert!(h.view().message.contains("Wait for the current change"));
+    assert!(!h.native.borrow().shutdown);
+}
+
+#[test]
+fn a_repair_click_that_gets_no_status_goes_ahead_without_one() {
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    h.click(ids::REPAIR);
+    h.advance(13_000);
+    h.tick();
+    let requests = maintenance_jobs(&mut h);
+    assert!(
+        requests.iter().any(
+            |m| matches!(m, MaintenanceRequest::PlanRepair { id: i, status: None } if *i == id)
+        ),
+        "{requests:?}"
+    );
+}
+
+#[test]
+fn the_repair_watches_the_new_agent_with_fresh_statuses_and_a_window_can_close_meanwhile() {
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    review_repair(&mut h, id, 5);
+    h.click(ids::REPAIR_CONFIRM);
+    h.status_reply();
+    maintenance_jobs(&mut h);
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairWaiting {
+            id,
+            detail: "Crosspane was started again. Waiting for the new instance…".into(),
+            closeable: true,
+        },
+    );
+    assert!(h.view().message.contains("Waiting for the new instance"));
+    // Nothing is changing now: the window can close, and Back waits for the verdict.
+    assert!(h.button(ids::CLOSE).is_some_and(|b| b.enabled));
+    assert!(!h.button(ids::BACK).unwrap().enabled);
+    // Each look is a Status issued after the previous one, offered with the repair's id.
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        h.advance(600);
+        h.status_reply();
+        let ask: Vec<_> = maintenance_jobs(&mut h)
+            .into_iter()
+            .filter_map(|m| match m {
+                MaintenanceRequest::VerifyRepair {
+                    id: i,
+                    status: Some(s),
+                } if i == id => Some(format!("{s:?}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ask.len(), 1, "one look per fresh Status");
+        seen.push(ask);
+        platform_says(
+            &mut h,
+            MaintenanceReport::RepairWaiting {
+                id,
+                detail: "Still waiting…".into(),
+                closeable: true,
+            },
+        );
+    }
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairFinished {
+            id,
+            outcome: RepairOutcome::Verified,
+            lines: vec!["1 file(s) were put back.".into()],
+            resumable: false,
+        },
+    );
+    assert!(h.view().message.contains("Crosspane was repaired"));
+    assert!(h.view().message.contains("1 file(s) were put back."));
+    // No more looks once it ended.
+    h.advance(600);
+    h.tick();
+    assert!(!h.has_call(|r| *r == InstallerRequest::Status));
+    assert!(
+        maintenance_jobs(&mut h)
+            .iter()
+            .all(|m| !matches!(m, MaintenanceRequest::VerifyRepair { .. }))
+    );
+}
+
+#[test]
+fn closing_the_window_while_the_new_agent_is_watched_is_allowed_and_leaves_nothing_working() {
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    review_repair(&mut h, id, 5);
+    h.click(ids::REPAIR_CONFIRM);
+    h.status_reply();
+    maintenance_jobs(&mut h);
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairWaiting {
+            id,
+            detail: "Waiting…".into(),
+            closeable: true,
+        },
+    );
+    assert!(
+        h.c.request_close(),
+        "nothing is changing, so the window closes"
+    );
+    assert!(h.native.borrow().shutdown);
+}
+
+#[test]
+fn each_typed_repair_outcome_reaches_the_view_and_offers_resume_only_when_it_can_help() {
+    for (outcome, head, resume) in [
+        (RepairOutcome::Verified, "Crosspane was repaired", false),
+        (
+            RepairOutcome::HealthVerifiedCleanupIncomplete,
+            "Repaired: health verified, cleanup incomplete.",
+            false,
+        ),
+        (
+            RepairOutcome::OutcomeUnknown,
+            "Outcome unknown, resume required.",
+            true,
+        ),
+        (
+            RepairOutcome::RecoveryRetained,
+            "The repair didn't finish. Backups and recovery files were kept.",
+            true,
+        ),
+    ] {
+        let mut h = H::new();
+        let id = open_repair(&mut h, live::Availability::Available);
+        review_repair(&mut h, id, 5);
+        h.click(ids::REPAIR_CONFIRM);
+        h.status_reply();
+        maintenance_jobs(&mut h);
+        platform_says(
+            &mut h,
+            MaintenanceReport::RepairFinished {
+                id,
+                outcome,
+                lines: vec!["Kept: the old backups.".into()],
+                resumable: resume,
+            },
+        );
+        let message = h.view().message.clone();
+        assert!(message.contains(head), "{outcome:?}: {message}");
+        assert!(message.contains("Kept: the old backups."), "{outcome:?}");
+        assert_eq!(
+            h.button(ids::REPAIR_RESUME).is_some_and(|b| b.enabled),
+            resume,
+            "{outcome:?}"
+        );
+        assert!(h.button(ids::REPAIR_CONFIRM).is_none());
+        assert!(
+            h.button(ids::CLOSE).is_some_and(|b| b.enabled),
+            "nothing is left working"
+        );
+        if resume {
+            // Resume asks for a Status issued after the click, then names the repair.
+            h.click(ids::REPAIR_RESUME);
+            h.status_reply();
+            let requests = maintenance_jobs(&mut h);
+            assert!(
+                requests.iter().any(|m| matches!(
+                    m,
+                    MaintenanceRequest::ResumeRepair { id: i, status: Some(_) } if *i == id
+                )),
+                "{requests:?}"
+            );
+            assert!(h.view().message.contains("Repairing Crosspane"));
+            platform_says(
+                &mut h,
+                MaintenanceReport::RepairFinished {
+                    id,
+                    outcome: RepairOutcome::Verified,
+                    lines: Vec::new(),
+                    resumable: false,
+                },
+            );
+            assert!(h.view().message.contains("Crosspane was repaired"));
+            assert!(h.button(ids::REPAIR_RESUME).is_none());
+        }
+    }
+}
+
+#[test]
+fn an_interrupted_repair_found_on_inspection_offers_resume_and_never_a_new_repair() {
+    let mut h = H::new();
+    let id = open_repair(
+        &mut h,
+        live::Availability::Unavailable("An earlier repair didn't finish.".into()),
+    );
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairResumable {
+            id,
+            lines: vec!["It stopped while files were being replaced.".into()],
+        },
+    );
+    assert!(h.button(ids::REPAIR_RESUME).is_some_and(|b| b.enabled));
+    assert!(!h.button(ids::REPAIR).unwrap().enabled);
+    assert!(
+        h.button(ids::REMOVE_REVIEW).is_some_and(|b| b.enabled),
+        "removal stays the way out when a resume can't settle the record"
+    );
+    let message = h.view().message.clone();
+    assert!(
+        message.contains("An earlier repair didn't finish"),
+        "{message}"
+    );
+    // One change at a time: while a removal is reviewed, Resume waits.
+    {
+        let mut h = H::new();
+        let id = open_repair(
+            &mut h,
+            live::Availability::Unavailable("An earlier repair didn't finish.".into()),
+        );
+        platform_says(
+            &mut h,
+            MaintenanceReport::RepairResumable {
+                id,
+                lines: vec!["It stopped while files were being replaced.".into()],
+            },
+        );
+        h.click(ids::REMOVE_REVIEW);
+        assert!(!h.button(ids::REPAIR_RESUME).unwrap().enabled);
+    }
+    assert!(message.contains("It stopped while files were being replaced."));
+    h.click(ids::REPAIR_RESUME);
+    h.status_reply();
+    assert!(
+        maintenance_jobs(&mut h)
+            .iter()
+            .any(|m| matches!(m, MaintenanceRequest::ResumeRepair { .. }))
+    );
+}
+
+#[test]
+fn a_refusal_or_a_busy_platform_never_leaves_a_repair_working() {
+    // The platform refuses the confirmation (the install changed, say).
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    review_repair(&mut h, id, 5);
+    h.click(ids::REPAIR_CONFIRM);
+    h.status_reply();
+    maintenance_jobs(&mut h);
+    platform_says(
+        &mut h,
+        MaintenanceReport::Refused {
+            id,
+            reason: "Things changed since the preview. Nothing was changed.".into(),
+        },
+    );
+    assert!(
+        h.view()
+            .message
+            .contains("Things changed since the preview")
+    );
+    assert!(h.button(ids::REPAIR_CONFIRM).is_none());
+    assert!(h.button(ids::CLOSE).is_some_and(|b| b.enabled));
+    assert!(h.button(ids::BACK).is_some_and(|b| b.enabled));
+    assert!(h.c.request_close(), "nothing is running");
+
+    // The platform can't even take the request.
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    review_repair(&mut h, id, 5);
+    h.native.borrow_mut().refuse = true;
+    h.click(ids::REPAIR_CONFIRM);
+    h.status_reply();
+    assert!(
+        h.button(ids::CLOSE).is_some_and(|b| b.enabled),
+        "{:?}",
+        h.view().buttons
+    );
+    assert!(h.view().message.contains("busy"), "{}", h.view().message);
+}
+
+#[test]
+fn a_silent_platform_ends_the_wait_as_unknown_with_a_resume_instead_of_working_forever() {
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    review_repair(&mut h, id, 5);
+    h.click(ids::REPAIR_CONFIRM);
+    h.status_reply();
+    maintenance_jobs(&mut h);
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairWaiting {
+            id,
+            detail: "Waiting…".into(),
+            closeable: true,
+        },
+    );
+    h.advance(151_000);
+    h.tick();
+    let message = h.view().message.clone();
+    assert!(
+        message.contains("Outcome unknown, resume required."),
+        "{message}"
+    );
+    assert!(h.button(ids::REPAIR_RESUME).is_some_and(|b| b.enabled));
+    assert!(h.button(ids::BACK).is_some_and(|b| b.enabled));
+}
+
+#[test]
+fn a_report_for_another_maintenance_visit_never_changes_the_repair_view() {
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    review_repair(&mut h, id, 5);
+    let stale = MaintenanceId(id.0 + 5);
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairFinished {
+            id: stale,
+            outcome: RepairOutcome::Verified,
+            lines: Vec::new(),
+            resumable: false,
+        },
+    );
+    assert!(h.button(ids::REPAIR_CONFIRM).is_some());
+    assert!(!h.view().message.contains("Crosspane was repaired"));
+    // A finished report that no confirmation asked for changes nothing either.
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairFinished {
+            id,
+            outcome: RepairOutcome::Verified,
+            lines: Vec::new(),
+            resumable: false,
+        },
+    );
+    assert!(h.button(ids::REPAIR_CONFIRM).is_some());
+}
+
+/// Review and confirm a repair, then let the platform say it waits.
+fn confirmed_and_waiting(h: &mut H, closeable: bool, detail: &str) -> MaintenanceId {
+    let id = open_repair(h, live::Availability::Available);
+    review_repair(h, id, 5);
+    h.click(ids::REPAIR_CONFIRM);
+    h.status_reply();
+    maintenance_jobs(h);
+    platform_says(
+        h,
+        MaintenanceReport::RepairWaiting {
+            id,
+            detail: detail.into(),
+            closeable,
+        },
+    );
+    id
+}
+
+#[test]
+fn a_repair_whose_agent_cant_answer_is_still_asked_to_look_so_its_own_bound_can_end_it() {
+    let mut h = H::new();
+    let id = confirmed_and_waiting(
+        &mut h,
+        false,
+        "Crosspane was stopped. Waiting for it to exit cleanly…",
+    );
+    // The old agent is stopped: no Status is ever answered.
+    let mut looks = 0;
+    for _ in 0..12 {
+        h.advance(600);
+        h.tick();
+        for m in maintenance_jobs(&mut h) {
+            match m {
+                MaintenanceRequest::VerifyRepair {
+                    id: i,
+                    status: None,
+                } if i == id => {
+                    looks += 1;
+                    platform_says(
+                        &mut h,
+                        MaintenanceReport::RepairWaiting {
+                            id,
+                            detail: "Still waiting for it to exit cleanly…".into(),
+                            closeable: false,
+                        },
+                    );
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert!(
+        (2..=4).contains(&looks),
+        "looks every couple of seconds: {looks}"
+    );
+    // The platform's own bound ends it with its typed result.
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairFinished {
+            id,
+            outcome: RepairOutcome::RecoveryRetained,
+            lines: vec!["Crosspane may not be running.".into()],
+            resumable: true,
+        },
+    );
+    let message = h.view().message.clone();
+    assert!(message.contains("The repair didn't finish"), "{message}");
+    assert!(
+        message.contains("Crosspane may not be running."),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_wait_that_isnt_closeable_keeps_the_window_open_and_shows_what_it_waits_for() {
+    let mut h = H::new();
+    let id = confirmed_and_waiting(
+        &mut h,
+        false,
+        "Crosspane was stopped. Waiting for it to exit cleanly…",
+    );
+    assert!(h.view().message.contains("Waiting for it to exit cleanly"));
+    assert!(h.button(ids::CLOSE).is_none());
+    assert!(h.button(ids::BACK).is_none());
+    assert!(!h.c.request_close());
+    assert!(!h.native.borrow().shutdown);
+    // The platform reaches the health wait, which leaves a resumable record: now it may close.
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairWaiting {
+            id,
+            detail: "Crosspane was started again. Waiting for the new instance…".into(),
+            closeable: true,
+        },
+    );
+    assert!(h.button(ids::CLOSE).is_some_and(|b| b.enabled));
+    assert!(h.c.request_close());
+}
+
+#[test]
+fn a_refusal_of_some_replayed_request_never_hides_a_repair_that_is_under_way() {
+    let mut h = H::new();
+    let id = confirmed_and_waiting(&mut h, true, "Waiting for the new instance…");
+    platform_says(
+        &mut h,
+        MaintenanceReport::Refused {
+            id,
+            reason: "Confirm the current repair preview before repairing Crosspane. Nothing was \
+                     changed."
+                .into(),
+        },
+    );
+    let message = h.view().message.clone();
+    assert!(
+        message.contains("Waiting for the new instance"),
+        "{message}"
+    );
+    assert!(!message.contains("Confirm the current"), "{message}");
+    assert!(h.button(ids::REPAIR_RESUME).is_none());
+    // It is still driven to its end.
+    h.advance(600);
+    h.status_reply();
+    assert!(maintenance_jobs(&mut h).iter().any(|m| matches!(
+        m,
+        MaintenanceRequest::VerifyRepair { id: i, status: Some(_) } if *i == id
+    )));
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairFinished {
+            id,
+            outcome: RepairOutcome::Verified,
+            lines: Vec::new(),
+            resumable: false,
+        },
+    );
+    assert!(h.view().message.contains("Crosspane was repaired"));
+}
+
+#[test]
+fn a_busy_platform_that_cant_take_a_look_never_ends_the_repair() {
+    let mut h = H::new();
+    let id = confirmed_and_waiting(&mut h, true, "Waiting for the new instance…");
+    h.native.borrow_mut().refuse = true;
+    h.advance(600);
+    h.status_reply();
+    h.tick();
+    let message = h.view().message.clone();
+    assert!(
+        message.contains("Waiting for the new instance"),
+        "{message}"
+    );
+    assert!(!message.contains("busy"), "{message}");
+    h.native.borrow_mut().refuse = false;
+    h.advance(600);
+    h.status_reply();
+    assert!(maintenance_jobs(&mut h).iter().any(|m| matches!(
+        m,
+        MaintenanceRequest::VerifyRepair { id: i, status: Some(_) } if *i == id
+    )));
+}
+
+#[test]
+fn a_repair_review_cant_start_while_a_removal_plan_is_pending() {
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    h.click(ids::REMOVE_REVIEW);
+    assert!(
+        maintenance_jobs(&mut h)
+            .iter()
+            .any(|m| matches!(m, MaintenanceRequest::PlanUninstall { id: i, .. } if *i == id))
+    );
+    assert!(!h.button(ids::REPAIR).unwrap().enabled);
+    let revision = h.view().revision;
+    h.act(revision, WizardIntent::Button(ids::REPAIR));
+    h.advance(13_000);
+    h.tick();
+    assert!(
+        maintenance_jobs(&mut h)
+            .iter()
+            .all(|m| !matches!(m, MaintenanceRequest::PlanRepair { .. }))
+    );
+    assert!(!h.view().message.contains("Preparing the repair preview"));
+}
+
+#[test]
+fn an_unknown_outcome_with_no_resume_doesnt_ask_for_one() {
+    let mut h = H::new();
+    let id = open_repair(&mut h, live::Availability::Available);
+    review_repair(&mut h, id, 5);
+    h.click(ids::REPAIR_CONFIRM);
+    h.status_reply();
+    maintenance_jobs(&mut h);
+    platform_says(
+        &mut h,
+        MaintenanceReport::RepairFinished {
+            id,
+            outcome: RepairOutcome::OutcomeUnknown,
+            lines: vec!["The repair was cut short.".into()],
+            resumable: false,
+        },
+    );
+    let message = h.view().message.clone();
+    assert!(message.contains("Outcome unknown"), "{message}");
+    assert!(!message.contains("resume required"), "{message}");
+    assert!(h.button(ids::REPAIR_RESUME).is_none());
 }

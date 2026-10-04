@@ -617,6 +617,7 @@ impl LiveController {
         self.dispatch_intents();
         self.after_status(reply.id);
         self.release_status_waits(reply);
+        self.release_repair_wait(reply);
     }
 
     /// The stable union: the local scope plus the selected peer while it is connected.
@@ -809,6 +810,7 @@ impl LiveController {
     pub(super) fn mutation_in_flight(&self) -> bool {
         self.jobs.values().any(|j| j.stage == JobStage::Apply)
             || self.maintenance.running()
+            || self.maintenance.repair_waiting()
             || self.practice.engaged(self.now)
     }
 
@@ -909,6 +911,7 @@ impl InstallerController for LiveController {
         self.practice_tick();
         self.poll_status();
         self.status_wait_tick();
+        self.repair_tick();
         self.connect_tick();
         self.auto_begin();
         self.dispatch_intents();

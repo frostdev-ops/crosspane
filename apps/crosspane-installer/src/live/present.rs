@@ -9,7 +9,7 @@ use super::practice::{CONFIRMATIONS, confirmation_label, confirmations};
 use super::shared::{CAPABILITIES, PairMode, capability_label};
 use super::{
     Availability, Consent, MaintenanceId, MaintenanceOutcome, MaintenanceReport,
-    MaintenanceRequest, NativeJob, RemovalChoice, ids,
+    MaintenanceRequest, NativeJob, RemovalChoice, RepairOutcome, StatusEvidence, ids,
 };
 use crate::agent_contract::{InstallerRequest, PairPhase};
 use crate::tutorial_flow::{TutorialRole, TutorialState, TutorialUserAction};
@@ -20,6 +20,19 @@ use crate::view::{
 };
 
 const MAX_PROGRESS_LINES: usize = 24;
+
+/// How long a repair click waits for a Status issued after it before it goes ahead without one:
+/// the platform then plans, or refuses, with what it can read itself.
+const REPAIR_STATUS_WAIT_MS: u64 = 12_000;
+/// A repair that has started the new agent is asked again with each fresh Status. The platform
+/// ends the wait itself well before this; this is only the backstop for a silent platform.
+const REPAIR_WAIT_BACKSTOP_MS: u64 = 150_000;
+/// A Status older than this isn't offered as evidence.
+const REPAIR_STATUS_FRESH_MS: u64 = 3_000;
+/// While a repair waits and no fresh Status comes (the old agent is stopped, or the new one
+/// isn't answering yet), the platform is still asked this often, without one. Its own bounded
+/// wait then ends the repair with its typed result instead of the backstop's.
+const REPAIR_BLIND_LOOK_MS: u64 = 2_000;
 
 /// The R9.4 attribution limit, shown with both audio rows.
 const AUDIO_LIMIT: &str = "Audio counters are computer-wide, not per computer, and are only \
@@ -41,11 +54,103 @@ pub(super) struct MaintenanceState {
     pub finished: Option<(MaintenanceOutcome, Vec<String>)>,
     pub refused: Option<String>,
     pub return_to: Option<ScreenId>,
+    pub repair_state: RepairState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum RepairPhase {
+    #[default]
+    Idle,
+    /// A review was asked for; the plan is being prepared.
+    Planning,
+    /// The preview is on screen and waits for the person's consent.
+    Previewed,
+    /// The platform is changing files and the service, or waits for a stage that will (the old
+    /// agent's clean exit). Closing the window would cut it short.
+    Running,
+    /// Nothing is changing: the new agent was started and its health is being watched, and the
+    /// platform said an interrupted repair is offered for resume next time. The window may close.
+    Waiting,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AwaitKind {
+    Plan,
+    Confirm { plan: u64, revision: u64 },
+    Resume,
+}
+
+/// A repair click that waits for a Status issued after it, so the platform works from what is
+/// running now and not from an older reading.
+#[derive(Clone, Copy, Debug)]
+struct AwaitStatus {
+    kind: AwaitKind,
+    /// The first call id that may serve as evidence.
+    from_call: u64,
+    started_at: u64,
+}
+
+#[derive(Default)]
+pub(super) struct RepairState {
+    pub phase: RepairPhase,
+    /// The number of the preview on screen.
+    pub plan: Option<u64>,
+    pub preview: Option<String>,
+    /// What an earlier, interrupted repair left, offered for resume.
+    pub resumable: Option<Vec<String>>,
+    pub finished: Option<RepairEnd>,
+    /// What the platform last said while waiting for the new agent.
+    pub detail: Option<String>,
+    awaiting: Option<AwaitStatus>,
+    /// When the platform last said anything about the running repair.
+    since: u64,
+    from_call: u64,
+    last_call: u64,
+    /// When the last `VerifyRepair` was sent.
+    last_look: u64,
+    verify_outstanding: bool,
+    /// The platform answered the confirmation (or a look) with `RepairWaiting`: the repair is
+    /// under way and is driven with `VerifyRepair` until it ends.
+    driving: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct RepairEnd {
+    pub outcome: RepairOutcome,
+    pub lines: Vec<String>,
+    pub resumable: bool,
+}
+
+impl RepairState {
+    /// A repair is somewhere past the start of its review.
+    fn engaged(&self) -> bool {
+        self.phase != RepairPhase::Idle || self.finished.is_some()
+    }
+
+    fn resume_offered(&self) -> bool {
+        self.phase == RepairPhase::Idle
+            && (self.resumable.is_some() || self.finished.as_ref().is_some_and(|f| f.resumable))
+    }
 }
 
 impl MaintenanceState {
     pub fn running(&self) -> bool {
-        self.confirmed && self.finished.is_none() && self.refused.is_none()
+        (self.confirmed && self.finished.is_none() && self.refused.is_none())
+            || (self.repair_state.phase == RepairPhase::Running && self.refused.is_none())
+    }
+
+    pub fn repair_waiting(&self) -> bool {
+        self.repair_state.phase == RepairPhase::Waiting && self.refused.is_none()
+    }
+
+    /// A confirmed repair the platform is still working through.
+    fn repair_driving(&self) -> bool {
+        self.repair_state.driving
+            && matches!(
+                self.repair_state.phase,
+                RepairPhase::Running | RepairPhase::Waiting
+            )
+            && self.refused.is_none()
     }
 }
 
@@ -303,16 +408,76 @@ impl LiveController {
         if let Some(reason) = &m.refused {
             return reason.clone();
         }
+        let repair = &m.repair_state;
+        if let Some(end) = &repair.finished {
+            let head = match end.outcome {
+                RepairOutcome::Verified => {
+                    "Crosspane was repaired. The new instance reported healthy."
+                }
+                RepairOutcome::HealthVerifiedCleanupIncomplete => {
+                    "Repaired: health verified, cleanup incomplete."
+                }
+                RepairOutcome::OutcomeUnknown if end.resumable => {
+                    "Outcome unknown, resume required."
+                }
+                // No Resume can help here (the Mac keeps no record past this window): don't ask
+                // for one.
+                RepairOutcome::OutcomeUnknown => {
+                    "Outcome unknown: what the repair did can't be proved."
+                }
+                RepairOutcome::RecoveryRetained => {
+                    "The repair didn't finish. Backups and recovery files were kept."
+                }
+            };
+            let mut text = vec![head.to_owned()];
+            text.extend(end.lines.iter().cloned());
+            return text.join("\n");
+        }
         let mut text = Vec::new();
+        let mut unavailable = Vec::new();
         match &m.uninstall {
             None => text.push("Checking what can be removed…".to_owned()),
             Some(Availability::Unavailable(reason) | Availability::NotAvailableYet(reason)) => {
-                text.push(reason.clone())
+                unavailable.push(reason.clone());
             }
             Some(Availability::Available) => {}
         }
+        // The reason repair isn't offered is shown too, unless it is the very text already shown.
+        if let Some(Availability::Unavailable(reason) | Availability::NotAvailableYet(reason)) =
+            &m.repair
+            && !unavailable.contains(reason)
+            && repair.phase == RepairPhase::Idle
+        {
+            unavailable.push(reason.clone());
+        }
+        text.extend(unavailable);
+        if let Some(lines) = &repair.resumable
+            && repair.phase == RepairPhase::Idle
+        {
+            let mut resume = vec!["An earlier repair didn't finish. Resume checks what is really on this computer and carries on without repeating anything uncertain.".to_owned()];
+            resume.extend(lines.iter().cloned());
+            text.push(resume.join("\n"));
+        }
         if let Some(preview) = &m.preview {
             text.push(preview.clone());
+        }
+        if let Some(preview) = &repair.preview
+            && repair.phase == RepairPhase::Previewed
+        {
+            text.push(preview.clone());
+        }
+        match repair.phase {
+            RepairPhase::Planning => text.push("Preparing the repair preview…".to_owned()),
+            RepairPhase::Running => text.push(
+                repair
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "Repairing Crosspane…".to_owned()),
+            ),
+            RepairPhase::Waiting => text.push(repair.detail.clone().unwrap_or_else(|| {
+                "Waiting for Crosspane to start again and report healthy…".to_owned()
+            })),
+            RepairPhase::Idle | RepairPhase::Previewed => {}
         }
         for (_, label, preview) in &m.follow_ups {
             text.push(format!("{label}: {preview}"));
@@ -660,8 +825,17 @@ impl LiveController {
 
     fn maintenance_controls(&self, buttons: &mut Vec<ButtonView>, fields: &mut Vec<FieldView>) {
         let m = &self.maintenance;
+        let repair = &m.repair_state;
         let available = m.uninstall == Some(Availability::Available);
-        let open = available && !m.confirmed && m.finished.is_none() && m.refused.is_none();
+        // Once a repair is under way (or ended) removal isn't offered on this visit: the person
+        // leaves and comes back to see a fresh reading. An earlier repair that can only be
+        // resumed doesn't hide it: when a resume can't settle that record, removing Crosspane
+        // and installing it again is the way out every refusal names.
+        let open = available
+            && !m.confirmed
+            && m.finished.is_none()
+            && m.refused.is_none()
+            && !repair.engaged();
         for choice in &m.choices {
             fields.push(FieldView::Toggle {
                 id: ids::removal_field(choice.id),
@@ -707,21 +881,47 @@ impl LiveController {
                 ));
             }
         }
-        let repair = m.repair == Some(Availability::Available);
+        let repair_open = m.repair == Some(Availability::Available)
+            && !m.confirmed
+            && !m.planning
+            && m.preview.is_none()
+            && m.finished.is_none()
+            && m.refused.is_none()
+            && !repair.engaged()
+            && repair.resumable.is_none();
         buttons.push(button(
             ids::REPAIR,
             ButtonRole::Ordinary,
-            "Repair Crosspane",
-            repair && !m.confirmed,
+            "Review repair",
+            repair_open,
             ButtonKind::Secondary,
         ));
+        if repair.phase == RepairPhase::Previewed {
+            buttons.push(button(
+                ids::REPAIR_CONFIRM,
+                ButtonRole::Confirm,
+                "Repair Crosspane",
+                true,
+                ButtonKind::Primary,
+            ));
+        }
+        if repair.resume_offered() && m.refused.is_none() {
+            // Not while a removal is being reviewed or runs: one change at a time.
+            buttons.push(button(
+                ids::REPAIR_RESUME,
+                ButtonRole::Confirm,
+                "Resume repair",
+                !m.planning && !m.confirmed && m.preview.is_none(),
+                ButtonKind::Primary,
+            ));
+        }
         if !m.running() {
             if m.finished.is_none() {
                 buttons.push(button(
                     ids::BACK,
                     ButtonRole::Back,
                     "Back",
-                    true,
+                    !m.repair_waiting(),
                     ButtonKind::Secondary,
                 ));
             }
@@ -813,7 +1013,7 @@ impl LiveController {
             .filter_map(|m| self.previews.get(&m.id))
             .collect();
         let signature = format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             view.screen,
             view.buttons
                 .iter()
@@ -833,6 +1033,10 @@ impl LiveController {
             view.layout.as_ref().map(|l| (&l.confirmed, l.busy)),
             view.hiding_choice,
             self.maintenance.preview,
+            (
+                self.maintenance.repair_state.plan,
+                &self.maintenance.repair_state.preview,
+            ),
         );
         if signature != self.signature {
             view.revision = self.view.revision.saturating_add(1);
@@ -894,7 +1098,9 @@ impl LiveController {
             ids::FINAL_CHECK => self.begin(steps::FINAL),
             ids::REMOVE_REVIEW => self.plan_uninstall(),
             ids::REMOVE_CONFIRM => self.confirm_uninstall(),
-            ids::REPAIR => {}
+            ids::REPAIR => self.review_repair(),
+            ids::REPAIR_CONFIRM => self.confirm_repair(),
+            ids::REPAIR_RESUME => self.resume_repair(),
             other => self.ranged_button(other),
         }
         false
@@ -983,7 +1189,7 @@ impl LiveController {
         let m = &mut self.maintenance;
         // While a plan is being prepared the choices are frozen, so the preview that comes back
         // always describes exactly the choices that will be confirmed.
-        if m.confirmed || m.planning || m.finished.is_some() {
+        if m.confirmed || m.planning || m.finished.is_some() || m.repair_state.engaged() {
             return;
         }
         if let Some(choice) = m
@@ -1014,6 +1220,187 @@ impl LiveController {
     fn submit_maintenance(&mut self, request: MaintenanceRequest) {
         if let Err(refusal) = self.platform.submit(NativeJob::Maintenance(request)) {
             self.maintenance.refused = Some(bounded(refusal.to_string()));
+            // A request the platform never took can't leave a repair "working".
+            let r = &mut self.maintenance.repair_state;
+            r.phase = RepairPhase::Idle;
+            r.awaiting = None;
+            r.driving = false;
+            r.verify_outstanding = false;
+        }
+    }
+
+    // ---- repair ------------------------------------------------------------------------------
+
+    /// Ask for the repair preview. The platform plans against a Status issued after this click.
+    fn review_repair(&mut self) {
+        let m = &self.maintenance;
+        if m.current.is_none()
+            || m.repair != Some(Availability::Available)
+            || m.confirmed
+            || m.planning
+            || m.preview.is_some()
+            || m.finished.is_some()
+            || m.refused.is_some()
+            || m.repair_state.engaged()
+            || m.repair_state.resumable.is_some()
+        {
+            return;
+        }
+        self.await_repair_status(AwaitKind::Plan, RepairPhase::Planning);
+    }
+
+    /// Confirm the preview on screen: the click carries its plan number and the view revision it
+    /// was given on, and the platform observes again with a Status issued after this click.
+    fn confirm_repair(&mut self) {
+        let r = &self.maintenance.repair_state;
+        let (RepairPhase::Previewed, Some(plan)) = (r.phase, r.plan) else {
+            return;
+        };
+        let revision = self.view.revision;
+        self.await_repair_status(AwaitKind::Confirm { plan, revision }, RepairPhase::Running);
+    }
+
+    fn resume_repair(&mut self) {
+        let m = &self.maintenance;
+        if m.current.is_none()
+            || !m.repair_state.resume_offered()
+            || m.planning
+            || m.confirmed
+            || m.preview.is_some()
+            || m.refused.is_some()
+        {
+            return;
+        }
+        self.await_repair_status(AwaitKind::Resume, RepairPhase::Running);
+    }
+
+    fn await_repair_status(&mut self, kind: AwaitKind, phase: RepairPhase) {
+        let r = &mut self.maintenance.repair_state;
+        r.phase = phase;
+        r.since = self.now;
+        r.detail = None;
+        if kind == AwaitKind::Resume {
+            // A resume starts a new attempt: the earlier verdict and offer are replaced by its own.
+            r.finished = None;
+            r.resumable = None;
+        }
+        r.awaiting = Some(AwaitStatus {
+            kind,
+            from_call: self.next_call,
+            started_at: self.now,
+        });
+        self.request_status_now();
+    }
+
+    fn submit_repair(&mut self, kind: AwaitKind, status: Option<StatusEvidence>) {
+        let Some(id) = self.maintenance.current else {
+            return;
+        };
+        self.submit_maintenance(match kind {
+            AwaitKind::Plan => MaintenanceRequest::PlanRepair { id, status },
+            AwaitKind::Confirm { plan, revision } => MaintenanceRequest::ConfirmRepair {
+                id,
+                plan,
+                revision,
+                status,
+            },
+            AwaitKind::Resume => MaintenanceRequest::ResumeRepair { id, status },
+        });
+    }
+
+    /// A Status reply arrived: release the repair click that waits for one issued after it.
+    pub(super) fn release_repair_wait(&mut self, reply: &crate::agent_contract::AgentReply) {
+        let Some(wait) = self.maintenance.repair_state.awaiting else {
+            return;
+        };
+        if reply.id < wait.from_call {
+            return;
+        }
+        self.maintenance.repair_state.awaiting = None;
+        self.submit_repair(wait.kind, Some(StatusEvidence(reply.clone())));
+    }
+
+    /// Per-tick repair driving: a click still waiting for its Status gives up after a while and
+    /// goes ahead without one, and a repair that started the new agent keeps offering it fresh
+    /// Status replies until the platform ends the wait.
+    pub(super) fn repair_tick(&mut self) {
+        let now = self.now;
+        if let Some(wait) = self.maintenance.repair_state.awaiting {
+            if now.saturating_sub(wait.started_at) > REPAIR_STATUS_WAIT_MS {
+                self.maintenance.repair_state.awaiting = None;
+                self.submit_repair(wait.kind, None);
+            } else {
+                self.poll_for_repair();
+            }
+        }
+        if !self.maintenance.repair_driving() {
+            return;
+        }
+        let r = &mut self.maintenance.repair_state;
+        if now.saturating_sub(r.since) > REPAIR_WAIT_BACKSTOP_MS {
+            // The platform went silent: say so rather than keep the view working forever.
+            r.phase = RepairPhase::Idle;
+            r.driving = false;
+            r.verify_outstanding = false;
+            r.finished = Some(RepairEnd {
+                outcome: RepairOutcome::OutcomeUnknown,
+                lines: vec![
+                    "Setup stopped hearing from the repair, so what it did can't be proved. Nothing was retried."
+                        .to_owned(),
+                ],
+                resumable: true,
+            });
+            return;
+        }
+        if r.verify_outstanding {
+            return;
+        }
+        self.poll_for_repair();
+        let fresh = self.health.as_ref().filter(|h| {
+            h.call >= self.maintenance.repair_state.from_call
+                && h.call > self.maintenance.repair_state.last_call
+                && now.saturating_sub(h.observed_at_ms) <= REPAIR_STATUS_FRESH_MS
+        });
+        let status = match fresh {
+            Some(h) => {
+                self.maintenance.repair_state.last_call = h.call;
+                Some(StatusEvidence(h.reply.clone()))
+            }
+            // No fresh Status: the stopped old agent can't answer, nor can a new one that isn't
+            // up yet. The platform is asked anyway, now and then, so its own stages and bounded
+            // wait move on.
+            None if now.saturating_sub(self.maintenance.repair_state.last_look)
+                >= REPAIR_BLIND_LOOK_MS =>
+            {
+                None
+            }
+            None => return,
+        };
+        let Some(id) = self.maintenance.current else {
+            return;
+        };
+        let request = MaintenanceRequest::VerifyRepair { id, status };
+        let r = &mut self.maintenance.repair_state;
+        r.last_look = now;
+        r.verify_outstanding = true;
+        // A look the platform can't take now (it is busy) is simply tried again; it never ends
+        // or abandons the repair that is under way.
+        if self
+            .platform
+            .submit(NativeJob::Maintenance(request))
+            .is_err()
+        {
+            self.maintenance.repair_state.verify_outstanding = false;
+        }
+    }
+
+    /// Ask for a Status now and then; one outstanding call at a time.
+    fn poll_for_repair(&mut self) {
+        if self
+            .status_sent_at
+            .is_none_or(|sent| self.now >= sent.saturating_add(super::controller::STATUS_ACTIVE_MS))
+        {
+            self.request_status_now();
         }
     }
 
@@ -1099,11 +1486,16 @@ impl LiveController {
             | MaintenanceReport::Progress { id, .. }
             | MaintenanceReport::FollowUp { id, .. }
             | MaintenanceReport::Finished { id, .. }
-            | MaintenanceReport::Refused { id, .. } => *id,
+            | MaintenanceReport::Refused { id, .. }
+            | MaintenanceReport::RepairPlanned { id, .. }
+            | MaintenanceReport::RepairResumable { id, .. }
+            | MaintenanceReport::RepairWaiting { id, .. }
+            | MaintenanceReport::RepairFinished { id, .. } => *id,
         };
         if self.maintenance.current != Some(id) {
             return;
         }
+        let (now, next_call) = (self.now, self.next_call);
         let m = &mut self.maintenance;
         match report {
             MaintenanceReport::Inspected {
@@ -1149,10 +1541,95 @@ impl LiveController {
                         .collect(),
                 ));
             }
+            // A confirmed repair under way is only ever asked to look again, which is never
+            // refused: a refusal now answers some replayed or stale request, and must not hide the
+            // repair that is still running (nor let the window close over it).
+            MaintenanceReport::Refused { .. } if m.repair_driving() => {}
             MaintenanceReport::Refused { reason, .. } => {
                 m.planning = false;
                 m.refused = Some(bounded(reason));
+                // A refusal ends whatever repair step it answered: nothing stays "working".
+                let r = &mut m.repair_state;
+                r.phase = RepairPhase::Idle;
+                r.awaiting = None;
+                r.verify_outstanding = false;
             }
+            // Only the answer to the outstanding review request is shown as the repair plan.
+            MaintenanceReport::RepairPlanned { plan, preview, .. }
+                if m.repair_state.phase == RepairPhase::Planning =>
+            {
+                let r = &mut m.repair_state;
+                r.phase = RepairPhase::Previewed;
+                r.plan = Some(plan);
+                r.preview = Some(bounded(preview));
+            }
+            MaintenanceReport::RepairPlanned { .. } => {}
+            MaintenanceReport::RepairResumable { lines, .. }
+                if m.repair_state.phase == RepairPhase::Idle =>
+            {
+                m.repair_state.resumable = Some(
+                    lines
+                        .into_iter()
+                        .take(MAX_PROGRESS_LINES)
+                        .map(bounded)
+                        .collect(),
+                );
+            }
+            MaintenanceReport::RepairResumable { .. } => {}
+            MaintenanceReport::RepairWaiting {
+                detail, closeable, ..
+            } if matches!(
+                m.repair_state.phase,
+                RepairPhase::Running | RepairPhase::Waiting
+            ) && m.repair_state.awaiting.is_none() =>
+            {
+                let r = &mut m.repair_state;
+                if !r.driving {
+                    // Health is judged only from Statuses issued after the repair got this far.
+                    r.driving = true;
+                    r.from_call = next_call;
+                }
+                // Only a wait that cuts no change short and leaves a resumable record may close.
+                r.phase = if closeable {
+                    RepairPhase::Waiting
+                } else {
+                    RepairPhase::Running
+                };
+                r.since = now;
+                r.last_look = now;
+                r.detail = Some(bounded(detail));
+                r.verify_outstanding = false;
+            }
+            MaintenanceReport::RepairWaiting { .. } => {}
+            MaintenanceReport::RepairFinished {
+                outcome,
+                lines,
+                resumable,
+                ..
+            } if matches!(
+                m.repair_state.phase,
+                RepairPhase::Running | RepairPhase::Waiting
+            ) && m.repair_state.awaiting.is_none() =>
+            {
+                let r = &mut m.repair_state;
+                r.phase = RepairPhase::Idle;
+                r.driving = false;
+                r.verify_outstanding = false;
+                r.awaiting = None;
+                r.preview = None;
+                r.plan = None;
+                r.resumable = None;
+                r.finished = Some(RepairEnd {
+                    outcome,
+                    lines: lines
+                        .into_iter()
+                        .take(MAX_PROGRESS_LINES)
+                        .map(bounded)
+                        .collect(),
+                    resumable,
+                });
+            }
+            MaintenanceReport::RepairFinished { .. } => {}
         }
     }
 }

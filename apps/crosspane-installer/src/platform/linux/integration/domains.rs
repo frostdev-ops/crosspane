@@ -177,6 +177,83 @@ pub trait Firewalls {
     fn receipt_lan(&mut self, proof: &SupportProof, operation: OperationId) -> Option<Vec<u8>>;
 }
 
+/// What compatible repair offers for the install on this computer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RepairOffer {
+    /// `Available` only when the producer's inventory says the install is compatible; otherwise
+    /// the typed guidance (for example "remove Crosspane and install it again").
+    pub repair: Availability,
+    /// An earlier repair left a record that can be resumed, as person-readable lines.
+    pub resumable: Option<Vec<String>>,
+}
+
+/// How a repair that went past planning ended, as the adapter proved it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairFinish {
+    pub outcome: crate::live::RepairOutcome,
+    pub lines: Vec<String>,
+    /// A resume can still make progress.
+    pub resumable: bool,
+}
+
+/// Where a repair stands after a stage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepairStep {
+    /// Everything that changes something is done; the new agent's health isn't proved yet. The
+    /// worker keeps asking for it, and ends the wait with `if_timed_out`.
+    Waiting {
+        detail: String,
+        if_timed_out: RepairFinish,
+        /// Closing the window now can't cut a change short, and what is left can still be
+        /// settled later: only the new agent's health is being watched, and an interrupted
+        /// repair is found again on the next visit. `false` while the old agent is stopped and
+        /// files are still to be replaced, or when nothing would be left to resume.
+        closeable: bool,
+    },
+    Finished(RepairFinish),
+}
+
+/// Compatible repair of an existing install. Every call re-reads what it needs, and an adapter
+/// never repeats a change whose outcome is uncertain. An `Err` is a refusal with guidance: it
+/// means nothing was changed.
+pub trait Repairer {
+    fn inspect(&mut self, package: Option<&Package>, now_ms: u64) -> RepairOffer;
+    /// Plan for `operation`, returning exactly the preview the person is asked to consent to.
+    fn plan(
+        &mut self,
+        package: Option<&Package>,
+        status: Option<&AgentReply>,
+        operation: OperationId,
+        now_ms: u64,
+    ) -> Result<String, String>;
+    /// Consent to the plan made for `plan`. The adapter observes everything again (a preview's
+    /// evidence lives only seconds), starts only if it still previews exactly what was shown,
+    /// and then runs every stage up to starting the new agent. `operation` is a fresh id for
+    /// that second observation.
+    fn confirm(
+        &mut self,
+        package: Option<&Package>,
+        status: Option<&AgentReply>,
+        plan: OperationId,
+        operation: OperationId,
+        now_ms: u64,
+    ) -> Result<RepairStep, String>;
+    /// Look again for the new instance's health with a Status issued after the last look.
+    fn verify(
+        &mut self,
+        package: Option<&Package>,
+        status: Option<&AgentReply>,
+        now_ms: u64,
+    ) -> RepairStep;
+    /// Resume an interrupted repair from its record; one attempt, never a replay.
+    fn resume(
+        &mut self,
+        package: Option<&Package>,
+        status: Option<&AgentReply>,
+        now_ms: u64,
+    ) -> Result<RepairFinish, String>;
+}
+
 /// The domains owned by the worker thread. Built on that thread, because the firewall controller
 /// holds a reader that must never cross threads.
 pub struct Domains {
@@ -184,6 +261,7 @@ pub struct Domains {
     pub services: Box<dyn Services>,
     pub firewalls: Box<dyn Firewalls>,
     pub uninstaller: Box<dyn Uninstaller>,
+    pub repairer: Box<dyn Repairer>,
 }
 
 pub type DomainFactory = Box<dyn FnOnce() -> Domains + Send>;
@@ -754,6 +832,54 @@ impl Uninstaller for NoUninstaller {
     }
 }
 
+/// Stands in when repair can't be offered at all, saying why. Nothing is ever touched.
+pub struct NoRepairer {
+    pub reason: String,
+}
+
+impl Repairer for NoRepairer {
+    fn inspect(&mut self, _: Option<&Package>, _: u64) -> RepairOffer {
+        RepairOffer {
+            repair: Availability::Unavailable(self.reason.clone()),
+            resumable: None,
+        }
+    }
+    fn plan(
+        &mut self,
+        _: Option<&Package>,
+        _: Option<&AgentReply>,
+        _: OperationId,
+        _: u64,
+    ) -> Result<String, String> {
+        Err(self.reason.clone())
+    }
+    fn confirm(
+        &mut self,
+        _: Option<&Package>,
+        _: Option<&AgentReply>,
+        _: OperationId,
+        _: OperationId,
+        _: u64,
+    ) -> Result<RepairStep, String> {
+        Err(self.reason.clone())
+    }
+    fn verify(&mut self, _: Option<&Package>, _: Option<&AgentReply>, _: u64) -> RepairStep {
+        RepairStep::Finished(RepairFinish {
+            outcome: crate::live::RepairOutcome::OutcomeUnknown,
+            lines: vec![self.reason.clone()],
+            resumable: false,
+        })
+    }
+    fn resume(
+        &mut self,
+        _: Option<&Package>,
+        _: Option<&AgentReply>,
+        _: u64,
+    ) -> Result<RepairFinish, String> {
+        Err(self.reason.clone())
+    }
+}
+
 opaque_debug!(
     Domains,
     NativeSupport,
@@ -761,5 +887,6 @@ opaque_debug!(
     NativeServices,
     NativeFirewalls,
     NoUninstaller,
+    NoRepairer,
     BrokenPayloads,
 );

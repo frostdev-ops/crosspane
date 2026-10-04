@@ -21,8 +21,8 @@ use crosspane_installer::live::{
 };
 use crosspane_installer::platform::linux::integration::{
     AgentSource, DomainFactory, Domains, FirewallReading, Firewalls, FixtureSource, LinuxPlatform,
-    NativePayloads, NativeUninstaller, Parts, RuleApply, RulePresence, Services, Support,
-    SupportOutcome, SupportedAgentPort,
+    NativePayloads, NativeRepairer, NativeUninstaller, Parts, RuleApply, RulePresence, Services,
+    Support, SupportOutcome, SupportedAgentPort,
 };
 use crosspane_installer::platform::linux::{
     firewall::FirewallError,
@@ -480,17 +480,20 @@ impl Rig {
         let domain_io = io.clone();
         let uninstall_support = support.clone();
         let uninstall_env = env.clone();
+        let repair_support = support.clone();
+        let repair_env = env.clone();
         let uninstall_clock: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 10_000);
         let domains: DomainFactory = Box::new(move || Domains {
             payloads: Box::new(NativePayloads::new(domain_io.clone()).unwrap()),
             services: Box::new(NoServices),
             firewalls: Box::new(NoFirewalls),
             uninstaller: Box::new(NativeUninstaller::new(
-                domain_io,
+                domain_io.clone(),
                 uninstall_env,
                 uninstall_clock,
                 uninstall_support,
             )),
+            repairer: Box::new(NativeRepairer::new(domain_io, repair_env, repair_support)),
         });
         let platform = LinuxPlatform::compose(Parts {
             io,

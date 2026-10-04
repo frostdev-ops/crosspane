@@ -23,7 +23,8 @@ use super::super::permissions::{
 };
 use super::domains::{
     Agents, AudioError, AudioPackages, AudioState, DomainFactory, FixtureLauncher, InstallError,
-    InstallState, Installs, Support, SupportOutcome, Uninstaller,
+    InstallState, Installs, RepairFinish, RepairStep, Repairer, Support, SupportOutcome,
+    Uninstaller,
 };
 use super::ports::{Broker, Command};
 use super::{AGENT, AUDIO, INSTALL, PERMISSIONS, SUPPORT};
@@ -32,8 +33,8 @@ use crate::agent_contract::{
     PermissionName, PermissionState, StartupRecovery, StatusAdmission,
 };
 use crate::live::{
-    Availability, Clock, Consent, MaintenanceId, MaintenanceReport, MaintenanceRequest, NativeJob,
-    NativeOutcome, NativeReport, StatusEvidence, StepReport,
+    Clock, Consent, MaintenanceId, MaintenanceReport, MaintenanceRequest, NativeJob, NativeOutcome,
+    NativeReport, StatusEvidence, StepReport,
 };
 
 /// A bounded deadline for ordinary reads, the install (which may wait for the old agent to
@@ -41,6 +42,11 @@ use crate::live::{
 const READ_MS: u64 = 8_000;
 const APPLY_MS: u64 = 100_000;
 const REMOVE_MS: u64 = 100_000;
+/// A repair stops the old agent, replaces files and starts the new one, in one bounded stage.
+const REPAIR_MS: u64 = 100_000;
+/// How long a repair that started the new agent waits for it to report healthy before it ends
+/// with an honest "outcome unknown, resume required".
+const REPAIR_HEALTH_WAIT_MS: u64 = 90_000;
 
 pub struct WorkerParts {
     pub clock: Clock,
@@ -61,6 +67,7 @@ pub struct Worker {
     audio: Box<dyn AudioPackages>,
     agents: Box<dyn Agents>,
     uninstaller: Box<dyn Uninstaller>,
+    repairer: Box<dyn Repairer>,
     fixtures: Option<Box<dyn FixtureLauncher>>,
     reports: SyncSender<NativeReport>,
     broker: Arc<Broker>,
@@ -84,6 +91,12 @@ struct Maintenance {
     id: Option<MaintenanceId>,
     planned: Option<(MaintenanceId, OperationId)>,
     running: bool,
+    /// The number of the repair preview the next confirmation must name.
+    repair_plan: Option<OperationId>,
+    /// A confirmed repair that hasn't ended: it is changing things, or watching the new agent.
+    repair_active: bool,
+    /// When the repair first waited for the new agent's health.
+    repair_since: Option<u64>,
 }
 
 /// What a stage reports when a gate refuses it.
@@ -195,6 +208,7 @@ impl Worker {
             audio: domains.audio,
             agents: domains.agents,
             uninstaller: domains.uninstaller,
+            repairer: domains.repairer,
             fixtures: domains.fixtures,
             reports: parts.reports,
             broker: parts.broker,
@@ -767,23 +781,112 @@ impl Worker {
                 };
                 let deadline = self.deadline(READ_MS);
                 let offer = self.uninstaller.inspect(&deadline);
+                let deadline = self.deadline(READ_MS);
+                let repair = self.repairer.inspect(&deadline);
                 self.maint(MaintenanceReport::Inspected {
                     id,
                     uninstall: offer.uninstall,
-                    repair: Availability::NotAvailableYet(
-                        "Compatible repair isn't available in this build yet. To fix a broken \
-                         install, remove Crosspane and install it again."
-                            .into(),
-                    ),
+                    repair: repair.repair,
                     choices: offer.choices,
                 });
+                // A repair that is still unfinished in this window is offered for resume.
+                if let Some(lines) = repair.resumable {
+                    self.maint(MaintenanceReport::RepairResumable { id, lines });
+                }
+            }
+            MaintenanceRequest::PlanRepair { id, status } => {
+                if self.maintenance.id != Some(id)
+                    || self.maintenance.running
+                    || self.maintenance.repair_active
+                {
+                    self.stale_repair(id, "That repair preview is no longer current.");
+                    return;
+                }
+                self.maintenance.repair_plan = None;
+                let operation = self.maintenance_op();
+                let deadline = self.deadline(READ_MS);
+                let status = status.as_ref().map(|s| &s.0);
+                match self.repairer.plan(status, operation, &deadline) {
+                    Ok(preview) => {
+                        self.maintenance.repair_plan = Some(operation);
+                        self.maint(MaintenanceReport::RepairPlanned {
+                            id,
+                            plan: operation.0,
+                            preview,
+                        });
+                    }
+                    Err(reason) => self.maint(MaintenanceReport::Refused { id, reason }),
+                }
+            }
+            MaintenanceRequest::ConfirmRepair {
+                id, plan, status, ..
+            } => {
+                // The preview is single use: whatever happens next, it is gone.
+                let held = self.maintenance.repair_plan.take();
+                if self.maintenance.id != Some(id)
+                    || self.maintenance.running
+                    || self.maintenance.repair_active
+                    || held.map(|o| o.0) != Some(plan)
+                {
+                    self.stale_repair(
+                        id,
+                        "Confirm the current repair preview before repairing Crosspane.",
+                    );
+                    return;
+                }
+                self.maintenance.repair_active = true;
+                self.maintenance.repair_since = None;
+                let operation = self.maintenance_op();
+                let deadline = self.deadline(REPAIR_MS);
+                let status = status.as_ref().map(|s| &s.0);
+                let result = self
+                    .repairer
+                    .confirm(status, OperationId(plan), operation, &deadline);
+                match result {
+                    Ok(step) => self.repair_step(id, step),
+                    Err(reason) => {
+                        self.maintenance.repair_active = false;
+                        self.maint(MaintenanceReport::Refused { id, reason });
+                    }
+                }
+            }
+            MaintenanceRequest::VerifyRepair { id, status } => {
+                if self.maintenance.id != Some(id) || !self.maintenance.repair_active {
+                    return;
+                }
+                let deadline = self.deadline(READ_MS);
+                let status = status.as_ref().map(|s| &s.0);
+                let step = self.repairer.verify(status, &deadline);
+                self.repair_step(id, step);
+            }
+            MaintenanceRequest::ResumeRepair { id, status } => {
+                if self.maintenance.id != Some(id)
+                    || self.maintenance.running
+                    || self.maintenance.repair_active
+                {
+                    self.stale_repair(id, "That repair can't be resumed from this window.");
+                    return;
+                }
+                self.maintenance.repair_active = true;
+                self.maintenance.repair_since = None;
+                let deadline = self.deadline(READ_MS);
+                let status = status.as_ref().map(|s| &s.0);
+                let result = self.repairer.resume(status, &deadline);
+                self.maintenance.repair_active = false;
+                match result {
+                    Ok(finish) => self.repair_finished(id, finish),
+                    Err(reason) => self.maint(MaintenanceReport::Refused { id, reason }),
+                }
             }
             MaintenanceRequest::PlanUninstall {
                 id,
                 choices,
                 status,
             } => {
-                if self.maintenance.id != Some(id) || self.maintenance.running {
+                if self.maintenance.id != Some(id)
+                    || self.maintenance.running
+                    || self.maintenance.repair_active
+                {
                     self.maint(MaintenanceReport::Refused {
                         id,
                         reason: "That removal preview is no longer current.".into(),
@@ -851,6 +954,51 @@ impl Worker {
                     id,
                     detail: "That follow-up is no longer waiting.".into(),
                 });
+            }
+        }
+    }
+
+    fn stale_repair(&self, id: MaintenanceId, reason: &str) {
+        self.maint(MaintenanceReport::Refused {
+            id,
+            reason: format!("{reason} Nothing was changed."),
+        });
+    }
+
+    fn repair_finished(&self, id: MaintenanceId, finish: RepairFinish) {
+        self.maint(MaintenanceReport::RepairFinished {
+            id,
+            outcome: finish.outcome,
+            lines: finish.lines,
+            resumable: finish.resumable,
+        });
+    }
+
+    /// Report where a repair stands. The wait for the new agent's health is bounded here: when it
+    /// runs out the repair ends with the adapter's honest typed result, never a guess.
+    fn repair_step(&mut self, id: MaintenanceId, step: RepairStep) {
+        match step {
+            RepairStep::Waiting {
+                detail,
+                if_timed_out,
+                closeable,
+            } => {
+                let now = self.now();
+                let since = *self.maintenance.repair_since.get_or_insert(now);
+                if now.saturating_sub(since) > REPAIR_HEALTH_WAIT_MS {
+                    self.maintenance.repair_active = false;
+                    self.repair_finished(id, if_timed_out);
+                } else {
+                    self.maint(MaintenanceReport::RepairWaiting {
+                        id,
+                        detail,
+                        closeable,
+                    });
+                }
+            }
+            RepairStep::Finished(finish) => {
+                self.maintenance.repair_active = false;
+                self.repair_finished(id, finish);
             }
         }
     }
