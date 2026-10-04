@@ -40,6 +40,7 @@ const HEALTH: &str = r#"{"ok":true,"result":{"controlling":null,"controlled_by":
 "audio":{"enabled":false,"active_peers":[],"frames_sent":0,"frames_played":0},"settings_opened":0,"peers":[]}}}"#;
 type FakeOutput = Result<(Option<i32>, Vec<u8>, Vec<u8>), NativeError>;
 struct Runner {
+    manager: Mutex<Option<uninstall_tests::Manager>>,
     calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
     output: Mutex<FakeOutput>,
     stall: Mutex<bool>,
@@ -64,6 +65,9 @@ impl CommandRunner for Runner {
             });
         }
         if c.executable() == Path::new("/usr/bin/systemctl") {
+            if let Some(manager) = self.manager.lock().unwrap().as_mut() {
+                return manager.run(c, d);
+            }
             // Deliberately unknown service facts; never pretend stop-zero or missing socket proves exit.
             return Ok(CommandOutput {
                 code: Some(1),
@@ -139,6 +143,7 @@ struct Fixture {
     probe: Arc<Probe>,
     runner: Arc<Runner>,
     proof: SupportProof,
+    auth: Arc<uninstall_tests::Auth>,
     _listener: UnixListener,
 }
 #[allow(dead_code)]
@@ -154,10 +159,15 @@ impl Fixture {
             executable: root.join(".local/bin/crosspane-agent"),
             generation: 77,
         })))));
-        let runner = Arc::new(Runner { calls: Mutex::default(), stall: Mutex::new(false), erase_gate: Mutex::default(),
+        let runner = Arc::new(Runner { manager: Mutex::default(), calls: Mutex::default(), stall: Mutex::new(false), erase_gate: Mutex::default(),
             output: Mutex::new(Ok((Some(0),br#"{"schema_version":1,"result":"removed","reason":null,"key":"removed","trust":"removed"}"#.to_vec(), vec![]))) });
         // Exclusive mkdir: collision is an error. No helper initializes a pre-existing root.
-        let io = Arc::new(LinuxNativeIo::scratch(&root, runner.clone(), probe.clone()).unwrap());
+        let auth = Arc::new(uninstall_tests::Auth::default());
+        let mut native = LinuxNativeIo::scratch(&root, runner.clone(), probe.clone()).unwrap();
+        native
+            .set_scratch_pkexec_runner(Arc::new(uninstall_tests::AuthRunner(auth.clone())))
+            .unwrap();
+        let io = Arc::new(native);
         let proof = io.scratch_support(facts(&io)).unwrap();
         for path in [
             io.target().paths().prefix.join("bin"),
@@ -175,6 +185,7 @@ impl Fixture {
             probe,
             runner,
             proof,
+            auth,
             _listener: listener,
         };
         if agent {
@@ -430,6 +441,1859 @@ fn installed(f: &Fixture, p: &Package) {
     install
         .verify(&f.proof, p, 19, 100, &f.reply(), &deadline())
         .unwrap();
+}
+
+mod uninstall_tests {
+    #[test]
+    fn original_replaced_between_executor_check_and_worker_observation_sends_zero_stop() {
+        for reused_pid in [false, true] {
+            let f = Fixture::new(false);
+            let mut run = start(&f, RemovalSelection::default(), true, true);
+            run.disable(&deadline()).unwrap();
+            let replaced = Arc::new(AtomicBool::new(false));
+            let marked = replaced.clone();
+            let (io, proof, probe) = (f.io.clone(), f.proof.clone(), f.probe.clone());
+            let mut manager_guard = f.runner.manager.lock().unwrap();
+            let manager = manager_guard.as_mut().unwrap();
+            manager.shows = 0;
+            // Each stable observation reads show twice; the worker starts the third read.
+            manager.show_hook = Some((
+                3,
+                Box::new(move |properties| {
+                    if !reused_pid {
+                        properties.insert("MainPID".into(), "4343".into());
+                    }
+                    probe
+                        .0
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .generation += 1;
+                    io.atomic_write(&proof, &io.target().runtime_dir().join("bootstrap.json"), &serde_json::to_vec(&json!({"schema_version":1,"instance_id":10,"pid":if reused_pid {4242} else {4343},"started_unix_ms":parse_ps_start(START).unwrap(),"phase":"ready","phase_seq":2,"keystore":"os_store","reason":null,"runtime_dir":io.target().runtime_dir()})).unwrap()).unwrap();
+                    marked.store(true, Ordering::Release);
+                }),
+            ));
+            drop(manager_guard);
+            let _ = run.stop(&deadline());
+            assert!(replaced.load(Ordering::Acquire));
+            assert_eq!(
+                f.runner
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, a)| a.get(1).is_some_and(|s| s == "stop"))
+                    .count(),
+                0,
+                "reused PID {reused_pid}"
+            );
+            assert!(run.report().recovery_retained);
+            assert!(
+                f.io.metadata(&f.io.target().agent_path())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    #[test]
+    fn actual_firewall_detect_expiry_keeps_pending_then_fresh_stop_records_unknown() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                mdns_rule: true,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        let (mut fw, mut store) = firewall(&f, &[RuleKind::Mdns]);
+        run.disable(&deadline()).unwrap();
+        let admitted = receipt(&f, &store, RuleKind::Mdns);
+        let mut context = UninstallFirewall {
+            firewall: &mut fw,
+            support: &f.proof,
+            store: &mut store,
+            manager: ManagerSelection::Ufw,
+        };
+        f.auth.detect_stall.store(true, Ordering::Release);
+        let result = run.prepare_rule(
+            &mut context,
+            RuleKind::Mdns,
+            admitted,
+            OperationId(101),
+            &Deadline::new(50, Cancellation::default()).unwrap(),
+        );
+        f.auth.detect_stall.store(false, Ordering::Release);
+        assert!(result.is_err());
+        assert_eq!(run.stage(), UninstallStage::Stop);
+        assert_eq!(run.report().progress.mdns, CleanupResult::Unknown);
+        let path =
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/cleanup-intent.json");
+        let record =
+            CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+        assert_eq!(record.progress.mdns, CleanupResult::Pending);
+        finish(&f, &mut run);
+        let record =
+            CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+        assert_eq!(record.progress.mdns, CleanupResult::Unknown);
+        assert_eq!(record.progress.stop, CleanupResult::Removed);
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        assert!(run.report().recovery_retained);
+        assert_eq!(f.erase_count(), 0);
+        assert_eq!(
+            f.auth
+                .trace
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.as_str() == "ufw")
+                .count(),
+            0
+        );
+    }
+    #[test]
+    fn resumed_uncertain_file_intent_never_dispatches_again_when_file_remains() {
+        for index in [6, 7] {
+            let f = Fixture::new(false);
+            let mut run = start(&f, RemovalSelection::default(), true, true);
+            run.disable(&deadline()).unwrap();
+            run.stop(&deadline()).unwrap();
+            run.observe_exit(&deadline()).unwrap();
+            run.identity([0; 32], f.environment(), &deadline()).unwrap();
+            let path =
+                f.io.target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/installer/cleanup-intent.json");
+            let mut record =
+                CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+            record.progress.stage = CleanupStage::FilesObserved;
+            // Simulated crash after this row's durable dispatch intent, before any outcome.
+            record.progress.resources[index] = CleanupResult::Unknown;
+            let target = PayloadInstaller::new(f.io.clone()).unwrap().targets()[index].clone();
+            let before = f.io.read(&target, 4096, false).unwrap();
+            f.io.atomic_write(&f.proof, &path, &record.encode().unwrap())
+                .unwrap();
+            drop(run);
+            let (plan, consent) = planned(&f, RemovalSelection::default(), None, 2, 200);
+            let mut resumed = plan
+                .resume(consent, Arc::new(f.service(&package())), &deadline())
+                .unwrap();
+            resumed.disable(&deadline()).unwrap();
+            finish(&f, &mut resumed);
+            assert_eq!(
+                f.io.read(&target, 4096, false).unwrap(),
+                before,
+                "row {index}"
+            );
+            assert_eq!(
+                resumed.report().progress.resources[index],
+                CleanupResult::Unknown
+            );
+            assert!(resumed.report().recovery_retained);
+            let unattempted = if index == 6 { 7 } else { 6 };
+            assert_eq!(
+                resumed.report().progress.resources[unattempted],
+                CleanupResult::Removed
+            );
+            assert!(
+                f.io.metadata(Path::new(
+                    &PayloadInstaller::new(f.io.clone()).unwrap().targets()[unattempted]
+                ))
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+    #[test]
+    fn reused_pid_or_changed_bootstrap_or_unknown_process_refuses_before_stop_dispatch() {
+        for axis in 0..3 {
+            let f = Fixture::new(false);
+            let mut run = start(&f, RemovalSelection::default(), true, true);
+            run.disable(&deadline()).unwrap();
+            match axis {
+                0 => {
+                    f.probe
+                        .0
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .generation += 1
+                }
+                1 => f.bootstrap(10),
+                _ => *f.probe.0.lock().unwrap() = Err(NativeError::Unavailable),
+            }
+            let _ = run.stop(&deadline());
+            assert_eq!(
+                f.runner
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, a)| a.get(1).is_some_and(|s| s == "stop"))
+                    .count(),
+                0,
+                "axis {axis}"
+            );
+            assert!(run.report().recovery_retained);
+            assert!(
+                f.io.metadata(&f.io.target().agent_path())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    #[test]
+    fn reenabled_autostart_after_clean_admission_refuses_erase_and_retains_files() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        run.disable(&deadline()).unwrap();
+        run.stop(&deadline()).unwrap();
+        run.observe_exit(&deadline()).unwrap();
+        {
+            let mut manager = f.runner.manager.lock().unwrap();
+            let properties = &mut manager.as_mut().unwrap().properties;
+            properties.insert("UnitFileState".into(), "enabled".into());
+            properties.insert("WantedBy".into(), "graphical-session.target".into());
+        }
+        let hash = sha256(&f.io.read(&f.io.target().agent_path(), 4096, false).unwrap());
+        assert!(run.identity(hash, f.environment(), &deadline()).is_err());
+        assert_eq!(f.erase_count(), 0);
+        assert!(run.report().recovery_retained);
+        assert!(run.remove_files(&deadline()).is_err());
+        assert!(
+            f.io.metadata(&f.io.target().agent_path())
+                .unwrap()
+                .is_some()
+        );
+    }
+    #[test]
+    fn ledger_drift_before_disable_keeps_last_durable_record_and_sends_no_mutation() {
+        let f = Fixture::new(false);
+        let mut run = start(&f, RemovalSelection::default(), true, true);
+        let path =
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/cleanup-intent.json");
+        let before = f.io.read(&path, MAX_RECORD_BYTES, true).unwrap();
+        let (ledger_path, mut ledger) = cleanup_ledger(&f);
+        ledger["manifest_hash"] = json!("00".repeat(32));
+        f.io.atomic_write(
+            &f.proof,
+            &ledger_path,
+            &serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+        assert!(run.disable(&deadline()).is_err());
+        assert_eq!(f.io.read(&path, MAX_RECORD_BYTES, true).unwrap(), before);
+        assert_eq!(
+            f.runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, a)| a
+                    .get(1)
+                    .is_some_and(|s| ["disable", "stop"].contains(&s.as_str())))
+                .count(),
+            0
+        );
+        assert!(
+            f.io.metadata(&f.io.target().agent_path())
+                .unwrap()
+                .is_some()
+        );
+    }
+    #[test]
+    fn replacement_instance_before_files_rejects_before_any_file_deletion() {
+        let f = Fixture::new(false);
+        let mut run = start(&f, RemovalSelection::default(), true, true);
+        run.disable(&deadline()).unwrap();
+        run.stop(&deadline()).unwrap();
+        run.observe_exit(&deadline()).unwrap();
+        run.identity([0; 32], f.environment(), &deadline()).unwrap();
+        let before = PayloadInstaller::new(f.io.clone())
+            .unwrap()
+            .targets()
+            .iter()
+            .map(|path| {
+                (
+                    PathBuf::from(path),
+                    f.io.read(Path::new(path), 4 * 1024 * 1024, false).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        f.bootstrap(10);
+        assert!(run.remove_files(&deadline()).is_err());
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        for (path, bytes) in before {
+            assert_eq!(f.io.read(&path, 4 * 1024 * 1024, false).unwrap(), bytes);
+        }
+    }
+    #[test]
+    fn erase_wrong_digest_or_environment_refuses_before_spawn() {
+        for wrong_environment in [false, true] {
+            let f = Fixture::new(false);
+            let mut run = start(
+                &f,
+                RemovalSelection {
+                    identity: IdentityChoice::DeleteIdentityAndPairings,
+                    ..Default::default()
+                },
+                true,
+                true,
+            );
+            run.disable(&deadline()).unwrap();
+            run.stop(&deadline()).unwrap();
+            run.observe_exit(&deadline()).unwrap();
+            let other = Fixture::new(false);
+            let hash = if wrong_environment {
+                sha256(&f.io.read(&f.io.target().agent_path(), 4096, false).unwrap())
+            } else {
+                [0; 32]
+            };
+            let environment = if wrong_environment {
+                other.environment()
+            } else {
+                f.environment()
+            };
+            assert!(run.identity(hash, environment, &deadline()).is_err());
+            assert_eq!(f.erase_count(), 0);
+            assert_eq!(other.erase_count(), 0);
+            assert!(
+                f.io.metadata(&f.io.target().agent_path())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    #[test]
+    fn reenabled_autostart_before_clean_observation_keeps_identity_and_recovery() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        run.disable(&deadline()).unwrap();
+        run.stop(&deadline()).unwrap();
+        {
+            let mut manager = f.runner.manager.lock().unwrap();
+            let properties = &mut manager.as_mut().unwrap().properties;
+            properties.insert("UnitFileState".into(), "enabled".into());
+            properties.insert("WantedBy".into(), "graphical-session.target".into());
+        }
+        run.observe_exit(&deadline()).unwrap();
+        let hash = sha256(&f.io.read(&f.io.target().agent_path(), 4096, false).unwrap());
+        run.identity(hash, f.environment(), &deadline()).unwrap();
+        run.remove_files(&deadline()).unwrap();
+        assert_eq!(f.erase_count(), 0);
+        assert!(run.report().recovery_retained);
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+    }
+
+    #[test]
+    fn actual_firewall_deadline_records_unknown_on_fresh_stop_call_without_replay() {
+        let f = Fixture::new(false);
+        let mut old = start(
+            &f,
+            RemovalSelection {
+                mdns_rule: true,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        let (mut fw, mut store) = firewall(&f, &[RuleKind::Mdns]);
+        old.disable(&deadline()).unwrap();
+        let admitted = receipt(&f, &store, RuleKind::Mdns);
+        let mut ctx = UninstallFirewall {
+            firewall: &mut fw,
+            support: &f.proof,
+            store: &mut store,
+            manager: ManagerSelection::Ufw,
+        };
+        let plan = old
+            .prepare_rule(
+                &mut ctx,
+                RuleKind::Mdns,
+                admitted,
+                OperationId(101),
+                &deadline(),
+            )
+            .unwrap();
+        let consent = plan.consent(OperationId(101), 1).unwrap();
+        f.auth.stall.store(true, Ordering::Release);
+        assert!(
+            old.apply_rule(
+                &mut ctx,
+                plan,
+                consent,
+                &Deadline::new(100, Cancellation::default()).unwrap()
+            )
+            .is_ok()
+        );
+        let path =
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/cleanup-intent.json");
+        let durable =
+            CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+        assert_eq!(durable.progress.stage, CleanupStage::FirewallObserved);
+        assert_eq!(durable.progress.mdns, CleanupResult::Pending);
+        assert_eq!(old.stage(), UninstallStage::Stop);
+        assert_eq!(old.report().progress.mdns, CleanupResult::Unknown);
+        finish(&f, &mut old);
+        let durable =
+            CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+        assert_eq!(durable.progress.mdns, CleanupResult::Unknown);
+        assert_eq!(durable.progress.stop, CleanupResult::Removed);
+        assert_eq!(old.report().form, UninstallForm::NotClean);
+        assert!(old.report().recovery_retained);
+        assert_eq!(
+            f.auth
+                .trace
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.as_str() == "ufw")
+                .count(),
+            1
+        );
+        assert_eq!(f.erase_count(), 0);
+    }
+    #[test]
+    fn crash_at_each_completed_stage_preserves_original_loss_and_does_not_replay_mutations() {
+        for cut in 0..4 {
+            let f = Fixture::new(false);
+            let mut old = start(&f, RemovalSelection::default(), true, true);
+            if cut >= 1 {
+                old.disable(&deadline()).unwrap();
+            }
+            if cut >= 2 {
+                old.stop(&deadline()).unwrap();
+            }
+            if cut >= 3 {
+                old.observe_exit(&deadline()).unwrap();
+                old.identity([0; 32], f.environment(), &deadline()).unwrap();
+            }
+            drop(old);
+            let (plan, consent) = planned(&f, RemovalSelection::default(), None, 2, 200);
+            let mut resumed = plan
+                .resume(consent, Arc::new(f.service(&package())), &deadline())
+                .unwrap();
+            resumed.disable(&deadline()).unwrap();
+            finish(&f, &mut resumed);
+            assert_eq!(resumed.report().form, UninstallForm::NotClean, "cut {cut}");
+            assert_eq!(f.erase_count(), 0);
+            let calls = f.runner.calls.lock().unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(_, a)| a.get(1).is_some_and(|s| s == "stop"))
+                    .count(),
+                1,
+                "cut {cut}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(_, a)| a.get(1).is_some_and(|s| s == "disable"))
+                    .count(),
+                1,
+                "cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn timed_out_erase_retains_worker_lease_and_rejects_repeated_dispatch() {
+        struct Release(Arc<lease_dispatch_tests::Gate>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.release();
+                self.0.wait(|| self.0.finished.load(Ordering::Acquire));
+            }
+        }
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        run.disable(&deadline()).unwrap();
+        run.stop(&deadline()).unwrap();
+        run.observe_exit(&deadline()).unwrap();
+        let gate = lease_dispatch_tests::Gate::new();
+        let _release = Release(gate.clone());
+        *f.runner.erase_gate.lock().unwrap() = Some(gate.clone());
+        let hash = sha256(&f.io.read(&f.io.target().agent_path(), 4096, false).unwrap());
+        assert!(
+            run.identity(
+                hash,
+                f.environment(),
+                &Deadline::new(200, Cancellation::default()).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(f.erase_count(), 1);
+        assert!(run.pending().is_some_and(|p| !p.completed()));
+        assert!(run.identity(hash, f.environment(), &deadline()).is_err());
+        let fresh = f.io.admit_cleanup(&deadline()).unwrap();
+        assert!(matches!(fresh.lease(&deadline()), Err(NativeError::Busy)));
+        assert!(
+            f.io.metadata(&f.io.target().agent_path())
+                .unwrap()
+                .is_some()
+        );
+        drop(run);
+        assert!(matches!(fresh.lease(&deadline()), Err(NativeError::Busy)));
+        gate.release();
+        gate.wait(|| gate.finished.load(Ordering::Acquire));
+    }
+    #[test]
+    fn reinstalled_matching_unprovenanced_rows_are_retained_without_mutations() {
+        let f = Fixture::new(false);
+        let p = package();
+        installed(&f, &p);
+        let install = PayloadInstaller::new(f.io.clone()).unwrap();
+        let repeat = install
+            .plan(&f.proof, &p, OperationId(48), MatchingFiles::Preserve)
+            .unwrap();
+        install.apply(&f.proof, &p, repeat, &deadline()).unwrap();
+        install
+            .verify(&f.proof, &p, 19, 100, &f.reply(), &deadline())
+            .unwrap();
+        let service = known_manager(&f, &p, true);
+        let (plan, consent) = planned(&f, RemovalSelection::default(), Some(f.tracked()), 1, 100);
+        assert!(plan.actions().iter().all(|a| *a == ResourceAction::Retain));
+        let mut run = plan.begin(consent, service, &deadline()).unwrap();
+        run.disable(&deadline()).unwrap();
+        finish(&f, &mut run);
+        assert!(
+            run.report()
+                .progress
+                .resources
+                .iter()
+                .all(|r| *r == CleanupResult::Kept)
+        );
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        assert_eq!(f.erase_count(), 0);
+    }
+    #[test]
+    fn already_absent_identity_receipt_is_complete_without_extra_deletes() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        *f.runner.output.lock().unwrap()=Ok((Some(0),br#"{"schema_version":1,"result":"already_absent","reason":null,"key":"absent","trust":"absent"}"#.to_vec(),vec![]));
+        run.disable(&deadline()).unwrap();
+        finish(&f, &mut run);
+        assert_eq!(run.report().form, UninstallForm::Complete);
+        assert_eq!(f.erase_count(), 1);
+        assert!(run.identity([0; 32], f.environment(), &deadline()).is_err());
+        assert_eq!(f.erase_count(), 1);
+    }
+    #[test]
+    fn unknown_rule_without_supported_firewall_authority_is_named_and_stop_continues() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                lan_rule: true,
+                mdns_rule: true,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        run.disable(&deadline()).unwrap();
+        assert!(run.stop(&deadline()).is_err()); // Wrong order retires this attempt before dispatch.
+        assert_eq!(
+            f.runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, a)| a.get(1).is_some_and(|s| s == "stop"))
+                .count(),
+            0
+        );
+        drop(run);
+        let (plan, consent) = planned(
+            &f,
+            RemovalSelection {
+                lan_rule: true,
+                mdns_rule: true,
+                ..Default::default()
+            },
+            None,
+            2,
+            200,
+        );
+        let mut run = plan
+            .resume(consent, Arc::new(f.service(&package())), &deadline())
+            .unwrap();
+        run.disable(&deadline()).unwrap();
+        run.retain_rule(RuleKind::Lan, FirewallError::Manual, &deadline())
+            .unwrap();
+        run.retain_rule(RuleKind::Mdns, FirewallError::CurrentRequired, &deadline())
+            .unwrap();
+        finish(&f, &mut run);
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        assert!(run.report().issues.iter().any(|i| matches!(
+            i,
+            UninstallIssue::Rule(RuleKind::Lan, FirewallError::Manual)
+        )));
+        assert!(run.report().issues.iter().any(|i| matches!(
+            i,
+            UninstallIssue::Rule(RuleKind::Mdns, FirewallError::CurrentRequired)
+        )));
+        assert!(f.auth.trace.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn cancel_before_new_intent_leaves_files_and_commands_untouched() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let (plan, consent) = planned(&f, RemovalSelection::default(), Some(f.tracked()), 1, 100);
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let count = f.runner.calls.lock().unwrap().len();
+        assert!(
+            plan.begin(
+                consent,
+                Arc::new(f.service(&package())),
+                &Deadline::new(5000, cancellation).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(count, f.runner.calls.lock().unwrap().len());
+        assert!(
+            f.io.metadata(
+                &f.io
+                    .target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/installer/cleanup-intent.json")
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_crash_resume_does_not_regress_durable_stage_or_lose_removed_rows() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let service = known_manager(&f, &package(), false);
+        let proof = f.io.admit_cleanup(&deadline()).unwrap();
+        let digest = sha256(&serde_json::to_vec(proof.receipt()).unwrap());
+        let lease = proof.lease(&deadline()).unwrap();
+        assert!(lease.delete(8, &deadline()).unwrap());
+        let mut resources = [CleanupResult::Pending; FILES.len()];
+        resources[8] = CleanupResult::Removed;
+        CleanupStore::new(lease)
+            .write(
+                &CleanupIntent {
+                    revision: 1,
+                    operation: OperationId(100),
+                    ledger_digest: digest,
+                    delete_identity: false,
+                    lan_rule: false,
+                    mdns_rule: false,
+                    progress: CleanupProgress {
+                        stage: CleanupStage::FilesObserved,
+                        resources,
+                        autostart: CleanupResult::AlreadyAbsent,
+                        stop: CleanupResult::AlreadyAbsent,
+                        identity: CleanupResult::Kept,
+                        lan: CleanupResult::Kept,
+                        mdns: CleanupResult::Kept,
+                    },
+                },
+                &deadline(),
+            )
+            .unwrap();
+        let (plan, consent) = planned(&f, RemovalSelection::default(), None, 2, 200);
+        let mut first = plan.resume(consent, service.clone(), &deadline()).unwrap();
+        first.disable(&deadline()).unwrap();
+        drop(first);
+        let (plan, consent) = planned(&f, RemovalSelection::default(), None, 3, 300);
+        assert!(plan.resume(consent, service, &deadline()).is_ok());
+        assert!(
+            f.io.metadata(&PayloadInstaller::new(f.io.clone()).unwrap().targets()[8])
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn changed_service_main_pid_cannot_stop_a_different_process_or_gain_clean_authority() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        run.disable(&deadline()).unwrap();
+        f.runner
+            .manager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .properties
+            .insert("MainPID".into(), "7777".into());
+        let _ = run.stop(&deadline());
+        assert_eq!(
+            f.runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, a)| a.get(1).is_some_and(|s| s == "stop"))
+                .count(),
+            0
+        );
+        assert_eq!(f.erase_count(), 0);
+        assert!(
+            f.io.metadata(&f.io.target().agent_path())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    use crosspane_installer::platform::linux::firewall::{current::*, receipts::*, *};
+    use crosspane_types::id::NodeId;
+    use std::sync::atomic::AtomicBool;
+    #[derive(Default)]
+    pub(super) struct Auth {
+        present: Mutex<[bool; 2]>,
+        unknown: AtomicBool,
+        stall: AtomicBool,
+        detect_stall: AtomicBool,
+        trace: Mutex<Vec<String>>,
+        reads: AtomicU64,
+    }
+    pub(super) struct AuthRunner(pub Arc<Auth>);
+    struct AuthChild {
+        auth: Arc<Auth>,
+        outcome: Option<PkexecOutcome>,
+        kind: usize,
+    }
+    impl PkexecRunner for AuthRunner {
+        fn spawn(
+            &self,
+            c: &PkexecCommand,
+            d: &Deadline,
+        ) -> Result<Box<dyn PkexecChild>, NativeError> {
+            d.check()?;
+            assert_eq!(c.executable(), Path::new("/usr/bin/setsid"));
+            assert_eq!(
+                &c.argv()[..5],
+                [
+                    "--wait",
+                    "/usr/bin/pkexec",
+                    "/usr/bin/ufw",
+                    "delete",
+                    "allow"
+                ]
+            );
+            self.0.trace.lock().unwrap().push("ufw".into());
+            let kind = if c.argv().contains(&"5353".into()) {
+                1
+            } else {
+                0
+            };
+            let outcome = if self.0.unknown.load(Ordering::Acquire) {
+                PkexecOutcome::TimedOut
+            } else {
+                PkexecOutcome::Exited {
+                    code: 0,
+                    stdout: vec![],
+                    stderr: vec![],
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                }
+            };
+            Ok(Box::new(AuthChild {
+                auth: self.0.clone(),
+                outcome: Some(outcome),
+                kind,
+            }))
+        }
+    }
+    impl PkexecChild for AuthChild {
+        fn poll(&mut self) -> Result<Option<PkexecOutcome>, NativeError> {
+            if self.auth.stall.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            if matches!(&self.outcome, Some(PkexecOutcome::Exited { code: 0, .. })) {
+                self.auth.present.lock().unwrap()[self.kind] = false;
+            }
+            Ok(self.outcome.take())
+        }
+        fn terminate(&mut self) {
+            self.auth.trace.lock().unwrap().push("terminate".into());
+            self.outcome = None;
+        }
+        fn reaped(&mut self) -> bool {
+            self.outcome.is_none()
+        }
+    }
+    struct RuleReads(Arc<Auth>);
+    impl FirewallReader for RuleReads {
+        fn file(&self, r: SystemRead, d: &Deadline) -> Result<Vec<u8>, NativeError> {
+            while self.0.detect_stall.load(Ordering::Acquire) {
+                d.check()?;
+                thread::sleep(Duration::from_millis(1));
+            }
+            d.check()?;
+            self.0.reads.fetch_add(1, Ordering::Relaxed);
+            match r {
+                SystemRead::UfwConfig => Ok(b"ENABLED=yes\n".to_vec()),
+                SystemRead::UfwRules6 => {
+                    Ok(b"*filter\n### RULES ###\n### END RULES ###\nCOMMIT\n".to_vec())
+                }
+                SystemRead::UfwRules => {
+                    let mut text = "*filter\n### RULES ###\n".to_string();
+                    for (i, present) in self.0.present.lock().unwrap().iter().enumerate() {
+                        if !present {
+                            continue;
+                        }
+                        let (ports, args, comment) = if i == 0 {
+                            (
+                                "47811:47812",
+                                "-m multiport --dports 47811:47812",
+                                "Crosspane (LAN)",
+                            )
+                        } else {
+                            ("5353", "--dport 5353", "Crosspane (mDNS)")
+                        };
+                        let hex = comment
+                            .bytes()
+                            .map(|v| format!("{v:02x}"))
+                            .collect::<String>();
+                        text.push_str(&format!("### tuple ### allow udp {ports} 0.0.0.0/0 any 192.168.4.0/24 in comment={hex}\n-A ufw-user-input -p udp {args} -s 192.168.4.0/24 -j ACCEPT\n"));
+                    }
+                    text.push_str("### END RULES ###\nCOMMIT\n");
+                    Ok(text.into_bytes())
+                }
+                _ => panic!("unapproved fake file"),
+            }
+        }
+        fn command(&self, r: FirewallRead, d: &Deadline) -> Result<CommandOutput, NativeError> {
+            d.check()?;
+            self.0.reads.fetch_add(1, Ordering::Relaxed);
+            let bytes=match r {
+                FirewallRead::Activity=>b"active\n".to_vec(),
+                FirewallRead::Addresses=>br#"[{"ifname":"enp1s0","flags":["UP","LOWER_UP"],"link_type":"ether","addr_info":[{"family":"inet","scope":"global","local":"192.168.4.31","prefixlen":24}]}]"#.to_vec(),
+                FirewallRead::Default4=>br#"[{"dst":"default","dev":"enp1s0"}]"#.to_vec(),
+                FirewallRead::Default6=>b"[]".to_vec(),
+            };
+            Ok(CommandOutput {
+                code: Some(0),
+                stdout: bytes,
+                stderr: vec![],
+            })
+        }
+    }
+    struct LiveReader {
+        io: Arc<LinuxNativeIo>,
+        probe: Arc<Probe>,
+        auth: Arc<Auth>,
+        stamp: u64,
+    }
+    impl CurrentReader for LiveReader {
+        fn read(
+            &mut self,
+            target: &LinuxTarget,
+            _: &LanLink,
+            peer: NodeId,
+            d: &Deadline,
+        ) -> Result<CurrentObservations, NativeError> {
+            d.check()?;
+            assert_eq!(target.paths(), self.io.target().paths());
+            assert!(
+                self.probe.0.lock().unwrap().as_ref().unwrap().is_some(),
+                "current evidence must precede stop"
+            );
+            self.auth.trace.lock().unwrap().push("current".into());
+            self.stamp += 20;
+            let mut value: Value = serde_json::from_str(HEALTH).unwrap();
+            let s = &mut value["result"]["installer"];
+            s["instance"]["uid"] = json!(target.paths().uid);
+            s["instance"]["exe"] = json!(target.agent_path());
+            s["instance"]["runtime_dir"] = json!(target.runtime_dir());
+            s["peers"] = json!([{"node":peer,"name":"inert","connected":true,"link_generation":2,"features":[],
+                "grants_given":[],"last_source_parking":null,"counters":{
+                "e1_controller_started":0,"e1_controller_ended":0,"e1_target_started":0,"e1_target_ended":0,
+                "e1_injections_ok":0,"e1_hud_shows":0,"e1_chord_releases":0,"e1_command_releases":0,
+                "e2_source_started":0,"e2_source_returned":0,"e2_dest_started":0,"e2_dest_returned":0,
+                "e2_frames_presented":null,"e2_returns_failed":0}}]);
+            let reply = |id, at| AgentReply {
+                id,
+                observed_at_ms: at,
+                source: ObservationSource::Demo,
+                result: decode_reply(
+                    &InstallerRequest::Status,
+                    &serde_json::to_vec(&value).unwrap(),
+                    AgentPlatform::Linux,
+                ),
+            };
+            let a = reply(self.stamp, self.stamp);
+            let b = reply(self.stamp + 1, self.stamp + 1);
+            assert!(matches!(
+                &a.result,
+                Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+            ));
+            Ok(CurrentObservations {
+                peer,
+                connection: a,
+                discovery: b,
+            })
+        }
+        fn dispatch_stamp_ms(&self) -> Result<u64, NativeError> {
+            Ok(self.stamp + 2)
+        }
+    }
+    fn firewall(f: &Fixture, kinds: &[RuleKind]) -> (LinuxFirewall, DurableIntentStore) {
+        let mut fw =
+            LinuxFirewall::scratch(f.io.clone(), Arc::new(RuleReads(f.auth.clone()))).unwrap();
+        fw.install_current_reader(
+            NodeId([2; 32]),
+            Box::new(LiveReader {
+                io: f.io.clone(),
+                probe: f.probe.clone(),
+                auth: f.auth.clone(),
+                stamp: 100,
+            }),
+        );
+        let mut store = DurableIntentStore::open(&mut fw, &f.proof).unwrap();
+        for kind in kinds {
+            let i = FirewallIntent {
+                operation: OperationId(if *kind == RuleKind::Lan { 1 } else { 2 }),
+                revision: 1,
+                target: f.io.target().paths().clone(),
+                kind: *kind,
+                link: LanLink {
+                    interface: "enp1s0".into(),
+                    cidr: LanCidr::parse("192.168.4.0/24").unwrap(),
+                    default_route: true,
+                },
+            };
+            store.record_intent(&f.proof, &i).unwrap();
+            store
+                .record_outcome(&f.proof, &i, RuleResult::PendingVerification)
+                .unwrap();
+            f.auth.present.lock().unwrap()[usize::from(*kind == RuleKind::Mdns)] = true;
+        }
+        (fw, store)
+    }
+    fn receipt(f: &Fixture, store: &DurableIntentStore, kind: RuleKind) -> AdmittedReceipt {
+        let bytes = store
+            .receipt(
+                &f.proof,
+                OperationId(if kind == RuleKind::Lan { 1 } else { 2 }),
+            )
+            .unwrap();
+        store.admit_receipt(&f.proof, &bytes).unwrap()
+    }
+    #[test]
+    fn present_lan_and_mdns_remove_with_separate_consent_and_live_evidence_before_stop() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                lan_rule: true,
+                mdns_rule: true,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        let (mut fw, mut store) = firewall(&f, &[RuleKind::Lan, RuleKind::Mdns]);
+        run.disable(&deadline()).unwrap();
+        for (kind, op) in [(RuleKind::Lan, 101), (RuleKind::Mdns, 102)] {
+            let admitted = receipt(&f, &store, kind);
+            let mut ctx = UninstallFirewall {
+                firewall: &mut fw,
+                support: &f.proof,
+                store: &mut store,
+                manager: ManagerSelection::Ufw,
+            };
+            let plan = run
+                .prepare_rule(&mut ctx, kind, admitted, OperationId(op), &deadline())
+                .unwrap();
+            assert!(plan.preview().contains("global rule"));
+            let consent = plan.consent(OperationId(op), 1).unwrap();
+            assert_eq!(format!("{plan:?}"), "UninstallRulePlan(..)");
+            assert_eq!(format!("{consent:?}"), "UninstallRuleConsent(..)");
+            assert_eq!(format!("{ctx:?}"), "UninstallFirewall(..)");
+            run.apply_rule(&mut ctx, plan, consent, &deadline())
+                .unwrap();
+        }
+        assert_eq!(
+            *f.auth.trace.lock().unwrap(),
+            ["current", "ufw", "current", "ufw"]
+        );
+        assert!(f.probe.0.lock().unwrap().as_ref().unwrap().is_some());
+        finish(&f, &mut run);
+        assert_eq!(run.report().form, UninstallForm::Complete);
+        assert_eq!(run.report().progress.lan, CleanupResult::AlreadyAbsent);
+        assert_eq!(run.report().progress.mdns, CleanupResult::AlreadyAbsent);
+        assert_eq!(*f.auth.present.lock().unwrap(), [false, false]);
+    }
+    #[test]
+    fn firewall_unknown_is_durable_stop_continues_and_recovery_tools_stay() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                mdns_rule: true,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        let (mut fw, mut store) = firewall(&f, &[RuleKind::Mdns]);
+        f.auth.unknown.store(true, Ordering::Release);
+        run.disable(&deadline()).unwrap();
+        let admitted = receipt(&f, &store, RuleKind::Mdns);
+        let mut ctx = UninstallFirewall {
+            firewall: &mut fw,
+            support: &f.proof,
+            store: &mut store,
+            manager: ManagerSelection::Ufw,
+        };
+        let plan = run
+            .prepare_rule(
+                &mut ctx,
+                RuleKind::Mdns,
+                admitted,
+                OperationId(101),
+                &deadline(),
+            )
+            .unwrap();
+        let consent = plan.consent(OperationId(101), 1).unwrap();
+        run.apply_rule(&mut ctx, plan, consent, &deadline())
+            .unwrap();
+        let path =
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/cleanup-intent.json");
+        let durable =
+            CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+        assert_eq!(durable.progress.mdns, CleanupResult::Unknown);
+        assert_eq!(run.stage(), UninstallStage::Stop);
+        finish(&f, &mut run);
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        assert!(run.report().issues.iter().any(|i| matches!(
+            i,
+            UninstallIssue::RuleOutcome(RuleKind::Mdns, RuleResult::OutcomeUnknown, _)
+        )));
+        assert!(
+            run.report().progress.resources[..6]
+                .iter()
+                .all(|r| *r == CleanupResult::Kept)
+        );
+        assert!(!f.probe.0.lock().unwrap().as_ref().unwrap().is_some());
+        assert_eq!(
+            f.auth
+                .trace
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.as_str() == "ufw")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn admitted_wrong_rule_kind_refuses_before_any_firewall_io() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                mdns_rule: true,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        let (mut fw, mut store) = firewall(&f, &[RuleKind::Lan]);
+        run.disable(&deadline()).unwrap();
+        let admitted = receipt(&f, &store, RuleKind::Lan);
+        assert_eq!(admitted.kind(), RuleKind::Lan);
+        let count = f.auth.reads.load(Ordering::Acquire);
+        let mut ctx = UninstallFirewall {
+            firewall: &mut fw,
+            support: &f.proof,
+            store: &mut store,
+            manager: ManagerSelection::Ufw,
+        };
+        assert!(
+            run.prepare_rule(
+                &mut ctx,
+                RuleKind::Mdns,
+                admitted,
+                OperationId(101),
+                &deadline()
+            )
+            .is_err()
+        );
+        assert_eq!(f.auth.reads.load(Ordering::Acquire), count);
+        assert!(f.auth.trace.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn each_unclean_or_mismatched_exit_fact_keeps_recovery_and_selected_identity() {
+        for axis in 0..9 {
+            let f = Fixture::new(false);
+            let mut run = start(
+                &f,
+                RemovalSelection {
+                    identity: IdentityChoice::DeleteIdentityAndPairings,
+                    ..Default::default()
+                },
+                false,
+                true,
+            );
+            *f.probe.0.lock().unwrap() = Ok(None);
+            if axis != 0 {
+                f.exit(|v| match axis {
+                    1 => {
+                        v["instance_id"] = json!(10);
+                    }
+                    2 => {
+                        v["stopped_unix_ms"] = json!(1);
+                    }
+                    3 => {
+                        v["parking"] = json!("failed");
+                        v["clean"] = json!(false);
+                    }
+                    4 => {
+                        v["input_journals_empty"] = json!(false);
+                        v["clean"] = json!(false);
+                    }
+                    5 => {
+                        v["audio_stopped"] = json!(false);
+                        v["clean"] = json!(false);
+                    }
+                    6 => {
+                        v["clean"] = json!(false);
+                    } // codec rejects contradictory otherwise-clean facts
+                    _ => {}
+                });
+            }
+            if axis == 7 {
+                f.bootstrap(10);
+            }
+            if axis == 8 {
+                *f.probe.0.lock().unwrap() = Ok(Some(ProcessFacts {
+                    uid: f.io.target().paths().uid,
+                    executable: f.io.target().agent_path(),
+                    generation: 88,
+                }));
+            }
+            run.disable(&deadline()).unwrap();
+            finish(&f, &mut run);
+            assert_eq!(run.report().form, UninstallForm::NotClean, "axis {axis}");
+            assert_eq!(f.erase_count(), 0, "axis {axis}");
+            assert!(
+                run.report().progress.resources[..6]
+                    .iter()
+                    .all(|r| *r == CleanupResult::Kept)
+            );
+        }
+    }
+    #[test]
+    fn erase_literal_refused_waiting_failed_and_kept_trust_keep_the_tools() {
+        for bytes in [
+            r#"{"schema_version":1,"result":"refused","reason":"agent_running","key":"kept","trust":"kept"}"#,
+            r#"{"schema_version":1,"result":"waiting","reason":"keystore_locked","key":"kept","trust":"kept"}"#,
+            r#"{"schema_version":1,"result":"failed","reason":"io","key":"removed","trust":"failed"}"#,
+            r#"{"schema_version":1,"result":"removed","reason":null,"key":"removed","trust":"kept"}"#,
+        ] {
+            let f = Fixture::new(false);
+            let mut run = start(
+                &f,
+                RemovalSelection {
+                    identity: IdentityChoice::DeleteIdentityAndPairings,
+                    ..Default::default()
+                },
+                true,
+                true,
+            );
+            *f.runner.output.lock().unwrap() = Ok((Some(0), bytes.as_bytes().to_vec(), vec![]));
+            run.disable(&deadline()).unwrap();
+            finish(&f, &mut run);
+            assert_eq!(f.erase_count(), 1);
+            assert_eq!(run.report().progress.identity, CleanupResult::Refused);
+            assert_eq!(run.report().form, UninstallForm::NotClean);
+            assert!(run.report().identity_receipt.is_some());
+            assert!(
+                run.report().progress.resources[..6]
+                    .iter()
+                    .all(|r| *r == CleanupResult::Kept)
+            );
+        }
+    }
+    #[test]
+    fn malformed_or_nonzero_erase_retires_without_a_retry_and_keeps_recovery() {
+        for (code, bytes) in [
+            (Some(0), b"{}\n".to_vec()),
+            (Some(0), vec![b'x'; 4097]),
+            (Some(1), b"{}\n".to_vec()),
+        ] {
+            let f = Fixture::new(false);
+            let mut run = start(
+                &f,
+                RemovalSelection {
+                    identity: IdentityChoice::DeleteIdentityAndPairings,
+                    ..Default::default()
+                },
+                true,
+                true,
+            );
+            *f.runner.output.lock().unwrap() = Ok((code, bytes, vec![]));
+            run.disable(&deadline()).unwrap();
+            run.stop(&deadline()).unwrap();
+            run.observe_exit(&deadline()).unwrap();
+            let hash = sha256(&f.io.read(&f.io.target().agent_path(), 4096, false).unwrap());
+            assert!(run.identity(hash, f.environment(), &deadline()).is_err());
+            assert!(run.identity(hash, f.environment(), &deadline()).is_err());
+            assert_eq!(f.erase_count(), 1);
+            assert_eq!(run.report().form, UninstallForm::NotClean);
+            assert!(
+                f.io.metadata(&f.io.target().agent_path())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    #[test]
+    fn resume_loses_original_watch_never_replays_erase_and_observes_completed_disable() {
+        let f = Fixture::new(false);
+        let mut old = start(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        old.disable(&deadline()).unwrap();
+        old.stop(&deadline()).unwrap();
+        old.observe_exit(&deadline()).unwrap();
+        drop(old);
+        let service = Arc::new(f.service(&package()));
+        let (plan, consent) = planned(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            None,
+            2,
+            200,
+        );
+        let mut run = plan.resume(consent, service, &deadline()).unwrap();
+        run.disable(&deadline()).unwrap();
+        finish(&f, &mut run);
+        assert_eq!(f.erase_count(), 0);
+        let stops = f
+            .runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, a)| a.get(1).is_some_and(|s| s == "stop"))
+            .count();
+        assert_eq!(stops, 1);
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        assert!(run.report().recovery_retained);
+    }
+    #[test]
+    fn contradictory_resume_resources_or_selection_reject_before_mutation() {
+        for axis in 0..3 {
+            let f = Fixture::new(false);
+            let old = start(&f, RemovalSelection::default(), true, true);
+            drop(old);
+            let path =
+                f.io.target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/installer/cleanup-intent.json");
+            let mut record =
+                CleanupIntent::decode(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
+            match axis {
+                0 => {
+                    record.progress.resources[0] = CleanupResult::Removed;
+                    record.progress.stage = CleanupStage::FilesObserved;
+                }
+                1 => {
+                    record.delete_identity = true;
+                }
+                _ => {
+                    record.progress.stage = CleanupStage::Finished;
+                }
+            }
+            f.io.atomic_write(&f.proof, &path, &record.encode().unwrap())
+                .unwrap();
+            let (plan, consent) = planned(&f, RemovalSelection::default(), None, 2, 200);
+            let commands = f.runner.calls.lock().unwrap().len();
+            assert!(
+                plan.resume(consent, Arc::new(f.service(&package())), &deadline())
+                    .is_err()
+            );
+            assert_eq!(commands, f.runner.calls.lock().unwrap().len());
+        }
+    }
+    #[test]
+    fn superseded_coherent_plan_and_consent_fail_before_any_native_io() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let cp = CleanupPlanner::default();
+        let up = UninstallPlanner::default();
+        let make = |r, o| {
+            let inv =
+                CleanupInventory::admit(f.io.admit_cleanup(&deadline()).unwrap(), &deadline())
+                    .unwrap();
+            let c = cp
+                .plan(inv, r, OperationId(o), RemovalSelection::default())
+                .unwrap();
+            let cc = cp.consent(&c, r, OperationId(o), &deadline()).unwrap();
+            let p = up.plan(c, f.io.clone(), Some(f.tracked())).unwrap();
+            let consent = up.consent(&p, cc, r, OperationId(o)).unwrap();
+            (p, consent)
+        };
+        let (old, consent) = make(1, 100);
+        let (_new, _) = make(2, 200);
+        let commands = f.runner.calls.lock().unwrap().len();
+        assert!(
+            old.begin(consent, Arc::new(f.service(&package())), &deadline())
+                .is_err()
+        );
+        assert_eq!(commands, f.runner.calls.lock().unwrap().len());
+        assert!(
+            f.io.metadata(
+                &f.io
+                    .target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/installer/cleanup-intent.json")
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    #[test]
+    fn new_uninstall_public_debug_is_type_only() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let (plan, consent) = planned(&f, RemovalSelection::default(), Some(f.tracked()), 1, 100);
+        let values = [
+            format!("{plan:?}"),
+            format!("{consent:?}"),
+            format!("{:?}", UninstallPlanner::default()),
+            format!("{:?}", UninstallError::Invalid),
+            format!("{:?}", UninstallIssue::CleanExit(RemovalError::NotClean)),
+        ];
+        assert_eq!(
+            values,
+            [
+                "UninstallPlan(..)",
+                "UninstallConsent(..)",
+                "UninstallPlanner(..)",
+                "UninstallError(..)",
+                "UninstallIssue(..)"
+            ]
+        );
+        let run = plan
+            .begin(consent, known_manager(&f, &package(), true), &deadline())
+            .unwrap();
+        assert_eq!(format!("{run:?}"), "UninstallRun(..)");
+        assert_eq!(format!("{:?}", run.report()), "UninstallReport(..)");
+    }
+
+    use super::*;
+    use crosspane_installer::platform::linux::removal::executor::*;
+    type ShowHook = Box<dyn FnOnce(&mut BTreeMap<String, String>) + Send>;
+    pub(super) struct Manager {
+        properties: BTreeMap<String, String>,
+        cat: Vec<u8>,
+        on_stop: Option<Box<dyn Fn() + Send>>,
+        shows: u64,
+        show_hook: Option<(u64, ShowHook)>,
+    }
+    impl Manager {
+        pub(super) fn run(
+            &mut self,
+            c: &CommandSpec,
+            d: &Deadline,
+        ) -> Result<CommandOutput, NativeError> {
+            d.check()?;
+            assert_eq!(c.argv()[0], "--user");
+            if c.argv()[1] == "show" {
+                self.shows += 1;
+                if self
+                    .show_hook
+                    .as_ref()
+                    .is_some_and(|(at, _)| *at == self.shows)
+                {
+                    let (_, hook) = self.show_hook.take().unwrap();
+                    hook(&mut self.properties);
+                }
+            }
+            let p = &mut self.properties;
+            let (code, stdout) = match c.argv()[1].as_str() {
+                "show" => (
+                    0,
+                    p.iter()
+                        .filter(|(_, v)| c.argv().iter().any(|a| a == "--all") || !v.is_empty())
+                        .map(|(k, v)| format!("{k}={v}\n"))
+                        .collect::<String>()
+                        .into_bytes(),
+                ),
+                "cat" => (0, self.cat.clone()),
+                "is-active" => (
+                    if p["ActiveState"] == "active" { 0 } else { 3 },
+                    format!("{}\n", p["ActiveState"]).into_bytes(),
+                ),
+                "is-enabled" => (
+                    if p["UnitFileState"] == "enabled" {
+                        0
+                    } else {
+                        1
+                    },
+                    format!("{}\n", p["UnitFileState"]).into_bytes(),
+                ),
+                "disable" => {
+                    p.insert("UnitFileState".into(), "disabled".into());
+                    p.insert("WantedBy".into(), "".into());
+                    (0, vec![])
+                }
+                "stop" => {
+                    p.insert("ActiveState".into(), "inactive".into());
+                    p.insert("SubState".into(), "dead".into());
+                    p.insert("MainPID".into(), "0".into());
+                    if let Some(effect) = &self.on_stop {
+                        effect();
+                    }
+                    (0, vec![])
+                }
+                _ => panic!("unapproved fake mutation"),
+            };
+            Ok(CommandOutput {
+                code: Some(code),
+                stdout,
+                stderr: vec![],
+            })
+        }
+    }
+    fn known_manager(f: &Fixture, p: &Package, clean: bool) -> Arc<LinuxService> {
+        let resources = PayloadInstaller::new(f.io.clone())
+            .unwrap()
+            .rendered_resources(p)
+            .unwrap();
+        let unit = &resources[0];
+        let mut p: BTreeMap<String, String> = MANAGER_PROPERTIES
+            .split(',')
+            .map(|k| (k.into(), "".into()))
+            .collect();
+        for (k, v) in [
+            ("Id", UNIT),
+            ("LoadState", "loaded"),
+            ("DynamicUser", "no"),
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("UnitFileState", "enabled"),
+            ("MainPID", "4242"),
+            ("PartOf", "graphical-session.target"),
+            ("After", "basic.target graphical-session.target app.slice"),
+            ("Requisite", "graphical-session.target"),
+            ("KillSignal", "15"),
+            ("TimeoutStopUSec", "10s"),
+            ("Restart", "on-failure"),
+            ("RestartUSec", "3s"),
+            ("NeedDaemonReload", "no"),
+            ("StartLimitIntervalUSec", "2min"),
+            ("StartLimitBurst", "30"),
+            ("Type", "simple"),
+            ("Requires", "basic.target app.slice"),
+            ("Conflicts", "shutdown.target"),
+            ("Before", "shutdown.target"),
+            ("DefaultDependencies", "yes"),
+            ("KillMode", "control-group"),
+            ("SendSIGKILL", "yes"),
+            ("FinalKillSignal", "9"),
+            ("RestartKillSignal", "15"),
+            ("SendSIGHUP", "no"),
+            ("UMask", "0022"),
+            ("RemainAfterExit", "no"),
+            ("NotifyAccess", "none"),
+            ("StandardInput", "null"),
+            ("StandardOutput", "journal"),
+            ("StandardError", "inherit"),
+            ("TTYPath", "/dev/console"),
+            ("Slice", "app.slice"),
+            ("Delegate", "no"),
+            ("OOMPolicy", "stop"),
+            ("ManagedOOMSwap", "auto"),
+            ("ManagedOOMMemoryPressure", "auto"),
+            ("ManagedOOMPreference", "none"),
+            ("SuccessAction", "none"),
+            ("FailureAction", "none"),
+            ("StartLimitAction", "none"),
+            ("JobTimeoutAction", "none"),
+            ("OnSuccessJobMode", "fail"),
+            ("OnFailureJobMode", "replace"),
+            ("StopWhenUnneeded", "no"),
+            ("RefuseManualStart", "no"),
+            ("RefuseManualStop", "no"),
+            ("AllowIsolate", "no"),
+            ("IgnoreOnIsolate", "no"),
+            ("SurviveFinalKillSignal", "no"),
+            ("JobTimeoutUSec", "infinity"),
+            ("JobRunningTimeoutUSec", "infinity"),
+            ("CollectMode", "inactive"),
+            ("RestartMode", "normal"),
+            ("RestartSteps", "0"),
+            ("RestartMaxDelayUSec", "infinity"),
+            ("TimeoutStartFailureMode", "terminate"),
+            ("TimeoutStopFailureMode", "terminate"),
+            ("RuntimeMaxUSec", "infinity"),
+            ("RuntimeRandomizedExtraUSec", "0"),
+            ("WatchdogUSec", "0"),
+            ("ExitType", "main"),
+            ("FileDescriptorStoreMax", "0"),
+            ("NFileDescriptorStore", "0"),
+            ("FileDescriptorStorePreserve", "restart"),
+            ("RootDirectoryStartOnly", "no"),
+            ("RootEphemeral", "no"),
+            ("RuntimeDirectoryPreserve", "no"),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        p.insert(
+            "FragmentPath".into(),
+            unit.target.to_string_lossy().into_owned(),
+        );
+        let exe = f.io.target().agent_path().to_string_lossy().into_owned();
+        p.insert("ExecStart".into(),format!("{{ path={exe} ; argv[]={exe} run ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}"));
+        p.insert("ExecStartEx".into(),format!("{{ path={exe} ; argv[]={exe} run ; flags= ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}"));
+        p.insert(
+            "Environment".into(),
+            [
+                format!(
+                    "XDG_CONFIG_HOME={}",
+                    f.io.target().paths().config_home.display()
+                ),
+                format!(
+                    "XDG_STATE_HOME={}",
+                    f.io.target().paths().state_home.display()
+                ),
+                format!(
+                    "XDG_RUNTIME_DIR={}",
+                    f.io.target().paths().runtime_home.display()
+                ),
+                format!(
+                    "CROSSPANE_RUNTIME_DIR={}",
+                    f.io.target().runtime_dir().display()
+                ),
+            ]
+            .iter()
+            .map(|v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(" "),
+        );
+
+        p.insert("WantedBy".into(), "graphical-session.target".into());
+        let mut cat = format!("# {}\n", unit.target.display()).into_bytes();
+        cat.extend(&unit.bytes);
+        let (io, proof, probe) = (f.io.clone(), f.proof.clone(), f.probe.clone());
+        let on_stop = clean.then(|| {
+            Box::new(move || {
+                *probe.0.lock().unwrap() = Ok(None);
+                let bytes = serde_json::to_vec(&json!({"schema_version":1,"instance_id":9,
+                "stopped_unix_ms":parse_ps_start(START).unwrap()+1000,"clean":true,
+                "parking":"restored","input_journals_empty":true,"audio_stopped":true}))
+                .unwrap();
+                io.atomic_write(
+                    &proof,
+                    &io.target()
+                        .paths()
+                        .state_home
+                        .join("crosspane/last_exit.json"),
+                    &bytes,
+                )
+                .unwrap();
+            }) as Box<dyn Fn() + Send>
+        });
+        *f.runner.manager.lock().unwrap() = Some(Manager {
+            properties: p,
+            cat,
+            on_stop,
+            shows: 0,
+            show_hook: None,
+        });
+        Arc::new(f.service(&package()))
+    }
+    fn planned(
+        f: &Fixture,
+        selection: RemovalSelection,
+        watch: Option<Arc<TrackedAgent>>,
+        revision: u64,
+        operation: u64,
+    ) -> (UninstallPlan, UninstallConsent) {
+        let cleanup_planner = CleanupPlanner::default();
+        let inventory =
+            CleanupInventory::admit(f.io.admit_cleanup(&deadline()).unwrap(), &deadline()).unwrap();
+        let cleanup = cleanup_planner
+            .plan(inventory, revision, OperationId(operation), selection)
+            .unwrap();
+        let cc = cleanup_planner
+            .consent(&cleanup, revision, OperationId(operation), &deadline())
+            .unwrap();
+        let planner = UninstallPlanner::default();
+        let plan = planner.plan(cleanup, f.io.clone(), watch).unwrap();
+        let consent = planner
+            .consent(&plan, cc, revision, OperationId(operation))
+            .unwrap();
+        (plan, consent)
+    }
+    fn start(
+        f: &Fixture,
+        selection: RemovalSelection,
+        clean: bool,
+        original: bool,
+    ) -> UninstallRun {
+        let p = package();
+        installed(f, &p);
+        let service = known_manager(f, &p, clean);
+        assert!(service.observe(&deadline()).unwrap().enabled);
+        let (plan, consent) = planned(f, selection, original.then(|| f.tracked()), 1, 100);
+        plan.begin(consent, service, &deadline()).unwrap()
+    }
+    fn finish(f: &Fixture, run: &mut UninstallRun) {
+        run.stop(&deadline()).unwrap();
+        run.observe_exit(&deadline()).unwrap();
+        let bytes =
+            f.io.read(&f.io.target().agent_path(), 4 * 1024 * 1024, false)
+                .unwrap();
+        run.identity(sha256(&bytes), f.environment(), &deadline())
+            .unwrap();
+        run.remove_files(&deadline()).unwrap();
+    }
+    #[test]
+    fn clean_default_keep_removes_owned_files_after_real_original_exit() {
+        let f = Fixture::new(false);
+        let mut run = start(&f, RemovalSelection::default(), true, true);
+        run.disable(&deadline()).unwrap();
+        finish(&f, &mut run);
+        let report = run.report();
+        assert_eq!(report.form, UninstallForm::Complete);
+        assert_eq!(report.progress.identity, CleanupResult::Kept);
+        assert!(
+            report
+                .progress
+                .resources
+                .iter()
+                .all(|r| *r == CleanupResult::Removed)
+        );
+        assert!(report.empty_directories_retained);
+        assert_eq!(f.erase_count(), 0);
+        let mutations = f
+            .runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, a)| {
+                a.first().is_some_and(|s| s == "--user")
+                    && ["disable", "stop"].contains(&a[1].as_str())
+            })
+            .map(|(_, a)| a.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutations,
+            vec![
+                vec!["--user", "disable", UNIT],
+                vec!["--user", "stop", UNIT]
+            ]
+        );
+        assert!(
+            f.io.read(
+                &f.io
+                    .target()
+                    .paths()
+                    .state_home
+                    .join("crosspane/last_exit.json"),
+                4096,
+                true
+            )
+            .is_ok()
+        );
+    }
+    #[test]
+    fn stop_zero_with_running_process_never_erases_or_removes_recovery() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            false,
+            true,
+        );
+        f.exit(|_| {}); // A matching receipt still grants nothing while the original process lives.
+        run.disable(&deadline()).unwrap();
+        finish(&f, &mut run);
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        assert_eq!(f.erase_count(), 0);
+        assert!(
+            run.report().progress.resources[..6]
+                .iter()
+                .all(|r| *r == CleanupResult::Kept)
+        );
+        assert!(
+            run.report().progress.resources[6..]
+                .iter()
+                .all(|r| *r == CleanupResult::Removed)
+        );
+    }
+    #[test]
+    fn genuine_clean_explicit_delete_admits_one_shot_semantics_before_recovery_removal() {
+        let f = Fixture::new(false);
+        let mut run = start(
+            &f,
+            RemovalSelection {
+                identity: IdentityChoice::DeleteIdentityAndPairings,
+                ..Default::default()
+            },
+            true,
+            true,
+        );
+        run.disable(&deadline()).unwrap();
+        finish(&f, &mut run);
+        assert_eq!(f.erase_count(), 1);
+        assert!(
+            run.report()
+                .identity_receipt
+                .unwrap()
+                .identity_and_pairings_removed()
+        );
+        assert_eq!(run.report().form, UninstallForm::Complete);
+    }
+    #[test]
+    fn uncorrelated_stop_is_not_clean_and_preview_never_promises_recovery_removal() {
+        let f = Fixture::new(false);
+        let mut run = start(&f, RemovalSelection::default(), true, false);
+        run.disable(&deadline()).unwrap();
+        finish(&f, &mut run);
+        assert!(run.stop(&deadline()).is_err());
+        assert_eq!(
+            f.runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, a)| a.get(1).is_some_and(|s| s == "stop"))
+                .count(),
+            1
+        );
+        assert_eq!(run.report().form, UninstallForm::NotClean);
+        assert!(
+            run.report().progress.resources[..6]
+                .iter()
+                .all(|r| *r == CleanupResult::Kept)
+        );
+    }
+    #[test]
+    fn uncorrelated_old_continuation_without_renewed_consent_sends_zero_stop() {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        let cleanup_planner = CleanupPlanner::default();
+        let planner = UninstallPlanner::default();
+        let make = |revision, operation| {
+            let inventory =
+                CleanupInventory::admit(f.io.admit_cleanup(&deadline()).unwrap(), &deadline())
+                    .unwrap();
+            let cleanup = cleanup_planner
+                .plan(
+                    inventory,
+                    revision,
+                    OperationId(operation),
+                    RemovalSelection::default(),
+                )
+                .unwrap();
+            let cc = cleanup_planner
+                .consent(&cleanup, revision, OperationId(operation), &deadline())
+                .unwrap();
+            let plan = planner.plan(cleanup, f.io.clone(), None).unwrap();
+            let consent = planner
+                .consent(&plan, cc, revision, OperationId(operation))
+                .unwrap();
+            (plan, consent)
+        };
+        let (old, consent) = make(1, 100);
+        let mut old = old
+            .begin(consent, known_manager(&f, &package(), false), &deadline())
+            .unwrap();
+        old.disable(&deadline()).unwrap();
+        let (_new, _renewed_consent) = make(2, 200);
+        let calls = f.runner.calls.lock().unwrap().len();
+        assert!(old.stop(&deadline()).is_err());
+        assert_eq!(f.runner.calls.lock().unwrap().len(), calls);
+        assert_eq!(old.report().form, UninstallForm::NotClean);
+        assert_eq!(f.erase_count(), 0);
+        assert!(
+            f.io.metadata(&f.io.target().agent_path())
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 #[test]
@@ -2439,7 +4303,7 @@ mod lease_dispatch_tests {
         pub(super) finished: AtomicBool,
     }
     impl Gate {
-        fn new() -> Arc<Self> {
+        pub(super) fn new() -> Arc<Self> {
             Arc::new(Self {
                 entered: AtomicBool::new(false),
                 release: (Mutex::new(false), Condvar::new()),
@@ -2453,11 +4317,11 @@ mod lease_dispatch_tests {
                 released = self.release.1.wait(released).unwrap();
             }
         }
-        fn release(&self) {
+        pub(super) fn release(&self) {
             *self.release.0.lock().unwrap() = true;
             self.release.1.notify_all();
         }
-        fn wait(&self, condition: impl Fn() -> bool) {
+        pub(super) fn wait(&self, condition: impl Fn() -> bool) {
             let end = Instant::now() + Duration::from_secs(2);
             while !condition() && Instant::now() < end {
                 thread::sleep(Duration::from_millis(1));

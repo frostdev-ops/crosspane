@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform::linux::removal::{RemovalError, executor::OriginalRunning};
 use crate::platform::linux::service::{LinuxService, ServiceFacts};
 pub(super) const UNIT_INDEX: usize = 5;
 pub(super) enum ManagerAction {
@@ -11,6 +12,21 @@ impl CleanupLease {
         self.manager_observing(ManagerAction::Stop, d, move |d| {
             service.observe(d).map_err(|_| NativeError::Foreign)
         })
+    }
+    /// Checks the original after worker observation. systemctl still targets the unit: a restart
+    /// between the final check and dispatch may be stopped, but never supplies clean authority.
+    pub(crate) fn stop_original(
+        &self,
+        service: Arc<LinuxService>,
+        original: OriginalRunning,
+        d: &Deadline,
+    ) -> ManagerMutation {
+        self.manager_checked(
+            ManagerAction::Stop,
+            d,
+            move |d| service.observe(d).map_err(|_| NativeError::Foreign),
+            Some(original),
+        )
     }
     /// One exact disable. Output is progress; effective state and clean exit are separate facts.
     pub fn disable(&self, service: Arc<LinuxService>, d: &Deadline) -> ManagerMutation {
@@ -30,6 +46,15 @@ impl CleanupLease {
         action: ManagerAction,
         d: &Deadline,
         observe: impl FnOnce(&Deadline) -> Result<ServiceFacts> + Send + 'static,
+    ) -> ManagerMutation {
+        self.manager_checked(action, d, observe, None)
+    }
+    fn manager_checked(
+        &self,
+        action: ManagerAction,
+        d: &Deadline,
+        observe: impl FnOnce(&Deadline) -> Result<ServiceFacts> + Send + 'static,
+        original: Option<OriginalRunning>,
     ) -> ManagerMutation {
         self.dispatch(d, move |state, d| {
             let verb = match action {
@@ -57,6 +82,15 @@ impl CleanupLease {
                 || before.source != io.target.source()
             {
                 return Err(NativeError::Foreign);
+            }
+            if let Some(original) = original {
+                if before.main_pid != original.pid() {
+                    return Err(NativeError::Foreign);
+                }
+                original.revalidate(d).map_err(|e| match e {
+                    RemovalError::Native(e) => e,
+                    _ => NativeError::Foreign,
+                })?;
             }
             CommandSpec::new(
                 "/usr/bin/systemctl".into(),

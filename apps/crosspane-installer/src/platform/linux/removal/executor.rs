@@ -11,6 +11,12 @@ macro_rules! type_only_debug {
     };
 }
 mod inventory;
+mod uninstall;
+mod uninstall_firewall;
+mod uninstall_resume;
+#[cfg(test)]
+mod uninstall_tests;
+pub(crate) use super::authority::OriginalRunning;
 use super::{CleanupForm, RemovalError, RemovalSelection, ResourceAction, Result};
 use crate::platform::linux::native_io::{CleanupLease, CleanupProof, Deadline};
 use crate::platform::linux::payload::sha256;
@@ -19,6 +25,11 @@ pub use inventory::{
     CleanupConsent, CleanupInventory, CleanupPlan, CleanupPlanner, CleanupResource,
 };
 use std::sync::{Arc, Mutex};
+pub use uninstall::{
+    UninstallConsent, UninstallError, UninstallForm, UninstallIssue, UninstallPlan,
+    UninstallPlanner, UninstallReport, UninstallRun, UninstallStage,
+};
+pub use uninstall_firewall::{UninstallFirewall, UninstallRuleConsent, UninstallRulePlan};
 
 #[derive(Default)]
 struct Current(Mutex<Binding>);

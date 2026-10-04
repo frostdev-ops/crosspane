@@ -88,6 +88,40 @@ pub struct AdmittedReceipt {
     record: Record,
     target: Binding,
 }
+impl AdmittedReceipt {
+    /// Literal admitted rule kind, for a selected removal stage's pre-I/O association check.
+    pub fn kind(&self) -> RuleKind {
+        self.record.kind
+    }
+}
+#[cfg(test)]
+mod receipt_kind_tests {
+    use super::*;
+    #[test]
+    fn getter_preserves_each_literal_admitted_kind() {
+        for kind in [RuleKind::Lan, RuleKind::Mdns] {
+            let receipt = AdmittedReceipt {
+                record: Record {
+                    operation: 1,
+                    revision: 1,
+                    cidr: "192.168.4.0/24".into(),
+                    kind,
+                    interface: "enp1s0".into(),
+                    delete: false,
+                    outcome: Some(0),
+                    retired: false,
+                },
+                target: (
+                    1000,
+                    std::array::from_fn(|_| PathBuf::from("/scratch")),
+                    None,
+                    true,
+                ),
+            };
+            assert_eq!(receipt.kind(), kind);
+        }
+    }
+}
 impl std::fmt::Debug for AdmittedReceipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AdmittedReceipt { .. }")
