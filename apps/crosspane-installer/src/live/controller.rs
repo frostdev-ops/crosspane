@@ -146,6 +146,9 @@ pub struct LiveController {
     pub(super) agent_health_pending: bool,
     /// The macOS permission rows' history and calls (WP-4.33).
     pub(super) permission_asks: PermissionAsks,
+    pub(super) saved_skipped: BTreeSet<StepId>,
+    pub(super) pending_skip: Option<Vec<StepId>>,
+    pub(super) reopened: Vec<ScreenId>,
 }
 
 /// How long a finished screen stays up before the next one, so its last check is seen.
@@ -215,11 +218,25 @@ fn bound(chars: impl Iterator<Item = char>, max: usize) -> String {
 }
 
 impl LiveController {
-    pub fn new(platform: Box<dyn Platform>, clock: Clock) -> Result<Self, LiveError> {
+    pub fn new(mut platform: Box<dyn Platform>, clock: Clock) -> Result<Self, LiveError> {
         let desc = platform.describe();
         let graph = graph::build(&desc)?;
-        let flow = Flow::new(graph.specs.clone())?;
+        let optional: Vec<_> = graph
+            .metas
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| super::skipped::optional(*id))
+            .collect();
+        let mut flow = Flow::new_with_optional_steps(graph.specs.clone(), &optional)?;
         let now = clock();
+        let saved_skipped: BTreeSet<_> = platform
+            .load_skipped()
+            .into_iter()
+            .filter(|id| optional.contains(id))
+            .collect();
+        for id in &saved_skipped {
+            let _ = flow.reduce(FlowEvent::Skip(*id), now);
+        }
         let summary = flow.summary(now, &[]);
         let mut controller = Self {
             platform,
@@ -262,6 +279,9 @@ impl LiveController {
             complete_since: None,
             agent_health_pending: false,
             permission_asks: PermissionAsks::default(),
+            saved_skipped,
+            pending_skip: None,
+            reopened: Vec::new(),
         };
         controller.view.demo = false;
         controller.rebuild_view();
@@ -303,6 +323,17 @@ impl LiveController {
 
     pub(super) fn refresh_summary(&mut self) {
         self.summary = self.flow.summary(self.now, self.ledger.latest());
+        let before = self.saved_skipped.clone();
+        self.saved_skipped.retain(|id| {
+            !self
+                .summary
+                .steps
+                .iter()
+                .any(|s| s.id == *id && s.state == StepState::Satisfied)
+        });
+        if before != self.saved_skipped {
+            self.platform.save_skipped(&self.saved_skipped);
+        }
         let summary = &self.summary;
         self.jobs.retain(|step, _| {
             summary.steps.iter().any(|s| {
@@ -334,7 +365,7 @@ impl LiveController {
     pub(super) fn prerequisites_valid(&self, step: StepId) -> bool {
         self.graph
             .meta(step)
-            .is_some_and(|m| m.prerequisites.iter().all(|p| self.satisfied(*p)))
+            .is_some_and(|m| m.prerequisites.iter().all(|p| self.settled(*p)))
     }
 
     pub(super) fn job(&self, step: StepId, stage: JobStage) -> Option<JobIntent> {
@@ -892,12 +923,15 @@ impl LiveController {
     /// Whether everything on the current screen is done, so it can move on by itself. A step that
     /// is asking a question (even an optional one) holds the screen until it is answered.
     fn screen_settled(&self) -> bool {
+        if self.skipped_on(self.screen) && !self.reopened.contains(&self.screen) {
+            return false;
+        }
         if self.screen == ScreenId::Practice {
             return self
                 .graph
                 .practice_steps()
                 .iter()
-                .all(|step| self.satisfied(*step));
+                .all(|step| self.settled(*step));
         }
         self.screen_complete(self.screen)
             && !self
@@ -954,7 +988,7 @@ impl LiveController {
 
     pub(super) fn screen_complete(&self, screen: ScreenId) -> bool {
         self.graph.on_screen(screen).all(|m| {
-            self.satisfied(m.id)
+            self.settled(m.id)
                 || (m.settles_with_peer
                     && !matches!(
                         self.step_state(m.id),
@@ -1034,7 +1068,7 @@ impl LiveController {
             if screen == ScreenId::RepairRemove {
                 self.inspect_maintenance();
             }
-            if screen == ScreenId::Connect {
+            if screen == ScreenId::Connect && !self.skipped_on(screen) {
                 self.scan();
             }
         }
@@ -1142,6 +1176,7 @@ impl InstallerController for LiveController {
         self.drain_agent();
         self.drain_fixtures();
         self.practice_tick();
+        self.finish_skip();
         self.poll_status();
         self.status_wait_tick();
         self.repair_tick();

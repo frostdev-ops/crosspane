@@ -158,7 +158,11 @@ pub(super) fn failure_text(failure: &CallFailure) -> &'static str {
 }
 
 /// The final health gate: every role's safety and backend facts, plus the selected peer.
-fn final_healthy(health: &HealthSnapshot, peer: Option<NodeId>) -> Result<(), &'static str> {
+fn final_healthy(
+    health: &HealthSnapshot,
+    peer: Option<NodeId>,
+    connect_skipped: bool,
+) -> Result<(), &'static str> {
     let i = health.installer();
     if !i.gate.open || i.gate.panic || i.gate.active != Some(true) {
         return Err("Crosspane's input gate isn't open on this computer.");
@@ -185,6 +189,9 @@ fn final_healthy(health: &HealthSnapshot, peer: Option<NodeId>) -> Result<(), &'
         return Err("A part of Crosspane isn't ready on this computer.");
     }
     let Some(peer) = peer else {
+        if connect_skipped {
+            return Ok(());
+        }
         return Err("No paired computer is selected.");
     };
     if !i.peers.iter().any(|p| p.node == peer && p.connected) {
@@ -1018,7 +1025,11 @@ impl LiveController {
         if sample.observed_at_ms != health.observed_at_ms {
             return;
         }
-        if let Err(reason) = final_healthy(&health.snapshot, self.peer) {
+        if let Err(reason) = final_healthy(
+            &health.snapshot,
+            self.peer,
+            self.step_state(steps::PAIR) == StepState::Skipped,
+        ) {
             self.details.insert(steps::FINAL, reason.into());
             let _ = self.reduce(FlowEvent::Failed {
                 step: job.step,
@@ -1044,12 +1055,7 @@ impl LiveController {
     /// Re-verify final health on every own Status once all practice holds, so readiness lapses
     /// honestly and is renewed without waiting for the five-second expiry.
     fn reverify_final(&mut self) {
-        if !self
-            .graph
-            .practice_steps()
-            .iter()
-            .all(|s| self.satisfied(*s))
-        {
+        if !self.graph.practice_steps().iter().all(|s| self.settled(*s)) {
             return;
         }
         if let Some(job) = self.job(steps::FINAL, JobStage::Verify) {

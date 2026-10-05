@@ -26,6 +26,7 @@ pub enum RowState {
     NeedsAction,
     Waiting,
     Verified,
+    Skipped,
     Failed,
     Unsupported,
     Note,

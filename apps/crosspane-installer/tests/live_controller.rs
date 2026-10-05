@@ -104,6 +104,7 @@ struct Native {
     shutdown: bool,
     /// The hiding choice the agent's settings already hold, as the platform reports it.
     saved_hiding: Option<HidingChoice>,
+    skipped: BTreeSet<StepId>,
 }
 
 struct SharedAgent(Rc<RefCell<AgentQueue>>);
@@ -194,6 +195,12 @@ impl Platform for Fake {
     }
     fn saved_hiding(&mut self) -> Option<HidingChoice> {
         self.native.borrow().saved_hiding
+    }
+    fn load_skipped(&mut self) -> BTreeSet<StepId> {
+        self.native.borrow().skipped.clone()
+    }
+    fn save_skipped(&mut self, steps: &BTreeSet<StepId>) {
+        self.native.borrow_mut().skipped = steps.clone();
     }
 }
 
@@ -1058,6 +1065,130 @@ fn to_connect(h: &mut H) {
     h.next();
     assert_eq!(h.view().screen, ScreenId::Connect);
     h.status_reply();
+}
+
+#[test]
+fn connect_skip_retires_pairing_and_reopens_only_after_an_explicit_action() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    h.click(ids::PAIR_LISTEN);
+    let listen = h.call(|r| matches!(r, InstallerRequest::PairListen { .. }));
+    h.click(ids::SKIP);
+    assert_eq!(h.view().screen, ScreenId::Summary);
+    let saved = h.native.borrow().skipped.clone();
+    assert_eq!(saved.len(), 12);
+    assert!(saved.contains(&live::steps::PAIR));
+    assert!(saved.contains(&live::steps::GRANTS));
+    h.pair_status(&listen, r#"{"ok":true,"result":{"phase":"confirm","sas":"123 456","candidates":[],"peer":"fixture","error":null}}"#);
+    h.status_reply();
+    assert_eq!(h.view().screen, ScreenId::Summary);
+    assert!(h.view().illustration.sas.is_none());
+    assert_eq!(h.summary(), SummaryView::WorkspaceReady);
+    assert!(
+        h.view()
+            .rows
+            .iter()
+            .filter(|r| r.state == RowState::Skipped)
+            .count()
+            == 3
+    );
+    h.set(&["installer", "startup_recovery"], json!("failed"));
+    h.status_reply();
+    assert_ne!(
+        h.summary(),
+        SummaryView::WorkspaceReady,
+        "skip never bypasses local recovery health"
+    );
+    h.set(&["installer", "startup_recovery"], json!("restored"));
+    h.calls.clear();
+    h.agent.borrow_mut().take_calls();
+    for _ in 0..4 {
+        h.advance(1000);
+        h.tick();
+    }
+    assert!(!h.has_call(|r| matches!(
+        r,
+        InstallerRequest::PairScan
+            | InstallerRequest::PairListen { .. }
+            | InstallerRequest::PairStatus
+    )));
+    // Reconstruct over the same fake persistence, with no owner filesystem or native port.
+    let time = h.clock.clone();
+    h.c = LiveController::new(
+        Box::new(Fake {
+            description: description(),
+            native: h.native.clone(),
+            agent: SharedAgent(h.agent.clone()),
+            fixtures: SharedFixtures(h.fixtures.clone()),
+            checks: None,
+        }),
+        Arc::new(move || time.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    h.last = ScreenId::Welcome;
+    h.calls.clear();
+    h.agent.borrow_mut().take_calls();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Skipped);
+    h.tick();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Skipped);
+    // This run verifies the required installation steps again, while deferrals stay untouched.
+    h.install();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Connect);
+    assert!(h.button(ids::SET_UP_NOW).is_some());
+    assert!(h.button(ids::PAIR_LISTEN).is_none());
+    h.click(ids::SET_UP_NOW);
+    assert!(h.native.borrow().skipped.contains(&live::steps::PAIR));
+    h.paired_peer(&ALL_GRANTS);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::Verified);
+    assert!(!h.native.borrow().skipped.contains(&live::steps::PAIR));
+    assert!(h.native.borrow().skipped.contains(&live::steps::LAYOUT));
+    assert!(
+        h.native
+            .borrow()
+            .skipped
+            .contains(&live::steps::practice(TutorialRole::E1Controller))
+    );
+    let mut practice = H::new();
+    to_practice(&mut practice);
+    practice.begin_practice(TutorialRole::E1Target);
+    practice.fixture_open();
+    let arm = practice
+        .fixture_command(|c| matches!(c, FixtureCommand::ArmTarget { .. }))
+        .unwrap();
+    let FixtureCommand::ArmTarget { phase, .. } = arm.command else {
+        unreachable!()
+    };
+    practice.click(ids::SKIP);
+    assert_eq!(
+        practice.view().screen,
+        ScreenId::Practice,
+        "owned cleanup precedes advancement"
+    );
+    assert!(
+        !practice
+            .native
+            .borrow()
+            .skipped
+            .contains(&live::steps::practice(TutorialRole::E1Target))
+    );
+    practice.fixture_reply(
+        &arm,
+        Ok(FixtureEvent::TargetArmed {
+            fixture: FixtureId(10),
+            phase,
+        }),
+    );
+    practice.fixture_close();
+    practice.status_reply();
+    assert_eq!(practice.view().screen, ScreenId::Summary);
+    assert_eq!(practice.native.borrow().skipped.len(), 9);
+    assert_eq!(
+        practice.practice_row(TutorialRole::E1Target).state,
+        RowState::Skipped
+    );
 }
 
 #[test]

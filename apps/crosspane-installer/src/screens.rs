@@ -171,6 +171,16 @@ pub(crate) fn permission_button_row(id: u16) -> Option<u16> {
         .then(|| PERMISSION_ROW_IDS.start + (id - PERMISSION_BUTTON_IDS.start) / 10)
 }
 
+fn inline_button_row(id: u16) -> Option<u16> {
+    use crate::live::ids;
+    permission_button_row(id).or(match id {
+        ids::REOPEN_CONNECT => Some(940),
+        ids::REOPEN_ARRANGE => Some(941),
+        ids::REOPEN_PRACTICE => Some(942),
+        _ => None,
+    })
+}
+
 #[derive(Default)]
 pub struct WizardShell {
     layout: LayoutWidget,
@@ -1284,7 +1294,7 @@ impl WizardShell {
                     let actions: Vec<&ButtonView> = view
                         .buttons
                         .iter()
-                        .filter(|button| permission_button_row(button.id) == Some(row.id))
+                        .filter(|button| inline_button_row(button.id) == Some(row.id))
                         .collect();
                     let mark = shifted(ui, Vec2::new(0.0, rise), motion.appear, |ui| {
                         let mark = self.step_row(ui, row, checks, &motion, frame);
@@ -1837,9 +1847,10 @@ impl<'a> FooterPlan<'a> {
         // Quiet alternatives without a heading of their own live in the footer, after Back.
         for button in view.buttons.iter().filter(|button| {
             button.role != ButtonRole::Back
-                && permission_button_row(button.id).is_none()
+                && inline_button_row(button.id).is_none()
                 && (button.kind == ButtonKind::Secondary
-                    || (button.kind == ButtonKind::Link && view.link_caption.is_none()))
+                    || (button.kind == ButtonKind::Link
+                        && (view.link_caption.is_none() || button.id == crate::live::ids::SKIP)))
         }) {
             left.push(item(button, ActionKind::Ghost, false));
         }
@@ -1848,7 +1859,7 @@ impl<'a> FooterPlan<'a> {
             .iter()
             .filter(|button| {
                 button.role != ButtonRole::Back
-                    && permission_button_row(button.id).is_none()
+                    && inline_button_row(button.id).is_none()
                     && matches!(button.kind, ButtonKind::Primary | ButtonKind::Destructive)
             })
             .collect();
@@ -1972,7 +1983,8 @@ fn links(ui: &mut egui::Ui, view: &WizardView, intents: &mut Vec<WizardIntent>) 
         .filter(|button| {
             button.kind == ButtonKind::Link
                 && button.role != ButtonRole::Back
-                && permission_button_row(button.id).is_none()
+                && inline_button_row(button.id).is_none()
+                && button.id != crate::live::ids::SKIP
         })
         .collect();
     if links.is_empty() {
@@ -2192,7 +2204,7 @@ fn choices(ui: &mut egui::Ui, view: &WizardView, intents: &mut Vec<WizardIntent>
         .buttons
         .iter()
         .filter(|button| {
-            button.kind == ButtonKind::Choice && permission_button_row(button.id).is_none()
+            button.kind == ButtonKind::Choice && inline_button_row(button.id).is_none()
         })
         .collect();
     if choices.is_empty() {
@@ -2256,7 +2268,7 @@ fn mark_of(state: RowState) -> StepMark {
         RowState::Verified => StepMark::Done,
         RowState::Failed => StepMark::Problem,
         RowState::Unsupported => StepMark::Blocked,
-        RowState::Note => StepMark::Info,
+        RowState::Note | RowState::Skipped => StepMark::Info,
     }
 }
 
@@ -2271,6 +2283,7 @@ fn state_words(state: RowState) -> &'static str {
         RowState::Failed => "stopped",
         RowState::Unsupported => "not available here",
         RowState::Note => "note",
+        RowState::Skipped => "skipped",
     }
 }
 
@@ -2346,6 +2359,7 @@ fn row_actions(
 
 fn row_detail(row: &RowView) -> String {
     match row.state {
+        RowState::Skipped => format!("Skipped. {}", row.detail).trim().to_owned(),
         RowState::Verified => "Done".into(),
         RowState::Unchecked => "Not started yet".into(),
         RowState::Working if row.label == "Install Crosspane" => "Installing…".into(),
@@ -2386,6 +2400,7 @@ pub(crate) fn check_wording(check: &RowView) -> String {
         RowState::Failed | RowState::Unsupported => with("Failed"),
         RowState::Waiting | RowState::NeedsAction => with("Couldn't confirm"),
         RowState::Note => with("Note"),
+        RowState::Skipped => with("Skipped"),
         RowState::Unchecked => "Not checked yet".to_owned(),
     }
 }

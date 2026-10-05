@@ -27,6 +27,8 @@ pub enum StepState {
     WaitingForPeer,
     PendingContract,
     Satisfied,
+    /// A deliberate deferral, carrying no verification evidence.
+    Skipped,
     Stale,
     Failed,
     Unsupported,
@@ -116,6 +118,7 @@ pub enum FlowEvent {
     Cancel {
         step: StepId,
     },
+    Skip(StepId),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GraphError {
@@ -131,6 +134,8 @@ pub enum GraphError {
     NoReadinessFreshnessGate,
     #[error("step evidence requirements conflict")]
     InvalidStepRequirement,
+    #[error("only Connect, Arrange and Practice can be optional")]
+    InvalidOptionalStep,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FlowError {
@@ -148,6 +153,8 @@ pub enum FlowError {
     InvalidEvidence,
     #[error("operation ids exhausted")]
     OperationExhausted,
+    #[error("this step cannot be skipped")]
+    NotOptional,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Milestone {
@@ -164,6 +171,8 @@ pub struct StepSummary {
 pub struct Summary {
     pub milestone: Milestone,
     pub steps: Vec<StepSummary>,
+    #[serde(default)]
+    pub skipped: Vec<StepId>,
 }
 #[derive(Debug)]
 struct Step {
@@ -188,10 +197,20 @@ pub struct Flow {
     retired_instances: BTreeSet<(NodeId, u64)>,
     next_operation: u64,
     last_now: u64,
+    optional: BTreeSet<StepId>,
 }
 
 impl Flow {
     pub fn new(steps: Vec<StepSpec>) -> Result<Self, GraphError> {
+        Self::new_with_optional_steps(steps, &[])
+    }
+
+    /// Opt-in only for the shared Connect/Arrange/Practice ids. Native installation,
+    /// permissions and the final fresh-health gate can never acquire skip authority.
+    pub fn new_with_optional_steps(
+        steps: Vec<StepSpec>,
+        optional_ids: &[StepId],
+    ) -> Result<Self, GraphError> {
         if steps.is_empty() {
             return Err(GraphError::Empty);
         }
@@ -261,6 +280,15 @@ impl Flow {
         {
             return Err(GraphError::NoReadinessFreshnessGate);
         }
+        let optional: BTreeSet<_> = optional_ids.iter().copied().collect();
+        if optional.iter().any(|id| {
+            !matches!(id.0, 60..=62 | 70..=78)
+                || !map.get(id).is_some_and(|step| {
+                    !step.spec.required_for_installed && !step.spec.requires_fresh_observation
+                })
+        }) {
+            return Err(GraphError::InvalidOptionalStep);
+        }
         Ok(Self {
             steps: map,
             ancestors,
@@ -271,11 +299,16 @@ impl Flow {
             retired_instances: BTreeSet::new(),
             next_operation: 1,
             last_now: 0,
+            optional,
         })
     }
 
     fn retire(&mut self, roots: &BTreeSet<StepId>, state: StepState) {
         for (id, step) in &mut self.steps {
+            // Evidence changes cannot undo a person's deferral. Begin explicitly reopens it.
+            if step.state == StepState::Skipped {
+                continue;
+            }
             if roots.contains(id)
                 || self
                     .ancestors
@@ -362,8 +395,21 @@ impl Flow {
             .collect();
         own.iter()
             .copied()
-            .filter(|id| self.ancestors.get(id).is_some_and(|a| a.is_subset(&own)))
+            .filter(|id| {
+                self.ancestors.get(id).is_some_and(|a| {
+                    a.iter()
+                        .all(|parent| own.contains(parent) || self.skipped(*parent))
+                })
+            })
             .collect()
+    }
+
+    fn skipped(&self, id: StepId) -> bool {
+        self.optional.contains(&id)
+            && self
+                .steps
+                .get(&id)
+                .is_some_and(|s| s.state == StepState::Skipped)
     }
     fn refresh(&mut self, now: u64) {
         let current = self
@@ -524,6 +570,7 @@ impl Flow {
         }
         self.refresh(now_ms);
         let (id, operation, stage) = match &event {
+            FlowEvent::Skip(step) => (*step, None, None),
             FlowEvent::Begin { step }
             | FlowEvent::Cancel { step }
             | FlowEvent::Invalidate { step } => (*step, None, None),
@@ -553,7 +600,7 @@ impl Flow {
         }
         if !matches!(
             event,
-            FlowEvent::Cancel { .. } | FlowEvent::Invalidate { .. }
+            FlowEvent::Cancel { .. } | FlowEvent::Invalidate { .. } | FlowEvent::Skip(_)
         ) {
             let current = self
                 .samples
@@ -562,11 +609,24 @@ impl Flow {
                 .map(|(scope, s)| (*scope, s))
                 .collect();
             let valid = self.valid_steps(now_ms, &current);
-            if !self.ancestors.get(&id).is_some_and(|a| a.is_subset(&valid)) {
+            if !self.ancestors.get(&id).is_some_and(|a| {
+                a.iter()
+                    .all(|parent| valid.contains(parent) || self.skipped(*parent))
+            }) {
                 return Err(FlowError::PrerequisitePending);
             }
         }
         match event {
+            FlowEvent::Skip(_) => {
+                if !self.optional.contains(&id) {
+                    return Err(FlowError::NotOptional);
+                }
+                self.retire(&BTreeSet::from([id]), StepState::Stale);
+                let step = self.steps.get_mut(&id).ok_or(FlowError::UnknownStep)?;
+                step.state = StepState::Skipped;
+                step.job = None;
+                step.evidence = None;
+            }
             FlowEvent::Begin { .. } => {
                 if matches!(
                     step.state,
@@ -577,6 +637,7 @@ impl Flow {
                 ) {
                     return Err(FlowError::Busy);
                 }
+                self.steps.get_mut(&id).ok_or(FlowError::UnknownStep)?.state = StepState::Stale;
                 self.retire(&BTreeSet::from([id]), StepState::Stale);
                 return self.schedule(id, JobStage::Detect);
             }
@@ -670,8 +731,14 @@ impl Flow {
                 .steps
                 .values()
                 .filter(|s| s.spec.required_for_ready)
-                .all(|s| valid.contains(&s.spec.id));
+                .all(|s| valid.contains(&s.spec.id) || self.skipped(s.spec.id));
         Summary {
+            skipped: self
+                .steps
+                .keys()
+                .copied()
+                .filter(|id| self.skipped(*id))
+                .collect(),
             milestone: if ready {
                 Milestone::WorkspaceReady
             } else if installed {

@@ -34,7 +34,7 @@ pub const SCREENS: [(ScreenId, &str); 15] = [
 ];
 
 /// Other states of a screen, for review: the name and the screen it belongs to.
-pub const VARIANTS: [(&str, ScreenId); 8] = [
+pub const VARIANTS: [(&str, ScreenId); 10] = [
     ("install-failed", ScreenId::InstallPlan),
     ("install-prerequisites", ScreenId::InstallPlan),
     ("connect-searching", ScreenId::Connect),
@@ -43,6 +43,8 @@ pub const VARIANTS: [(&str, ScreenId); 8] = [
     ("match-pick", ScreenId::MatchNumbers),
     ("practice-choose", ScreenId::Practice),
     ("summary-waiting", ScreenId::Summary),
+    ("summary-skipped", ScreenId::Summary),
+    ("connect-skipped", ScreenId::Connect),
 ];
 
 /// The screen a review name shows: one of [`SCREENS`] or a [`VARIANTS`] state of one.
@@ -60,12 +62,82 @@ pub fn screen_named(name: &str) -> Option<ScreenId> {
         })
 }
 
+fn skipped_fixture(screen: ScreenId) -> WizardView {
+    let mut view = fixture(screen);
+    view.message = "You skipped this step. Set it up when you're ready.".into();
+    view.rows = vec![row(
+        60,
+        &view.title,
+        "Do this later from the Crosspane menu > Settings",
+        RowState::Skipped,
+    )];
+    view.buttons = vec![
+        button(2, ButtonRole::Back, "Back", ButtonKind::Link),
+        button(
+            crate::live::ids::SET_UP_NOW,
+            ButtonRole::Ordinary,
+            "Set up now",
+            ButtonKind::Primary,
+        ),
+    ];
+    view.fields.clear();
+    view.layout = None;
+    view.illustration.practice = None;
+    view.link_caption = None;
+    view
+}
+
 /// The fixture a review name shows.
 pub fn fixture_named(name: &str) -> Option<WizardView> {
     let (name, motion) = motion_variant(name);
     let screen = screen_named(name)?;
     let mut view = fixture(screen);
     match name {
+        "summary-skipped" => {
+            view.message = "Crosspane is ready. The steps you skipped are listed below.".into();
+            view.rows.retain(|row| row.id <= 3);
+            for (id, label) in [
+                (940, "Connect another computer"),
+                (941, "Arrange your screens"),
+                (942, "Practise sharing input, windows and sound"),
+            ] {
+                view.rows.push(row(
+                    id,
+                    label,
+                    "Do this later from the Crosspane menu > Settings",
+                    RowState::Skipped,
+                ));
+            }
+            view.buttons.extend([
+                button(
+                    crate::live::ids::REOPEN_CONNECT,
+                    ButtonRole::Ordinary,
+                    "Set up now",
+                    ButtonKind::Link,
+                ),
+                button(
+                    crate::live::ids::REOPEN_ARRANGE,
+                    ButtonRole::Ordinary,
+                    "Set up now",
+                    ButtonKind::Link,
+                ),
+                button(
+                    crate::live::ids::REOPEN_PRACTICE,
+                    ButtonRole::Ordinary,
+                    "Set up now",
+                    ButtonKind::Link,
+                ),
+            ]);
+            view.progress.completed.retain(|g| {
+                !matches!(
+                    g,
+                    ProgressGroup::Connect | ProgressGroup::Arrange | ProgressGroup::Practice
+                )
+            });
+        }
+        "connect-skipped" => {
+            view = skipped_fixture(ScreenId::Connect);
+        }
         "install-prerequisites" => {
             let checks = [
                 "Operating system",
@@ -592,7 +664,7 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::Connect => {
             view.title = "Pair with the other computer".into();
-            view.message = "Both computers will show a number to compare.".into();
+            view.message = "Both computers will show a number to compare.\n\nSkipping Connect also skips Arrange and Practice.".into();
             view.rows = vec![row(
                 951,
                 "Found mac-studio on your network",
@@ -808,6 +880,17 @@ pub fn fixture(screen: ScreenId) -> WizardView {
             ];
         }
     }
+    if matches!(
+        screen,
+        ScreenId::Connect | ScreenId::Layout | ScreenId::Practice
+    ) {
+        view.buttons.push(button(
+            crate::live::ids::SKIP,
+            ButtonRole::Ordinary,
+            "Skip for now",
+            ButtonKind::Link,
+        ));
+    }
     view
 }
 
@@ -923,6 +1006,70 @@ impl DisconnectedController {
                 else {
                     return false;
                 };
+                if self.demo_mode
+                    && id == crate::live::ids::SKIP
+                    && matches!(
+                        self.view.screen,
+                        ScreenId::Connect | ScreenId::Layout | ScreenId::Practice
+                    )
+                {
+                    let revision = self.view.revision + 1;
+                    if let Some(mut view) = fixture_named("summary-skipped") {
+                        if self.view.screen != ScreenId::Connect {
+                            let (row_id, button_id) = if self.view.screen == ScreenId::Layout {
+                                (941, crate::live::ids::REOPEN_ARRANGE)
+                            } else {
+                                (942, crate::live::ids::REOPEN_PRACTICE)
+                            };
+                            let skipped = view.rows.iter().find(|r| r.id == row_id).cloned();
+                            view = fixture(ScreenId::Summary);
+                            view.rows
+                                .retain(|r| if row_id == 941 { r.id != 5 } else { r.id < 6 });
+                            view.rows.extend(skipped);
+                            view.message =
+                                "Crosspane is ready. The step you skipped is listed below.".into();
+                            view.buttons.push(crate::demo::button(
+                                button_id,
+                                ButtonRole::Ordinary,
+                                "Set up now",
+                                ButtonKind::Link,
+                            ));
+                        }
+                        view.revision = revision;
+                        self.view = view;
+                    }
+                    return false;
+                }
+                if self.demo_mode
+                    && matches!(
+                        id,
+                        crate::live::ids::REOPEN_CONNECT
+                            | crate::live::ids::REOPEN_ARRANGE
+                            | crate::live::ids::REOPEN_PRACTICE
+                    )
+                {
+                    let revision = self.view.revision + 1;
+                    let screen = match id {
+                        crate::live::ids::REOPEN_ARRANGE => ScreenId::Layout,
+                        crate::live::ids::REOPEN_PRACTICE => ScreenId::Practice,
+                        _ => ScreenId::Connect,
+                    };
+                    self.view = skipped_fixture(screen);
+                    self.view.revision = revision;
+                    return false;
+                }
+                if self.demo_mode
+                    && id == crate::live::ids::SET_UP_NOW
+                    && matches!(
+                        self.view.screen,
+                        ScreenId::Connect | ScreenId::Layout | ScreenId::Practice
+                    )
+                {
+                    let revision = self.view.revision + 1;
+                    self.view = fixture(self.view.screen);
+                    self.view.revision = revision;
+                    return false;
+                }
                 // "They don't match" is a refusal, not a close.
                 if button.role == ButtonRole::Cancel && button.kind != ButtonKind::Destructive {
                     return true;

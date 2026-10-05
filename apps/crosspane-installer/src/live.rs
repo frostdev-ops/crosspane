@@ -11,6 +11,9 @@ mod ledger;
 mod practice;
 mod present;
 mod shared;
+mod skipped;
+
+pub(crate) use skipped::SkippedStore;
 
 use std::sync::{Arc, Mutex};
 
@@ -479,6 +482,11 @@ pub trait Platform {
     fn saved_hiding(&mut self) -> Option<HidingChoice> {
         None
     }
+    /// Only installer-owned deferrals; these are never installation or activity evidence.
+    fn load_skipped(&mut self) -> std::collections::BTreeSet<StepId> {
+        std::collections::BTreeSet::new()
+    }
+    fn save_skipped(&mut self, _steps: &std::collections::BTreeSet<StepId>) {}
 }
 
 /// The hiding choice (D7) an agent config file proves was made: `mac_virtual_display = true` at
@@ -528,6 +536,11 @@ pub mod ids {
     pub const RETRY_ALL: u16 = 5;
     /// From the summary: go back to the first screen with something left to finish.
     pub const CONTINUE_SETUP: u16 = 6;
+    pub const SKIP: u16 = 7;
+    pub const SET_UP_NOW: u16 = 8;
+    pub const REOPEN_CONNECT: u16 = 9;
+    pub const REOPEN_ARRANGE: u16 = 91;
+    pub const REOPEN_PRACTICE: u16 = 92;
     pub const PEER_ADDRESS: u16 = 1;
     pub const PAIR_LISTEN: u16 = 2001;
     pub const PAIR_JOIN: u16 = 2002;

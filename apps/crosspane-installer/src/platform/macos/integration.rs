@@ -331,6 +331,7 @@ pub enum FixtureSource {
 }
 
 pub struct MacPlatform {
+    skipped: Option<crate::live::SkippedStore>,
     desc: PlatformDescription,
     commands: Option<mpsc::SyncSender<Command>>,
     reports: Receiver<NativeReport>,
@@ -388,6 +389,7 @@ impl MacPlatform {
     pub(crate) fn native(clock: Clock, env: NativeEnv, font: PathBuf) -> Result<Self> {
         let checks = SupportChecksSlot::new(SUPPORT);
         let config = env.target.state_dir().join("config.toml");
+        let skipped = crate::live::SkippedStore(env.target.installer_dir().join("skipped.json"));
         let domains = native::domains(env, checks.clone());
         let mut platform = Self::start(
             Parts {
@@ -399,6 +401,7 @@ impl MacPlatform {
             Some(checks),
         )?;
         platform.config = Some(config);
+        platform.skipped = Some(skipped);
         Ok(platform)
     }
 
@@ -453,11 +456,24 @@ impl MacPlatform {
             stop,
             checks,
             config: None,
+            skipped: None,
         })
     }
 }
 
 impl Platform for MacPlatform {
+    fn load_skipped(&mut self) -> std::collections::BTreeSet<StepId> {
+        self.skipped.as_ref().map_or_else(
+            std::collections::BTreeSet::new,
+            crate::live::SkippedStore::load,
+        )
+    }
+
+    fn save_skipped(&mut self, steps: &std::collections::BTreeSet<StepId>) {
+        if let Some(store) = &self.skipped {
+            store.save(steps);
+        }
+    }
     fn describe(&self) -> PlatformDescription {
         self.desc.clone()
     }

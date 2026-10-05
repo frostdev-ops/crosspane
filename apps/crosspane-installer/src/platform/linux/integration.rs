@@ -347,6 +347,7 @@ pub enum FixtureSource {
 }
 
 pub struct LinuxPlatform {
+    skipped: crate::live::SkippedStore,
     desc: PlatformDescription,
     commands: Option<mpsc::SyncSender<Command>>,
     reports: Receiver<NativeReport>,
@@ -423,6 +424,14 @@ impl LinuxPlatform {
 
     /// Start the worker and wire the GUI-thread ports to it.
     fn start(parts: Parts) -> Result<Self> {
+        let skipped = crate::live::SkippedStore(
+            parts
+                .io
+                .target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/skipped.json"),
+        );
         let resume_note = resume::read(&parts.io).as_ref().and_then(resume::note);
         let checks = parts.support.checks();
         let (commands, receiver) = mpsc::sync_channel::<Command>(8);
@@ -468,6 +477,7 @@ impl LinuxPlatform {
             })
             .context("Cannot start the Linux installer worker")?;
         Ok(Self {
+            skipped,
             desc: description(resume_note),
             commands: Some(commands),
             reports: reports_rx,
@@ -481,6 +491,13 @@ impl LinuxPlatform {
 }
 
 impl Platform for LinuxPlatform {
+    fn load_skipped(&mut self) -> std::collections::BTreeSet<StepId> {
+        self.skipped.load()
+    }
+
+    fn save_skipped(&mut self, steps: &std::collections::BTreeSet<StepId>) {
+        self.skipped.save(steps);
+    }
     fn describe(&self) -> PlatformDescription {
         self.desc.clone()
     }

@@ -175,6 +175,7 @@ fn row_state(state: StepState) -> RowState {
             RowState::Waiting
         }
         StepState::Satisfied => RowState::Verified,
+        StepState::Skipped => RowState::Skipped,
         StepState::Failed => RowState::Failed,
         StepState::Unsupported => RowState::Unsupported,
     }
@@ -341,6 +342,7 @@ impl LiveController {
                 StepState::Stale => "Needs checking again.".into(),
                 StepState::NotChecked => "Not checked yet.".into(),
                 StepState::Satisfied => "Done.".into(),
+                StepState::Skipped => super::skipped::LATER.into(),
                 _ => String::new(),
             });
         let detail = if matches!(
@@ -439,7 +441,7 @@ impl LiveController {
 
     fn screen_rows(&self, screen: ScreenId) -> Vec<RowView> {
         match screen {
-            ScreenId::Summary => self.rows(),
+            ScreenId::Summary => self.summary_rows(),
             ScreenId::Welcome | ScreenId::RepairRemove => Vec::new(),
             ScreenId::Connect | ScreenId::MatchNumbers => self.connect_rows(),
             // One row per permission, each with its own Allow (WP-4.33).
@@ -500,7 +502,7 @@ impl LiveController {
             .pairing_peer()
             .unwrap_or_else(|| "the other computer".into());
         match state {
-            StepState::Satisfied => vec![self.row(steps::PAIR)],
+            StepState::Satisfied | StepState::Skipped => vec![self.row(steps::PAIR)],
             StepState::NotChecked
             | StepState::Stale
             | StepState::Checking
@@ -814,6 +816,9 @@ impl LiveController {
                 }
                 .into(),
                 match self.summary.milestone {
+                    Milestone::WorkspaceReady if !self.summary.skipped.is_empty() => {
+                        "Crosspane is ready. The steps you skipped are listed below.".to_owned()
+                    }
                     Milestone::WorkspaceReady => "Everything was checked just now.".to_owned(),
                     Milestone::InstalledWaiting => "A few steps are left.".to_owned(),
                     Milestone::NotInstalled => {
@@ -827,6 +832,15 @@ impl LiveController {
             ),
         };
         let mut message = message;
+        if screen == ScreenId::Connect {
+            message.push_str("\n\nSkipping Connect also skips Arrange and Practice.");
+        }
+        if self.skipped_on(screen)
+            && !self.reopened.contains(&screen)
+            && screen != ScreenId::Summary
+        {
+            message = "You skipped this step. Set it up when you're ready.".into();
+        }
         if let Some(notice) = &self.notice {
             message = format!("{notice}\n\n{message}");
         }
@@ -956,6 +970,36 @@ impl LiveController {
     fn buttons_and_fields(&self, screen: ScreenId) -> (Vec<ButtonView>, Vec<FieldView>) {
         let mut buttons = Vec::new();
         let mut fields = Vec::new();
+        if self.pending_skip.is_some() {
+            return (
+                vec![button(
+                    ids::BACK,
+                    ButtonRole::Back,
+                    "Back",
+                    false,
+                    ButtonKind::Link,
+                )],
+                fields,
+            );
+        }
+        if self.skipped_on(screen)
+            && !self.reopened.contains(&screen)
+            && screen != ScreenId::Summary
+        {
+            return (
+                vec![
+                    button(ids::BACK, ButtonRole::Back, "Back", true, ButtonKind::Link),
+                    button(
+                        ids::SET_UP_NOW,
+                        ButtonRole::Ordinary,
+                        "Set up now",
+                        !self.practice.engaged(self.now),
+                        ButtonKind::Primary,
+                    ),
+                ],
+                fields,
+            );
+        }
         // Waiting in setup's own pairing window is not work the person must sit through.
         let busy = self.mutation_in_flight() && !self.following_auto_window();
         // Consent for a step that asks first: its own action, with its preview on screen.
@@ -1183,10 +1227,7 @@ impl LiveController {
                     ids::FINAL_CHECK,
                     ButtonRole::Retry,
                     "Check again",
-                    self.graph
-                        .practice_steps()
-                        .iter()
-                        .all(|s| self.satisfied(*s)),
+                    self.graph.practice_steps().iter().all(|s| self.settled(*s)),
                     ButtonKind::Link,
                 ));
                 buttons.push(button(
@@ -1205,9 +1246,38 @@ impl LiveController {
                         ButtonKind::Link,
                     ));
                 }
+                for (screen, id) in [
+                    (ScreenId::Connect, ids::REOPEN_CONNECT),
+                    (ScreenId::Layout, ids::REOPEN_ARRANGE),
+                    (ScreenId::Practice, ids::REOPEN_PRACTICE),
+                ] {
+                    if self.skipped_on(screen)
+                        || (screen == ScreenId::Layout && self.skipped_on(ScreenId::Grants))
+                    {
+                        buttons.push(button(
+                            id,
+                            ButtonRole::Ordinary,
+                            "Set up now",
+                            !busy,
+                            ButtonKind::Link,
+                        ));
+                    }
+                }
             }
             ScreenId::RepairRemove => self.maintenance_controls(&mut buttons, &mut fields),
             _ => {}
+        }
+        if matches!(
+            screen,
+            ScreenId::Connect | ScreenId::Layout | ScreenId::Practice
+        ) {
+            buttons.push(button(
+                ids::SKIP,
+                ButtonRole::Ordinary,
+                "Skip for now",
+                self.pending_skip.is_none() && !self.native_change_running(),
+                ButtonKind::Link,
+            ));
         }
         if !matches!(
             screen,
@@ -1581,7 +1651,9 @@ impl LiveController {
         let screen = self.display_screen();
         let (title, message) = self.title_and_message(screen);
         let (buttons, fields) = self.buttons_and_fields(screen);
-        let layout = (screen == ScreenId::Layout).then(|| {
+        let layout = (screen == ScreenId::Layout
+            && (!self.skipped_on(screen) || self.reopened.contains(&screen)))
+        .then(|| {
             let (confirmed, local_node, peer_order) = self.layout_rects();
             LayoutPreview {
                 confirmed,
@@ -1715,6 +1787,11 @@ impl LiveController {
     /// Returns true when the window should close.
     pub(super) fn button(&mut self, id: u16) -> bool {
         match id {
+            ids::SKIP => self.skip_current(),
+            ids::SET_UP_NOW => self.reopen(self.screen),
+            ids::REOPEN_CONNECT => self.reopen(ScreenId::Connect),
+            ids::REOPEN_ARRANGE => self.reopen(ScreenId::Layout),
+            ids::REOPEN_PRACTICE => self.reopen(ScreenId::Practice),
             ids::NEXT => {
                 if self.screen == ScreenId::Welcome {
                     // The go-ahead for the install steps that stay inside this account.

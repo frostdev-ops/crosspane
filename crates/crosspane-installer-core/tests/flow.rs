@@ -126,6 +126,79 @@ fn graphs_reject_invalid_shapes_and_requirements() {
         );
     }
 }
+
+#[test]
+fn optional_skip_never_satisfies_evidence_and_still_requires_fresh_health() {
+    let mut specs = graph();
+    specs[1].prerequisites = vec![StepId(70)];
+    let pair = step(60);
+    let mut layout = step(62);
+    layout.prerequisites = vec![StepId(60)];
+    let mut practice = step(70);
+    practice.prerequisites = vec![StepId(62)];
+    practice.requires_activity = true;
+    practice.requires_human = true;
+    practice.requires_fixture = true;
+    specs.extend([pair, layout, practice]);
+    let optional = [StepId(60), StepId(62), StepId(70)];
+    assert_eq!(
+        Flow::new_with_optional_steps(specs.clone(), &[StepId(1)]).unwrap_err(),
+        GraphError::InvalidOptionalStep
+    );
+    assert_eq!(
+        Flow::new_with_optional_steps(specs.clone(), &[StepId(2)]).unwrap_err(),
+        GraphError::InvalidOptionalStep
+    );
+    let mut closed = Flow::new(specs.clone()).unwrap();
+    assert_eq!(
+        closed.reduce(FlowEvent::Skip(StepId(60)), 0),
+        Err(FlowError::NotOptional)
+    );
+    let mut flow = Flow::new_with_optional_steps(specs, &optional).unwrap();
+    satisfy(&mut flow, 1, 0, verification(0, None));
+    let old = begin(&mut flow, 60, 0);
+    for id in optional {
+        flow.reduce(FlowEvent::Skip(id), 0).unwrap();
+    }
+    assert_eq!(
+        flow.reduce(
+            FlowEvent::Detected {
+                step: old.step,
+                operation: old.operation,
+                needs_action: false
+            },
+            0
+        ),
+        Err(FlowError::WrongOperation)
+    );
+    assert_eq!(flow.summary(0, &[]).milestone, Milestone::InstalledWaiting);
+    let live = sample(0, 1);
+    flow.reduce(
+        FlowEvent::Observe {
+            samples: vec![live.clone()],
+        },
+        0,
+    )
+    .unwrap();
+    satisfy(&mut flow, 2, 0, verification(0, Some(live.binding.clone())));
+    let ready = flow.summary(0, std::slice::from_ref(&live));
+    assert_eq!(ready.milestone, Milestone::WorkspaceReady);
+    assert_eq!(ready.skipped, optional);
+    assert!(
+        ready
+            .steps
+            .iter()
+            .filter(|s| optional.contains(&s.id))
+            .all(|s| s.state == StepState::Skipped)
+    );
+    assert_eq!(
+        flow.summary(5001, &[live]).milestone,
+        Milestone::InstalledWaiting
+    );
+    // An explicit reopen retires readiness, but does not reopen the other deferrals.
+    begin(&mut flow, 60, 1);
+    assert_eq!(flow.summary(1, &[]).skipped, vec![StepId(62), StepId(70)]);
+}
 #[test]
 fn detection_is_not_verification_and_install_is_not_ready() {
     let mut flow = Flow::new(graph()).unwrap();
