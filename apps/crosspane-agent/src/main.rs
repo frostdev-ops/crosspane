@@ -105,12 +105,18 @@ enum TrustAction {
 /// Set for a restart-required stop, including an engine restart pending teardown, so a timeout
 /// also exits with failure and lets the service manager start it again.
 static RESTART: AtomicBool = AtomicBool::new(false);
+/// Accepted installer stop is sticky for this process, including later host restart failures.
+/// Tests that accept a stop run alone in an ignored child process; the latch is never cleared.
+static INSTALLER_STOP_ACCEPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static APPKIT_STOPPED: AtomicBool = AtomicBool::new(false);
 
 /// The exit status after a clean stop: 75 (`EX_TEMPFAIL`) for a restart or AppKit termination.
 #[cfg(unix)]
 fn stop_status() -> i32 {
+    if INSTALLER_STOP_ACCEPTED.load(Ordering::Acquire) {
+        return 0;
+    }
     #[cfg(target_os = "macos")]
     if APPKIT_STOPPED.load(Ordering::Acquire) {
         // The engine can finish concurrently with the callback's first restart publication.
@@ -756,7 +762,7 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
                     move |error| host_failed(error, &stop_tx),
                     [host_done, engine_done],
                 )?;
-                if restart {
+                if restart_after_stop(restart) {
                     agent::restart();
                 }
                 // The host's graphics resources and the engine are gone before libc's exit
@@ -824,10 +830,10 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
                 stop_linux_media(media_workers, deadline);
                 engine_done.store(true, Ordering::Release);
                 receipt?;
-                if restart {
+                if restart_after_stop(restart) {
                     agent::restart();
                 }
-                if RESTART.load(Ordering::Acquire) {
+                if restart_after_stop(RESTART.load(Ordering::Acquire)) {
                     bail!("stopped to be started again");
                 }
                 Ok(())
@@ -891,10 +897,15 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
         .stopped(stopped.outcomes)
         .context("write exit receipt")?;
     drop(shutdown_watch);
-    if stopped.restart || RESTART.load(Ordering::Acquire) {
+    if restart_after_stop(stopped.restart || RESTART.load(Ordering::Acquire)) {
         agent::restart();
     }
     Ok(())
+}
+
+/// Final replacement/exit policy observes sticky intent even after a later host failure.
+fn restart_after_stop(restart_requested: bool) -> bool {
+    restart_requested && !INSTALLER_STOP_ACCEPTED.load(Ordering::Acquire)
 }
 
 #[cfg(target_os = "macos")]
@@ -1010,14 +1021,14 @@ fn media_exit_status(receipt_ok: bool, has_proxy_host: bool) -> i32 {
     } else if has_proxy_host {
         stop_status()
     } else {
-        i32::from(RESTART.load(Ordering::Acquire))
+        i32::from(restart_after_stop(RESTART.load(Ordering::Acquire)))
     }
 }
 
 #[cfg(target_os = "macos")]
 fn finish_run(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) -> Result<()> {
     lifecycle.stopped(stopped.outcomes)?;
-    if stopped.restart {
+    if restart_after_stop(stopped.restart) {
         #[cfg(target_os = "macos")]
         if !APPKIT_STOPPED.load(Ordering::Acquire) {
             agent::restart();

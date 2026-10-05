@@ -76,6 +76,11 @@ pub enum Request {
     Rearm,
     /// Stop cleanly and start again in place (e.g. after granting OS permissions).
     Restart,
+    /// Submit a normal quit for this lifecycle instance. The ACK is submission only;
+    /// process exit and its matching clean receipt establish completion, with no restart.
+    InstallerStop {
+        expected_instance: u64,
+    },
     SettingsUpdate {
         expected_revision: String,
         mac_virtual_display: bool,

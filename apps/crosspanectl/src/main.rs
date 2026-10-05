@@ -1013,3 +1013,165 @@ mod drag_status_tests {
         assert_eq!(format_drag_label(&json!({"drag":null})), None);
     }
 }
+
+/// Only the Limited Windows scratch fixture runs this helper; no shipping CLI command added.
+#[cfg(all(windows, test))]
+mod installer_stop_live_tests {
+    #![allow(clippy::unwrap_used)]
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn scratch_root() -> PathBuf {
+        assert_eq!(
+            std::env::var("CROSSPANE_INSTALLER_STOP_LIVE").as_deref(),
+            Ok("1")
+        );
+        let appdata = PathBuf::from(std::env::var_os("APPDATA").unwrap());
+        let root = appdata.parent().unwrap().to_owned();
+        let suffix = root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix("crosspane-WP-W1.5b-")
+            .unwrap();
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            std::fs::canonicalize(root.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+        for (name, leaf) in [
+            ("APPDATA", "roaming"),
+            ("LOCALAPPDATA", "local"),
+            ("CROSSPANE_RUNTIME_DIR", "runtime"),
+        ] {
+            assert_eq!(
+                PathBuf::from(std::env::var_os(name).unwrap()),
+                root.join(leaf)
+            );
+        }
+        for (name, value) in [
+            ("CROSSPANE_ACCEPTANCE_E1_ONLY", "1"),
+            ("CROSSPANE_DISCOVERY", "0"),
+            ("CROSSPANE_AUDIO", "0"),
+            ("CROSSPANE_GPU", "0"),
+        ] {
+            assert_eq!(std::env::var(name).as_deref(), Ok(value));
+        }
+        root
+    }
+
+    fn closed_marker(path: &Path, bytes: &[u8]) {
+        let staging = path.with_extension("tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        drop(file);
+        assert!(!path.exists());
+        std::fs::rename(staging, path).unwrap();
+    }
+
+    fn owned_status(root: &Path, pid: u32) -> Value {
+        let response = windows_ctl::exchange(&json!({ "cmd": "status" })).unwrap();
+        assert_eq!(response["ok"], json!(true));
+        let status = response["result"].clone();
+        let suffix = root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix("crosspane-WP-W1.5b-")
+            .unwrap();
+        assert_eq!(status["name"], json!(format!("wp-w1-5b-{suffix}")));
+        assert_eq!(
+            status["installer"]["instance"]["pid"].as_u64(),
+            Some(u64::from(pid))
+        );
+        assert!(
+            status["installer"]["instance"]
+                .get("uid")
+                .is_some_and(Value::is_null)
+        );
+        assert_eq!(status["installer"]["keystore"], json!("file"));
+        assert!(status["peers"].as_array().is_some_and(Vec::is_empty));
+        let listening: std::net::SocketAddr =
+            status["listening"].as_str().unwrap().parse().unwrap();
+        let loopback = listening.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert!(
+            loopback,
+            "scratch agent must already be bound only to approved loopback"
+        );
+        status
+    }
+
+    #[test]
+    #[ignore = "requires the Limited loopback-only installer-stop scratch fixture"]
+    fn installer_stop_stale_then_matching_ack_and_exact_receipt() {
+        let root = scratch_root();
+        let pid = std::env::var("CROSSPANE_INSTALLER_STOP_AGENT_PID")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_ne!(pid, 0);
+        let status = owned_status(&root, pid);
+        let instance = status["installer"]["instance"]["id"].as_u64().unwrap();
+        let stale = windows_ctl::exchange(
+            &json!({ "cmd": "installer_stop", "expected_instance": instance.wrapping_add(1) }),
+        )
+        .unwrap();
+        assert_eq!(stale["ok"], json!(false));
+        assert_eq!(stale["error"], json!("stale_instance"));
+        assert_eq!(
+            owned_status(&root, pid)["installer"]["instance"]["id"].as_u64(),
+            Some(instance)
+        );
+        println!("installer_stop_stale_instance=true; stale_kept_running=true; loopback_only=true");
+        let accepted = windows_ctl::exchange(
+            &json!({ "cmd": "installer_stop", "expected_instance": instance }),
+        );
+        let ack_received = match accepted {
+            Ok(response) => {
+                assert_eq!(response, json!({ "ok": true, "result": "stopping" }));
+                true
+            }
+            // A missed ACK is unknown submission. It does not establish failure or completion;
+            // the bounded native exit plus this exact instance's clean receipt is authoritative.
+            Err(_) => false,
+        };
+        closed_marker(
+            &root.join("stop-ack"),
+            if ack_received {
+                b"ack_received=true"
+            } else {
+                b"ack_received=false"
+            },
+        );
+        println!("installer_stop_ack_received={ack_received}; ack_submission_only=true");
+        // The outer fixture owns the native process handle and publishes this only after exit 0.
+        let exit = root.join("agent-exit-observed");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !exit.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(exit).unwrap(), "native_exit=0");
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(root.join("local/Crosspane/last_exit.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["schema_version"], json!(1));
+        assert_eq!(receipt["instance_id"].as_u64(), Some(instance));
+        assert_eq!(receipt["clean"], json!(true));
+        assert_eq!(receipt["input_journals_empty"], json!(true));
+        assert_eq!(receipt["audio_stopped"], json!(true));
+        assert_ne!(receipt["parking"], json!("failed"));
+        println!(
+            "installer_stop_native_exit_and_receipt=true; exact_u64_instance=true; receipt_clean=true"
+        );
+    }
+}

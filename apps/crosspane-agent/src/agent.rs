@@ -4738,6 +4738,22 @@ impl Agent {
                 self.restart_requested = true;
                 Response::ok(json!("restarting"))
             }
+            Request::InstallerStop { expected_instance } => {
+                if self.status()["installer"]["instance"]["id"].as_u64() != Some(expected_instance)
+                {
+                    return Response::err("stale_instance");
+                }
+                // The existing quit path wins any pending restart. Setting its latch again
+                // only repeats submission; shutdown runs once after the response is queued.
+                let _ = crate::INSTALLER_STOP_ACCEPTED.compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Release,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.quit_requested = true;
+                Response::ok(json!("stopping"))
+            }
             Request::SettingsUpdate {
                 expected_revision,
                 mac_virtual_display,
@@ -8127,6 +8143,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn installer_stop_wire_contract_preserves_u64_instance() {
+        let wire = json!({ "cmd": "installer_stop", "expected_instance": u64::MAX });
+        let request: Request = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(
+            request,
+            Request::InstallerStop {
+                expected_instance: u64::MAX
+            }
+        ));
+        assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        for invalid in [
+            json!({ "cmd": "installer_stop" }),
+            json!({ "cmd": "installer_stop", "expected_instance": -1 }),
+            json!({ "cmd": "installer_stop", "expected_instance": "1234" }),
+            json!({ "cmd": "installer_stop", "expected_instance": 1.5 }),
+        ] {
+            assert!(serde_json::from_value::<Request>(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn fixed_node_colours() {
         assert_eq!(node_accent(NodeId([0; 32])), [210, 45, 45]);
         let mut node = [0; 32];
@@ -8641,6 +8678,150 @@ mod audio_tests {
         assert_eq!(
             response.result["installer"]["config_revision"],
             json!("0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn installer_stop_stale_instance_leaves_the_agent_running() {
+        let mut rig = rig(true);
+        let instance = rig.agent.status()["installer"]["instance"]["id"]
+            .as_u64()
+            .unwrap();
+        let response = rig.agent.on_ctl(Request::InstallerStop {
+            expected_instance: instance.wrapping_add(1),
+        });
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("stale_instance"));
+        assert!(!rig.agent.quit_requested);
+        assert!(!rig.agent.restart_requested);
+        let status = rig.agent.on_ctl(Request::Status);
+        assert!(status.ok);
+        assert_eq!(
+            status.result["installer"]["instance"]["id"],
+            json!(instance)
+        );
+        assert!(
+            rig.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| *c != Call::Shutdown)
+        );
+    }
+
+    #[test]
+    #[ignore = "sets sticky process intent; run alone with --exact --ignored"]
+    fn installer_stop_matching_repeat_quits_once_with_a_matching_clean_receipt() {
+        let mut rig = rig(true);
+        let paths = crate::paths::Paths {
+            config_dir: rig._dir.0.clone(),
+            state_dir: rig._dir.0.clone(),
+            runtime_dir: rig._dir.0.clone(),
+        };
+        for journal in [paths.journal_file(), paths.e2_journal_file()] {
+            crate::paths::write_private(&journal, b"").unwrap();
+        }
+        let mut lifecycle = crate::lifecycle::Lifecycle::start(&paths).unwrap();
+        let instance = lifecycle.instance.id;
+        rig.agent.set_startup(
+            StartupFacts::collect(
+                rig.local,
+                &paths,
+                crate::keys::KeySource::File,
+                &crate::config::Config::default(),
+                "0123456789abcdef".into(),
+            )
+            .with_instance(lifecycle.instance),
+        );
+        rig.agent.set_lifecycle_paths(paths.clone());
+        lifecycle
+            .phase(crate::lifecycle::Phase::Ready, None)
+            .unwrap();
+        // An accepted normal quit takes precedence even over an already submitted restart.
+        assert!(rig.agent.on_ctl(Request::Restart).ok);
+        for _ in 0..2 {
+            let response = rig.agent.on_ctl(Request::InstallerStop {
+                expected_instance: instance,
+            });
+            assert_eq!(
+                serde_json::to_value(response).unwrap(),
+                json!({ "ok": true, "result": "stopping" })
+            );
+        }
+        assert!(rig.agent.quit_requested);
+        assert!(crate::INSTALLER_STOP_ACCEPTED.load(std::sync::atomic::Ordering::Acquire));
+        // A host can publish a restart after acceptance. Exercise the real sticky latch and
+        // final replacement policy in this isolated test process without ever resetting intent.
+        crate::RESTART.store(true, std::sync::atomic::Ordering::Release);
+        assert!(!crate::restart_after_stop(true));
+        #[cfg(unix)]
+        assert_eq!(crate::stop_status(), 0);
+        assert!(!paths.exit_receipt().exists(), "ACK is submission only");
+        assert!(
+            rig.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| *c != Call::Shutdown)
+        );
+        // A stale repeat remains stale even while the matching quit latch is set.
+        let stale = rig.agent.on_ctl(Request::InstallerStop {
+            expected_instance: instance.wrapping_add(1),
+        });
+        assert_eq!(stale.error.as_deref(), Some("stale_instance"));
+        let (reply, received) = mpsc::channel();
+        rig.agent
+            .events
+            .send(Event::Ctl(Request::Status, reply))
+            .unwrap();
+        let stopped = rig.agent.run(Vec::new(), &rig.events);
+        assert!(received.recv().unwrap().ok);
+        assert!(
+            !stopped.restart,
+            "installer stop must never request replacement"
+        );
+        assert!(!crate::restart_after_stop(
+            stopped.restart || crate::RESTART.load(std::sync::atomic::Ordering::Acquire)
+        ));
+        lifecycle.stopped(stopped.outcomes).unwrap();
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(paths.exit_receipt()).unwrap()).unwrap();
+        assert_eq!(receipt["instance_id"], json!(instance));
+        assert_eq!(receipt["clean"], json!(true));
+        assert_eq!(
+            rig.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| **c == Call::Shutdown)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn installer_stop_does_not_change_existing_restart_behavior() {
+        let rig = rig(true);
+        let (reply, received) = mpsc::channel();
+        rig.agent
+            .events
+            .send(Event::Ctl(Request::Restart, reply))
+            .unwrap();
+        let stopped = rig.agent.run(Vec::new(), &rig.events);
+        assert_eq!(
+            serde_json::to_value(received.recv().unwrap()).unwrap(),
+            json!({ "ok": true, "result": "restarting" })
+        );
+        assert!(stopped.restart);
+        assert!(crate::restart_after_stop(stopped.restart));
+        assert_eq!(
+            rig.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| **c == Call::Shutdown)
+                .count(),
+            1
         );
     }
 
