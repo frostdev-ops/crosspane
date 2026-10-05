@@ -18,6 +18,10 @@ use winit::{
     window::{CursorIcon, CustomCursor, Fullscreen, Window, WindowId},
 };
 
+#[cfg(any(target_os = "windows", test))]
+use super::HostMonitorMapping;
+#[cfg(target_os = "windows")]
+use super::HostPlacementMapping;
 use super::{
     HostCommand, HostEvent, HostPlace, PictureImporter, cursor,
     gpu::{Presenter, surface_format},
@@ -35,6 +39,8 @@ pub(super) struct App {
     pending: VecDeque<HostCommand>,
     pending_arms: HashMap<u64, (Instant, std::sync::mpsc::SyncSender<bool>, bool)>,
     importer: Option<PictureImporter>,
+    #[cfg(target_os = "windows")]
+    placement_mapping: Option<HostPlacementMapping>,
 }
 
 struct Gpu {
@@ -61,6 +67,11 @@ struct ProxyWindow {
     presents: PresentCounter,
     /// What `HostEvent::Placed` last said about this window, and the occlusion it is built on.
     placement: PlacementTracker,
+    #[cfg(target_os = "windows")]
+    dpi_correction: Option<DpiCorrection>,
+    /// Latest confirmed geometry or newer source request, independent of the presenter size.
+    #[cfg(target_os = "windows")]
+    dpi_baseline: (PhysicalSize<u32>, f64),
 }
 
 impl App {
@@ -68,9 +79,12 @@ impl App {
         proxy: EventLoopProxy<HostCommand>,
         events: Box<dyn FnMut(HostEvent)>,
         importer: Option<PictureImporter>,
+        #[cfg(target_os = "windows")] placement_mapping: Option<HostPlacementMapping>,
     ) -> Self {
         Self {
             importer,
+            #[cfg(target_os = "windows")]
+            placement_mapping,
             proxy,
             events,
             instance: None,
@@ -101,6 +115,37 @@ impl App {
         let monitor = event_loop
             .primary_monitor()
             .or_else(|| event_loop.available_monitors().next());
+        #[cfg(target_os = "windows")]
+        let mapped = place.and_then(|place| {
+            let rows = self.placement_mapping.as_ref().and_then(|read| read());
+            let count = rows.as_ref().map_or(0, Vec::len);
+            let mapped = rows
+                .as_deref()
+                .and_then(|rows| map_logical(rows, place.content))
+                .and_then(|(row, content)| {
+                    use winit::platform::windows::MonitorHandleExtWindows;
+                    event_loop
+                        .available_monitors()
+                        .find(|monitor| {
+                            monitor.native_id() == row.native_id
+                                && native_bounds_match(row, monitor)
+                        })
+                        .map(|monitor| (monitor, content))
+                });
+            if mapped.is_none() {
+                tracing::warn!(
+                    monitors = count,
+                    degraded = 1,
+                    "proxy placement mapping unavailable; using OS placement"
+                );
+            }
+            mapped
+        });
+        #[cfg(target_os = "windows")]
+        let monitor = mapped
+            .as_ref()
+            .map(|(monitor, _)| monitor.clone())
+            .or(monitor);
         let initial_scale = monitor
             .as_ref()
             .map_or(1.0, |monitor| monitor.scale_factor());
@@ -122,10 +167,15 @@ impl App {
             use winit::platform::windows::WindowAttributesExtWindows;
             // The frozen Open describes an independent, decorated toplevel, with no owner
             // or popup relation. Winit supplies the normal resizable overlapped style.
-            attributes
+            let attributes = attributes
                 .with_class_name("CrosspaneProxy")
                 .with_skip_taskbar(false)
-                .with_drag_and_drop(false)
+                .with_drag_and_drop(false);
+            if let Some((_, content)) = &mapped {
+                attributes.with_position(*content)
+            } else {
+                attributes
+            }
         };
         let window = Arc::new(
             event_loop
@@ -163,11 +213,19 @@ impl App {
         #[cfg(not(target_os = "macos"))]
         let _ = place;
         #[cfg(target_os = "windows")]
-        if place.is_some() {
-            // Crosspane's seam-preserving logical desktop cannot be converted by multiplying
-            // a global point by the current DPI. The agent must supply its monitor mapping.
-            tracing::debug!(id, "Windows proxy placement awaits logical monitor mapping");
+        if let Some((_, desired)) = mapped {
+            let physical_content = window.inner_size();
+            if !place_physical_content(&window, desired) {
+                tracing::warn!(degraded = 1, "proxy placement could not be verified");
+            }
+            // Creation/moving can dispatch DPI events before this HWND has an ID in App.
+            // Preserve its fitted physical viewport before publishing Opened/Placed.
+            if window.inner_size() != physical_content {
+                let _ = window.request_inner_size(physical_content);
+            }
         }
+        #[cfg(target_os = "windows")]
+        let scale = window.scale_factor();
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
@@ -222,6 +280,10 @@ impl App {
             consecutive_surface_losses: 0,
             presents: PresentCounter::new(Instant::now()),
             placement: PlacementTracker::for_new_window(),
+            #[cfg(target_os = "windows")]
+            dpi_correction: None,
+            #[cfg(target_os = "windows")]
+            dpi_baseline: (actual_size, scale),
         };
         proxy.resize(gpu, actual_size)?;
         if gpu.failed.load(Ordering::Acquire) {
@@ -248,8 +310,49 @@ impl App {
         let Some(window) = self.windows.get_mut(&id) else {
             return;
         };
+        #[cfg(target_os = "windows")]
+        if trigger == Trigger::Geometry && window.dpi_correction.is_some() {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        let rows = self.placement_mapping.as_ref().and_then(|read| read());
         let sample = sample_window(&window.window);
-        if let Some(placed) = window.placement.update(&sample) {
+        #[cfg(target_os = "windows")]
+        let placed = {
+            use winit::platform::windows::MonitorHandleExtWindows;
+            let monitor = window.window.current_monitor();
+            let row = rows
+                .as_deref()
+                .filter(|rows| valid_mapping(rows))
+                .and_then(|rows| {
+                    monitor.as_ref().and_then(|monitor| {
+                        rows.iter().find(|row| {
+                            row.native_id == monitor.native_id()
+                                && native_bounds_match(row, monitor)
+                        })
+                    })
+                });
+            let mut placed = placement(&sample, window.placement.occluded);
+            if let (Some(row), Some(inner)) = (row, sample.inner_position)
+                && window.window.current_monitor().map(|m| m.native_id())
+                    == monitor.as_ref().map(|m| m.native_id())
+            {
+                placed.monitor = Some(row.id);
+                placed.origin = PointDevice::new(
+                    f64::from(inner.x) - f64::from(row.physical_origin.x),
+                    f64::from(inner.y) - f64::from(row.physical_origin.y),
+                );
+            }
+            if window.placement.last == Some(placed) {
+                None
+            } else {
+                window.placement.last = Some(placed);
+                Some(placed)
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let placed = window.placement.update(&sample);
+        if let Some(placed) = placed {
             tracing::debug!(id, ?placed, ?trigger, "proxy placement");
             (self.events)(placed.event(id));
         }
@@ -328,6 +431,10 @@ impl App {
                 }
             }
             HostCommand::SetFullscreen { id, fullscreen } => {
+                #[cfg(target_os = "windows")]
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.dpi_correction = None;
+                }
                 if let Some(window) = self.windows.get(&id) {
                     #[cfg(target_os = "windows")]
                     window
@@ -344,6 +451,10 @@ impl App {
                     return;
                 }
                 if let Some(window) = self.windows.get_mut(&id) {
+                    #[cfg(target_os = "windows")]
+                    {
+                        window.dpi_correction = None;
+                    }
                     // The source's size is exact: no opening fit and no logical rounding, or the
                     // window system's answer would differ from it and be sent back as a resize.
                     let Some(request) = content_request(size, window.window.fullscreen().is_some())
@@ -351,6 +462,12 @@ impl App {
                         tracing::debug!(id, "content resize dropped while proxy is fullscreen");
                         return;
                     };
+                    #[cfg(target_os = "windows")]
+                    {
+                        // Windows requests return None even when native resizing is synchronous.
+                        // Supersede buffered DPI callbacks before their Resized event arrives.
+                        window.dpi_baseline = (request, window.window.scale_factor());
+                    }
                     let result = window.window.request_inner_size(request);
                     if let Some(actual) = result {
                         self.resized(id, actual, window_scale(&self.windows, id));
@@ -447,6 +564,15 @@ impl App {
     }
 
     fn geometry_changed(&mut self, id: u64, report: Report) {
+        #[cfg(target_os = "windows")]
+        if let Some(window) = self.windows.get_mut(&id)
+            && let Some(correction) = &window.dpi_correction
+        {
+            if !correction.done(report.size, Instant::now()) {
+                return;
+            }
+            window.dpi_correction = None;
+        }
         if report.stale {
             tracing::debug!(id, size = ?report.size, scale = report.scale, "window event payload was stale");
         }
@@ -458,6 +584,10 @@ impl App {
             return;
         };
         window.scale = scale;
+        #[cfg(target_os = "windows")]
+        {
+            window.dpi_baseline = (size, scale);
+        }
         if let Err(error) = window.resize(gpu, size) {
             tracing::warn!(id, %error, "proxy resize failed");
             self.remove(id, true);
@@ -648,7 +778,56 @@ impl ApplicationHandler<HostCommand> for App {
                 let report = reported(Change::Resized(size), sample(&window.window));
                 self.geometry_changed(id, report);
             }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                mut inner_size_writer,
+            } => {
+                #[cfg(target_os = "windows")]
+                {
+                    let size = window.window.inner_size();
+                    let (previous, old_scale) = window
+                        .dpi_correction
+                        .as_ref()
+                        .map_or(window.dpi_baseline, |correction| {
+                            (correction.size, correction.scale)
+                        });
+                    let current_scale = window.window.scale_factor();
+                    // Buffered older generations must not overwrite the latest native DPI.
+                    // Fence their intervening Resized events until the current callback arrives,
+                    // preserving the old physical baseline and its scale without any request.
+                    if scale_factor != current_scale {
+                        let target = dpi_physical_size(previous, old_scale, size, current_scale);
+                        if target != size {
+                            let mut fence = DpiCorrection::new(target, old_scale, Instant::now());
+                            fence.requested = true;
+                            window.dpi_correction = Some(fence);
+                        }
+                        return;
+                    }
+                    window.dpi_correction = None;
+                    if size.width != 0
+                        && size.height != 0
+                        && window.window.fullscreen().is_none()
+                        && !window.window.is_maximized()
+                        && window.window.is_minimized() != Some(true)
+                    {
+                        // winit 0.30.13 windows/event_loop/runner.rs:361–402 regenerates a
+                        // buffered writer after auto-resizing, and applies its answer only
+                        // after this callback. Recognize that resize within one physical pixel;
+                        // a concurrent user resize at the same ratio is indistinguishable.
+                        let target = dpi_physical_size(previous, old_scale, size, scale_factor);
+                        let accepted = inner_size_writer.request_inner_size(target).is_ok();
+                        if !accepted || target != size {
+                            let mut correction =
+                                DpiCorrection::new(target, scale_factor, Instant::now());
+                            // A successful writer needs observation only, never another request.
+                            correction.requested = accepted;
+                            window.dpi_correction = Some(correction);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                let _ = &mut inner_size_writer;
                 let report = reported(Change::ScaleFactor(scale_factor), sample(&window.window));
                 self.geometry_changed(id, report);
             }
@@ -690,9 +869,25 @@ impl ApplicationHandler<HostCommand> for App {
         }
         let now = Instant::now();
         let mut next = None;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let mut corrections = Vec::new();
         for (&id, window) in &mut self.windows {
+            #[cfg(target_os = "windows")]
+            if let Some(correction) = &mut window.dpi_correction {
+                // about_to_wait runs after WM_DPICHANGED returns; one live request only.
+                let mut actual = sample(&window.window);
+                if correction.begin_request(actual.0, now) {
+                    let _ = window.window.request_inner_size(correction.size);
+                    actual = sample(&window.window);
+                }
+                if correction.done(actual.0, now) {
+                    window.dpi_correction = None;
+                    corrections.push((id, actual));
+                } else {
+                    let deadline = correction.deadline;
+                    next = Some(next.map_or(deadline, |previous: Instant| previous.min(deadline)));
+                }
+            }
             #[cfg(target_os = "macos")]
             if let Some(poll) = &mut window.fullscreen_poll {
                 if poll.due(now) && window.window.fullscreen().is_some() != window.fullscreen {
@@ -721,11 +916,154 @@ impl ApplicationHandler<HostCommand> for App {
         }
         // AppKit can update the fullscreen ivar after its queued Resized. A late change gets
         // Fullscreen followed by fresh current geometry; unchanged ticks never resize or rearm.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         for (id, (size, scale)) in corrections {
             self.resized(id, size, scale);
         }
         event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn valid_mapping(rows: &[HostMonitorMapping]) -> bool {
+    let mut ids = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    rows.iter().all(|row| {
+        let bounds = row.geometry.logical_bounds();
+        row.geometry.is_valid()
+            && bounds.max_x().is_finite()
+            && bounds.max_y().is_finite()
+            && bounds.max_x() > bounds.min_x()
+            && bounds.max_y() > bounds.min_y()
+            && !row.native_id.is_empty()
+            && ids.insert(row.id)
+            && names.insert(&row.native_id)
+            && i64::from(row.physical_origin.x) + i64::from(row.geometry.pixel_size.width)
+                <= i64::from(i32::MAX)
+            && i64::from(row.physical_origin.y) + i64::from(row.geometry.pixel_size.height)
+                <= i64::from(i32::MAX)
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn map_logical(
+    rows: &[HostMonitorMapping],
+    point: winit::dpi::LogicalPosition<f64>,
+) -> Option<(&HostMonitorMapping, PhysicalPosition<i32>)> {
+    if !valid_mapping(rows) || !point.x.is_finite() || !point.y.is_finite() {
+        return None;
+    }
+    let point = crosspane_types::geom::PointLogical::new(point.x, point.y);
+    let mut containing = rows
+        .iter()
+        .filter(|row| row.geometry.logical_bounds().contains(point));
+    let row = containing.next()?;
+    if containing.next().is_some() {
+        return None;
+    }
+    let local = row.geometry.logical_to_device(point);
+    if local.x.round() >= f64::from(row.geometry.pixel_size.width)
+        || local.y.round() >= f64::from(row.geometry.pixel_size.height)
+    {
+        return None;
+    }
+    let x = f64::from(row.physical_origin.x) + local.x.round();
+    let y = f64::from(row.physical_origin.y) + local.y.round();
+    if x < f64::from(i32::MIN)
+        || x > f64::from(i32::MAX)
+        || y < f64::from(i32::MIN)
+        || y > f64::from(i32::MAX)
+    {
+        return None;
+    }
+    Some((row, PhysicalPosition::new(x as i32, y as i32)))
+}
+
+#[cfg(target_os = "windows")]
+fn native_bounds_match(row: &HostMonitorMapping, monitor: &MonitorHandle) -> bool {
+    monitor.position() == row.physical_origin
+        && monitor.size()
+            == PhysicalSize::new(
+                row.geometry.pixel_size.width,
+                row.geometry.pixel_size.height,
+            )
+}
+
+#[cfg(target_os = "windows")]
+fn place_physical_content(window: &Window, desired: PhysicalPosition<i32>) -> bool {
+    for correction in 0..=1 {
+        let (Ok(outer), Ok(inner)) = (window.outer_position(), window.inner_position()) else {
+            return false;
+        };
+        if correction != 0
+            && (i64::from(inner.x) - i64::from(desired.x)).abs() <= 1
+            && (i64::from(inner.y) - i64::from(desired.y)).abs() <= 1
+        {
+            return true;
+        }
+        let x = i32::try_from(i64::from(desired.x) + i64::from(outer.x) - i64::from(inner.x));
+        let y = i32::try_from(i64::from(desired.y) + i64::from(outer.y) - i64::from(inner.y));
+        let (Ok(x), Ok(y)) = (x, y) else {
+            return false;
+        };
+        window.set_outer_position(PhysicalPosition::new(x, y));
+    }
+    window.inner_position().is_ok_and(|inner| {
+        (i64::from(inner.x) - i64::from(desired.x)).abs() <= 1
+            && (i64::from(inner.y) - i64::from(desired.y)).abs() <= 1
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn dpi_physical_size(
+    previous: PhysicalSize<u32>,
+    old_scale: f64,
+    actual: PhysicalSize<u32>,
+    new_scale: f64,
+) -> PhysicalSize<u32> {
+    let scaled = |length: u32| (f64::from(length) * new_scale / old_scale).round();
+    if previous.width != 0
+        && previous.height != 0
+        && old_scale.is_finite()
+        && old_scale > 0.0
+        && new_scale.is_finite()
+        && new_scale > 0.0
+        && old_scale != new_scale
+        && (f64::from(actual.width) - scaled(previous.width)).abs() <= 1.0
+        && (f64::from(actual.height) - scaled(previous.height)).abs() <= 1.0
+    {
+        previous
+    } else {
+        actual
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+struct DpiCorrection {
+    size: PhysicalSize<u32>,
+    scale: f64,
+    deadline: Instant,
+    requested: bool,
+}
+#[cfg(any(target_os = "windows", test))]
+impl DpiCorrection {
+    fn new(size: PhysicalSize<u32>, scale: f64, now: Instant) -> Self {
+        Self {
+            size,
+            scale,
+            deadline: now + Duration::from_millis(250),
+            requested: false,
+        }
+    }
+    fn done(&self, actual: PhysicalSize<u32>, now: Instant) -> bool {
+        actual == self.size || now >= self.deadline
+    }
+    fn begin_request(&mut self, actual: PhysicalSize<u32>, now: Instant) -> bool {
+        if self.requested || self.done(actual, now) {
+            return false;
+        }
+        self.requested = true;
+        true
     }
 }
 
@@ -1157,6 +1495,7 @@ impl PlacementTracker {
     }
 
     /// The report for `sample`, unless it equals the last one.
+    #[cfg(any(not(target_os = "windows"), test))]
     fn update(&mut self, sample: &Sample) -> Option<Placement> {
         let now = placement(sample, self.occluded);
         if self.last == Some(now) {
@@ -2219,6 +2558,131 @@ mod tests {
         assert_eq!(
             fit(LogicalSize::new(500.0, 2000.0), laptop),
             LogicalSize::new(196.0, 785.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod windows_mapping_tests {
+    use super::*;
+    use crosspane_types::geom::{DisplayGeometry, PointLogical, SizeMm};
+    fn row(
+        id: u32,
+        physical: (i32, i32),
+        pixels: (u32, u32),
+        logical: (f64, f64),
+        scale: f64,
+    ) -> HostMonitorMapping {
+        HostMonitorMapping {
+            id,
+            native_id: format!("monitor{id}"),
+            physical_origin: PhysicalPosition::new(physical.0, physical.1),
+            geometry: DisplayGeometry {
+                physical_size: SizeMm::new(500.0, 300.0),
+                pixel_size: PixelSize::new(pixels.0, pixels.1),
+                scale,
+                logical_origin: PointLogical::new(logical.0, logical.1),
+            },
+        }
+    }
+    #[test]
+    fn mixed_dpi_mapping_uses_monitor_relative_offsets_and_offset_seams() {
+        let a = row(1, (0, 0), (1920, 1080), (0.0, 0.0), 1.0);
+        let b = row(2, (1920, 0), (1920, 2160), (1920.0, 0.0), 2.0);
+        let rows = [a, b];
+        let (monitor, point) =
+            map_logical(&rows, winit::dpi::LogicalPosition::new(2020.0, 100.0)).unwrap();
+        assert_eq!(monitor.id, 2);
+        assert_eq!(point, PhysicalPosition::new(2120, 200));
+        let rows = [
+            row(1, (0, 0), (2560, 1440), (0.0, 0.0), 2.0),
+            row(2, (2560, 200), (1920, 1080), (1280.0, 100.0), 1.0),
+        ];
+        assert_eq!(
+            map_logical(&rows, winit::dpi::LogicalPosition::new(1380.0, 200.0))
+                .unwrap()
+                .1,
+            PhysicalPosition::new(2660, 300)
+        );
+    }
+    #[test]
+    fn missing_invalid_and_ambiguous_mapping_degrades_instead_of_guessing() {
+        let point = winit::dpi::LogicalPosition::new(10.0, 10.0);
+        assert!(map_logical(&[], point).is_none());
+        let a = row(1, (-1920, 0), (1920, 1080), (-1920.0, 0.0), 1.0);
+        assert!(map_logical(std::slice::from_ref(&a), point).is_none());
+        assert!(map_logical(&[a.clone(), a.clone()], point).is_none());
+        let b = row(2, (0, 0), (1920, 1080), (-1920.0, 0.0), 1.0);
+        assert!(map_logical(&[a, b], winit::dpi::LogicalPosition::new(-10.0, 10.0)).is_none());
+        let mut a = row(1, (0, 0), (1920, 1080), (0.0, 0.0), 1.0);
+        a.geometry.scale = f64::NAN;
+        assert!(map_logical(&[a], point).is_none());
+    }
+    #[test]
+    fn expired_writer_correction_observes_physical_size_or_absolute_expiry() {
+        let now = Instant::now();
+        let mut correction = DpiCorrection::new(PhysicalSize::new(640, 480), 2.0, now);
+        assert!(!correction.requested);
+        assert!(correction.begin_request(PhysicalSize::new(1280, 960), now));
+        assert!(!correction.begin_request(PhysicalSize::new(1280, 960), now));
+        assert!(correction.requested);
+        assert!(!correction.done(
+            PhysicalSize::new(1280, 960),
+            now + Duration::from_millis(249)
+        ));
+        assert!(correction.done(PhysicalSize::new(640, 480), now));
+        assert!(correction.done(
+            PhysicalSize::new(1280, 960),
+            now + Duration::from_millis(250)
+        ));
+        let mut delayed = DpiCorrection::new(PhysicalSize::new(640, 480), 2.0, now);
+        assert!(!delayed.begin_request(
+            PhysicalSize::new(1280, 960),
+            now + Duration::from_millis(250)
+        ));
+        assert!(!delayed.requested);
+        let mut already_correct = DpiCorrection::new(PhysicalSize::new(640, 480), 2.0, now);
+        assert!(!already_correct.begin_request(PhysicalSize::new(640, 480), now));
+        let mut accepted = DpiCorrection::new(PhysicalSize::new(320, 240), 2.0, now);
+        accepted.requested = true;
+        assert_eq!(accepted.scale, 2.0);
+        assert!(!accepted.begin_request(PhysicalSize::new(640, 480), now));
+        assert!(!accepted.done(PhysicalSize::new(640, 480), now));
+        assert!(accepted.done(PhysicalSize::new(320, 240), now));
+    }
+    #[test]
+    fn buffered_dpi_writer_retains_only_the_rounded_automatic_size() {
+        let previous = PhysicalSize::new(320, 240);
+        assert_eq!(
+            dpi_physical_size(previous, 1.0, PhysicalSize::new(640, 480), 2.0),
+            previous
+        );
+        assert_eq!(
+            dpi_physical_size(previous, 1.0, PhysicalSize::new(641, 479), 2.0),
+            previous
+        );
+        for actual in [PhysicalSize::new(642, 480), PhysicalSize::new(640, 482)] {
+            assert_eq!(dpi_physical_size(previous, 1.0, actual, 2.0), actual);
+        }
+        assert_eq!(
+            dpi_physical_size(previous, 2.0, PhysicalSize::new(160, 120), 1.0),
+            previous
+        );
+        assert_eq!(dpi_physical_size(previous, 1.0, previous, 2.0), previous);
+        let newer_source = PhysicalSize::new(360, 280);
+        assert_eq!(
+            dpi_physical_size(newer_source, 2.0, newer_source, 2.0),
+            newer_source
+        );
+        // Older buffered DPI callbacks are ignored, so the latest generation still sees
+        // the original physical baseline, even after two native automatic resizes.
+        assert_eq!(
+            dpi_physical_size(previous, 1.0, PhysicalSize::new(960, 720), 3.0),
+            previous
+        );
+        assert_eq!(
+            dpi_physical_size(newer_source, 1.0, PhysicalSize::new(720, 560), 2.0),
+            newer_source
         );
     }
 }

@@ -22,6 +22,25 @@ pub struct HostPlace {
     pub content: winit::dpi::LogicalPosition<f64>,
 }
 
+/// One monitor from the platform's coherent logical-desktop observation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostMonitorMapping {
+    /// The platform's retained display ID (`DisplayId.0` on Windows).
+    pub id: u32,
+    /// Opaque native identity: the exact GDI device name on Windows.
+    pub native_id: String,
+    pub geometry: crosspane_types::geom::DisplayGeometry,
+    /// Global physical desktop origin, from the same observation as `geometry`.
+    pub physical_origin: winit::dpi::PhysicalPosition<i32>,
+}
+
+/// A fresh coherent monitor table, called on the host event-loop thread.
+///
+/// The provider must be bounded and avoid lock inversion. Return `None` instead of cached
+/// geometry when its native owner is gone or the observation failed. Only Windows consumes it;
+/// the agent must retain the native owner for the lifetime of every geometry consumer.
+pub type HostPlacementMapping = Arc<dyn Fn() -> Option<Vec<HostMonitorMapping>> + Send + Sync>;
+
 /// Commands to the host, sent from any thread through `HostHandle`.
 pub enum HostCommand {
     /// `Window::set_fullscreen(Some(Fullscreen::Borderless(None)))` or `None`. Never `Exclusive`.
@@ -303,6 +322,8 @@ impl HostHandle {
 pub struct ProxyHost {
     event_loop: EventLoop<HostCommand>,
     importer: Option<PictureImporter>,
+    #[cfg(target_os = "windows")]
+    placement_mapping: Option<HostPlacementMapping>,
 }
 
 impl ProxyHost {
@@ -343,6 +364,8 @@ impl ProxyHost {
             Self {
                 event_loop,
                 importer: None,
+                #[cfg(target_os = "windows")]
+                placement_mapping: None,
             },
             handle,
         ))
@@ -353,9 +376,25 @@ impl ProxyHost {
         self.importer = Some(importer);
     }
 
+    /// Install a placement provider before `run`. Only the Windows host consumes it.
+    pub fn set_placement_mapping(&mut self, mapping: HostPlacementMapping) {
+        #[cfg(target_os = "windows")]
+        {
+            self.placement_mapping = Some(mapping);
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = mapping;
+    }
+
     /// Run until `Shutdown`. The event callback runs on the main thread and must not block.
     pub fn run(self, events: Box<dyn FnMut(HostEvent)>) -> Result<(), HostError> {
-        let mut app = app::App::new(self.event_loop.create_proxy(), events, self.importer);
+        let mut app = app::App::new(
+            self.event_loop.create_proxy(),
+            events,
+            self.importer,
+            #[cfg(target_os = "windows")]
+            self.placement_mapping,
+        );
         self.event_loop.run_app(&mut app)?;
         Ok(())
     }

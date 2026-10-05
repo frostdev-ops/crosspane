@@ -7,12 +7,16 @@ use anyhow::{Context, Result, ensure};
 
 const DRIVER: &str = r#"
 use std::{ffi::c_void, path::PathBuf, sync::{Arc, Mutex, mpsc}, time::{Duration, Instant}};
-use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle, ProxyHost};
+use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle, HostMonitorMapping, HostPlace, ProxyHost};
+use crosspane_types::geom::{DisplayGeometry, PointDevice, PointLogical, SizeMm};
+use winit::dpi::{LogicalPosition, PhysicalPosition};
 use crosspane_types::geom::{PixelRect, PixelSize, euclid::point2};
 use tracing::{Event, Metadata, Subscriber, span::{Attributes, Id, Record}};
 
 type Handle = *mut c_void;
+#[repr(C)] struct NativePoint { x: i32, y: i32 }
 #[repr(C)] #[derive(Default)] struct Rect { left: i32, top: i32, right: i32, bottom: i32 }
+#[repr(C)] struct MonitorInfo { size: u32, monitor: Rect, work: Rect, flags: u32, name: [u16; 32] }
 #[repr(C)] struct BitmapInfo {
     size: u32, width: i32, height: i32, planes: u16, bit_count: u16, compression: u32,
     image_size: u32, x_pixels: i32, y_pixels: i32, used: u32, important: u32, colours: [u32; 1],
@@ -32,6 +36,11 @@ unsafe extern "system" {
     fn ShowWindow(window: Handle, command: i32) -> i32;
     fn SetForegroundWindow(window: Handle) -> i32;
     fn PostMessageW(window: Handle, message: u32, wparam: usize, lparam: isize) -> i32;
+    fn SendMessageW(window: Handle, message: u32, wparam: usize, lparam: isize) -> isize;
+    fn MonitorFromWindow(window: Handle, flags: u32) -> Handle;
+    fn GetMonitorInfoW(monitor: Handle, info: *mut MonitorInfo) -> i32;
+    fn GetDpiForWindow(window: Handle) -> u32;
+    fn ClientToScreen(window: Handle, point: *mut NativePoint) -> i32;
     fn PrintWindow(window: Handle, dc: Handle, flags: u32) -> i32;
 }
 #[link(name = "kernel32")]
@@ -156,13 +165,136 @@ fn screenshot(window: isize, output: PathBuf) {
     std::fs::write(&output, bmp).expect("fixture screenshot");
     eprintln!("screenshot: {} ({width}x{height}); synthetic center verified", output.display());
 }
-fn check(handle: &HostHandle, events: &mpsc::Receiver<HostEvent>, adapter: &AdapterLog, output: PathBuf) {
-    const ID: u64 = 1;
-    handle.send(HostCommand::Open { id: ID, title: "Crosspane Windows fixture".into(),
-        size: PixelSize::new(320, 240), accent: [80, 200, 60],
-        place: None }).expect("open");
-    wait(events, |e| matches!(e, HostEvent::Opened { .. }));
+fn close_owned(handle: &HostHandle, id: u64) {
+    handle.send(HostCommand::Close { id }).expect("engine close");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let closed = on_host(handle, || {
+            let mut remaining = Vec::<isize>::new();
+            // SAFETY: only this fixture's host thread, with synchronous callback storage.
+            unsafe { EnumThreadWindows(GetCurrentThreadId(), find_proxy, &mut remaining as *mut _ as isize); }
+            remaining.is_empty()
+        });
+        if closed { break; }
+        assert!(Instant::now() < deadline, "owned proxy destruction");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+fn monitor_row(window: isize) -> HostMonitorMapping {
+    let hwnd = window as Handle; verify_owned(hwnd);
+    let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32,
+        monitor: Rect::default(), work: Rect::default(), flags: 0, name: [0; 32] };
+    // SAFETY: own retained HWND selects its monitor; writable correctly-sized monitor metadata.
+    let dpi = unsafe { assert_ne!(GetMonitorInfoW(MonitorFromWindow(hwnd, 2), &mut info), 0); GetDpiForWindow(hwnd) };
+    let len = info.name.iter().position(|c| *c == 0).unwrap_or(info.name.len());
+    HostMonitorMapping { id: 42, native_id: String::from_utf16(&info.name[..len]).expect("GDI name"),
+        physical_origin: PhysicalPosition::new(info.monitor.left, info.monitor.top),
+        geometry: DisplayGeometry { physical_size: SizeMm::new(500.0, 300.0),
+            pixel_size: PixelSize::new((info.monitor.right - info.monitor.left) as u32,
+                (info.monitor.bottom - info.monitor.top) as u32), scale: f64::from(dpi) / 96.0,
+            logical_origin: PointLogical::zero() } }
+}
+fn open_placed(handle: &HostHandle, events: &mpsc::Receiver<HostEvent>, id: u64, row: &HostMonitorMapping, origin: (i32, i32)) -> isize {
+    let logical = row.geometry.device_to_logical(PointDevice::new(f64::from(origin.0), f64::from(origin.1)));
+    handle.send(HostCommand::Open { id, title: "Crosspane placement fixture".into(), size: PixelSize::new(320, 240),
+        accent: [80, 200, 60], place: Some(HostPlace { content: LogicalPosition::new(logical.x, logical.y) }) }).expect("placed open");
+    wait(events, |e| matches!(e, HostEvent::Opened { id: opened, size, .. } if *opened == id && *size == PixelSize::new(320, 240)));
+    let expected = PointDevice::new(f64::from(origin.0), f64::from(origin.1));
+    wait(events, |e| matches!(e, HostEvent::Placed { id: placed, monitor: Some(42), origin, size, .. }
+        if *placed == id && (origin.x - expected.x).abs() <= 1.0 && (origin.y - expected.y).abs() <= 1.0 && *size == PixelSize::new(320, 240)));
     let window = on_host(handle, owned_window);
+    let physical = row.physical_origin;
+    on_host(handle, move || {
+        let hwnd = window as Handle; verify_owned(hwnd); let mut point = NativePoint { x: 0, y: 0 };
+        // SAFETY: own retained fixture HWND and initialized writable client origin.
+        assert_ne!(unsafe { ClientToScreen(hwnd, &mut point) }, 0);
+        assert!((point.x - physical.x - origin.0).abs() <= 1 && (point.y - physical.y - origin.1).abs() <= 1);
+    });
+    eprintln!("owned logical placement verified: monitor=42, physical_size=320x240");
+    window
+}
+fn check(handle: &HostHandle, events: &mpsc::Receiver<HostEvent>, adapter: &AdapterLog, output: PathBuf,
+    mapping: Arc<Mutex<Option<Vec<HostMonitorMapping>>>>) {
+    const ID: u64 = 4;
+    handle.send(HostCommand::Open { id: 1, title: "Crosspane Windows fixture".into(),
+        size: PixelSize::new(320, 240), accent: [80, 200, 60],
+        place: Some(HostPlace { content: LogicalPosition::new(100.0, 100.0) }) }).expect("degraded open");
+    wait(events, |e| matches!(e, HostEvent::Opened { id: 1, .. }));
+    wait(events, |e| matches!(e, HostEvent::Placed { id: 1, monitor: None, .. }));
+    let window = on_host(handle, owned_window);
+    let row = on_host(handle, move || monitor_row(window));
+    close_owned(handle, 1);
+    *mapping.lock().expect("fixture mapping") = Some(vec![row.clone(), row.clone()]);
+    handle.send(HostCommand::Open { id: 2, title: "Crosspane invalid mapping fixture".into(),
+        size: PixelSize::new(320, 240), accent: [80, 200, 60],
+        place: Some(HostPlace { content: LogicalPosition::new(100.0, 100.0) }) }).expect("invalid mapping open");
+    wait(events, |e| matches!(e, HostEvent::Opened { id: 2, .. }));
+    wait(events, |e| matches!(e, HostEvent::Placed { id: 2, monitor: None, .. }));
+    close_owned(handle, 2);
+    eprintln!("missing and invalid mapping: opened via OS placement");
+    *mapping.lock().expect("fixture mapping") = Some(vec![row.clone()]);
+    let _window = open_placed(handle, events, 3, &row, (80, 100));
+    close_owned(handle, 3);
+    let mut changed = row.clone(); changed.geometry.scale *= 2.0;
+    changed.geometry.logical_origin = PointLogical::new(100.0, 50.0);
+    *mapping.lock().expect("fixture mapping") = Some(vec![changed.clone()]);
+    let window = open_placed(handle, events, ID, &changed, (120, 140));
+    eprintln!("simulated mapping scale/origin change preserved physical pixels");
+    *mapping.lock().expect("fixture mapping") = Some(vec![row.clone()]);
+    for dpi in [192usize, 96usize] {
+        on_host(handle, move || {
+            let hwnd = window as Handle; verify_owned(hwnd); let mut rect = Rect::default();
+            // SAFETY: own HWND only; synchronous owned WM_DPICHANGED with live RECT storage.
+            unsafe { assert_ne!(GetWindowRect(hwnd, &mut rect), 0);
+                SendMessageW(hwnd, 0x02e0, dpi | (dpi << 16), &rect as *const Rect as isize); }
+        });
+        wait(events, |e| {
+            if let HostEvent::Resized { id: resized, size, scale } = e {
+                if *resized == ID && (*scale - dpi as f64 / 96.0).abs() < 0.001 {
+                    assert_eq!(*size, PixelSize::new(320, 240), "no interim automatic DPI resize report");
+                    return true;
+                }
+            }
+            false
+        });
+    }
+    eprintln!("owned synthetic DPI messages: regenerated buffered writer preserved 320x240 without interim resize");
+    on_host(handle, move || {
+        let hwnd = window as Handle; verify_owned(hwnd); let mut rect = Rect::default();
+        for dpi in [192usize, 288usize] {
+            // SAFETY: batched synthetic DPI generations target only the retained fixture HWND;
+            // each synchronous SendMessage consumes the live initialized RECT before reuse.
+            unsafe { assert_ne!(GetWindowRect(hwnd, &mut rect), 0);
+                SendMessageW(hwnd, 0x02e0, dpi | (dpi << 16), &rect as *const Rect as isize); }
+        }
+    });
+    wait(events, |e| {
+        if let HostEvent::Resized { id: resized, size, scale } = e {
+            if *resized == ID {
+                assert_eq!(*size, PixelSize::new(320, 240), "batched DPI has no interim resize report");
+                return (*scale - 3.0).abs() < 0.001;
+            }
+        }
+        false
+    });
+    handle.send(HostCommand::SetContentSize { id: ID, size: PixelSize::new(360, 280) }).expect("newer source baseline");
+    on_host(handle, move || {
+        let hwnd = window as Handle; verify_owned(hwnd); let mut rect = Rect::default();
+        // SAFETY: own fixture HWND only, latest source request precedes this synchronous DPI change.
+        unsafe { assert_ne!(GetWindowRect(hwnd, &mut rect), 0);
+            SendMessageW(hwnd, 0x02e0, 96usize | (96usize << 16), &rect as *const Rect as isize); }
+    });
+    wait(events, |e| {
+        if let HostEvent::Resized { id: resized, size, scale } = e {
+            if *resized == ID && (*scale - 1.0).abs() < 0.001 {
+                assert_eq!(*size, PixelSize::new(360, 280), "newer source supersedes DPI baseline");
+                return true;
+            }
+        }
+        false
+    });
+    eprintln!("owned batched DPI generations and newer source request superseded old baseline");
+
     on_host(handle, move || {
         let hwnd = window as Handle; verify_owned(hwnd);
         // SAFETY: style, owner and DPI context are read from only the retained fixture HWND.
@@ -195,6 +327,33 @@ fn check(handle: &HostHandle, events: &mpsc::Receiver<HostEvent>, adapter: &Adap
     wait(events, |e| matches!(e, HostEvent::Resized { size, .. } if *size == PixelSize::new(400, 300)));
     handle.send(HostCommand::SetContentSize { id: ID, size: PixelSize::new(360, 280) }).expect("source correction");
     wait(events, |e| matches!(e, HostEvent::Resized { size, .. } if *size == PixelSize::new(360, 280)));
+    let before_monitor = on_host(handle, move || {
+        verify_owned(window as Handle);
+        // SAFETY: query only retained own window's monitor.
+        unsafe { MonitorFromWindow(window as Handle, 2) as isize }
+    });
+    handle.send(HostCommand::SetFullscreen { id: ID, fullscreen: true }).expect("fullscreen");
+    wait(events, |e| matches!(e, HostEvent::Fullscreen { id: ID, fullscreen: true }));
+    on_host(handle, move || {
+        let hwnd = window as Handle; verify_owned(hwnd); let mut rect = Rect::default();
+        let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32,
+            monitor: Rect::default(), work: Rect::default(), flags: 0, name: [0; 32] };
+        // SAFETY: own HWND and its monitor metadata only; writable initialized output.
+        unsafe { let monitor = MonitorFromWindow(hwnd, 2); assert_eq!(monitor as isize, before_monitor);
+            assert_ne!(GetMonitorInfoW(monitor, &mut info), 0); assert_ne!(GetWindowRect(hwnd, &mut rect), 0); }
+        assert_eq!((rect.left, rect.top, rect.right, rect.bottom),
+            (info.monitor.left, info.monitor.top, info.monitor.right, info.monitor.bottom));
+    });
+    handle.send(HostCommand::SetFullscreen { id: ID, fullscreen: false }).expect("exit fullscreen");
+    wait(events, |e| matches!(e, HostEvent::Resized { id: ID, size, .. } if *size == PixelSize::new(360, 280)));
+    eprintln!("owned fullscreen retained current native monitor and restored 360x280");
+    // Fullscreen reconfigures the swapchain; observe a fresh own frame before PrintWindow.
+    while events.try_recv().is_ok() {}
+    let size = PixelSize::new(360, 280);
+    handle.send(HostCommand::Frame { id: ID, size,
+        pixels: Arc::from([30, 140, 220, 255].repeat((size.width * size.height) as usize)),
+        dirty: vec![PixelRect::new(point2(0, 0), point2(360, 280))] }).expect("capture frame");
+    wait(events, |e| matches!(e, HostEvent::Presented { id: ID, .. }));
     on_host(handle, move || screenshot(window, output));
     handle.send(HostCommand::SetCursor { id: ID, size: PixelSize::new(16, 16), hotspot: (2, 3),
         pixels: Arc::from([0, 0, 255, 255].repeat(256)) }).expect("custom cursor");
@@ -250,10 +409,13 @@ fn main() {
     let output = std::env::args_os().nth(1).map(PathBuf::from).expect("owned screenshot output path");
     let adapter = AdapterLog(Arc::new(Mutex::new(None)));
     tracing::subscriber::set_global_default(adapter.clone()).expect("fixture subscriber");
-    let (host, handle) = ProxyHost::new().expect("main-thread host");
+    let (mut host, handle) = ProxyHost::new().expect("main-thread host");
+    let mapping = Arc::new(Mutex::new(None::<Vec<HostMonitorMapping>>));
+    let provider = mapping.clone();
+    host.set_placement_mapping(Arc::new(move || provider.lock().ok().and_then(|rows| rows.clone())));
     let (send, events) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&handle, &events, &adapter, output)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&handle, &events, &adapter, output, mapping)));
         let _ = handle.send(HostCommand::Shutdown); result.is_ok()
     });
     host.run(Box::new(move |event| { let _ = send.send(event); })).expect("host event loop");
@@ -306,7 +468,7 @@ fn proxy_windows_fixture_compiles_without_running_gui() -> Result<()> {
             }
         }
     }
-    for name in ["crosspane_render", "crosspane_types", "tracing"] {
+    for name in ["crosspane_render", "crosspane_types", "tracing", "winit"] {
         compiler
             .arg("--extern")
             .arg(format!("{name}={}", library(deps, name)?.display()));
