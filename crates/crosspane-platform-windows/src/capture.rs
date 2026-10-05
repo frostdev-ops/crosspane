@@ -82,12 +82,7 @@ fn now(start: Instant) -> u64 {
 }
 
 fn event_time() -> MonoTime {
-    // SAFETY: read-only system monotonic clock with the common Windows boot epoch; never called
-    // from LL callbacks. Its millisecond resolution is reported, not represented as precision.
-    MonoTime::from_nanos(
-        unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
-            .saturating_mul(1_000_000),
-    )
+    crate::clock::now()
 }
 
 #[derive(Clone, Copy)]

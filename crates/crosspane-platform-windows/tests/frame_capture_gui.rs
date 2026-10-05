@@ -6,6 +6,7 @@ use crosspane_platform::{
     CaptureTarget, Frame, FrameCapture, FrameEvent, IoGate, PlatformError, StreamEndReason,
     StreamId, WindowSource,
 };
+pub use crosspane_platform_windows::clock;
 use crosspane_platform_windows::model::{
     self,
     geometry::{DisplayIds, MonitorProbe},

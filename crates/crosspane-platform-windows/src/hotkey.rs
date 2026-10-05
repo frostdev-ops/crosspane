@@ -15,7 +15,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -52,10 +52,7 @@ const POLL: Duration = Duration::from_millis(500);
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 
 fn now() -> MonoTime {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    MonoTime::from_nanos(
-        u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX),
-    )
+    crate::clock::now()
 }
 
 struct Data {

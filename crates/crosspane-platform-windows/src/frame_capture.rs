@@ -18,7 +18,6 @@ use crosspane_platform::{
 use crosspane_types::{
     geom::{PixelRect, PixelSize},
     id::WindowId,
-    time::MonoTime,
 };
 use std::{
     any::Any,
@@ -640,7 +639,7 @@ impl Stream {
         &mut self,
         shared: &Shared,
         graphics: &Graphics,
-        start: Instant,
+        _start: Instant,
     ) -> Result<Option<Frame>, PlatformError> {
         // Drain a bounded number, replacing/releasing older pool frames immediately.
         for _ in 0..4 {
@@ -679,7 +678,7 @@ impl Stream {
                 Err(e) => return Err(api("dequeue WGC frame", e)),
             }
         }
-        let now = MonoTime::from_nanos(start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        let now = crate::clock::now();
         if !self.latest.due(now) {
             return Ok(None);
         }
@@ -928,9 +927,7 @@ fn worker(
                         end(shared, &mut streams, id, StreamEndReason::TargetGone);
                         continue;
                     }
-                    frame.at = MonoTime::from_nanos(
-                        start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                    );
+                    frame.at = crate::clock::now();
                     if !shared.permitted(stream.epoch) {
                         end(shared, &mut streams, id, StreamEndReason::Blocked);
                         continue;

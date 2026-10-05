@@ -9,6 +9,10 @@
 #[cfg(windows)]
 pub mod capture;
 #[cfg(windows)]
+pub mod clock;
+#[cfg(windows)]
+pub mod displays;
+#[cfg(windows)]
 pub mod frame_capture;
 #[cfg(windows)]
 pub mod hotkey;
