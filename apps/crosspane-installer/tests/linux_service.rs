@@ -801,7 +801,8 @@ fn show_all_preserves_supported_empty_properties_but_missing_properties_refuse()
         );
     }
     drop(calls);
-    f.runner.properties.lock().unwrap().remove("OpenFile");
+    // A scalar property is never optional: absence refuses.
+    f.runner.properties.lock().unwrap().remove("Type");
     assert_eq!(
         service.observe(&deadline()).unwrap_err(),
         ServiceError::Unknown
@@ -812,6 +813,176 @@ fn show_all_preserves_supported_empty_properties_but_missing_properties_refuse()
             .is_err()
     );
     assert_eq!(f.mutations(), 0);
+}
+
+/// `systemctl --user show --all crosspane-agent.service -p …` on systemd 261.2 (owner's desktop):
+/// 20 empty list/path properties are omitted, and several defaults print differently.
+const SYSTEMD_261_OMITTED: [&str; 20] = [
+    "CacheDirectorySymlink",
+    "EnvironmentFiles",
+    "ExecCondition",
+    "ExecConditionEx",
+    "ExecReload",
+    "ExecReloadEx",
+    "ExecReloadPost",
+    "ExecReloadPostEx",
+    "ExecStartPost",
+    "ExecStartPostEx",
+    "ExecStartPre",
+    "ExecStartPreEx",
+    "ExecStop",
+    "ExecStopEx",
+    "ExecStopPost",
+    "ExecStopPostEx",
+    "LogsDirectorySymlink",
+    "OpenFile",
+    "RuntimeDirectorySymlink",
+    "StateDirectorySymlink",
+];
+type Mutation<'a> = Box<dyn Fn(&Fixture, &mut BTreeMap<String, String>) + 'a>;
+fn systemd_261(f: &Fixture) -> Vec<String> {
+    let home = f.io.target().paths().home.to_string_lossy().into_owned();
+    let first = home.split('/').nth(1).unwrap().to_owned();
+    assert!(first.bytes().all(|b| b.is_ascii_alphanumeric()));
+    let mounts = vec!["-.mount".to_owned(), format!("{first}.mount")];
+    let mut properties = f.runner.properties.lock().unwrap();
+    for key in SYSTEMD_261_OMITTED {
+        assert_eq!(properties.remove(key).as_deref(), Some(""), "{key}");
+    }
+    for (key, value) in [
+        ("WorkingDirectory", format!("!{home}")),
+        ("WantsMountsFor", home.clone()),
+        (
+            "After",
+            format!(
+                "{} app.slice basic.target graphical-session.target {}",
+                mounts[1], mounts[0]
+            ),
+        ),
+        ("TTYPath", String::new()),
+        ("WatchdogUSec", "infinity".into()),
+        ("Conditions", "[unprintable]".into()),
+        ("Asserts", "[unprintable]".into()),
+    ] {
+        properties.insert(key.into(), value);
+    }
+    mounts
+}
+
+#[test]
+fn systemd_261_show_output_is_read_as_the_same_sealed_unit() {
+    let f = Fixture::new("");
+    systemd_261(&f);
+    let service = f.service();
+    let facts = service.observe(&deadline()).unwrap();
+    assert!(!facts.enabled);
+    assert_eq!(facts.active_state, "inactive");
+    assert!(
+        service
+            .plan(&f.proof(), ServiceAction::Enable, &deadline())
+            .is_ok()
+    );
+    assert_eq!(f.mutations(), 0);
+    // systemd 261 prints dependency sets in hash order, which differs between two calls.
+    let mut reordered = f.runner.properties.lock().unwrap().clone();
+    let mut after: Vec<_> = reordered["After"].split(' ').map(String::from).collect();
+    after.reverse();
+    reordered.insert("After".into(), after.join(" "));
+    *f.runner.failure.lock().unwrap() = Some((Some(0), shown_properties(&reordered, true), vec![]));
+    assert!(service.observe(&deadline()).is_ok());
+}
+
+#[test]
+fn systemd_261_tolerances_never_admit_other_values_or_absent_scalars() {
+    let home = |f: &Fixture| f.io.target().paths().home.to_string_lossy().into_owned();
+    let cases: Vec<Mutation<'_>> = vec![
+        // Scalars and non-hook lists stay mandatory.
+        Box::new(|_, p| {
+            p.remove("KillMode");
+        }),
+        Box::new(|_, p| {
+            p.remove("ExecStart");
+        }),
+        Box::new(|_, p| {
+            p.remove("Environment");
+        }),
+        Box::new(|_, p| {
+            p.remove("WorkingDirectory");
+        }),
+        // A shown hook must still be empty.
+        Box::new(|_, p| {
+            p.insert(
+                "ExecStartPre".into(),
+                "{ path=/foreign ; argv[]=/foreign }".into(),
+            );
+        }),
+        Box::new(|_, p| {
+            p.insert("OpenFile".into(), "/foreign".into());
+        }),
+        // Only the home default, only with its matching mount wants.
+        Box::new(|_, p| {
+            p.insert("WorkingDirectory".into(), "!/foreign".into());
+            p.insert("WantsMountsFor".into(), "/foreign".into());
+        }),
+        Box::new(|f, p| {
+            p.insert("WorkingDirectory".into(), home(f));
+        }),
+        Box::new(|_, p| {
+            p.insert("WantsMountsFor".into(), "".into());
+        }),
+        Box::new(|f, p| {
+            p.insert("WorkingDirectory".into(), "".into());
+            p.insert("WantsMountsFor".into(), home(f));
+        }),
+        // After: no other units, no duplicates, nothing missing.
+        Box::new(|_, p| {
+            let after = format!("{} foreign.service", p["After"]);
+            p.insert("After".into(), after);
+        }),
+        Box::new(|_, p| {
+            let after = format!("{} -.mount", p["After"]);
+            p.insert("After".into(), after);
+        }),
+        Box::new(|_, p| {
+            p.insert("After".into(), "-.mount app.slice basic.target".into());
+        }),
+        Box::new(|_, p| {
+            p.insert("TTYPath".into(), "/dev/tty1".into());
+        }),
+        Box::new(|_, p| {
+            p.insert("WatchdogUSec".into(), "1s".into());
+        }),
+        Box::new(|_, p| {
+            p.insert("Conditions".into(), "foreign".into());
+        }),
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        let f = Fixture::new("");
+        systemd_261(&f);
+        case(&f, &mut f.runner.properties.lock().unwrap());
+        let service = f.service();
+        assert!(service.observe(&deadline()).is_err(), "case {index}");
+        assert!(
+            service
+                .plan(&f.proof(), ServiceAction::Start, &deadline())
+                .is_err(),
+            "case {index}"
+        );
+        assert_eq!(f.mutations(), 0);
+    }
+    // Unknown keys and duplicates still refuse.
+    for extra in ["Foreign=x\n", "Type=simple\n"] {
+        let f = Fixture::new("");
+        systemd_261(&f);
+        let mut stdout = shown_properties(&f.runner.properties.lock().unwrap(), true);
+        stdout.extend_from_slice(extra.as_bytes());
+        *f.runner.failure.lock().unwrap() = Some((Some(0), stdout, vec![]));
+        assert_eq!(
+            f.service().observe(&deadline()).unwrap_err(),
+            ServiceError::Unknown,
+            "{extra}"
+        );
+    }
 }
 
 #[test]

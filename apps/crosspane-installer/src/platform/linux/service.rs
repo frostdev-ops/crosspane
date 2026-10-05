@@ -113,6 +113,99 @@ impl std::fmt::Debug for LinuxService {
 }
 
 // Parse the bounded systemctl property word representation; unsupported escapes fail closed.
+/// Exactly the properties systemd 261 omits from `show --all` when empty: hooks, environment
+/// files, directory symlinks and OpenFile, whose required value is empty anyway.
+const OMITTED_WHEN_EMPTY: [&str; 20] = [
+    "CacheDirectorySymlink",
+    "EnvironmentFiles",
+    "ExecCondition",
+    "ExecConditionEx",
+    "ExecReload",
+    "ExecReloadEx",
+    "ExecReloadPost",
+    "ExecReloadPostEx",
+    "ExecStartPost",
+    "ExecStartPostEx",
+    "ExecStartPre",
+    "ExecStartPreEx",
+    "ExecStop",
+    "ExecStopEx",
+    "ExecStopPost",
+    "ExecStopPostEx",
+    "LogsDirectorySymlink",
+    "OpenFile",
+    "RuntimeDirectorySymlink",
+    "StateDirectorySymlink",
+];
+/// Unit-dependency sets. systemd prints them in hash order, which differs between two `show`
+/// calls on systemd 261, so they are compared as sorted sets.
+const DEPENDENCY_SETS: [&str; 28] = [
+    "Requires",
+    "Requisite",
+    "Wants",
+    "BindsTo",
+    "PartOf",
+    "Upholds",
+    "RequiredBy",
+    "RequisiteOf",
+    "WantedBy",
+    "BoundBy",
+    "UpheldBy",
+    "ConsistsOf",
+    "Conflicts",
+    "ConflictedBy",
+    "Before",
+    "After",
+    "OnSuccess",
+    "OnSuccessOf",
+    "OnFailure",
+    "OnFailureOf",
+    "Triggers",
+    "TriggeredBy",
+    "PropagatesReloadTo",
+    "ReloadPropagatedFrom",
+    "PropagatesStopTo",
+    "StopPropagatedFrom",
+    "JoinsNamespaceOf",
+    "SliceOf",
+];
+fn canonical(key: &str, value: &str) -> String {
+    if DEPENDENCY_SETS.contains(&key) {
+        let mut units: Vec<_> = value.split(' ').collect();
+        units.sort_unstable();
+        units.join(" ")
+    } else {
+        value.into()
+    }
+}
+/// systemd's mount unit names for `home` and each parent (unit-name escaping of a path).
+fn home_mount_units(home: &str) -> Result<Vec<String>> {
+    if !home.starts_with('/')
+        || home
+            .split('/')
+            .skip(1)
+            .any(|s| s.is_empty() || s == "." || s == "..")
+    {
+        return Err(ServiceError::Foreign);
+    }
+    let mut units = vec!["-.mount".to_owned()];
+    let mut prefix = String::new();
+    for segment in home.split('/').skip(1) {
+        prefix.push('/');
+        prefix.push_str(segment);
+        let mut name = String::new();
+        for (index, byte) in prefix[1..].bytes().enumerate() {
+            match byte {
+                b'/' => name.push('-'),
+                b'.' if index == 0 => name.push_str("\\x2e"),
+                b if b.is_ascii_alphanumeric() || b":_.".contains(&b) => name.push(b as char),
+                b => name.push_str(&format!("\\x{b:02x}")),
+            }
+        }
+        units.push(format!("{name}.mount"));
+    }
+    Ok(units)
+}
 fn words(value: &str) -> Result<Vec<String>> {
     let mut result = Vec::new();
     let (mut word, mut quoted, mut present) = (String::new(), false, false);
@@ -358,10 +451,16 @@ impl LinuxService {
             let (key, value) = line.split_once('=').ok_or(ServiceError::Unknown)?;
             if !MANAGER_PROPERTIES.split(',').any(|p| p == key)
                 || value.chars().any(char::is_control)
-                || map.insert(key.into(), value.into()).is_some()
+                || map.insert(key.into(), canonical(key, value)).is_some()
             {
                 return Err(ServiceError::Unknown);
             }
+        }
+        // systemd 261 leaves these list/path properties out of `show --all` when they are empty.
+        // facts() requires each of them to be empty, so absence is read as exactly that. Every
+        // other property stays mandatory.
+        for key in OMITTED_WHEN_EMPTY {
+            map.entry(key.into()).or_default();
         }
         if map.len() != MANAGER_PROPERTIES.split(',').count() {
             return Err(ServiceError::Unknown);
@@ -375,7 +474,8 @@ impl LinuxService {
     // ExecStopPre does not exist. Sockets= is sealed through effective dependency edges.
     // Type=simple makes GuessMainPID and ReloadSignal inert; action arguments are inert with
     // actions=none. Quotas/accounting and access restrictions cannot select other code/units.
-    // Missing exported properties (including newer ExecReloadPost) refuse unsupported managers.
+    // Missing exported properties refuse unsupported managers, except OMITTED_WHEN_EMPTY, which
+    // systemd 261 leaves out when empty (a manager without ExecReloadPost cannot run one).
     fn facts(&self, properties: &BTreeMap<String, String>) -> Result<ServiceFacts> {
         let get = |key: &str| {
             properties
@@ -417,7 +517,6 @@ impl LinuxService {
             ("SendSIGHUP", "no"),
             ("UnsetEnvironment", ""),
             ("PassEnvironment", ""),
-            ("WorkingDirectory", ""),
             ("UMask", "0022"),
             ("BusName", ""),
             ("PIDFile", ""),
@@ -427,7 +526,6 @@ impl LinuxService {
             ("StandardInput", "null"),
             ("StandardOutput", "journal"),
             ("StandardError", "inherit"),
-            ("TTYPath", "/dev/console"),
             ("EnvironmentFiles", ""),
             ("RootDirectory", ""),
             ("RootImage", ""),
@@ -440,7 +538,6 @@ impl LinuxService {
             ("StopPropagatedFrom", ""),
             ("JoinsNamespaceOf", ""),
             ("RequiresMountsFor", ""),
-            ("WantsMountsFor", ""),
             ("RequiredBy", ""),
             ("RequisiteOf", ""),
             ("BoundBy", ""),
@@ -455,8 +552,6 @@ impl LinuxService {
             ("SliceOf", ""),
             ("DelegateControllers", ""),
             ("DelegateSubgroup", ""),
-            ("Conditions", ""),
-            ("Asserts", ""),
             ("ExecConditionEx", ""),
             ("ExecStartPreEx", ""),
             ("ExecStartPostEx", ""),
@@ -505,7 +600,6 @@ impl LinuxService {
             ("TimeoutStopFailureMode", "terminate"),
             ("RuntimeMaxUSec", "infinity"),
             ("RuntimeRandomizedExtraUSec", "0"),
-            ("WatchdogUSec", "0"),
             ("ExitType", "main"),
             ("FileDescriptorStoreMax", "0"),
             ("NFileDescriptorStore", "0"),
@@ -528,17 +622,58 @@ impl LinuxService {
                 return Err(ServiceError::Foreign);
             }
         }
+        // Values that differ only by systemd version, each limited to its known equivalents.
+        // TTYPath is inert with StandardInput=null; WatchdogUSec 0 and infinity both disable it.
+        // `show` prints Conditions/Asserts (a(sbbsi)) as "[unprintable]" even when empty; observe()
+        // proves there are none, since `cat` must equal the installed unit and DropInPaths is empty.
+        for (key, allowed) in [
+            ("TTYPath", ["/dev/console", ""]),
+            ("WatchdogUSec", ["0", "infinity"]),
+            ("Conditions", ["", "[unprintable]"]),
+            ("Asserts", ["", "[unprintable]"]),
+        ] {
+            if !allowed.contains(&get(key)?) {
+                return Err(ServiceError::Foreign);
+            }
+        }
+        // A newer user manager defaults WorkingDirectory=-~ (shown "!<home>"). That adds
+        // WantsMountsFor=<home> and After= edges to the mount units of <home> and its parents.
+        let home = self.io.target().paths().home.to_string_lossy().into_owned();
+        let mounts = match (get("WorkingDirectory")?, get("WantsMountsFor")?) {
+            ("", "") => Vec::new(),
+            (directory, wants) if directory == format!("!{home}") && wants == home => {
+                home_mount_units(&home)?
+            }
+            _ => return Err(ServiceError::Foreign),
+        };
         // systemd.unit/dbus-unit and systemd.service/dbus-service define this finite seal.
         // All propagation/inverse edges and hooks are empty; actions cannot affect other units.
         // Sockets= is represented by Wants/After/TriggeredBy, not a service property.
         // app.slice is the default non-instanced user slice, adding Requires and After.
-        for (key, expected) in [
-            ("Requires", "app.slice basic.target"),
-            ("After", "app.slice basic.target graphical-session.target"),
+        for (key, expected, optional) in [
+            ("Requires", "app.slice basic.target", &[][..]),
+            (
+                "After",
+                "app.slice basic.target graphical-session.target",
+                &mounts[..],
+            ),
         ] {
+            // Exactly the expected edges, plus at most once each of the allowed mount orderings.
             let mut actual: Vec<_> = get(key)?.split(' ').collect();
             actual.sort_unstable();
-            if actual != expected.split(' ').collect::<Vec<_>>() {
+            let mut remaining = actual.clone();
+            for edge in expected.split(' ') {
+                let index = remaining
+                    .iter()
+                    .position(|v| *v == edge)
+                    .ok_or(ServiceError::Foreign)?;
+                remaining.remove(index);
+            }
+            let mut extra = std::collections::BTreeSet::new();
+            if remaining
+                .iter()
+                .any(|v| !optional.iter().any(|o| o == v) || !extra.insert(*v))
+            {
                 return Err(ServiceError::Foreign);
             }
         }
