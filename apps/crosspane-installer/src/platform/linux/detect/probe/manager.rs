@@ -141,6 +141,15 @@ fn instance(value: &str) -> Result<String, ProbeIssue> {
     }
     Ok(value)
 }
+/// systemd's running main-process record: same PID as MainPID, started, not exited, no exit status.
+fn running_main(values: &Properties, pid: u32) -> Result<bool, ProbeIssue> {
+    let main: u32 = required(values, "ExecMainPID")?;
+    let start: u64 = required(values, "ExecMainStartTimestamp")?;
+    let exit: u64 = required(values, "ExecMainExitTimestamp")?;
+    let code: i32 = required(values, "ExecMainCode")?;
+    let status: i32 = required(values, "ExecMainStatus")?;
+    Ok(main == pid && start != 0 && exit == 0 && code == 0 && status == 0)
+}
 fn running_uwsm(values: &Properties, id: &str) -> Result<Option<u32>, ProbeIssue> {
     let kind: String = required(values, "Type")?;
     bounded_text(&kind, 64)?;
@@ -166,7 +175,11 @@ fn running_uwsm(values: &Properties, id: &str) -> Result<Option<u32>, ProbeIssue
         return Err(ProbeIssue::Ambiguous);
     }
     let row = &exec[0];
-    if row.7 != pid || row.3 == 0 || row.4 == 0 || row.5 != 0 || row.6 != 0 {
+    // Older systemd fills the ExecStart row while the command runs. systemd 261 leaves it all zero
+    // until exit and keeps the running main process in the ExecMain* properties instead.
+    let row_running = row.7 == pid && row.3 != 0 && row.4 != 0 && row.5 == 0 && row.6 == 0;
+    let row_unpopulated = (row.3, row.4, row.5, row.6, row.7) == (0, 0, 0, 0, 0);
+    if !row_running && !(row_unpopulated && running_main(values, pid)?) {
         return Err(ProbeIssue::Unverified);
     }
     let id = id

@@ -392,8 +392,8 @@ impl NativeSupport {
         let Some(package) = package else {
             return empty;
         };
-        let prefix = package.agent_elf_prefix();
-        if prefix.is_empty() || prefix.len() > MAX_ELF_PREFIX_BYTES {
+        let agent = package.agent_elf();
+        if agent.is_empty() || agent.len() > MAX_ELF_PREFIX_BYTES {
             return empty;
         }
         let Ok(architecture) = Architecture::native() else {
@@ -413,7 +413,7 @@ impl NativeSupport {
             RuntimeInput {
                 architecture,
                 features,
-                agent_elf_prefix: prefix,
+                agent_elf: agent,
                 keystore: None,
             },
             &|| (self.clock)(),

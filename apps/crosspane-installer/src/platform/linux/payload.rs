@@ -482,13 +482,10 @@ impl Package {
         &self.manifest
     }
 
-    /// Bounded prefix of the already hash-validated agent bytes. No archive re-parse.
-    pub(crate) fn agent_elf_prefix(&self) -> &[u8] {
-        let Some(bytes) = self.files.get(FILES[0]) else {
-            return &[];
-        };
-        let end = bytes.len().min(super::native_io::MAX_ELF_PREFIX_BYTES);
-        &bytes[..end]
+    /// The whole already hash-validated agent member (at most `MAX_MEMBER_BYTES`). Its dependency
+    /// metadata (PT_DYNAMIC, DT_STRTAB) can lie anywhere in the image. No archive re-parse.
+    pub(crate) fn agent_elf(&self) -> &[u8] {
+        self.files.get(FILES[0]).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -516,15 +513,14 @@ mod elf_prefix_tests {
     }
 
     #[test]
-    fn agent_elf_prefix_is_a_bounded_slice_of_the_validated_agent() {
+    fn agent_elf_is_the_whole_validated_agent_beyond_any_header_prefix() {
         use super::super::native_io::MAX_ELF_PREFIX_BYTES;
-        let agent = vec![0x7f; MAX_ELF_PREFIX_BYTES + 64];
+        assert_eq!(MAX_ELF_PREFIX_BYTES, MAX_MEMBER_BYTES);
+        let agent = vec![0x7f; 4 * 1024 * 1024 + 64];
         let package = package_with_agent(agent.clone());
-        let prefix = package.agent_elf_prefix();
-        assert_eq!(prefix.len(), MAX_ELF_PREFIX_BYTES);
-        assert_eq!(prefix, &agent[..MAX_ELF_PREFIX_BYTES]);
+        assert_eq!(package.agent_elf(), agent.as_slice());
         assert_eq!(
-            package_with_agent(b"\x7fELF".to_vec()).agent_elf_prefix(),
+            package_with_agent(b"\x7fELF".to_vec()).agent_elf(),
             b"\x7fELF"
         );
     }

@@ -92,8 +92,11 @@ pub(crate) fn bus_issue(error: zbus::Error) -> ProbeIssue {
         _ => ProbeIssue::Unavailable,
     }
 }
+/// A real systemd 261 `org.freedesktop.systemd1.Service` GetAll returns 369 properties (Unit: 102,
+/// login1 Session: 29); the 64 KiB reply bound and per-key bounds still apply.
+pub const MAX_PROPERTIES: usize = 512;
 fn validate_properties(values: &Properties) -> Result<(), ProbeIssue> {
-    if values.len() > 128 || values.keys().any(|s| s.len() > 128) {
+    if values.len() > MAX_PROPERTIES || values.keys().any(|s| s.len() > 128) {
         return Err(ProbeIssue::Oversize);
     }
     for key in values.keys() {

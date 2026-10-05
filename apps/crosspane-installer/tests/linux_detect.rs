@@ -391,6 +391,7 @@ mod session_tests {
                         protocols: s.protocols,
                         pid: 71,
                     }),
+                    lineage: Fact::issue(ProbeIssue::Unverified, ObservationSource::Demo, 299),
                     installed_agent: Fact::issue(ProbeIssue::Missing, ObservationSource::Demo, 300),
                     reduced_motion: Fact::issue(
                         ProbeIssue::Unverified,
@@ -565,6 +566,50 @@ mod session_tests {
                     pending: 5,
                     startup: StartupRecovery::Restored
                 }
+            );
+        }
+        #[test]
+        fn start_hyprland_launcher_admits_only_its_direct_child_compositor() {
+            let scratch = Scratch::new();
+            let lineage = |launcher: u32, exe: &str, parent: u32| CompositorLineage {
+                launcher_pid: launcher,
+                launcher_executable: exe.into(),
+                compositor_pid: 71,
+                compositor_parent: parent,
+            };
+            // uwsm MainPID 70 is start-hyprland; Hyprland 71 is its direct child (real shape).
+            let (env, mut p) = pass(&scratch);
+            p.manager.value.as_mut().unwrap().compositor_pid = Some(70);
+            p.lineage = known(lineage(70, START_HYPRLAND, 70));
+            let result = assemble_support(&scratch.io, env, p, runtime(), &deadline());
+            assert_eq!(result.report.eligibility, Eligibility::Supported);
+            assert!(result.proof.is_some());
+            for (value, expected) in [
+                // Grandchild: Hyprland's parent isn't MainPID.
+                (Ok(lineage(70, START_HYPRLAND, 69)), ProbeIssue::Foreign),
+                // MainPID isn't the launcher.
+                (Ok(lineage(70, "/usr/bin/uwsm", 70)), ProbeIssue::Foreign),
+                // Evidence about other processes.
+                (Ok(lineage(68, START_HYPRLAND, 70)), ProbeIssue::Foreign),
+                (Err(ProbeIssue::Unavailable), ProbeIssue::Unavailable),
+                (Err(ProbeIssue::Foreign), ProbeIssue::Foreign),
+            ] {
+                let (env, mut p) = pass(&scratch);
+                p.manager.value.as_mut().unwrap().compositor_pid = Some(70);
+                p.lineage.value = value;
+                let result = assemble_support(&scratch.io, env, p, runtime(), &deadline());
+                assert_eq!(result.report.eligibility, Eligibility::Pending(expected));
+                assert!(result.proof.is_none());
+            }
+            // The IPC and Wayland peers must still be one process, launcher or not.
+            let (env, mut p) = pass(&scratch);
+            p.manager.value.as_mut().unwrap().compositor_pid = Some(70);
+            p.lineage = known(lineage(70, START_HYPRLAND, 70));
+            p.registry.value.as_mut().unwrap().pid = 72;
+            let result = assemble_support(&scratch.io, env, p, runtime(), &deadline());
+            assert_eq!(
+                result.report.eligibility,
+                Eligibility::Pending(ProbeIssue::Foreign)
             );
         }
         #[test]
@@ -1519,6 +1564,112 @@ mod session_tests {
             assert_eq!(decoded.clone(), decoded);
         }
         #[test]
+        fn real_systemd_property_counts_are_admitted_and_still_bounded() {
+            // systemd 261 on the owner's desktop: Unit GetAll 102 properties, Service 369.
+            let mut steps = script();
+            for (index, count) in [(1, 102), (2, 102), (3, 102), (4, 369)] {
+                let values = properties(&mut steps[index]);
+                for i in values.len()..count {
+                    values.insert(format!("Property{i}"), value(0u64));
+                }
+                assert_eq!(values.len(), count);
+            }
+            let decoded = manager(steps).0.value.unwrap();
+            assert_eq!(decoded.uwsm_managed.value, Ok(true));
+            assert_eq!(decoded.graphical_target_active.value, Ok(true));
+            let mut steps = script();
+            let values = properties(&mut steps[1]);
+            for i in values.len()..=MAX_PROPERTIES {
+                values.insert(format!("Property{i}"), value(0u64));
+            }
+            steps.truncate(2);
+            assert_eq!(manager(steps).0.value, Err(ProbeIssue::Oversize));
+        }
+        /// systemd 261 on the owner's desktop: the running ExecStart row is all zero and the
+        /// main process lives in ExecMain* (ExecMainPID = MainPID, started, not exited).
+        fn systemd_261_service() -> Properties {
+            let mut values = service();
+            let mut row = exec();
+            (row.3, row.4, row.5, row.6, row.7) = (0, 0, 0, 0, 0);
+            values.insert("ExecStart".into(), value(vec![row]));
+            values.insert("ExecMainPID".into(), value(4242u32));
+            values.insert(
+                "ExecMainStartTimestamp".into(),
+                value(1_791_096_132_706_343u64),
+            );
+            values.insert("ExecMainExitTimestamp".into(), value(0u64));
+            values.insert("ExecMainCode".into(), value(0i32));
+            values.insert("ExecMainStatus".into(), value(0i32));
+            values
+        }
+        #[test]
+        fn systemd_261_exec_main_properties_prove_the_running_uwsm_process() {
+            let mut steps = script();
+            steps[4].reply = Reply::Properties(systemd_261_service());
+            let decoded = manager(steps).0.value.unwrap();
+            assert_eq!(decoded.uwsm_managed.value, Ok(true));
+            assert_eq!(decoded.compositor_pid, Some(4242));
+            // The populated-row path still works, with or without the ExecMain* properties.
+            let mut steps = script();
+            let mut both = systemd_261_service();
+            both.insert("ExecStart".into(), value(vec![exec()]));
+            steps[4].reply = Reply::Properties(both);
+            assert_eq!(manager(steps).0.value.unwrap().compositor_pid, Some(4242));
+            // Any contradiction in the ExecMain* record, or a half-filled row, is not proof.
+            let contradictions: [(&str, OwnedValue); 6] = [
+                ("ExecMainPID", value(4243u32)),
+                ("ExecMainPID", value(0u32)),
+                ("ExecMainStartTimestamp", value(0u64)),
+                ("ExecMainExitTimestamp", value(1u64)),
+                ("ExecMainCode", value(1i32)),
+                ("ExecMainStatus", value(1i32)),
+            ];
+            for (key, bad) in contradictions {
+                let mut steps = script();
+                let mut values = systemd_261_service();
+                values.insert(key.into(), bad);
+                steps[4].reply = Reply::Properties(values);
+                assert_eq!(manager(steps).0.value, Err(ProbeIssue::Unverified), "{key}");
+            }
+            for key in [
+                "ExecMainPID",
+                "ExecMainStartTimestamp",
+                "ExecMainExitTimestamp",
+                "ExecMainCode",
+                "ExecMainStatus",
+            ] {
+                let mut steps = script();
+                let mut values = systemd_261_service();
+                values.remove(key);
+                steps[4].reply = Reply::Properties(values);
+                assert_eq!(manager(steps).0.value, Err(ProbeIssue::Unverified), "{key}");
+                let mut steps = script();
+                let mut values = systemd_261_service();
+                values.insert(key.into(), value("wrong".to_string()));
+                steps[4].reply = Reply::Properties(values);
+                assert_eq!(manager(steps).0.value, Err(ProbeIssue::Malformed), "{key}");
+            }
+            for field in 3..=6 {
+                let mut steps = script();
+                let mut values = systemd_261_service();
+                let mut row = exec();
+                (row.3, row.4, row.5, row.6, row.7) = (0, 0, 0, 0, 0);
+                match field {
+                    3 => row.3 = 1,
+                    4 => row.4 = 1,
+                    5 => row.5 = 1,
+                    _ => row.6 = 1,
+                }
+                values.insert("ExecStart".into(), value(vec![row]));
+                steps[4].reply = Reply::Properties(values);
+                assert_eq!(
+                    manager(steps).0.value,
+                    Err(ProbeIssue::Unverified),
+                    "{field}"
+                );
+            }
+        }
+        #[test]
         fn active_target_and_effective_environment_never_manufacture_uwsm_lifecycle() {
             let mut steps = script();
             steps.truncate(2);
@@ -2443,7 +2594,8 @@ mod session_tests {
                 (
                     Ok(CommandOutput {
                         code: Some(0),
-                        stdout: vec![0xff],
+                        // An undecodable unrelated line is skipped; a required one is malformed.
+                        stdout: b"OTHER=\xff\nXDG_RUNTIME_DIR=\xff\n".to_vec(),
                         stderr: vec![],
                     }),
                     ProbeIssue::Malformed,
@@ -3008,10 +3160,19 @@ mod session_tests {
                 decode_session(&format!("/{}", "p".repeat(512)), &Properties::new()),
                 Err(ProbeIssue::Oversize)
             );
+            // Real systemd 261 replies carry hundreds of properties (Service GetAll: 369).
             let mut values = session("c7", "wayland", 1000, true, false);
-            for i in 0..129 {
+            for i in 0..300 {
                 values.insert(format!("Extra{i}"), value(true));
             }
+            assert!(decode_session("/session/c7", &values).is_ok());
+            let mut values = session("c7", "wayland", 1000, true, false);
+            for i in values.len()..MAX_PROPERTIES {
+                values.insert(format!("Extra{i}"), value(true));
+            }
+            assert_eq!(values.len(), MAX_PROPERTIES);
+            assert!(decode_session("/session/c7", &values).is_ok());
+            values.insert("Extra".into(), value(true));
             assert_eq!(
                 decode_session("/session/c7", &values),
                 Err(ProbeIssue::Oversize)
@@ -3820,6 +3981,88 @@ ID_LIKE="arch \linux""#,
         );
     }
 
+    // Line shapes from `systemctl --user show-environment` on the owner's Omarchy desktop
+    // (systemd 261): values with spaces, `;`, `*` and trailing blanks print as `$'…'`.
+    const REAL_SHAPES: &str = "DEBUGINFOD_URLS=$'https://debuginfod.archlinux.org '\nEDITOR=$'omarchy-launch-editor --inline'\nGDK_BACKEND=$'wayland,x11,*'\nHYPRLAND_CMD=$'Hyprland --watchdog-fd 4'\nHOME=/home/owner\nPATH=/usr/local/bin:/usr/bin\nQT_QPA_PLATFORM=$'wayland;xcb'\nUWSM_FINALIZE_VARNAMES=$'HYPRLAND_INSTANCE_SIGNATURE HYPRLAND_CMD HYPRCURSOR_THEME'\nXCURSOR_SIZE=24\n";
+
+    #[test]
+    fn manager_environment_accepts_real_systemd_quoting_and_skips_unrelated_lines() {
+        let real = format!("{REAL_SHAPES}{MANAGER}XDG_SESSION_ID=2\n");
+        let mut expected = environment();
+        expected.session_id = Some("2".into());
+        assert_eq!(parse_manager_environment(real.as_bytes()), Ok(expected));
+        // systemd quotes required values too; decode its C escapes exactly.
+        for (encoded, decoded) in [
+            ("$'/run/user/1000'", "/run/user/1000"),
+            (r"$'/run/a b\'c\\d\x41\x2a'", r"/run/a b'c\dA*"),
+        ] {
+            let bytes = MANAGER.replace("/run/user/1000", encoded);
+            let environment = parse_manager_environment(bytes.as_bytes()).unwrap();
+            assert_eq!(environment.runtime_dir, PathBuf::from(decoded), "{encoded}");
+        }
+        // Unrelated variables that can't be decoded are skipped, never returned or fatal.
+        for unrelated in [
+            "BROKEN=$'unterminated\n",
+            "BROKEN=$'bad\\q escape'\n",
+            "BROKEN=$'bell\\a'\n",
+            "BROKEN=$'\\xff'\n",
+            "BROKEN=a b\n",
+            "BROKEN=$(command)\n",
+            "BROKEN=tab\there\n",
+            "not a key=value\n",
+            "NO_EQUALS\n",
+            "9BAD=value\n",
+        ] {
+            let bytes = format!("{unrelated}{MANAGER}");
+            assert_eq!(
+                parse_manager_environment(bytes.as_bytes()),
+                Ok(environment()),
+                "{unrelated:?}"
+            );
+            let mut invalid = format!("{unrelated}{MANAGER}").into_bytes();
+            invalid.extend_from_slice(b"OTHER=\xff\xfe\n");
+            assert_eq!(parse_manager_environment(&invalid), Ok(environment()));
+        }
+        // The four variables detection reads stay strict, in either quoting.
+        for (key, original) in [
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("WAYLAND_DISPLAY", "wayland-2"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "test_1790950000"),
+        ] {
+            for bad in [
+                "$'unterminated",
+                "$'early'end'",
+                "$'bad\\q'",
+                "$'nl\\n'",
+                "$'\\xff'",
+                "$'\\x4'",
+                "a b",
+            ] {
+                let bytes = MANAGER.replace(&format!("{key}={original}"), &format!("{key}={bad}"));
+                assert_eq!(
+                    parse_manager_environment(bytes.as_bytes()),
+                    Err(ProbeIssue::Malformed),
+                    "{key}={bad}"
+                );
+            }
+        }
+        for bad in ["$'unterminated", "$'c\\t7'", "$''"] {
+            assert_eq!(
+                parse_manager_environment(format!("{MANAGER}XDG_SESSION_ID={bad}\n").as_bytes()),
+                Err(ProbeIssue::Malformed),
+                "{bad}"
+            );
+        }
+        // Line count stays bounded; the byte bound still applies first.
+        let filler = (0..1024).map(|i| format!("V{i}=x\n")).collect::<String>();
+        assert_eq!(
+            parse_manager_environment(format!("{MANAGER}{filler}").as_bytes()),
+            Err(ProbeIssue::Oversize)
+        );
+        let filler = (0..1021).map(|i| format!("V{i}=x\n")).collect::<String>();
+        assert!(parse_manager_environment(format!("{MANAGER}{filler}").as_bytes()).is_ok());
+    }
+
     #[test]
     fn manager_missing_invalid_alias_duplicate_and_bounds_are_pending_facts() {
         for key in [
@@ -4566,7 +4809,9 @@ mod runtime_tests {
         platform::linux::{
             detect::{
                 ProbeIssue,
-                runtime::{RuntimeInput, RuntimeReader, inspect_with},
+                runtime::{
+                    MAX_GRAPH_LIBRARIES, MAX_LIBRARIES, RuntimeInput, RuntimeReader, inspect_with,
+                },
             },
             native_io::{Cancellation, Deadline, NativeError, SystemBytes},
             payload::Architecture,
@@ -4717,7 +4962,7 @@ mod runtime_tests {
             RuntimeInput {
                 architecture: Architecture::X86_64,
                 features,
-                agent_elf_prefix: bytes,
+                agent_elf: bytes,
                 keystore,
             },
             &|| reader.clock.get(),
@@ -4788,6 +5033,44 @@ mod runtime_tests {
     }
 
     #[test]
+    fn ffmpeg_is_exactly_the_libav_libraries_the_release_agent_links() {
+        // DT_NEEDED of the real stripped release agent: no libavformat.
+        let needed = [
+            "libavutil.so.61",
+            "libswscale.so.10",
+            "libavcodec.so.63",
+            "libxkbcommon.so.0",
+            "libpipewire-0.3.so.0",
+            "libopus.so.0",
+            "libgcc_s.so.1",
+            "libm.so.6",
+            "libc.so.6",
+            "ld-linux-x86-64.so.2",
+        ];
+        let mut reader = Reader::fixed();
+        for name in needed {
+            reader.add(name, &[]);
+        }
+        reader.add("libavcodec.so.63", &["libx264.so.165"]);
+        reader.add("libx264.so.165", &[]);
+        let facts = inspect(
+            &reader,
+            &elf(&needed, None),
+            &["video".into()],
+            None,
+            &deadline(),
+        );
+        assert_eq!(facts.ffmpeg.value, Ok(true));
+        assert_eq!(facts.software_video.value, Ok(true));
+        // Each of the three is still required; a missing one is a known absence.
+        for missing in ["libavutil.so.61", "libswscale.so.10", "libavcodec.so.63"] {
+            let without: Vec<_> = needed.into_iter().filter(|n| *n != missing).collect();
+            let facts = inspect(&reader, &elf(&without, None), &[], None, &deadline());
+            assert_eq!(facts.ffmpeg.value, Ok(false), "{missing}");
+        }
+    }
+
+    #[test]
     fn complete_graph_non_declaration_feature_absence_and_unknown_reads_are_distinct() {
         let mut reader = Reader::fixed();
         let bytes = elf(&[], None);
@@ -4836,23 +5119,34 @@ mod runtime_tests {
                 .count(),
             1
         );
-        let names = (0..60)
+        // The real agent's closure is ~100 libraries; the graph bound is MAX_GRAPH_LIBRARIES.
+        // DT_NEEDED stays at most MAX_LIBRARIES per image, so fan out through intermediates.
+        let names = (0..MAX_GRAPH_LIBRARIES - 4 - 8)
             .map(|i| format!("libfixture{i}.so.1"))
             .collect::<Vec<_>>();
-        for name in &names {
-            reader.add(name, &[]);
+        let groups = names.chunks(MAX_LIBRARIES).collect::<Vec<_>>();
+        assert_eq!(groups.len(), 8);
+        let parents = (0..groups.len())
+            .map(|i| format!("libgroup{i}.so.1"))
+            .collect::<Vec<_>>();
+        for (parent, group) in parents.iter().zip(&groups) {
+            let refs = group.iter().map(String::as_str).collect::<Vec<_>>();
+            reader.add(parent, &refs);
+            for name in *group {
+                reader.add(name, &[]);
+            }
         }
-        let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let refs = parents.iter().map(String::as_str).collect::<Vec<_>>();
         reader.calls.borrow_mut().clear();
         let facts = inspect(&reader, &elf(&refs, None), &[], None, &deadline());
-        assert_eq!(facts.libraries.len(), 64);
+        assert_eq!(facts.libraries.len(), MAX_GRAPH_LIBRARIES);
         assert_eq!(facts.opus.value, Ok(true));
         reader.add(&names[0], &["libextra.so.1"]);
         reader.add("libextra.so.1", &[]);
         reader.calls.borrow_mut().clear();
         let facts = inspect(&reader, &elf(&refs, None), &[], None, &deadline());
-        assert_eq!(facts.libraries.len(), 64);
-        assert_eq!(reader.calls.borrow().len(), 64);
+        assert_eq!(facts.libraries.len(), MAX_GRAPH_LIBRARIES);
+        assert_eq!(reader.calls.borrow().len(), MAX_GRAPH_LIBRARIES);
         assert_eq!(facts.opus.value, Err(ProbeIssue::Oversize));
     }
 

@@ -164,6 +164,14 @@ fn shell_value(value: &str) -> Result<String, ProbeIssue> {
         Ok(decoded)
     }
 }
+fn valid_key(key: &str) -> bool {
+    key.len() <= 128
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
 fn assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIssue> {
     if bytes.len() > MAX_PROBE_BYTES {
         return Err(ProbeIssue::Oversize);
@@ -182,22 +190,119 @@ fn assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIssue> {
         .filter(|s| !s.is_empty() && !s.starts_with('#'))
     {
         let (key, value) = line.split_once('=').ok_or(ProbeIssue::Malformed)?;
-        if key.len() > 128
-            || key
-                .chars()
-                .next()
-                .is_none_or(|c| !c.is_ascii_alphabetic() && c != '_')
-            || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
+        if !valid_key(key) {
             return Err(ProbeIssue::Malformed);
         }
         let value = shell_value(value)?;
-        if value.len() > 4096
+        if value.len() > MAX_VALUE_BYTES
             || value.chars().any(char::is_control)
             || values.len() >= 256
             || values.insert(key.into(), value).is_some()
         {
             return Err(ProbeIssue::Malformed);
+        }
+    }
+    Ok(values)
+}
+const MAX_VALUE_BYTES: usize = 4096;
+/// `systemctl --user show-environment` lines considered; bytes stay bounded by MAX_PROBE_BYTES.
+pub const MAX_ENVIRONMENT_LINES: usize = 1024;
+/// The only manager variables detection reads. Each must decode exactly or the read is malformed.
+const STRICT_ENVIRONMENT: [&str; 4] = [
+    "XDG_RUNTIME_DIR",
+    "WAYLAND_DISPLAY",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "XDG_SESSION_ID",
+];
+/// systemd's POSIX `$'…'` form (escape.c `shell_maybe_quote`/`cescape_char`): `\a \b \f \n \r
+/// \t \v \\ \' \"` and `\xHH`. Any other escape, a missing or early closing quote, or
+/// non-UTF-8 result is refused.
+fn c_quoted(value: &str) -> Result<String, ProbeIssue> {
+    let body = value.strip_prefix("$'").ok_or(ProbeIssue::Malformed)?;
+    let mut decoded = Vec::with_capacity(body.len());
+    let mut chars = body.chars();
+    loop {
+        match chars.next().ok_or(ProbeIssue::Malformed)? {
+            '\'' => {
+                if chars.next().is_some() {
+                    return Err(ProbeIssue::Malformed);
+                }
+                return String::from_utf8(decoded).map_err(|_| ProbeIssue::Malformed);
+            }
+            '\\' => {
+                let byte = match chars.next().ok_or(ProbeIssue::Malformed)? {
+                    'a' => 0x07,
+                    'b' => 0x08,
+                    'f' => 0x0c,
+                    'n' => b'\n',
+                    'r' => b'\r',
+                    't' => b'\t',
+                    'v' => 0x0b,
+                    '\\' => b'\\',
+                    '\'' => b'\'',
+                    '"' => b'"',
+                    'x' => {
+                        let mut digit = || {
+                            chars
+                                .next()
+                                .and_then(|c| c.to_digit(16))
+                                .ok_or(ProbeIssue::Malformed)
+                        };
+                        (digit()? * 16 + digit()?) as u8
+                    }
+                    _ => return Err(ProbeIssue::Malformed),
+                };
+                decoded.push(byte);
+            }
+            c => decoded.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+}
+fn manager_value(value: &[u8]) -> Result<String, ProbeIssue> {
+    let value = std::str::from_utf8(value).map_err(|_| ProbeIssue::Malformed)?;
+    let decoded = if value.starts_with("$'") {
+        c_quoted(value)?
+    } else {
+        shell_value(value)?
+    };
+    if decoded.len() > MAX_VALUE_BYTES || decoded.chars().any(char::is_control) {
+        return Err(ProbeIssue::Malformed);
+    }
+    Ok(decoded)
+}
+/// One `KEY=value` per line, as systemd prints it. Only STRICT_ENVIRONMENT values must decode;
+/// an unrelated line that can't be decoded is skipped, never repaired or returned.
+fn manager_assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIssue> {
+    if bytes.len() > MAX_PROBE_BYTES {
+        return Err(ProbeIssue::Oversize);
+    }
+    let mut values = BTreeMap::new();
+    for (index, line) in bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        if index >= MAX_ENVIRONMENT_LINES {
+            return Err(ProbeIssue::Oversize);
+        }
+        let Some(split) = line.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        // Strict keys are ASCII, so a non-UTF-8 or invalid key can never be one of them.
+        let Some(key) = std::str::from_utf8(&line[..split])
+            .ok()
+            .filter(|key| valid_key(key))
+        else {
+            continue;
+        };
+        match manager_value(&line[split + 1..]) {
+            Ok(value) => {
+                if values.insert(key.to_owned(), value).is_some() {
+                    return Err(ProbeIssue::Malformed);
+                }
+            }
+            Err(error) if STRICT_ENVIRONMENT.contains(&key) => return Err(error),
+            Err(_) => {}
         }
     }
     Ok(values)
@@ -231,7 +336,7 @@ pub fn parse_architecture(value: &str) -> Result<Architecture, ProbeIssue> {
     })
 }
 pub fn parse_manager_environment(bytes: &[u8]) -> Result<EffectiveEnvironment, ProbeIssue> {
-    let values = assignments(bytes)?;
+    let values = manager_assignments(bytes)?;
     let required = |key| values.get(key).cloned().ok_or(ProbeIssue::Missing);
     let runtime_dir = required("XDG_RUNTIME_DIR")?;
     let wayland_display = required("WAYLAND_DISPLAY")?;

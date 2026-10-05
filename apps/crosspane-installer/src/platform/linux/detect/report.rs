@@ -62,6 +62,8 @@ pub struct DetectionPass {
     pub manager_environment: Fact<EffectiveEnvironment>,
     pub hyprland: Fact<HyprlandFacts>,
     pub registry: Fact<RegistryFacts>,
+    /// Launcher evidence, consulted only when uwsm's MainPID differs from the Hyprland peer.
+    pub lineage: Fact<CompositorLineage>,
     pub installed_agent: Fact<InstalledAgentFacts>,
     pub reduced_motion: Fact<bool>,
 }
@@ -111,8 +113,8 @@ pub(super) fn compose_support(
         &pass.registry.value,
     ) {
         (Ok(manager), Ok(hyprland), Ok(registry)) => match manager.compositor_pid {
-            Some(pid) if pid == hyprland.pid && pid == registry.pid => Ok(()),
-            Some(_) => Err(ProbeIssue::Foreign),
+            Some(_) if hyprland.pid != registry.pid => Err(ProbeIssue::Foreign),
+            Some(pid) => compositor_matches(pid, hyprland.pid, &pass.lineage.value),
             None => Err(ProbeIssue::Unverified),
         },
         _ => Ok(()),

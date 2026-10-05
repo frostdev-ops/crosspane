@@ -20,17 +20,23 @@ use std::{
     time::Duration,
 };
 
+/// DT_NEEDED entries in one image (the largest real one on the owner's desktop has 37).
 pub const MAX_LIBRARIES: usize = 64;
+/// Distinct libraries in the whole transitive graph (the release agent's is ~100 on a real desktop).
+pub const MAX_GRAPH_LIBRARIES: usize = 512;
 pub const MAX_PROGRAM_HEADERS: usize = 128;
 pub const MAX_DYNAMIC_ENTRIES: usize = 4096;
 pub const MAX_STRING_BYTES: usize = 1024 * 1024;
+/// SONAME prefixes of the FFmpeg libraries the release agent declares in DT_NEEDED.
+pub const FFMPEG_FAMILY: [&str; 3] = ["libavcodec.so.", "libavutil.so.", "libswscale.so."];
 
 #[derive(Debug)]
 pub struct RuntimeInput<'a> {
     pub architecture: Architecture,
     pub features: &'a [String],
-    /// Caller-verified staged/installed bytes. Acquisition belongs to integration, not this parser.
-    pub agent_elf_prefix: &'a [u8],
+    /// The whole caller-verified staged/installed agent image (at most `MAX_ELF_PREFIX_BYTES`),
+    /// not a header prefix. Acquisition belongs to integration, not this parser.
+    pub agent_elf: &'a [u8],
     /// Only the caller's identity-matched decoded agent observation, never inferred from a bus name.
     pub keystore: Option<KeyStoreProvenance>,
 }
@@ -110,6 +116,8 @@ fn metadata_mapping(
     mapped.ok_or(ProbeIssue::Malformed)
 }
 /// ELF64 little-endian x86_64/aarch64 PT_DYNAMIC/DT_NEEDED only. No loader or symbol execution.
+/// `bytes` is the whole image: the program headers come from its start, then exactly the
+/// PT_DYNAMIC range and the referenced DT_STRTAB range (each size-bounded) wherever they lie.
 /// Missing/truncated metadata, nonstandard search paths, and unsupported images never resolve.
 pub fn elf_dependencies(
     bytes: &[u8],
@@ -347,7 +355,7 @@ fn inspect_checked(
         source,
         observed_at_ms: now_ms(),
     };
-    let root = elf_dependencies(input.agent_elf_prefix, input.architecture);
+    let root = elf_dependencies(input.agent_elf, input.architecture);
     let mut pending: VecDeque<_> = root
         .as_ref()
         .map(|elf| elf.needed.clone())
@@ -369,7 +377,7 @@ fn inspect_checked(
         if !seen.insert(name.clone()) {
             continue;
         }
-        if seen.len() > MAX_LIBRARIES {
+        if seen.len() > MAX_GRAPH_LIBRARIES {
             graph_issue = Some(ProbeIssue::Oversize);
             break;
         }
@@ -437,12 +445,8 @@ fn inspect_checked(
     } else {
         Ok(input.features.iter().any(|feature| feature == "video"))
     };
-    let ffmpeg = fact(family(&[
-        "libavcodec.so.",
-        "libavutil.so.",
-        "libavformat.so.",
-        "libswscale.so.",
-    ]));
+    // Exactly the libav* libraries the release agent links (it doesn't link libavformat).
+    let ffmpeg = fact(family(&FFMPEG_FAMILY));
     let software_video = fact(family(&["libavcodec.so.", "libx264.so."]));
     let opus = fact(family(&["libopus.so."]));
     let pipewire_library = fact(family(&["libpipewire-0.3.so."]));
@@ -658,7 +662,7 @@ mod tests {
                 RuntimeInput {
                     architecture: Architecture::X86_64,
                     features: &[],
-                    agent_elf_prefix: &bytes,
+                    agent_elf: &bytes,
                     keystore: None,
                 },
                 &|| 0,
@@ -726,6 +730,114 @@ mod tests {
             .map(|i| format!("libfixture{i}.so.1"))
             .collect::<Vec<_>>();
         assert_eq!(parse(&image(&names, None, 2, 0)), Err(ProbeIssue::Oversize));
+    }
+
+    /// Moves the PT_DYNAMIC and DT_STRTAB bytes of `image` to `at`, as a real linker places them
+    /// in the data segment near the end of a large binary, and maps them with a second PT_LOAD.
+    fn relocated(names: &[String], at: usize) -> Vec<u8> {
+        let mut bytes = image(names, Some("libfixture.so.1"), 3, 0);
+        let dynamic = number(&bytes, 128, 8).unwrap() as usize; // PT_DYNAMIC p_offset
+        let metadata = bytes[dynamic..].to_vec(); // dynamic entries, then the string table
+        let base = 0x4000_0000u64;
+        bytes.truncate(dynamic);
+        bytes.resize(at, 0);
+        bytes.extend_from_slice(&metadata);
+        let length = (bytes.len() - at) as u64;
+        // PT_LOAD 0 keeps only the headers; header 2 becomes a PT_LOAD of the moved metadata.
+        put(&mut bytes, 96, 8, dynamic as u64);
+        put(&mut bytes, 104, 8, dynamic as u64);
+        put(&mut bytes, 128, 8, at as u64);
+        put(&mut bytes, 136, 8, base);
+        put(&mut bytes, 176, 4, 1);
+        put(&mut bytes, 184, 8, at as u64);
+        put(&mut bytes, 192, 8, base);
+        put(&mut bytes, 208, 8, length);
+        put(&mut bytes, 216, 8, length);
+        let table = base + (number(&bytes, at + 8, 8).unwrap() - 0x1000 - dynamic as u64);
+        put(&mut bytes, at + 8, 8, table); // DT_STRTAB moves with the metadata
+        bytes
+    }
+
+    #[test]
+    fn dependency_metadata_far_beyond_a_header_prefix_resolves() {
+        // The real stripped release agent (34 MB) has PT_DYNAMIC at 0x19242a8 (~25 MiB).
+        let names = ["libavcodec.so.63", "libopus.so.0", "libc.so.6"].map(String::from);
+        for at in [0x19242a8, MAX_ELF_PREFIX_BYTES - 4096] {
+            let bytes = relocated(&names, at);
+            assert!(bytes.len() > 4 * 1024 * 1024);
+            assert_eq!(
+                parse(&bytes),
+                Ok(ElfDependencies {
+                    needed: names.to_vec(),
+                    soname: Some("libfixture.so.1".into())
+                }),
+                "{at:#x}"
+            );
+            // Every bound and mapping check still applies far into the image.
+            let mut truncated = bytes.clone();
+            truncated.truncate(truncated.len() - 1);
+            assert!(parse(&truncated).is_err());
+            let mut unmapped = bytes.clone();
+            put(&mut unmapped, 136, 8, 0x900000); // PT_DYNAMIC outside every PT_LOAD
+            assert!(parse(&unmapped).is_err());
+            let mut search_path = bytes.clone();
+            put(&mut search_path, at + 32, 8, 29); // DT_NEEDED -> DT_RUNPATH
+            assert_eq!(parse(&search_path), Err(ProbeIssue::Unverified));
+        }
+        let mut oversize = relocated(&names, 0x19242a8);
+        oversize.resize(MAX_ELF_PREFIX_BYTES + 1, 0);
+        assert_eq!(parse(&oversize), Err(ProbeIssue::Oversize));
+    }
+
+    #[test]
+    fn graph_admits_a_real_desktop_sized_closure_and_still_bounds_it() {
+        struct Reader;
+        impl RuntimeReader for Reader {
+            fn source(&self) -> ObservationSource {
+                ObservationSource::Demo
+            }
+            fn library(&self, name: &str, _: &Deadline) -> Result<SystemBytes, NativeError> {
+                // A chain libchainN -> libchainN+1 -> ... ending at MAX_GRAPH_LIBRARIES + 3.
+                let next = name
+                    .strip_prefix("libchain")
+                    .and_then(|n| n.strip_suffix(".so.1"))
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|n| *n < MAX_GRAPH_LIBRARIES + 3)
+                    .map(|n| vec![format!("libchain{}.so.1", n + 1)])
+                    .unwrap_or_default();
+                let bytes = image(&next, Some(name), 2, 0);
+                Ok(SystemBytes {
+                    path: Path::new("/usr/lib").join(name),
+                    file_size: bytes.len() as u64,
+                    bytes,
+                })
+            }
+            fn secret_service(&self, _: &Deadline) -> Result<bool, NativeError> {
+                Ok(true)
+            }
+        }
+        let run = |chain: usize| {
+            let start = MAX_GRAPH_LIBRARIES + 4 - chain;
+            let bytes = image(&[format!("libchain{start}.so.1")], None, 2, 0);
+            let deadline = Deadline::new(10_000, Cancellation::default()).unwrap();
+            inspect_with(
+                &Reader,
+                &deadline,
+                RuntimeInput {
+                    architecture: Architecture::X86_64,
+                    features: &[],
+                    agent_elf: &bytes,
+                    keystore: None,
+                },
+                &|| 0,
+            )
+        };
+        // libchainN for N in start..=MAX+3 is `chain` libraries, then the four fixed ones.
+        let facts = run(MAX_GRAPH_LIBRARIES - 4);
+        assert_eq!(facts.libraries.len(), MAX_GRAPH_LIBRARIES);
+        assert_eq!(facts.opus.value, Ok(true));
+        let facts = run(MAX_GRAPH_LIBRARIES - 3);
+        assert_eq!(facts.opus.value, Err(ProbeIssue::Oversize));
     }
 
     #[test]

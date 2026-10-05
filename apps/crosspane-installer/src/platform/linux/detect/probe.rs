@@ -2,6 +2,7 @@
 //! pathname, owner-environment fallback, mutation or readiness policy; detect composes support.
 mod hyprland;
 mod installed;
+mod lineage;
 mod logind;
 mod manager;
 mod os;
@@ -10,7 +11,13 @@ use super::*;
 use crate::platform::linux::{native_io::*, transport::CallerClock};
 pub use hyprland::{HyprlandFacts, hyprland_from_stream, parse_hyprland_version};
 pub use installed::associate_installed;
-pub use logind::{LogindFacts, Properties, decode_session, decode_user, logind_from_stream};
+pub use lineage::{
+    CompositorLineage, ProcessReader, ProcessStat, START_HYPRLAND, compositor_matches, parse_stat,
+    read_lineage,
+};
+pub use logind::{
+    LogindFacts, MAX_PROPERTIES, Properties, decode_session, decode_user, logind_from_stream,
+};
 pub use manager::{ManagerFacts, UnitRows, decode_units, manager_from_stream};
 pub use os::{OsFacts, os_from_reader};
 pub use registry::{REQUIRED_PROTOCOLS, RegistryFacts, protocols_satisfy, registry_from_stream};
@@ -132,18 +139,27 @@ impl NativeSessionProbes {
                 .unwrap_or_default(),
             session_id: values.get("XDG_SESSION_ID").cloned(),
         };
+        let os = self.os(deadline);
+        let architecture = Fact {
+            value: parse_architecture(std::env::consts::ARCH),
+            source,
+            observed_at_ms: (self.clock)(),
+        };
+        let logind = self.logind(deadline);
+        let manager = self.manager(deadline);
+        let manager_environment = self.manager_environment(deadline);
+        let hyprland = self.hyprland(deadline);
+        let registry = self.registry(deadline);
+        let lineage = self.lineage(&manager, &hyprland, deadline);
         let pass = DetectionPass {
-            os: self.os(deadline),
-            architecture: Fact {
-                value: parse_architecture(std::env::consts::ARCH),
-                source,
-                observed_at_ms: (self.clock)(),
-            },
-            logind: self.logind(deadline),
-            manager: self.manager(deadline),
-            manager_environment: self.manager_environment(deadline),
-            hyprland: self.hyprland(deadline),
-            registry: self.registry(deadline),
+            os,
+            architecture,
+            logind,
+            manager,
+            manager_environment,
+            hyprland,
+            registry,
+            lineage,
             installed_agent: self.installed_agent(deadline),
             reduced_motion: Fact::issue(ProbeIssue::Unverified, source, (self.clock)()),
         };
@@ -201,6 +217,36 @@ impl NativeSessionProbes {
                 Ok(facts)
             },
         )
+    }
+    /// /proc lineage only when uwsm's MainPID isn't itself the Hyprland IPC peer. Scratch targets
+    /// never read the host's /proc.
+    pub fn lineage(
+        &self,
+        manager: &Fact<ManagerFacts>,
+        hyprland: &Fact<HyprlandFacts>,
+        deadline: &Deadline,
+    ) -> Fact<CompositorLineage> {
+        let source = self.io.target().source();
+        let value = match (&manager.value, &hyprland.value) {
+            (Ok(manager), Ok(hyprland)) => match manager.compositor_pid {
+                Some(main) if main != hyprland.pid => {
+                    if source == ObservationSource::Demo {
+                        Err(ProbeIssue::Foreign)
+                    } else {
+                        deadline.check().map_err(issue).and_then(|_| {
+                            read_lineage(&lineage::NativeProcesses, main, hyprland.pid)
+                        })
+                    }
+                }
+                _ => Err(ProbeIssue::Unverified),
+            },
+            _ => Err(ProbeIssue::Unverified),
+        };
+        Fact {
+            value,
+            source,
+            observed_at_ms: (self.clock)(),
+        }
     }
     pub fn manager(&self, deadline: &Deadline) -> Fact<ManagerFacts> {
         let shared = deadline.clone();

@@ -35,7 +35,10 @@ pub const MAX_NATIVE_TIMEOUT_MS: u64 = 120_000;
 pub const SUPPORT_LIFETIME: Duration = Duration::from_secs(5);
 pub const MAX_OS_RELEASE_BYTES: usize = 64 * 1024;
 pub const MAX_FONT_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_ELF_PREFIX_BYTES: usize = 4 * 1024 * 1024;
+/// ELF bytes read for dependency metadata. Real images keep PT_DYNAMIC near their end (the release
+/// agent at ~25 MiB, libavcodec ~20 MiB, libicudata ~33 MiB), so this equals the payload member
+/// bound (`payload::MAX_MEMBER_BYTES`) rather than a small header prefix.
+pub const MAX_ELF_PREFIX_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_UFW_BYTES: usize = 1024 * 1024;
 pub const MAX_FIREWALL_COMMAND_BYTES: usize = 256 * 1024;
 static READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
@@ -3349,7 +3352,7 @@ mod tests {
                     .path_and_limit()
                     .unwrap()
                     .1,
-                4 * 1024 * 1024
+                64 * 1024 * 1024
             );
         }
         for path in [
