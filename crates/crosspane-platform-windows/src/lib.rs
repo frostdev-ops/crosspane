@@ -6,6 +6,8 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(windows)]
+pub mod hotkey;
 pub mod keystore;
 pub mod model;
 #[cfg(windows)]

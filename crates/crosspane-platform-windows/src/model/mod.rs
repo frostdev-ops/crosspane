@@ -4,6 +4,7 @@
 
 pub mod geometry;
 pub mod hook;
+pub mod hotkey;
 pub mod journal;
 pub mod keystore;
 pub mod session;
