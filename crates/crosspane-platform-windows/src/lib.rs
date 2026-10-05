@@ -7,6 +7,8 @@
 #![deny(unsafe_code)]
 
 #[cfg(windows)]
+pub mod capture;
+#[cfg(windows)]
 pub mod hotkey;
 #[cfg(windows)]
 pub mod inject;

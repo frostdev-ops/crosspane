@@ -212,6 +212,22 @@ impl HookState {
             .map_or_else(Vec::new, |(id, _)| vec![CaptureEvent::Ended { id, reason }])
     }
 
+    /// Native activation consumes the entering portal rather than cancelling its pending crossing.
+    /// Existing pure-model callers retain their original release notification behaviour.
+    pub fn native_begin(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        held: &[KeySnapshot],
+        buttons: &[bool; 256],
+        lock_keys: LockKeys,
+        now: MonoTime,
+    ) -> Result<(CaptureStart, Vec<CaptureEvent>), PlatformError> {
+        let (start, mut events) = self.begin(id, portal, held, buttons, lock_keys, now)?;
+        events.retain(|event| !matches!(event, CaptureEvent::EdgeReleased { portal: consumed, .. } if *consumed == portal));
+        Ok((start, events))
+    }
+
     fn release_edges(&mut self, at: MonoTime) -> Vec<CaptureEvent> {
         std::mem::take(&mut self.pressed)
             .into_iter()
@@ -258,6 +274,20 @@ impl HookState {
                 down: !key.up,
                 at: key.at,
             });
+        }
+        decision
+    }
+
+    /// Native queue records retain their capture generation. Old swallowed tails update the
+    /// ledger without becoming events of a new capture; existing model callers are unchanged.
+    pub fn queued_key(&mut self, observed: Option<CaptureId>, key: KeyIn) -> Decision {
+        let old_tail = self
+            .suppressed_keys
+            .get(&key_identity((key.scancode, key.extended, key.vk)))
+            .is_some_and(|token| Some(*token) != self.capture.map(|(id, _)| id));
+        let mut decision = self.on_key(key);
+        if old_tail || observed != self.capture.map(|(id, _)| id) {
+            decision.events.clear();
         }
         decision
     }
