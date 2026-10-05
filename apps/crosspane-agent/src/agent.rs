@@ -6259,9 +6259,37 @@ fn proxy(key: ProjectionKey, event: ProxyEvent) -> Input {
     Input::Proxy { key, event }
 }
 
+#[cfg(target_os = "macos")]
+const LAUNCHD_RESTART_EXIT_CODE: i32 = 75; // EX_TEMPFAIL: KeepAlive restarts unsuccessful exits.
+
+#[cfg(any(target_os = "macos", test))]
+fn restart_through_launchd(service_name: Option<&std::ffi::OsStr>) -> bool {
+    service_name == Some(std::ffi::OsStr::new(crate::macos_launch::LABEL))
+}
+
+/// After a clean shutdown, let the managed LaunchAgent start a fresh process.
+/// Terminal/developer runs retain the same binary, arguments and PID through exec.
+#[cfg(target_os = "macos")]
+pub(crate) fn restart() -> ! {
+    if restart_through_launchd(std::env::var_os("XPC_SERVICE_NAME").as_deref()) {
+        tracing::info!("restarting through launchd");
+        std::process::exit(LAUNCHD_RESTART_EXIT_CODE);
+    }
+    use std::os::unix::process::CommandExt;
+    tracing::info!("restarting");
+    let error = match std::env::current_exe() {
+        Ok(exe) => std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec(),
+        Err(error) => error,
+    };
+    tracing::error!(%error, "could not restart; exiting");
+    std::process::exit(1);
+}
+
 /// Start this agent again in place (same binary, same arguments, same PID), after a clean
 /// shutdown. Exits if that fails, rather than run on with closed links.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn restart() -> ! {
     use std::os::unix::process::CommandExt;
     tracing::info!("restarting");
@@ -8443,6 +8471,34 @@ mod twin_video_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_through_launchd_requires_exact_service_label() {
+        use std::ffi::OsStr;
+        assert!(restart_through_launchd(Some(OsStr::new(
+            crate::macos_launch::LABEL
+        ))));
+        for service in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("io.frostdev.crosspane")),
+            Some(OsStr::new("io.frostdev.crosspane.agent.helper")),
+            Some(OsStr::new("IO.FROSTDEV.CROSSPANE.AGENT")),
+            Some(OsStr::new(" io.frostdev.crosspane.agent")),
+            Some(OsStr::new("io.frostdev.crosspane.agent ")),
+        ] {
+            assert!(!restart_through_launchd(service));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!restart_through_launchd(Some(OsStr::from_bytes(
+                b"io.frostdev.crosspane.agent\xff",
+            ))));
+        }
+        #[cfg(target_os = "macos")]
+        assert_ne!(LAUNCHD_RESTART_EXIT_CODE, 0);
+    }
 
     #[test]
     fn installer_stop_wire_contract_preserves_u64_instance() {

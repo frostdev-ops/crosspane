@@ -1,7 +1,7 @@
 //! Default bundle launches hand off to the exact managed GUI job before any agent startup.
 use anyhow::{Result, bail};
 use std::sync::atomic::{AtomicBool, Ordering};
-const LABEL: &str = "io.frostdev.crosspane.agent";
+pub(crate) const LABEL: &str = "io.frostdev.crosspane.agent";
 const LIMIT: usize = 1024 * 1024;
 
 pub(crate) struct Output {
