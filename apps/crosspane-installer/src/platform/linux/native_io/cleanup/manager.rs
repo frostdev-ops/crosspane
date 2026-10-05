@@ -147,6 +147,7 @@ impl CleanupLease {
                 return ManagerMutation {
                     result: Err(e),
                     pending: None,
+                    submitted: false,
                 };
             }
         };
@@ -154,10 +155,13 @@ impl CleanupLease {
         let worker_binding = binding.clone();
         let lease = self.clone();
         let deadline = d.clone();
+        let submitted = Arc::new(AtomicBool::new(false));
+        let worker_submitted = submitted.clone();
         let result = bounded_launch(&PROCESS_LAUNCHES, d, move || {
             let result = (|| {
                 worker_binding.check(&deadline)?;
                 let mut command = prepare(&lease.0, &deadline)?;
+                command.spawn_attempt = Some(worker_submitted);
                 command.cleanup = Some(worker_binding.clone());
                 lease.0.proof.0.io.execute(&command, &deadline, None)
             })();
@@ -180,6 +184,10 @@ impl CleanupLease {
         }
         drop(binding);
         let pending = (!pending.completed()).then_some(pending);
-        ManagerMutation { result, pending }
+        ManagerMutation {
+            result,
+            pending,
+            submitted: submitted.load(Ordering::Acquire),
+        }
     }
 }

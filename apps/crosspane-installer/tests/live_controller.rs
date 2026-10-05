@@ -871,6 +871,100 @@ fn an_install_step_that_plans_again_after_applying_goes_ahead_by_itself_only_onc
 }
 
 #[test]
+fn an_unsubmitted_restart_fails_visibly_and_does_not_spend_the_automatic_go_ahead() {
+    for after_submission in [ApplyOutcome::Failed, ApplyOutcome::Unknown] {
+        let mut h = H::new();
+        h.tick();
+        h.next();
+        h.pass(SUPPORT);
+        let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+        h.report(&detect, NativeOutcome::Detected { needs_action: true });
+        let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+        h.report(
+            &plan,
+            NativeOutcome::Planned {
+                preview: "Restart the selected Crosspane service once".into(),
+            },
+        );
+        let (apply, _) = h.job(PAYLOAD, JobStage::Apply);
+        h.report(&apply, NativeOutcome::NotSubmitted);
+        assert_eq!(h.row(PAYLOAD).state, RowState::Failed);
+        let retry = h.button(ids::retry(PAYLOAD)).expect("plain retry action");
+        assert_eq!(retry.label, "Try again");
+        assert_eq!(retry.kind, ButtonKind::Primary);
+        for _ in 0..5 {
+            h.advance(300);
+            h.tick();
+        }
+        assert!(
+            h.take_jobs().is_empty(),
+            "an unsubmitted failure never loops"
+        );
+        h.click(ids::retry(PAYLOAD));
+        let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+        h.report(&detect, NativeOutcome::Detected { needs_action: true });
+        let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+        h.report(
+            &plan,
+            NativeOutcome::Planned {
+                preview: "Restart the selected Crosspane service once".into(),
+            },
+        );
+        let (submitted, consent) = h.job(PAYLOAD, JobStage::Apply);
+        assert_eq!(
+            consent.map(|c| c.plan),
+            Some(plan.operation),
+            "unsubmitted attempt did not spend consent"
+        );
+        h.report(&submitted, NativeOutcome::Applied(after_submission));
+        if after_submission == ApplyOutcome::Failed {
+            assert_eq!(h.button(ids::retry(PAYLOAD)).unwrap().label, "Try again");
+            h.click(ids::retry(PAYLOAD));
+        }
+        let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+        h.report(&detect, NativeOutcome::Detected { needs_action: true });
+        let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+        h.report(
+            &plan,
+            NativeOutcome::Planned {
+                preview: "Restart again only with your go-ahead".into(),
+            },
+        );
+        // A stale not-submitted report cannot release a newer operation's spent guard.
+        h.report(&apply, NativeOutcome::NotSubmitted);
+        for _ in 0..5 {
+            h.advance(300);
+            h.tick();
+        }
+        assert!(
+            h.take_jobs().is_empty(),
+            "a submitted failure/unknown is never taken again automatically"
+        );
+        assert_eq!(h.row(PAYLOAD).state, RowState::NeedsAction);
+        assert!(h.view().message.contains("already did this once"));
+        h.click(ids::consent(PAYLOAD));
+        let (manual, consent) = h.job(PAYLOAD, JobStage::Apply);
+        assert_eq!(consent.map(|c| c.plan), Some(plan.operation));
+        h.report(&manual, NativeOutcome::NotSubmitted);
+        h.click(ids::retry(PAYLOAD));
+        let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+        h.report(&detect, NativeOutcome::Detected { needs_action: true });
+        let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+        h.report(
+            &plan,
+            NativeOutcome::Planned {
+                preview: "The earlier submitted restart still counts".into(),
+            },
+        );
+        assert!(
+            h.take_jobs().is_empty(),
+            "a manual unsubmitted failure never refunds the earlier automatic submission"
+        );
+        assert_eq!(h.row(PAYLOAD).state, RowState::NeedsAction);
+    }
+}
+
+#[test]
 fn refused_and_unknown_mutations_wait_or_redetect_before_any_retry() {
     let mut h = H::new();
     h.tick();

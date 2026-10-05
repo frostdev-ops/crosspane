@@ -552,6 +552,8 @@ impl Worker {
                     .apply(proof, package, plan_operation, &deadline)
                 {
                     Ok(()) => {
+                        self.services
+                            .payload_applied(self.payloads.applied_operation());
                         resume::write(&self.io, proof, "payload", "applied");
                         let text = match self.payloads.backup() {
                             Some(folder) => format!(
@@ -593,12 +595,20 @@ impl Worker {
         let deadline = self.deadline(READ_MS);
         let Some(package) = self.package.as_ref() else {
             let text = self.package().err().unwrap_or_default();
+            if job.step == RESTART && job.stage == JobStage::Apply {
+                self.restart_failed(job.clone(), false, &text);
+                return Err(());
+            }
             self.emit(job.clone(), NativeOutcome::Waiting(WaitKind::User), text);
             return Err(());
         };
         // Disjoint fields: the package is only read while the service binds its files.
         let result = self.services.prepare(package, &deadline);
         if let Err(error) = result {
+            if job.step == RESTART && job.stage == JobStage::Apply {
+                self.restart_failed(job.clone(), false, &error.to_string());
+                return Err(());
+            }
             let stop = service_problem(job.stage, error);
             self.emit_stop(job.clone(), stop);
             return Err(());
@@ -827,17 +837,13 @@ impl Worker {
             JobStage::Apply => {
                 let held = self.held.restart.take();
                 if !Self::consented(held, &consent, &job) {
-                    self.emit(
-                        job,
-                        NativeOutcome::Applied(ApplyOutcome::Refused),
-                        "That consent was for a different preview. Review the restart again.",
-                    );
+                    self.restart_failed(job, false, "consent does not match the restart preview");
                     return;
                 }
                 let proof = match self.proof() {
                     Ok(proof) => proof,
                     Err((_, text)) => {
-                        self.emit(job, NativeOutcome::Applied(ApplyOutcome::Refused), text);
+                        self.restart_failed(job, false, &text);
                         return;
                     }
                 };
@@ -846,7 +852,11 @@ impl Worker {
                     .services
                     .apply(&proof, ServiceAction::Restart, &deadline)
                 {
-                    Ok(result) if result.after.is_some() => {
+                    Ok(result)
+                        if result.submitted
+                            && result.after.is_some()
+                            && result.diagnostic.is_none() =>
+                    {
                         self.held.restarted = Some(result.previous_instance);
                         resume::write(&self.io, &proof, "restart", "applied");
                         self.emit(
@@ -855,19 +865,25 @@ impl Worker {
                             "A restart was requested. The new instance is checked next.",
                         );
                     }
-                    Ok(_) | Err(ServiceError::OutcomeUnknown) | Err(ServiceError::Native(_)) => {
-                        self.emit(
-                            job,
-                            NativeOutcome::Applied(ApplyOutcome::Unknown),
-                            "Whether the restart happened is unclear, so it is checked again \
-                             before anything is retried.",
+                    Ok(result) if result.submission_pending && !result.submitted => {
+                        // A worker can still finish admission/spawn. Unknown is neither a
+                        // submission nor proof that nothing will be submitted: keep the reservation.
+                        eprintln!(
+                            "Crosspane restart submission is still pending: {:?}",
+                            result.diagnostic
                         );
+                        self.emit(job, NativeOutcome::Failed,
+                            "Crosspane's restart could not be confirmed yet. Try again; setup checks whether the service request has finished first.");
                     }
-                    Err(_) => self.emit(
+                    Ok(result) => self.restart_failed(
                         job,
-                        NativeOutcome::Applied(ApplyOutcome::Refused),
-                        "The restart wasn't started. Nothing was changed.",
+                        result.submitted,
+                        result
+                            .diagnostic
+                            .as_deref()
+                            .unwrap_or("the manager did not confirm the restart request"),
                     ),
+                    Err(error) => self.restart_failed(job, false, &error.to_string()),
                 }
             }
             JobStage::Verify => {
@@ -885,6 +901,19 @@ impl Worker {
                 }
             }
         }
+    }
+
+    fn restart_failed(&self, job: JobIntent, submitted: bool, cause: &str) {
+        eprintln!("Crosspane restart failed (submitted={submitted}): {cause}");
+        self.emit(
+            job,
+            if submitted { NativeOutcome::Applied(ApplyOutcome::Failed) } else { NativeOutcome::NotSubmitted },
+            if submitted {
+                "Crosspane's restart could not be confirmed. Try again; setup checks the service before requesting another restart."
+            } else {
+                "Crosspane could not be restarted. The restart was not started. Try again."
+            },
+        );
     }
 
     // ---- agent -------------------------------------------------------------------------------

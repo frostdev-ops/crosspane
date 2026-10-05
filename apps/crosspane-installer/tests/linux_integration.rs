@@ -534,6 +534,9 @@ impl Services for FakeServices {
             after: Some(w.facts.clone()),
             previous_instance: (before.main_pid != 0).then_some(9),
             outcome: MutationOutcome::Verified,
+            submitted: true,
+            submission_pending: false,
+            diagnostic: None,
         })
     }
     fn agent(

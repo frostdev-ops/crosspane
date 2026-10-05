@@ -173,14 +173,17 @@ impl CommandRunner for Runner {
         })
     }
 }
-struct Probe(PathBuf);
+struct Probe {
+    executable: Mutex<PathBuf>,
+    generation: AtomicU64,
+}
 impl ProcessProbe for Probe {
     fn snapshot(&self, _: u32, d: &Deadline) -> Result<ProcessFacts, NativeError> {
         d.check()?;
         Ok(ProcessFacts {
             uid: rustix::process::geteuid().as_raw(),
-            executable: self.0.join(".local/bin/crosspane-agent"),
-            generation: 77,
+            executable: self.executable.lock().unwrap().clone(),
+            generation: self.generation.load(Ordering::Acquire),
         })
     }
 }
@@ -302,6 +305,7 @@ struct Fixture {
     io: Arc<LinuxNativeIo>,
     runner: Arc<Runner>,
     resources: Vec<RenderedResource>,
+    probe: Arc<Probe>,
     _listener: UnixListener,
 }
 impl Fixture {
@@ -325,9 +329,11 @@ impl Fixture {
             block_mutation: AtomicBool::new(false),
             no_change: AtomicBool::new(false),
         });
-        let io = Arc::new(
-            LinuxNativeIo::scratch(&root, runner.clone(), Arc::new(Probe(root.clone()))).unwrap(),
-        );
+        let probe = Arc::new(Probe {
+            executable: Mutex::new(root.join(".local/bin/crosspane-agent")),
+            generation: AtomicU64::new(77),
+        });
+        let io = Arc::new(LinuxNativeIo::scratch(&root, runner.clone(), probe.clone()).unwrap());
         let proof = io.scratch_support(facts(&io)).unwrap();
         for path in [
             io.target().paths().runtime_home.join("systemd"),
@@ -472,6 +478,7 @@ impl Fixture {
             io,
             runner,
             resources,
+            probe,
             _listener: listener,
         }
     }
@@ -586,6 +593,161 @@ impl Fixture {
             })
             .count()
     }
+}
+
+/// WP-4.32b: real Applied journal shape, synthetic paths and an injected /proc observation.
+/// The old process survives publication on a deleted inode; only this run's receipt can admit
+/// it for a restart, and it remains inadmissible for ordinary health verification.
+#[test]
+fn an_applied_upgrade_restarts_only_its_recorded_deleted_instance_and_reports_submission() {
+    use crosspane_installer_core::OperationId;
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new("");
+    f.active();
+    f.bootstrap(9, "ready");
+    let service = f.service();
+    let p = f.io.target().paths();
+    let paths = [
+        p.prefix.join("bin/crosspane-agent"),
+        p.prefix.join("bin/crosspanectl"),
+        p.prefix.join("bin/crosspane-ui"),
+        p.prefix.join("bin/crosspane-installer"),
+        p.prefix.join("bin/crosspane-tutorial"),
+        p.config_home.join("systemd/user/crosspane-agent.service"),
+        p.data_home.join("applications/crosspane-settings.desktop"),
+        p.data_home.join("applications/crosspane-installer.desktop"),
+        p.data_home
+            .join("icons/hicolor/scalable/apps/crosspane.svg"),
+        p.data_home.join("crosspane/LICENSE"),
+    ];
+    let meta = fs::metadata(&paths[0]).unwrap();
+    let parent = fs::metadata(paths[0].parent().unwrap()).unwrap();
+    let new = sha256(&fs::read(&paths[0]).unwrap());
+    let old = sha256(b"the old recorded agent");
+    let record = p
+        .state_home
+        .join("crosspane/installer/payload-outcome.json");
+    let mut journal = json!({
+        "receipt": {"schema_version":1,"operation_id":4,"product_version":"0.0.0",
+            "manifest_sha256":vec![0u8;32],"payload_sha256":vec![0u8;32],
+            "resources": FILES.iter().zip(&paths).map(|(name,path)| json!({
+                "resource_id":name,"resolved_path":path,"ownership":"Created",
+                "before":"Different","after":"Matching","outcome":"Unknown"
+            })).collect::<Vec<_>>(), "unfinished":[47]},
+        "items": (0..10).map(|i| json!({"old":old,"new":new,"template":new,
+            "ownership":"Created","replacement":if i == 0 { json!({
+                "file":[meta.dev(),meta.ino()],"parent":[parent.dev(),parent.ino()],
+                "hash":new,"mode":493}) } else { Value::Null }
+        })).collect::<Vec<_>>(),
+        "phase":"Applied","source":"Demo","previous_instance":9,"base_generation":null
+    });
+    let write = |value: &Value| {
+        f.io.atomic_write(&f.proof(), &record, &serde_json::to_vec(value).unwrap())
+            .unwrap()
+    };
+    let mut deleted = paths[0].clone().into_os_string();
+    deleted.push(" (deleted)");
+    *f.probe.executable.lock().unwrap() = deleted.into();
+    assert!(
+        service
+            .plan(&f.proof(), ServiceAction::Restart, &deadline())
+            .is_err()
+    );
+    assert!(
+        service
+            .plan_restart_after_payload(&f.proof(), OperationId(4), &deadline())
+            .is_err()
+    );
+    write(&journal);
+    assert!(
+        service
+            .plan_restart_after_payload(&f.proof(), OperationId(5), &deadline())
+            .is_err()
+    );
+    journal["previous_instance"] = json!(8);
+    write(&journal);
+    assert!(
+        service
+            .plan_restart_after_payload(&f.proof(), OperationId(4), &deadline())
+            .is_err()
+    );
+    journal["previous_instance"] = json!(9);
+    write(&journal);
+    let deleted_path = f.probe.executable.lock().unwrap().clone();
+    *f.probe.executable.lock().unwrap() = paths[0].with_file_name("foreign-agent (deleted)");
+    assert!(
+        service
+            .plan_restart_after_payload(&f.proof(), OperationId(4), &deadline())
+            .is_err()
+    );
+    *f.probe.executable.lock().unwrap() = deleted_path;
+    let plan = service
+        .plan_restart_after_payload(&f.proof(), OperationId(4), &deadline())
+        .unwrap();
+    f.probe.generation.store(78, Ordering::Release);
+    assert!(service.apply(&f.proof(), plan, &deadline()).is_err());
+    f.probe.generation.store(77, Ordering::Release);
+    let plan = service
+        .plan_restart_after_payload(&f.proof(), OperationId(4), &deadline())
+        .unwrap();
+    journal["receipt"]["unfinished"] = json!([48]);
+    write(&journal);
+    assert!(service.apply(&f.proof(), plan, &deadline()).is_err());
+    assert_eq!(f.mutations(), 0);
+    // Restore the exact journal, then submit once to the selected fake manager.
+    journal["receipt"]["unfinished"] = json!([47]);
+    write(&journal);
+    let plan = service
+        .plan_restart_after_payload(&f.proof(), OperationId(4), &deadline())
+        .unwrap();
+    let installed = fs::read(&paths[0]).unwrap();
+    fs::write(&paths[0], b"changed after planning").unwrap();
+    assert!(service.apply(&f.proof(), plan, &deadline()).is_err());
+    fs::write(&paths[0], installed).unwrap();
+    assert_eq!(f.mutations(), 0);
+    let plan = service
+        .plan_restart_after_payload(&f.proof(), OperationId(4), &deadline())
+        .unwrap();
+    let result = service.apply(&f.proof(), plan, &deadline()).unwrap();
+    assert!(result.submitted);
+    assert!(result.after.is_some());
+    assert!(result.diagnostic.is_none());
+    assert_eq!(result.previous_instance, Some(9));
+    assert_eq!(f.mutations(), 1);
+    assert!(f.io.bootstrap(&deadline()).is_err(), "health stays strict");
+    // A real manager rejection is submitted, but carries its failure rather than success.
+    *f.runner.mutation_failure.lock().unwrap() =
+        Some((Some(1), vec![], b"fixture restart refused\n".to_vec()));
+    let plan = service
+        .plan_restart_after_payload(&f.proof(), OperationId(4), &deadline())
+        .unwrap();
+    let result = service.apply(&f.proof(), plan, &deadline()).unwrap();
+    assert!(result.submitted);
+    assert!(result.after.is_none());
+    assert!(
+        result
+            .diagnostic
+            .unwrap()
+            .contains("fixture restart refused")
+    );
+    let cancelled = Cancellation::default();
+    cancelled.cancel();
+    let cancelled = Deadline::new(5000, cancelled).unwrap();
+    let proof = f.proof();
+    let unsubmitted = f.io.run_manager_mutation(
+        &proof,
+        &f.command("restart"),
+        f.io.install_lease(&proof).unwrap(),
+        &cancelled,
+    );
+    assert!(!unsubmitted.submitted);
+    assert!(unsubmitted.pending.is_none());
+    assert!(unsubmitted.result.is_err());
+    assert_eq!(
+        f.mutations(),
+        2,
+        "cancelled before dispatch never contacts the manager"
+    );
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

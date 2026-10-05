@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crosspane_installer_core::{
-    Flow, FlowError, FlowEvent, JobIntent, JobStage, ObservationSource, StepId, StepState, Summary,
-    Verification,
+    Flow, FlowError, FlowEvent, JobIntent, JobStage, ObservationSource, OperationId, StepId,
+    StepState, Summary, Verification,
 };
 use crosspane_types::id::NodeId;
 
@@ -133,6 +133,9 @@ pub struct LiveController {
     /// once: if it asks again (it planned another change after the first one), the person
     /// answers, so a step that keeps re-planning can never repeat itself without end.
     pub(super) auto_consented: BTreeSet<StepId>,
+    /// Reservations still awaiting the platform's submission result. A later manual attempt
+    /// must never refund an earlier automatic restart that really reached the OS.
+    pub(super) auto_reserved: BTreeMap<StepId, OperationId>,
     /// The current screen moves on by itself once everything on it is done. Off after the person
     /// went back to it, so a deliberate visit isn't cut short.
     pub(super) auto_advance: bool,
@@ -254,6 +257,7 @@ impl LiveController {
             support_checks: None,
             install_started: false,
             auto_consented: BTreeSet::new(),
+            auto_reserved: BTreeMap::new(),
             auto_advance: true,
             complete_since: None,
             agent_health_pending: false,
@@ -424,6 +428,11 @@ impl LiveController {
         };
         let step = job.step;
         let operation = job.operation;
+        if let Some(consent) = &consent
+            && self.auto_reserved.get(&step) == Some(&consent.plan)
+        {
+            self.auto_reserved.insert(step, operation);
+        }
         // An agent-applied step is performed here, by the controller, through the agent port.
         if job.stage == JobStage::Apply
             && let Some(kind) = self.graph.meta(step).and_then(|m| m.agent_apply)
@@ -453,6 +462,14 @@ impl LiveController {
             consent,
             status,
         }) {
+            if self.auto_reserved.get(&step) == Some(&operation) {
+                self.auto_reserved.remove(&step);
+                self.auto_consented.remove(&step);
+            }
+            eprintln!(
+                "Crosspane setup step {} was not submitted: {refusal}",
+                step.0
+            );
             self.details.insert(step, bounded(refusal.to_string()));
             let _ = self.reduce(FlowEvent::Failed { step, operation });
         }
@@ -574,11 +591,21 @@ impl LiveController {
                 self.previews.insert(step, bounded_lines(preview));
                 FlowEvent::Planned { step, operation }
             }
-            (JobStage::Apply, NativeOutcome::Applied(outcome)) => FlowEvent::Applied {
-                step,
-                operation,
-                outcome,
-            },
+            (JobStage::Apply, NativeOutcome::Applied(outcome)) => {
+                self.auto_reserved.remove(&step);
+                FlowEvent::Applied {
+                    step,
+                    operation,
+                    outcome,
+                }
+            }
+            (JobStage::Apply, NativeOutcome::NotSubmitted) => {
+                if self.auto_reserved.get(&step) == Some(&operation) {
+                    self.auto_reserved.remove(&step);
+                    self.auto_consented.remove(&step);
+                }
+                FlowEvent::Failed { step, operation }
+            }
             (
                 JobStage::Verify,
                 NativeOutcome::Verified {
@@ -834,8 +861,12 @@ impl LiveController {
             .map(|m| m.id)
             .collect();
         for step in ready {
-            // Recorded before the attempt: whatever happens to it, this was the step's one go.
+            // Reserve the one go while it runs. Only a platform's positive NotSubmitted
+            // report releases it; an unknown outcome must never allow an automatic loop.
             self.auto_consented.insert(step);
+            if let Some(plan) = self.job(step, JobStage::Plan) {
+                self.auto_reserved.insert(step, plan.operation);
+            }
             self.consent_click(step);
         }
         self.dispatch_intents();

@@ -1222,9 +1222,15 @@ impl PendingOperation {
 pub struct ManagerMutation {
     pub result: Result<CommandOutput>,
     pub pending: Option<PendingOperation>,
+    /// The manager child was spawned (or the injected runner was dispatched).
+    pub submitted: bool,
 }
 pub trait CommandRunner: Send + Sync {
     fn run(&self, command: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput>;
+    /// Production reports its successful spawn; injected runners count dispatch as submission.
+    fn tracks_submission(&self) -> bool {
+        false
+    }
 }
 /// Canonical network only; further LAN interface/range policy belongs to the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1606,6 +1612,9 @@ fn drain(pipe: &mut impl Read, bytes: &mut Vec<u8>, limit: usize) -> Result<bool
     }
 }
 impl CommandRunner for SystemRunner {
+    fn tracks_submission(&self) -> bool {
+        true
+    }
     fn run(&self, spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutput> {
         // LinuxNativeIo's private executor already owns bounded admission for this whole operation.
         if let Some(attempt) = &spec.spawn_attempt {
@@ -1653,9 +1662,6 @@ fn system_command(spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutp
     let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
     child_environment(&mut command, &spec.environment);
     cleanup_dispatch_check(target, spec, deadline)?;
-    if let Some(attempt) = &spec.spawn_attempt {
-        attempt.store(true, Ordering::Release);
-    }
     let mut child = native(
         command
             .arg0(&spec.executable)
@@ -1665,6 +1671,9 @@ fn system_command(spec: &CommandSpec, deadline: &Deadline) -> Result<CommandOutp
             .stderr(Stdio::piped())
             .spawn(),
     )?;
+    if let Some(attempt) = &spec.spawn_attempt {
+        attempt.store(true, Ordering::Release);
+    }
     let result = (|| {
         let mut stdout = child.stdout.take().ok_or(NativeError::Unavailable)?;
         let mut stderr = child.stderr.take().ok_or(NativeError::Unavailable)?;
@@ -2572,7 +2581,10 @@ impl LinuxNativeIo {
         let runner = self.runner.clone();
         let worker_deadline = deadline.clone();
         let mutation = manager_mutation(spec) || spec.agent.is_some();
-        let started = Arc::new(AtomicBool::new(false));
+        let started = spec
+            .spawn_attempt
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let worker_started = started.clone();
         admitted.spawn_attempt = Some(worker_started.clone());
         #[cfg(test)]
@@ -2633,7 +2645,9 @@ impl LinuxNativeIo {
                 }
             }
             cleanup_dispatch_check(&target, &admitted, &worker_deadline)?;
-            worker_started.store(true, Ordering::Release);
+            if !runner.tracks_submission() {
+                worker_started.store(true, Ordering::Release);
+            }
             let result = runner.run(&admitted, &worker_deadline);
             let drift = if let Some(manager) = &admitted.environment.manager {
                 manager.revalidate(&target).and_then(|_| {
@@ -2718,10 +2732,13 @@ impl LinuxNativeIo {
             return ManagerMutation {
                 result: Err(NativeError::Invalid),
                 pending: None,
+                submitted: false,
             };
         }
         let pending = PendingOperation(Arc::new(AtomicBool::new(false)));
         let mut command = spec.clone();
+        let submitted = Arc::new(AtomicBool::new(false));
+        command.spawn_attempt = Some(submitted.clone());
         command.lease = Some(Arc::new(LeaseGuard {
             lease: Some(lease),
             finished: pending.0.clone(),
@@ -2734,15 +2751,25 @@ impl LinuxNativeIo {
             ManagerMutation {
                 result,
                 pending: None,
+                submitted: submitted.load(Ordering::Acquire),
             }
         } else {
             ManagerMutation {
                 result: Err(NativeError::OutcomeUnknown),
                 pending: Some(pending),
+                submitted: submitted.load(Ordering::Acquire),
             }
         }
     }
     pub fn process_identity(&self, pid: u32, deadline: &Deadline) -> Result<ProcessIdentity> {
+        self.process_identity_at(pid, deadline, &self.target.agent_path())
+    }
+    fn process_identity_at(
+        &self,
+        pid: u32,
+        deadline: &Deadline,
+        expected_executable: &Path,
+    ) -> Result<ProcessIdentity> {
         if pid == 0 {
             return Err(NativeError::Invalid);
         }
@@ -2757,7 +2784,7 @@ impl LinuxNativeIo {
             return Err(NativeError::Foreign);
         }
         let before = self.probe.snapshot(pid, deadline)?;
-        if before.uid != self.target.paths.uid || before.executable != self.target.agent_path() {
+        if before.uid != self.target.paths.uid || before.executable != expected_executable {
             return Err(NativeError::Foreign);
         }
         let environment = ChildEnvironment::selected(&self.target, BTreeMap::new())?;
@@ -2799,10 +2826,31 @@ impl LinuxNativeIo {
         })
     }
     pub fn bootstrap(&self, deadline: &Deadline) -> Result<(BootstrapV1, ProcessIdentity)> {
+        self.bootstrap_at(deadline, &self.target.agent_path())
+    }
+    /// Only restart planning/apply use this after admitting this run's replacement journal.
+    pub(super) fn replaced_bootstrap(
+        &self,
+        deadline: &Deadline,
+        previous_instance: u64,
+    ) -> Result<(BootstrapV1, ProcessIdentity)> {
+        let mut path = self.target.agent_path().into_os_string();
+        path.push(" (deleted)");
+        let result = self.bootstrap_at(deadline, &PathBuf::from(path))?;
+        if result.0.instance_id != previous_instance {
+            return Err(NativeError::Foreign);
+        }
+        Ok(result)
+    }
+    fn bootstrap_at(
+        &self,
+        deadline: &Deadline,
+        expected_executable: &Path,
+    ) -> Result<(BootstrapV1, ProcessIdentity)> {
         let path = self.target.runtime.join("bootstrap.json");
         let first =
             parse_bootstrap(&self.read(&path, 4096, true)?).map_err(|_| NativeError::Invalid)?;
-        let identity = self.process_identity(first.pid, deadline)?;
+        let identity = self.process_identity_at(first.pid, deadline, expected_executable)?;
         let second =
             parse_bootstrap(&self.read(&path, 4096, true)?).map_err(|_| NativeError::Invalid)?;
         if first.instance_id != second.instance_id
@@ -2815,7 +2863,7 @@ impl LinuxNativeIo {
         {
             return Err(NativeError::Foreign);
         }
-        if identity != self.process_identity(first.pid, deadline)? {
+        if identity != self.process_identity_at(first.pid, deadline, expected_executable)? {
             return Err(NativeError::Foreign);
         }
         Ok((second, identity))

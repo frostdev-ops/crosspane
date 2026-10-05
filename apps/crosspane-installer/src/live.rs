@@ -191,6 +191,8 @@ pub enum NativeOutcome {
         preview: String,
     },
     Applied(ApplyOutcome),
+    /// Apply failed before any OS mutation was submitted. Its automatic consent is unspent.
+    NotSubmitted,
     /// Native verification never carries a counter binding.
     Verified {
         source: ObservationSource,

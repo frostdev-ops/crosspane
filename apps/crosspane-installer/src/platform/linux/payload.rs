@@ -562,6 +562,32 @@ struct FileIdentity {
     hash: [u8; 32],
     mode: u32,
 }
+/// Private authority for restarting the old inode this run replaced, never for health admission.
+#[derive(Clone, Debug)]
+pub(super) struct ReplacedAgent {
+    operation: OperationId,
+    record_hash: [u8; 32],
+    previous_instance: u64,
+}
+impl ReplacedAgent {
+    pub(super) fn instance(&self) -> u64 {
+        self.previous_instance
+    }
+    pub(super) fn revalidate(
+        &self,
+        io: Arc<LinuxNativeIo>,
+        proof: &SupportProof,
+        deadline: &Deadline,
+    ) -> Result<()> {
+        let current = PayloadInstaller::new(io)?.replaced_agent(proof, self.operation, deadline)?;
+        if current.record_hash != self.record_hash
+            || current.previous_instance != self.previous_instance
+        {
+            return Err(PayloadError::Foreign);
+        }
+        Ok(())
+    }
+}
 /// Plans are opaque and bound to the selected target, the package and the observed file hashes.
 #[derive(Debug)]
 pub struct PayloadPlan {
@@ -650,6 +676,40 @@ impl Snapshot {
 }
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 impl PayloadInstaller {
+    pub(super) fn replaced_agent(
+        &self,
+        proof: &SupportProof,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<ReplacedAgent> {
+        deadline.check()?;
+        let record_hash = self.generation(proof)?.ok_or(PayloadError::Foreign)?;
+        let journal = self.load(proof, false)?.ok_or(PayloadError::Foreign)?;
+        let item = &journal.items[0];
+        let replacement = item.replacement.ok_or(PayloadError::Foreign)?;
+        if journal.phase != Phase::Applied
+            || journal.receipt.operation_id != operation
+            || item.old.is_none()
+            || item.old == Some(item.new)
+            || journal.receipt.resources[0].after != ResourceObservation::Matching
+        {
+            return Err(PayloadError::Foreign);
+        }
+        let current = self
+            .snapshot(proof, &self.paths[0], Self::mode(0), MAX_MEMBER_BYTES)?
+            .ok_or(PayloadError::Foreign)?;
+        if current.admitted_identity(Self::mode(0))? != replacement
+            || self.generation(proof)? != Some(record_hash)
+        {
+            return Err(PayloadError::Foreign);
+        }
+        deadline.check()?;
+        Ok(ReplacedAgent {
+            operation,
+            record_hash,
+            previous_instance: journal.previous_instance.ok_or(PayloadError::Foreign)?,
+        })
+    }
     /// Repair authority is additional to current SupportProof, never cleanup authority.
     pub fn apply_after_clean_stop(
         &self,

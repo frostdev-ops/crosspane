@@ -1,7 +1,7 @@
 //! Selected user-manager facts and bounded operations, never readiness or consent policy.
 use super::{
     native_io::*,
-    payload::{RenderedResource, sha256},
+    payload::{PayloadInstaller, RenderedResource, ReplacedAgent, sha256},
 };
 use crate::agent_contract::{
     AgentReply, BootstrapPhase, BootstrapV1, CallFailure, DecodedReply, HealthSnapshot,
@@ -72,6 +72,7 @@ pub struct ServicePlan {
     before: ServiceFacts,
     previous_instance: Option<u64>,
     dead_runtime: Option<super::native_io::DeadRuntime>,
+    replaced_agent: Option<(ReplacedAgent, ProcessIdentity)>,
 }
 #[derive(Debug)]
 pub struct ServiceResult {
@@ -81,6 +82,11 @@ pub struct ServiceResult {
     pub previous_instance: Option<u64>,
     /// Verifies only the requested manager state. Start/restart remain Unknown until inspection.
     pub outcome: MutationOutcome,
+    pub submitted: bool,
+    /// A launch/cleanup worker still holds the lease, so absence of submission is not proven.
+    pub submission_pending: bool,
+    /// Bounded native failure context for stderr, never a readiness proof.
+    pub diagnostic: Option<String>,
 }
 /// Bootstrap progress is distinct from the actual decoded, identity-matched Status facts.
 pub enum AgentEvidence {
@@ -329,7 +335,7 @@ impl LinuxService {
     ) -> Result<ServicePlan> {
         proof.check(&self.io)?;
         clean.revalidate_for(&self.io, deadline)?;
-        self.plan_with(proof, action, Some(clean), deadline)
+        self.plan_with(proof, action, Some(clean), None, deadline)
     }
     pub fn apply_after_clean_stop(
         &self,
@@ -833,13 +839,29 @@ impl LinuxService {
         action: ServiceAction,
         deadline: &Deadline,
     ) -> Result<ServicePlan> {
-        self.plan_with(proof, action, None, deadline)
+        self.plan_with(proof, action, None, None, deadline)
+    }
+    /// The caller names the receipt operation it actually applied during this setup run.
+    pub fn plan_restart_after_payload(
+        &self,
+        proof: &SupportProof,
+        applied_operation: crosspane_installer_core::OperationId,
+        deadline: &Deadline,
+    ) -> Result<ServicePlan> {
+        self.plan_with(
+            proof,
+            ServiceAction::Restart,
+            None,
+            Some(applied_operation),
+            deadline,
+        )
     }
     fn plan_with(
         &self,
         proof: &SupportProof,
         action: ServiceAction,
         clean: Option<&super::removal::CleanStop>,
+        applied_operation: Option<crosspane_installer_core::OperationId>,
         deadline: &Deadline,
     ) -> Result<ServicePlan> {
         proof.check(&self.io)?;
@@ -868,6 +890,7 @@ impl LinuxService {
         if before.needs_reload && action != ServiceAction::Reload {
             return Err(ServiceError::Unknown);
         }
+        let mut replaced_agent = None;
         let previous_instance = if let Some(clean) = clean {
             if before.main_pid != 0 || before.active_state != "inactive" {
                 return Err(ServiceError::Foreign);
@@ -875,7 +898,25 @@ impl LinuxService {
             clean.revalidate_for(&self.io, deadline)?;
             Some(clean.instance_id())
         } else if before.main_pid != 0 {
-            let (bootstrap, _) = self.io.bootstrap(deadline)?;
+            let (bootstrap, _) = match self.io.bootstrap(deadline) {
+                Ok(current) => current,
+                Err(error) => {
+                    let Some(operation) =
+                        applied_operation.filter(|_| action == ServiceAction::Restart)
+                    else {
+                        return Err(error.into());
+                    };
+                    let prior = PayloadInstaller::new(self.io.clone())
+                        .and_then(|p| p.replaced_agent(proof, operation, deadline))
+                        .map_err(|_| ServiceError::Foreign)?;
+                    let bootstrap = self.io.replaced_bootstrap(deadline, prior.instance())?;
+                    prior
+                        .revalidate(self.io.clone(), proof, deadline)
+                        .map_err(|_| ServiceError::Foreign)?;
+                    replaced_agent = Some((prior, bootstrap.1.clone()));
+                    bootstrap
+                }
+            };
             if bootstrap.pid != before.main_pid {
                 return Err(ServiceError::Foreign);
             }
@@ -900,6 +941,7 @@ impl LinuxService {
             before,
             previous_instance,
             dead_runtime,
+            replaced_agent,
         })
     }
     fn absent_agent(&self, deadline: &Deadline) -> Result<Option<super::native_io::DeadRuntime>> {
@@ -938,10 +980,25 @@ impl LinuxService {
         }
         if let Some(clean) = clean {
             clean.revalidate_for(&self.io, deadline)?;
-        } else if let Some(id) = plan.previous_instance
-            && self.io.bootstrap(deadline)?.0.instance_id != id
-        {
-            return Err(ServiceError::Foreign);
+        } else if let Some(id) = plan.previous_instance {
+            let bootstrap = if let Some((prior, original)) = &plan.replaced_agent {
+                if plan.action != ServiceAction::Restart || prior.instance() != id {
+                    return Err(ServiceError::Foreign);
+                }
+                prior
+                    .revalidate(self.io.clone(), proof, deadline)
+                    .map_err(|_| ServiceError::Foreign)?;
+                let current = self.io.replaced_bootstrap(deadline, id)?;
+                if current.1 != *original {
+                    return Err(ServiceError::Foreign);
+                }
+                current
+            } else {
+                self.io.bootstrap(deadline)?
+            };
+            if bootstrap.0.instance_id != id || bootstrap.0.pid != plan.before.main_pid {
+                return Err(ServiceError::Foreign);
+            }
         }
         if matches!(plan.action, ServiceAction::Start | ServiceAction::Restart)
             && plan.previous_instance.is_none()
@@ -960,33 +1017,60 @@ impl LinuxService {
         if let Some(clean) = clean {
             clean.revalidate_for(&self.io, deadline)?;
         }
+        // Any poisoned bookkeeping lock refuses before dispatch. Once submitted, an error
+        // must be returned with its submission fact, never as a pre-command refusal.
+        let mut pending_state = self.pending.lock().map_err(|_| ServiceError::Unknown)?;
         let ManagerMutation {
             result: output,
             pending,
+            submitted,
         } = self.io.run_manager_mutation(
             proof,
             &self.command(plan.action.verb())?,
             lease,
             deadline,
         );
-        *self.pending.lock().map_err(|_| ServiceError::Unknown)? = pending;
+        let submission_pending = pending.is_some();
+        *pending_state = pending;
+        drop(pending_state);
         let mut result = ServiceResult {
             action: plan.action,
             before: plan.before,
             after: None,
             previous_instance: plan.previous_instance,
             outcome: MutationOutcome::Unknown,
+            submitted,
+            submission_pending,
+            diagnostic: None,
         };
-        let Ok(output) = output else {
-            return Ok(result);
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                result.diagnostic = Some(error.to_string());
+                return Ok(result);
+            }
         };
         // Bounded informational diagnostics (including enable/disable symlink messages) do
         // not establish success or failure; the subsequent pinned manager facts do.
         if output.code != Some(0) {
+            result.diagnostic = Some(format!(
+                "systemctl {} exited {:?}: {}",
+                plan.action.verb(),
+                output.code,
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == '\n')
+                    .take(1024)
+                    .collect::<String>()
+            ));
             return Ok(result);
         }
-        let Ok(after) = self.observe(deadline) else {
-            return Ok(result);
+        let after = match self.observe(deadline) {
+            Ok(after) => after,
+            Err(error) => {
+                result.diagnostic = Some(format!("post-command observation: {error}"));
+                return Ok(result);
+            }
         };
         let verified = match plan.action {
             ServiceAction::Reload => !after.needs_reload,

@@ -97,6 +97,11 @@ pub trait Payloads {
     fn backup(&self) -> Option<PathBuf> {
         None
     }
+    /// The receipt this adapter successfully applied in this run; an on-disk record alone
+    /// cannot authorize restarting a deleted old executable.
+    fn applied_operation(&self) -> Option<OperationId> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +115,7 @@ pub struct PayloadPreview {
 
 /// The user-manager unit for the installed agent.
 pub trait Services {
+    fn payload_applied(&mut self, _operation: Option<OperationId>) {}
     /// Bind the rendered unit and desktop files of `package`. Required before anything else.
     fn prepare(&mut self, package: &Package, deadline: &Deadline) -> Result<(), ServiceError>;
     fn observe(&mut self, deadline: &Deadline) -> Result<ServiceFacts, ServiceError>;
@@ -726,6 +732,7 @@ pub struct NativePayloads {
     held: Option<(OperationId, Held)>,
     /// An earlier apply in this run didn't finish: the next plan starts fresh (WP-4.32).
     start_fresh: bool,
+    applied_operation: Option<OperationId>,
 }
 
 /// A kept plan: the ordinary one, or a fresh start over whatever is in the install paths.
@@ -756,6 +763,7 @@ impl NativePayloads {
             installer: PayloadInstaller::new(io)?,
             held: None,
             start_fresh: false,
+            applied_operation: None,
         })
     }
 
@@ -772,7 +780,8 @@ impl NativePayloads {
         let plan = self
             .installer
             .plan(proof, package, operation, MatchingFiles::Preserve)?;
-        self.installer.apply(proof, package, plan, deadline)?;
+        let receipt = self.installer.apply(proof, package, plan, deadline)?;
+        self.applied_operation = Some(receipt.operation_id);
         self.start_fresh = false;
         Ok(())
     }
@@ -865,6 +874,7 @@ impl Payloads for NativePayloads {
         deadline: &Deadline,
     ) -> Result<(), PayloadError> {
         // The plan is single use: whatever happens next, it is gone.
+        self.applied_operation = None;
         let Some((planned, plan)) = self.held.take() else {
             return Err(PayloadError::Pending);
         };
@@ -873,7 +883,10 @@ impl Payloads for NativePayloads {
         }
         let result = match plan {
             Held::Plan(plan) => match self.installer.apply(proof, package, *plan, deadline) {
-                Ok(_) => Ok(()),
+                Ok(receipt) => {
+                    self.applied_operation = Some(receipt.operation_id);
+                    Ok(())
+                }
                 // The kept plan no longer fits what is there: start fresh, once, right now.
                 Err(error) if start_fresh_over(&error) => {
                     self.fresh(proof, package, operation, deadline)
@@ -904,6 +917,9 @@ impl Payloads for NativePayloads {
     fn backup(&self) -> Option<PathBuf> {
         self.installer.backup_used()
     }
+    fn applied_operation(&self) -> Option<OperationId> {
+        self.applied_operation
+    }
 }
 
 /// The real user-manager unit, bound to the staged package's rendered files.
@@ -911,6 +927,7 @@ pub struct NativeServices {
     pub io: Arc<LinuxNativeIo>,
     pub env: ChildEnvironment,
     service: Option<Arc<LinuxService>>,
+    applied_operation: Option<OperationId>,
 }
 
 impl NativeServices {
@@ -919,6 +936,7 @@ impl NativeServices {
             io,
             env,
             service: None,
+            applied_operation: None,
         }
     }
 
@@ -932,6 +950,9 @@ impl NativeServices {
 }
 
 impl Services for NativeServices {
+    fn payload_applied(&mut self, operation: Option<OperationId>) {
+        self.applied_operation = operation;
+    }
     fn prepare(&mut self, package: &Package, deadline: &Deadline) -> Result<(), ServiceError> {
         if self.service.is_some() {
             return Ok(());
@@ -967,7 +988,13 @@ impl Services for NativeServices {
                 .map_err(ServiceError::Native)?;
         }
         let service = self.bound()?.clone();
-        let plan = service.plan(proof, action, deadline)?;
+        let plan = if action == ServiceAction::Restart
+            && let Some(operation) = self.applied_operation
+        {
+            service.plan_restart_after_payload(proof, operation, deadline)?
+        } else {
+            service.plan(proof, action, deadline)?
+        };
         service.apply(proof, plan, deadline)
     }
 
