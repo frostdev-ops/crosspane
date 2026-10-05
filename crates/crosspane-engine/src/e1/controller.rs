@@ -1713,7 +1713,29 @@ impl ControllerE1 {
                     }
                 }
             }
-            CaptureEvent::LockKeys(keys) => self.lock_keys = *keys,
+            CaptureEvent::LockKeys(keys) => {
+                let changed = self.lock_keys != *keys;
+                self.lock_keys = *keys;
+                if changed
+                    && self.permits_io()
+                    && !self.gate_closed
+                    && self.teardown.is_none()
+                    && self.input_mode() == InputMode::Routing
+                    && self.ensure_sequence_room(now, out)
+                    && let Phase::Controlling(c) = &mut self.phase
+                    && c.capture.started
+                {
+                    let (session, seq) = c.session.next_input(now);
+                    out.push(Output::SendInput {
+                        peer: c.session.peer,
+                        msg: InputMessage::LockKeys {
+                            session,
+                            seq,
+                            keys: *keys,
+                        },
+                    });
+                }
+            }
             CaptureEvent::EdgePressed {
                 portal,
                 position,
@@ -5302,6 +5324,491 @@ mod release_cause_tests {
                 })));
             }
             out
+        }
+    }
+
+    mod lock_key_forwarding {
+        use super::*;
+        use crate::e1::target::TargetE1;
+        use crate::io::InjectCmd;
+        use crosspane_input::journal::MemoryJournal;
+        use crosspane_platform::{KeyInjector, PlatformError};
+        use crosspane_protocol::msg::Capability;
+
+        const CAPS: HidUsage = HidUsage::keyboard(0x39);
+        const NUM: HidUsage = HidUsage::keyboard(0x53);
+        const SCROLL: HidUsage = HidUsage::keyboard(0x47);
+
+        fn caps(value: bool) -> LockKeys {
+            LockKeys {
+                caps_lock: Some(value),
+                num_lock: None,
+                scroll_lock: None,
+            }
+        }
+
+        fn locks(out: &[Output]) -> Vec<(NodeId, SessionId, u32, LockKeys)> {
+            out.iter()
+                .filter_map(|o| match o {
+                    Output::SendInput {
+                        peer,
+                        msg: InputMessage::LockKeys { session, seq, keys },
+                    } => Some((*peer, *session, *seq, *keys)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Models OS lock toggles on physical downs. Lock-state requests submit paired native
+        /// transitions only for differing Some values, independently of the held-key ledger.
+        struct FakeKeys {
+            state: LockKeys,
+            held: BTreeSet<HidUsage>,
+            submitted: Vec<(HidUsage, bool)>,
+        }
+        impl FakeKeys {
+            fn new() -> Self {
+                Self {
+                    state: LockKeys {
+                        caps_lock: Some(false),
+                        num_lock: Some(true),
+                        scroll_lock: Some(false),
+                    },
+                    held: BTreeSet::new(),
+                    submitted: Vec::new(),
+                }
+            }
+            fn native(&mut self, usage: HidUsage, down: bool) {
+                self.submitted.push((usage, down));
+                if down {
+                    let state = match usage {
+                        CAPS => &mut self.state.caps_lock,
+                        NUM => &mut self.state.num_lock,
+                        SCROLL => &mut self.state.scroll_lock,
+                        _ => return,
+                    };
+                    if let Some(value) = state {
+                        *value = !*value;
+                    }
+                }
+            }
+        }
+        impl KeyInjector for FakeKeys {
+            fn key(&mut self, usage: HidUsage, down: bool) -> Result<(), PlatformError> {
+                if (down && self.held.insert(usage)) || (!down && self.held.remove(&usage)) {
+                    self.native(usage, down);
+                }
+                Ok(())
+            }
+            fn lock_keys(&self) -> Result<LockKeys, PlatformError> {
+                Ok(self.state)
+            }
+            fn set_lock_keys(&mut self, wanted: LockKeys) -> Result<(), PlatformError> {
+                for (usage, desired, actual) in [
+                    (CAPS, wanted.caps_lock, self.state.caps_lock),
+                    (NUM, wanted.num_lock, self.state.num_lock),
+                    (SCROLL, wanted.scroll_lock, self.state.scroll_lock),
+                ] {
+                    if desired.is_some() && desired != actual {
+                        self.native(usage, true);
+                        self.native(usage, false);
+                    }
+                }
+                Ok(())
+            }
+            fn release_all(&mut self) -> Result<(), PlatformError> {
+                for usage in self.held.clone() {
+                    self.key(usage, false)?;
+                }
+                Ok(())
+            }
+            fn recover_keys(&mut self, keys: &[HidUsage]) -> Result<(), PlatformError> {
+                for usage in keys {
+                    self.key(*usage, false)?;
+                }
+                Ok(())
+            }
+        }
+
+        struct Pair {
+            rig: Rig,
+            target: TargetE1,
+            keys: FakeKeys,
+            requests: Vec<LockKeys>,
+            session: SessionId,
+        }
+        impl Pair {
+            fn new() -> Self {
+                let (mut target, startup) = TargetE1::new(
+                    &EngineConfig::new(B),
+                    Box::new(MemoryJournal::default()),
+                    ms(0),
+                )
+                .unwrap();
+                assert!(startup.is_empty());
+                let mut setup = Vec::new();
+                target.handle(
+                    &Input::Session(SessionEvent::State(SessionState {
+                        lock: LockState::Unlocked,
+                        active: Some(true),
+                    })),
+                    ms(0),
+                    &mut setup,
+                );
+                target.handle(
+                    &Input::Grants([(A, BTreeSet::from([Capability::InputAccept]))].into()),
+                    ms(0),
+                    &mut setup,
+                );
+                assert!(setup.is_empty());
+                let mut rig = Rig::new();
+                rig.crossing();
+                let start = rig.send(Input::Overlay(OverlayEvent::Visible(HUD)));
+                let session = start
+                    .iter()
+                    .find_map(|o| match o {
+                        Output::SendControl {
+                            msg: ControlMessage::StartControl { session, .. },
+                            ..
+                        } => Some(*session),
+                        _ => None,
+                    })
+                    .unwrap();
+                let mut pair = Self {
+                    rig,
+                    target,
+                    keys: FakeKeys::new(),
+                    requests: Vec::new(),
+                    session,
+                };
+                let begun = pair.deliver(start);
+                let capture = begun
+                    .iter()
+                    .find_map(|o| match o {
+                        Output::BeginCapture { id, .. } => Some(*id),
+                        _ => None,
+                    })
+                    .unwrap();
+                pair.rig
+                    .send(Input::Capture(CaptureEvent::Started { id: capture }));
+                pair.rig.send(Input::CaptureBegun {
+                    id: capture,
+                    result: Ok(CaptureStart {
+                        held_keys: Vec::new(),
+                        lock_keys: caps(false),
+                    }),
+                });
+                assert_eq!(pair.rig.controller.established(), Some(B));
+                pair.requests.clear();
+                assert!(pair.keys.submitted.is_empty());
+                pair
+            }
+
+            /// Drive real reliable messages through TargetE1, execute its injection outputs
+            /// using the frozen fake KeyInjector, and feed real acknowledgements/completions.
+            fn deliver(&mut self, out: Vec<Output>) -> Vec<Output> {
+                let mut target_out = Vec::new();
+                for output in out {
+                    let input = match output {
+                        Output::SendControl { peer, msg } => {
+                            assert_eq!(peer, B);
+                            Input::Link(LinkEvent::Control { peer: A, msg })
+                        }
+                        Output::SendInput { peer, msg } => {
+                            assert_eq!(peer, B);
+                            Input::Link(LinkEvent::Input { peer: A, msg })
+                        }
+                        _ => continue,
+                    };
+                    self.target.handle(&input, self.rig.now, &mut target_out);
+                }
+                let mut pending = VecDeque::from(target_out);
+                let mut controller_out = Vec::new();
+                while let Some(output) = pending.pop_front() {
+                    match output {
+                        Output::Inject { id, cmd } => {
+                            match cmd {
+                                InjectCmd::Key { usage, down } => {
+                                    self.keys.key(usage, down).unwrap()
+                                }
+                                InjectCmd::LockKeys(keys) => {
+                                    self.requests.push(keys);
+                                    self.keys.set_lock_keys(keys).unwrap();
+                                }
+                                InjectCmd::MoveTo { .. } => {}
+                                other => panic!("unexpected fake injection {other:?}"),
+                            }
+                            let mut done = Vec::new();
+                            self.target.handle(
+                                &Input::InjectDone { id, ok: true },
+                                self.rig.now,
+                                &mut done,
+                            );
+                            pending.extend(done);
+                        }
+                        Output::SendControl { peer, msg } => {
+                            assert_eq!(peer, A);
+                            controller_out.extend(
+                                self.rig
+                                    .send(Input::Link(LinkEvent::Control { peer: B, msg })),
+                            );
+                        }
+                        Output::SendInput { peer, msg } => {
+                            assert_eq!(peer, A);
+                            controller_out.extend(
+                                self.rig
+                                    .send(Input::Link(LinkEvent::Input { peer: B, msg })),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                controller_out
+            }
+        }
+
+        #[test]
+        fn lock_keys_state_only_caps_forwards_once_and_uses_session_sequence() {
+            let mut pair = Pair::new();
+            pair.rig.now = ms(20);
+            let out = pair
+                .rig
+                .send(Input::Capture(CaptureEvent::LockKeys(caps(true))));
+            assert_eq!(locks(&out), [(B, pair.session, 1, caps(true))]);
+            let Phase::Controlling(c) = &pair.rig.controller.phase else {
+                panic!()
+            };
+            assert_eq!(
+                c.session.lease.ack_deadline(None),
+                Some(ms(170).saturating_add(Duration::from_nanos(1)))
+            );
+            pair.deliver(out);
+            let Phase::Controlling(c) = &pair.rig.controller.phase else {
+                panic!()
+            };
+            assert_eq!(c.session.lease.ack_deadline(None), None);
+            assert_eq!(pair.requests, [caps(true)]);
+            assert_eq!(pair.keys.submitted, [(CAPS, true), (CAPS, false)]);
+            assert_eq!(pair.keys.lock_keys().unwrap().caps_lock, Some(true));
+            assert!(pair.keys.held.is_empty());
+            assert!(
+                pair.rig
+                    .send(Input::Capture(CaptureEvent::LockKeys(caps(true))))
+                    .is_empty()
+            );
+            let out = pair.rig.send(Input::Capture(CaptureEvent::Key {
+                usage: HidUsage::keyboard(4),
+                down: true,
+                at: pair.rig.now,
+            }));
+            assert!(
+                matches!(&out[..], [Output::SendInput { msg: InputMessage::Key { session, seq: 2, .. }, .. }] if *session == pair.session)
+            );
+            pair.deliver(out);
+        }
+
+        #[test]
+        fn lock_keys_key_transition_then_state_is_no_double_toggle_and_none_preserves_keys() {
+            for before_up in [false, true] {
+                let mut pair = Pair::new();
+                let out = pair.rig.send(Input::Capture(CaptureEvent::Key {
+                    usage: CAPS,
+                    down: true,
+                    at: pair.rig.now,
+                }));
+                pair.deliver(out);
+                if !before_up {
+                    let out = pair.rig.send(Input::Capture(CaptureEvent::Key {
+                        usage: CAPS,
+                        down: false,
+                        at: pair.rig.now,
+                    }));
+                    pair.deliver(out);
+                }
+                assert_eq!(pair.keys.lock_keys().unwrap().caps_lock, Some(true));
+                let held = pair.keys.held.clone();
+                let out = pair
+                    .rig
+                    .send(Input::Capture(CaptureEvent::LockKeys(caps(true))));
+                assert_eq!(
+                    locks(&out),
+                    [(B, pair.session, if before_up { 2 } else { 3 }, caps(true))]
+                );
+                pair.deliver(out);
+                assert_eq!(pair.requests, [caps(true)]);
+                assert_eq!(pair.keys.held, held);
+                if before_up {
+                    let out = pair.rig.send(Input::Capture(CaptureEvent::Key {
+                        usage: CAPS,
+                        down: false,
+                        at: pair.rig.now,
+                    }));
+                    pair.deliver(out);
+                }
+                assert_eq!(pair.keys.submitted, [(CAPS, true), (CAPS, false)]);
+                assert_eq!(
+                    pair.keys.lock_keys().unwrap(),
+                    LockKeys {
+                        caps_lock: Some(true),
+                        num_lock: Some(true),
+                        scroll_lock: Some(false),
+                    }
+                );
+                assert!(pair.keys.held.is_empty());
+            }
+        }
+
+        #[test]
+        fn lock_keys_idle_crossing_activation_release_and_pause_only_update_cache() {
+            let mut rig = Rig::new();
+            assert!(
+                locks(&rig.send(Input::Capture(CaptureEvent::LockKeys(caps(true))))).is_empty()
+            );
+            assert_eq!(rig.controller.lock_keys, caps(true));
+            rig.crossing();
+            let out = rig.send(Input::Overlay(OverlayEvent::Visible(HUD)));
+            let session = out
+                .iter()
+                .find_map(|o| match o {
+                    Output::SendControl {
+                        msg:
+                            ControlMessage::StartControl {
+                                session, lock_keys, ..
+                            },
+                        ..
+                    } => {
+                        assert_eq!(*lock_keys, caps(true));
+                        Some(*session)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                locks(&rig.send(Input::Capture(CaptureEvent::LockKeys(caps(false))))).is_empty()
+            );
+            let out = rig.send(Input::Link(LinkEvent::Control {
+                peer: B,
+                msg: ControlMessage::ControlStarted { session },
+            }));
+            let capture = out
+                .iter()
+                .find_map(|o| match o {
+                    Output::BeginCapture { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .unwrap();
+            rig.send(Input::Capture(CaptureEvent::Started { id: capture }));
+            assert_eq!(rig.controller.established(), None);
+            assert!(
+                locks(&rig.send(Input::Capture(CaptureEvent::LockKeys(caps(true))))).is_empty()
+            );
+            rig.send(Input::Command(Command::ReleaseControl));
+            assert!(
+                locks(&rig.send(Input::Capture(CaptureEvent::LockKeys(caps(false))))).is_empty()
+            );
+            rig.send(Input::Capture(CaptureEvent::Ended {
+                id: capture,
+                reason: CaptureEnd::Requested,
+            }));
+            assert!(
+                locks(&rig.send(Input::Capture(CaptureEvent::LockKeys(caps(true))))).is_empty()
+            );
+            let mut pair = Pair::new();
+            pair.rig.send(Input::Link(LinkEvent::Input {
+                peer: B,
+                msg: InputMessage::Status {
+                    session: pair.session,
+                    status: TargetStatus::LocalOverride,
+                },
+            }));
+            assert_eq!(pair.rig.controller.established(), None);
+            assert!(
+                locks(
+                    &pair
+                        .rig
+                        .send(Input::Capture(CaptureEvent::LockKeys(caps(true))))
+                )
+                .is_empty()
+            );
+            let mut pair = Pair::new();
+            let Phase::Controlling(c) = &pair.rig.controller.phase else {
+                panic!()
+            };
+            let capture = c.capture.id;
+            pair.rig.send(Input::Command(Command::ReleaseControl));
+            assert!(matches!(pair.rig.controller.phase, Phase::Returning { .. }));
+            assert!(
+                locks(
+                    &pair
+                        .rig
+                        .send(Input::Capture(CaptureEvent::LockKeys(caps(true))))
+                )
+                .is_empty()
+            );
+            pair.rig.send(Input::Capture(CaptureEvent::Ended {
+                id: capture,
+                reason: CaptureEnd::Requested,
+            }));
+            assert!(
+                locks(
+                    &pair
+                        .rig
+                        .send(Input::Capture(CaptureEvent::LockKeys(caps(false))))
+                )
+                .is_empty()
+            );
+        }
+
+        #[test]
+        fn lock_keys_closed_gate_missing_capture_and_teardown_do_not_send_or_consume_sequence() {
+            for fence in 0..4 {
+                let mut pair = Pair::new();
+                match fence {
+                    0 => pair.rig.controller.gate_closed = true,
+                    1 => pair.rig.controller.state = NOT_PERMITTED,
+                    2 => {
+                        let Phase::Controlling(c) = &mut pair.rig.controller.phase else {
+                            panic!()
+                        };
+                        c.capture.started = false;
+                    }
+                    _ => {
+                        pair.rig.controller.teardown = Some(Teardown {
+                            op: HomeOp(1),
+                            attempt: 0,
+                            next: ms(10),
+                            peer: B,
+                            projection: ProjectionId(1),
+                            continuation: None,
+                        })
+                    }
+                }
+                let out = pair
+                    .rig
+                    .send(Input::Capture(CaptureEvent::LockKeys(caps(true))));
+                assert!(locks(&out).is_empty());
+                assert_eq!(pair.rig.controller.lock_keys, caps(true));
+                let Phase::Controlling(c) = &pair.rig.controller.phase else {
+                    panic!()
+                };
+                assert_eq!(c.session.input_seq, 1);
+            }
+        }
+
+        #[test]
+        fn lock_keys_sequence_exhaustion_uses_existing_release_fence() {
+            let mut pair = Pair::new();
+            let Phase::Controlling(c) = &mut pair.rig.controller.phase else {
+                panic!()
+            };
+            c.session.input_seq = u32::MAX - 290;
+            let out = pair
+                .rig
+                .send(Input::Capture(CaptureEvent::LockKeys(caps(true))));
+            assert!(locks(&out).is_empty());
+            assert_eq!(pair.rig.controller.lock_keys, caps(true));
+            assert!(out.iter().any(|o| matches!(o, Output::EndCapture { .. })));
+            assert!(matches!(pair.rig.controller.phase, Phase::Returning { .. }));
         }
     }
 
