@@ -413,12 +413,8 @@ pub fn audio_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::Audio
     let host = crosspane_platform_macos::audio::CoreAudioHost::new(gate)
         .map(|h| Box::new(h) as Box<dyn crosspane_platform::AudioHost>);
     #[cfg(windows)]
-    let host: Result<Box<dyn crosspane_platform::AudioHost>, PlatformError> = {
-        let _ = gate;
-        Err(PlatformError::Unsupported(
-            "Windows audio/clipboard backend",
-        ))
-    };
+    let host = crosspane_platform_windows::audio::WindowsAudioHost::new(gate)
+        .map(|h| Box::new(h) as Box<dyn crosspane_platform::AudioHost>);
     match host {
         Ok(host) => Some(host),
         Err(e) => {

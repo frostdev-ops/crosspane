@@ -2,6 +2,7 @@
 //! translates OS values into these inputs and carries out their outputs. Each model is
 //! "builds and unit-tests its pure logic"; P9 verifies the Windows behaviour it assumes.
 
+pub mod audio;
 pub mod capture;
 pub mod clipboard;
 pub mod cursor;

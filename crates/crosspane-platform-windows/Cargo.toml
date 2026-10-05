@@ -11,14 +11,15 @@ publish.workspace = true
 workspace = true
 
 [features]
-video = ["dep:crosspane-media"]
+video = []
 
 [dependencies]
 crosspane-input.workspace = true
-crosspane-media = { workspace = true, optional = true }
+crosspane-media.workspace = true
 crosspane-platform.workspace = true
 crosspane-types.workspace = true
 png.workspace = true
+rtrb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
@@ -27,7 +28,7 @@ zeroize.workspace = true
 proptest.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_UI_Shell", "Graphics_Capture", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_WindowsAndMessaging", "Win32_Media_MediaFoundation", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Ole"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_UI_Shell", "Graphics_Capture", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_WindowsAndMessaging", "Win32_Media_MediaFoundation", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Ole"] }
 windows-sys = { workspace = true, features = [
     "Win32_Devices_Display",
     "Win32_Foundation",
@@ -49,6 +50,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_UI_Input",
