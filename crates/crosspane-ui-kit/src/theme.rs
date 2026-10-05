@@ -398,3 +398,422 @@ pub fn icon(painter: &egui::Painter, rect: Rect, index: usize, color: Color32) {
         }
     }
 }
+
+/// The state of one step in a checklist. Every mark has its own shape, so a state never rests on
+/// colour alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepMark {
+    /// Not started: a faint ring.
+    Pending,
+    /// Running now: a ring with a bright arc (it turns only when a phase is supplied).
+    Active,
+    /// The question being asked now: a ring around a filled dot.
+    Current,
+    /// Done: a filled disc with a check.
+    Done,
+    /// Waiting on something outside this window: a ring with clock hands.
+    Waiting,
+    /// Stopped with a problem the person can fix: a ring with an exclamation mark.
+    Problem,
+    /// Can't be done here: a ring with a cross.
+    Blocked,
+    /// Information only: a ring with a small "i".
+    Info,
+}
+
+impl StepMark {
+    /// The mark's colour in the Crosspane palette.
+    pub fn color(self) -> Color32 {
+        match self {
+            Self::Pending => alpha(QUIET, 120),
+            Self::Active | Self::Current | Self::Done => FROST,
+            Self::Waiting => GLACIER,
+            Self::Problem | Self::Blocked => WARNING,
+            Self::Info => QUIET,
+        }
+    }
+}
+
+/// Draws a [`StepMark`] centred in `rect`. `phase` (0–1) turns the [`StepMark::Active`] arc; with
+/// `None` the arc stays still, which is how reduced motion shows work in progress.
+pub fn step_mark(painter: &egui::Painter, rect: Rect, mark: StepMark, phase: Option<f32>) {
+    let color = mark.color();
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.5 - 1.5;
+    let thin = Stroke::new(1.5, color);
+    match mark {
+        StepMark::Pending => {
+            painter.circle_stroke(center, radius, Stroke::new(1.5, color));
+        }
+        StepMark::Active => {
+            painter.circle_stroke(center, radius, Stroke::new(2.0, alpha(FROST, 45)));
+            let start = phase.unwrap_or(0.0) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+            let points: Vec<Pos2> = (0..=16)
+                .map(|i| {
+                    let angle = start + i as f32 / 16.0 * std::f32::consts::PI * 1.3;
+                    center + radius * Vec2::new(angle.cos(), angle.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, Stroke::new(2.0, FROST)));
+        }
+        StepMark::Current => {
+            painter.circle_stroke(center, radius, Stroke::new(1.5, color));
+            painter.circle_filled(center, radius * 0.45, color);
+        }
+        StepMark::Done => {
+            painter.circle_filled(center, radius, color);
+            let r = radius * 0.5;
+            painter.add(egui::Shape::line(
+                vec![
+                    center + Vec2::new(-r, 0.05 * r),
+                    center + Vec2::new(-0.25 * r, 0.75 * r),
+                    center + Vec2::new(r, -0.6 * r),
+                ],
+                Stroke::new(2.0, MIDNIGHT),
+            ));
+        }
+        StepMark::Waiting => {
+            painter.circle_stroke(center, radius, thin);
+            painter.line_segment([center, center - Vec2::new(0.0, radius * 0.55)], thin);
+            painter.line_segment([center, center + Vec2::new(radius * 0.45, 0.0)], thin);
+        }
+        StepMark::Problem => {
+            painter.circle_stroke(center, radius, thin);
+            painter.line_segment(
+                [
+                    center - Vec2::new(0.0, radius * 0.5),
+                    center + Vec2::new(0.0, radius * 0.12),
+                ],
+                Stroke::new(2.0, color),
+            );
+            painter.circle_filled(center + Vec2::new(0.0, radius * 0.45), 1.3, color);
+        }
+        StepMark::Blocked => {
+            painter.circle_stroke(center, radius, thin);
+            let r = radius * 0.4;
+            painter.line_segment([center + Vec2::new(-r, -r), center + Vec2::new(r, r)], thin);
+            painter.line_segment([center + Vec2::new(r, -r), center + Vec2::new(-r, r)], thin);
+        }
+        StepMark::Info => {
+            painter.circle_stroke(center, radius, thin);
+            painter.line_segment(
+                [
+                    center - Vec2::new(0.0, radius * 0.1),
+                    center + Vec2::new(0.0, radius * 0.5),
+                ],
+                thin,
+            );
+            painter.circle_filled(center - Vec2::new(0.0, radius * 0.42), 1.2, color);
+        }
+    }
+}
+
+fn focus_ring(ui: &egui::Ui, response: &Response, rect: Rect, radius: f32) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(3.0),
+            radius + 3.0,
+            Stroke::new(1.5, GLACIER),
+            StrokeKind::Outside,
+        );
+    }
+}
+
+/// A quiet text link for secondary actions: Glacier text, underlined while hovered or focused,
+/// never wrapped. Muted and inert when the surrounding `Ui` is disabled.
+pub fn link(ui: &mut egui::Ui, text: &str) -> Response {
+    let enabled = ui.is_enabled();
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        GLACIER,
+    );
+    let padding = Vec2::new(2.0, 6.0);
+    let (rect, response) = ui.allocate_exact_size(galley.size() + 2.0 * padding, Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, enabled, text));
+    if ui.is_rect_visible(rect) {
+        let lit = enabled && (response.hovered() || response.has_focus());
+        let color = if !enabled {
+            alpha(QUIET, 110)
+        } else if lit {
+            ICE
+        } else {
+            GLACIER
+        };
+        let origin = rect.min + padding;
+        let underline_y = origin.y + galley.size().y + 1.0;
+        let width = galley.size().x;
+        ui.painter().galley(origin, galley, color);
+        if lit {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(origin.x, underline_y),
+                    Pos2::new(origin.x + width, underline_y),
+                ],
+                Stroke::new(1.0, color),
+            );
+        }
+        focus_ring(ui, &response, rect, 4.0);
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// An outlined secondary button whose text never wraps.
+pub fn secondary(ui: &mut egui::Ui, text: &str) -> Response {
+    ui.add(
+        egui::Button::new(RichText::new(text).color(ICE))
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .fill(alpha(NAVY, 70))
+            .stroke(Stroke::new(1.0, alpha(GLACIER, 90))),
+    )
+}
+
+/// A selectable tile for choosing one answer among several (a number to match, a computer to
+/// pair with, a statement to confirm). `large` draws short labels big and centred, for numbers.
+/// The tile is `width` wide; its height follows the wrapped label.
+pub fn choice(ui: &mut egui::Ui, label: &str, width: f32, large: bool) -> Response {
+    let enabled = ui.is_enabled();
+    let font = if large {
+        FontId::proportional(30.0)
+    } else {
+        egui::TextStyle::Body.resolve(ui.style())
+    };
+    let padding = if large {
+        Vec2::new(16.0, 16.0)
+    } else {
+        Vec2::new(16.0, 13.0)
+    };
+    let mark = if large { 0.0 } else { 26.0 };
+    let wrap = (width - 2.0 * padding.x - mark).max(40.0);
+    let galley = ui.painter().layout(label.to_owned(), font, ICE, wrap);
+    let height = galley.size().y + 2.0 * padding.y;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    if ui.is_rect_visible(rect) {
+        let lit = enabled && (response.hovered() || response.has_focus());
+        let pressed = enabled && response.is_pointer_button_down_on();
+        let fill = if pressed {
+            alpha(FROST, 60)
+        } else if lit {
+            alpha(NAVY, 200)
+        } else {
+            alpha(NAVY, 110)
+        };
+        let border = if !enabled {
+            alpha(QUIET, 40)
+        } else if lit {
+            FROST
+        } else {
+            alpha(GLACIER, 90)
+        };
+        ui.painter().rect_filled(rect, 10.0, fill);
+        ui.painter()
+            .rect_stroke(rect, 10.0, Stroke::new(1.0, border), StrokeKind::Inside);
+        let text_color = if enabled { ICE } else { alpha(QUIET, 140) };
+        if large {
+            let at = rect.center() - galley.size() * 0.5;
+            ui.painter().galley(at, galley, text_color);
+        } else {
+            let ring = Rect::from_center_size(
+                Pos2::new(rect.left() + padding.x + 8.0, rect.top() + padding.y + 9.0),
+                Vec2::splat(16.0),
+            );
+            ui.painter().circle_stroke(
+                ring.center(),
+                7.0,
+                Stroke::new(1.5, if lit { FROST } else { alpha(GLACIER, 160) }),
+            );
+            if pressed {
+                ui.painter().circle_filled(ring.center(), 3.5, FROST);
+            }
+            let at = Pos2::new(rect.left() + padding.x + mark, rect.top() + padding.y);
+            ui.painter().galley(at, galley, text_color);
+        }
+        focus_ring(ui, &response, rect, 10.0);
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// One option of a single choice, drawn as a tile with a radio ring. The ring is outlined in
+/// Glacier even when nothing is chosen, so an unselected option is always visibly selectable.
+pub fn option(ui: &mut egui::Ui, selected: bool, label: &str, width: f32) -> Response {
+    let enabled = ui.is_enabled();
+    let padding = Vec2::new(16.0, 14.0);
+    let ring_space = 26.0;
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui.painter().layout(
+        label.to_owned(),
+        font,
+        ICE,
+        (width - 2.0 * padding.x - ring_space).max(40.0),
+    );
+    let height = galley.size().y.max(18.0) + 2.0 * padding.y;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::RadioButton, enabled, selected, label)
+    });
+    if ui.is_rect_visible(rect) {
+        let lit = enabled && (response.hovered() || response.has_focus());
+        let fill = if selected {
+            alpha(FROST, 28)
+        } else if lit {
+            alpha(NAVY, 190)
+        } else {
+            alpha(NAVY, 100)
+        };
+        let border = if selected {
+            FROST
+        } else if lit {
+            alpha(GLACIER, 200)
+        } else {
+            alpha(GLACIER, 70)
+        };
+        ui.painter().rect_filled(rect, 10.0, fill);
+        ui.painter()
+            .rect_stroke(rect, 10.0, Stroke::new(1.0, border), StrokeKind::Inside);
+        let ring = Pos2::new(rect.left() + padding.x + 9.0, rect.top() + padding.y + 9.0);
+        ui.painter().circle_stroke(
+            ring,
+            8.0,
+            Stroke::new(1.5, if selected { FROST } else { GLACIER }),
+        );
+        if selected {
+            ui.painter().circle_filled(ring, 4.0, FROST);
+        }
+        ui.painter().galley(
+            Pos2::new(rect.left() + padding.x + ring_space, rect.top() + padding.y),
+            galley,
+            if enabled { ICE } else { alpha(QUIET, 140) },
+        );
+        focus_ring(ui, &response, rect, 10.0);
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// A labelled on/off switch whose label wraps to `width`. It reports clicks and never flips
+/// `on` itself: the caller decides. Off, the track is outlined in Glacier, so it reads as a
+/// control without hovering.
+pub fn toggle(ui: &mut egui::Ui, on: bool, label: &str, width: f32) -> Response {
+    let enabled = ui.is_enabled();
+    let track_size = Vec2::new(38.0, 22.0);
+    let gap = 10.0;
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui.painter().layout(
+        label.to_owned(),
+        font,
+        ICE,
+        (width - track_size.x - gap).max(40.0),
+    );
+    let height = galley.size().y.max(track_size.y) + 8.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, on, label));
+    if ui.is_rect_visible(rect) {
+        let lit = enabled && (response.hovered() || response.has_focus());
+        let track = Rect::from_min_size(Pos2::new(rect.left(), rect.top() + 4.0), track_size);
+        ui.painter().rect_filled(
+            track,
+            11.0,
+            if on {
+                alpha(FROST, 90)
+            } else {
+                alpha(NAVY, 150)
+            },
+        );
+        ui.painter().rect_stroke(
+            track,
+            11.0,
+            Stroke::new(
+                1.5,
+                if on {
+                    FROST
+                } else if !enabled {
+                    alpha(QUIET, 90)
+                } else {
+                    GLACIER
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        let knob_x = if on {
+            track.right() - 11.0
+        } else {
+            track.left() + 11.0
+        };
+        ui.painter().circle_filled(
+            Pos2::new(knob_x, track.center().y),
+            7.0,
+            if on { ICE } else { alpha(QUIET, 150) },
+        );
+        let text_color = if !enabled {
+            alpha(QUIET, 140)
+        } else if lit {
+            ICE
+        } else {
+            alpha(ICE, 235)
+        };
+        ui.painter().galley(
+            Pos2::new(track.right() + gap, rect.top() + 4.0 + 1.0),
+            galley,
+            text_color,
+        );
+        focus_ring(ui, &response, rect, 6.0);
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// A slim segmented progress strip: `done` segments filled, the `current` one highlighted.
+pub fn progress_strip(painter: &egui::Painter, rect: Rect, done: &[bool], current: Option<usize>) {
+    let count = done.len().max(1) as f32;
+    let gap = 6.0;
+    let width = ((rect.width() - gap * (count - 1.0)) / count).max(2.0);
+    for (index, finished) in done.iter().enumerate() {
+        let left = rect.left() + index as f32 * (width + gap);
+        let segment =
+            Rect::from_min_size(Pos2::new(left, rect.top()), Vec2::new(width, rect.height()));
+        let color = if *finished {
+            FROST
+        } else if current == Some(index) {
+            GLACIER
+        } else {
+            alpha(QUIET, 55)
+        };
+        painter.rect_filled(segment, rect.height() * 0.5, color);
+    }
+}
+
+/// A small gear, for the settings affordance.
+pub fn gear(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.5;
+    let stroke = Stroke::new(1.5, color);
+    for tooth in 0..8 {
+        let angle = tooth as f32 * std::f32::consts::TAU / 8.0;
+        let direction = Vec2::new(angle.cos(), angle.sin());
+        painter.line_segment(
+            [
+                center + direction * radius * 0.62,
+                center + direction * radius * 0.95,
+            ],
+            Stroke::new(2.4, color),
+        );
+    }
+    painter.circle_stroke(center, radius * 0.62, stroke);
+    painter.circle_stroke(center, radius * 0.25, stroke);
+}

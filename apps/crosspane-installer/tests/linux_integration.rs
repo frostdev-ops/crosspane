@@ -3285,71 +3285,68 @@ mod flow {
             self.run_menu();
         }
 
-        /// Install, restart and look at the agent; stop at the network step's waiting state.
+        /// Start setup, then let it install, restart and look at the agent by itself; stop at
+        /// the network step's waiting state.
         pub fn install(&mut self) {
             self.until("the welcome screen", |f| {
                 f.view().screen == ScreenId::Welcome
             });
+            for _ in 0..20 {
+                self.answer_status();
+                self.advance(PACE_MS);
+                self.tick();
+            }
+            assert!(
+                !super::calls(&self.w)
+                    .iter()
+                    .any(|c| c.starts_with("payload.apply")),
+                "nothing is installed before the person starts setup"
+            );
             self.go_next();
             self.until("support verified", |f| f.verified(10));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::InstallPlan);
-            self.until("a payload preview to consent to", |f| {
-                f.has_button(live::ids::consent(StepId(20)))
-            });
-            let preview = self.view().message.clone();
-            assert!(preview.contains("0.0.1"), "{preview}");
-            self.click(live::ids::consent(StepId(20)));
+            // From here the install page carries on by itself: no further click.
             self.until("files installed", |f| f.verified(20));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Installing);
-            self.until("a startup preview", |f| {
-                f.has_button(live::ids::consent(StepId(21)))
-            });
-            self.click(live::ids::consent(StepId(21)));
             self.until("startup done", |f| f.verified(21));
             // Installed, not ready: only support, files and startup are done.
             assert_eq!(self.view().summary, SummaryView::InstalledWaiting);
-            self.until("a restart preview", |f| {
-                f.has_button(live::ids::consent(StepId(22)))
-            });
-            self.click(live::ids::consent(StepId(22)));
             self.until("the restart verified against a fresh status", |f| {
                 f.verified(22)
             });
             self.until("the agent verified", |f| f.verified(23));
         }
 
+        /// The screen the flow is on now, letting a finished screen move on by itself first.
+        pub fn reach(&mut self, screen: ScreenId) {
+            self.until(&format!("the {screen:?} screen"), |f| {
+                f.view().screen == screen
+            });
+        }
+
         pub fn network_then_pair(&mut self) {
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Network);
+            self.reach(ScreenId::Network);
             self.until("the network step to wait for traffic", |f| {
                 f.row(30).state == RowState::Waiting
             });
-            // Next stays available: the network is proved by the other computer connecting.
-            assert!(self.has_button(live::ids::NEXT));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Connect);
+            // Nothing to answer there: the network is proved by the other computer connecting,
+            // so the screen moves on by itself.
+            self.reach(ScreenId::Connect);
             self.pair_externally(&[]);
             self.until("pairing verified from status", |f| f.verified(60));
             self.until("the network proved by the connection", |f| f.verified(30));
         }
 
         pub fn arrange(&mut self) {
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Grants);
+            self.reach(ScreenId::Grants);
             self.pair_externally(&["browse", "input", "present", "share", "speaker"]);
             self.until("grants verified", |f| f.verified(61));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Layout);
+            self.reach(ScreenId::Layout);
             self.place();
             self.until("a layout to accept", |f| {
                 f.has_button(live::ids::LAYOUT_ACCEPT)
             });
             self.click(live::ids::LAYOUT_ACCEPT);
             self.until("layout committed", |f| f.verified(62));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Practice);
+            self.reach(ScreenId::Practice);
         }
 
         pub fn summary(&self) -> SummaryView {
@@ -3432,12 +3429,13 @@ fn the_full_linux_install_pairing_practice_and_final_health_reach_ready_only_at_
         "nothing is practised yet"
     );
     f.practise_everything();
-    f.go_next();
+    f.reach(crosspane_installer::view::ScreenId::Summary);
     f.until("final fresh health", |f| {
         f.summary() == SummaryView::WorkspaceReady
     });
-    // Every mutation had its own consent: nothing destructive ran without a click, and the
-    // service commands were the previewed ones in order.
+    // The install inside the person's account went ahead on the start click, each step against
+    // its own preview, and the service commands were the previewed ones in order. Nothing that
+    // needs more than that (the firewall, removal) ran without its own click.
     let calls = calls(f.world());
     assert!(calls.contains(&"payload.apply".to_owned()));
     assert!(calls.contains(&"service.Enable".to_owned()));
@@ -3805,11 +3803,11 @@ fn a_repair_waiting_for_the_old_agents_clean_exit_cannot_be_closed() {
 #[test]
 fn the_network_step_is_never_verified_by_a_rule_or_command_alone() {
     let mut f = flow::Flow::new();
-    f.install();
-    f.go_next();
     // Active ufw without the rule: the exact rule is offered, applied only after consent, and
     // even after the command succeeds the step stays waiting until traffic is observed.
     f.world().lock().unwrap().fw_read = reading(Some(true), RulePresence::Absent);
+    f.install();
+    f.reach(crosspane_installer::view::ScreenId::Network);
     f.until("a network preview", |f| {
         f.has_button(live::ids::consent(StepId(30)))
     });
@@ -3817,11 +3815,35 @@ fn the_network_step_is_never_verified_by_a_rule_or_command_alone() {
         f.row(30).state,
         crosspane_installer::view::RowState::Verified
     );
+    // The firewall change never goes ahead by itself, and its question holds the screen.
+    for _ in 0..3 {
+        f.status_once();
+    }
+    assert!(
+        !calls(f.world())
+            .iter()
+            .any(|c| c.starts_with("firewall.apply"))
+    );
+    assert_eq!(
+        f.view().screen,
+        crosspane_installer::view::ScreenId::Network
+    );
+    assert!(
+        f.view().message.contains("pkexec /usr/bin/ufw"),
+        "the exact command is shown before consent: {}",
+        f.view().message
+    );
     f.click(live::ids::consent(StepId(30)));
+    // After the command the step waits for traffic, and (still without traffic) looks again;
+    // either way it is never verified by the command.
     f.until("the command to finish", |f| {
-        f.row(30).state == crosspane_installer::view::RowState::Waiting
+        calls(f.world()).contains(&"firewall.apply".to_owned())
+            && matches!(
+                f.row(30).state,
+                crosspane_installer::view::RowState::Waiting
+                    | crosspane_installer::view::RowState::NeedsAction
+            )
     });
-    assert!(calls(f.world()).contains(&"firewall.apply".to_owned()));
     assert_ne!(
         f.row(30).state,
         crosspane_installer::view::RowState::Verified

@@ -123,6 +123,39 @@ pub struct LiveController {
     /// The latest finished support checklist the platform reported, and when this controller
     /// first saw that pass (its own clock, so "checked N s ago" never mixes clocks).
     pub(super) support_checks: Option<(SupportChecklist, u64)>,
+    /// The person started setup from the welcome screen. That click is the go-ahead for the
+    /// install steps that only touch their own account; nothing is changed before it.
+    pub(super) install_started: bool,
+    /// The current screen moves on by itself once everything on it is done. Off after the person
+    /// went back to it, so a deliberate visit isn't cut short.
+    pub(super) auto_advance: bool,
+    /// When the current screen was first seen complete.
+    pub(super) complete_since: Option<u64>,
+    /// The last own Status came from an agent too old to report its health, so whether it is in
+    /// use (and what a restart would interrupt) can't be known.
+    pub(super) agent_health_pending: bool,
+}
+
+/// How long a finished screen stays up before the next one, so its last check is seen.
+const ADVANCE_PAUSE_MS: u64 = 700;
+
+/// The screens of the user-scope installation. Their changes stay inside the person's own
+/// account (no administrator, no system permission, no firewall), so once setup is started
+/// they run without asking again. Steps on every other screen ask first.
+pub(super) fn automatic_screen(screen: ScreenId) -> bool {
+    matches!(
+        screen,
+        ScreenId::Compatibility | ScreenId::InstallPlan | ScreenId::Installing
+    )
+}
+
+/// Screens that move on by themselves once complete. The welcome, the numbers comparison, the
+/// summary and maintenance always wait for the person.
+fn advances_by_itself(screen: ScreenId) -> bool {
+    !matches!(
+        screen,
+        ScreenId::Welcome | ScreenId::MatchNumbers | ScreenId::Summary | ScreenId::RepairRemove
+    )
 }
 
 impl std::fmt::Debug for LiveController {
@@ -132,13 +165,35 @@ impl std::fmt::Debug for LiveController {
 }
 
 pub(super) fn bounded(text: impl Into<String>) -> String {
-    let mut text: String = text
-        .into()
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if text.len() > MAX_TEXT {
-        let mut end = MAX_TEXT;
+    bound(
+        text.into()
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c }),
+        MAX_TEXT,
+    )
+}
+
+/// [`bounded`] for text shown as paragraphs (messages and consent previews): line breaks are
+/// kept, so an exact command stays on a line of its own, and the bound is roomier, so a preview
+/// is never cut short of the command it asks consent for.
+pub(super) fn bounded_lines(text: impl Into<String>) -> String {
+    bound(
+        text.into().chars().map(|c| match c {
+            '\n' => '\n',
+            c if c.is_control() => ' ',
+            c => c,
+        }),
+        MAX_MESSAGE,
+    )
+}
+
+/// The longest message or preview shown.
+const MAX_MESSAGE: usize = 2_400;
+
+fn bound(chars: impl Iterator<Item = char>, max: usize) -> String {
+    let mut text: String = chars.collect();
+    if text.len() > max {
+        let mut end = max;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -188,6 +243,10 @@ impl LiveController {
             change_since: None,
             step_apply_calls: BTreeMap::new(),
             support_checks: None,
+            install_started: false,
+            auto_advance: true,
+            complete_since: None,
+            agent_health_pending: false,
         };
         controller.view.demo = false;
         controller.rebuild_view();
@@ -501,7 +560,7 @@ impl LiveController {
                 needs_action,
             },
             (JobStage::Plan, NativeOutcome::Planned { preview }) => {
-                self.previews.insert(step, bounded(preview));
+                self.previews.insert(step, bounded_lines(preview));
                 FlowEvent::Planned { step, operation }
             }
             (JobStage::Apply, NativeOutcome::Applied(outcome)) => FlowEvent::Applied {
@@ -621,12 +680,19 @@ impl LiveController {
                     reply: reply.clone(),
                 });
                 if own {
+                    self.agent_health_pending = false;
                     let samples = self.samples(snapshot, reply.source, reply.observed_at_ms);
                     let _ = self.reduce(FlowEvent::Observe { samples });
                 }
             }
             _ => {
                 if own {
+                    self.agent_health_pending = matches!(
+                        reply.result,
+                        Ok(DecodedReply::Status(
+                            StatusAdmission::PendingHealthContract(_)
+                        ))
+                    );
                     self.health = None;
                     let _ = self.reduce(FlowEvent::Observe {
                         samples: Vec::new(),
@@ -729,6 +795,95 @@ impl LiveController {
         }
     }
 
+    /// The install steps go ahead on their own once the person has started setup: each one is
+    /// still planned and previewed, and the consent the platform requires is the person's start
+    /// click, recorded against that exact preview. Never for steps that need an administrator, a
+    /// system permission or a firewall change, and never while the agent is in use (a restart or
+    /// replacement would cut that short): then the step asks, with its preview, like any other.
+    fn auto_consent(&mut self) {
+        if !self.install_started || !automatic_screen(self.screen) || !self.agent_quiet() {
+            return;
+        }
+        let ready: Vec<StepId> = self
+            .graph
+            .on_screen(self.screen)
+            .filter(|m| m.kind == StepKind::Native)
+            .filter(|m| {
+                self.step_state(m.id) == StepState::NeedsAction
+                    && self.previews.contains_key(&m.id)
+                    && self.job(m.id, JobStage::Plan).is_some()
+            })
+            .map(|m| m.id)
+            .collect();
+        for step in ready {
+            self.consent_click(step);
+        }
+        self.dispatch_intents();
+    }
+
+    /// Whether nothing the person is doing right now would be interrupted by a restart: no input
+    /// is shared, no window is projected and no sound is playing across. An agent that can't
+    /// report this (too old) counts as in use.
+    pub(super) fn agent_quiet(&self) -> bool {
+        if self.agent_health_pending {
+            return false;
+        }
+        let Some(health) = self.health.as_ref().map(|h| h.snapshot.as_ref()) else {
+            return true;
+        };
+        let terminal = health.terminal();
+        terminal.controlling.is_none()
+            && terminal.controlled_by.is_none()
+            && terminal.projections.is_empty()
+            && health.installer().audio.active_peers.is_empty()
+    }
+
+    /// Whether everything on the current screen is done, so it can move on by itself. A step that
+    /// is asking a question (even an optional one) holds the screen until it is answered.
+    fn screen_settled(&self) -> bool {
+        if self.screen == ScreenId::Practice {
+            return self
+                .graph
+                .practice_steps()
+                .iter()
+                .all(|step| self.satisfied(*step));
+        }
+        self.screen_complete(self.screen)
+            && !self
+                .graph
+                .on_screen(self.screen)
+                .any(|m| self.step_state(m.id) == StepState::NeedsAction)
+    }
+
+    /// Move on from a finished screen without a click. Screens of one page follow each other at
+    /// once; a new page comes after a short pause so the last check is seen.
+    fn auto_advance_tick(&mut self) {
+        let eligible = self.auto_advance
+            && advances_by_itself(self.screen)
+            && self.display_screen() == self.screen
+            && !self.mutation_in_flight()
+            && self.screen_settled();
+        if !eligible {
+            self.complete_since = None;
+            return;
+        }
+        let Some(next) = self.next_screen() else {
+            return;
+        };
+        let since = *self.complete_since.get_or_insert(self.now);
+        let pause = if automatic_screen(self.screen) && automatic_screen(next) {
+            0
+        } else {
+            ADVANCE_PAUSE_MS
+        };
+        if self.now >= since.saturating_add(pause) {
+            self.go(next);
+            // Start looking at the new screen's steps in this same pass.
+            self.auto_begin();
+            self.dispatch_intents();
+        }
+    }
+
     pub(super) fn begin(&mut self, step: StepId) {
         self.auto_begun.insert(step, self.now);
         self.details.remove(&step);
@@ -816,8 +971,15 @@ impl LiveController {
             if self.screen == ScreenId::Layout {
                 self.effects.push(ShellEffect::CancelLayoutDrag);
             }
+            if self.screen == ScreenId::Connect {
+                self.connect.leave();
+            }
             self.screen = screen;
             self.notice = None;
+            self.complete_since = None;
+            // Going forward (or anywhere else) lets the new screen move on by itself; `back`
+            // turns that off again for the screen it returns to.
+            self.auto_advance = true;
             if screen == ScreenId::RepairRemove {
                 self.inspect_maintenance();
             }
@@ -935,6 +1097,13 @@ impl InstallerController for LiveController {
         self.connect_tick();
         self.auto_begin();
         self.dispatch_intents();
+        self.auto_consent();
+        // A change started in this pass is guarded from now, not from the next pass.
+        if self.change_since.is_none() && self.native_change_running() {
+            self.change_since = Some(self.now);
+        }
+        self.refresh_summary();
+        self.auto_advance_tick();
         self.refresh_summary();
         self.rebuild_view();
         ControllerTick {

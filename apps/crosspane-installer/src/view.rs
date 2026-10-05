@@ -82,11 +82,21 @@ pub enum HidingChoice {
     Mirror,
 }
 
+/// How a button is drawn. A screen offers at most one `Primary`: the answer to its current
+/// question. Everything else is quieter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ButtonKind {
+    /// The one filled action in the footer.
     Primary,
+    /// An outlined action in the footer, next to the primary one.
     Secondary,
+    /// An outlined action in warning red, in the footer.
     Destructive,
+    /// A quiet text link under the content, for other ways to do the same thing.
+    Link,
+    /// A tile in the content, one of several answers to pick from (a number to match, a
+    /// computer to pair with, a statement to confirm).
+    Choice,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +198,9 @@ pub struct WizardView {
     pub progress: ProgressView,
     pub illustration: IllustrationView,
     pub demo: bool,
+    /// The heading over the screen's [`ButtonKind::Link`] actions, such as "Other ways to
+    /// connect". Without one the links stand on their own.
+    pub link_caption: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -229,11 +229,17 @@ pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
                 .font
                 .as_deref()
                 .context("Missing explicit review font")?;
+            // A named screen may be one of its review variants (see `demo::VARIANTS`).
+            let controller = match options.screen.as_deref() {
+                Some(name) => DisconnectedController::named(name)
+                    .with_context(|| format!("Unknown demo screen: {name}"))?,
+                None => DisconnectedController::new(Some(screen)),
+            };
             run_gui(
                 options.screenshot,
                 brand,
                 load_review_font(font)?,
-                Box::new(DisconnectedController::new(Some(screen))),
+                Box::new(controller),
             )
         }
         LaunchMode::Refused => {

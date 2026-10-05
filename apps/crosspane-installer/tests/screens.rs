@@ -250,6 +250,21 @@ fn key(key: Key, shift: bool) -> Event {
     }
 }
 
+/// The buttons drawn in the fixed footer: Back, and every outlined or filled action. Links and
+/// choices belong to the scrolling content.
+fn footer(view: &WizardView) -> Vec<&ButtonView> {
+    view.buttons
+        .iter()
+        .filter(|button| {
+            button.role == ButtonRole::Back
+                || matches!(
+                    button.kind,
+                    ButtonKind::Primary | ButtonKind::Secondary | ButtonKind::Destructive
+                )
+        })
+        .collect()
+}
+
 #[test]
 fn all_fifteen_screens_render_with_demo_label_and_supplied_state_at_both_sizes() {
     for size in [egui::vec2(1100.0, 760.0), egui::vec2(800.0, 600.0)] {
@@ -266,14 +281,121 @@ fn all_fifteen_screens_render_with_demo_label_and_supplied_state_at_both_sizes()
             );
             assert!(harness.texts().iter().any(|(text, _)| text == &view.title));
             assert_eq!(view, before);
-            for button in &view.buttons {
+            for button in footer(&view) {
                 assert!(
                     harness.rect(&button.label).max.y <= size.y,
                     "Footer escaped viewport on {screen:?}"
                 );
             }
+            // A screen asks one question at a time: never more than one filled button.
+            assert!(
+                view.buttons
+                    .iter()
+                    .filter(|button| button.kind == ButtonKind::Primary)
+                    .count()
+                    <= 1,
+                "{screen:?} has several primary buttons"
+            );
+        }
+        for (name, _) in demo::VARIANTS {
+            let view = demo::fixture_named(name).unwrap();
+            harness.settle(&view);
+            assert!(harness.texts().iter().any(|(text, _)| text == &view.title));
+            for button in footer(&view) {
+                assert!(
+                    harness.rect(&button.label).max.y <= size.y,
+                    "Footer escaped viewport on {name}"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn rows_read_as_marks_and_plain_words_without_status_vocabulary() {
+    let mut harness = Harness::review(egui::vec2(1100.0, 760.0));
+    for (screen, _) in demo::SCREENS {
+        let view = demo::fixture(screen);
+        harness.settle(&view);
+        for word in [
+            "Needs your action",
+            "Verified",
+            "Working",
+            "Waiting",
+            "Unsupported",
+            "Not checked",
+        ] {
+            assert!(
+                !harness.texts().iter().any(|(text, _)| text == word),
+                "{screen:?} shows the status word {word:?}"
+            );
+        }
+    }
+    // A failure reads as its own sentence, next to the fix.
+    let view = demo::fixture_named("install-failed").unwrap();
+    harness.settle(&view);
+    let failed = view
+        .rows
+        .iter()
+        .find(|row| row.state == RowState::Failed)
+        .unwrap();
+    assert!(
+        harness
+            .texts()
+            .iter()
+            .any(|(text, _)| text == &failed.detail)
+    );
+    assert_eq!(
+        footer(&view)
+            .iter()
+            .find(|button| button.kind == ButtonKind::Primary)
+            .map(|button| button.label.as_str()),
+        Some("Try again")
+    );
+}
+
+#[test]
+fn footer_buttons_never_wrap_and_move_to_a_new_row_when_narrow() {
+    let mut harness = Harness::review(egui::vec2(800.0, 600.0));
+    let mut view = demo::fixture(ScreenId::RepairRemove);
+    for (id, label) in [
+        (40, "Look for computers nearby"),
+        (41, "Reconnect a computer paired before"),
+        (42, "Let the other computer join"),
+    ] {
+        view.buttons.push(ButtonView {
+            id,
+            role: ButtonRole::Ordinary,
+            label: label.into(),
+            enabled: true,
+            kind: ButtonKind::Secondary,
+        });
+    }
+    harness.settle(&view);
+    let line_height = harness.raw_text("Back").0.height();
+    let mut tops = Vec::new();
+    for button in footer(&view) {
+        let (raw, clip, text) = harness.raw_text(&button.label);
+        assert_eq!(
+            text.galley.rows.len(),
+            1,
+            "{:?} wrapped inside its button",
+            button.label
+        );
+        assert!(raw.height() < line_height * 1.6);
+        assert!(
+            clip.contains_rect(raw) && raw.right() <= 800.0,
+            "{:?} overflows",
+            button.label
+        );
+        tops.push(raw.top());
+    }
+    tops.sort_by(f32::total_cmp);
+    tops.dedup_by(|a, b| (*a - *b).abs() < 2.0);
+    assert!(
+        tops.len() >= 2,
+        "the buttons that don't fit move to another row"
+    );
 }
 
 #[test]
@@ -283,12 +405,12 @@ fn enabled_disabled_buttons_emit_only_rendered_revision() {
     view.revision = 42;
     view.buttons[0].enabled = false;
     harness.settle(&view);
-    assert!(harness.click(&view, "Continue").is_empty());
+    assert!(harness.click(&view, "Start setup").is_empty());
     view.buttons[0].enabled = true;
     view.revision = 43;
     harness.settle(&view);
     assert_eq!(
-        harness.click(&view, "Continue"),
+        harness.click(&view, "Start setup"),
         vec![WizardAction {
             revision: 43,
             intent: WizardIntent::Button(1)
@@ -376,11 +498,16 @@ fn literal_privacy_copy_and_global_removal_checkbox_are_present() {
 #[test]
 fn address_edit_is_single_line_bounded_and_passive_updates_retain_focus() {
     let mut harness = Harness::new(egui::vec2(800.0, 600.0));
-    let mut view = demo::fixture(ScreenId::Connect);
-    // Keep the address visible; the unrelated waiting row is supplied independently.
-    view.rows.clear();
+    // The address field appears only once the person chose to type one.
+    assert!(
+        !demo::fixture(ScreenId::Connect)
+            .fields
+            .iter()
+            .any(|field| matches!(field, FieldView::PeerAddress { .. }))
+    );
+    let mut view = demo::fixture_named("connect-address").unwrap();
     harness.settle(&view);
-    harness.click(&view, "Address of the other machine");
+    harness.click(&view, "For example 192.168.1.20:47811");
     let focused = harness.ctx.memory(|memory| memory.focused());
     let actions = harness.frame(&view, vec![Event::Text("peer.example".into())]);
     assert_eq!(
@@ -415,7 +542,7 @@ fn tab_shift_tab_focused_enter_and_explicit_escape_mapping() {
             .frame(&view, vec![key(Key::Enter, false)])
             .is_empty()
     );
-    harness.focus_label(&view, "Continue");
+    harness.focus_label(&view, "Start setup");
     let focused = harness.ctx.memory(|memory| memory.focused()).unwrap();
     harness.frame(&view, vec![key(Key::Tab, false)]);
     let next = harness.ctx.memory(|memory| memory.focused()).unwrap();
@@ -455,7 +582,7 @@ fn changed_plan_clears_button_focus_and_discards_queued_enter() {
     let mut harness = Harness::new(egui::vec2(800.0, 600.0));
     let mut view = demo::fixture(ScreenId::Welcome);
     harness.settle(&view);
-    harness.focus_label(&view, "Continue");
+    harness.focus_label(&view, "Start setup");
     let old = harness.ctx.memory(|memory| memory.focused()).unwrap();
     view.revision = 2;
     view.buttons[0].label = "Remove a different target".into();
@@ -492,7 +619,7 @@ fn disabled_controls_are_skipped_and_choices_are_keyboard_reachable() {
     );
     for _ in 0..16 {
         harness.frame(&view, vec![key(Key::Tab, false)]);
-        assert!(!harness.focused_label("Continue"));
+        assert!(!harness.focused_label("Apply and restart Crosspane"));
         assert!(!harness.focused_label("Back"));
     }
 }
@@ -518,10 +645,10 @@ fn keyboard_scrolls_long_content_while_release_and_stop_remain_visible() {
     harness.settle(&view);
     let after = harness.texts();
     assert_ne!(before, after);
-    assert!(harness.rect("Release control").max.y <= 600.0);
-    assert!(harness.rect("Stop practice").max.y <= 600.0);
+    assert!(harness.rect("Play the test sound").max.y <= 600.0);
+    assert!(harness.rect("Stop this practice").max.y <= 600.0);
     assert_eq!(
-        harness.click(&view, "Release control"),
+        harness.click(&view, "Play the test sound"),
         vec![WizardAction {
             revision: 1,
             intent: WizardIntent::Button(6)
@@ -779,57 +906,65 @@ fn progress_uses_supplied_groups_and_the_actual_viewport_breakpoint() {
         };
         harness.settle(&view);
         let texts = harness.texts();
+        let labels = [
+            "Install",
+            "Permissions",
+            "Connect",
+            "Arrange",
+            "Practice",
+            "Ready",
+        ];
+        // Progress reads by marks, not by "Current"/"Completed" words.
+        for word in ["Current", "Completed", "Current: Arrange"] {
+            assert!(!texts.iter().any(|(text, _)| text == word));
+        }
+        // The narrow strip: six slim segments, the completed one Frost, the current Glacier.
+        let segments: Vec<egui::Color32> = harness
+            .shapes()
+            .into_iter()
+            .filter_map(|(shape, _)| match shape {
+                egui::epaint::Shape::Rect(rect)
+                    if (rect.rect.height() - 4.0).abs() < 0.5 && rect.rect.width() > 40.0 =>
+                {
+                    Some(rect.fill)
+                }
+                _ => None,
+            })
+            .collect();
         if size.x == 1100.0 {
-            for label in [
-                "Install",
-                "Permissions / Network",
-                "Connect",
-                "Arrange",
-                "Practice",
-                "Ready",
-            ] {
-                assert!(texts.iter().any(|(text, _)| text == label));
+            for label in labels {
+                assert!(texts.iter().any(|(text, _)| text == label), "{label}");
             }
-            assert_eq!(
-                texts.iter().filter(|(text, _)| text == "Completed").count(),
-                1
-            );
-            assert_eq!(
-                texts.iter().filter(|(text, _)| text == "Current").count(),
-                1
-            );
-            assert!(!texts.iter().any(|(text, _)| text == "Current: Arrange"));
+            assert!(segments.is_empty(), "the rail replaces the strip");
         } else {
-            assert!(texts.iter().any(|(text, _)| text == "Current: Arrange"));
-            assert!(
-                texts
-                    .iter()
-                    .any(|(text, _)| text == "1 of 6 groups completed")
-            );
-            assert!(
-                !texts
-                    .iter()
-                    .any(|(text, _)| text == "Permissions / Network")
-            );
+            for label in labels {
+                assert!(
+                    !texts.iter().any(|(text, _)| text == label),
+                    "the narrow layout has no rail: {label}"
+                );
+            }
+            assert_eq!(segments.len(), 6);
+            assert_eq!(segments.iter().filter(|c| **c == theme::FROST).count(), 1);
+            assert_eq!(segments.iter().filter(|c| **c == theme::GLACIER).count(), 1);
         }
     }
 }
 
 #[test]
-fn compact_fixtures_show_the_whole_first_state_card_without_scrolling() {
+fn compact_fixtures_show_the_first_step_and_the_footer_without_scrolling() {
     for (screen, _) in demo::SCREENS {
         let mut harness = Harness::review(egui::vec2(800.0, 600.0));
         let view = demo::fixture(screen);
         let before = view.clone();
         harness.settle(&view);
         if let Some(first) = view.rows.first() {
-            let (card, body_clip) = harness.card(&first.label);
-            assert!(
-                body_clip.expand(1.0).contains_rect(card),
-                "First {screen:?} card {card:?} escaped body {body_clip:?}"
-            );
-            for label in [&first.label, &first.detail] {
-                // Match the text inside this card, not Audio's duplicate outside privacy copy.
+            let (card, _) = harness.card(&first.label);
+            let mut labels = vec![&first.label];
+            if !matches!(first.state, RowState::Verified | RowState::Unchecked) {
+                labels.push(&first.detail);
+            }
+            for label in labels {
+                // Match the text inside the card, not Audio's duplicate outside privacy copy.
                 assert!(
                     harness.shapes().iter().any(|(shape, clip)| match shape {
                         egui::epaint::Shape::Text(text) if text.galley.text() == label => {
@@ -838,18 +973,14 @@ fn compact_fixtures_show_the_whole_first_state_card_without_scrolling() {
                         }
                         _ => false,
                     }),
-                    "First {screen:?} card has a clipped {label:?}"
+                    "First {screen:?} step has a clipped {label:?}"
                 );
             }
         }
         assert_eq!(view, before);
-        for button in &view.buttons {
-            assert!(
-                harness
-                    .raw_text(&button.label)
-                    .1
-                    .contains_rect(harness.raw_text(&button.label).0)
-            );
+        for button in footer(&view) {
+            let (raw, clip, _) = harness.raw_text(&button.label);
+            assert!(clip.contains_rect(raw), "{screen:?}: {}", button.label);
         }
     }
 }
@@ -900,27 +1031,27 @@ fn overflow_has_a_dormant_solid_track_and_handle_and_keeps_fixed_actions_visible
         harness.settle(&view);
         let (track, handle) =
             solid_scrollbar(&harness).expect("Overflow must show a solid dormant scrollbar");
-        let (card, body_clip) = harness.card(&view.rows[0].label);
-        assert!(
-            track.left() >= card.right() + 2.0,
-            "Scrollbar floats over the content: track {track:?}, card {card:?}, clip {body_clip:?}"
-        );
+        let (message, body_clip, _) = harness.raw_text(&view.message);
+        // No text of the scrolling body sits under the scrollbar.
+        for (text, rect) in harness.texts() {
+            if body_clip.contains_rect(rect) && rect.top() < track.bottom() {
+                assert!(
+                    rect.right() <= track.left() + 0.5,
+                    "Scrollbar floats over {text:?}: track {track:?}, text {rect:?}"
+                );
+            }
+        }
         assert!(handle.height() < track.height());
-        let content_top = if size.y == 600.0 {
-            card.top()
-        } else {
-            harness.raw_text(&view.message).0.top()
-        };
         assert!(
-            (content_top - body_clip.top()).abs() <= 4.0,
-            "Overflow must stay top-aligned: content {content_top}, body {body_clip:?}"
+            (message.top() - body_clip.top()).abs() <= 4.0,
+            "Overflow must stay top-aligned: content {message:?}, body {body_clip:?}"
         );
-        for label in ["Release control", "Stop practice"] {
+        for label in ["Play the test sound", "Stop this practice"] {
             let (raw, clip, _) = harness.raw_text(label);
             assert!(clip.contains_rect(raw) && raw.bottom() <= size.y);
         }
         let mut short = Harness::review(size);
-        let mut short_view = demo::fixture(ScreenId::Welcome);
+        let mut short_view = demo::fixture(ScreenId::Connect);
         // The full welcome paragraph can overflow with a wider system font.
         // Keep this no-overflow control intentionally short for every font.
         short_view.message = "Short body".into();
@@ -956,7 +1087,7 @@ fn body_content_bounds(harness: &Harness, clip: Rect) -> Rect {
 }
 
 #[test]
-fn short_whole_bodies_with_choices_and_controls_are_centered_at_review_size() {
+fn short_bodies_with_choices_and_controls_leave_no_dead_space_at_review_size() {
     for (screen, include_row) in [
         (ScreenId::MatchNumbers, false),
         (ScreenId::HidingChoice, false),
@@ -983,30 +1114,35 @@ fn short_whole_bodies_with_choices_and_controls_are_centered_at_review_size() {
             body_clip.expand(1.0).contains_rect(bounds),
             "Short {screen:?} body overflows: {bounds:?} in {body_clip:?}"
         );
-        let top = bounds.top() - body_clip.top();
-        let bottom = body_clip.bottom() - bounds.bottom();
+        // No dead space: the content starts under the title, and the footer follows the
+        // content directly (the card is as tall as what it holds).
+        let title = harness.raw_text(&view.title).0;
         assert!(
-            (top - bottom).abs() <= 20.0,
-            "Short {screen:?} whole body is off-center: top {top}, bottom {bottom}"
+            (bounds.top() - body_clip.top()).abs() <= 4.0,
+            "Short {screen:?} body is padded at the top"
         );
+        assert!(
+            bounds.top() - title.bottom() <= 70.0,
+            "Short {screen:?} content starts far below its title: {bounds:?} after {title:?}"
+        );
+        if let Some(button) = footer(&view).first() {
+            let footer_top = harness.raw_text(&button.label).0.top();
+            assert!(
+                footer_top - bounds.bottom() <= 64.0,
+                "Short {screen:?} footer floats below its content: {footer_top} after {bounds:?}"
+            );
+        }
     }
 }
 
 #[test]
 fn component_and_direction_diagrams_are_bounded_and_explanatory_at_both_sizes() {
     for size in [egui::vec2(800.0, 600.0), egui::vec2(1100.0, 760.0)] {
-        for (screen, caption, labels) in [
-            (
-                ScreenId::InstallPlan,
-                "Preview: user-owned agent and startup; optional audio package affects all users",
-                &["User agent", "User startup", "Audio driver"][..],
-            ),
-            (
-                ScreenId::Grants,
-                "Control and windows · each direction is a separate opt-in",
-                &["This machine", "Other machine"][..],
-            ),
-        ] {
+        for (screen, caption, labels) in [(
+            ScreenId::Grants,
+            "Control and windows · each direction is a separate opt-in",
+            &["This machine", "Other machine"][..],
+        )] {
             let mut harness = Harness::review(size);
             let view = demo::fixture(screen);
             let before = view.clone();
@@ -1159,6 +1295,8 @@ fn network_caption_and_traffic_dot_follow_only_the_supplied_traffic_fact() {
         let mut harness = Harness::review(egui::vec2(800.0, 600.0));
         let mut view = demo::fixture(ScreenId::Network);
         view.illustration.traffic_observed = observed;
+        // The diagram belongs to the wait for traffic, not to the firewall question.
+        view.rows[0].state = RowState::Waiting;
         let before = view.clone();
         harness.settle(&view);
         harness.frame(&view, vec![key(Key::Tab, false)]);
@@ -1186,31 +1324,41 @@ fn network_caption_and_traffic_dot_follow_only_the_supplied_traffic_fact() {
             egui::epaint::Shape::Circle(circle) if clip.contains_rect(shape_clip) && circle.fill == theme::GLACIER));
         assert_eq!(dot, observed);
         assert_eq!(view, before);
-        assert_eq!(view.rows[0].state, RowState::Waiting);
+        assert_ne!(view.rows[0].state, RowState::Verified);
     }
 }
 
 #[test]
-fn completed_current_ready_rail_group_shows_one_status_label() {
+fn completed_current_ready_rail_group_shows_one_status_mark() {
     let mut harness = Harness::review(egui::vec2(1100.0, 760.0));
     let view = demo::fixture(ScreenId::Summary);
     harness.settle(&view);
     let ready = harness.raw_text("Ready").0;
-    let labels = harness
+    // The marks just left of the label: one filled Done disc, not a Current ring and dot too.
+    let region = Rect::from_min_max(
+        egui::pos2(ready.left() - 40.0, ready.top() - 6.0),
+        egui::pos2(ready.left(), ready.bottom() + 6.0),
+    );
+    let discs: Vec<f32> = harness
         .shapes()
         .into_iter()
         .filter_map(|(shape, _)| match shape {
-            egui::epaint::Shape::Text(text)
-                if matches!(text.galley.text(), "Current" | "Completed") =>
+            egui::epaint::Shape::Circle(circle)
+                if region.contains(circle.center) && circle.fill == theme::FROST =>
             {
-                let rect = text.galley.rect.translate(text.pos.to_vec2());
-                (rect.top() > ready.bottom() && rect.top() < ready.bottom() + 55.0)
-                    .then_some(text.galley.text())
+                Some(circle.radius)
             }
             _ => None,
         })
-        .collect::<Vec<_>>();
-    assert_eq!(labels, vec!["Completed"]);
+        .collect();
+    assert_eq!(discs.len(), 1, "{discs:?}");
+    assert!(discs[0] > 5.0, "a full disc, not the current-step dot");
+    assert!(
+        !harness
+            .texts()
+            .iter()
+            .any(|(text, _)| matches!(text.as_str(), "Current" | "Completed"))
+    );
 }
 
 fn check(index: usize, label: &str, state: RowState, detail: &str) -> RowView {

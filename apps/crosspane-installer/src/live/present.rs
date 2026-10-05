@@ -3,7 +3,7 @@
 
 use crosspane_installer_core::{JobStage, Milestone, StepId, StepState};
 
-use super::controller::{LiveController, bounded};
+use super::controller::{LiveController, automatic_screen, bounded, bounded_lines};
 use super::graph::{self, StepKind, steps};
 use super::practice::{CONFIRMATIONS, confirmation_label, confirmations};
 use super::shared::{CAPABILITIES, PairMode, capability_label};
@@ -20,6 +20,11 @@ use crate::view::{
 };
 
 const MAX_PROGRESS_LINES: usize = 24;
+
+/// Rows the pairing screen draws in place of the pairing step: what it is doing right now, and
+/// the computer it found. Outside both the step and the checklist id ranges.
+const LOOKING_ROW: u16 = 950;
+const FOUND_ROW: u16 = 951;
 
 /// How long a repair click waits for a Status issued after it before it goes ahead without one:
 /// the platform then plans, or refuses, with what it can read itself.
@@ -218,11 +223,12 @@ impl LiveController {
         self.connect.pairing.as_ref().map(|p| p.phase)
     }
 
-    fn display_screen(&self) -> ScreenId {
+    /// The screen shown: the pairing screen becomes the numbers comparison while one runs.
+    pub(super) fn display_screen(&self) -> ScreenId {
         if self.screen == ScreenId::Connect
             && matches!(
                 self.pairing_phase(),
-                Some(PairPhase::Confirm | PairPhase::Pick)
+                Some(PairPhase::Confirm | PairPhase::Pick | PairPhase::Waiting)
             )
         {
             ScreenId::MatchNumbers
@@ -231,13 +237,48 @@ impl LiveController {
         }
     }
 
+    /// The steps shown together: the three install screens are one page with one checklist.
+    fn page_steps(&self, screen: ScreenId) -> Vec<StepId> {
+        self.graph
+            .metas
+            .iter()
+            .filter(|m| {
+                if automatic_screen(screen) {
+                    automatic_screen(m.screen)
+                } else {
+                    m.screen == screen
+                }
+            })
+            .map(|m| m.id)
+            .collect()
+    }
+
+    /// The other computer's name as the pairing knows it, if it does yet.
+    fn pairing_peer(&self) -> Option<String> {
+        self.connect
+            .pairing
+            .as_ref()
+            .and_then(|p| p.peer.clone())
+            .map(bounded)
+            .or_else(|| match &self.connect.mode {
+                Some(PairMode::Join(addr)) => self
+                    .pair_candidates()
+                    .iter()
+                    .find(|c| c.addr == *addr)
+                    .map(|c| bounded(c.name.clone())),
+                _ => None,
+            })
+    }
+
     pub(super) fn row(&self, step: StepId) -> RowView {
         let state = self.step_state(step);
         let meta = self.graph.meta(step);
-        let detail = self
-            .details
-            .get(&step)
-            .cloned()
+        // While a change runs, what it is doing is the preview it was started from.
+        let running = (state == StepState::Running)
+            .then(|| self.previews.get(&step).cloned())
+            .flatten();
+        let detail = running
+            .or_else(|| self.details.get(&step).cloned())
             .unwrap_or_else(|| match state {
                 StepState::NeedsAction => self.previews.get(&step).cloned().unwrap_or_default(),
                 StepState::Stale => "Needs checking again.".into(),
@@ -339,24 +380,160 @@ impl LiveController {
     }
 
     fn screen_rows(&self, screen: ScreenId) -> Vec<RowView> {
-        let screen = if screen == ScreenId::MatchNumbers {
-            ScreenId::Connect
-        } else {
-            screen
-        };
         match screen {
             ScreenId::Summary => self.rows(),
             ScreenId::Welcome | ScreenId::RepairRemove => Vec::new(),
+            ScreenId::Connect | ScreenId::MatchNumbers => self.connect_rows(),
+            ScreenId::Practice => self.practice_rows(),
+            // These screens ask their question in their content; the step itself is shown only
+            // while it isn't asking (checking, saving, or stopped with a reason).
+            ScreenId::Grants | ScreenId::Layout | ScreenId::HidingChoice => self
+                .page_steps(screen)
+                .into_iter()
+                .filter(|step| self.step_state(*step) != StepState::NeedsAction)
+                .map(|step| self.row(step))
+                .collect(),
             other => self
-                .graph
-                .on_screen(other)
-                .flat_map(|m| {
-                    let mut rows = vec![self.row(m.id)];
-                    rows.extend(self.support_check_rows(m.id));
+                .page_steps(other)
+                .into_iter()
+                .flat_map(|step| {
+                    let mut rows = vec![self.row(step)];
+                    rows.extend(self.support_check_rows(step));
                     rows
                 })
                 .collect(),
         }
+    }
+
+    /// What the pairing screen says is happening, in place of the pairing step's own row.
+    fn connect_rows(&self) -> Vec<RowView> {
+        let line = |id: u16, label: String, detail: &str, state: RowState| RowView {
+            id,
+            label,
+            detail: detail.to_owned(),
+            state,
+            human_confirmed: false,
+        };
+        let looking = || {
+            line(
+                LOOKING_ROW,
+                "Looking for the other computer…".into(),
+                "Open Crosspane setup on the other computer too. The two find each other on \
+                 your network.",
+                RowState::Working,
+            )
+        };
+        let state = self.step_state(steps::PAIR);
+        let peer = self
+            .pairing_peer()
+            .unwrap_or_else(|| "the other computer".into());
+        match state {
+            StepState::Satisfied => vec![self.row(steps::PAIR)],
+            StepState::NotChecked
+            | StepState::Stale
+            | StepState::Checking
+            | StepState::Planning => {
+                vec![looking()]
+            }
+            StepState::NeedsAction => {
+                let candidates = self.pair_candidates();
+                if self.connect.manual || candidates.len() > 1 || self.connected_peers().len() > 1 {
+                    Vec::new()
+                } else if let [only] = candidates {
+                    vec![line(
+                        FOUND_ROW,
+                        bounded(format!("Found {} on your network", only.name)),
+                        "Pair with it to continue. You'll compare a number on both screens.",
+                        RowState::Note,
+                    )]
+                } else if self.connect.auto_windows >= super::shared::MAX_AUTO_WINDOWS {
+                    vec![line(
+                        LOOKING_ROW,
+                        "Still no sign of the other computer".into(),
+                        "Check that Crosspane setup is open on it and that both computers are on \
+                         the same network, then look again.",
+                        RowState::Waiting,
+                    )]
+                } else {
+                    vec![looking()]
+                }
+            }
+            StepState::Running => {
+                let phase = self.connect.pairing.as_ref().map(|p| p.phase);
+                let row = match (&self.connect.mode, phase) {
+                    (_, Some(PairPhase::Waiting)) => line(
+                        LOOKING_ROW,
+                        bounded(format!("Waiting for you to confirm on {peer}")),
+                        "",
+                        RowState::Working,
+                    ),
+                    (Some(PairMode::Listen), _) if self.connect.collision => line(
+                        LOOKING_ROW,
+                        "The other computer is waiting too".into(),
+                        "Both opened a pairing window at the same moment. This one steps back \
+                         when its window closes, then pairs with the other.",
+                        RowState::Waiting,
+                    ),
+                    (Some(PairMode::Listen), _) => line(
+                        LOOKING_ROW,
+                        "Ready to be found".into(),
+                        "On the other computer, choose this one when Crosspane setup finds it. \
+                         Then compare the number on both screens.",
+                        RowState::Working,
+                    ),
+                    (Some(PairMode::Join(_)), _) => line(
+                        LOOKING_ROW,
+                        bounded(format!("Connecting to {peer}…")),
+                        "",
+                        RowState::Working,
+                    ),
+                    (Some(PairMode::Dial(_)), _) => line(
+                        LOOKING_ROW,
+                        "Reconnecting to a computer paired before…".into(),
+                        "",
+                        RowState::Working,
+                    ),
+                    _ => line(LOOKING_ROW, "Pairing…".into(), "", RowState::Working),
+                };
+                vec![row]
+            }
+            StepState::Verifying => vec![line(
+                LOOKING_ROW,
+                "Paired. Waiting for the two computers to connect…".into(),
+                "",
+                RowState::Working,
+            )],
+            // Setup's own window closed with nobody joining: it is about to look again.
+            _ if self.connect.relook_at.is_some() => vec![looking()],
+            _ => {
+                let mut row = self.row(steps::PAIR);
+                row.label = "Pairing didn't finish".into();
+                vec![row]
+            }
+        }
+    }
+
+    /// The practice screen lists what is done; what is left is offered as choices.
+    fn practice_rows(&self) -> Vec<RowView> {
+        if let Some(run) = self
+            .practice
+            .run
+            .as_ref()
+            .filter(|_| self.practice.active())
+        {
+            return vec![self.row(run.step)];
+        }
+        graph::ROLES
+            .iter()
+            .map(|role| steps::practice(*role))
+            .filter(|step| {
+                !matches!(
+                    self.step_state(*step),
+                    StepState::NotChecked | StepState::Stale
+                )
+            })
+            .map(|step| self.row(step))
+            .collect()
     }
 
     fn progress(&self, screen: ScreenId) -> ProgressView {
@@ -385,74 +562,204 @@ impl LiveController {
         }
     }
 
-    fn title_and_message(&self, screen: ScreenId) -> (String, String) {
-        let consent_preview = self
-            .graph
-            .on_screen(screen)
-            .filter(|m| self.step_state(m.id) == StepState::NeedsAction)
-            .filter_map(|m| self.previews.get(&m.id).cloned())
+    /// The previews of the steps on this page that are asking for consent right now.
+    fn consent_preview(&self, screen: ScreenId) -> String {
+        self.page_steps(screen)
+            .into_iter()
+            .filter(|step| self.step_state(*step) == StepState::NeedsAction)
+            .filter_map(|step| self.previews.get(&step).cloned())
             .collect::<Vec<_>>()
-            .join("\n\n");
-        let (title, message) = match screen {
-            ScreenId::Welcome => ("Set up Crosspane", {
-                let intro = "Crosspane lets this computer and another one share a keyboard, \
-                                 mouse, windows and sound. Setup checks this computer, installs \
-                                 Crosspane for your account, pairs the two computers and walks \
-                                 you through each feature once.";
+            .join("\n\n")
+    }
+
+    /// Whether any step on this page stopped with a problem the person has to fix.
+    fn page_failed(&self, screen: ScreenId) -> bool {
+        self.page_steps(screen).into_iter().any(|step| {
+            matches!(
+                self.step_state(step),
+                StepState::Failed | StepState::Unsupported
+            )
+        })
+    }
+
+    fn title_and_message(&self, screen: ScreenId) -> (String, String) {
+        let preview = self.consent_preview(screen);
+        let asking = !preview.is_empty();
+        let peer = self.peer_name();
+        let (title, message): (String, String) = match screen {
+            ScreenId::Welcome => ("Set up Crosspane".into(), {
+                let intro = "Share one keyboard and mouse between this computer and another, \
+                             send windows back and forth, and play sound on each other's \
+                             speakers. Setup installs Crosspane for your account, pairs the two \
+                             computers and lets you try each feature once. It only stops when \
+                             your answer is needed.";
                 match &self.desc.resume_note {
                     Some(note) => format!("{intro}\n\n{note}"),
                     None => intro.to_owned(),
                 }
             }),
-            ScreenId::Compatibility => (
-                "Checking this computer",
-                "Nothing changes on this computer during these checks.".to_owned(),
-            ),
-            ScreenId::InstallPlan => ("What will be installed", consent_preview.clone()),
-            ScreenId::Installing => ("Installing Crosspane", consent_preview.clone()),
-            ScreenId::Permissions => ("Permissions", consent_preview.clone()),
-            ScreenId::AudioComponent => ("Sound", consent_preview.clone()),
-            ScreenId::Network => ("Network access", consent_preview.clone()),
-            ScreenId::HidingChoice => ("Windows you send", consent_preview.clone()),
-            ScreenId::Connect => ("Pair with the other computer", consent_preview.clone()),
-            ScreenId::MatchNumbers => (
-                "Check the numbers",
-                match self.pairing_phase() {
-                    Some(PairPhase::Pick) => {
-                        "Choose the number shown on the other computer.".to_owned()
-                    }
-                    _ => "Make sure the other computer shows the same numbers.".to_owned(),
+            ScreenId::Compatibility | ScreenId::InstallPlan | ScreenId::Installing => {
+                let unsupported = self
+                    .page_steps(screen)
+                    .into_iter()
+                    .any(|step| self.step_state(step) == StepState::Unsupported);
+                let done = self
+                    .page_steps(screen)
+                    .into_iter()
+                    .all(|step| self.satisfied(step));
+                if unsupported {
+                    (
+                        "Crosspane can't run here yet".into(),
+                        "Nothing was changed on this computer. The checks below say why.".into(),
+                    )
+                } else if self.page_failed(screen) {
+                    (
+                        "Setup stopped".into(),
+                        "The step marked below didn't finish. Fix what it says, then try again."
+                            .into(),
+                    )
+                } else if asking {
+                    (
+                        "Ready for the next step".into(),
+                        format!(
+                            "{preview}\n\nCrosspane is in use right now, so this waits for you. \
+                             Continuing interrupts what is shared at the moment."
+                        ),
+                    )
+                } else if done {
+                    ("Crosspane is installed".into(), String::new())
+                } else {
+                    (
+                        "Installing Crosspane".into(),
+                        "Setup is installing Crosspane for your account. It carries on by \
+                         itself."
+                            .into(),
+                    )
+                }
+            }
+            ScreenId::Permissions => (
+                "Allow Crosspane on this Mac".into(),
+                if asking {
+                    preview
+                } else {
+                    "macOS asks you to allow each permission. Setup notices each one as you \
+                     allow it."
+                        .into()
                 },
             ),
-            ScreenId::Grants => ("What the other computer may do", consent_preview.clone()),
-            ScreenId::Layout => ("Arrange your screens", consent_preview.clone()),
-            ScreenId::Practice => ("Try each feature once", self.practice_message()),
+            ScreenId::AudioComponent => (
+                "Bring sound across".into(),
+                if asking {
+                    preview
+                } else {
+                    "The Crosspane sound driver adds the speakers the other computer plays to."
+                        .into()
+                },
+            ),
+            ScreenId::Network => (
+                if asking {
+                    "Let Crosspane through the firewall".into()
+                } else {
+                    "Checking the network".into()
+                },
+                if asking {
+                    preview
+                } else {
+                    "Setup checks that the other computer can reach this one.".into()
+                },
+            ),
+            ScreenId::HidingChoice => (
+                "Windows you send from this Mac".into(),
+                if asking {
+                    preview
+                } else if self.hiding_restart_pending() {
+                    "Your choice is saved. Crosspane restarts to use it, which ends what is \
+                     shared right now (input, windows or sound). Restart when you're ready."
+                        .into()
+                } else {
+                    "Setup applies your choice and restarts Crosspane.".into()
+                },
+            ),
+            ScreenId::Connect => (
+                "Pair with the other computer".into(),
+                if self.connect.manual {
+                    "Enter the other computer's address and port. Crosspane uses port 47811 \
+                     unless it was changed."
+                        .into()
+                } else {
+                    "Pairing lets the two computers trust each other. You'll check that both \
+                     screens show the same number."
+                        .into()
+                },
+            ),
+            ScreenId::MatchNumbers => {
+                let peer = self
+                    .pairing_peer()
+                    .unwrap_or_else(|| "the other computer".into());
+                match self.pairing_phase() {
+                    Some(PairPhase::Pick) => (
+                        "Which number do you see on the other computer?".into(),
+                        format!("Pick the number shown on {peer}'s screen."),
+                    ),
+                    Some(PairPhase::Waiting) => (
+                        "Confirm on the other computer".into(),
+                        format!(
+                            "Now confirm the number on {peer}. This screen moves on by itself."
+                        ),
+                    ),
+                    _ => (
+                        "Do the numbers match?".into(),
+                        format!(
+                            "Check that {peer} shows this number, then confirm. If it doesn't, \
+                             stop: something else may be trying to pair."
+                        ),
+                    ),
+                }
+            }
+            ScreenId::Grants => (
+                match &peer {
+                    Some(peer) => format!("What may {peer} do here?"),
+                    None => "What the other computer may do here".into(),
+                },
+                "Turn on what you allow on this computer. Trying every feature needs all five; \
+                 you can change them any time in Crosspane's settings."
+                    .into(),
+            ),
+            ScreenId::Layout => (
+                "Arrange your screens".into(),
+                "If this isn't how the screens sit on your desk, drag them into place and apply."
+                    .into(),
+            ),
+            ScreenId::Practice => ("Try each feature once".into(), self.practice_message()),
             ScreenId::Summary => (
                 match self.summary.milestone {
                     Milestone::WorkspaceReady => "Your workspace is ready",
                     Milestone::InstalledWaiting => "Crosspane is installed",
                     Milestone::NotInstalled => "Crosspane isn't installed yet",
-                },
+                }
+                .into(),
                 match self.summary.milestone {
                     Milestone::WorkspaceReady => {
                         "Every step was checked just now on this computer.".to_owned()
                     }
                     Milestone::InstalledWaiting => {
-                        "Some steps still need to be finished before the workspace is ready."
-                            .to_owned()
+                        "A few steps are left before the workspace is ready.".to_owned()
                     }
                     Milestone::NotInstalled => {
                         "Finish the installation steps to start using Crosspane.".to_owned()
                     }
                 },
             ),
-            ScreenId::RepairRemove => ("Remove or repair Crosspane", self.maintenance_message()),
+            ScreenId::RepairRemove => (
+                "Remove or repair Crosspane".into(),
+                self.maintenance_message(),
+            ),
         };
         let mut message = message;
         if let Some(notice) = &self.notice {
             message = format!("{notice}\n\n{message}");
         }
-        (title.to_owned(), bounded(message.trim().to_owned()))
+        (bounded(title), bounded_lines(message.trim().to_owned()))
     }
 
     fn practice_message(&self) -> String {
@@ -462,8 +769,9 @@ impl LiveController {
             .as_ref()
             .filter(|_| self.practice.active())
         else {
-            return "Each practice uses a small Crosspane practice window and checks that it \
-                    really worked. Choose one to start."
+            return "Each practice runs together with its partner on the other computer: when \
+                    this one controls, the other is controlled. Start the same pair on both. A \
+                    small practice window checks that it really worked."
                 .into();
         };
         let mut text = format!("Practising: {}.", graph::role_label(run.role));
@@ -572,21 +880,26 @@ impl LiveController {
         text.join("\n\n")
     }
 
+    /// The screen's actions. Each screen asks one question at a time: at most one primary button
+    /// (its answer), outlined buttons beside it, quiet links for other ways, and tiles when the
+    /// answer is picked from several.
     fn buttons_and_fields(&self, screen: ScreenId) -> (Vec<ButtonView>, Vec<FieldView>) {
         let mut buttons = Vec::new();
         let mut fields = Vec::new();
-        let busy = self.mutation_in_flight();
-        let secondary = ButtonKind::Secondary;
-        // Step-level consent and retry buttons for native steps on this screen.
-        for meta in self.graph.on_screen(screen) {
-            let state = self.step_state(meta.id);
+        // Waiting in setup's own pairing window is not work the person must sit through.
+        let busy = self.mutation_in_flight() && !self.following_auto_window();
+        // Consent for a step that asks first: its own action, with its preview on screen.
+        for step in self.page_steps(screen) {
+            let Some(meta) = self.graph.meta(step) else {
+                continue;
+            };
             if meta.kind == StepKind::Native
-                && state == StepState::NeedsAction
-                && self.previews.contains_key(&meta.id)
-                && self.job(meta.id, JobStage::Plan).is_some()
+                && self.step_state(step) == StepState::NeedsAction
+                && self.previews.contains_key(&step)
+                && self.job(step, JobStage::Plan).is_some()
             {
                 buttons.push(button(
-                    ids::consent(meta.id),
+                    ids::consent(step),
                     ButtonRole::Confirm,
                     &meta.action_label,
                     true,
@@ -594,36 +907,41 @@ impl LiveController {
                 ));
             }
         }
-        // One "Check again" for the whole screen, however many of its steps are waiting.
+        // One retry for the whole screen, however many of its steps stopped. A problem to fix is
+        // the screen's question; a wait that re-checks by itself only gets a quiet link.
         let waiting = self.retryable_on(screen);
-        if !waiting.is_empty() {
+        if !waiting.is_empty() && !self.pairing_relooks(screen) {
             let id = match waiting.as_slice() {
                 [only] => ids::retry(*only),
                 _ => ids::RETRY_ALL,
             };
-            buttons.push(button(
-                id,
-                ButtonRole::Retry,
-                "Check again",
-                true,
-                secondary,
-            ));
+            let failed = waiting
+                .iter()
+                .any(|step| self.step_state(*step) == StepState::Failed);
+            let primary_taken = buttons.iter().any(|b| b.kind == ButtonKind::Primary);
+            let (label, kind) = if failed && !primary_taken {
+                ("Try again", ButtonKind::Primary)
+            } else {
+                ("Check again", ButtonKind::Link)
+            };
+            buttons.push(button(id, ButtonRole::Retry, label, true, kind));
         }
         match screen {
             ScreenId::Welcome => {
+                // Closing is the window's own button (or Escape) here.
                 buttons.push(button(
                     ids::REMOVE_OR_REPAIR,
                     ButtonRole::Ordinary,
                     "Remove or repair Crosspane…",
                     true,
-                    secondary,
+                    ButtonKind::Link,
                 ));
                 buttons.push(button(
-                    ids::CLOSE,
-                    ButtonRole::Cancel,
-                    "Close",
+                    ids::NEXT,
+                    ButtonRole::Next,
+                    "Start setup",
                     true,
-                    secondary,
+                    ButtonKind::Primary,
                 ));
             }
             ScreenId::Connect => self.connect_controls(&mut buttons, &mut fields),
@@ -641,24 +959,25 @@ impl LiveController {
                             ButtonRole::Confirm,
                             &bounded(number.clone()),
                             true,
-                            ButtonKind::Primary,
+                            ButtonKind::Choice,
                         ));
                     }
                 }
+                Some(PairPhase::Waiting) => {}
                 _ => {
-                    buttons.push(button(
-                        ids::PAIR_CONFIRM,
-                        ButtonRole::Confirm,
-                        "The numbers match",
-                        true,
-                        ButtonKind::Primary,
-                    ));
                     buttons.push(button(
                         ids::PAIR_REJECT,
                         ButtonRole::Cancel,
                         "They don't match",
                         true,
                         ButtonKind::Destructive,
+                    ));
+                    buttons.push(button(
+                        ids::PAIR_CONFIRM,
+                        ButtonRole::Confirm,
+                        "The numbers match",
+                        true,
+                        ButtonKind::Primary,
                     ));
                 }
             },
@@ -673,13 +992,33 @@ impl LiveController {
                             enabled: true,
                         });
                     }
-                    buttons.push(button(
-                        ids::GRANTS_APPLY,
-                        ButtonRole::Confirm,
-                        "Apply",
-                        true,
-                        ButtonKind::Primary,
-                    ));
+                    let on = self.connect.grants.iter().filter(|g| **g).count();
+                    if on == CAPABILITIES.len() {
+                        buttons.push(button(
+                            ids::GRANTS_APPLY,
+                            ButtonRole::Confirm,
+                            "Allow and continue",
+                            true,
+                            ButtonKind::Primary,
+                        ));
+                    } else {
+                        buttons.push(button(
+                            ids::GRANTS_ALL,
+                            ButtonRole::Confirm,
+                            "Allow all and continue",
+                            true,
+                            ButtonKind::Primary,
+                        ));
+                        if on > 0 {
+                            buttons.push(button(
+                                ids::GRANTS_APPLY,
+                                ButtonRole::Confirm,
+                                "Save only the ones turned on",
+                                true,
+                                ButtonKind::Link,
+                            ));
+                        }
+                    }
                 }
             }
             ScreenId::Layout => {
@@ -700,7 +1039,7 @@ impl LiveController {
                     buttons.push(button(
                         ids::HIDING_APPLY,
                         ButtonRole::Confirm,
-                        "Apply and continue",
+                        "Apply and restart Crosspane",
                         self.connect.hiding.is_some(),
                         ButtonKind::Primary,
                     ));
@@ -715,8 +1054,44 @@ impl LiveController {
                     ));
                 }
             }
+            ScreenId::Network => {
+                // The firewall rule is optional: the other computer may still get through.
+                if self
+                    .page_steps(screen)
+                    .into_iter()
+                    .any(|step| self.step_state(step) == StepState::NeedsAction)
+                    && self.screen_complete(screen)
+                    && self.next_screen().is_some()
+                {
+                    buttons.push(button(
+                        ids::NEXT,
+                        ButtonRole::Next,
+                        "Not now",
+                        !busy,
+                        ButtonKind::Link,
+                    ));
+                }
+            }
             ScreenId::Practice => self.practice_controls(&mut buttons),
             ScreenId::Summary => {
+                let ready = self.summary.milestone == Milestone::WorkspaceReady;
+                if ready {
+                    buttons.push(button(
+                        ids::CLOSE,
+                        ButtonRole::Cancel,
+                        "Done",
+                        true,
+                        ButtonKind::Primary,
+                    ));
+                } else if self.first_unfinished_screen().is_some() {
+                    buttons.push(button(
+                        ids::CONTINUE_SETUP,
+                        ButtonRole::Next,
+                        "Finish setup",
+                        !busy,
+                        ButtonKind::Primary,
+                    ));
+                }
                 buttons.push(button(
                     ids::FINAL_CHECK,
                     ButtonRole::Retry,
@@ -725,22 +1100,24 @@ impl LiveController {
                         .practice_steps()
                         .iter()
                         .all(|s| self.satisfied(*s)),
-                    secondary,
+                    ButtonKind::Link,
                 ));
                 buttons.push(button(
                     ids::REMOVE_OR_REPAIR,
                     ButtonRole::Ordinary,
                     "Remove or repair Crosspane…",
                     !busy,
-                    secondary,
+                    ButtonKind::Link,
                 ));
-                buttons.push(button(
-                    ids::CLOSE,
-                    ButtonRole::Cancel,
-                    "Close",
-                    true,
-                    secondary,
-                ));
+                if !ready {
+                    buttons.push(button(
+                        ids::CLOSE,
+                        ButtonRole::Cancel,
+                        "Close",
+                        true,
+                        ButtonKind::Link,
+                    ));
+                }
             }
             ScreenId::RepairRemove => self.maintenance_controls(&mut buttons, &mut fields),
             _ => {}
@@ -755,96 +1132,152 @@ impl LiveController {
                     ButtonRole::Back,
                     "Back",
                     !busy,
-                    secondary,
+                    ButtonKind::Link,
                 ));
             }
-            if self.next_screen().is_some() {
-                let enabled = !self.practice.engaged(self.now)
-                    && (screen == ScreenId::Practice || self.screen_complete(screen));
-                let label = if screen == ScreenId::Practice {
-                    "Continue"
-                } else {
-                    "Next"
-                };
+            // A finished screen moves on by itself. Continue is offered only where it doesn't:
+            // after the person came back to it.
+            if !self.auto_advance
+                && screen != ScreenId::Practice
+                && self.screen_complete(screen)
+                && !buttons.iter().any(|b| b.id == ids::NEXT)
+                && self.next_screen().is_some()
+            {
                 buttons.push(button(
                     ids::NEXT,
                     ButtonRole::Next,
-                    label,
-                    enabled,
+                    "Continue",
+                    !busy,
                     ButtonKind::Primary,
                 ));
             }
         }
-        if screen == ScreenId::Welcome {
-            buttons.push(button(
-                ids::NEXT,
-                ButtonRole::Next,
-                "Get started",
-                true,
-                ButtonKind::Primary,
-            ));
-        }
         (buttons, fields)
     }
 
+    /// The pairing screen hides its retry while setup is about to look again by itself.
+    fn pairing_relooks(&self, screen: ScreenId) -> bool {
+        screen == ScreenId::Connect && self.connect.relook_at.is_some()
+    }
+
+    /// The first screen, in order, that still has a step to finish.
+    pub(super) fn first_unfinished_screen(&self) -> Option<ScreenId> {
+        super::controller::ORDER.iter().copied().find(|screen| {
+            *screen != ScreenId::Summary
+                && self
+                    .graph
+                    .on_screen(*screen)
+                    .any(|m| m.kind != StepKind::Final && !self.satisfied(m.id))
+        })
+    }
+
+    /// Pairing is searched for automatically. The one computer found is the screen's answer;
+    /// typing an address, opening this computer's own window and reconnecting are other ways.
     fn connect_controls(&self, buttons: &mut Vec<ButtonView>, fields: &mut Vec<FieldView>) {
+        if self.following_auto_window() {
+            // Waiting to be found never takes the other ways away.
+            buttons.push(button(
+                ids::PAIR_MANUAL,
+                ButtonRole::Ordinary,
+                "Enter its address",
+                true,
+                ButtonKind::Link,
+            ));
+            return;
+        }
         if self.step_state(steps::PAIR) != StepState::NeedsAction {
             return;
         }
         let address = self.parsed_address().is_some();
-        fields.push(FieldView::PeerAddress {
-            id: ids::PEER_ADDRESS,
-            value: self.connect.address.clone(),
-            enabled: true,
-        });
-        buttons.push(button(
-            ids::PAIR_LISTEN,
-            ButtonRole::Ordinary,
-            "Let the other computer join",
-            true,
-            ButtonKind::Primary,
-        ));
-        buttons.push(button(
-            ids::PAIR_JOIN,
-            ButtonRole::Ordinary,
-            "Join the address above",
-            address,
-            ButtonKind::Secondary,
-        ));
-        buttons.push(button(
-            ids::PAIR_DIAL,
-            ButtonRole::Ordinary,
-            "Reconnect a computer paired before",
-            address,
-            ButtonKind::Secondary,
-        ));
-        buttons.push(button(
-            ids::PAIR_SCAN,
-            ButtonRole::Ordinary,
-            "Look for computers nearby",
-            true,
-            ButtonKind::Secondary,
-        ));
-        for (i, candidate) in self.connect.candidates.iter().enumerate() {
+        if self.connect.manual {
+            fields.push(FieldView::PeerAddress {
+                id: ids::PEER_ADDRESS,
+                value: self.connect.address.clone(),
+                enabled: true,
+            });
             buttons.push(button(
-                ids::pair_candidate(i),
+                ids::PAIR_JOIN,
                 ButtonRole::Ordinary,
-                &bounded(format!("Pair with {}", candidate.name)),
-                true,
-                ButtonKind::Secondary,
+                "Join",
+                address,
+                ButtonKind::Primary,
             ));
+            buttons.push(button(
+                ids::PAIR_DIAL,
+                ButtonRole::Ordinary,
+                "Reconnect a computer paired before",
+                address,
+                ButtonKind::Link,
+            ));
+            buttons.push(button(
+                ids::PAIR_MANUAL,
+                ButtonRole::Ordinary,
+                "Search automatically instead",
+                true,
+                ButtonKind::Link,
+            ));
+            return;
         }
         let connected = self.connected_peers();
         if connected.len() > 1 {
+            // Several paired computers are connected: the person says which one this is for.
             for (i, (_, name)) in connected.iter().take(8).enumerate() {
                 buttons.push(button(
                     ids::select_peer(i),
                     ButtonRole::Ordinary,
                     &bounded(format!("Use {name}")),
                     true,
-                    ButtonKind::Secondary,
+                    ButtonKind::Choice,
                 ));
             }
+        }
+        match self.connect.candidates.as_slice() {
+            [] => {}
+            [only] => buttons.push(button(
+                ids::pair_candidate(0),
+                ButtonRole::Ordinary,
+                &bounded(format!("Pair with {}", only.name)),
+                true,
+                ButtonKind::Primary,
+            )),
+            several => {
+                for (i, candidate) in several.iter().enumerate() {
+                    buttons.push(button(
+                        ids::pair_candidate(i),
+                        ButtonRole::Ordinary,
+                        &bounded(format!("Pair with {}", candidate.name)),
+                        true,
+                        ButtonKind::Choice,
+                    ));
+                }
+            }
+        }
+        if self.connect.auto_windows >= super::shared::MAX_AUTO_WINDOWS
+            && self.connect.candidates.is_empty()
+        {
+            buttons.push(button(
+                ids::PAIR_SCAN,
+                ButtonRole::Ordinary,
+                "Look again",
+                true,
+                ButtonKind::Primary,
+            ));
+        }
+        buttons.push(button(
+            ids::PAIR_MANUAL,
+            ButtonRole::Ordinary,
+            "Enter its address",
+            true,
+            ButtonKind::Link,
+        ));
+        if self.connect.candidates.is_empty() {
+            buttons.push(button(
+                ids::PAIR_LISTEN,
+                ButtonRole::Ordinary,
+                "Let the other computer find this one",
+                true,
+                ButtonKind::Link,
+            ));
         }
     }
 
@@ -859,6 +1292,7 @@ impl LiveController {
                 || self.practice.tutorial.state() == TutorialState::Running;
             let private = self.source_policy()
                 == crate::tutorial_flow::TutorialSourcePolicy::MacPrivateDisplay;
+            // What the person saw or heard: each statement is confirmed on its own.
             for c in confirmations(run.role, private) {
                 if run.confirmed.contains(&c) {
                     continue;
@@ -868,16 +1302,7 @@ impl LiveController {
                     ButtonRole::Confirm,
                     confirmation_label(c),
                     waiting,
-                    ButtonKind::Primary,
-                ));
-            }
-            if run.role == TutorialRole::AudioSender {
-                buttons.push(button(
-                    ids::PLAY_TONE,
-                    ButtonRole::Ordinary,
-                    "Play the test sound",
-                    waiting,
-                    ButtonKind::Secondary,
+                    ButtonKind::Choice,
                 ));
             }
             if run.role == TutorialRole::E2DestinationPull {
@@ -887,7 +1312,7 @@ impl LiveController {
                         ButtonRole::Ordinary,
                         &bounded(format!("Take “{}” ({})", w.title, w.app)),
                         waiting,
-                        ButtonKind::Secondary,
+                        ButtonKind::Choice,
                     ));
                 }
             }
@@ -898,8 +1323,19 @@ impl LiveController {
                 true,
                 ButtonKind::Secondary,
             ));
+            if run.role == TutorialRole::AudioSender {
+                buttons.push(button(
+                    ids::PLAY_TONE,
+                    ButtonRole::Ordinary,
+                    "Play the test sound",
+                    waiting,
+                    ButtonKind::Primary,
+                ));
+            }
             return;
         }
+        // What is left to try, each offered as a choice: the person starts the one whose partner
+        // runs on the other computer.
         for role in graph::ROLES {
             let step = steps::practice(role);
             if self.satisfied(step) {
@@ -908,9 +1344,27 @@ impl LiveController {
             buttons.push(button(
                 ids::practice_start(role),
                 ButtonRole::Ordinary,
-                &format!("Start: {}", graph::role_label(role)),
+                graph::role_label(role),
                 self.prerequisites_valid(step) && !self.practice.engaged(self.now),
-                ButtonKind::Secondary,
+                ButtonKind::Choice,
+            ));
+        }
+        if self.next_screen().is_some() && !self.practice.engaged(self.now) {
+            let all_done = self
+                .graph
+                .practice_steps()
+                .iter()
+                .all(|step| self.satisfied(*step));
+            buttons.push(button(
+                ids::NEXT,
+                ButtonRole::Next,
+                if all_done { "Continue" } else { "Finish later" },
+                true,
+                if all_done {
+                    ButtonKind::Primary
+                } else {
+                    ButtonKind::Link
+                },
             ));
         }
     }
@@ -1003,7 +1457,7 @@ impl LiveController {
                 ButtonRole::Confirm,
                 "Discard",
                 !repair.engaged() && !m.planning && !m.confirmed && m.preview.is_none(),
-                ButtonKind::Secondary,
+                ButtonKind::Link,
             ));
         }
         if repair.resume_offered() && m.refused.is_none() {
@@ -1067,7 +1521,7 @@ impl LiveController {
             .then(|| self.connect.pairing.as_ref().and_then(|p| p.sas.clone()))
             .flatten()
             .map(bounded);
-        let escape = if self.mutation_in_flight() {
+        let escape = if self.mutation_in_flight() && !self.following_auto_window() {
             EscapeMapping::None
         } else {
             match screen {
@@ -1106,6 +1560,11 @@ impl LiveController {
                 practice,
             },
             demo: false,
+            link_caption: (screen == ScreenId::Connect
+                && (self.step_state(steps::PAIR) == StepState::NeedsAction
+                    || self.following_auto_window())
+                && !self.connect.manual)
+                .then(|| "Other ways to connect".to_owned()),
         };
         let previews: Vec<&String> = self
             .graph
@@ -1147,6 +1606,8 @@ impl LiveController {
     }
 
     pub(super) fn back(&mut self) {
+        // Setup's own pairing window doesn't hold the person on this screen.
+        self.abandon_auto_window();
         if self.mutation_in_flight() {
             return;
         }
@@ -1159,6 +1620,8 @@ impl LiveController {
             self.go(to);
         } else if let Some(previous) = self.previous_screen() {
             self.go(previous);
+            // A screen the person went back to stays until they move on.
+            self.auto_advance = false;
         }
     }
 
@@ -1166,8 +1629,29 @@ impl LiveController {
     pub(super) fn button(&mut self, id: u16) -> bool {
         match id {
             ids::NEXT => {
+                if self.screen == ScreenId::Welcome {
+                    // The go-ahead for the install steps that stay inside this account.
+                    self.install_started = true;
+                }
                 if let Some(next) = self.next_screen() {
                     self.go(next);
+                }
+            }
+            ids::CONTINUE_SETUP => {
+                if let Some(screen) = self.first_unfinished_screen() {
+                    self.install_started = true;
+                    self.go(screen);
+                }
+            }
+            ids::PAIR_MANUAL => {
+                self.abandon_auto_window();
+                self.connect.manual = !self.connect.manual;
+                self.connect.searching_since = None;
+            }
+            ids::GRANTS_ALL => {
+                if self.step_state(steps::GRANTS) == StepState::NeedsAction {
+                    self.connect.grants = [true; 5];
+                    self.request_apply(steps::GRANTS);
                 }
             }
             ids::BACK => self.back(),
@@ -1187,7 +1671,12 @@ impl LiveController {
                     self.pair_action(PairMode::Dial(addr));
                 }
             }
-            ids::PAIR_SCAN => self.scan(),
+            ids::PAIR_SCAN => {
+                // Look again: a fresh automatic search, windows included.
+                self.connect.auto_windows = 0;
+                self.connect.searching_since = None;
+                self.scan();
+            }
             ids::PAIR_CONFIRM => self.pair_answer(InstallerRequest::PairConfirm { accept: true }),
             ids::PAIR_REJECT => self.pair_answer(InstallerRequest::PairConfirm { accept: false }),
             ids::GRANTS_APPLY => self.request_apply(steps::GRANTS),
@@ -1269,7 +1758,7 @@ impl LiveController {
         }
     }
 
-    fn consent_click(&mut self, step: StepId) {
+    pub(super) fn consent_click(&mut self, step: StepId) {
         if self.graph.kind(step) != Some(StepKind::Native)
             || self.step_state(step) != StepState::NeedsAction
             || !self.previews.contains_key(&step)
@@ -1668,7 +2157,7 @@ impl LiveController {
             // Only the answer to the outstanding review request is shown as the plan.
             MaintenanceReport::Planned { preview, .. } if m.planning && !m.confirmed => {
                 m.planning = false;
-                m.preview = Some(bounded(preview));
+                m.preview = Some(bounded_lines(preview));
             }
             MaintenanceReport::Planned { .. } => {}
             MaintenanceReport::Progress { detail, .. } => {
@@ -1684,7 +2173,7 @@ impl LiveController {
             } => {
                 if !m.follow_ups.iter().any(|(f, ..)| *f == follow_up) {
                     m.follow_ups
-                        .push((follow_up, bounded(label), bounded(preview)));
+                        .push((follow_up, bounded(label), bounded_lines(preview)));
                 }
             }
             MaintenanceReport::Finished { outcome, lines, .. } => {
@@ -1718,7 +2207,7 @@ impl LiveController {
                 let r = &mut m.repair_state;
                 r.phase = RepairPhase::Previewed;
                 r.plan = Some(plan);
-                r.preview = Some(bounded(preview));
+                r.preview = Some(bounded_lines(preview));
             }
             MaintenanceReport::RepairPlanned { .. } => {}
             MaintenanceReport::RepairResumable { lines, .. }

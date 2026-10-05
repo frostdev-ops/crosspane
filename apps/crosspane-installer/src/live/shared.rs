@@ -33,6 +33,16 @@ const PAIR_TIMEOUT_MS: u64 = 180_000;
 const VERIFY_TIMEOUT_MS: u64 = 20_000;
 const MAX_CANDIDATES: usize = 8;
 const MAX_ADDRESS: usize = 256;
+/// How often discovery is asked while looking for the other computer.
+const SCAN_LOOKING_MS: u64 = 1_000;
+/// How often it is asked while this computer waits in its own pairing window, to notice the
+/// other computer waiting at the same time.
+const SCAN_LISTENING_MS: u64 = 2_000;
+/// Pairing windows setup opens by itself on one visit to the screen (each stays open up to two
+/// minutes). After that the person starts the next one.
+pub(super) const MAX_AUTO_WINDOWS: u32 = 8;
+/// After setup's own window closed unanswered, it looks again this soon.
+const RELOOK_MS: u64 = 1_000;
 
 pub(super) fn capability_label(c: GrantableCapability) -> &'static str {
     match c {
@@ -84,6 +94,42 @@ pub(super) struct ConnectState {
     pub layout_busy: bool,
     pub hiding: Option<HidingChoice>,
     pub settings: Option<crate::tutorial_flow::SettingsTransition>,
+    /// The hiding choice was applied with its restart consent in the same click.
+    pub hiding_restart_agreed: bool,
+    // ---- automatic pairing ----
+    /// The person chose to type an address instead of searching.
+    pub manual: bool,
+    /// When discovery is asked next.
+    pub scan_at: u64,
+    /// Since when this visit has been looking without finding anyone to pair with.
+    pub searching_since: Option<u64>,
+    /// Pairing windows setup opened by itself on this visit.
+    pub auto_windows: u32,
+    /// The pairing in flight was started by setup, not by a click.
+    pub auto: bool,
+    /// The pairing in flight reached the other computer: an exchange began.
+    pub exchanged: bool,
+    /// While this computer waits in its window, another one is seen waiting too.
+    pub collision: bool,
+    /// A collision happened on this visit; the next window waits longer, by this computer's id.
+    pub collided: bool,
+    /// A refused automatic start is checked against the agent's own pairing state, which may
+    /// already be a window to follow.
+    pub adopting: bool,
+    /// When setup looks again after its own window closed unanswered.
+    pub relook_at: Option<u64>,
+}
+
+impl ConnectState {
+    /// Leaving the pairing screen ends its automatic search; coming back starts a fresh one.
+    pub(super) fn leave(&mut self) {
+        self.manual = false;
+        self.searching_since = None;
+        self.auto_windows = 0;
+        self.collision = false;
+        self.collided = false;
+        self.relook_at = None;
+    }
 }
 
 pub(super) fn outcome(failure: &CallFailure) -> ApplyOutcome {
@@ -142,7 +188,7 @@ fn final_healthy(health: &HealthSnapshot, peer: Option<NodeId>) -> Result<(), &'
 }
 
 impl LiveController {
-    fn health_ref(&self) -> Option<&HealthSnapshot> {
+    pub(super) fn health_ref(&self) -> Option<&HealthSnapshot> {
         self.health.as_ref().map(|h| h.snapshot.as_ref())
     }
 
@@ -396,6 +442,9 @@ impl LiveController {
             .health_ref()
             .map(|h| h.installer().peers.iter().map(|p| p.node).collect())
             .unwrap_or_default();
+        self.connect.exchanged = false;
+        self.connect.adopting = false;
+        self.connect.collision = false;
         let (kind, request) = match self.connect.mode.clone() {
             Some(PairMode::Listen) => (
                 OwnCall::PairListen,
@@ -428,12 +477,141 @@ impl LiveController {
         }
     }
 
+    /// A pairing the person started with a click.
     pub(super) fn pair_action(&mut self, mode: PairMode) {
+        self.start_pair(mode, false);
+    }
+
+    fn start_pair(&mut self, mode: PairMode, auto: bool) {
         if self.step_state(steps::PAIR) != StepState::NeedsAction {
             return;
         }
+        self.connect.auto = auto;
+        self.connect.searching_since = None;
+        self.connect.relook_at = None;
         self.connect.mode = Some(mode);
         self.request_apply(steps::PAIR);
+    }
+
+    /// The pairing in flight ended without completing. One that setup started by itself and that
+    /// never reached the other computer (its window closed unanswered) ends quietly and setup
+    /// looks again; any other says why, and waits for the person.
+    fn pairing_ended(&mut self, outcome: ApplyOutcome, detail: String) {
+        self.connect.polling = false;
+        self.connect.adopting = false;
+        if self.connect.auto && !self.connect.exchanged {
+            self.connect.relook_at = Some(self.now.saturating_add(RELOOK_MS));
+            self.connect.collision = false;
+            self.apply_outcome(steps::PAIR, ApplyOutcome::Failed);
+            self.details.remove(&steps::PAIR);
+            return;
+        }
+        self.details.insert(steps::PAIR, bounded(detail));
+        self.apply_outcome(steps::PAIR, outcome);
+    }
+
+    /// Setup's own pairing window is open and nobody has reached it yet.
+    pub(super) fn following_auto_window(&self) -> bool {
+        self.connect.auto
+            && !self.connect.exchanged
+            && matches!(self.connect.mode, Some(PairMode::Listen))
+            && self.job(steps::PAIR, JobStage::Apply).is_some()
+    }
+
+    /// Stop following setup's own pairing window, so the person can go back or type an address.
+    /// The agent closes the window by itself (it lasts two minutes), and nothing can pair through
+    /// it unattended: the numbers are only ever confirmed here, by the person.
+    pub(super) fn abandon_auto_window(&mut self) {
+        if !self.following_auto_window() {
+            return;
+        }
+        self.connect.polling = false;
+        self.connect.adopting = false;
+        self.connect.collision = false;
+        self.connect.relook_at = None;
+        self.apply_outcome(steps::PAIR, ApplyOutcome::Failed);
+        self.details.remove(&steps::PAIR);
+        self.begin(steps::PAIR);
+    }
+
+    /// The other computers waiting to be paired with that discovery reported last.
+    pub(super) fn pair_candidates(&self) -> &[PairCandidate] {
+        &self.connect.candidates
+    }
+
+    /// How long setup looks before opening this computer's own pairing window. Quickly when no
+    /// other Crosspane is on the network yet (the other computer will find this one later);
+    /// otherwise after a pause set by this computer's id, so two computers arriving together
+    /// rarely open their windows at the same moment. After such a collision, longer still.
+    fn listen_delay(&self) -> u64 {
+        let Some(health) = self.health_ref() else {
+            return 3_000;
+        };
+        let spread = u64::from(health.installer().node.0[0]);
+        if self.connect.collided {
+            3_000 + spread * 20_000 / 255
+        } else if health.installer().discovery.candidates == 0 {
+            1_500
+        } else {
+            2_500 + spread * 10_000 / 255
+        }
+    }
+
+    /// Discovery runs while the pairing screen is up. When exactly one computer is waiting to be
+    /// found it is offered; when nobody is, this computer opens its own pairing window so the
+    /// other computer finds it. Either way the numbers are compared and confirmed by the person.
+    fn auto_pair_tick(&mut self) {
+        if self.screen != crate::view::ScreenId::Connect {
+            return;
+        }
+        let state = self.step_state(steps::PAIR);
+        let listening = self.job(steps::PAIR, JobStage::Apply).is_some()
+            && matches!(self.connect.mode, Some(PairMode::Listen));
+        let looking = state == StepState::NeedsAction && !self.connect.manual;
+        if (looking || listening) && self.now >= self.connect.scan_at {
+            self.connect.scan_at = self.now.saturating_add(if listening {
+                SCAN_LISTENING_MS
+            } else {
+                SCAN_LOOKING_MS
+            });
+            self.scan();
+        }
+        if listening
+            && self
+                .connect
+                .pairing
+                .as_ref()
+                .is_some_and(|p| p.phase == PairPhase::Listening)
+            && !self.connect.candidates.is_empty()
+        {
+            self.connect.collision = true;
+            self.connect.collided = true;
+        }
+        if let Some(at) = self.connect.relook_at
+            && self.now >= at
+        {
+            self.connect.relook_at = None;
+            if matches!(state, StepState::Failed | StepState::WaitingForUser) {
+                self.begin(steps::PAIR);
+            }
+            return;
+        }
+        if !looking {
+            return;
+        }
+        if !self.connect.candidates.is_empty() || self.connected_peers().len() > 1 {
+            // There is someone to choose: no window of this computer's own.
+            self.connect.searching_since = None;
+            return;
+        }
+        let since = *self.connect.searching_since.get_or_insert(self.now);
+        if self.connect.auto_windows >= MAX_AUTO_WINDOWS
+            || self.now < since.saturating_add(self.listen_delay())
+        {
+            return;
+        }
+        self.connect.auto_windows += 1;
+        self.start_pair(PairMode::Listen, true);
     }
 
     pub(super) fn parsed_address(&self) -> Option<SocketAddr> {
@@ -452,10 +630,24 @@ impl LiveController {
                 self.connect.polling = true;
                 self.connect.poll_at = self.now;
             }
+            // The agent already runs a pairing (a window from an earlier visit, or one opened
+            // in Settings). Setup's own window follows that one instead of failing.
+            Err(CallFailure::Refused(_)) if self.connect.auto && kind == OwnCall::PairListen => {
+                self.connect.adopting = true;
+                self.connect.polling = true;
+                self.connect.poll_at = self.now;
+            }
+            // Most often a pairing window setup opened earlier, which stays open up to two
+            // minutes: say so, and how to carry on.
+            Err(failure @ CallFailure::Refused(_)) => self.pairing_ended(
+                outcome(&failure),
+                "Crosspane couldn't start pairing. If a pairing window is still open (they stay \
+                 open up to two minutes), try again shortly, or join this computer from the other \
+                 one."
+                    .into(),
+            ),
             Err(failure) => {
-                self.details
-                    .insert(steps::PAIR, failure_text(&failure).into());
-                self.apply_outcome(steps::PAIR, outcome(&failure));
+                self.pairing_ended(outcome(&failure), failure_text(&failure).into());
             }
         }
     }
@@ -470,6 +662,30 @@ impl LiveController {
         };
         let phase = status.phase;
         let error = status.error.clone();
+        if self.connect.adopting {
+            if matches!(
+                phase,
+                PairPhase::Listening
+                    | PairPhase::Connecting
+                    | PairPhase::Confirm
+                    | PairPhase::Pick
+                    | PairPhase::Waiting
+                    | PairPhase::Paired
+            ) {
+                self.connect.adopting = false;
+            } else {
+                // Nothing to follow: the refusal stands. Setup looks again shortly.
+                self.connect.exchanged = false;
+                self.pairing_ended(ApplyOutcome::Refused, String::new());
+                return;
+            }
+        }
+        if matches!(
+            phase,
+            PairPhase::Connecting | PairPhase::Confirm | PairPhase::Pick | PairPhase::Waiting
+        ) {
+            self.connect.exchanged = true;
+        }
         self.connect.pairing = Some(status);
         match phase {
             PairPhase::Paired => {
@@ -477,12 +693,10 @@ impl LiveController {
                 self.apply_outcome(steps::PAIR, ApplyOutcome::Applied);
             }
             PairPhase::Failed => {
-                self.connect.polling = false;
-                self.details.insert(
-                    steps::PAIR,
-                    bounded(error.unwrap_or_else(|| "Pairing didn't finish.".into())),
+                self.pairing_ended(
+                    ApplyOutcome::Failed,
+                    error.unwrap_or_else(|| "Pairing didn't finish.".into()),
                 );
-                self.apply_outcome(steps::PAIR, ApplyOutcome::Failed);
             }
             _ => {}
         }
@@ -554,12 +768,10 @@ impl LiveController {
 
     pub(super) fn connect_tick(&mut self) {
         self.settings_tick();
+        self.auto_pair_tick();
         if self.connect.polling {
             if self.now.saturating_sub(self.connect.started_at) > PAIR_TIMEOUT_MS {
-                self.connect.polling = false;
-                self.details
-                    .insert(steps::PAIR, "Pairing timed out. Try again.".into());
-                self.apply_outcome(steps::PAIR, ApplyOutcome::Failed);
+                self.pairing_ended(ApplyOutcome::Failed, "Pairing timed out. Try again.".into());
             } else if self.now >= self.connect.poll_at.saturating_add(PAIR_POLL_MS)
                 && !self.own_calls.values().any(|k| *k == OwnCall::PairStatus)
             {
@@ -1084,6 +1296,8 @@ impl LiveController {
         let id = self.alloc_call_id();
         let call = transition.consent_update(id, revision, hide);
         self.connect.settings = Some(transition);
+        // The Apply button says it restarts Crosspane: that click is the restart's consent too.
+        self.connect.hiding_restart_agreed = true;
         match call {
             Ok(call) => {
                 if let Err(failure) = self.submit_call(OwnCall::Settings, call) {
@@ -1137,6 +1351,7 @@ impl LiveController {
             return;
         };
         let state = transition.state().clone();
+        let restart_consent = state == S::NeedsRestartConsent;
         for event in outcome_.observations {
             let _ = self.reduce(event);
         }
@@ -1151,6 +1366,14 @@ impl LiveController {
                 self.apply_outcome(steps::HIDING, ApplyOutcome::Unknown);
             }
             _ => {}
+        }
+        // The setting was saved; restart now unless something shared would be cut short, in
+        // which case "Restart Crosspane now" asks first. A recovery restart always asks.
+        if restart_consent {
+            if self.connect.hiding_restart_agreed && self.agent_quiet() {
+                self.hiding_restart();
+            }
+            self.connect.hiding_restart_agreed = false;
         }
         self.dispatch_intents();
     }

@@ -202,6 +202,8 @@ struct H {
     calls: Vec<AgentCall>,
     effects: Vec<ShellEffect>,
     fixture_sequence: u64,
+    /// Where the last `next` (or `install`) left the flow.
+    last: ScreenId,
 }
 
 impl H {
@@ -239,6 +241,7 @@ impl H {
             calls: Vec::new(),
             effects: Vec::new(),
             fixture_sequence: 0,
+            last: ScreenId::Welcome,
         }
     }
     fn advance(&mut self, ms: u64) {
@@ -276,8 +279,29 @@ impl H {
         self.tick();
         closed
     }
+    /// Move to the next screen: with Next where the screen offers it (the welcome screen, or a
+    /// screen the person came back to), otherwise by letting a finished screen move on by itself.
     fn next(&mut self) {
-        self.click(ids::NEXT);
+        let from = self.view().screen;
+        if from != self.last {
+            // It already moved on by itself while the test was answering the agent.
+            self.last = from;
+            return;
+        }
+        if self.button(ids::NEXT).is_some_and(|b| b.enabled) {
+            self.click(ids::NEXT);
+            self.last = self.view().screen;
+            return;
+        }
+        for _ in 0..20 {
+            self.advance(100);
+            self.tick();
+            if self.view().screen != from {
+                self.last = self.view().screen;
+                return;
+            }
+        }
+        panic!("{from:?} neither offers Next nor moves on by itself");
     }
     fn row(&self, step: StepId) -> RowView {
         let wanted = step.0;
@@ -337,17 +361,17 @@ impl H {
         self.report(&verify, live);
         assert_eq!(self.row(step).state, RowState::Verified);
     }
+    /// Start setup, then let the install page run: each finished screen of it moves on by itself.
     fn install(&mut self) {
         self.tick();
         self.next();
         assert_eq!(self.view().screen, ScreenId::Compatibility);
         self.pass(SUPPORT);
-        self.next();
         assert_eq!(self.view().screen, ScreenId::InstallPlan);
         self.pass(PAYLOAD);
-        self.next();
         assert_eq!(self.view().screen, ScreenId::Installing);
         self.pass(AGENT);
+        self.last = ScreenId::Installing;
     }
     fn call(&mut self, matches: impl Fn(&InstallerRequest) -> bool) -> AgentCall {
         self.calls.extend(self.agent.borrow_mut().take_calls());
@@ -498,11 +522,12 @@ fn welcome_starts_nothing_and_detection_begins_only_on_its_screen() {
 }
 
 #[test]
-fn next_is_disabled_until_every_step_on_the_screen_is_verified() {
+fn a_screen_moves_on_by_itself_only_once_every_step_on_it_is_verified() {
     let mut h = H::new();
     h.tick();
     h.next();
-    assert!(!h.button(ids::NEXT).unwrap().enabled);
+    // No Next to click: the install page carries on by itself.
+    assert!(h.button(ids::NEXT).is_none());
     let (detect, _) = h.job(SUPPORT, JobStage::Detect);
     h.report(
         &detect,
@@ -510,11 +535,44 @@ fn next_is_disabled_until_every_step_on_the_screen_is_verified() {
             needs_action: false,
         },
     );
-    assert!(!h.button(ids::NEXT).unwrap().enabled);
+    for _ in 0..5 {
+        h.advance(500);
+        h.tick();
+    }
+    assert_eq!(
+        h.view().screen,
+        ScreenId::Compatibility,
+        "detection alone never moves on"
+    );
     let (verify, _) = h.job(SUPPORT, JobStage::Verify);
     let live = h.live();
     h.report(&verify, live);
-    assert!(h.button(ids::NEXT).unwrap().enabled);
+    assert_eq!(h.view().screen, ScreenId::InstallPlan);
+    // The next screen's step starts being looked at in the same pass.
+    let _ = h.job(PAYLOAD, JobStage::Detect);
+}
+
+#[test]
+fn going_back_to_a_finished_screen_keeps_it_until_the_person_continues() {
+    let mut h = H::new();
+    h.install();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Connect);
+    h.click(ids::BACK);
+    assert_eq!(h.view().screen, ScreenId::Installing);
+    for _ in 0..10 {
+        h.advance(500);
+        h.tick();
+    }
+    assert_eq!(
+        h.view().screen,
+        ScreenId::Installing,
+        "a screen the person went back to stays"
+    );
+    let next = h.button(ids::NEXT).expect("Continue is offered");
+    assert_eq!(next.kind, ButtonKind::Primary);
+    h.click(ids::NEXT);
+    assert_eq!(h.view().screen, ScreenId::Connect);
 }
 
 #[test]
@@ -539,7 +597,11 @@ fn demo_or_scratch_verification_reaches_core_and_never_verifies() {
         },
     );
     assert_ne!(h.row(SUPPORT).state, RowState::Verified);
-    assert!(!h.button(ids::NEXT).unwrap().enabled);
+    assert_eq!(
+        h.view().screen,
+        ScreenId::Compatibility,
+        "an unverified screen never moves on"
+    );
 }
 
 #[test]
@@ -588,44 +650,132 @@ fn stale_wrong_stage_and_retired_reports_are_dropped() {
 
 #[test]
 fn consent_is_bound_to_the_plan_preview_revision_and_operation() {
+    // A step outside the user-scope install (here a network change) always asks.
+    const NETWORK: StepId = StepId(30);
+    let mut h = with_extra_step(native(NETWORK, &[], ScreenId::Network, false));
+    h.install();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Network);
+    let (detect, _) = h.job(NETWORK, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(NETWORK, JobStage::Plan);
+    assert!(
+        h.button(ids::consent(NETWORK)).is_none(),
+        "no consent before the preview exists"
+    );
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "pkexec /usr/bin/ufw allow from 192.0.2.0/24".into(),
+        },
+    );
+    assert_eq!(h.row(NETWORK).state, RowState::NeedsAction);
+    assert!(h.view().message.contains("pkexec /usr/bin/ufw allow"));
+    let consent_button = h.button(ids::consent(NETWORK)).unwrap();
+    assert_eq!(consent_button.kind, ButtonKind::Primary);
+    for _ in 0..10 {
+        h.advance(500);
+        h.tick();
+    }
+    assert!(
+        h.take_jobs().is_empty(),
+        "a step outside the install page never goes ahead by itself"
+    );
+    assert_eq!(
+        h.view().screen,
+        ScreenId::Network,
+        "an open question holds the screen"
+    );
+    let old = h.view().revision;
+    // A stale revision is ignored.
+    h.act(old - 1, WizardIntent::Button(ids::consent(NETWORK)));
+    assert!(h.take_jobs().is_empty());
+    h.click(ids::consent(NETWORK));
+    let (apply, consent) = h.job(NETWORK, JobStage::Apply);
+    let consent = consent.expect("apply carries consent");
+    assert_eq!(consent.operation, apply.operation);
+    assert_eq!(consent.revision, old);
+    // A double click cannot start a second mutation.
+    let revision = h.view().revision;
+    h.act(revision, WizardIntent::Button(ids::consent(NETWORK)));
+    assert!(h.take_jobs().is_empty());
+    h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Applied));
+    let (verify, _) = h.job(NETWORK, JobStage::Verify);
+    let live = h.live();
+    h.report(&verify, live);
+    assert_eq!(h.row(NETWORK).state, RowState::Verified);
+}
+
+#[test]
+fn install_steps_go_ahead_with_the_start_click_bound_to_their_own_preview() {
     let mut h = H::new();
     h.tick();
     h.next();
     h.pass(SUPPORT);
-    h.next();
     let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
     h.report(&detect, NativeOutcome::Detected { needs_action: true });
     let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
-    assert!(
-        h.button(ids::consent(PAYLOAD)).is_none(),
-        "no consent before the preview exists"
-    );
     h.report(
         &plan,
         NativeOutcome::Planned {
             preview: "Copy 4 files into ~/.local".into(),
         },
     );
-    assert_eq!(h.row(PAYLOAD).state, RowState::NeedsAction);
-    assert!(h.view().message.contains("Copy 4 files"));
-    let old = h.view().revision;
-    // A stale revision is ignored.
-    h.act(old - 1, WizardIntent::Button(ids::consent(PAYLOAD)));
-    assert!(h.take_jobs().is_empty());
-    h.click(ids::consent(PAYLOAD));
+    // No further click: the start of setup is the consent, recorded against exactly this plan.
     let (apply, consent) = h.job(PAYLOAD, JobStage::Apply);
     let consent = consent.expect("apply carries consent");
+    assert_eq!(consent.plan, plan.operation);
     assert_eq!(consent.operation, apply.operation);
-    assert_eq!(consent.revision, old);
-    // A double click cannot start a second mutation.
-    let revision = h.view().revision;
-    h.act(revision, WizardIntent::Button(ids::consent(PAYLOAD)));
-    assert!(h.take_jobs().is_empty());
+    // While it runs, the step says what it is doing: the preview it was started from.
+    assert_eq!(h.row(PAYLOAD).state, RowState::Working);
+    assert!(h.row(PAYLOAD).detail.contains("Copy 4 files"));
+    assert!(h.button(ids::consent(PAYLOAD)).is_none());
     h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Applied));
     let (verify, _) = h.job(PAYLOAD, JobStage::Verify);
     let live = h.live();
     h.report(&verify, live);
     assert_eq!(h.row(PAYLOAD).state, RowState::Verified);
+    assert_eq!(h.view().screen, ScreenId::Installing);
+}
+
+#[test]
+fn an_install_step_waits_for_the_person_while_crosspane_is_in_use() {
+    const RESTART: StepId = StepId(30);
+    let mut h = with_extra_step(native(RESTART, &[], ScreenId::Installing, false));
+    // Something is playing across right now: a restart would cut it short.
+    h.status["result"]["installer"]["audio"]["active_peers"] = json!([peer().to_string()]);
+    h.install();
+    h.status_reply();
+    let (detect, _) = h.job(RESTART, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = h.job(RESTART, JobStage::Plan);
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "Restart Crosspane once".into(),
+        },
+    );
+    for _ in 0..4 {
+        h.advance(300);
+        h.tick();
+    }
+    assert!(
+        h.take_jobs().is_empty(),
+        "nothing in use is interrupted without the person"
+    );
+    assert_eq!(h.row(RESTART).state, RowState::NeedsAction);
+    assert!(h.view().message.contains("Restart Crosspane once"));
+    assert!(h.view().message.contains("in use"));
+    assert_eq!(
+        h.button(ids::consent(RESTART)).map(|b| b.kind),
+        Some(ButtonKind::Primary)
+    );
+    // Once nothing is shared any more, setup carries on by itself.
+    h.status["result"]["installer"]["audio"]["active_peers"] = json!([]);
+    h.status_reply();
+    let (apply, consent) = h.job(RESTART, JobStage::Apply);
+    assert_eq!(consent.map(|c| c.plan), Some(plan.operation));
+    assert_eq!(apply.step, RESTART);
 }
 
 #[test]
@@ -634,7 +784,6 @@ fn refused_and_unknown_mutations_wait_or_redetect_before_any_retry() {
     h.tick();
     h.next();
     h.pass(SUPPORT);
-    h.next();
     let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
     h.report(&detect, NativeOutcome::Detected { needs_action: true });
     let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
@@ -644,7 +793,7 @@ fn refused_and_unknown_mutations_wait_or_redetect_before_any_retry() {
             preview: "p".into(),
         },
     );
-    h.click(ids::consent(PAYLOAD));
+    // The install step goes ahead with the start click as its consent.
     let (apply, _) = h.job(PAYLOAD, JobStage::Apply);
     h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Unknown));
     // Unknown always re-detects; nothing is retried blindly.
@@ -658,11 +807,19 @@ fn refused_and_unknown_mutations_wait_or_redetect_before_any_retry() {
             preview: "p2".into(),
         },
     );
-    h.click(ids::consent(PAYLOAD));
-    let (apply, _) = h.job(PAYLOAD, JobStage::Apply);
+    // A new plan is a new preview: the go-ahead is recorded against it, never against "p".
+    let (apply, consent) = h.job(PAYLOAD, JobStage::Apply);
+    assert_eq!(consent.map(|c| c.plan), Some(plan.operation));
     h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Refused));
     assert_eq!(h.row(PAYLOAD).state, RowState::Waiting);
-    assert!(h.take_jobs().is_empty());
+    for _ in 0..5 {
+        h.advance(500);
+        h.tick();
+    }
+    assert!(
+        h.take_jobs().is_empty(),
+        "a refusal is never retried by itself"
+    );
     h.click(ids::retry(PAYLOAD));
     let _ = h.job(PAYLOAD, JobStage::Detect);
 }
@@ -718,6 +875,14 @@ fn pairing_never_offers_input_and_the_sas_is_display_only_until_explicit_confirm
     let mut h = H::new();
     to_connect(&mut h);
     assert_eq!(h.row(live::steps::PAIR).state, RowState::NeedsAction);
+    // Typing an address is one of the other ways to connect; the field appears only then.
+    assert!(
+        !h.view()
+            .fields
+            .iter()
+            .any(|f| matches!(f, FieldView::PeerAddress { .. }))
+    );
+    h.click(ids::PAIR_MANUAL);
     let revision = h.view().revision;
     h.act(
         revision,
@@ -821,6 +986,345 @@ fn a_refused_pairing_waits_for_the_person_and_an_unknown_one_redetects() {
     h.status_reply();
     h.status_reply();
     assert_eq!(h.row(live::steps::PAIR).state, RowState::Verified);
+}
+
+// ---- automatic pairing ----------------------------------------------------------------------
+
+impl H {
+    /// Answer the outstanding discovery request with `found` (a JSON list of name/addr pairs).
+    fn scan_reply(&mut self, found: &str) {
+        for _ in 0..20 {
+            if self.has_call(|r| *r == InstallerRequest::PairScan) {
+                break;
+            }
+            self.advance(200);
+            self.tick();
+        }
+        let call = self.call(|r| *r == InstallerRequest::PairScan);
+        let body = format!(r#"{{"ok":true,"result":{found}}}"#);
+        let decoded = decode_reply(&call.request, body.as_bytes(), AgentPlatform::Linux).unwrap();
+        self.reply(&call, Ok(decoded));
+    }
+    /// Let time pass on the pairing screen, answering discovery with nobody, until setup asks
+    /// the agent to open a pairing window.
+    fn until_listen(&mut self) -> AgentCall {
+        for _ in 0..40 {
+            if self.has_call(|r| matches!(r, InstallerRequest::PairListen { .. })) {
+                return self.call(|r| matches!(r, InstallerRequest::PairListen { .. }));
+            }
+            if self.has_call(|r| *r == InstallerRequest::PairScan) {
+                self.scan_reply("[]");
+            }
+            self.advance(250);
+            self.tick();
+        }
+        panic!("setup never opened a pairing window");
+    }
+    fn pair_poll(&mut self, body: &str) {
+        for _ in 0..10 {
+            if self.has_call(|r| *r == InstallerRequest::PairStatus) {
+                break;
+            }
+            self.advance(300);
+            self.tick();
+        }
+        let poll = self.call(|r| *r == InstallerRequest::PairStatus);
+        self.pair_status(&poll, body);
+    }
+}
+
+#[test]
+fn discovery_starts_on_the_pairing_screen_and_one_found_computer_is_the_one_primary_action() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    assert!(
+        h.has_call(|r| *r == InstallerRequest::PairScan),
+        "looking starts when the screen opens"
+    );
+    h.scan_reply(r#"[{"name":"mac-studio","addr":"192.0.2.9:47811"}]"#);
+    let primary: Vec<_> = h
+        .view()
+        .buttons
+        .iter()
+        .filter(|b| b.kind == ButtonKind::Primary)
+        .cloned()
+        .collect();
+    assert_eq!(primary.len(), 1, "one primary action: {primary:?}");
+    assert_eq!(primary[0].id, ids::pair_candidate(0));
+    assert_eq!(primary[0].label, "Pair with mac-studio");
+    // The other ways are quiet links under their own heading; no address field yet.
+    assert_eq!(
+        h.view().link_caption.as_deref(),
+        Some("Other ways to connect")
+    );
+    assert_eq!(
+        h.button(ids::PAIR_MANUAL).map(|b| b.kind),
+        Some(ButtonKind::Link)
+    );
+    assert!(h.view().fields.is_empty());
+    assert!(
+        h.view()
+            .rows
+            .iter()
+            .any(|r| r.label == "Found mac-studio on your network")
+    );
+    // While someone is there to choose, this computer opens no window of its own.
+    for _ in 0..12 {
+        h.advance(500);
+        h.tick();
+        if h.has_call(|r| *r == InstallerRequest::PairScan) {
+            h.scan_reply(r#"[{"name":"mac-studio","addr":"192.0.2.9:47811"}]"#);
+        }
+    }
+    assert!(!h.has_call(|r| matches!(r, InstallerRequest::PairListen { .. })));
+    h.click(ids::pair_candidate(0));
+    let join = h.call(|r| matches!(r, InstallerRequest::PairJoin { .. }));
+    assert_eq!(
+        join.request,
+        InstallerRequest::PairJoin {
+            addr: "192.0.2.9:47811".parse().unwrap(),
+            allow_input: false
+        }
+    );
+}
+
+#[test]
+fn with_nobody_found_setup_opens_this_computers_window_and_the_numbers_still_need_confirming() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    let listen = h.until_listen();
+    assert_eq!(
+        listen.request,
+        InstallerRequest::PairListen { allow_input: false },
+        "an automatic window never offers input"
+    );
+    h.ack(&listen);
+    h.pair_poll(
+        r#"{"ok":true,"result":{"phase":"listening","sas":null,"candidates":[],"peer":null,"error":null}}"#,
+    );
+    assert_eq!(h.view().screen, ScreenId::Connect);
+    assert!(
+        h.view()
+            .rows
+            .iter()
+            .any(|r| r.label == "Ready to be found" && r.state == RowState::Working)
+    );
+    h.pair_poll(
+        r#"{"ok":true,"result":{"phase":"confirm","sas":"482 913","candidates":[],"peer":"mac-studio","error":null}}"#,
+    );
+    assert_eq!(h.view().screen, ScreenId::MatchNumbers);
+    assert_eq!(h.view().illustration.sas.as_deref(), Some("482 913"));
+    for _ in 0..5 {
+        h.advance(400);
+        h.tick();
+    }
+    assert!(
+        !h.has_call(|r| matches!(r, InstallerRequest::PairConfirm { .. })),
+        "the numbers are never confirmed for the person"
+    );
+    assert_eq!(
+        h.button(ids::PAIR_CONFIRM).map(|b| b.kind),
+        Some(ButtonKind::Primary)
+    );
+    assert_eq!(
+        h.button(ids::PAIR_REJECT).map(|b| b.kind),
+        Some(ButtonKind::Destructive)
+    );
+    h.click(ids::PAIR_CONFIRM);
+    let confirm = h.call(|r| matches!(r, InstallerRequest::PairConfirm { .. }));
+    assert_eq!(
+        confirm.request,
+        InstallerRequest::PairConfirm { accept: true }
+    );
+}
+
+#[test]
+fn an_automatic_window_that_closes_unanswered_is_reopened_quietly() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    let listen = h.until_listen();
+    h.ack(&listen);
+    h.pair_poll(
+        r#"{"ok":true,"result":{"phase":"failed","sas":null,"candidates":[],"peer":null,"error":"the pairing window closed without a connection"}}"#,
+    );
+    // Nobody joined: not a failure to show, and nothing to click.
+    assert!(
+        !h.view()
+            .rows
+            .iter()
+            .any(|r| r.label == "Pairing didn't finish")
+    );
+    assert!(h.button(ids::retry(live::steps::PAIR)).is_none());
+    assert!(
+        h.view()
+            .rows
+            .iter()
+            .any(|r| r.label == "Looking for the other computer…")
+    );
+    h.status_reply();
+    let again = h.until_listen();
+    assert_eq!(
+        again.request,
+        InstallerRequest::PairListen { allow_input: false }
+    );
+}
+
+#[test]
+fn a_window_the_person_opened_that_fails_says_why_and_waits() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    h.click(ids::PAIR_LISTEN);
+    let listen = h.call(|r| matches!(r, InstallerRequest::PairListen { .. }));
+    h.ack(&listen);
+    h.pair_poll(
+        r#"{"ok":true,"result":{"phase":"failed","sas":null,"candidates":[],"peer":null,"error":"the pairing window closed without a connection"}}"#,
+    );
+    let row = h.row(live::steps::PAIR);
+    assert_eq!(row.state, RowState::Failed);
+    assert_eq!(row.label, "Pairing didn't finish");
+    assert!(row.detail.contains("closed without a connection"));
+    assert_eq!(
+        h.button(ids::retry(live::steps::PAIR)).map(|b| b.kind),
+        Some(ButtonKind::Primary)
+    );
+}
+
+#[test]
+fn a_refused_automatic_window_follows_the_pairing_the_agent_already_runs() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    let listen = h.until_listen();
+    h.reply(&listen, Err(CallFailure::Refused(AgentRefusal::Other)));
+    // The agent already had a window open (an earlier visit): setup follows it.
+    h.pair_poll(
+        r#"{"ok":true,"result":{"phase":"listening","sas":null,"candidates":[],"peer":null,"error":null}}"#,
+    );
+    assert_ne!(h.row(live::steps::PAIR).state, RowState::Failed);
+    h.pair_poll(
+        r#"{"ok":true,"result":{"phase":"confirm","sas":"111 222","candidates":[],"peer":"mac-studio","error":null}}"#,
+    );
+    assert_eq!(h.view().screen, ScreenId::MatchNumbers);
+}
+
+#[test]
+fn while_waiting_to_be_found_the_person_can_still_type_an_address_or_go_back() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    let listen = h.until_listen();
+    h.ack(&listen);
+    h.pair_poll(
+        r#"{"ok":true,"result":{"phase":"listening","sas":null,"candidates":[],"peer":null,"error":null}}"#,
+    );
+    assert_eq!(h.button(ids::BACK).map(|b| b.enabled), Some(true));
+    assert_eq!(
+        h.button(ids::PAIR_MANUAL).map(|b| b.kind),
+        Some(ButtonKind::Link)
+    );
+    h.click(ids::PAIR_MANUAL);
+    h.status_reply();
+    assert_eq!(h.row(live::steps::PAIR).state, RowState::NeedsAction);
+    assert!(
+        h.view()
+            .fields
+            .iter()
+            .any(|f| matches!(f, FieldView::PeerAddress { .. }))
+    );
+    for _ in 0..10 {
+        h.advance(500);
+        h.tick();
+    }
+    assert!(
+        !h.has_call(|r| *r == InstallerRequest::PairStatus),
+        "the abandoned window is no longer followed"
+    );
+    assert!(!h.has_call(|r| matches!(r, InstallerRequest::PairListen { .. })));
+
+    let mut h = H::new();
+    to_connect(&mut h);
+    let listen = h.until_listen();
+    h.ack(&listen);
+    h.click(ids::BACK);
+    assert_ne!(h.view().screen, ScreenId::Connect);
+}
+
+fn hiding_description() -> PlatformDescription {
+    let mut d = description();
+    d.hiding_choice = true;
+    d.source_policy = TutorialSourcePolicy::MacMirror;
+    d
+}
+
+#[test]
+fn the_hiding_choice_is_never_preselected_and_apply_restarts_unless_something_is_shared() {
+    for busy in [false, true] {
+        let mut h = H::with(hiding_description());
+        if busy {
+            h.status["result"]["installer"]["audio"]["active_peers"] = json!([peer().to_string()]);
+        }
+        h.install();
+        h.status_reply();
+        h.next();
+        assert_eq!(h.view().screen, ScreenId::HidingChoice);
+        h.status_reply();
+        assert_eq!(h.view().hiding_choice, None, "D7: nothing is preselected");
+        let apply = h.button(ids::HIDING_APPLY).cloned().expect("apply");
+        assert!(!apply.enabled, "D7: no choice, no apply");
+        assert_eq!(apply.kind, ButtonKind::Primary);
+        let revision = h.view().revision;
+        h.act(revision, WizardIntent::ChooseHiding(HidingChoice::Hide));
+        h.click(ids::HIDING_APPLY);
+        let update = h.call(|r| matches!(r, InstallerRequest::SettingsUpdate { .. }));
+        let InstallerRequest::SettingsUpdate {
+            mac_virtual_display,
+            ..
+        } = update.request
+        else {
+            unreachable!()
+        };
+        assert!(mac_virtual_display);
+        let saved = decode_reply(
+            &update.request,
+            br#"{"ok":true,"result":{"revision":"aaaaaaaaaaaaaaaa","restart_required":true}}"#,
+            AgentPlatform::Linux,
+        )
+        .unwrap();
+        h.reply(&update, Ok(saved));
+        if busy {
+            // Something is shared right now: the restart asks, explained, instead of cutting
+            // it short.
+            assert!(!h.has_call(|r| *r == InstallerRequest::Restart));
+            assert_eq!(
+                h.button(ids::HIDING_RESTART).map(|b| b.kind),
+                Some(ButtonKind::Primary)
+            );
+            assert!(h.view().message.contains("ends what is shared"));
+            h.click(ids::HIDING_RESTART);
+        }
+        // Otherwise the Apply click, which said it restarts Crosspane, was the consent.
+        let _ = h.call(|r| *r == InstallerRequest::Restart);
+    }
+}
+
+#[test]
+fn typing_an_address_stops_the_automatic_window() {
+    let mut h = H::new();
+    to_connect(&mut h);
+    h.click(ids::PAIR_MANUAL);
+    assert!(
+        h.view()
+            .fields
+            .iter()
+            .any(|f| matches!(f, FieldView::PeerAddress { .. }))
+    );
+    assert_eq!(h.button(ids::PAIR_JOIN).map(|b| b.enabled), Some(false));
+    for _ in 0..20 {
+        h.advance(500);
+        h.tick();
+    }
+    assert!(!h.has_call(|r| matches!(r, InstallerRequest::PairListen { .. })));
+    // Back to searching: the automatic window comes back.
+    h.click(ids::PAIR_MANUAL);
+    let _ = h.until_listen();
 }
 
 fn to_grants(h: &mut H) {
@@ -1172,8 +1676,13 @@ fn practice_starts_only_on_an_explicit_click_and_never_before_prerequisites() {
     h.next();
     h.placements();
     h.status_reply();
-    // Layout is not committed yet, so Next is blocked and no practice can start.
-    assert!(!h.button(ids::NEXT).unwrap().enabled);
+    // Layout is not committed yet, so the screen stays and no practice can start.
+    for _ in 0..5 {
+        h.advance(500);
+        h.tick();
+    }
+    assert_eq!(h.view().screen, ScreenId::Layout);
+    assert!(h.button(ids::NEXT).is_none());
     let mut h = H::new();
     to_practice(&mut h);
     for _ in 0..6 {
@@ -1940,7 +2449,6 @@ fn a_window_close_is_refused_while_a_native_change_runs_and_allowed_after() {
             preview: "Install".into(),
         },
     );
-    h.click(ids::consent(PAYLOAD));
     let (apply, _) = h.job(PAYLOAD, JobStage::Apply);
     assert!(!h.c.request_close(), "closing would cut the install short");
     assert!(!h.native.borrow().shutdown);
@@ -1972,7 +2480,6 @@ fn a_silent_platform_never_makes_the_window_unclosable() {
             preview: "Install".into(),
         },
     );
-    h.click(ids::consent(PAYLOAD));
     let _ = h.job(PAYLOAD, JobStage::Apply);
     assert!(!h.c.request_close());
     h.advance(151_000);
@@ -2762,9 +3269,10 @@ fn the_checklist_follows_the_support_pass_and_check_again_resets_it() {
             (903, "Processor", RowState::Verified, ""),
         ]
     );
-    // The rows sit right under their card, and the summary sentence is kept.
+    // The rows sit right under their card, before the page's later steps, and the summary
+    // sentence is kept.
     let ids: Vec<u16> = h.view().rows.iter().map(|r| r.id).collect();
-    assert_eq!(ids, vec![SUPPORT.0, 900, 901, 902, 903]);
+    assert_eq!(ids, vec![SUPPORT.0, 900, 901, 902, 903, PAYLOAD.0, AGENT.0]);
     let card = h.row(SUPPORT);
     assert!(card.detail.starts_with("fake detail"), "{card:?}");
     assert!(card.detail.ends_with("Last checked just now."), "{card:?}");
@@ -2845,9 +3353,20 @@ fn the_checklist_stays_on_its_own_screen_and_platforms_without_one_are_unchanged
     )]);
     let live = h.live();
     h.report(&verify, live);
-    assert_eq!(check_rows(&h).len(), 1);
-    h.next();
+    // The three install screens are one page: the checklist stays under the support card while
+    // the page carries on, and never moves under another card.
     assert_eq!(h.view().screen, ScreenId::InstallPlan);
+    assert_eq!(check_rows(&h).len(), 1);
+    let ids: Vec<u16> = h.view().rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![SUPPORT.0, 900, PAYLOAD.0, AGENT.0]);
+    h.pass(PAYLOAD);
+    h.pass(AGENT);
+    h.status_reply();
+    h.last = h.view().screen;
+    if h.view().screen != ScreenId::Connect {
+        h.next();
+    }
+    assert_eq!(h.view().screen, ScreenId::Connect);
     assert!(check_rows(&h).is_empty());
     // A checklist naming a step that isn't a native step is ignored.
     let mut h = H::with_checks(description(), Some(SupportChecksSlot::new(StepId(59))));

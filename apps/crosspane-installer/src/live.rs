@@ -495,14 +495,21 @@ pub mod ids {
     /// One "Check again" for a screen where more than one step is waiting: it re-checks each.
     /// A screen with a single waiting step uses that step's own [`retry`] id.
     pub const RETRY_ALL: u16 = 5;
+    /// From the summary: go back to the first screen with something left to finish.
+    pub const CONTINUE_SETUP: u16 = 6;
     pub const PEER_ADDRESS: u16 = 1;
     pub const PAIR_LISTEN: u16 = 2001;
     pub const PAIR_JOIN: u16 = 2002;
     pub const PAIR_DIAL: u16 = 2003;
+    /// Look again: a fresh automatic search for the other computer.
     pub const PAIR_SCAN: u16 = 2004;
+    /// Switch between the automatic search and typing the other computer's address.
+    pub const PAIR_MANUAL: u16 = 2005;
     pub const PAIR_CONFIRM: u16 = 2101;
     pub const PAIR_REJECT: u16 = 2102;
     pub const GRANTS_APPLY: u16 = 2201;
+    /// Turn on every capability and apply them in one click.
+    pub const GRANTS_ALL: u16 = 2202;
     pub const LAYOUT_ACCEPT: u16 = 2301;
     pub const HIDING_APPLY: u16 = 2401;
     pub const HIDING_RESTART: u16 = 2402;

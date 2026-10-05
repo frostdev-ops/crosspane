@@ -2666,21 +2666,17 @@ mod flow {
 
         // ---- install, permissions, hiding ----
 
+        /// Start setup; the install inside this account then runs by itself.
         pub fn install(&mut self) {
             self.until("the welcome screen", |f| {
                 f.view().screen == ScreenId::Welcome
             });
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Compatibility);
-            self.until("support verified", |f| f.verified(10));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::InstallPlan);
-            self.until("an install preview to consent to", |f| {
-                f.has_button(live::ids::consent(StepId(20)))
-            });
-            let preview = self.view().message.clone();
-            assert!(preview.contains("0.0.1"), "{preview}");
-            // Nothing was installed before the click.
+            for _ in 0..20 {
+                self.answer_status();
+                self.advance(PACE_MS);
+                self.tick();
+            }
+            // Nothing is installed before the person starts setup.
             assert_eq!(
                 super::calls(&self.w)
                     .iter()
@@ -2688,19 +2684,26 @@ mod flow {
                     .count(),
                 0
             );
-            self.click(live::ids::consent(StepId(20)));
+            self.go_next();
+            assert_eq!(self.view().screen, ScreenId::Compatibility);
+            self.until("support verified", |f| f.verified(10));
+            // No further click: the start of setup is the install's consent.
             self.until("the install verified from a fresh status", |f| {
                 f.verified(20)
             });
             assert_eq!(self.summary(), SummaryView::InstalledWaiting);
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Installing);
             self.until("the agent verified", |f| f.verified(21));
         }
 
+        /// Let a finished screen move on by itself until `screen` is up.
+        pub fn reach(&mut self, screen: ScreenId) {
+            self.until(&format!("the {screen:?} screen"), |f| {
+                f.view().screen == screen
+            });
+        }
+
         pub fn permissions(&mut self) {
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Permissions);
+            self.reach(ScreenId::Permissions);
             self.until("a permission preview", |f| {
                 f.has_button(live::ids::consent(StepId(30)))
             });
@@ -2728,8 +2731,7 @@ mod flow {
         }
 
         pub fn audio(&mut self) {
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::AudioComponent);
+            self.reach(ScreenId::AudioComponent);
             self.until("a sound driver preview", |f| {
                 f.has_button(live::ids::consent(StepId(31)))
             });
@@ -2761,8 +2763,7 @@ mod flow {
         }
 
         pub fn choose_hiding(&mut self, choice: HidingChoice) {
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::HidingChoice);
+            self.reach(ScreenId::HidingChoice);
             self.until("the hiding choice to be offered", |f| {
                 f.row(63).state == RowState::NeedsAction
             });
@@ -2790,10 +2791,9 @@ mod flow {
                 br#"{"ok":true,"result":{"revision":"aaaaaaaaaaaaaaaa","restart_required":true}}"#,
             );
             self.tick();
-            self.until("the restart to be offered", |f| {
-                f.has_button(live::ids::HIDING_RESTART)
-            });
-            self.click(live::ids::HIDING_RESTART);
+            // The Apply click said it restarts Crosspane, and nothing is shared yet: the restart
+            // follows the saved setting without a second click.
+            assert!(!self.has_button(live::ids::HIDING_RESTART));
             self.take_and_ack(|r| *r == InstallerRequest::Restart);
             // The new instance comes up with the new revision.
             self.set(&["installer", "instance", "id"], json!(10));
@@ -2804,24 +2804,20 @@ mod flow {
         }
 
         pub fn pair_and_arrange(&mut self) {
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Connect);
+            self.reach(ScreenId::Connect);
             self.pair_externally(&[]);
             self.until("pairing verified from status", |f| f.verified(60));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Grants);
+            self.reach(ScreenId::Grants);
             self.pair_externally(&["browse", "input", "present", "share", "speaker"]);
             self.until("grants verified", |f| f.verified(61));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Layout);
+            self.reach(ScreenId::Layout);
             self.place();
             self.until("a layout to accept", |f| {
                 f.has_button(live::ids::LAYOUT_ACCEPT)
             });
             self.click(live::ids::LAYOUT_ACCEPT);
             self.until("layout committed", |f| f.verified(62));
-            self.go_next();
-            assert_eq!(self.view().screen, ScreenId::Practice);
+            self.reach(ScreenId::Practice);
         }
 
         pub fn summary(&self) -> SummaryView {
@@ -3279,11 +3275,12 @@ fn full_mac_flow(choice: crosspane_installer::view::HidingChoice) {
         "nothing is practised yet"
     );
     f.practise_everything(choice == HidingChoice::Hide);
-    f.go_next();
+    f.reach(crosspane_installer::view::ScreenId::Summary);
     f.until("final fresh health", |f| {
         f.summary() == SummaryView::WorkspaceReady
     });
-    // Every mutation had its own consent, and nothing destructive was ever requested.
+    // The install in this account went ahead on the start click; the permissions request and
+    // the sound driver each had their own click, and nothing destructive was ever requested.
     let calls = calls(f.world());
     assert!(calls.iter().any(|c| c.starts_with("install.apply:")));
     assert!(
@@ -3627,14 +3624,10 @@ fn an_install_that_cannot_be_confirmed_from_the_running_agent_never_verifies() {
     f.until("welcome", |f| {
         f.view().screen == crosspane_installer::view::ScreenId::Welcome
     });
+    f.world().lock().unwrap().verify = Some(Err(InstallError::Unavailable));
     f.go_next();
     f.until("support verified", |f| f.verified(10));
-    f.go_next();
-    f.world().lock().unwrap().verify = Some(Err(InstallError::Unavailable));
-    f.until("an install preview", |f| {
-        f.has_button(live::ids::consent(StepId(20)))
-    });
-    f.click(live::ids::consent(StepId(20)));
+    // The install goes ahead with the start click as its consent.
     f.until("the install to be applied", |f| {
         f.world()
             .lock()
