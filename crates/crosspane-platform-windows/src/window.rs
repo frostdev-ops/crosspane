@@ -51,6 +51,77 @@ const RAW_LIMIT: usize = 4096;
 /// Must return current physical monitor facts within the platform call bound.
 pub type MonitorReader = Arc<dyn Fn() -> Result<Vec<MonitorProbe>, PlatformError> + Send + Sync>;
 
+/// A currently admitted native identity. `generation` is the opaque observed-lifetime
+/// token (`WindowId.0`), not a sequence number and never an HWND encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeWindow {
+    pub hwnd: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub process_created: u64,
+    pub generation: u64,
+}
+
+/// Read-only access to the source's one authoritative, live identity table.
+#[derive(Clone)]
+pub struct WindowResolver {
+    state: Arc<State>,
+}
+
+impl fmt::Debug for WindowResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WindowResolver").finish_non_exhaustive()
+    }
+}
+
+impl WindowResolver {
+    pub fn resolve(&self, id: WindowId) -> Option<NativeWindow> {
+        self.resolve_with(id, |expected| {
+            // SAFETY: checks only the admitted handle's existence before fresh identity queries.
+            if unsafe { IsWindow(hwnd(expected.hwnd)) } == 0 {
+                return None;
+            }
+            identity(hwnd(expected.hwnd), Some(expected))
+                .ok()
+                .map(|i| i.0)
+        })
+    }
+
+    fn resolve_with(
+        &self,
+        id: WindowId,
+        query: impl FnOnce(Identity) -> Option<Identity>,
+    ) -> Option<NativeWindow> {
+        let healthy = || {
+            self.state.alive.load(Ordering::Acquire)
+                && !self.state.fault.load(Ordering::Acquire)
+                && self
+                    .state
+                    .updated
+                    .lock()
+                    .is_ok_and(|updated| updated.elapsed() < BOUND)
+        };
+        if !healthy() {
+            return None;
+        }
+        let expected = self.state.windows.lock().ok()?.identity(id)?;
+        let fresh = query(expected)?;
+        if fresh != expected
+            || !healthy()
+            || self.state.windows.lock().ok()?.identity(id) != Some(expected)
+        {
+            return None;
+        }
+        Some(NativeWindow {
+            hwnd: fresh.hwnd,
+            pid: fresh.pid,
+            tid: fresh.tid,
+            process_created: fresh.process_created,
+            generation: id.0,
+        })
+    }
+}
+
 struct State {
     windows: Mutex<Windows>,
     updated: Mutex<Instant>,
@@ -101,6 +172,12 @@ impl fmt::Debug for WindowsWindowSource {
 }
 
 impl WindowsWindowSource {
+    pub fn resolver(&self) -> WindowResolver {
+        WindowResolver {
+            state: Arc::clone(&self.state),
+        }
+    }
+
     pub fn new(
         ids: Arc<Mutex<DisplayIds>>,
         monitors: MonitorReader,
@@ -1166,5 +1243,120 @@ mod tests {
         call.abandoned.store(false, Ordering::Release);
         call.until = Instant::now();
         assert!(matches!(call.check(&state), Err(PlatformError::Timeout)));
+    }
+
+    #[allow(clippy::unwrap_used)]
+    fn admitted() -> (Arc<State>, WindowId, Identity) {
+        use crosspane_types::{
+            geom::{PointLogical, RectLogical, SizeLogical},
+            id::DisplayId,
+        };
+        let shared = state();
+        let identity = Identity {
+            hwnd: 7,
+            pid: 8,
+            tid: 9,
+            process_created: 10,
+        };
+        let mut table = shared.windows.lock().unwrap();
+        table.observe(Observation {
+            identity,
+            title: "fixture".into(),
+            app_id: "fixture.exe".into(),
+            class: "fixture".into(),
+            style: 0x00c0_0000,
+            ex_style: 0,
+            owner: None,
+            root: true,
+            visible: true,
+            iconic: false,
+            cloaked: false,
+            current_desktop: Some(true),
+            display: DisplayId(1),
+            frame: RectLogical::new(PointLogical::new(0.0, 0.0), SizeLogical::new(10.0, 10.0)),
+            fills_monitor: false,
+        });
+        let id = table.list()[0].id;
+        drop(table);
+        (shared, id, identity)
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn capture_resolver_requires_fresh_native_identity() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<WindowResolver>();
+        let _: fn(&WindowResolver, WindowId) -> Option<NativeWindow> = WindowResolver::resolve;
+        let _: fn(&WindowsWindowSource) -> WindowResolver = WindowsWindowSource::resolver;
+        let (state, id, expected) = admitted();
+        let resolver = WindowResolver { state };
+        assert!(
+            resolver
+                .resolve_with(WindowId(id.0 ^ u64::MAX), |_| {
+                    panic!("unadmitted ID must not query any native fields")
+                })
+                .is_none()
+        );
+        let good = resolver.resolve_with(id, Some).unwrap();
+        assert_eq!(good.hwnd, expected.hwnd);
+        assert_eq!(good.generation, id.0);
+        for field in 0..3 {
+            let mut changed = expected;
+            match field {
+                0 => changed.pid += 1,
+                1 => changed.tid += 1,
+                _ => changed.process_created += 1,
+            }
+            assert!(resolver.resolve_with(id, |_| Some(changed)).is_none());
+        }
+        assert!(resolver.resolve_with(id, |_| None).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn capture_resolver_rechecks_live_generation_after_query() {
+        let (state, id, _) = admitted();
+        let resolver = WindowResolver {
+            state: Arc::clone(&state),
+        };
+        assert!(
+            resolver
+                .resolve_with(id, |identity| {
+                    state
+                        .windows
+                        .lock()
+                        .unwrap()
+                        .close(identity.hwnd, Some(identity));
+                    Some(identity)
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn capture_resolver_refuses_source_loss_stall_and_query_fault() {
+        for variant in 0..3 {
+            let (state, id, _) = admitted();
+            let resolver = WindowResolver {
+                state: Arc::clone(&state),
+            };
+            if variant == 0 {
+                state.alive.store(false, Ordering::Release);
+            }
+            if variant == 1 {
+                *state.updated.lock().unwrap() = Instant::now() - BOUND;
+            }
+            assert!(
+                resolver
+                    .resolve_with(id, |identity| {
+                        if variant == 2 {
+                            state.fault.store(true, Ordering::Release);
+                        }
+                        Some(identity)
+                    })
+                    .is_none()
+            );
+        }
     }
 }
