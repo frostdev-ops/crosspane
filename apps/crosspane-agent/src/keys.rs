@@ -306,6 +306,7 @@ impl Drop for StopWatch {
 
 /// The watcher thread's body: tell `ready` whether the handlers are installed, then send one `()` on
 /// `stop` for the first SIGTERM or SIGINT, or end when `end` is dropped.
+#[cfg(unix)]
 fn watch_signals(
     stop: &mpsc::Sender<()>,
     ready: &mpsc::Sender<bool>,
@@ -341,8 +342,27 @@ fn watch_signals(
     });
 }
 
+#[cfg(windows)]
+fn watch_signals(
+    stop: &mpsc::Sender<()>,
+    ready: &mpsc::Sender<bool>,
+    end: tokio::sync::oneshot::Receiver<()>,
+) {
+    let watch = match crate::windows::shutdown::Watch::install(stop.clone()) {
+        Ok(watch) => watch,
+        Err(error) => {
+            tracing::warn!(%error, "no shutdown handling while waiting for the key store");
+            let _ = ready.send(false);
+            return;
+        }
+    };
+    let _ = ready.send(true);
+    let _ = end.blocking_recv();
+    drop(watch);
+}
+
 fn load_or_create_file(path: &Path) -> Result<DeviceIdentity> {
-    match std::fs::read(path) {
+    match crate::paths::read_private(path) {
         Ok(bytes) => {
             let bytes = zeroize::Zeroizing::new(bytes);
             DeviceIdentity::from_pkcs8(&bytes)
@@ -496,7 +516,10 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("crosspane-keys-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        #[cfg(unix)]
         std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        crate::paths::create_private_dir(&dir).unwrap();
         dir.join("device-key.pk8")
     }
 
@@ -752,6 +775,7 @@ mod tests {
 
     /// One test for both halves, because a signal is process-wide: under plain `cargo test` (one
     /// process, many threads) a second test using the signal pacer would see this one's SIGTERM.
+    #[cfg(unix)]
     #[test]
     fn the_signal_pacer_sleeps_until_a_stop_signal_arrives() {
         let mut pacer = SignalPacer::new();

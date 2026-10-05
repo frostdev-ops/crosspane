@@ -81,6 +81,7 @@ impl Default for Config {
     }
 }
 
+#[cfg(unix)]
 fn default_name() -> String {
     std::fs::read_to_string("/etc/hostname")
         .ok()
@@ -98,6 +99,11 @@ fn default_name() -> String {
         .unwrap_or_else(|| "crosspane".to_owned())
 }
 
+#[cfg(windows)]
+fn default_name() -> String {
+    crate::windows::process::hostname().unwrap_or_else(|| "crosspane".to_owned())
+}
+
 /// The revision of a config file (`status.result.installer.config_revision`, WP-4.5): 16 lowercase
 /// hex digits, `xxh3_64` of its bytes; all zeros for no file at all (the only zero).
 pub fn revision_of(bytes: Option<&[u8]>) -> String {
@@ -110,7 +116,7 @@ pub fn settings_update(
     expected_revision: &str,
     mac_virtual_display: bool,
 ) -> crate::ctl::Response {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         let _ = (paths, expected_revision, mac_virtual_display);
         crate::ctl::Response::err("not_supported")
@@ -128,7 +134,7 @@ fn update_mac_setting(
     mac_virtual_display: bool,
 ) -> crate::ctl::Response {
     let update = || -> Result<crate::ctl::Response> {
-        let bytes = match std::fs::read(path) {
+        let bytes = match crate::paths::read_private(path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("read config"),
@@ -163,7 +169,7 @@ impl Config {
     /// error, never the zero revision.
     pub fn load_revision(paths: &Paths) -> Result<(Config, String)> {
         let file = paths.config_file();
-        match std::fs::read(&file) {
+        match crate::paths::read_private(&file) {
             Ok(bytes) => {
                 let text = std::str::from_utf8(&bytes)
                     .with_context(|| format!("read {}: not valid UTF-8", file.display()))?;
@@ -202,7 +208,10 @@ mod tests {
             let dir = std::env::temp_dir()
                 .join(format!("crosspane-config-{}-{test}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
+            #[cfg(unix)]
             std::fs::create_dir_all(&dir).unwrap();
+            #[cfg(windows)]
+            crate::paths::create_private_dir(&dir).unwrap();
             Scratch(dir)
         }
 
@@ -258,14 +267,14 @@ mod tests {
         let scratch = Scratch::new("replaced");
         let paths = scratch.paths();
         let loaded = b"name = \"loaded\"\nport = 47811\n";
-        std::fs::write(paths.config_file(), loaded).unwrap();
+        crate::paths::write_fixture(paths.config_file(), loaded).unwrap();
         let (config, revision) = Config::load_revision(&paths).unwrap();
         assert_eq!(config.name, "loaded");
         assert_eq!(revision, revision_of(Some(loaded)));
         // Someone edits the file while the agent waits for its key store (or just runs): the
         // revision it keeps still describes what it loaded.
         let edited = b"name = \"edited\"\nport = 47811\n";
-        std::fs::write(paths.config_file(), edited).unwrap();
+        crate::paths::write_fixture(paths.config_file(), edited).unwrap();
         assert_eq!(revision, revision_of(Some(loaded)));
         assert_ne!(revision, revision_of(Some(edited)));
         // The next start loads, and reports, the edited file.
@@ -298,9 +307,9 @@ mod tests {
         assert!(Config::load(&paths).is_err());
         // Bytes that aren't text, and text that isn't a config, are errors too.
         std::fs::remove_dir(paths.config_file()).unwrap();
-        std::fs::write(paths.config_file(), [0xff, 0xfe, 0x00]).unwrap();
+        crate::paths::write_fixture(paths.config_file(), [0xff, 0xfe, 0x00]).unwrap();
         assert!(Config::load_revision(&paths).is_err());
-        std::fs::write(paths.config_file(), b"not = [valid").unwrap();
+        crate::paths::write_fixture(paths.config_file(), b"not = [valid").unwrap();
         assert!(Config::load_revision(&paths).is_err());
     }
 
@@ -313,7 +322,7 @@ mod tests {
         assert!(!path.exists());
         let original =
             b"# keep until an update succeeds\nname = \"desk\"\nmac_virtual_display = false\n";
-        std::fs::write(&path, original).unwrap();
+        crate::paths::write_fixture(&path, original).unwrap();
         let response = update_mac_setting(&path, &revision_of(None), true);
         assert_eq!(response.error.as_deref(), Some("revision_conflict"));
         assert_eq!(std::fs::read(path).unwrap(), original);
@@ -321,11 +330,12 @@ mod tests {
 
     #[test]
     fn settings_update_preserves_all_other_keys_and_returns_the_saved_revision() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new("settings-preserve");
         let path = scratch.paths().config_file();
         let original = b"# comments are not preserved\nname = \"desk\"\nport = 47812\nmac_virtual_display = false\nfuture = [1, 2, 3]\n[remap]\nlaptop = \"swap-ctrl-gui\"\n[[peers]]\naddr = \"127.0.0.1:47811\"\n";
-        std::fs::write(&path, original).unwrap();
+        crate::paths::write_fixture(&path, original).unwrap();
         let expected_revision = revision_of(Some(original));
         let response = update_mac_setting(&path, &expected_revision, true);
         assert!(response.ok);
@@ -347,6 +357,7 @@ mod tests {
                 .unwrap(),
             before
         );
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

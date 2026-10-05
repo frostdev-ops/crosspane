@@ -36,7 +36,7 @@ impl SharedTrust {
 
     /// Re-read the file if it changed. Returns true if it did.
     pub fn refresh(&self) -> Result<bool> {
-        let modified = std::fs::metadata(&self.path)
+        let modified = crate::paths::metadata_private(&self.path)
             .and_then(|m| m.modified())
             .ok();
         {
@@ -78,7 +78,7 @@ impl SharedTrust {
         if next != loaded.store {
             save(&self.path, &next)?;
             loaded.store = next;
-            loaded.modified = std::fs::metadata(&self.path)
+            loaded.modified = crate::paths::metadata_private(&self.path)
                 .and_then(|m| m.modified())
                 .ok();
         }
@@ -93,9 +93,11 @@ impl PinStore for SharedTrust {
 }
 
 fn read(path: &std::path::Path) -> Result<(TrustStore, Option<SystemTime>)> {
-    match std::fs::read_to_string(path) {
+    match crate::paths::read_private_to_string(path) {
         Ok(text) => {
-            let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            let modified = crate::paths::metadata_private(path)
+                .and_then(|m| m.modified())
+                .ok();
             let store = TrustStore::from_json(&text)
                 .with_context(|| format!("parse {}", path.display()))?;
             Ok((store, modified))
@@ -118,8 +120,18 @@ mod tests {
 
     #[test]
     fn a_failed_save_changes_nothing_in_memory() {
-        // A path whose directory can't be created: every save fails.
-        let trust = SharedTrust::load(PathBuf::from("/proc/crosspane-test/trust.json")).unwrap();
+        // Admit an empty, owned parent, then remove it to make every save fail portably.
+        let scratch = std::env::temp_dir().join(format!(
+            "crosspane-trust-save-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::paths::create_private_dir(&scratch).unwrap();
+        let trust = SharedTrust::load(scratch.join("trust.json")).unwrap();
+        std::fs::remove_dir(&scratch).unwrap();
         let peer = DeviceIdentity::generate().unwrap();
         let result = trust.update(|t| {
             t.pin(PeerEntry {

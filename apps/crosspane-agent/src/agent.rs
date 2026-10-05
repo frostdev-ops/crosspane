@@ -4899,6 +4899,8 @@ impl Agent {
     /// would otherwise bring them back only at the next start), then the links close so peers end
     /// their sessions at once instead of after the idle timeout.
     fn shutdown(&mut self) -> crate::lifecycle::Shutdown {
+        #[cfg(all(windows, not(test)))]
+        platform::exit_deadline(Duration::from_secs(5));
         tracing::info!("stopping");
         // The panic ends every audio session too (the engine stops and closes each one, which the
         // worker carries out), so the worker has nothing running when it is shut down below.
@@ -5663,11 +5665,16 @@ fn resolve<'a>(
 /// Start the settings app: `crosspane-ui` next to this executable (the same bin directory, or
 /// Contents/MacOS in the app bundle), else from PATH. Its exit is reaped on a thread.
 fn open_settings_app() -> std::io::Result<()> {
+    let program_name = if cfg!(windows) {
+        "crosspane-ui.exe"
+    } else {
+        "crosspane-ui"
+    };
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("crosspane-ui")))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(program_name)))
         .filter(|path| path.exists());
-    let program = beside.unwrap_or_else(|| std::path::PathBuf::from("crosspane-ui"));
+    let program = beside.unwrap_or_else(|| std::path::PathBuf::from(program_name));
     let mut child = std::process::Command::new(program)
         .stdin(std::process::Stdio::null())
         .spawn()?;
@@ -5955,6 +5962,7 @@ fn proxy(key: ProjectionKey, event: ProxyEvent) -> Input {
 
 /// Start this agent again in place (same binary, same arguments, same PID), after a clean
 /// shutdown. Exits if that fails, rather than run on with closed links.
+#[cfg(unix)]
 pub(crate) fn restart() -> ! {
     use std::os::unix::process::CommandExt;
     tracing::info!("restarting");
@@ -5966,6 +5974,11 @@ pub(crate) fn restart() -> ! {
     };
     tracing::error!(%error, "could not restart; exiting");
     std::process::exit(1);
+}
+
+#[cfg(windows)]
+pub(crate) fn restart() -> ! {
+    crate::windows::process::restart()
 }
 
 /// A node's colour on proxy edges: a hue from its id, at fixed saturation and lightness.
@@ -6013,7 +6026,7 @@ mod installer {
     pub struct StartupFacts {
         instance_id: u64,
         pid: u32,
-        uid: u32,
+        uid: Option<u32>,
         exe: String,
         runtime_dir: String,
         started_unix_ms: u64,
@@ -6078,7 +6091,10 @@ mod installer {
                     u64::try_from(started.as_nanos()).unwrap_or(u64::MAX),
                 ),
                 pid,
-                uid: rustix::process::geteuid().as_raw(),
+                #[cfg(unix)]
+                uid: Some(rustix::process::geteuid().as_raw()),
+                #[cfg(windows)]
+                uid: None,
                 exe: std::env::current_exe()
                     .map(|exe| exe.to_string_lossy().into_owned())
                     .unwrap_or_default(),
@@ -6645,6 +6661,8 @@ mod installer {
             };
             let audio = if t.audio_off {
                 down("audio", "missing", "disabled")
+            } else if cfg!(windows) {
+                optional("audio", self.audio.is_some())
             } else {
                 built("audio", self.audio.is_some(), &[Permission::Microphone])
             };
@@ -6668,14 +6686,22 @@ mod installer {
                 optional("hotkeys", p.hotkeys.is_some()),
                 keystore,
                 built("windows", p.windows.is_some(), &[Accessibility]),
-                built(
-                    "parking",
-                    p.parking.is_some() || self.parking_available,
-                    &[Accessibility],
-                ),
+                if cfg!(windows) {
+                    optional("parking", p.parking.is_some() || self.parking_available)
+                } else {
+                    built(
+                        "parking",
+                        p.parking.is_some() || self.parking_available,
+                        &[Accessibility],
+                    )
+                },
                 built("frames", p.frames.is_some(), &[ScreenRecording]),
                 built("tray", p.tray.is_some(), &[]),
-                built("links", p.links.is_some(), &[]),
+                if cfg!(windows) {
+                    optional("links", p.links.is_some())
+                } else {
+                    built("links", p.links.is_some(), &[])
+                },
                 gpu,
                 home,
                 audio,
@@ -8407,7 +8433,10 @@ mod audio_tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
+            #[cfg(unix)]
             std::fs::create_dir_all(&path).unwrap();
+            #[cfg(windows)]
+            crate::paths::create_private_dir(&path).unwrap();
             TempDir(path)
         }
     }
@@ -10541,7 +10570,7 @@ mod home_tests {
     #[test]
     fn shutdown_returns_parking_outcomes_and_failed_recovery_is_unclean() {
         use crate::lifecycle::{Lifecycle, Parking, Phase};
-        use crosspane_input::journal::FileJournal;
+
         for (i, recovered, expected) in [
             (0, Ok(Vec::new()), Parking::NothingParked),
             (1, Ok(vec![WindowId(1)]), Parking::Restored),
@@ -10559,8 +10588,8 @@ mod home_tests {
                 state_dir: dir.clone(),
                 runtime_dir: dir.clone(),
             };
-            FileJournal::open(&paths.journal_file()).unwrap();
-            FileJournal::open(&paths.e2_journal_file()).unwrap();
+            crate::paths::open_journal(&paths.journal_file()).unwrap();
+            crate::paths::open_journal(&paths.e2_journal_file()).unwrap();
             let mut lifecycle = Lifecycle::start(&paths).unwrap();
             lifecycle.phase(Phase::Ready, None).unwrap();
             let mut rig = rig(false);
@@ -10601,7 +10630,7 @@ mod home_tests {
     fn check_shutdown_journals(releases_ok: bool) {
         use crate::lifecycle::{Lifecycle, Phase};
         use crosspane_input::Held;
-        use crosspane_input::journal::{FileJournal, Journal};
+        use crosspane_input::journal::Journal;
         for e2 in [false, true] {
             let dir = std::env::temp_dir().join(format!(
                 "crosspane-shutdown-journals-{}-{releases_ok}-{e2}",
@@ -10637,8 +10666,8 @@ mod home_tests {
                 .collect();
             let (engine, startup) = Engine::new(
                 crosspane_engine::EngineConfig::new(h.rig.local),
-                Box::new(FileJournal::open(&paths.journal_file()).unwrap()),
-                Box::new(FileJournal::open(&paths.e2_journal_file()).unwrap()),
+                Box::new(crate::paths::open_journal(&paths.journal_file()).unwrap()),
+                Box::new(crate::paths::open_journal(&paths.e2_journal_file()).unwrap()),
                 ms(0),
             )
             .unwrap();
@@ -10672,7 +10701,10 @@ mod home_tests {
             };
             let held = vec![Held::Key(HidUsage::keyboard(4))];
             assert_eq!(
-                FileJournal::open(&journal_path).unwrap().held().unwrap(),
+                crate::paths::open_journal(&journal_path)
+                    .unwrap()
+                    .held()
+                    .unwrap(),
                 held,
                 "e2={e2}"
             );
@@ -10684,7 +10716,10 @@ mod home_tests {
             assert!(h.rig.agent.pending.is_empty());
             assert_eq!(outcomes.input_journals_empty, releases_ok);
             assert_eq!(
-                FileJournal::open(&journal_path).unwrap().held().unwrap(),
+                crate::paths::open_journal(&journal_path)
+                    .unwrap()
+                    .held()
+                    .unwrap(),
                 if releases_ok { Vec::new() } else { held }
             );
             lifecycle.stopped(outcomes).unwrap();
@@ -12432,7 +12467,6 @@ mod home_tests {
     }
 
     fn receipt_journals(h: &mut Home) -> ParkingReceiptDir {
-        use crosspane_input::journal::FileJournal;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "crosspane-wp236-shutdown-{}-{}",
@@ -12445,8 +12479,8 @@ mod home_tests {
             state_dir: dir.clone(),
             runtime_dir: dir.clone(),
         };
-        FileJournal::open(&paths.journal_file()).unwrap();
-        FileJournal::open(&paths.e2_journal_file()).unwrap();
+        crate::paths::open_journal(&paths.journal_file()).unwrap();
+        crate::paths::open_journal(&paths.e2_journal_file()).unwrap();
         h.rig.agent.set_lifecycle_paths(paths);
         ParkingReceiptDir(dir)
     }
@@ -17224,7 +17258,10 @@ mod home_tests {
             ["exe", "id", "pid", "runtime_dir", "started_unix_ms", "uid"]
         );
         assert_eq!(instance["pid"], json!(std::process::id()));
+        #[cfg(unix)]
         assert_eq!(instance["uid"], json!(rustix::process::geteuid().as_raw()));
+        #[cfg(windows)]
+        assert!(instance["uid"].is_null());
         assert!(instance["id"].is_u64());
         assert!(instance["started_unix_ms"].as_u64().unwrap() > 1_700_000_000_000);
         assert!(instance["exe"].is_string() && instance["runtime_dir"].is_string());
@@ -17273,13 +17310,13 @@ mod home_tests {
                     missing("hotkeys", "not_supported"),
                     failed("keystore", "construction_failed"),
                     failed("windows", "construction_failed"),
-                    failed("parking", "construction_failed"),
+                    if cfg!(windows) { missing("parking", "not_supported") } else { failed("parking", "construction_failed") },
                     failed("frames", "construction_failed"),
                     failed("tray", "construction_failed"),
-                    failed("links", "construction_failed"),
+                    if cfg!(windows) { missing("links", "not_supported") } else { failed("links", "construction_failed") },
                     missing("gpu", "not_supported"),
                     ready("home"),
-                    failed("audio", "construction_failed"),
+                    if cfg!(windows) { missing("audio", "not_supported") } else { failed("audio", "construction_failed") },
                     failed("discovery", "unknown"),
                 ],
                 "keystore": "file",
@@ -17378,7 +17415,15 @@ mod home_tests {
         for name in [
             "capture", "keys", "pointer", "windows", "parking", "frames", "audio",
         ] {
-            assert_eq!(by_name(&list, name), blocked(), "{name}");
+            if cfg!(windows) && matches!(name, "parking" | "audio") {
+                assert_eq!(
+                    by_name(&list, name),
+                    ("missing".into(), Some("not_supported".into())),
+                    "{name}"
+                );
+            } else {
+                assert_eq!(by_name(&list, name), blocked(), "{name}");
+            }
         }
         assert_eq!(by_name(&list, "tray"), ("ready".into(), None));
         assert_eq!(by_name(&list, "home"), ("ready".into(), None));
@@ -17402,7 +17447,11 @@ mod home_tests {
         );
         assert_eq!(
             by_name(&list, "audio"),
-            ("failed".into(), Some("construction_failed".into()))
+            if cfg!(windows) {
+                ("missing".into(), Some("not_supported".into()))
+            } else {
+                ("failed".into(), Some("construction_failed".into()))
+            }
         );
         // The permissions the Mac reports, by their frozen tokens.
         assert_eq!(

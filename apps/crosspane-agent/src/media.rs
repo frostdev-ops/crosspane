@@ -578,7 +578,7 @@ pub struct VideoSetup {
 }
 
 /// Kept by Linux's main orchestration until the owner's GPU destructors have finished.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub struct Worker {
     name: &'static str,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -623,7 +623,7 @@ pub fn fake_worker(
 }
 
 /// Stop both owners together and spend one absolute budget, including their destructors.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub fn stop_workers(workers: &mut [Worker], deadline: Instant) -> Vec<&'static str> {
     use std::sync::atomic::Ordering;
     for worker in workers.iter() {
@@ -1055,7 +1055,14 @@ enum Plan {
 /// A frame's texture on the source GPU and the frame's top-left corner in it, when the frame is
 /// in GPU memory there (DMA-BUF capture on Linux, an SCK IOSurface on the Mac).
 fn frame_texture(frame: &Frame, video: &VideoSetup) -> Option<(wgpu::Texture, (u32, u32))> {
+    #[cfg(windows)]
+    {
+        let _ = (frame, video);
+        None
+    }
+    #[cfg(unix)]
     let native = frame.native()?;
+    #[cfg(unix)]
     let gpu = video.gpu.as_ref()?;
     #[cfg(target_os = "linux")]
     {

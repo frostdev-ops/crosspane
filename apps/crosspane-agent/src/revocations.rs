@@ -29,7 +29,17 @@ impl Issued {
     /// Load the notices from `path`; a missing file is empty, a corrupt one is logged and
     /// treated as empty (the trust store's revoked set is what protects this node).
     pub fn load(path: PathBuf) -> Issued {
-        let notices = match std::fs::read_to_string(&path) {
+        #[cfg(windows)]
+        let _parents = match crate::windows::security::pin_parent(&path) {
+            Ok(pins) => pins,
+            Err(_) => {
+                return Issued {
+                    path,
+                    notices: Vec::new(),
+                };
+            }
+        };
+        let notices = match crate::paths::read_private_to_string(&path) {
             Ok(text) => parse(&text).unwrap_or_else(|e| {
                 // Keep the unreadable file for inspection rather than overwrite it later.
                 let aside = path.with_extension("json.corrupt");
@@ -176,7 +186,7 @@ mod tests {
         }
         assert_eq!(issued.notices().len(), MAX);
         assert_eq!(issued.notices()[0], notice(6, 6));
-        std::fs::write(&path, "not json").unwrap();
+        crate::paths::write_fixture(&path, "not json").unwrap();
         assert!(Issued::load(path.clone()).notices().is_empty());
         assert!(path.with_extension("json.corrupt").exists());
     }

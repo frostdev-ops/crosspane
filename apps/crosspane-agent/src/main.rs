@@ -19,6 +19,8 @@ mod platform;
 mod revocations;
 mod tray;
 mod trust;
+#[cfg(windows)]
+mod windows;
 // Twin-or-mirror parking: Hyprland, and macOS builds with `private-vdisplay`.
 #[cfg_attr(
     not(any(
@@ -35,7 +37,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use crosspane_engine::{Engine, EngineConfig};
-use crosspane_input::journal::FileJournal;
 use crosspane_platform::{Permission, PermissionState, Permissions};
 use crosspane_protocol::msg::{Capability, Hello};
 use crosspane_security::identity::{DeviceIdentity, node_id};
@@ -108,6 +109,7 @@ static RESTART: AtomicBool = AtomicBool::new(false);
 static APPKIT_STOPPED: AtomicBool = AtomicBool::new(false);
 
 /// The exit status after a clean stop: 75 (`EX_TEMPFAIL`) for a restart or AppKit termination.
+#[cfg(unix)]
 fn stop_status() -> i32 {
     #[cfg(target_os = "macos")]
     if APPKIT_STOPPED.load(Ordering::Acquire) {
@@ -129,6 +131,8 @@ fn stop_for_restart(events: &std::sync::mpsc::Sender<agent::Event>) {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    windows::process::wait_for_restart_parent()?;
     #[cfg(target_os = "linux")]
     platform::prepare_exit_diagnostics();
     tracing_subscriber::fmt()
@@ -138,7 +142,11 @@ fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    if is_elevated() {
+    #[cfg(unix)]
+    let elevated = is_elevated();
+    #[cfg(windows)]
+    let elevated = windows::security::is_elevated().context("check agent elevation")?;
+    if elevated {
         bail!("crosspane-agent refuses to run elevated (04 §7)");
     }
     let command = Cli::parse().command;
@@ -320,11 +328,13 @@ struct Started {
     startup: Vec<crosspane_engine::Output>,
     rx: std::sync::mpsc::Receiver<agent::Event>,
     tx: std::sync::mpsc::Sender<agent::Event>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     host_shutdown: Option<crosspane_render::proxy::HostHandle>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     media_workers: [media::Worker; 2],
     host: Option<crosspane_render::proxy::ProxyHost>,
+    #[cfg(windows)]
+    shutdown_watch: windows::shutdown::Watch,
 }
 
 fn start_agent(
@@ -365,9 +375,9 @@ fn start_agent(
 
     // Crash recovery runs first (04 §8 invariant 2): Engine::new returns it as outputs.
     *failure = lifecycle::Failure::Other;
-    let journal = FileJournal::open(&paths.journal_file()).context("open input journal")?;
+    let journal = paths::open_journal(&paths.journal_file()).context("open input journal")?;
     let e2_journal =
-        FileJournal::open(&paths.e2_journal_file()).context("open projection input journal")?;
+        paths::open_journal(&paths.e2_journal_file()).context("open projection input journal")?;
     let mut engine_config = EngineConfig::new(node);
     engine_config.drag_across = config.drag.across;
     engine_config.push_to_cross =
@@ -389,6 +399,8 @@ fn start_agent(
     .context("start engine")?;
 
     let (tx, rx) = std::sync::mpsc::channel();
+    #[cfg(windows)]
+    let shutdown_watch = windows::shutdown::Watch::for_agent(tx.clone())?;
     agent::subscribe_platform(&mut platform, &tx);
 
     // E2 video (WP-2.14): this node's encoder/decoder, if it has one and video isn't turned off.
@@ -449,7 +461,7 @@ fn start_agent(
     stop_on_signal(&net.runtime(), tx.clone()).inspect_err(|error| {
         tracing::error!(%error, "could not install signal handlers");
     })?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     stop_on_signal(&net.runtime(), tx.clone());
     #[cfg(target_os = "linux")]
     platform::watch_compositor({
@@ -490,7 +502,7 @@ fn start_agent(
         tx.clone(),
         video,
     );
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     drop((source_worker, dest_worker)); // Preserve macOS's existing orchestration.
     let e2 = agent::E2Wiring {
         source_media,
@@ -529,11 +541,13 @@ fn start_agent(
         startup,
         rx,
         tx,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         host_shutdown: host.as_ref().map(|(_, handle)| handle.clone()),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         media_workers: [source_worker, dest_worker],
         host: host.map(|(host, _)| host),
+        #[cfg(windows)]
+        shutdown_watch,
     }))
 }
 
@@ -593,7 +607,7 @@ fn stop_on_signal(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn stop_on_signal(runtime: &tokio::runtime::Handle, events: std::sync::mpsc::Sender<agent::Event>) {
     use tokio::signal::unix::{SignalKind, signal};
     runtime.spawn(async move {
@@ -674,6 +688,7 @@ fn start_linux_signals(
 /// Run the engine loop on its own thread and the proxy host (if any) on this, the main thread.
 /// Without a host on Linux, the engine loop runs here; on macOS the AppKit loop always owns the
 /// main thread.
+#[cfg(unix)]
 fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
     let Started {
         agent,
@@ -813,6 +828,67 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
     }
 }
 
+/// Windows retains every engine/media/host owner before writing a clean receipt or restarting.
+#[cfg(windows)]
+fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
+    let Started {
+        agent,
+        startup,
+        rx,
+        tx,
+        host_shutdown,
+        mut media_workers,
+        host,
+        shutdown_watch,
+    } = started;
+    let stopped = match host {
+        Some(host) => {
+            let host_shutdown = host_shutdown.context("missing proxy host shutdown handle")?;
+            let host_tx = tx.clone();
+            let engine = std::thread::Builder::new()
+                .name("engine".into())
+                .spawn(move || {
+                    let stopped = exit_on_panic("engine", || agent.run(startup, &rx));
+                    platform::exit_deadline(std::time::Duration::from_secs(5));
+                    let _ = host_shutdown.send(crosspane_render::proxy::HostCommand::Shutdown);
+                    stopped
+                })
+                .context("spawn engine thread")?;
+            if let Err(error) = host.run(Box::new(move |event| {
+                let _ = host_tx.send(agent::Event::Host(event));
+            })) {
+                stop_for_restart(&tx);
+                tracing::error!(%error, "the proxy window host failed; stopping");
+            }
+            engine
+                .join()
+                .map_err(|_| anyhow::anyhow!("engine thread panicked"))?
+        }
+        None => {
+            let stopped = exit_on_panic("engine", || agent.run(startup, &rx));
+            platform::exit_deadline(std::time::Duration::from_secs(5));
+            stopped
+        }
+    };
+    drop(tx);
+    let pending = media::stop_workers(
+        &mut media_workers,
+        std::time::Instant::now() + std::time::Duration::from_secs(3),
+    );
+    if !pending.is_empty() {
+        // No receipt: a still-running owner cannot establish completion.
+        windows::process::exit_without_handlers(1);
+    }
+    lifecycle
+        .stopped(stopped.outcomes)
+        .context("write exit receipt")?;
+    drop(shutdown_watch);
+    if stopped.restart || RESTART.load(Ordering::Acquire) {
+        agent::restart();
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn stop_appkit_for_restart(events: &std::sync::mpsc::Sender<agent::Event>) {
     macos_launch::appkit_returned(&APPKIT_STOPPED, &RESTART, || {
@@ -930,7 +1006,7 @@ fn media_exit_status(receipt_ok: bool, has_proxy_host: bool) -> i32 {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn finish_run(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) -> Result<()> {
     lifecycle.stopped(stopped.outcomes)?;
     if stopped.restart {
@@ -944,7 +1020,7 @@ fn finish_run(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) -> Resul
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn finish_run_or_exit(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) {
     if let Err(error) = finish_run(lifecycle, stopped) {
         tracing::error!(%error, "could not write the exit receipt");
@@ -1070,6 +1146,12 @@ fn platform_permissions() -> Box<dyn Permissions> {
     Box::new(crosspane_platform_linux::permissions::LinuxPermissions)
 }
 
+#[cfg(windows)]
+fn platform_permissions() -> Box<dyn Permissions> {
+    // The agent watches only required(): an empty set has no notices/retries/backend failures.
+    Box::new(crosspane_platform_windows::stubs::UnsupportedWindows)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn open_settings_pane(permission: Permission) {
     let url = crosspane_platform_macos::permissions::MacPermissions::settings_url(permission);
@@ -1085,6 +1167,7 @@ pub(crate) fn open_settings_pane(permission: Permission) {
 pub(crate) fn open_settings_pane(_permission: Permission) {}
 
 /// True when running as root (uid 0), which the agent refuses (04 §7).
+#[cfg(unix)]
 fn is_elevated() -> bool {
     std::fs::metadata("/proc/self")
         .map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0)

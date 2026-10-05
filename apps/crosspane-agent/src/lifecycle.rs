@@ -7,8 +7,10 @@ use std::fs::File;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
-use crosspane_input::journal::{FileJournal, Journal};
+#[cfg(unix)]
+use anyhow::bail;
+use anyhow::{Context, Result};
+use crosspane_input::journal::Journal;
 use crosspane_platform::{KeyStore, PlatformError};
 use serde::{Deserialize, Serialize};
 
@@ -32,17 +34,22 @@ pub struct Instance {
 impl Instance {
     fn current() -> Result<Self> {
         let pid = std::process::id();
-        let output = std::process::Command::new("/bin/ps")
-            .args(["-o", "lstart=", "-p", &pid.to_string()])
-            .env("LC_ALL", "C")
-            .env("TZ", "UTC")
-            .output()
-            .context("probe agent process start")?;
-        if !output.status.success() {
-            bail!("could not probe agent process start");
-        }
-        let started_unix_ms = parse_start(std::str::from_utf8(&output.stdout)?)
-            .context("invalid process start time from ps")?;
+        #[cfg(unix)]
+        let started_unix_ms = {
+            let output = std::process::Command::new("/bin/ps")
+                .args(["-o", "lstart=", "-p", &pid.to_string()])
+                .env("LC_ALL", "C")
+                .env("TZ", "UTC")
+                .output()
+                .context("probe agent process start")?;
+            if !output.status.success() {
+                bail!("could not probe agent process start");
+            }
+            parse_start(std::str::from_utf8(&output.stdout)?)
+                .context("invalid process start time from ps")?
+        };
+        #[cfg(windows)]
+        let started_unix_ms = crate::windows::process::started_unix_ms()?;
         // A restart in place keeps the PID and process start, so include this run's fresh time.
         let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
         Ok(Self {
@@ -62,6 +69,7 @@ pub(crate) fn instance_id(pid: u32, start_ns: u64) -> u64 {
 }
 
 /// Parse `LC_ALL=C TZ=UTC ps -o lstart=` without a new dependency or OS bindings.
+#[cfg(any(unix, test))]
 fn parse_start(text: &str) -> Option<u64> {
     let parts: Vec<_> = text.split_whitespace().collect();
     let [_, month, day, clock, year] = parts.as_slice() else {
@@ -270,34 +278,46 @@ pub fn journals_empty(paths: &Paths) -> bool {
     [paths.journal_file(), paths.e2_journal_file()]
         .iter()
         .all(|path| {
-            let Ok(before) = std::fs::metadata(path) else {
+            let Ok(before) = crate::paths::metadata_private(path) else {
                 return false;
             };
             if !before.is_file() {
                 return false;
             }
-            FileJournal::open(path)
-                .and_then(|journal| journal.held())
+            crate::paths::open_journal(path)
+                .and_then(|journal| journal.held().map_err(Into::into))
                 .is_ok_and(|held| {
                     // `open` repairs corrupt/torn tails. Such a read did not establish an intact empty
                     // journal, so conservatively keep the receipt unclean if the file changed length.
                     held.is_empty()
-                        && std::fs::metadata(path).is_ok_and(|after| after.len() == before.len())
+                        && crate::paths::metadata_private(path)
+                            .is_ok_and(|after| after.len() == before.len())
                 })
         })
 }
 
 pub fn instance_lock(paths: &Paths) -> std::io::Result<File> {
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(paths.instance_lock())
+    #[cfg(unix)]
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    #[cfg(unix)]
+    let file = options.open(paths.instance_lock())?;
+    #[cfg(windows)]
+    let file = crate::windows::security::open_private_lock(&paths.instance_lock())
+        .map_err(std::io::Error::other)?;
+    Ok(file)
 }
 
 fn remove_if_present(path: &Path) -> std::io::Result<bool> {
+    #[cfg(windows)]
+    let _parents = crate::windows::security::pin_parent(path).map_err(std::io::Error::other)?;
+    #[cfg(windows)]
+    drop(crate::windows::security::private_file(path).map_err(std::io::Error::other)?);
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -379,7 +399,7 @@ pub fn erase_identity(
             return EraseReceipt::io();
         }
     };
-    let receipt = match std::fs::read(paths.exit_receipt()) {
+    let receipt = match crate::paths::read_private(&paths.exit_receipt()) {
         Ok(bytes) => serde_json::from_slice::<ExitReceipt>(&bytes).ok(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return EraseReceipt::refused("no_exit_receipt");
@@ -533,6 +553,7 @@ mod tests {
 
     #[test]
     fn bootstrap_phases_advance_and_failed_carries_a_bounded_reason() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new();
         let mut lifecycle = scratch.lifecycle();
@@ -564,6 +585,7 @@ mod tests {
         assert_eq!(failed["phase"], json!("failed"));
         assert_eq!(failed["phase_seq"], json!(4));
         assert_eq!(failed["reason"], json!("socket"));
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(scratch.0.bootstrap_file())
                 .unwrap()
@@ -572,6 +594,7 @@ mod tests {
                 & 0o777,
             0o600
         );
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&scratch.0.runtime_dir)
                 .unwrap()
@@ -666,6 +689,7 @@ mod tests {
 
     #[test]
     fn starting_removes_the_previous_receipt_and_exit_keeps_bootstrap() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::new();
         scratch.clean_receipt();
@@ -686,6 +710,7 @@ mod tests {
         let receipt = read(scratch.0.exit_receipt());
         assert_eq!(receipt["instance_id"], json!(lifecycle.instance.id));
         assert_eq!(receipt["clean"], json!(true));
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(scratch.0.exit_receipt())
                 .unwrap()
@@ -701,8 +726,8 @@ mod tests {
     fn journal_emptiness_reads_both_files_and_unknown_is_false() {
         let scratch = Scratch::new();
         assert!(!journals_empty(&scratch.0));
-        let mut journal = FileJournal::open(&scratch.0.journal_file()).unwrap();
-        FileJournal::open(&scratch.0.e2_journal_file()).unwrap();
+        let mut journal = crate::paths::open_journal(&scratch.0.journal_file()).unwrap();
+        crate::paths::open_journal(&scratch.0.e2_journal_file()).unwrap();
         assert!(journals_empty(&scratch.0));
         let key = Held::Key(HidUsage::keyboard(4));
         journal.record_down(key).unwrap();
@@ -790,7 +815,7 @@ mod tests {
             audio_stopped: true,
         });
         assert_eq!(guarded().reason, Some("unclean_exit"));
-        std::fs::write(scratch.0.exit_receipt(), "invalid").unwrap();
+        crate::paths::write_fixture(scratch.0.exit_receipt(), "invalid").unwrap();
         assert_eq!(guarded().reason, Some("unclean_exit"));
         let mut dishonest = serde_json::to_value(ExitReceipt::new(
             123,
@@ -803,7 +828,7 @@ mod tests {
         ))
         .unwrap();
         dishonest["clean"] = json!(true);
-        std::fs::write(scratch.0.exit_receipt(), dishonest.to_string()).unwrap();
+        crate::paths::write_fixture(scratch.0.exit_receipt(), dishonest.to_string()).unwrap();
         assert_eq!(guarded().reason, Some("unclean_exit"));
         assert!(!scratch.0.bootstrap_file().exists());
     }
@@ -822,7 +847,7 @@ mod tests {
             scratch.0.e2_journal_file(),
             scratch.0.state_dir.join("parking.journal"),
         ] {
-            std::fs::write(path, "fixture").unwrap();
+            crate::paths::write_fixture(path, "fixture").unwrap();
         }
         let receipt = erase(&scratch, &store, false);
         assert_eq!(
@@ -850,9 +875,9 @@ mod tests {
         scratch.clean_receipt();
         let store = FakeStore::default();
         assert_eq!(erase(&scratch, &store, false).result, "already_absent");
-        std::fs::write(scratch.0.trust_file(), "pairings").unwrap();
+        crate::paths::write_fixture(scratch.0.trust_file(), "pairings").unwrap();
         let revocations = crate::revocations::file_beside(&scratch.0.trust_file());
-        std::fs::write(&revocations, "revocations").unwrap();
+        crate::paths::write_fixture(&revocations, "revocations").unwrap();
         // The lead amendment counts only selected items: kept trust does not prevent an
         // already-absent key from being an already_absent result.
         let receipt = erase(&scratch, &store, true);
@@ -929,7 +954,7 @@ mod tests {
         let scratch = Scratch::new();
         scratch.clean_receipt();
         let store = FakeStore::default();
-        std::fs::write(
+        crate::paths::write_fixture(
             crate::revocations::file_beside(&scratch.0.trust_file()),
             "fixture",
         )
@@ -1064,11 +1089,19 @@ mod tests {
             scratch.clean_receipt();
             // Run this exact unit fixture through the required session-isolation wrapper. The
             // child simulates the writer's process lifetime, including descriptor teardown.
+            #[cfg(unix)]
             let wrapper =
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lead/impl-env.sh");
+            #[cfg(unix)]
+            let mut command = {
+                let mut command = Command::new(wrapper);
+                command.arg(std::env::current_exe().unwrap());
+                command
+            };
+            #[cfg(windows)]
+            let mut command = Command::new(std::env::current_exe().unwrap());
             let mut writer = WriterProcess(
-                Command::new(wrapper)
-                    .arg(std::env::current_exe().unwrap())
+                command
                     .args([
                         "--exact",
                         "lifecycle::tests::timed_out_identity_write_retains_the_lock_until_the_writer_process_exits",

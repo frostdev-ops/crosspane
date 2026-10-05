@@ -1,14 +1,21 @@
 //! CLI for the running agent: status, release, panic, re-arm, layout, dial. It speaks the agent's
 //! control socket (one JSON request and response per line).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
+
+#[cfg(windows)]
+mod windows;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -302,6 +309,7 @@ enum Side {
     Below,
 }
 
+#[cfg(unix)]
 fn socket_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CROSSPANE_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir).join("agent.sock"));
@@ -443,6 +451,7 @@ fn main() -> Result<()> {
 }
 
 /// One request and its response on the agent's control socket.
+#[cfg(unix)]
 fn exchange(request: &Value) -> Result<Value> {
     let path = socket_path()?;
     let stream = UnixStream::connect(&path)
@@ -455,6 +464,11 @@ fn exchange(request: &Value) -> Result<Value> {
     serde_json::from_str(&line).context("bad response from agent")
 }
 
+#[cfg(windows)]
+fn exchange(request: &Value) -> Result<Value> {
+    windows::exchange(request)
+}
+
 /// The result of a request, or its error.
 fn call(request: &Value) -> Result<Value> {
     let response = exchange(request)?;
@@ -465,6 +479,7 @@ fn call(request: &Value) -> Result<Value> {
 }
 
 /// `crosspanectl diag`: gather what a bug report needs into one archive.
+#[cfg(unix)]
 fn diag(out: Option<PathBuf>) -> Result<()> {
     use std::process::Command as Process;
     let stamp = std::time::SystemTime::now()
@@ -571,6 +586,11 @@ fn diag(out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn diag(out: Option<PathBuf>) -> Result<()> {
+    windows::diag(out)
+}
+
 /// `crosspanectl pick`: list `peer`'s windows, let the user choose one, pull it.
 fn pick(peer: &str, menu: Option<&str>) -> Result<()> {
     let windows = call(&json!({"cmd": "windows_from", "peer": peer}))?;
@@ -610,6 +630,12 @@ fn choose(windows: &[(u64, String)], menu: Option<&str>) -> Result<Option<usize>
         .enumerate()
         .map(|(i, (_, text))| format!("{}. {text}", i + 1))
         .collect();
+    #[cfg(windows)]
+    let chosen = match menu {
+        Some(menu) => run_menu(menu, &lines)?,
+        None => windows::choose_terminal(&lines)?,
+    };
+    #[cfg(unix)]
     let chosen = if cfg!(target_os = "macos") && menu.is_none() {
         choose_macos(&lines)?
     } else {
@@ -631,6 +657,7 @@ fn choose(windows: &[(u64, String)], menu: Option<&str>) -> Result<Option<usize>
     Ok(number.checked_sub(1).filter(|i| *i < windows.len()))
 }
 
+#[cfg(unix)]
 fn default_menu() -> Option<String> {
     let found = |name: &str| {
         std::env::var_os("PATH")
@@ -649,9 +676,20 @@ fn default_menu() -> Option<String> {
 
 fn run_menu(menu: &str, lines: &[String]) -> Result<Option<String>> {
     use std::process::{Command as Process, Stdio};
-    let mut child = Process::new("sh")
-        .arg("-c")
-        .arg(menu)
+    #[cfg(unix)]
+    let mut process = {
+        let mut process = Process::new("sh");
+        process.arg("-c").arg(menu);
+        process
+    };
+    #[cfg(windows)]
+    let mut process = {
+        let root = std::env::var_os("SystemRoot").context("SystemRoot is not set")?;
+        let mut process = Process::new(PathBuf::from(root).join("System32/cmd.exe"));
+        process.arg("/d").arg("/s").arg("/c").arg(menu);
+        process
+    };
+    let mut child = process
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -666,6 +704,7 @@ fn run_menu(menu: &str, lines: &[String]) -> Result<Option<String>> {
     Ok((!chosen.is_empty()).then_some(chosen))
 }
 
+#[cfg(unix)]
 fn choose_macos(lines: &[String]) -> Result<Option<String>> {
     // AppleScript's `choose from list` needs no special permission.
     let items = lines

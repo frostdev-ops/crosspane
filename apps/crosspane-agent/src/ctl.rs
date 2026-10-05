@@ -2,11 +2,16 @@
 //! (and the tray, later) talk to the agent through it. The socket lives in a 0700 directory, so
 //! only this user can connect.
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{self, Sender};
+#[cfg(unix)]
+use std::sync::mpsc;
+use std::sync::mpsc::Sender;
+#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -210,6 +215,7 @@ impl Response {
 }
 
 /// Serve the control socket on a background thread.
+#[cfg(unix)]
 pub fn serve(path: &Path, events: Sender<Event>) -> Result<()> {
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
@@ -235,6 +241,7 @@ pub fn serve(path: &Path, events: Sender<Event>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn handle(stream: UnixStream, events: &Sender<Event>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let Ok(mut writer) = stream.try_clone() else {
@@ -262,6 +269,15 @@ fn handle(stream: UnixStream, events: &Sender<Event>) {
             return;
         }
     }
+}
+
+#[cfg(windows)]
+pub fn serve(path: &Path, events: Sender<Event>) -> Result<()> {
+    let runtime = path
+        .parent()
+        .context("control path has no runtime directory")?;
+    let endpoint = crate::windows::security::endpoint(runtime)?;
+    crate::windows::control::serve(&endpoint, events)
 }
 
 #[cfg(test)]

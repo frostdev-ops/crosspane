@@ -808,6 +808,7 @@ dependencies = [
  "crosspane-platform",
  "crosspane-platform-linux",
  "crosspane-platform-macos",
+ "crosspane-platform-windows",
  "crosspane-protocol",
  "crosspane-render",
  "crosspane-security",
@@ -823,6 +824,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wgpu",
+ "windows-sys 0.61.2",
  "xxhash-rust",
  "zeroize",
 ]
@@ -1109,6 +1111,9 @@ dependencies = [
  "anyhow",
  "clap",
  "serde_json",
+ "tokio",
+ "windows-sys 0.61.2",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4138,6 +4143,7 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

@@ -50,7 +50,7 @@ pub trait HomeSeat: Send {
 /// Move only an identified proxy; return the compositor's freshly confirmed content frame.
 pub trait ProxyPlacementSeat: Send {
     // Only the Hyprland drag gesture places proxies (WP-2.58); a Mac never calls it.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn place(
         &self,
         window: &WindowInfo,
@@ -327,7 +327,7 @@ pub struct Platform {
     /// Hyprland, and on Hyprland when the bind can't be spelled (the agent logs why).
     pub home: Option<Box<dyn HomeSeat>>,
     /// Proxy placement for the drag gesture (WP-2.58): Hyprland only, never read on a Mac.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub proxy_placement: Option<Box<dyn ProxyPlacementSeat>>,
     #[cfg(target_os = "macos")]
     pub visible_frame: fn(DisplayId) -> Result<RectLogical, PlatformError>,
@@ -345,6 +345,7 @@ pub struct GpuDevice {
 }
 
 /// GPU frame paths are on unless `CROSSPANE_GPU=0` (for comparisons and as an escape hatch).
+#[cfg(unix)]
 fn gpu_enabled() -> bool {
     std::env::var("CROSSPANE_GPU").as_deref() != Ok("0")
 }
@@ -405,6 +406,13 @@ pub fn audio_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::Audio
     #[cfg(target_os = "macos")]
     let host = crosspane_platform_macos::audio::CoreAudioHost::new(gate)
         .map(|h| Box::new(h) as Box<dyn crosspane_platform::AudioHost>);
+    #[cfg(windows)]
+    let host: Result<Box<dyn crosspane_platform::AudioHost>, PlatformError> = {
+        let _ = gate;
+        Err(PlatformError::Unsupported(
+            "Windows audio/clipboard backend",
+        ))
+    };
     match host {
         Ok(host) => Some(host),
         Err(e) => {
@@ -430,6 +438,13 @@ pub fn clipboard_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::C
         crosspane_platform_macos::clipboard::PasteboardName::General,
     )
     .map(|host| Box::new(host) as Box<dyn crosspane_platform::ClipboardHost>);
+    #[cfg(windows)]
+    let host: Result<Box<dyn crosspane_platform::ClipboardHost>, PlatformError> = {
+        let _ = gate;
+        Err(PlatformError::Unsupported(
+            "Windows audio/clipboard backend",
+        ))
+    };
     match host {
         Ok(host) => Some(host),
         Err(error) => {
@@ -486,6 +501,13 @@ pub fn keystore() -> Option<Box<dyn KeyStore>> {
     ))
 }
 
+#[cfg(windows)]
+pub fn keystore() -> Option<Box<dyn KeyStore>> {
+    Some(Box::new(
+        crosspane_platform_windows::keystore::WindowsKeyStore::new(),
+    ))
+}
+
 fn optional<T>(what: &str, result: Result<T, PlatformError>) -> Option<T> {
     match result {
         Ok(backend) => Some(backend),
@@ -498,11 +520,15 @@ fn optional<T>(what: &str, result: Result<T, PlatformError>) -> Option<T> {
 
 /// The node's monotonic clock, the one every backend stamps events with.
 pub fn now() -> MonoTime {
+    #[cfg(windows)]
+    {
+        crosspane_platform_windows::clock::now()
+    }
     #[cfg(target_os = "macos")]
     {
         crosspane_platform_macos::clock::now()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
         let nanos = u64::try_from(t.tv_sec)
@@ -511,6 +537,151 @@ pub fn now() -> MonoTime {
             + u64::try_from(t.tv_nsec).unwrap_or(0);
         MonoTime::from_nanos(nanos)
     }
+}
+
+/// The acceptance switch admits only the disposable, unpaired file-keystore fixture.
+#[cfg(windows)]
+fn acceptance_e1(
+    state_dir: &std::path::Path,
+    config: &crate::config::Config,
+) -> anyhow::Result<bool> {
+    use anyhow::{Context, ensure};
+    use std::path::PathBuf;
+    let Some(value) = std::env::var_os("CROSSPANE_ACCEPTANCE_E1_ONLY") else {
+        return Ok(false);
+    };
+    ensure!(value == "1", "invalid E1 acceptance switch");
+    let appdata = PathBuf::from(std::env::var_os("APPDATA").context("scratch APPDATA")?);
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").context("scratch LOCALAPPDATA")?);
+    let runtime =
+        PathBuf::from(std::env::var_os("CROSSPANE_RUNTIME_DIR").context("scratch runtime")?);
+    let root = appdata.parent().context("scratch root")?;
+    let suffix = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("crosspane-WP-W1.5b-"))
+        .context("E1 acceptance requires a uniquely named scratch root")?;
+    ensure!(
+        suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+        "E1 acceptance requires a unique scratch identity"
+    );
+    ensure!(
+        root.parent().map(std::fs::canonicalize).transpose()?
+            == Some(std::fs::canonicalize(std::env::temp_dir())?),
+        "E1 acceptance root must be under the temporary directory"
+    );
+    ensure!(
+        appdata == root.join("roaming")
+            && local == root.join("local")
+            && runtime == root.join("runtime")
+            && state_dir == local.join("Crosspane"),
+        "E1 acceptance requires isolated config, state and runtime paths"
+    );
+    ensure!(
+        config.force_file_keystore
+            && config.name == format!("wp-w1-5b-{suffix}")
+            && config.peers.is_empty()
+            && ["CROSSPANE_DISCOVERY", "CROSSPANE_AUDIO", "CROSSPANE_GPU"]
+                .into_iter()
+                .all(|name| std::env::var(name).as_deref() == Ok("0")),
+        "E1 acceptance requires a scratch file identity and disabled discovery/audio/GPU"
+    );
+    Ok(true)
+}
+
+#[cfg(windows)]
+pub fn create(
+    state_dir: &std::path::Path,
+    config: &crate::config::Config,
+) -> anyhow::Result<Platform> {
+    use anyhow::Context;
+    use crosspane_platform_windows::{
+        capture::WindowsCapture, displays::WindowsDisplays, frame_capture::WindowsFrameCapture,
+        hotkey::WindowsHotkeys, inject, overlay::WindowsOverlay, session::WindowsSession,
+        stubs::UnsupportedWindows, tray::WindowsTray, window::WindowsWindowSource,
+    };
+    let e1_only = acceptance_e1(state_dir, config)?;
+    let gate = IoGate::new();
+    let session = WindowsSession::new(gate.clone())
+        .context("Windows session state (required: Crosspane fails closed without it)")?;
+    let displays = WindowsDisplays::new().context("Windows displays")?;
+    let snapshot = displays.snapshot().context("Windows display snapshot")?;
+    let mut ids = snapshot.ids;
+    let capture = optional(
+        "capture",
+        WindowsCapture::new(gate.clone(), &snapshot.probes, &mut ids),
+    )
+    .map(|backend| Box::new(backend) as Box<dyn InputCapture>);
+    let (keys, pointer) = match optional(
+        "injection",
+        inject::injectors(
+            gate.clone(),
+            &snapshot.probes,
+            &mut ids,
+            displays.monitor_refresh(),
+        ),
+    ) {
+        Some((keys, pointer)) => (
+            Some(Box::new(keys) as Box<dyn KeyInjector>),
+            Some(Box::new(pointer) as Box<dyn PointerInjector>),
+        ),
+        None => (None, None),
+    };
+    let overlay = optional("overlay", WindowsOverlay::new(&snapshot.probes, &mut ids))
+        .map(|backend| Box::new(backend) as Box<dyn OverlayHost>);
+    // Window enumeration reads titles, so the explicitly isolated acceptance fixture omits
+    // these E2 source backends. Production always attempts every landed backend.
+    let windows = if e1_only {
+        None
+    } else {
+        optional(
+            "windows",
+            WindowsWindowSource::new(displays.ids(), displays.monitor_reader()),
+        )
+    };
+    let frames = windows.as_ref().and_then(|windows| {
+        optional(
+            "frame capture",
+            WindowsFrameCapture::new(gate.clone(), windows.resolver()),
+        )
+    });
+    Ok(Platform {
+        gate,
+        session: Box::new(session),
+        // Reader/refresh closures hold Weak references. This Box retains the native owner
+        // and authoritative allocator for the full lifetime of all geometry consumers.
+        displays: Box::new(displays),
+        capture,
+        keys,
+        pointer,
+        overlay,
+        hotkeys: optional(
+            "hotkeys",
+            WindowsHotkeys::new().and_then(|mut backend| {
+                // There is no configurable release chord: use the engine's exact default,
+                // configured before subscribe so both release and panic have an observer.
+                let chord =
+                    crosspane_engine::EngineConfig::new(crosspane_types::id::NodeId([0; 32]))
+                        .release_chord;
+                backend.set_chord(&chord)?;
+                Ok(backend)
+            }),
+        )
+        .map(|backend| Box::new(backend) as Box<dyn GlobalHotkeys>),
+        keystore: if e1_only { None } else { keystore() },
+        // required=[] is benign in the agent: no OS request/subscription, notice or retry.
+        permissions: Box::new(UnsupportedWindows),
+        windows: windows.map(|backend| Box::new(backend) as Box<dyn WindowSource>),
+        parking: None,
+        frames: frames.map(|backend| Box::new(backend) as Box<dyn FrameCapture>),
+        tray: optional("tray", WindowsTray::new())
+            .map(|backend| Box::new(backend) as Box<dyn TrayHost>),
+        links: None,
+        gpu: None,
+        home: None,
+        proxy_placement: None,
+        startup_recovery: StartupRecovery::combine(&[]),
+    })
 }
 
 /// Call `lost` (once, from another thread) when the Hyprland instance this agent belongs to dies.
@@ -562,7 +733,9 @@ pub fn exit_deadline(after: std::time::Duration) {
         .name("exit-deadline".into())
         .spawn(move || {
             std::thread::sleep(after);
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            crate::windows::process::exit_without_handlers(1);
+            #[cfg(target_os = "macos")]
             tracing::error!("the agent did not stop in time; killing it");
             #[cfg(target_os = "linux")]
             {
@@ -575,6 +748,7 @@ pub fn exit_deadline(after: std::time::Duration) {
                     rustix::process::Signal::KILL,
                 );
             }
+            #[cfg(unix)]
             std::process::abort();
         });
 }

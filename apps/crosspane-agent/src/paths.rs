@@ -18,9 +18,11 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Result<Paths> {
+        #[cfg(unix)]
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .context("HOME is not set")?;
+        #[cfg(unix)]
         let paths = if cfg!(target_os = "macos") {
             let base = home.join("Library/Application Support/Crosspane");
             let tmp =
@@ -41,6 +43,20 @@ impl Paths {
                 config_dir: xdg("XDG_CONFIG_HOME", ".config").join("crosspane"),
                 state_dir: xdg("XDG_STATE_HOME", ".local/state").join("crosspane"),
                 runtime_dir: runtime.join("crosspane"),
+            }
+        };
+        #[cfg(windows)]
+        let paths = {
+            let appdata = std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .context("APPDATA is not set")?;
+            let local = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .context("LOCALAPPDATA is not set")?;
+            Paths {
+                config_dir: appdata.join("Crosspane"),
+                state_dir: local.join("Crosspane"),
+                runtime_dir: local.join("Crosspane/runtime"),
             }
         };
         // Several agents on one machine (integration tests) need their own control sockets.
@@ -98,26 +114,43 @@ impl Paths {
 
 /// Create `dir` (and parents) readable only by this user.
 pub fn create_private_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("chmod {}", dir.display()))?;
+    #[cfg(windows)]
+    crate::windows::security::create_private_directory(dir)?;
     Ok(())
 }
 
 /// Serialize identity and trust mutations independently of the running agent's instance lock.
 /// The returned file holds the lock until dropped; a busy writer gets at most five seconds.
 pub fn identity_mutation_lock(state_dir: &Path) -> Result<std::fs::File> {
+    #[cfg(windows)]
+    let started = std::time::Instant::now();
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let path = state_dir.join("identity.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
+    #[cfg(unix)]
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    #[cfg(unix)]
+    let file = options
         .open(&path)
         .with_context(|| format!("open identity mutation lock {}", path.display()))?;
-    wait_for_mutation_lock(&file, std::time::Duration::from_secs(5))?;
+    #[cfg(windows)]
+    let file = crate::windows::security::open_private_lock(&path)?;
+    #[cfg(unix)]
+    let timeout = std::time::Duration::from_secs(5);
+    #[cfg(windows)]
+    let timeout = std::time::Duration::from_secs(5).saturating_sub(started.elapsed());
+    wait_for_mutation_lock(&file, timeout)?;
     Ok(file)
 }
 
@@ -160,9 +193,14 @@ pub(crate) fn observe_mutation_lock_wait(waiting: std::sync::mpsc::Sender<()>) {
 /// Write `bytes` to `path` atomically, readable only by this user.
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    #[cfg(windows)]
+    let _parents = crate::windows::security::pin_parent(path)?;
+    #[cfg(windows)]
+    drop(crate::windows::security::private_file(path)?);
     let (tmp, mut file) = loop {
         let mut name = path.as_os_str().to_os_string();
         name.push(format!(
@@ -171,12 +209,19 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let tmp = PathBuf::from(name);
-        match std::fs::OpenOptions::new()
+        #[cfg(unix)]
+        let opened = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp)
-        {
+            .open(&tmp);
+        #[cfg(windows)]
+        let opened = crate::windows::security::create_private_file(&tmp).map_err(|error| {
+            error
+                .downcast::<std::io::Error>()
+                .unwrap_or_else(std::io::Error::other)
+        });
+        match opened {
             Ok(file) => break (tmp, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error).context("create private temporary file"),
@@ -194,10 +239,72 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+/// Read a known private leaf; Windows keeps validated no-follow path pins for the whole read.
+pub(crate) fn read_private(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    let _parents = crate::windows::security::pin_parent(path).map_err(std::io::Error::other)?;
+    #[cfg(windows)]
+    let _leaf = crate::windows::security::private_file(path).map_err(std::io::Error::other)?;
+    std::fs::read(path)
+}
+
+pub(crate) fn metadata_private(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(windows)]
+    let _parents = crate::windows::security::pin_parent(path).map_err(std::io::Error::other)?;
+    #[cfg(windows)]
+    let _leaf = crate::windows::security::private_file(path).map_err(std::io::Error::other)?;
+    std::fs::metadata(path)
+}
+
+pub(crate) fn read_private_to_string(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        std::fs::read_to_string(path)
+    }
+    #[cfg(windows)]
+    {
+        String::from_utf8(read_private(path)?)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+
+/// FileJournal can rename a compacted nonempty journal in open. The owner-only parent and all
+/// ancestors remain pinned while the admitted leaf pin is released to permit that replacement.
+pub(crate) fn open_journal(path: &Path) -> Result<crosspane_input::journal::FileJournal> {
+    #[cfg(windows)]
+    let _parents = crate::windows::security::pin_parent(path)?;
+    #[cfg(windows)]
+    {
+        let leaf = crate::windows::security::private_file(path)?;
+        if leaf.is_none() {
+            drop(crate::windows::security::create_private_file(path)?);
+        }
+        drop(leaf);
+    }
+    crosspane_input::journal::FileJournal::open(path).map_err(Into::into)
+}
+
+/// Elevated Windows cargo fixtures must explicitly own their new private leaves as TokenUser.
+#[cfg(test)]
+pub(crate) fn write_fixture(
+    path: impl AsRef<Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::write(path, bytes)
+    }
+    #[cfg(windows)]
+    {
+        write_private(path.as_ref(), bytes.as_ref()).map_err(std::io::Error::other)
+    }
+}
+
 #[cfg(test)]
 mod mutation_tests {
     #[test]
     fn identity_mutation_lock_has_a_bounded_wait_and_private_permissions() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("crosspane-mutation-lock-{}", std::process::id()));
@@ -209,6 +316,7 @@ mod mutation_tests {
             .unwrap();
         let error = super::wait_for_mutation_lock(&other, std::time::Duration::ZERO).unwrap_err();
         assert!(error.to_string().contains("timed out"));
+        #[cfg(unix)]
         assert_eq!(
             other.metadata().unwrap().permissions().mode() & 0o777,
             0o600
