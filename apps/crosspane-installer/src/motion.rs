@@ -2,14 +2,70 @@
 
 use crate::view::{MotionPreference, RowState, ScreenId, SummaryView, WizardView};
 
-pub const TRANSITION_MS: u64 = 200;
+/// A page change in full motion: the body slides and fades.
+pub const TRANSITION_MS: u64 = 320;
 pub const HOVER_SECONDS: f32 = 0.14;
 
-pub fn reduced_motion(preference: MotionPreference, system: Option<bool>) -> bool {
+/// How much the shell moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionLevel {
+    /// Slides, eased fades, turning marks and a slow ambient drift.
+    Full,
+    /// Short fades only: nothing moves, pulses or turns.
+    Reduced,
+    /// Every change is instant.
+    Off,
+}
+
+impl MotionLevel {
+    /// The duration of a change that takes `full_ms` in full motion: a short fade when reduced,
+    /// nothing when off.
+    pub fn duration(self, full_ms: u64) -> u64 {
+        match self {
+            Self::Full => full_ms,
+            Self::Reduced => full_ms.min(160),
+            Self::Off => 0,
+        }
+    }
+
+    /// Whether things may move, pulse or turn.
+    pub fn moves(self) -> bool {
+        self == Self::Full
+    }
+
+    /// The hover and press fade time, in seconds.
+    pub fn hover_seconds(self) -> f32 {
+        match self {
+            Self::Full => HOVER_SECONDS,
+            Self::Reduced => 0.08,
+            Self::Off => 0.0,
+        }
+    }
+}
+
+/// The motion a preference resolves to. Auto follows the system's reduce-motion setting where
+/// the platform reports one, and is full motion where none can be read (owner, 2026-10-05: the
+/// installer is animated unless the person or the system asks otherwise).
+pub fn motion_level(preference: MotionPreference, system: Option<bool>) -> MotionLevel {
     match preference {
-        MotionPreference::Auto => system.unwrap_or(true),
-        MotionPreference::Reduced => true,
-        MotionPreference::Full => false,
+        MotionPreference::Auto if system == Some(true) => MotionLevel::Reduced,
+        MotionPreference::Auto | MotionPreference::Full => MotionLevel::Full,
+        MotionPreference::Reduced => MotionLevel::Reduced,
+        MotionPreference::Off => MotionLevel::Off,
+    }
+}
+
+/// Whether movement is withheld (reduced or off).
+pub fn reduced_motion(preference: MotionPreference, system: Option<bool>) -> bool {
+    !motion_level(preference, system).moves()
+}
+
+/// Progress 0–1 of a change that started at `start_ms` and lasts `duration_ms`.
+pub fn progress(now_ms: u64, start_ms: u64, duration_ms: u64) -> f32 {
+    if duration_ms == 0 {
+        1.0
+    } else {
+        (now_ms.saturating_sub(start_ms) as f32 / duration_ms as f32).clamp(0.0, 1.0)
     }
 }
 
@@ -19,15 +75,6 @@ pub fn transition_fraction(elapsed_ms: u64, duration_ms: u64, reduced: bool) -> 
     } else {
         elapsed_ms as f32 / duration_ms as f32
     }
-}
-
-pub(crate) fn transition_allowed(view: &WizardView) -> bool {
-    !view.rows.iter().any(|row| {
-        matches!(
-            row.state,
-            RowState::Waiting | RowState::Failed | RowState::NeedsAction | RowState::Unsupported
-        )
-    })
 }
 
 pub(crate) fn illustration_duration(view: &WizardView) -> u64 {
@@ -103,23 +150,6 @@ impl IllustrationMotion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::demo;
-    use crate::view::{RowView, ScreenId};
-
-    #[test]
-    fn waiting_or_failure_stops_transition() {
-        let mut view = demo::fixture(ScreenId::Welcome);
-        for state in [RowState::Waiting, RowState::Failed, RowState::NeedsAction] {
-            view.rows = vec![RowView {
-                id: 1,
-                label: "Waiting for you".into(),
-                detail: String::new(),
-                state,
-                human_confirmed: false,
-            }];
-            assert!(!transition_allowed(&view));
-        }
-    }
 
     #[test]
     fn illustration_pause_preserves_position_and_resumes_without_wall_clock_jump() {

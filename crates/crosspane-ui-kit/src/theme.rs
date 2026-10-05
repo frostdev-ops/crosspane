@@ -508,6 +508,12 @@ pub fn step_mark(painter: &egui::Painter, rect: Rect, mark: StepMark, phase: Opt
     }
 }
 
+/// How lit a control is, 0–1, eased over the style's animation time.
+fn glow(ui: &egui::Ui, response: &Response, lit: bool) -> f32 {
+    ui.ctx()
+        .animate_bool_with_time(response.id.with("glow"), lit, ui.style().animation_time)
+}
+
 fn focus_ring(ui: &egui::Ui, response: &Response, rect: Rect, radius: f32) {
     if response.has_focus() {
         ui.painter().rect_stroke(
@@ -533,24 +539,24 @@ pub fn link(ui: &mut egui::Ui, text: &str) -> Response {
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, enabled, text));
     if ui.is_rect_visible(rect) {
         let lit = enabled && (response.hovered() || response.has_focus());
+        let t = glow(ui, &response, lit);
         let color = if !enabled {
             alpha(QUIET, 110)
-        } else if lit {
-            ICE
         } else {
-            GLACIER
+            mix(GLACIER, ICE, t)
         };
         let origin = rect.min + padding;
         let underline_y = origin.y + galley.size().y + 1.0;
         let width = galley.size().x;
         ui.painter().galley(origin, galley, color);
-        if lit {
+        if t > 0.0 {
+            // The underline draws in from the left as the pointer arrives.
             ui.painter().line_segment(
                 [
                     Pos2::new(origin.x, underline_y),
-                    Pos2::new(origin.x + width, underline_y),
+                    Pos2::new(origin.x + width * t, underline_y),
                 ],
-                Stroke::new(1.0, color),
+                Stroke::new(1.0, alpha(color, (255.0 * t) as u8)),
             );
         }
         focus_ring(ui, &response, rect, 4.0);
@@ -596,19 +602,16 @@ pub fn choice(ui: &mut egui::Ui, label: &str, width: f32, large: bool) -> Respon
     if ui.is_rect_visible(rect) {
         let lit = enabled && (response.hovered() || response.has_focus());
         let pressed = enabled && response.is_pointer_button_down_on();
+        let t = glow(ui, &response, lit);
         let fill = if pressed {
             alpha(FROST, 60)
-        } else if lit {
-            alpha(NAVY, 200)
         } else {
-            alpha(NAVY, 110)
+            mix(alpha(NAVY, 90), alpha(NAVY, 190), t)
         };
         let border = if !enabled {
             alpha(QUIET, 40)
-        } else if lit {
-            FROST
         } else {
-            alpha(GLACIER, 90)
+            mix(alpha(GLACIER, 80), FROST, t)
         };
         ui.painter().rect_filled(rect, 10.0, fill);
         ui.painter()
@@ -625,7 +628,7 @@ pub fn choice(ui: &mut egui::Ui, label: &str, width: f32, large: bool) -> Respon
             ui.painter().circle_stroke(
                 ring.center(),
                 7.0,
-                Stroke::new(1.5, if lit { FROST } else { alpha(GLACIER, 160) }),
+                Stroke::new(1.5, mix(alpha(GLACIER, 160), FROST, t)),
             );
             if pressed {
                 ui.painter().circle_filled(ring.center(), 3.5, FROST);
@@ -662,20 +665,22 @@ pub fn option(ui: &mut egui::Ui, selected: bool, label: &str, width: f32) -> Res
     });
     if ui.is_rect_visible(rect) {
         let lit = enabled && (response.hovered() || response.has_focus());
-        let fill = if selected {
-            alpha(FROST, 28)
-        } else if lit {
-            alpha(NAVY, 190)
-        } else {
-            alpha(NAVY, 100)
-        };
-        let border = if selected {
-            FROST
-        } else if lit {
-            alpha(GLACIER, 200)
-        } else {
-            alpha(GLACIER, 70)
-        };
+        let t = glow(ui, &response, lit);
+        let chosen = ui.ctx().animate_bool_with_time(
+            response.id.with("chosen"),
+            selected,
+            ui.style().animation_time * 1.5,
+        );
+        let fill = mix(
+            mix(alpha(NAVY, 90), alpha(NAVY, 180), t),
+            alpha(FROST, 30),
+            chosen,
+        );
+        let border = mix(
+            mix(alpha(GLACIER, 70), alpha(GLACIER, 200), t),
+            FROST,
+            chosen,
+        );
         ui.painter().rect_filled(rect, 10.0, fill);
         ui.painter()
             .rect_stroke(rect, 10.0, Stroke::new(1.0, border), StrokeKind::Inside);
@@ -685,8 +690,8 @@ pub fn option(ui: &mut egui::Ui, selected: bool, label: &str, width: f32) -> Res
             8.0,
             Stroke::new(1.5, if selected { FROST } else { GLACIER }),
         );
-        if selected {
-            ui.painter().circle_filled(ring, 4.0, FROST);
+        if chosen > 0.0 {
+            ui.painter().circle_filled(ring, 4.0 * chosen, FROST);
         }
         ui.painter().galley(
             Pos2::new(rect.left() + padding.x + ring_space, rect.top() + padding.y),
@@ -722,6 +727,16 @@ pub fn toggle(ui: &mut egui::Ui, on: bool, label: &str, width: f32) -> Response 
         .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, on, label));
     if ui.is_rect_visible(rect) {
         let lit = enabled && (response.hovered() || response.has_focus());
+        let slide = ui.ctx().animate_bool_with_time(
+            response.id.with("on"),
+            on,
+            // Reduced-motion layouts disable geometric animation but keep short color fades.
+            if ui.style().scroll_animation.duration.max > 0.0 {
+                ui.style().animation_time * 1.4
+            } else {
+                0.0
+            },
+        );
         let track = Rect::from_min_size(Pos2::new(rect.left(), rect.top() + 4.0), track_size);
         ui.painter().rect_filled(
             track,
@@ -747,11 +762,7 @@ pub fn toggle(ui: &mut egui::Ui, on: bool, label: &str, width: f32) -> Response 
             ),
             StrokeKind::Inside,
         );
-        let knob_x = if on {
-            track.right() - 11.0
-        } else {
-            track.left() + 11.0
-        };
+        let knob_x = track.left() + 11.0 + (track.width() - 22.0) * slide;
         ui.painter().circle_filled(
             Pos2::new(knob_x, track.center().y),
             7.0,
@@ -816,4 +827,259 @@ pub fn gear(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
     painter.circle_stroke(center, radius * 0.62, stroke);
     painter.circle_stroke(center, radius * 0.25, stroke);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Onboarding tokens and controls (WP-4.34). Additive: the settings app keeps the controls above.
+// ---------------------------------------------------------------------------------------------
+
+/// Spacing tokens, in points. Layouts use these instead of ad-hoc numbers.
+pub mod space {
+    /// Hairline gaps: a mark and its label.
+    pub const XS: f32 = 4.0;
+    /// Inside a group.
+    pub const S: f32 = 8.0;
+    /// Between related items.
+    pub const M: f32 = 12.0;
+    /// Between items of a list.
+    pub const L: f32 = 16.0;
+    /// Between groups.
+    pub const XL: f32 = 24.0;
+    /// Around a surface.
+    pub const XXL: f32 = 32.0;
+}
+
+/// The type scale: one title size, body, caption, a small label and mono for exact commands.
+pub mod text {
+    use egui::FontId;
+
+    /// A screen's title.
+    pub fn title() -> FontId {
+        FontId::proportional(25.0)
+    }
+    /// Running text and step titles.
+    pub fn body() -> FontId {
+        FontId::proportional(15.0)
+    }
+    /// A step's state line and other secondary text.
+    pub fn caption() -> FontId {
+        FontId::proportional(13.0)
+    }
+    /// Eyebrows and badges.
+    pub fn small() -> FontId {
+        FontId::proportional(11.5)
+    }
+    /// Exact commands.
+    pub fn mono() -> FontId {
+        FontId::monospace(13.0)
+    }
+    /// The line height of running text.
+    pub const BODY_LINE: f32 = 22.0;
+}
+
+/// The onboarding card's fill: nearly opaque, so text never fights the backdrop.
+pub fn card_fill() -> Color32 {
+    Color32::from_rgba_unmultiplied(8, 22, 38, 236)
+}
+
+/// The onboarding card's edge.
+pub fn card_stroke() -> Color32 {
+    alpha(GLACIER, 34)
+}
+
+/// `a` blended towards `b` by `t` (0–1), on unmultiplied channels. Exactly `a` at 0 and `b` at 1.
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    if t <= 0.0 {
+        return a;
+    }
+    if t >= 1.0 {
+        return b;
+    }
+    let [ar, ag, ab, aa] = a.to_srgba_unmultiplied();
+    let [br, bg, bb, ba] = b.to_srgba_unmultiplied();
+    let channel = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(
+        channel(ar, br),
+        channel(ag, bg),
+        channel(ab, bb),
+        channel(aa, ba),
+    )
+}
+
+/// A soft round glow: `color` at the centre fading to nothing at `radius`.
+pub fn radial_glow(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32) {
+    if radius <= 0.0 || color.a() == 0 {
+        return;
+    }
+    const SEGMENTS: u32 = 48;
+    let middle = mix(alpha(color, 0), color, 0.38);
+    let clear = alpha(color, 0);
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(center, color);
+    for ring in [(0.45, middle), (1.0, clear)] {
+        for i in 0..SEGMENTS {
+            let angle = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            mesh.colored_vertex(
+                center + Vec2::new(angle.cos(), angle.sin()) * radius * ring.0,
+                ring.1,
+            );
+        }
+    }
+    for i in 0..SEGMENTS {
+        let next = (i + 1) % SEGMENTS;
+        let (a, b) = (1 + i, 1 + next);
+        mesh.add_triangle(0, a, b);
+        let (c, d) = (1 + SEGMENTS + i, 1 + SEGMENTS + next);
+        mesh.add_triangle(a, c, d);
+        mesh.add_triangle(a, d, b);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// How an [`action`] button is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionKind {
+    /// The one filled answer of a screen.
+    Primary,
+    /// An outlined alternative.
+    Secondary,
+    /// An outlined alternative in warning red.
+    Destructive,
+    /// A quiet text button: no fill until hovered.
+    Ghost,
+}
+
+/// The height of every [`action`] button.
+pub const ACTION_HEIGHT: f32 = 36.0;
+
+fn action_font() -> FontId {
+    FontId::proportional(14.5)
+}
+
+fn action_padding(kind: ActionKind) -> f32 {
+    match kind {
+        ActionKind::Ghost => 12.0,
+        _ => 18.0,
+    }
+}
+
+/// The width [`action`] takes for `label`: never less than its text, so it never wraps or shrinks.
+pub fn action_width(ui: &egui::Ui, label: &str, kind: ActionKind, leading: bool) -> f32 {
+    let text = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), action_font(), ICE)
+        .size()
+        .x;
+    let width = text + 2.0 * action_padding(kind) + if leading { 14.0 } else { 0.0 };
+    match kind {
+        ActionKind::Ghost => width,
+        _ => width.max(96.0),
+    }
+}
+
+/// A footer button with animated hover, press and focus. `leading_chevron` draws a "back"
+/// chevron before the label. The label never wraps: the button is as wide as its text needs.
+/// Muted and not focusable when `enabled` is false (or the `Ui` is disabled).
+pub fn action(
+    ui: &mut egui::Ui,
+    label: &str,
+    kind: ActionKind,
+    enabled: bool,
+    leading_chevron: bool,
+) -> Response {
+    let enabled = enabled && ui.is_enabled();
+    let width = action_width(ui, label, kind, leading_chevron);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(width, ACTION_HEIGHT),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    if ui.is_rect_visible(rect) {
+        let time = ui.style().animation_time;
+        let lit = enabled && (response.hovered() || response.has_focus());
+        let hover = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("hover"), lit, time);
+        let press = ui.ctx().animate_bool_with_time(
+            response.id.with("press"),
+            enabled && response.is_pointer_button_down_on(),
+            time * 0.5,
+        );
+        let geometry = ui.style().scroll_animation.duration.max > 0.0;
+        let body = rect.shrink(if geometry { press * 0.8 } else { 0.0 });
+        let radius = 10.0;
+        let painter = ui.painter();
+        let (fill, stroke, text) = match (kind, enabled) {
+            (ActionKind::Primary, true) => {
+                let lift = if geometry { hover * (1.0 - press) } else { 0.0 };
+                painter.add(
+                    egui::epaint::Shadow {
+                        offset: [0, (2.0 + 3.0 * lift) as i8],
+                        blur: (10.0 + 10.0 * lift) as u8,
+                        spread: 0,
+                        color: alpha(FROST, (40.0 + 50.0 * lift) as u8),
+                    }
+                    .as_shape(body, radius),
+                );
+                (
+                    mix(
+                        mix(FROST, GLACIER, hover * 0.55),
+                        Color32::from_rgb(8, 151, 192),
+                        press,
+                    ),
+                    Stroke::NONE,
+                    MIDNIGHT,
+                )
+            }
+            (ActionKind::Secondary, true) => (
+                alpha(NAVY, (70.0 + 70.0 * hover) as u8),
+                Stroke::new(1.0, alpha(GLACIER, (80.0 + 90.0 * hover) as u8)),
+                ICE,
+            ),
+            (ActionKind::Destructive, true) => (
+                alpha(WARNING, (10.0 + 26.0 * hover) as u8),
+                Stroke::new(1.0, alpha(WARNING, (100.0 + 90.0 * hover) as u8)),
+                mix(WARNING, ICE, hover * 0.35),
+            ),
+            (ActionKind::Ghost, true) => (
+                alpha(GLACIER, (26.0 * hover + 14.0 * press) as u8),
+                Stroke::NONE,
+                mix(GLACIER, ICE, hover),
+            ),
+            (ActionKind::Ghost, false) => (Color32::TRANSPARENT, Stroke::NONE, alpha(QUIET, 110)),
+            (_, false) => (
+                alpha(NAVY, 45),
+                Stroke::new(1.0, alpha(QUIET, 36)),
+                alpha(QUIET, 140),
+            ),
+        };
+        painter.rect(body, radius, fill, stroke, StrokeKind::Inside);
+        let galley = painter.layout_no_wrap(label.to_owned(), action_font(), text);
+        let content = galley.size().x + if leading_chevron { 14.0 } else { 0.0 };
+        let left = body.center().x - content * 0.5;
+        if leading_chevron {
+            let c = Pos2::new(
+                left + 3.5 - if geometry { 2.0 * hover } else { 0.0 },
+                body.center().y,
+            );
+            let stroke = Stroke::new(1.6, text);
+            painter.line_segment([c + Vec2::new(3.5, -4.5), c], stroke);
+            painter.line_segment([c, c + Vec2::new(3.5, 4.5)], stroke);
+        }
+        let at = Pos2::new(
+            left + if leading_chevron { 14.0 } else { 0.0 },
+            body.center().y - galley.size().y * 0.5,
+        );
+        painter.galley(at, galley, text);
+        focus_ring(ui, &response, body, radius);
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }

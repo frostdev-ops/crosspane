@@ -34,8 +34,9 @@ pub const SCREENS: [(ScreenId, &str); 15] = [
 ];
 
 /// Other states of a screen, for review: the name and the screen it belongs to.
-pub const VARIANTS: [(&str, ScreenId); 7] = [
+pub const VARIANTS: [(&str, ScreenId); 8] = [
     ("install-failed", ScreenId::InstallPlan),
+    ("install-prerequisites", ScreenId::InstallPlan),
     ("connect-searching", ScreenId::Connect),
     ("connect-waiting", ScreenId::Connect),
     ("connect-address", ScreenId::Connect),
@@ -46,6 +47,7 @@ pub const VARIANTS: [(&str, ScreenId); 7] = [
 
 /// The screen a review name shows: one of [`SCREENS`] or a [`VARIANTS`] state of one.
 pub fn screen_named(name: &str) -> Option<ScreenId> {
+    let name = motion_variant(name).0;
     SCREENS
         .iter()
         .find(|(_, key)| *key == name)
@@ -60,13 +62,33 @@ pub fn screen_named(name: &str) -> Option<ScreenId> {
 
 /// The fixture a review name shows.
 pub fn fixture_named(name: &str) -> Option<WizardView> {
+    let (name, motion) = motion_variant(name);
     let screen = screen_named(name)?;
     let mut view = fixture(screen);
     match name {
+        "install-prerequisites" => {
+            let checks = [
+                "Operating system",
+                "Processor architecture",
+                "Hyprland version",
+                "Login session",
+                "Session manager",
+                "Manager environment",
+                "Wayland protocols",
+                "Required libraries",
+                "Video support",
+                "Sound support",
+                "System keyring",
+            ];
+            view.rows.retain(|row| !row.is_check());
+            for (index, label) in checks.iter().enumerate().rev() {
+                view.rows
+                    .insert(1, row(check_row_id(index), label, "", RowState::Verified));
+            }
+        }
         "install-failed" => {
             view.title = "Setup stopped".into();
-            view.message =
-                "The step marked below didn't finish. Fix what it says, then try again.".into();
+            view.message = "Fix the step marked below, then try again.".into();
             view.rows = install_rows(&[
                 RowState::Verified,
                 RowState::Failed,
@@ -123,9 +145,9 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
             view.link_caption = None;
         }
         "connect-address" => {
-            view.message = "Enter the other computer's address and port. Crosspane uses port \
-                            47811 unless it was changed."
-                .into();
+            view.message =
+                "Enter the other computer's address. The port is 47811 unless it was changed."
+                    .into();
             view.rows.clear();
             view.fields.push(FieldView::PeerAddress {
                 id: 10,
@@ -158,7 +180,7 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
         }
         "match-pick" => {
             view.title = "Which number do you see on the other computer?".into();
-            view.message = "Pick the number shown on mac-studio's screen.".into();
+            view.message = "Pick the number shown on mac-studio.".into();
             view.illustration.sas = None;
             view.buttons = ["482 913", "730 155", "096 284"]
                 .iter()
@@ -174,10 +196,9 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
                 .collect();
         }
         "practice-choose" => {
-            view.message = "Each practice runs together with its partner on the other computer: \
-                            when this one controls, the other is controlled. Start the same pair \
-                            on both. A small practice window checks that it really worked."
-                .into();
+            view.message =
+                "Start the same practice on both computers. A small window checks that it worked."
+                    .into();
             view.illustration.practice = None;
             view.rows = vec![
                 RowView {
@@ -218,7 +239,7 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
         }
         "summary-waiting" => {
             view.title = "Crosspane is installed".into();
-            view.message = "A few steps are left before the workspace is ready.".into();
+            view.message = "A few steps are left.".into();
             view.summary = SummaryView::InstalledWaiting;
             view.progress.completed = vec![
                 ProgressGroup::Install,
@@ -247,7 +268,23 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
         }
         _ => {}
     }
+    if let Some(motion) = motion {
+        view.motion = motion;
+    }
     Some(view)
+}
+
+// Review variants exercise the same screen without changing its data or any production mode.
+fn motion_variant(name: &str) -> (&str, Option<MotionPreference>) {
+    for (suffix, motion) in [
+        ("-reduced", MotionPreference::Reduced),
+        ("-off", MotionPreference::Off),
+    ] {
+        if let Some(name) = name.strip_suffix(suffix) {
+            return (name, Some(motion));
+        }
+    }
+    (name, None)
 }
 
 fn row(id: u16, label: &str, detail: &str, state: RowState) -> RowView {
@@ -273,14 +310,11 @@ fn button(id: u16, role: ButtonRole, label: &str, kind: ButtonKind) -> ButtonVie
 /// The install page's steps, in the Linux order, in the given states.
 fn install_rows(states: &[RowState; 5]) -> Vec<RowView> {
     let steps = [
-        (10, "This computer can run Crosspane"),
-        (20, "Crosspane is installed for your account"),
-        (21, "Crosspane starts when you sign in"),
-        (22, "A restart brings up a new, healthy instance"),
-        (
-            23,
-            "Crosspane is running with its key in the system keyring",
-        ),
+        (10, "Check this computer"),
+        (20, "Install Crosspane"),
+        (21, "Start Crosspane when you sign in"),
+        (22, "Restart Crosspane"),
+        (23, "Check that Crosspane is running"),
     ];
     let mut rows = Vec::new();
     for ((id, label), state) in steps.iter().zip(states) {
@@ -350,7 +384,7 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         screen,
         title: String::new(),
         message: String::new(),
-        machine: Some("This machine · review fixture".into()),
+        machine: Some("omarchy".into()),
         peer: None,
         rows: Vec::new(),
         buttons: vec![button(2, ButtonRole::Back, "Back", ButtonKind::Link)],
@@ -364,17 +398,13 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         demo: true,
         link_caption: None,
     };
-    let install_message =
-        "Setup is installing Crosspane for your account. It carries on by itself.";
+    let install_message = "This carries on by itself.";
     match screen {
         ScreenId::Welcome => {
             view.escape = EscapeMapping::Close;
             view.title = "Set up Crosspane".into();
-            view.message = "Share one keyboard and mouse between this computer and another, send \
-                            windows back and forth, and play sound on each other's speakers. \
-                            Setup installs Crosspane for your account, pairs the two computers \
-                            and lets you try each feature once. It only stops when your answer \
-                            is needed."
+            view.message = "Use one keyboard and mouse across two computers, move windows between \
+                            them and share sound. Setup asks only when it needs you."
                 .into();
             view.buttons = vec![
                 button(1, ButtonRole::Next, "Start setup", ButtonKind::Primary),
@@ -397,6 +427,9 @@ pub fn fixture(screen: ScreenId) -> WizardView {
                 RowState::Unchecked,
             ]);
             view.rows[0].detail = "Checking now…".into();
+            if let Some(payload) = view.rows.iter_mut().find(|row| row.id == 20) {
+                payload.detail = "Crosspane's files need to be installed for your account.".into();
+            }
         }
         ScreenId::InstallPlan => {
             view.title = "Installing Crosspane".into();
@@ -426,9 +459,9 @@ pub fn fixture(screen: ScreenId) -> WizardView {
                 RowState::Waiting,
             ]);
             if let Some(agent) = view.rows.iter_mut().find(|row| row.id == 23) {
-                agent.detail = "Crosspane is waiting for your system keyring. Unlock it when \
-                                asked and setup carries on by itself."
-                    .into();
+                agent.detail =
+                    "Waiting for your system keyring. Unlock it when asked; setup carries on."
+                        .into();
             }
             view.buttons.push(button(
                 123,
@@ -439,54 +472,75 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::Permissions => {
             view.title = "Allow Crosspane on this Mac".into();
-            view.message = "Crosspane needs these permissions to share your keyboard, mouse, \
-                            windows and sound. macOS asks for each one, so several dialogs may \
-                            appear. Nothing is granted without you."
+            view.message = "Allow each permission below. macOS shows a request, or opens System \
+                            Settings where you turn Crosspane on. Setup notices each one by itself \
+                            and moves on once all are allowed."
                 .into();
-            view.illustration.permission_row = Some(1);
             view.rows = vec![
                 row(
-                    3,
-                    "Screen Recording",
-                    "Lets Crosspane show windows you send on the other computer",
-                    RowState::Verified,
-                ),
-                row(
-                    1,
-                    "Accessibility",
-                    "Lets the other computer's keyboard and mouse work here, when you allow it",
+                    30,
+                    "Crosspane has the Mac permissions it needs",
+                    "1 of 4 allowed. Allow each one below.",
                     RowState::NeedsAction,
                 ),
                 row(
-                    2,
-                    "Input Monitoring",
-                    "Lets this keyboard and mouse move onto the other computer",
-                    RowState::Unchecked,
+                    960,
+                    "Device Control and Data Access",
+                    "Answer the macOS request, or turn Crosspane on in System Settings. Setup \
+                     notices it by itself.",
+                    RowState::Waiting,
                 ),
-                row(4, "Microphone", MICROPHONE_DETAIL, RowState::Unchecked),
                 row(
-                    5,
-                    "Local Network",
-                    "Checked when the two computers first connect",
+                    961,
+                    "Input Monitoring",
+                    "Allow Device Control and Data Access first.",
+                    RowState::Waiting,
+                ),
+                row(
+                    962,
+                    "Screen & System Audio Recording",
+                    "Allowed.",
+                    RowState::Verified,
+                ),
+                row(
+                    963,
+                    "Microphone",
+                    "macOS still reports this off for Crosspane. Restart Crosspane so it reads \
+                     it again, or reset Crosspane's entry and ask again.",
                     RowState::Waiting,
                 ),
             ];
-            view.buttons.push(button(
-                1030,
-                ButtonRole::Confirm,
-                "Ask for permissions",
-                ButtonKind::Primary,
-            ));
+            view.buttons.extend([
+                button(2600, ButtonRole::Confirm, "Allow", ButtonKind::Choice),
+                button(2601, ButtonRole::Confirm, "It's on", ButtonKind::Link),
+                ButtonView {
+                    enabled: false,
+                    ..button(2610, ButtonRole::Confirm, "Allow", ButtonKind::Choice)
+                },
+                button(2630, ButtonRole::Confirm, "Allow", ButtonKind::Choice),
+                button(
+                    2633,
+                    ButtonRole::Confirm,
+                    "Restart Crosspane and check again",
+                    ButtonKind::Link,
+                ),
+                button(
+                    2632,
+                    ButtonRole::Confirm,
+                    "Reset Crosspane's entry and ask again",
+                    ButtonKind::Link,
+                ),
+            ]);
         }
         ScreenId::AudioComponent => {
             view.title = "Bring sound across".into();
-            view.message = "The Crosspane sound driver adds the speakers the other computer plays \
-                            to. Installing it asks for an administrator password, restarts this \
-                            Mac's sound for a moment and affects every user on this Mac."
+            view.message = "Adds the speakers the other computer plays to. Installing asks for an \
+                            administrator password, restarts this Mac's sound for a moment and \
+                            affects every user on this Mac."
                 .into();
             view.rows = vec![row(
                 31,
-                "Crosspane can hear its own speakers device",
+                "Let Crosspane hear its own speakers",
                 MICROPHONE_DETAIL,
                 RowState::NeedsAction,
             )];
@@ -508,8 +562,8 @@ pub fn fixture(screen: ScreenId) -> WizardView {
             view.illustration.traffic_observed = true;
             view.rows = vec![row(
                 30,
-                "This computer can reach the other one on your network",
-                "ufw is active without a Crosspane rule.",
+                "Allow Crosspane on your network",
+                "ufw is on and has no rule for Crosspane.",
                 RowState::NeedsAction,
             )];
             view.buttons.extend([
@@ -524,11 +578,11 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::HidingChoice => {
             view.title = "Windows you send from this Mac".into();
-            view.message = "Choose what happens on this Mac while one of its windows is shown on \
-                            the other computer. Hide uses an Apple private interface approved by \
-                            Crosspane's owner and falls back to mirroring if that interface stops \
-                            working."
-                .into();
+            view.message =
+                "What happens here while one of this Mac's windows is shown on the other \
+                            computer. Hide uses an Apple private interface and falls back to \
+                            mirroring if it stops working."
+                    .into();
             view.buttons.push(button(
                 1,
                 ButtonRole::Next,
@@ -538,13 +592,11 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::Connect => {
             view.title = "Pair with the other computer".into();
-            view.message = "Pairing lets the two computers trust each other. You'll check that \
-                            both screens show the same number."
-                .into();
+            view.message = "Both computers will show a number to compare.".into();
             view.rows = vec![row(
                 951,
                 "Found mac-studio on your network",
-                "Pair with it to continue. You'll compare a number on both screens.",
+                "Pair with it to continue.",
                 RowState::Note,
             )];
             view.link_caption = Some("Other ways to connect".into());
@@ -565,13 +617,13 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::MatchNumbers => {
             view.title = "Do the numbers match?".into();
-            view.message = "Check that mac-studio shows this number, then confirm. If it doesn't, \
-                            stop: something else may be trying to pair. These demo numbers \
-                            establish no trust."
-                .into();
+            view.message =
+                "Confirm only if mac-studio shows the same number. If it doesn't, stop: \
+                            something else may be trying to pair."
+                    .into();
             view.escape = EscapeMapping::None;
             view.illustration.sas = Some("482 913".into());
-            view.peer = Some("Other machine · review fixture".into());
+            view.peer = Some("mac-studio".into());
             view.buttons = vec![
                 button(
                     8,
@@ -589,9 +641,8 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::Grants => {
             view.title = "What may mac-studio do here?".into();
-            view.message = "Turn on what you allow on this computer. Trying every feature needs \
-                            all five; you can change them any time in Crosspane's settings."
-                .into();
+            view.message =
+                "Choose what to allow here. You can change this later in Settings.".into();
             view.peer = Some("mac-studio".into());
             for (index, label) in [
                 "Control this computer's keyboard and mouse",
@@ -620,9 +671,7 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::Layout => {
             view.title = "Arrange your screens".into();
-            view.message =
-                "If this isn't how the screens sit on your desk, drag them into place and apply."
-                    .into();
+            view.message = "Drag the screens to match your desk.".into();
             let display = |node: &str, machine: &str, x| crosspane_ui_kit::layout::DisplayRect {
                 node: node.into(),
                 machine: machine.into(),
@@ -650,9 +699,8 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::Practice => {
             view.title = "Try each feature once".into();
-            view.message = "Practising: Play sound from this computer on the other one. Choose \
-                            the Crosspane speakers for mac-studio as the output, play the test \
-                            sound, then confirm what you heard."
+            view.message = "Choose the Crosspane speakers for mac-studio as the output, play the \
+                            test sound, then confirm what you heard."
                 .into();
             view.illustration.practice = Some(PracticeIllustration::Tone);
             view.rows = vec![row(
@@ -691,17 +739,14 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         ScreenId::Summary => {
             view.escape = EscapeMapping::Close;
             view.title = "Your workspace is ready".into();
-            view.message = "Every step was checked just now on this computer. This ready \
-                            illustration is demo data: nothing was installed, connected or \
-                            granted."
-                .into();
+            view.message = "Everything was checked just now.".into();
             view.summary = SummaryView::WorkspaceReady;
             view.rows = [
-                "This computer can run Crosspane",
-                "Crosspane is installed for your account",
-                "Crosspane starts when you sign in",
-                "Paired and connected to the other computer",
-                "Where the other computer's screens sit",
+                "Check this computer",
+                "Install Crosspane",
+                "Start Crosspane when you sign in",
+                "Pair with the other computer",
+                "Arrange the screens",
                 "Control the other computer from this keyboard and mouse",
                 "Send a window from this computer",
                 "Play sound from this computer on the other one",
@@ -726,8 +771,8 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::RepairRemove => {
             view.title = "Remove or repair Crosspane".into();
-            view.message = "Removal stops Crosspane first. Deleting this computer's identity and \
-                            removing the shared sound driver are separate choices."
+            view.message = "Removal stops Crosspane first. The two options below are separate \
+                            choices."
                 .into();
             view.progress.current = None;
             view.fields = vec![

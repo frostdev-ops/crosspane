@@ -18,9 +18,36 @@ use eframe::egui;
 
 use crate::WizardShell;
 use crate::demo::{self, DisconnectedController};
+use crate::review::{self, ReviewScript};
 use crate::view::{ScreenId, WizardAction, WizardView};
 
 pub const MAX_FONT_BYTES: usize = 16 * 1024 * 1024;
+/// The window's first size, in points: the content column plus the progress rail and a
+/// comfortable margin.
+pub const DEFAULT_SIZE: egui::Vec2 = egui::vec2(980.0, 700.0);
+/// The smallest window the content column fits without squeezing.
+pub const MIN_SIZE: egui::Vec2 = egui::vec2(640.0, 560.0);
+
+fn parse_size(text: &str) -> std::result::Result<egui::Vec2, String> {
+    let (width, height) = text
+        .split_once(['x', 'X'])
+        .ok_or_else(|| "expected WIDTHxHEIGHT".to_owned())?;
+    let width: f32 = width.trim().parse().map_err(|_| "bad width".to_owned())?;
+    let height: f32 = height.trim().parse().map_err(|_| "bad height".to_owned())?;
+    if !(100.0..=4096.0).contains(&width) || !(100.0..=4096.0).contains(&height) {
+        return Err("size must be between 100 and 4096 points".into());
+    }
+    Ok(egui::vec2(width, height))
+}
+
+fn parse_point(text: &str) -> std::result::Result<egui::Pos2, String> {
+    let (x, y) = text
+        .split_once(',')
+        .ok_or_else(|| "expected X,Y".to_owned())?;
+    let x: f32 = x.trim().parse().map_err(|_| "bad X".to_owned())?;
+    let y: f32 = y.trim().parse().map_err(|_| "bad Y".to_owned())?;
+    Ok(egui::pos2(x, y))
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,6 +67,24 @@ pub struct ReviewOptions {
     /// Explicit, absolute path to a readable system font (maximum 16 MiB).
     #[arg(long)]
     pub font: Option<PathBuf>,
+    /// Review: the window's logical size, as WIDTHxHEIGHT points.
+    #[arg(long, value_name = "WxH", value_parser = parse_size)]
+    pub size: Option<egui::Vec2>,
+    /// Review: physical pixels per logical point (2 matches a Retina display).
+    #[arg(long, value_name = "PPP")]
+    pub pixels_per_point: Option<f32>,
+    /// Review: capture this many milliseconds after the reviewed screen appears (scripted clock).
+    #[arg(long, value_name = "MS")]
+    pub screenshot_at_ms: Option<u64>,
+    /// Review: show this screen first, then move to `--screen`, so its transition is captured.
+    #[arg(long, value_name = "NAME")]
+    pub from: Option<String>,
+    /// Review: rest the pointer here (X,Y in points), to capture hover states.
+    #[arg(long, value_name = "X,Y", value_parser = parse_point)]
+    pub pointer: Option<egui::Pos2>,
+    /// Review: render the capture without opening a window.
+    #[arg(long)]
+    pub offscreen: bool,
     /// Linux production: directory holding `payload.tar` and `payload.sha256`.
     #[arg(long, value_name = "DIR")]
     pub payload: Option<PathBuf>,
@@ -59,6 +104,21 @@ impl ReviewOptions {
             !(self.demo && self.payload.is_some()),
             "--payload cannot be used with --demo"
         );
+        ensure!(
+            self.demo || !self.has_review_flags(),
+            "--size, --pixels-per-point, --screenshot-at-ms, --from, --pointer and --offscreen \
+             require --demo"
+        );
+        ensure!(
+            !self.offscreen || self.screenshot.is_some(),
+            "--offscreen needs --screenshot"
+        );
+        if let Some(from) = &self.from {
+            ensure!(
+                demo::screen_named(from).is_some(),
+                "Unknown demo screen: {from}"
+            );
+        }
         if let Some(path) = &self.screenshot {
             ensure!(
                 path.extension()
@@ -208,10 +268,36 @@ pub enum LaunchMode {
 }
 
 impl ReviewOptions {
+    fn has_review_flags(&self) -> bool {
+        self.size.is_some()
+            || self.pixels_per_point.is_some()
+            || self.screenshot_at_ms.is_some()
+            || self.from.is_some()
+            || self.pointer.is_some()
+            || self.offscreen
+    }
+
+    /// The scripted review this launch captures, if it captures one.
+    pub fn script(&self) -> Option<ReviewScript> {
+        self.screenshot.as_ref()?;
+        Some(ReviewScript {
+            screen: self.screen.clone().unwrap_or_else(|| "welcome".into()),
+            from: self.from.clone(),
+            at_ms: self.screenshot_at_ms.unwrap_or(review::SETTLED_MS),
+            size: self.size.unwrap_or(DEFAULT_SIZE),
+            pixels_per_point: self.pixels_per_point.unwrap_or(1.0),
+            pointer: self.pointer,
+        })
+    }
+
     pub fn mode(&self) -> LaunchMode {
         if self.demo {
             LaunchMode::Demo
-        } else if self.screen.is_some() || self.screenshot.is_some() || self.font.is_some() {
+        } else if self.screen.is_some()
+            || self.screenshot.is_some()
+            || self.font.is_some()
+            || self.has_review_flags()
+        {
             LaunchMode::Refused
         } else {
             LaunchMode::Production
@@ -229,16 +315,28 @@ pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
                 .font
                 .as_deref()
                 .context("Missing explicit review font")?;
+            let fonts = load_review_font(font)?;
+            if let (true, Some(path), Some(script)) =
+                (options.offscreen, &options.screenshot, options.script())
+            {
+                return review::render_offscreen(&script, fonts, brand, path);
+            }
             // A named screen may be one of its review variants (see `demo::VARIANTS`).
             let controller = match options.screen.as_deref() {
                 Some(name) => DisconnectedController::named(name)
                     .with_context(|| format!("Unknown demo screen: {name}"))?,
                 None => DisconnectedController::new(Some(screen)),
             };
+            let window = Window {
+                size: options.size.unwrap_or(DEFAULT_SIZE),
+                pixels_per_point: options.pixels_per_point.unwrap_or(1.0),
+            };
             run_gui(
-                options.screenshot,
+                options.screenshot.clone(),
+                options.script(),
+                window,
                 brand,
-                load_review_font(font)?,
+                fonts,
                 Box::new(controller),
             )
         }
@@ -253,6 +351,8 @@ pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
                 let font = options.font.as_deref().context("Missing explicit font")?;
                 run_gui(
                     None,
+                    None,
+                    Window::default(),
                     brand,
                     load_review_font(font)?,
                     Box::new(DisconnectedController::new(None)),
@@ -261,7 +361,7 @@ pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
         }
         LaunchMode::Production => {
             let (fonts, controller) = production_controller(options.payload)?;
-            run_gui(None, brand, fonts, controller)
+            run_gui(None, None, Window::default(), brand, fonts, controller)
         }
     }
 }
@@ -292,8 +392,26 @@ fn production_controller(
     }
 }
 
+/// The window a launch opens.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    size: egui::Vec2,
+    pixels_per_point: f32,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Self {
+            size: DEFAULT_SIZE,
+            pixels_per_point: 1.0,
+        }
+    }
+}
+
 fn run_gui(
     screenshot: Option<PathBuf>,
+    script: Option<ReviewScript>,
+    window: Window,
     brand: BrandBytes<'static>,
     fonts: egui::FontDefinitions,
     controller: Box<dyn InstallerController>,
@@ -307,8 +425,9 @@ fn run_gui(
     let app_completion = completion.clone();
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 760.0])
-            .with_min_inner_size([800.0, 600.0]),
+            // A review zoom keeps the logical size: the window grows by the zoom instead.
+            .with_inner_size(window.size * window.pixels_per_point)
+            .with_min_inner_size(MIN_SIZE.min(window.size) * window.pixels_per_point),
         ..Default::default()
     };
     eframe::run_native(
@@ -318,7 +437,16 @@ fn run_gui(
             cc.egui_ctx.set_fonts(fonts);
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             cc.egui_ctx.set_style_of(egui::Theme::Dark, theme::style());
+            if window.pixels_per_point != 1.0 {
+                cc.egui_ctx.set_zoom_factor(window.pixels_per_point);
+            }
             let art = Art::load(&cc.egui_ctx, brand);
+            let from = script
+                .as_ref()
+                .and_then(|script| script.from.as_deref())
+                .map(review::controller)
+                .transpose()?
+                .map(|controller| Box::new(controller) as Box<dyn InstallerController>);
             Ok(Box::new(InstallerGui {
                 controller,
                 shell: WizardShell::default(),
@@ -331,6 +459,9 @@ fn run_gui(
                 completion: app_completion,
                 pending_actions: Vec::new(),
                 pending_frame: None,
+                script,
+                script_frame: 0,
+                from,
             }))
         }),
     )
@@ -406,6 +537,11 @@ struct InstallerGui {
     completion: Arc<Mutex<CaptureCompletion>>,
     pending_actions: Vec<WizardAction>,
     pending_frame: Option<u64>,
+    /// Review captures run on a scripted clock instead of the wall clock.
+    script: Option<ReviewScript>,
+    script_frame: u64,
+    /// The screen shown before the reviewed one, while it still shows.
+    from: Option<Box<dyn InstallerController>>,
 }
 
 impl Drop for InstallerGui {
@@ -462,7 +598,11 @@ impl eframe::App for InstallerGui {
             );
             return;
         };
-        match timing.poll(Instant::now(), self.frames) {
+        let scripted_ready = self
+            .script
+            .as_ref()
+            .is_none_or(|script| script.step(self.script_frame.saturating_sub(1)).capture);
+        match timing.poll(Instant::now(), if scripted_ready { self.frames } else { 0 }) {
             CaptureNext::Timeout => {
                 self.finish_capture(
                     ctx,
@@ -503,19 +643,23 @@ impl eframe::App for InstallerGui {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let now_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let mut now_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if let Some(script) = &self.script {
+            let step = script.step(self.script_frame);
+            self.script_frame += 1;
+            now_ms = step.now_ms;
+            if step.target {
+                self.from = None;
+            }
+            ui.ctx().request_repaint();
+        }
         let tick = self.controller.tick();
         apply_effects(&mut self.shell, self.controller.view(), tick.effects);
         if let Some(ms) = tick.wake_after_ms {
             ui.ctx().request_repaint_after(Duration::from_millis(ms));
         }
-        let actions = egui::Frame::new()
-            .inner_margin(24)
-            .show(ui, |ui| {
-                self.shell
-                    .show(ui, self.controller.view(), &self.art, now_ms)
-            })
-            .inner;
+        let controller = self.from.as_ref().unwrap_or(&self.controller);
+        let actions = self.shell.show(ui, controller.view(), &self.art, now_ms);
         if !actions.is_empty() {
             self.pending_frame = Some(ui.ctx().cumulative_frame_nr());
             for action in actions {

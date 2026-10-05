@@ -100,8 +100,9 @@ impl Harness {
         actions
     }
 
+    /// Long enough for every finite motion of a page (transition, rows, height) to finish.
     fn settle(&mut self, view: &WizardView) {
-        for _ in 0..8 {
+        for _ in 0..16 {
             assert!(self.frame(view, Vec::new()).is_empty());
         }
     }
@@ -152,8 +153,8 @@ impl Harness {
             .into_iter()
             .filter_map(|(shape, clip)| match shape {
                 egui::epaint::Shape::Rect(rect)
-                    if rect.fill == theme::alpha(theme::MIDNIGHT, 205)
-                        && rect.stroke.color == theme::alpha(theme::GLACIER, 42)
+                    if rect.fill == theme::card_fill()
+                        && rect.stroke.color == theme::card_stroke()
                         && rect.rect.contains(label_rect.center()) =>
                 {
                     Some((rect.rect, clip))
@@ -1079,7 +1080,8 @@ fn body_content_bounds(harness: &Harness, clip: Rect) -> Rect {
                 egui::epaint::Shape::Text(text) => {
                     Some(text.galley.rect.translate(text.pos.to_vec2()))
                 }
-                _ => Some(shape.visual_bounding_rect()),
+                // What is painted is clipped: a soft glow may reach past its clip.
+                _ => Some(shape.visual_bounding_rect().intersect(shape_clip)),
             }
         })
         .filter(|rect| rect.is_positive())
@@ -1136,94 +1138,59 @@ fn short_bodies_with_choices_and_controls_leave_no_dead_space_at_review_size() {
 }
 
 #[test]
-fn component_and_direction_diagrams_are_bounded_and_explanatory_at_both_sizes() {
-    for size in [egui::vec2(800.0, 600.0), egui::vec2(1100.0, 760.0)] {
-        for (screen, caption, labels) in [(
-            ScreenId::Grants,
-            "Control and windows · each direction is a separate opt-in",
-            &["This machine", "Other machine"][..],
-        )] {
-            let mut harness = Harness::review(size);
-            let view = demo::fixture(screen);
-            let before = view.clone();
-            harness.settle(&view);
-            // State rows keep priority. Reveal the diagram through keyboard scrolling
-            // when needed, stopping before scrolling past art ahead of grant controls.
-            let diagram_visible = |harness: &Harness| {
-                let (raw, clip, _) = harness.raw_text(caption);
-                clip.height() >= 95.0
-                    && clip.contains_rect(raw)
-                    && labels.iter().all(|label| {
-                        let (raw, clip, _) = harness.raw_text(label);
-                        clip.contains_rect(raw)
-                    })
-            };
-            if !diagram_visible(&harness) {
-                harness.frame(&view, vec![key(Key::Tab, false)]);
-                for _ in 0..32 {
-                    assert!(
-                        harness
-                            .frame(&view, vec![key(Key::ArrowDown, false)])
-                            .is_empty()
-                    );
-                    harness.frame(&view, Vec::new());
-                    if diagram_visible(&harness) {
-                        break;
-                    }
-                }
-            }
-            let (raw, clip, _) = harness.raw_text(caption);
-            assert!(
-                clip.contains_rect(raw) && clip.height() <= 97.0,
-                "{screen:?} diagram caption {raw:?} in {clip:?}"
-            );
-            for label in labels {
-                let (raw, label_clip, _) = harness.raw_text(label);
-                assert!(
-                    label_clip.contains_rect(raw),
-                    "Clipped diagram label {label}"
-                );
-            }
-            let colors = harness
-                .shapes()
-                .into_iter()
-                .filter_map(|(shape, shape_clip)| match shape {
-                    egui::epaint::Shape::Rect(rect)
-                        if clip.contains_rect(shape_clip) && rect.rect.width() > 60.0 =>
-                    {
-                        Some(rect.stroke.color)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert!(colors.contains(&theme::FROST));
-            assert!(colors.contains(&if screen == ScreenId::Grants {
-                theme::PEER_ICE
-            } else {
-                theme::GLACIER
-            }));
-            if screen == ScreenId::Grants {
-                let arrows = harness
-                    .shapes()
-                    .into_iter()
-                    .filter_map(|(shape, shape_clip)| match shape {
-                        egui::epaint::Shape::LineSegment { points, stroke }
-                            if clip.contains_rect(shape_clip)
-                                && stroke.color == theme::QUIET
-                                && (points[0].y - points[1].y).abs() < 0.5
-                                && (points[0].x - points[1].x).abs() > 15.0 =>
-                        {
-                            Some(points[1].x - points[0].x)
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                assert!(arrows.iter().any(|direction| *direction > 0.0));
-                assert!(arrows.iter().any(|direction| *direction < 0.0));
-            }
-            assert_eq!(view, before);
-        }
+fn direction_diagram_is_bounded_and_decoration_gives_way_in_short_windows() {
+    // At the review size the grants diagram shows both machines and both directions.
+    let mut harness = Harness::review(egui::vec2(1100.0, 760.0));
+    let view = demo::fixture(ScreenId::Grants);
+    let before = view.clone();
+    harness.settle(&view);
+    let (_, clip, _) = harness.raw_text("This machine");
+    for label in ["This machine", "Other machine"] {
+        let (raw, label_clip, _) = harness.raw_text(label);
+        assert!(
+            label_clip.contains_rect(raw),
+            "Clipped diagram label {label}"
+        );
     }
+    let colors = harness
+        .shapes()
+        .into_iter()
+        .filter_map(|(shape, shape_clip)| match shape {
+            egui::epaint::Shape::Rect(rect)
+                if clip.contains_rect(shape_clip) && rect.rect.width() > 60.0 =>
+            {
+                Some(rect.stroke.color)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(colors.contains(&theme::FROST));
+    assert!(colors.contains(&theme::PEER_ICE));
+    let arrows = harness
+        .shapes()
+        .into_iter()
+        .filter_map(|(shape, shape_clip)| match shape {
+            egui::epaint::Shape::LineSegment { points, stroke }
+                if clip.contains_rect(shape_clip)
+                    && stroke.color == theme::QUIET
+                    && (points[0].y - points[1].y).abs() < 0.5
+                    && (points[0].x - points[1].x).abs() > 15.0 =>
+            {
+                Some(points[1].x - points[0].x)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(arrows.iter().any(|direction| *direction > 0.0));
+    assert!(arrows.iter().any(|direction| *direction < 0.0));
+    // In a short window the decoration gives way, so the controls come first.
+    let mut short = Harness::review(egui::vec2(800.0, 600.0));
+    short.settle(&view);
+    assert!(
+        !short.texts().iter().any(|(text, _)| text == "This machine"),
+        "a decorative diagram crowds the controls in a short window"
+    );
+    assert_eq!(view, before);
 }
 
 #[test]
@@ -1404,14 +1371,32 @@ fn the_support_checklist_is_drawn_inside_its_card_with_its_own_wording_in_every_
             ];
             harness.settle(&view);
             let (card, _) = harness.card("This computer can run Crosspane");
-            for line in [
-                "Operating system  Passed (Arch-based)",
-                "Processor  Passed",
+            let open = [
                 "Hyprland version  Failed: too old",
                 "This session is the signed-in one  Couldn't confirm: couldn't read the session \
                  environment",
                 "Required libraries  Checking…",
-            ] {
+            ];
+            let passed = ["Operating system  Passed (Arch-based)", "Processor  Passed"];
+            // What needs attention is listed; what passed folds into one line.
+            for line in open.iter().chain(["2 other checks passed"].iter()) {
+                let (rect, _, _) = harness.raw_text(line);
+                assert!(
+                    card.contains_rect(rect),
+                    "{motion:?} {size:?}: {line:?} {rect:?} outside the card {card:?}"
+                );
+            }
+            for line in passed {
+                assert!(
+                    !harness.texts().iter().any(|(text, _)| text == line),
+                    "{motion:?}: passed check {line:?} is shown before Details"
+                );
+            }
+            // Details opens them, still inside the card.
+            harness.click(&view, "Details");
+            harness.settle(&view);
+            let (card, _) = harness.card("This computer can run Crosspane");
+            for line in passed {
                 let (rect, _, _) = harness.raw_text(line);
                 assert!(
                     card.contains_rect(rect),
@@ -1426,8 +1411,8 @@ fn the_support_checklist_is_drawn_inside_its_card_with_its_own_wording_in_every_
                     .into_iter()
                     .filter(|(shape, _)| {
                         matches!(shape, egui::epaint::Shape::Rect(rect)
-                            if rect.fill == theme::alpha(theme::MIDNIGHT, 205)
-                                && rect.stroke.color == theme::alpha(theme::GLACIER, 42))
+                            if rect.fill == theme::card_fill()
+                                && rect.stroke.color == theme::card_stroke())
                     })
                     .count()
             };
@@ -1537,4 +1522,191 @@ fn permission_rows_draw_their_own_allow_and_links_inside_the_row() {
             .any(|a| a.intent == WizardIntent::Button(2601)),
         "{actions:?}"
     );
+}
+
+/// The card that holds `label`, in the current frame.
+fn card_of(harness: &Harness, label: &str) -> Rect {
+    harness.card(label).0
+}
+
+#[test]
+fn nothing_is_squished_at_the_minimum_size_or_at_retina_scale() {
+    for (size, ppp) in [
+        (egui::vec2(640.0, 560.0), 1.0),
+        (egui::vec2(640.0, 560.0), 2.0),
+        (egui::vec2(980.0, 700.0), 2.0),
+    ] {
+        let mut harness = Harness::new(size);
+        harness.ctx.set_pixels_per_point(ppp);
+        let names = demo::SCREENS
+            .iter()
+            .map(|(_, name)| *name)
+            .chain(demo::VARIANTS.iter().map(|(name, _)| *name));
+        for name in names {
+            let view = demo::fixture_named(name).unwrap();
+            harness.settle(&view);
+            let card = card_of(&harness, &view.title);
+            let title = harness.raw_text(&view.title).0;
+            assert!(
+                card.contains_rect(title),
+                "{name} {size:?}: title outside its card"
+            );
+            for button in footer(&view) {
+                let (raw, clip, text) = harness.raw_text(&button.label);
+                assert_eq!(
+                    text.galley.rows.len(),
+                    1,
+                    "{name} {size:?}: {:?} wraps",
+                    button.label
+                );
+                assert!(
+                    clip.contains_rect(raw) && card.contains_rect(raw),
+                    "{name} {size:?}: {:?} is cut off",
+                    button.label
+                );
+            }
+            // Nothing in the card runs past its right edge.
+            for (text, rect) in harness.texts() {
+                if card.contains(rect.left_center()) {
+                    assert!(
+                        rect.right() <= card.right() + 0.5,
+                        "{name} {size:?}: {text:?} overflows the card"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_header_stays_where_it_is_from_screen_to_screen() {
+    for size in [egui::vec2(980.0, 700.0), egui::vec2(640.0, 560.0)] {
+        let mut harness = Harness::review(size);
+        let mut tops = Vec::new();
+        for (screen, _) in demo::SCREENS {
+            let view = demo::fixture(screen);
+            harness.settle(&view);
+            tops.push((screen, card_of(&harness, &view.title).top()));
+        }
+        let first = tops[0].1;
+        for (screen, top) in tops {
+            assert!(
+                (top - first).abs() < 0.5,
+                "{screen:?} {size:?}: the card starts at {top}, not {first}"
+            );
+        }
+    }
+}
+
+/// The left edge of `label` `ms` after `to` replaces `from`, in `motion`.
+fn edge_during_change(
+    from: ScreenId,
+    to: ScreenId,
+    motion: MotionPreference,
+    label: &str,
+    ms: u64,
+) -> Option<f32> {
+    let mut harness = Harness::review(egui::vec2(980.0, 700.0));
+    let mut before = demo::fixture(from);
+    before.motion = motion;
+    harness.settle(&before);
+    let mut after = demo::fixture(to);
+    after.motion = motion;
+    after.revision = 2;
+    // The harness advances 50 ms a frame; the change starts on the first frame of `to`.
+    for _ in 0..=(ms / 50) {
+        harness.frame(&after, Vec::new());
+    }
+    // Unclipped: a page sliding in from the left starts partly outside the body.
+    harness
+        .shapes()
+        .into_iter()
+        .find_map(|(shape, _)| match shape {
+            egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()).left())
+            }
+            _ => None,
+        })
+}
+
+#[test]
+fn pages_slide_in_their_direction_of_travel_reduced_only_fades_and_off_is_instant() {
+    let label = "Both computers will show a number to compare.";
+    let rest = edge_during_change(
+        ScreenId::Welcome,
+        ScreenId::Connect,
+        MotionPreference::Full,
+        label,
+        1000,
+    )
+    .unwrap();
+    // Forward: the new page comes in from the right.
+    let forward = edge_during_change(
+        ScreenId::Welcome,
+        ScreenId::Connect,
+        MotionPreference::Full,
+        label,
+        150,
+    )
+    .unwrap();
+    assert!(forward > rest + 1.0, "forward {forward} vs rest {rest}");
+    // Back: from the left.
+    let back = edge_during_change(
+        ScreenId::Grants,
+        ScreenId::Connect,
+        MotionPreference::Full,
+        label,
+        150,
+    )
+    .unwrap();
+    assert!(back < rest - 1.0, "back {back} vs rest {rest}");
+    // Reduced: nothing moves, the page only fades.
+    let reduced = edge_during_change(
+        ScreenId::Welcome,
+        ScreenId::Connect,
+        MotionPreference::Reduced,
+        label,
+        50,
+    )
+    .unwrap();
+    assert!((reduced - rest).abs() < 0.5);
+    // Off: the first frame is the settled one.
+    let mut harness = Harness::review(egui::vec2(980.0, 700.0));
+    let mut view = demo::fixture(ScreenId::Connect);
+    view.motion = MotionPreference::Off;
+    harness.frame(&view, Vec::new());
+    harness.frame(&view, Vec::new());
+    let first = harness.texts();
+    harness.settle(&view);
+    assert_eq!(first, harness.texts());
+}
+
+#[test]
+fn a_finished_step_animates_then_the_window_goes_idle() {
+    let mut harness = Harness::review(egui::vec2(980.0, 700.0));
+    let mut view = demo::fixture(ScreenId::Compatibility);
+    view.motion = MotionPreference::Full;
+    harness.settle(&view);
+    let mut done = demo::fixture(ScreenId::InstallPlan);
+    done.motion = MotionPreference::Full;
+    done.revision = 2;
+    harness.frame(&done, Vec::new());
+    let delay = |harness: &Harness| {
+        harness.output.as_ref().unwrap().viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    };
+    // The check pops in at full frame rate…
+    assert!(delay(&harness) <= std::time::Duration::from_millis(20));
+    // …and once nothing is in progress or waiting, frames stop.
+    let mut idle = demo::fixture(ScreenId::InstallPlan);
+    idle.motion = MotionPreference::Full;
+    idle.revision = 3;
+    for row in &mut idle.rows {
+        if !row.is_check() {
+            row.state = RowState::Verified;
+        }
+    }
+    for _ in 0..200 {
+        harness.frame(&idle, Vec::new());
+    }
+    assert!(delay(&harness) >= std::time::Duration::from_millis(500));
 }

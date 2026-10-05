@@ -180,6 +180,61 @@ fn row_state(state: StepState) -> RowState {
     }
 }
 
+/// A step's title names the action, so it reads right whatever its state: the mark and the line
+/// under it say how far it got ("Install Crosspane" with "Installing…", never "Crosspane is
+/// installed" while it isn't). The platforms describe steps by outcome; unknown ones pass through.
+fn step_title(outcome: &str) -> &str {
+    match outcome {
+        "This computer can run Crosspane" => "Check this computer",
+        "This Mac can run Crosspane" => "Check this Mac",
+        "Crosspane is installed for your account"
+        | "Crosspane is installed and starts when you sign in" => "Install Crosspane",
+        "Crosspane starts when you sign in" => "Start Crosspane when you sign in",
+        "A restart brings up a new, healthy instance" => "Restart Crosspane",
+        "Crosspane is running with its key in the system keyring"
+        | "Crosspane is running with its key in the Keychain" => "Check that Crosspane is running",
+        "This computer can reach the other one on your network" => {
+            "Allow Crosspane on your network"
+        }
+        "Crosspane has the Mac permissions it needs" => "Allow Mac permissions",
+        "The Crosspane sound driver is installed" => "Install the sound driver",
+        "Paired and connected to the other computer" => "Pair with the other computer",
+        "What the other computer may do here" => "Choose what the other computer may do",
+        "Where the other computer's screens sit" => "Arrange the screens",
+        "How windows you send are hidden here" => "Choose how sent windows are hidden",
+        "Everything is working right now" => "Check that everything works",
+        other => other,
+    }
+}
+
+/// A support check as the person reads it. Checks that need nothing from the person are notes,
+/// folded away with the passed ones, and internal wording is replaced by plain language.
+fn plain_check(state: RowState, detail: String) -> (RowState, String) {
+    const PLAIN: [(&str, RowState, &str); 3] = [
+        (
+            "Runtime state is active or couldn't be proved safe to recover",
+            RowState::Note,
+            "Existing Crosspane files are left in place while setup checks them",
+        ),
+        (
+            "The owned dead runtime will be cleaned",
+            RowState::Note,
+            "Leftovers from an earlier Crosspane are cleaned up during install",
+        ),
+        (
+            "A system font couldn't be confirmed",
+            RowState::Note,
+            "The system font couldn't be confirmed; setup carries on",
+        ),
+    ];
+    for (raw, plain_state, plain) in PLAIN {
+        if detail.starts_with(raw) {
+            return (plain_state, plain.to_owned());
+        }
+    }
+    (state, detail)
+}
+
 fn button(id: u16, role: ButtonRole, label: &str, enabled: bool, kind: ButtonKind) -> ButtonView {
     ButtonView {
         id,
@@ -303,7 +358,7 @@ impl LiveController {
         };
         RowView {
             id: step.0,
-            label: meta.map_or_else(String::new, |m| m.label.clone()),
+            label: meta.map_or_else(String::new, |m| step_title(&m.label).to_owned()),
             detail,
             state: row_state(state),
             human_confirmed: graph::role_of(step).is_some() && state == StepState::Satisfied,
@@ -370,6 +425,7 @@ impl LiveController {
                         CheckState::Note(issue) => (RowState::Note, issue.clone()),
                     }
                 };
+                let (state, detail) = plain_check(state, detail);
                 RowView {
                     id: check_row_id(index),
                     label: bounded(check.label.clone()),
@@ -594,10 +650,10 @@ impl LiveController {
             self.step_state(step) == StepState::NeedsAction && self.auto_consented.contains(&step)
         });
         if !self.agent_quiet() {
-            "Crosspane is in use right now, so this waits for you. Continuing interrupts what is \
-             shared at the moment."
+            "Crosspane is in use, so this waits for you. Continuing interrupts what is shared \
+             right now."
         } else if repeated {
-            "Setup already did this once and it is needed again, so this time it waits for you."
+            "Setup already did this once and it is needed again, so it waits for you."
         } else {
             "This waits for you."
         }
@@ -619,11 +675,8 @@ impl LiveController {
         let peer = self.peer_name();
         let (title, message): (String, String) = match screen {
             ScreenId::Welcome => ("Set up Crosspane".into(), {
-                let intro = "Share one keyboard and mouse between this computer and another, \
-                             send windows back and forth, and play sound on each other's \
-                             speakers. Setup installs Crosspane for your account, pairs the two \
-                             computers and lets you try each feature once. It only stops when \
-                             your answer is needed.";
+                let intro = "Use one keyboard and mouse across two computers, move windows \
+                             between them and share sound. Setup asks only when it needs you.";
                 match &self.desc.resume_note {
                     Some(note) => format!("{intro}\n\n{note}"),
                     None => intro.to_owned(),
@@ -641,13 +694,12 @@ impl LiveController {
                 if unsupported {
                     (
                         "Crosspane can't run here yet".into(),
-                        "Nothing was changed on this computer. The checks below say why.".into(),
+                        "Nothing was changed. The checks below say why.".into(),
                     )
                 } else if self.page_failed(screen) {
                     (
                         "Setup stopped".into(),
-                        "The step marked below didn't finish. Fix what it says, then try again."
-                            .into(),
+                        "Fix the step marked below, then try again.".into(),
                     )
                 } else if asking {
                     (
@@ -659,9 +711,7 @@ impl LiveController {
                 } else {
                     (
                         "Installing Crosspane".into(),
-                        "Setup is installing Crosspane for your account. It carries on by \
-                         itself."
-                            .into(),
+                        "This carries on by itself.".into(),
                     )
                 }
             }
@@ -674,9 +724,7 @@ impl LiveController {
                 if asking {
                     preview
                 } else {
-                    "macOS asks you to allow each permission. Setup notices each one as you \
-                     allow it."
-                        .into()
+                    "Allow each one when macOS asks. Setup notices as you go.".into()
                 },
             ),
             ScreenId::AudioComponent => (
@@ -684,8 +732,7 @@ impl LiveController {
                 if asking {
                     preview
                 } else {
-                    "The Crosspane sound driver adds the speakers the other computer plays to."
-                        .into()
+                    "Adds the speakers the other computer plays to.".into()
                 },
             ),
             ScreenId::Network => (
@@ -697,7 +744,7 @@ impl LiveController {
                 if asking {
                     preview
                 } else {
-                    "Setup checks that the other computer can reach this one.".into()
+                    "Checking that the other computer can reach this one.".into()
                 },
             ),
             ScreenId::HidingChoice => (
@@ -709,8 +756,8 @@ impl LiveController {
                      display while they are shown on the other computer."
                         .into()
                 } else if self.hiding_restart_pending() {
-                    "Your choice is saved. Crosspane restarts to use it, which ends what is \
-                     shared right now (input, windows or sound). Restart when you're ready."
+                    "Your choice is saved. Restarting Crosspane ends what is shared right now \
+                     (input, windows or sound)."
                         .into()
                 } else {
                     "Setup applies your choice and restarts Crosspane.".into()
@@ -719,13 +766,10 @@ impl LiveController {
             ScreenId::Connect => (
                 "Pair with the other computer".into(),
                 if self.connect.manual {
-                    "Enter the other computer's address and port. Crosspane uses port 47811 \
-                     unless it was changed."
+                    "Enter the other computer's address. The port is 47811 unless it was changed."
                         .into()
                 } else {
-                    "Pairing lets the two computers trust each other. You'll check that both \
-                     screens show the same number."
-                        .into()
+                    "Both computers will show a number to compare.".into()
                 },
             ),
             ScreenId::MatchNumbers => {
@@ -735,19 +779,17 @@ impl LiveController {
                 match self.pairing_phase() {
                     Some(PairPhase::Pick) => (
                         "Which number do you see on the other computer?".into(),
-                        format!("Pick the number shown on {peer}'s screen."),
+                        format!("Pick the number shown on {peer}."),
                     ),
                     Some(PairPhase::Waiting) => (
                         "Confirm on the other computer".into(),
-                        format!(
-                            "Now confirm the number on {peer}. This screen moves on by itself."
-                        ),
+                        format!("Confirm the number on {peer}. This screen moves on by itself."),
                     ),
                     _ => (
                         "Do the numbers match?".into(),
                         format!(
-                            "Check that {peer} shows this number, then confirm. If it doesn't, \
-                             stop: something else may be trying to pair."
+                            "Confirm only if {peer} shows the same number. If it doesn't, stop: \
+                             something else may be trying to pair."
                         ),
                     ),
                 }
@@ -757,14 +799,11 @@ impl LiveController {
                     Some(peer) => format!("What may {peer} do here?"),
                     None => "What the other computer may do here".into(),
                 },
-                "Turn on what you allow on this computer. Trying every feature needs all five; \
-                 you can change them any time in Crosspane's settings."
-                    .into(),
+                "Choose what to allow here. You can change this later in Settings.".into(),
             ),
             ScreenId::Layout => (
                 "Arrange your screens".into(),
-                "If this isn't how the screens sit on your desk, drag them into place and apply."
-                    .into(),
+                "Drag the screens to match your desk.".into(),
             ),
             ScreenId::Practice => ("Try each feature once".into(), self.practice_message()),
             ScreenId::Summary => (
@@ -775,14 +814,10 @@ impl LiveController {
                 }
                 .into(),
                 match self.summary.milestone {
-                    Milestone::WorkspaceReady => {
-                        "Every step was checked just now on this computer.".to_owned()
-                    }
-                    Milestone::InstalledWaiting => {
-                        "A few steps are left before the workspace is ready.".to_owned()
-                    }
+                    Milestone::WorkspaceReady => "Everything was checked just now.".to_owned(),
+                    Milestone::InstalledWaiting => "A few steps are left.".to_owned(),
                     Milestone::NotInstalled => {
-                        "Finish the installation steps to start using Crosspane.".to_owned()
+                        "Finish installing to start using Crosspane.".to_owned()
                     }
                 },
             ),
@@ -805,9 +840,8 @@ impl LiveController {
             .as_ref()
             .filter(|_| self.practice.active())
         else {
-            return "Each practice runs together with its partner on the other computer: when \
-                    this one controls, the other is controlled. Start the same pair on both. A \
-                    small practice window checks that it really worked."
+            return "Start the same practice on both computers. A small window checks that it \
+                    worked."
                 .into();
         };
         let mut text = format!("Practising: {}.", graph::role_label(run.role));
@@ -2332,5 +2366,64 @@ impl LiveController {
             }
             MaintenanceReport::RepairFinished { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{plain_check, step_title};
+    use crate::view::RowState;
+
+    #[test]
+    fn step_titles_name_the_action_so_no_state_contradicts_them() {
+        for (outcome, action) in [
+            ("This computer can run Crosspane", "Check this computer"),
+            ("This Mac can run Crosspane", "Check this Mac"),
+            (
+                "Crosspane is installed for your account",
+                "Install Crosspane",
+            ),
+            (
+                "Crosspane is installed and starts when you sign in",
+                "Install Crosspane",
+            ),
+            (
+                "Crosspane is running with its key in the system keyring",
+                "Check that Crosspane is running",
+            ),
+            (
+                "Paired and connected to the other computer",
+                "Pair with the other computer",
+            ),
+        ] {
+            assert_eq!(step_title(outcome), action);
+        }
+        // An unknown step keeps the platform's own words.
+        assert_eq!(step_title("Something new"), "Something new");
+    }
+
+    #[test]
+    fn internal_check_reasons_never_reach_the_person() {
+        let (state, text) = plain_check(
+            RowState::Waiting,
+            "Runtime state is active or couldn't be proved safe to recover; it will be retained"
+                .into(),
+        );
+        assert_eq!(state, RowState::Note);
+        assert!(
+            !text.contains("proved") && !text.contains("retained"),
+            "{text}"
+        );
+        let (state, text) = plain_check(
+            RowState::Note,
+            "The owned dead runtime will be cleaned under the install lock when you install".into(),
+        );
+        assert_eq!(state, RowState::Note);
+        assert!(!text.contains("lock"), "{text}");
+        // Plain failures pass through untouched.
+        assert_eq!(
+            plain_check(RowState::Failed, "uwsm isn't installed".into()),
+            (RowState::Failed, "uwsm isn't installed".to_owned())
+        );
     }
 }

@@ -71,9 +71,13 @@ pub struct IllustrationView {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MotionPreference {
+    /// Follows the system's reduce-motion preference; full motion when there is none to read.
     Auto,
+    /// Short fades only: no movement, pulsing or turning.
     Reduced,
     Full,
+    /// Every change is instant.
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -37,12 +37,37 @@ fn test_font_path() -> PathBuf {
 }
 
 #[test]
-fn auto_unknown_and_reduced_are_static_full_is_explicit() {
-    assert!(reduced_motion(MotionPreference::Auto, None));
-    assert!(reduced_motion(MotionPreference::Auto, Some(true)));
-    assert!(!reduced_motion(MotionPreference::Auto, Some(false)));
-    assert!(reduced_motion(MotionPreference::Reduced, Some(false)));
-    assert!(!reduced_motion(MotionPreference::Full, Some(true)));
+fn auto_follows_the_system_and_is_full_when_unknown_reduced_and_off_hold_still() {
+    // Owner, 2026-10-05: animated unless the person or the system asks otherwise.
+    assert_eq!(
+        motion_level(MotionPreference::Auto, None),
+        MotionLevel::Full
+    );
+    assert_eq!(
+        motion_level(MotionPreference::Auto, Some(true)),
+        MotionLevel::Reduced
+    );
+    assert_eq!(
+        motion_level(MotionPreference::Auto, Some(false)),
+        MotionLevel::Full
+    );
+    assert_eq!(
+        motion_level(MotionPreference::Reduced, Some(false)),
+        MotionLevel::Reduced
+    );
+    assert_eq!(
+        motion_level(MotionPreference::Full, Some(true)),
+        MotionLevel::Full
+    );
+    assert_eq!(motion_level(MotionPreference::Off, None), MotionLevel::Off);
+    assert!(reduced_motion(MotionPreference::Reduced, None));
+    assert!(reduced_motion(MotionPreference::Off, None));
+    assert!(!reduced_motion(MotionPreference::Auto, None));
+    // Reduced keeps only short fades; Off is instant.
+    assert_eq!(MotionLevel::Full.duration(320), 320);
+    assert_eq!(MotionLevel::Reduced.duration(320), 160);
+    assert_eq!(MotionLevel::Off.duration(320), 0);
+    assert_eq!(MotionLevel::Off.hover_seconds(), 0.0);
 }
 
 #[test]
@@ -73,7 +98,8 @@ fn idle_and_completed_success_do_not_schedule_a_perpetual_animation() {
     let mut view = demo::fixture(ScreenId::Summary);
     view.motion = MotionPreference::Full;
     let original = view.clone();
-    for now in [0, 100, 300, 1000, 2000, 3000] {
+    // The backdrop drifts for a few seconds after a page appears, then everything rests.
+    for now in [0, 100, 300, 1000, 4000, 7000, 9000] {
         let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -92,7 +118,7 @@ fn idle_and_completed_success_do_not_schedule_a_perpetual_animation() {
                 });
             },
         );
-        if now == 3000 {
+        if now == 9000 {
             assert!(
                 output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
                     >= Duration::from_millis(500)
@@ -115,17 +141,24 @@ fn reduced_waiting_screen_updates_without_widget_motion() {
             wordmark: &[],
         },
     );
-    let mut shell = WizardShell::default();
-    let view = demo::fixture(ScreenId::Installing);
-    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-        egui::CentralPanel::default().show(ui, |ui| {
-            shell.show(ui, &view, &art, 0);
-            assert_eq!(ui.style().animation_time, 0.0);
-            assert_eq!(ui.style().scroll_animation.duration.max, 0.0);
+    for (motion, hover) in [
+        (MotionPreference::Reduced, 0.08),
+        (MotionPreference::Off, 0.0),
+    ] {
+        let mut shell = WizardShell::default();
+        let mut view = demo::fixture(ScreenId::Installing);
+        view.motion = motion;
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                shell.show(ui, &view, &art, 0);
+                // Reduced keeps short hover fades and nothing that moves; Off keeps nothing.
+                assert_eq!(ui.style().animation_time, hover);
+                assert_eq!(ui.style().scroll_animation.duration.max, 0.0);
+            });
         });
-    });
-    output.drop_without_applying_deltas();
-    assert!(view.rows.iter().any(|row| row.state == RowState::Waiting));
+        output.drop_without_applying_deltas();
+        assert!(view.rows.iter().any(|row| row.state == RowState::Waiting));
+    }
 }
 
 fn illustration_context() -> (egui::Context, Art) {
@@ -192,8 +225,10 @@ fn visible_illustrations_are_finite_reduced_static_and_failure_halts_motion() {
     let original = view.clone();
     let start = paint(&ctx, &mut shell, &art, &view, 0);
     let middle = paint(&ctx, &mut shell, &art, &view, 300);
-    let settled = paint(&ctx, &mut shell, &art, &view, 800);
-    let idle = paint(&ctx, &mut shell, &art, &view, 2000);
+    // One settling frame after the last motion, then nothing changes.
+    paint(&ctx, &mut shell, &art, &view, 7000);
+    let settled = paint(&ctx, &mut shell, &art, &view, 7016);
+    let idle = paint(&ctx, &mut shell, &art, &view, 9000);
     assert_ne!(start.shapes, middle.shapes);
     assert_eq!(settled.shapes, idle.shapes);
     assert!(
@@ -204,7 +239,9 @@ fn visible_illustrations_are_finite_reduced_static_and_failure_halts_motion() {
     let mut shell = WizardShell::default();
     view.motion = MotionPreference::Reduced;
     paint(&ctx, &mut shell, &art, &view, 0);
-    let early = paint(&ctx, &mut shell, &art, &view, 100);
+    // Reduced fades are short (160 ms) and nothing drifts afterwards.
+    paint(&ctx, &mut shell, &art, &view, 200);
+    let early = paint(&ctx, &mut shell, &art, &view, 400);
     let later = paint(&ctx, &mut shell, &art, &view, 2000);
     assert!(
         visible_shapes(&early) == visible_shapes(&later),
@@ -226,8 +263,9 @@ fn visible_illustrations_are_finite_reduced_static_and_failure_halts_motion() {
     // The new failure card can expose a solid scrollbar and change content width.
     // Allow its finite scrollbar/layout settling before comparing paused drawing.
     paint(&ctx, &mut shell, &art, &view, 400);
-    let stopped = paint(&ctx, &mut shell, &art, &view, 500);
-    let later = paint(&ctx, &mut shell, &art, &view, 2500);
+    paint(&ctx, &mut shell, &art, &view, 7000);
+    let stopped = paint(&ctx, &mut shell, &art, &view, 7100);
+    let later = paint(&ctx, &mut shell, &art, &view, 9500);
     assert!(stopped.shapes == later.shapes, "Paused drawings changed");
     assert!(
         later.viewport_output[&egui::ViewportId::ROOT].repaint_delay >= Duration::from_millis(500)
@@ -252,8 +290,9 @@ fn ready_settles_once_only_when_supplied_verification_changes_on_summary() {
     view.revision += 1;
     let verified = view.clone();
     let start = paint(&ctx, &mut shell, &art, &view, 5100);
-    let settled = paint(&ctx, &mut shell, &art, &view, 5300);
-    let idle = paint(&ctx, &mut shell, &art, &view, 8000);
+    paint(&ctx, &mut shell, &art, &view, 5300);
+    let settled = paint(&ctx, &mut shell, &art, &view, 9000);
+    let idle = paint(&ctx, &mut shell, &art, &view, 12000);
     assert_ne!(start.shapes, settled.shapes);
     assert_eq!(settled.shapes, idle.shapes);
     assert_eq!(view, verified);
@@ -271,18 +310,18 @@ fn choosing_full_runs_welcome_once_without_replaying_on_text_revisions() {
     view.revision += 1;
     let start = paint(&ctx, &mut shell, &art, &view, 500);
     let middle = paint(&ctx, &mut shell, &art, &view, 800);
-    let settled = paint(&ctx, &mut shell, &art, &view, 1100);
-    let idle = paint(&ctx, &mut shell, &art, &view, 3000);
+    let settled = paint(&ctx, &mut shell, &art, &view, 7000);
+    let idle = paint(&ctx, &mut shell, &art, &view, 9000);
     assert_ne!(start.shapes, middle.shapes);
     assert_eq!(settled.shapes, idle.shapes);
     view.message = "Review your keyboard, windows and sound across your computers. Review each change before it happens.".into();
     view.revision += 1;
-    paint(&ctx, &mut shell, &art, &view, 3100);
+    paint(&ctx, &mut shell, &art, &view, 9100);
     // Different system-font metrics can change wrapping, centering and scrollbar width.
     // Allow four layout frames, but less than the 600 ms welcome animation: a replay
     // must still be repainting when this bounded settling window ends.
     let mut idle = None;
-    for now in [3200, 3300, 3400, 3500] {
+    for now in [9200, 9300, 9400, 9500] {
         let output = paint(&ctx, &mut shell, &art, &view, now);
         if output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
             >= Duration::from_millis(500)
