@@ -28,6 +28,7 @@ pub struct PayloadPlan {
     pub(super) manifest: [u8; 32],
     pub(super) target: TargetPaths,
     pub(super) repair: Option<Arc<inventory::RepairOrigins>>,
+    pub(super) origin: Option<Arc<recovery::RecoveryOrigin>>,
 }
 impl PayloadPlan {
     /// Initial LaunchAgent publication must use the genuine receipt captured by this repair.
@@ -35,6 +36,14 @@ impl PayloadPlan {
         self.repair
             .as_ref()
             .map(|origin| (&origin.launch.0, origin.launch.1.as_slice()))
+    }
+    pub(crate) fn owned_files(&self) -> bool {
+        self.origin.is_some()
+    }
+    pub(crate) fn resuming_publication(&self) -> bool {
+        self.origin
+            .as_ref()
+            .is_some_and(|origin| origin.unfinished())
     }
     pub fn state(&self) -> PayloadState {
         self.state
@@ -54,7 +63,9 @@ impl PayloadPlan {
         if revision != self.revision
             || operation != self.operation
             || self.state == PayloadState::Conflict
-            || (self.state == PayloadState::AdoptionRequired && !adopt_and_interrupt)
+            || (self.state == PayloadState::AdoptionRequired
+                && !self.owned_files()
+                && !adopt_and_interrupt)
         {
             return Err(NativeError::Refused);
         }
@@ -138,7 +149,8 @@ impl MacPayload {
         let dead_runtime = self.io.dead_runtime(deadline).ok().flatten();
         self.admit_tree(&self.io.target().paths().payload_root, true, deadline)?;
         let recovery = self.recovery(deadline)?;
-        if recovery.unfinished() {
+        let origin = self.recovery_origin(&recovery, deadline)?;
+        if recovery.remnants() || (recovery.unfinished() && origin.is_none()) {
             return Err(NativeError::OutcomeUnknown);
         }
         if original
@@ -153,25 +165,11 @@ impl MacPayload {
                 tree(&self.io, &self.io.target().app_path(), deadline)?,
                 tree(&self.io, &self.ctl(), deadline)?,
                 false,
-                true,
+                origin.is_none(),
             ),
             Err(error) => return Err(error),
         };
-        let owned = recovery.record.as_ref().is_some_and(|r| {
-            let receipt = &r.receipt;
-            r.phase == PayloadPhase::Verified
-                && receipt.operation_id.0 != 0
-                && receipt.resources.len() == 2
-                && *receipt
-                    == self
-                        .receipt(
-                            receipt.operation_id.0,
-                            PayloadPhase::Verified,
-                            receipt.resources[0].ownership == ResourceOwnership::Adopted,
-                            receipt.resources[1].ownership == ResourceOwnership::Adopted,
-                        )
-                        .receipt
-        });
+        let owned = origin.is_some();
         let state = if conflict {
             PayloadState::Conflict
         } else if matching && owned {
@@ -194,6 +192,7 @@ impl MacPayload {
             manifest: self.digest,
             target: self.io.target().paths().clone(),
             repair: None,
+            origin,
         })
     }
     pub fn install(
@@ -223,6 +222,7 @@ impl MacPayload {
         if plan.state == PayloadState::Matching
             && plan.repair.is_none()
             && plan.dead_runtime.is_none()
+            && !plan.resuming_publication()
         {
             return Ok(None);
         }
@@ -242,12 +242,40 @@ impl MacPayload {
             self.io
                 .clean_dead_runtime(&self.support, dead, &lock, deadline)?;
         }
-        if plan.state == PayloadState::Matching && plan.repair.is_none() {
-            return Ok(None);
+        if let Some(origin) = &plan.origin {
+            origin.check(self, deadline)?;
         }
+        // Newly observed remnants cannot become deletion authority for a reopened receipt.
         let recovery = self.recovery(deadline)?;
-        if recovery.unfinished() {
+        if recovery.remnants() || (recovery.unfinished() && !plan.resuming_publication()) {
             return Err(NativeError::OutcomeUnknown);
+        }
+        if plan.app != tree(&self.io, &self.io.target().app_path(), deadline)?
+            || plan.ctl != tree(&self.io, &self.ctl(), deadline)?
+        {
+            return Err(NativeError::Foreign);
+        }
+        if plan.state == PayloadState::Matching && plan.repair.is_none() {
+            if plan.resuming_publication() {
+                let (app, ctl) = plan.origin.as_ref().ok_or(NativeError::Invalid)?.adopted();
+                let record = self.receipt(plan.operation, PayloadPhase::Published, app, ctl);
+                self.persist(&record, deadline)?;
+                return Ok(Some(PendingPayload {
+                    operation: plan.operation,
+                    manifest: self.digest,
+                    original: plan.original,
+                    baseline_instance: plan.baseline_instance,
+                    target: plan.target,
+                    previous_app: tree(&self.io, &self.app_previous(), deadline)?,
+                    previous_ctl: tree(&self.io, &self.ctl_previous(), deadline)?,
+                    published_at: self.io.clock().now_ms(),
+                    health_call: None,
+                    phase: PayloadPhase::Published,
+                    repair: None,
+                    origins: Some((app, ctl)),
+                }));
+            }
+            return Ok(None);
         }
         if let Some(origins) = &plan.repair {
             origins.check_payload(self, deadline)?;
@@ -255,12 +283,12 @@ impl MacPayload {
         let mut record = if plan.repair.is_some() {
             self.repair_receipt(plan.operation, PayloadPhase::Intent)
         } else {
-            self.receipt(
-                plan.operation,
-                PayloadPhase::Intent,
-                plan.app.root.is_some(),
-                plan.ctl.root.is_some(),
-            )
+            let (app, ctl) = plan
+                .origin
+                .as_ref()
+                .map(|o| o.adopted())
+                .unwrap_or((plan.app.root.is_some(), plan.ctl.root.is_some()));
+            self.receipt(plan.operation, PayloadPhase::Intent, app, ctl)
         };
         self.persist(&record, deadline)?;
         let result = (|| {
@@ -388,6 +416,7 @@ impl MacPayload {
                 health_call: None,
                 phase: PayloadPhase::Published,
                 repair: plan.repair,
+                origins: plan.origin.as_ref().map(|o| o.adopted()),
             })
         })();
         match result {

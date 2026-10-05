@@ -2650,3 +2650,119 @@ fn declared_binary_member_and_aggregate_archive_limits_are_enforced() {
     assert!(Package::read(&mut reader, Architecture::native().unwrap(), [0; 32]).is_err());
     assert_eq!(reader.0, 1); // the reader stops after the single bounded overflow byte.
 }
+
+#[test]
+fn applied_unknown_receipt_is_owned_by_prior_bytes_and_newer_payload_is_consented() {
+    let f = Fixture::new();
+    let prior = package(1);
+    f.applied(&prior, 5);
+    assert!(
+        !f.io.target().runtime_dir().exists(),
+        "publication did not start an agent"
+    );
+    let record: Value = serde_json::from_slice(&fs::read(f.record(false)).unwrap()).unwrap();
+    assert_eq!(record["phase"], "Applied");
+    assert_eq!(record["receipt"]["operation_id"], 5);
+    for row in record["receipt"]["resources"].as_array().unwrap() {
+        assert_eq!(row["ownership"], "Created");
+        assert_eq!(row["before"], "Absent");
+        assert_eq!(row["after"], "Matching");
+        assert_eq!(row["outcome"], "Unknown");
+    }
+    let next = package(2);
+    let rebuilt = PayloadInstaller::new(f.io.clone()).unwrap();
+    let rows = rebuilt.detect(&f.proof, &next).unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.ownership == ResourceOwnership::Created
+                && r.before == crosspane_installer_core::ResourceObservation::Different)
+    );
+    let original = installed_contents(&f, 1);
+    let plan = rebuilt
+        .plan(&f.proof, &next, OperationId(6), MatchingFiles::Preserve)
+        .unwrap();
+    for (i, path) in rebuilt.targets().iter().enumerate() {
+        assert_eq!(fs::read(path).unwrap(), original[i]);
+    }
+    let receipt = rebuilt.apply(&f.proof, &next, plan, &deadline()).unwrap();
+    assert!(!receipt.unfinished.is_empty());
+    assert!(
+        receipt
+            .resources
+            .iter()
+            .all(|r| r.outcome == MutationOutcome::Unknown)
+    );
+    for (i, path) in rebuilt.targets().iter().enumerate() {
+        assert_eq!(fs::read(path).unwrap(), installed_contents(&f, 2)[i]);
+    }
+}
+#[test]
+fn applied_unknown_same_payload_resumes_without_faking_health() {
+    let f = Fixture::new();
+    let p = package(1);
+    f.applied(&p, 5);
+    let rebuilt = PayloadInstaller::new(f.io.clone()).unwrap();
+    assert_eq!(
+        rebuilt
+            .plan(&f.proof, &p, OperationId(6), MatchingFiles::Preserve)
+            .unwrap_err(),
+        PayloadError::Pending
+    );
+    let plan = rebuilt.resume_plan(&f.proof, &p).unwrap();
+    let result = rebuilt.apply(&f.proof, &p, plan, &deadline()).unwrap();
+    assert_eq!(result.operation_id, OperationId(5));
+    assert!(
+        result
+            .resources
+            .iter()
+            .all(|r| r.outcome == MutationOutcome::Unknown)
+    );
+}
+#[test]
+fn applied_previous_hashes_do_not_adopt_modified_files_or_displace_recovery() {
+    for kind in 0..3 {
+        let f = Fixture::new();
+        f.applied(&package(1), 5);
+        let path = match kind {
+            0 => f.install.targets()[0].clone(),
+            1 => f.sibling(5, 0, false),
+            _ => f.sibling(5, 0, true),
+        };
+        put(&path, b"user modification", 0o755);
+        assert!(
+            f.install
+                .plan(
+                    &f.proof,
+                    &package(2),
+                    OperationId(6),
+                    MatchingFiles::Preserve
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), b"user modification");
+        let record: Value = serde_json::from_slice(&fs::read(f.record(false)).unwrap()).unwrap();
+        assert_eq!(record["receipt"]["operation_id"], 5);
+    }
+}
+#[test]
+fn applied_receipt_changed_after_preview_refuses_before_replacement() {
+    let f = Fixture::new();
+    f.applied(&package(1), 5);
+    let next = package(2);
+    let plan = f
+        .install
+        .plan(&f.proof, &next, OperationId(6), MatchingFiles::Preserve)
+        .unwrap();
+    let mut record: Value = serde_json::from_slice(&fs::read(f.record(false)).unwrap()).unwrap();
+    record["receipt"]["operation_id"] = json!(7);
+    put(
+        &f.record(false),
+        &serde_json::to_vec(&record).unwrap(),
+        0o600,
+    );
+    assert_eq!(
+        f.install.apply(&f.proof, &next, plan, &deadline()),
+        Err(PayloadError::Pending)
+    );
+    assert_eq!(fs::read(&f.install.targets()[0]).unwrap(), contents(1)[0]);
+}

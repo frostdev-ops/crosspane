@@ -456,17 +456,18 @@ impl NativeInstalls {
         // verified, which is what makes the install "current".
         let payload =
             MacPayload::admit(io, self.env.inventory.clone(), deadline).map_err(map_admission)?;
-        let payload_state = payload
+        let payload_plan = payload
             .plan(operation.0, operation.0, None, deadline)
-            .map_err(map_native)?
-            .state();
+            .map_err(map_native)?;
+        let payload_state = payload_plan.state();
         if payload_state == PayloadState::Conflict
-            || payload_state == PayloadState::AdoptionRequired
+            || (payload_state == PayloadState::AdoptionRequired && !payload_plan.owned_files())
         {
             return Err(InstallError::Foreign);
         }
-        let is_current =
-            plan.state() == LaunchState::Owned && payload_state == PayloadState::Matching;
+        let is_current = plan.state() == LaunchState::Owned
+            && payload_state == PayloadState::Matching
+            && !payload_plan.resuming_publication();
         Ok((launch, plan, is_current))
     }
 }
@@ -585,13 +586,21 @@ impl Installs for NativeInstalls {
                 InstallState::Needed => Err(InstallError::Unavailable),
             };
         };
-        let selected = admit_selected(&self.env, None, deadline).map_err(map_native)?;
+        let selected = match admit_selected(&self.env, None, deadline) {
+            Ok(selected) => selected,
+            Err(error) => {
+                // A managed restart can briefly make instance admission unavailable. Keep the
+                // genuine publication token for the next fresh Status, without resending bootstrap.
+                self.running = Some(running);
+                return Err(map_native(error));
+            }
+        };
         // The Status was issued after the apply: say so to the adapter, which refuses anything
         // issued earlier or from the old instance.
-        running
-            .pending
-            .expect_health(reply.id)
-            .map_err(|_| InstallError::Unavailable)?;
+        if running.pending.expect_health(reply.id).is_err() {
+            self.running = Some(running);
+            return Err(InstallError::Unavailable);
+        }
         match running.launch.observe(
             &mut running.pending,
             &selected,

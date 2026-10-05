@@ -7,6 +7,8 @@ mod config;
 mod ctl;
 mod keys;
 mod lifecycle;
+#[cfg(any(target_os = "macos", test))]
+mod macos_launch;
 mod media;
 mod net;
 mod pairing;
@@ -101,9 +103,16 @@ enum TrustAction {
 /// Set for a restart-required stop, including an engine restart pending teardown, so a timeout
 /// also exits with failure and lets the service manager start it again.
 static RESTART: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static APPKIT_STOPPED: AtomicBool = AtomicBool::new(false);
 
-/// The exit status after a clean stop: 75 (`EX_TEMPFAIL`) when [`RESTART`] is set.
+/// The exit status after a clean stop: 75 (`EX_TEMPFAIL`) for a restart or AppKit termination.
 fn stop_status() -> i32 {
+    #[cfg(target_os = "macos")]
+    if APPKIT_STOPPED.load(Ordering::Acquire) {
+        // The engine can finish concurrently with the callback's first restart publication.
+        return 75;
+    }
     if RESTART.load(Ordering::Acquire) {
         75
     } else {
@@ -131,7 +140,22 @@ fn main() -> Result<()> {
     if is_elevated() {
         bail!("crosspane-agent refuses to run elevated (04 §7)");
     }
-    dispatch(Cli::parse().command.unwrap_or(Command::Run), run, one_shot)
+    let command = Cli::parse().command;
+    #[cfg(target_os = "macos")]
+    match macos_launch::handoff(
+        command.is_none(),
+        rustix::process::geteuid().as_raw(),
+        macos_launch::system_command,
+    ) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(%error, "managed Crosspane handoff failed");
+            macos_launch::show_handoff_error();
+            return Err(error);
+        }
+    }
+    dispatch(command.unwrap_or(Command::Run), run, one_shot)
 }
 
 fn dispatch(
@@ -770,6 +794,7 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
         None => {
             #[cfg(target_os = "macos")]
             {
+                let stop_tx = tx.clone();
                 std::thread::Builder::new()
                     .name("engine".into())
                     .spawn(move || {
@@ -779,8 +804,15 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
                         std::process::exit(stop_status());
                     })
                     .context("spawn engine thread")?;
-                crosspane_platform_macos::main_thread::run_app()?;
-                Ok(())
+                let terminate_tx = stop_tx.clone();
+                crosspane_platform_macos::main_thread::run_app_with_termination(move || {
+                    stop_appkit_for_restart(&terminate_tx);
+                })?;
+                // stop() can also return from run; ordinary terminate() uses the delegate above.
+                stop_appkit_for_restart(&stop_tx);
+                loop {
+                    std::thread::park();
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -805,6 +837,25 @@ fn run_loop(started: Started, lifecycle: lifecycle::Lifecycle) -> Result<()> {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn stop_appkit_for_restart(events: &std::sync::mpsc::Sender<agent::Event>) {
+    macos_launch::appkit_returned(&APPKIT_STOPPED, &RESTART, || {
+        // Arm before sending Shutdown. A stalled engine or cleanup can never let AppKit exit 0.
+        if let Err(error) = std::thread::Builder::new()
+            .name("appkit-exit-deadline".into())
+            .spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                tracing::error!("AppKit termination cleanup timed out; aborting for restart");
+                std::process::abort();
+            })
+        {
+            tracing::error!(%error, "cannot arm AppKit termination deadline");
+            std::process::abort();
+        }
+        let _ = events.send(agent::Event::Shutdown);
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -909,6 +960,11 @@ fn media_exit_status(receipt_ok: bool, has_proxy_host: bool) -> i32 {
 fn finish_run(lifecycle: lifecycle::Lifecycle, stopped: agent::Stopped) -> Result<()> {
     lifecycle.stopped(stopped.outcomes)?;
     if stopped.restart {
+        #[cfg(target_os = "macos")]
+        if !APPKIT_STOPPED.load(Ordering::Acquire) {
+            agent::restart();
+        }
+        #[cfg(not(target_os = "macos"))]
         agent::restart();
     }
     Ok(())
@@ -2448,5 +2504,57 @@ mod lifecycle_dispatch_tests {
             assert!(!paths.exit_receipt().exists());
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_launch_tests {
+    use super::*;
+    #[test]
+    fn appkit_return_uses_failure_exit_after_shutdown_request() {
+        const MARKER: &str = "CROSSPANE_APPKIT_EXIT_TEST";
+        if std::env::var_os(MARKER).is_some() {
+            let (send, recv) = std::sync::mpsc::channel();
+            assert_eq!(
+                stop_status(),
+                0,
+                "normal Quit must remain a successful stop"
+            );
+            APPKIT_STOPPED.store(true, Ordering::Release);
+            assert_eq!(
+                stop_status(),
+                75,
+                "AppKit termination cannot race into exit 0"
+            );
+            APPKIT_STOPPED.store(false, Ordering::Release);
+            stop_appkit_for_restart(&send);
+            assert!(matches!(recv.try_recv().unwrap(), agent::Event::Shutdown));
+            assert!(APPKIT_STOPPED.load(Ordering::Acquire));
+            assert_eq!(stop_status(), 75);
+            // No platform startup, launchctl, AppKit or real lifecycle state in this child.
+            std::process::exit(stop_status());
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "macos_launch_tests::appkit_return_uses_failure_exit_after_shutdown_request",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .spawn()
+            .unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(75));
+                break;
+            }
+            if std::time::Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("owned AppKit exit fixture timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }

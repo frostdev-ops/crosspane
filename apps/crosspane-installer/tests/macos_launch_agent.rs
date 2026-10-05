@@ -2883,7 +2883,7 @@ fn loaded_stopped_job_cannot_authorize_payload_replacement() {
     let mut a = adapter(&f, Approval::Allowed);
     assert!(matches!(
         a.plan(2, 2, None, &f.deadline()),
-        Err(NativeError::Refused)
+        Err(NativeError::Refused | NativeError::Foreign)
     ));
     assert_eq!(f.runner.count("bootout"), 0);
     assert_eq!(f.runner.count("bootstrap"), 1);
@@ -2944,4 +2944,56 @@ fn loaded_stopped_job_change_under_install_lock_refuses_before_bootout() {
     assert_eq!(pending.error(), Some(NativeError::Foreign));
     assert_eq!(f.runner.count("bootout"), 0);
     assert_eq!(f.runner.count("bootstrap"), 1);
+}
+
+#[test]
+fn published_payload_and_bootstrap_requested_receipts_resume_owned_loaded_stopped_job() {
+    let f = Fixture::new(false);
+    let mut first = adapter(&f, Approval::Allowed);
+    let pending = execute_new(&f, &mut first);
+    assert_eq!(pending.phase(), LaunchPhase::BootstrapRequested);
+    drop(pending);
+    drop(first); // No health verification from the interrupted installer.
+    f.runner.behavior.lock().unwrap().loaded_stopped = true;
+    f.runner.stopped.store(true, Ordering::Release);
+    let old = f.io.metadata(&f.io.target().agent_path()).unwrap();
+    let mut resumed = adapter(&f, Approval::Allowed);
+    let plan = resumed.plan(5, 5, None, &f.deadline()).unwrap();
+    assert_eq!(plan.state(), LaunchState::LoadedStopped);
+    let consent = plan.consent(5, 5, false, false).unwrap();
+    let mut pending = resumed.execute(plan, consent, &f.deadline()).unwrap();
+    assert_eq!(pending.error(), None);
+    assert_eq!(pending.phase(), LaunchPhase::BootstrapRequested);
+    assert_eq!(f.io.metadata(&f.io.target().agent_path()).unwrap(), old);
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert_eq!(f.runner.count("bootstrap"), 2);
+    let facts = finish(&f, &resumed, &mut pending, 3, 5);
+    assert!(facts.payload_verified.is_some());
+    let record: Value = serde_json::from_slice(&read_owned(
+        &f.io.target().installer_dir().join("launch-agent.json"),
+    ))
+    .unwrap();
+    assert_eq!(record["receipt"]["resources"][0]["ownership"], "Created");
+    assert_eq!(record["receipt"]["resources"][0]["before"], "Absent");
+}
+#[test]
+fn managed_restart_after_bootstrap_rejects_old_status_and_verifies_current_instance() {
+    let f = Fixture::new(false);
+    let mut launch = adapter(&f, Approval::Allowed);
+    let mut pending = execute_new(&f, &mut launch);
+    let stale = f.reply(&f.status(2), 10);
+    // Model launchd relaunch after the TCC/AppKit exit: new PID and instance, same signed app.
+    f.runner.pid.store(4244, Ordering::Release);
+    f.runner.behavior.lock().unwrap().job_pid = 4244;
+    f.bootstrap(3, 4244, 1000, "ready");
+    pending.expect_health(10).unwrap();
+    assert!(
+        launch
+            .observe(&mut pending, &f.selected(), stale, None, &f.deadline())
+            .is_err()
+    );
+    assert_eq!(pending.phase(), LaunchPhase::BootstrapRequested);
+    let facts = finish(&f, &launch, &mut pending, 3, 11);
+    assert_eq!(facts.payload_verified.unwrap().instance_id, 3);
+    assert_eq!(f.runner.count("bootout"), 0);
 }

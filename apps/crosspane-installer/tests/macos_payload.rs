@@ -2491,3 +2491,238 @@ fn unknown_process_observation_never_becomes_death_or_opens_the_socket() {
     );
     assert!(f.runtime.join("bootstrap.json").exists());
 }
+
+fn companion(f: &Fixture) -> PathBuf {
+    let record = f.payload().recovery(&f.deadline()).unwrap().record.unwrap();
+    let digest: String = record
+        .receipt
+        .manifest_sha256
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    f.io.target()
+        .installer_dir()
+        .join(format!("payload-inventory-{digest}.json"))
+}
+fn newer_payload(f: &Fixture) -> MacPayload {
+    let mut next = inventory();
+    next.product_version = "test-2".into();
+    for file in &mut next.files {
+        if let Some(rule) = &file.signing {
+            let data = macho(rule.role == PayloadRole::EmbeddedCode, 2);
+            file.sha256 = sha(&data);
+            file.size = data.len() as u64;
+            bytes(&f.source.join(&file.path), &data, file.mode);
+        }
+    }
+    MacPayload::admit(f.io.clone(), next, &f.deadline()).unwrap()
+}
+#[test]
+fn legacy_published_unknown_record_resumes_exact_signed_bytes_without_fake_health() {
+    let f = Fixture::new(false);
+    f.install(None, None);
+    let receipt_path = f.io.target().installer_dir().join("payload.json");
+    let record: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(record["phase"], "Published");
+    assert_eq!(record["receipt"]["unfinished"], json!([12]));
+    for row in record["receipt"]["resources"].as_array().unwrap() {
+        assert_eq!(row["ownership"], "Created");
+        assert_eq!(row["before"], "Absent");
+        assert_eq!(row["after"], "Unknown");
+        assert_eq!(row["outcome"], "Unknown");
+    }
+    remove_owned(&companion(&f)); // The real earlier record predates the private companion.
+    let payload = f.payload();
+    let old = owned_stat(&f.io.target().agent_path());
+    let plan = payload.plan(2, 2, None, &f.deadline()).unwrap();
+    assert_eq!(plan.state(), PayloadState::Matching);
+    assert!(plan.resuming_publication());
+    let consent = plan.consent(2, 2, false).unwrap();
+    let mut pending = payload
+        .install(plan, consent, None, &f.deadline())
+        .unwrap()
+        .unwrap();
+    assert!(same_inode(&old, &owned_stat(&f.io.target().agent_path())));
+    assert_eq!(pending.phase(), PayloadPhase::Published);
+    let current = payload.recovery(&f.deadline()).unwrap().record.unwrap();
+    assert_eq!(current.receipt.operation_id.0, 2);
+    assert!(
+        current
+            .receipt
+            .resources
+            .iter()
+            .all(|r| r.outcome == crosspane_installer_core::MutationOutcome::Unknown)
+    );
+    let selected = f.start_new();
+    pending.expect_health(2).unwrap();
+    let verified = payload
+        .verify(
+            &mut pending,
+            &selected,
+            &f.reply(&f.status(2), 2),
+            None,
+            &f.deadline(),
+        )
+        .unwrap();
+    assert!(verified.receipt.resources.iter().all(|r| r.ownership
+        == crosspane_installer_core::ResourceOwnership::Created
+        && r.before == crosspane_installer_core::ResourceObservation::Absent));
+}
+#[test]
+fn prior_inventory_allows_consented_newer_payload_but_replacement_still_needs_clean_stop() {
+    let f = Fixture::new(false);
+    f.install(None, None);
+    let original = f.original();
+    let payload = newer_payload(&f);
+    let plan = payload
+        .plan(2, 2, Some(original.clone()), &f.deadline())
+        .unwrap();
+    assert!(plan.owned_files());
+    assert_eq!(plan.state(), PayloadState::AdoptionRequired);
+    let consent = plan.consent(2, 2, false).unwrap();
+    assert_eq!(
+        payload
+            .install(plan, consent, None, &f.deadline())
+            .unwrap_err(),
+        NativeError::Refused
+    );
+    assert_eq!(
+        fs::read(f.io.target().agent_path()).unwrap(),
+        macho(false, 1)
+    );
+    f.exit(true, "restored");
+    let gate = CleanStopGate::observe(original.clone(), &f.deadline())
+        .unwrap()
+        .unwrap();
+    let plan = payload.plan(3, 3, Some(original), &f.deadline()).unwrap();
+    let consent = plan.consent(3, 3, false).unwrap();
+    let mut pending = payload
+        .install(plan, consent, Some(&gate), &f.deadline())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::read(f.io.target().agent_path()).unwrap(),
+        macho(false, 2)
+    );
+    pending.expect_health(3).unwrap();
+    let selected = f.start_new();
+    let mut status = f.status(2);
+    status["result"]["installer"]["build"]["version"] = json!("test-2");
+    let verified = payload
+        .verify(
+            &mut pending,
+            &selected,
+            &f.reply(&status, 3),
+            None,
+            &f.deadline(),
+        )
+        .unwrap();
+    assert!(
+        verified
+            .receipt
+            .resources
+            .iter()
+            .all(|r| r.ownership == crosspane_installer_core::ResourceOwnership::Created)
+    );
+}
+#[test]
+fn unknown_legacy_different_inventory_and_changed_owned_bytes_stay_blocking() {
+    for kind in 0..4 {
+        let f = Fixture::new(false);
+        f.install(None, None);
+        if kind == 0 {
+            remove_owned(&companion(&f));
+        }
+        if kind == 1 {
+            bytes(&f.io.target().agent_path(), &macho(false, 9), 0o755);
+        }
+        if kind == 2 {
+            let path = companion(&f);
+            let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            record["inventory"]["files"][0]["signing"]["designated_requirement"] =
+                json!("foreign rule");
+            bytes(&path, &serde_json::to_vec(&record).unwrap(), 0o600);
+        }
+        if kind == 3 {
+            bytes(
+                &f.home.join(".local/bin/.crosspanectl.crosspane-stage"),
+                b"retained",
+                0o755,
+            );
+        }
+        let payload = newer_payload(&f);
+        assert!(payload.plan(2, 2, None, &f.deadline()).is_err());
+        assert!(f.io.target().agent_path().exists());
+    }
+}
+#[test]
+fn published_receipt_change_after_consent_refuses_before_any_publication() {
+    let f = Fixture::new(false);
+    f.install(None, None);
+    let payload = f.payload();
+    let plan = payload.plan(2, 2, None, &f.deadline()).unwrap();
+    let consent = plan.consent(2, 2, false).unwrap();
+    let path = f.io.target().installer_dir().join("payload.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["receipt"]["operation_id"] = json!(3);
+    bytes(&path, &serde_json::to_vec(&record).unwrap(), 0o600);
+    assert_eq!(
+        payload
+            .install(plan, consent, None, &f.deadline())
+            .unwrap_err(),
+        NativeError::Foreign
+    );
+    let after: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(after["receipt"]["operation_id"], 3);
+}
+
+#[test]
+fn new_recovery_remnant_after_preview_is_retained_without_cleanup_authority() {
+    let f = Fixture::new(false);
+    f.install(None, None);
+    let payload = f.payload();
+    let plan = payload.plan(2, 2, None, &f.deadline()).unwrap();
+    let consent = plan.consent(2, 2, false).unwrap();
+    let foreign = f.home.join(".local/bin/.crosspanectl.crosspane-previous");
+    bytes(&foreign, b"owner retained bytes", 0o755);
+    assert_eq!(
+        payload
+            .install(plan, consent, None, &f.deadline())
+            .unwrap_err(),
+        NativeError::OutcomeUnknown
+    );
+    assert_eq!(fs::read(&foreign).unwrap(), b"owner retained bytes");
+}
+
+#[test]
+fn failed_prior_inventory_publication_is_retained_and_blocks_blind_retry() {
+    let f = Fixture::new(false);
+    let io = f.hooked(Arc::new(|stage, path, identity| {
+        if stage == "write"
+            && path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("payload-inventory-")
+        {
+            return Err(NativeError::Unavailable);
+        }
+        Ok(identity)
+    }));
+    let payload = MacPayload::admit(io, inventory(), &f.deadline()).unwrap();
+    let plan = payload.plan(1, 1, None, &f.deadline()).unwrap();
+    let consent = plan.consent(1, 1, false).unwrap();
+    assert!(matches!(
+        payload.install(plan, consent, None, &f.deadline()),
+        Err(NativeError::OutcomeUnknown)
+    ));
+    let recovery = f.payload().recovery(&f.deadline()).unwrap();
+    assert_eq!(recovery.retained_temporaries.len(), 1);
+    assert!(recovery.record.is_none());
+    assert!(!recovery.app_present && !recovery.ctl_present);
+    assert!(matches!(
+        f.payload().plan(2, 2, None, &f.deadline()),
+        Err(NativeError::OutcomeUnknown)
+    ));
+    assert!(recovery.retained_temporaries[0].exists());
+}

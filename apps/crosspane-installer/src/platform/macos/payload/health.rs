@@ -13,6 +13,7 @@ pub struct PendingPayload {
     pub(super) health_call: Option<u64>,
     pub(super) phase: PayloadPhase,
     pub(super) repair: Option<Arc<inventory::RepairOrigins>>,
+    pub(super) origins: Option<(bool, bool)>,
 }
 impl PendingPayload {
     pub(crate) fn repair_launch_owned(&self) -> bool {
@@ -158,12 +159,11 @@ impl MacPayload {
             let record = if pending.repair.is_some() {
                 current.repair_receipt(pending.operation, PayloadPhase::Verified)
             } else {
-                current.receipt(
-                    pending.operation,
-                    PayloadPhase::Verified,
+                let (app, ctl) = pending.origins.unwrap_or((
                     pending.previous_app.root.is_some(),
                     pending.previous_ctl.root.is_some(),
-                )
+                ));
+                current.receipt(pending.operation, PayloadPhase::Verified, app, ctl)
             };
             current.persist(&record, deadline)?;
             Ok(record.receipt)

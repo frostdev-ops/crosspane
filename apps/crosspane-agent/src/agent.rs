@@ -18830,6 +18830,17 @@ mod home_tests {
         assert_eq!(opened(&h), json!(2));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_bar_quit_stops_the_engine_without_requesting_a_restart() {
+        let mut h = home();
+        h.rig.agent.tray_action(TrayAction::Quit);
+        assert!(h.rig.agent.quit_requested);
+        assert!(!h.rig.agent.restart_requested);
+        let stopped = h.rig.agent.run(vec![], &h.rig.events);
+        assert!(!stopped.restart);
+    }
+
     #[test]
     fn audio_peers_are_those_with_a_live_speaker_session_either_way_and_the_counters_pass_through()
     {

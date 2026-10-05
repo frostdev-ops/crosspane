@@ -112,12 +112,16 @@ impl MacLaunchAgent {
                 resources: vec![ResourceReceipt {
                     resource_id: "mac.launch-agent".into(),
                     resolved_path: Self::plist(io).to_string_lossy().into_owned(),
-                    ownership: if pending.plan.snapshot.identity.is_some() && !repair_owned {
+                    ownership: if let Some((_, _, ownership, _)) = &pending.plan.record_origin {
+                        *ownership
+                    } else if pending.plan.snapshot.identity.is_some() && !repair_owned {
                         ResourceOwnership::Adopted
                     } else {
                         ResourceOwnership::Created
                     },
-                    before: if pending.plan.snapshot.identity.is_some() && !repair_owned {
+                    before: if let Some((_, _, _, before)) = &pending.plan.record_origin {
+                        *before
+                    } else if pending.plan.snapshot.identity.is_some() && !repair_owned {
                         ResourceObservation::Different
                     } else {
                         ResourceObservation::Absent

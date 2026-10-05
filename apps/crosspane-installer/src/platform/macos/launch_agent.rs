@@ -67,6 +67,12 @@ pub enum LoginEvidence {
 }
 use super::launchd_observation::JobObservation as Job;
 
+type ReceiptOrigin = (
+    FileIdentity,
+    Vec<u8>,
+    ResourceOwnership,
+    ResourceObservation,
+);
 #[derive(Clone, PartialEq, Eq)]
 struct Snapshot {
     identity: Option<FileIdentity>,
@@ -81,6 +87,7 @@ pub struct LaunchPlan {
     operation: u64,
     state: LaunchState,
     snapshot: Snapshot,
+    record_origin: Option<ReceiptOrigin>,
     original: Option<Arc<OriginalAgent>>,
     selected: Option<SelectedAgent>,
     installed_main: Option<SignatureProof>,

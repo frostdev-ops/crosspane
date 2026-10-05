@@ -32,6 +32,15 @@ impl MacLaunchAgent {
             prior: None,
         };
         let lock = self.io.lock(&support, deadline)?;
+        if let Some((identity, bytes, _, _)) = &pending.plan.record_origin {
+            let path = Self::record(&self.io);
+            if self.io.metadata(&path)? != Some(identity.clone())
+                || self.io.read(&path, 512 * 1024, true, deadline)? != *bytes
+                || self.io.metadata(&path)? != Some(identity.clone())
+            {
+                return Err(NativeError::Foreign);
+            }
+        }
         self.persist(&pending, &self.io, &support, deadline)?;
         drop(lock);
         self.advance(&mut pending, &payload, &support, deadline);

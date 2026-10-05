@@ -4,8 +4,8 @@ mod domains;
 #[path = "../integration/native.rs"]
 mod native;
 use super::*;
-use domains::Repairer;
-use native::{MacProbes, NativeEnv, NativeRepairer};
+use domains::{Installs, Repairer};
+use native::{MacProbes, NativeEnv, NativeInstalls, NativeRepairer};
 use std::io::BufRead;
 use std::time::{Duration, Instant};
 
@@ -266,4 +266,44 @@ fn stale_plan_and_confirm_in_a_fresh_window_never_overwrite_a_saved_record() {
         (f.runner.count("bootout"), f.runner.count("bootstrap")),
         mutations
     );
+}
+
+#[test]
+fn install_keeps_publication_across_managed_restart_admission_failure() {
+    let f = Fixture::new(false);
+    let mut installs = NativeInstalls::new(Arc::new(NativeEnv::new(
+        f.io.target().clone(),
+        inventory(),
+        MacProbes {
+            support: f.support.clone(),
+            signatures: f.signatures.clone(),
+            approval: Arc::new(ApprovalFixture(Approval::Allowed)),
+            runner: f.runner.clone(),
+        },
+        f.clock.clone(),
+    )));
+    let op = crosspane_installer_core::OperationId(1);
+    assert!(installs.plan(op, None, &f.deadline()).unwrap().is_some());
+    assert_eq!(
+        installs.apply(op, &f.deadline()).unwrap(),
+        domains::InstallApplied::Requested
+    );
+    f.clock.0.store(100, Ordering::Release);
+    let (_, old) = current(&f, 100);
+    // Simulate the gap between AppKit termination and launchd's next managed process.
+    f.runner.stopped.store(true, Ordering::Release);
+    assert!(installs.verify(Some(&old), &f.deadline()).is_err());
+    assert_eq!(record(&f, "payload.json")["phase"], "Published");
+    f.runner.stopped.store(false, Ordering::Release);
+    f.runner.pid.store(4244, Ordering::Release);
+    f.runner.behavior.lock().unwrap().job_pid = 4244;
+    f.bootstrap(3, 4244, 1000, "ready");
+    let (_, fresh) = current(&f, 101);
+    assert_eq!(
+        installs.verify(Some(&fresh), &f.deadline()).unwrap(),
+        ObservationSource::Demo
+    );
+    assert_eq!(record(&f, "payload.json")["phase"], "Verified");
+    assert_eq!(f.runner.count("bootstrap"), 1);
+    assert_eq!(f.runner.count("bootout"), 0);
 }

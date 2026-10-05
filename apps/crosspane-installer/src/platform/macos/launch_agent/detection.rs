@@ -136,7 +136,8 @@ impl MacLaunchAgent {
             )?));
             selected = Some(agent.clone());
         }
-        let owned = self.owned(&snapshot, deadline)?;
+        let record_origin = self.record_origin(&snapshot, deadline)?;
+        let owned = record_origin.is_some();
         let state = if snapshot.disabled == Disabled::Yes {
             LaunchState::UserDisabled
         } else if snapshot.disabled == Disabled::Unknown || snapshot.job == Job::Unknown {
@@ -178,6 +179,7 @@ impl MacLaunchAgent {
             operation,
             state,
             snapshot,
+            record_origin,
             original,
             selected,
             installed_main,
@@ -226,28 +228,64 @@ impl MacLaunchAgent {
         support.check(io, deadline)?;
         Ok(support)
     }
-    fn owned(&self, snapshot: &Snapshot, deadline: &Deadline) -> NativeResult<bool> {
+    fn record_origin(
+        &self,
+        snapshot: &Snapshot,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<ReceiptOrigin>> {
         let path = Self::record(&self.io);
-        if snapshot.bytes != self.xml || self.io.metadata(&path)?.is_none() {
-            return Ok(false);
+        let Some(identity) = self.io.metadata(&path)? else {
+            return Ok(None);
+        };
+        if snapshot.bytes != self.xml {
+            return Ok(None);
         }
-        let record: Record =
-            serde_json::from_slice(&self.io.read(&path, 512 * 1024, true, deadline)?)
-                .map_err(|_| NativeError::Invalid)?;
-        let receipt = record.receipt;
-        Ok(receipt.schema_version == 1
-            && receipt.operation_id.0 != 0
-            && receipt.product_version == self.version
-            && receipt.manifest_sha256 == self.payload.manifest_sha256()
-            && receipt.payload_sha256 == digest(&self.xml)
-            && receipt.resources.len() == 1
-            && receipt.resources[0].resource_id == "mac.launch-agent"
-            && receipt.resources[0].resolved_path == Self::plist(&self.io).to_string_lossy()
-            && matches!(
-                receipt.resources[0].ownership,
-                ResourceOwnership::Created | ResourceOwnership::Adopted
+        let bytes = self.io.read(&path, 512 * 1024, true, deadline)?;
+        let record: Record = serde_json::from_slice(&bytes).map_err(|_| NativeError::Invalid)?;
+        if record.phase == LaunchPhase::Unknown {
+            // A timed-out command's phase is not a bootstrap receipt; its uncertain dispatch
+            // remains retained. Published/BootstrapRequested can be freshly reassessed below.
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let receipt = &record.receipt;
+        let current = receipt.product_version == self.version
+            && receipt.manifest_sha256 == self.payload.manifest_sha256();
+        if (!current
+            && !self.payload.owns_receipt_identity(
+                &receipt.product_version,
+                receipt.manifest_sha256,
+                deadline,
+            )?)
+            || receipt.schema_version != 1
+            || receipt.operation_id.0 == 0
+            || receipt.payload_sha256 != digest(&self.xml)
+            || receipt.resources.len() != 1
+            || receipt.unfinished != vec![StepId(12)]
+            || !matches!(
+                record.phase,
+                LaunchPhase::Published | LaunchPhase::BootstrapRequested | LaunchPhase::Observed
             )
-            && receipt.resources[0].after == ResourceObservation::Matching)
+            || record.stop_attempted
+            || record.session != self.io.support_observation(deadline)?.gui.console_session
+        {
+            return Ok(None);
+        }
+        let row = &receipt.resources[0];
+        if row.resource_id != "mac.launch-agent"
+            || row.resolved_path != Self::plist(&self.io).to_string_lossy()
+            || !matches!(
+                (row.ownership, row.before),
+                (ResourceOwnership::Created, ResourceObservation::Absent)
+                    | (ResourceOwnership::Adopted, ResourceObservation::Different)
+            )
+            || row.after != ResourceObservation::Matching
+            || row.outcome != MutationOutcome::Unknown
+            || self.io.metadata(&path)? != Some(identity.clone())
+        {
+            return Ok(None);
+        }
+        let (ownership, before) = (row.ownership, row.before);
+        Ok(Some((identity, bytes, ownership, before)))
     }
 }
 pub(super) fn checked_reply(

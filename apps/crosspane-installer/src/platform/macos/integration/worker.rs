@@ -1079,8 +1079,13 @@ fn install_problem(stage: JobStage, error: InstallError) -> Stop {
             "What was checked changed before it could be used. Nothing was changed; review again.",
         ),
         InstallError::OutcomeUnknown => wait_user(
-            "An earlier install of Crosspane didn't finish, and it can't be continued from here. \
-             Remove Crosspane, then install it again. Nothing is assumed about what was copied.",
+            "The earlier install cannot be verified against this build. Use Uninstall (keeping identity), \
+             then install again. If uninstall cannot verify the files, inspect and remove \
+             ~/Applications/Crosspane.app, ~/.local/bin/crosspanectl, and the Crosspane sign-in item \
+             in ~/Library/LaunchAgents before a fresh install. Keep the private recovery records \
+             for inspection. If using manual removal, also move the payload.json and launch-agent.json \
+             receipts out of ~/Library/Application Support/Crosspane/Installer, keeping a copy. \
+             Nothing was removed automatically.",
         ),
         InstallError::Unobservable | InstallError::Unavailable => wait_contract(
             "The sign-in item or the installed files can't be read just now. Nothing was assumed.",

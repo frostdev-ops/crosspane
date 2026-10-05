@@ -565,6 +565,7 @@ pub struct PayloadPlan {
     journal: Journal,
     generation: Option<[u8; 32]>,
     resuming: bool,
+    superseding_applied: bool,
     dead_runtime: Option<DeadRuntime>,
 }
 impl PayloadPlan {
@@ -1034,6 +1035,12 @@ impl PayloadInstaller {
             .map_err(|_| PayloadError::Foreign)
     }
     fn current_instance(&self, deadline: &Deadline) -> Result<Option<u64>> {
+        // A completed publication need not have started the agent. Child metadata cannot
+        // prove absence when its parent is missing, so observe the exact private root first.
+        if self.io.metadata(self.io.target().runtime_dir())?.is_none() {
+            self.fresh_absence()?;
+            return Ok(None);
+        }
         if self
             .io
             .metadata(&self.io.target().runtime_dir().join("bootstrap.json"))?
@@ -1067,7 +1074,11 @@ impl PayloadInstaller {
             let new = sha256(&self.materialize(package, i)?);
             let known = previous
                 .as_ref()
-                .filter(|p| p.phase == Phase::Verified && old == Some(p.items[i].new))
+                .filter(|p| {
+                    matches!(p.phase, Phase::Applied | Phase::Verified)
+                        && old == Some(p.items[i].new)
+                        && p.receipt.resources[i].after == ResourceObservation::Matching
+                })
                 .map(|p| p.items[i].ownership);
             let ownership = if old.is_none() || known == Some(ResourceOwnership::Created) {
                 ResourceOwnership::Created
@@ -1126,9 +1137,14 @@ impl PayloadInstaller {
         if self.load(proof, true)?.is_some() {
             return Err(PayloadError::Pending);
         }
+        let mut superseding_applied = false;
         if let Some(previous) = self.load(proof, false)? {
             if previous.phase != Phase::Verified {
-                return Err(PayloadError::Pending);
+                if self.bind(&previous, package).is_ok() {
+                    return Err(PayloadError::Pending);
+                }
+                self.settled_applied(proof, &previous)?;
+                superseding_applied = true;
             }
             for i in 0..10 {
                 for backup in [false, true] {
@@ -1167,6 +1183,7 @@ impl PayloadInstaller {
         Ok(PayloadPlan {
             generation,
             resuming: false,
+            superseding_applied,
             dead_runtime: if items[0].old.is_none() {
                 self.io.dead_runtime()?
             } else {
@@ -1213,7 +1230,44 @@ impl PayloadInstaller {
             journal,
             generation,
             resuming: true,
+            superseding_applied: false,
         })
+    }
+    // An Applied receipt is publication evidence, not agent health. A newer package may
+    // supersede it only after every recorded byte/inode is observed and no recovery is displaced.
+    fn settled_applied(&self, proof: &SupportProof, journal: &Journal) -> Result<()> {
+        if journal.phase != Phase::Applied
+            || journal.receipt.unfinished != vec![PAYLOAD_STEP]
+            || journal.receipt.resources.iter().any(|row| {
+                row.after != ResourceObservation::Matching
+                    || row.outcome != MutationOutcome::Unknown
+                    || row.ownership == ResourceOwnership::Foreign
+            })
+        {
+            return Err(PayloadError::Pending);
+        }
+        self.recheck(proof, journal, true)?;
+        for (i, item) in journal.items.iter().enumerate() {
+            if self
+                .snapshot(proof, &self.paths[i], Self::mode(i), MAX_MEMBER_BYTES)?
+                .map(|snapshot| snapshot.hash)
+                != Some(item.new)
+            {
+                return Err(PayloadError::Foreign);
+            }
+        }
+        if self
+            .snapshot(
+                proof,
+                &self.state.join("payload-intent.json.retired"),
+                0o600,
+                MAX_RECORD_BYTES,
+            )?
+            .is_some()
+        {
+            return Err(PayloadError::Pending);
+        }
+        Ok(())
     }
     fn recheck(&self, proof: &SupportProof, journal: &Journal, resuming: bool) -> Result<()> {
         for (i, item) in journal.items.iter().enumerate() {
@@ -1415,9 +1469,12 @@ impl PayloadInstaller {
         }
         self.interrupt(Interruption::Locked)?;
         let outcome = self.load(proof, false)?;
+        if plan.superseding_applied {
+            self.settled_applied(proof, outcome.as_ref().ok_or(PayloadError::Pending)?)?;
+        }
         if outcome.as_ref().is_some_and(|outcome| {
             if !plan.resuming {
-                outcome.phase != Phase::Verified
+                (outcome.phase != Phase::Verified && !plan.superseding_applied)
                     || outcome.receipt.operation_id == plan.journal.receipt.operation_id
             } else {
                 outcome.receipt.operation_id != plan.journal.receipt.operation_id
