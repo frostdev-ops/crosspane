@@ -6,4 +6,5 @@ pub mod geometry;
 pub mod hook;
 pub mod journal;
 pub mod keystore;
+pub mod session;
 pub mod winevent;
