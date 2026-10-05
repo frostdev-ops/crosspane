@@ -7,6 +7,7 @@ pub mod hook;
 pub mod hotkey;
 pub mod journal;
 pub mod keystore;
+pub mod overlay;
 pub mod session;
 pub mod tray;
 pub mod winevent;

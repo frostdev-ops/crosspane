@@ -22,10 +22,11 @@ zeroize.workspace = true
 proptest.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Graphics_Imaging", "Win32_System_Com"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_UI_Shell"] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
@@ -38,5 +39,7 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
     "Win32_UI_Shell",
 ] }
