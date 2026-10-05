@@ -6,6 +6,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod keystore;
 pub mod model;
 #[cfg(windows)]
 pub mod stubs;
