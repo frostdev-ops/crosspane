@@ -271,7 +271,7 @@ fn preview(plan: &RepairPlan) -> String {
     };
     let tail = format!(
         "Crosspane is stopped, then started again; {activity}. Settings, identity, pairings and \
-         permissions are kept, and files Crosspane didn't create are left alone. Old files stay \
+         permissions are kept, and only the files setup recorded are replaced. Old files stay \
          as backups until the new Crosspane reports healthy. No firewall change is made."
     );
     // Name as many files as fit; the rest are counted.
@@ -329,11 +329,11 @@ fn discard_guidance(error: &RepairError) -> String {
 }
 
 fn guidance(error: &RepairError) -> String {
-    let foreign = format!(
-        "Some files where Crosspane installs weren't put there by Crosspane, or were taken over \
-         by it, so repair would have to guess. They are left exactly as they are. \
-         {REMOVE_AND_REINSTALL}"
-    );
+    let foreign = "Some of Crosspane's files differ from what setup recorded, so repair stops \
+                   here. Run setup again instead: it saves what is there in \
+                   ~/.local/state/crosspane/backups and installs Crosspane fresh. Nothing was \
+                   changed."
+        .to_owned();
     match error {
         RepairError::Tier2(CompatibilityIssue::MixedOwnership)
         | RepairError::Payload(PayloadError::Foreign) => foreign,
@@ -381,7 +381,8 @@ fn reason(error: &RepairError) -> String {
                 .to_owned()
         }
         RepairError::Tier2(CompatibilityIssue::MixedOwnership) => {
-            "Some files aren't Crosspane's own, so they were left alone.".to_owned()
+            "Some files differ from what setup recorded; running setup again replaces them."
+                .to_owned()
         }
         RepairError::NotReady => "The new instance hasn't reported healthy yet.".to_owned(),
         RepairError::Native(NativeError::Timeout | NativeError::Cancelled) => {

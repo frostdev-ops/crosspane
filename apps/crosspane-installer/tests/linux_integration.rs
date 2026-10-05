@@ -301,10 +301,12 @@ impl World {
             plan: Ok(PayloadPreview {
                 version: "0.0.1".into(),
                 resuming: false,
+                replacing: false,
             }),
             resume: Ok(PayloadPreview {
                 version: "0.0.1".into(),
                 resuming: true,
+                replacing: false,
             }),
             apply: Ok(()),
             verify: Ok(()),
@@ -1307,13 +1309,26 @@ fn an_interrupted_install_is_resumed_from_its_journal_not_replanned() {
 }
 
 #[test]
-fn foreign_files_are_left_alone_and_reported() {
-    let mut rig = Rig::new();
-    rig.set(|w| w.detect = Err(PayloadError::Foreign));
-    let (_, detect) = rig.run(PAYLOAD, JobStage::Detect, None, None);
-    assert_eq!(detect.outcome, NativeOutcome::Waiting(WaitKind::User));
-    assert!(detect.detail.contains("left"));
-    assert_eq!(rig.count("payload.apply"), 0);
+fn files_setup_cant_build_on_are_an_install_to_do_not_a_stop() {
+    // WP-4.32: setup owns its install paths. Unrecorded, modified or unreadable files there are
+    // installed over (saved aside first); detection says the install is needed, in plain words.
+    for error in [
+        PayloadError::Foreign,
+        PayloadError::Pending,
+        PayloadError::OutcomeUnknown,
+    ] {
+        let mut rig = Rig::new();
+        rig.set(|w| w.detect = Err(error));
+        let (_, detect) = rig.run(PAYLOAD, JobStage::Detect, None, None);
+        assert_eq!(
+            detect.outcome,
+            NativeOutcome::Detected { needs_action: true }
+        );
+        for word in ["put there", "left", "foreign", "Foreign", "didn't"] {
+            assert!(!detect.detail.contains(word), "{}", detect.detail);
+        }
+        assert_eq!(rig.count("payload.apply"), 0);
+    }
 }
 
 #[test]

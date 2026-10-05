@@ -261,7 +261,7 @@ impl Uninstaller for NativeUninstaller {
         if self.io.admit_cleanup(&deadline).is_err() {
             return unavailable(
                 "Crosspane's install record can't be read or doesn't match what is on disk, so \
-                 nothing will be removed. Files setup didn't create are never deleted.",
+                 nothing will be removed. Only files setup recorded are ever deleted.",
             );
         }
         self.lan_receipt = resume::read_receipt(&self.io).is_some();

@@ -943,11 +943,14 @@ impl Runner {
                     assert_eq!(repair["step"], "before_stop");
                     assert_eq!(repair["status_watermark"], 101);
                 }
-                let intent: Value = serde_json::from_slice(&read_owned(
-                    &home.join("Library/Application Support/Crosspane/Installer/launch-agent.json"),
-                ))
-                .unwrap();
-                assert_eq!(intent["phase"], "Intent");
+                // WP-4.32: a fresh start moves the install records aside before it stops the
+                // sign-in item; any record that is still there is the executor's own intent.
+                let record =
+                    home.join("Library/Application Support/Crosspane/Installer/launch-agent.json");
+                if fs::symlink_metadata(&record).is_ok() {
+                    let intent: Value = serde_json::from_slice(&read_owned(&record)).unwrap();
+                    assert_eq!(intent["phase"], "Intent");
+                }
                 if b.bootout == 4 {
                     return Err(NativeError::OutcomeUnknown);
                 }

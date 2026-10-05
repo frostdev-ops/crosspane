@@ -4,6 +4,7 @@
 //! module's typed results into the worker's vocabulary. The worker (see `worker.rs`) holds the
 //! policy that decides what each result means for a step.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crosspane_installer_core::{ObservationSource, OperationId, ResourceReceipt};
@@ -20,7 +21,7 @@ use super::super::firewall::{
     RuleKind, RuleResult, receipts::DurableIntentStore,
 };
 use super::super::native_io::{
-    ChildEnvironment, Deadline, LinuxNativeIo, MAX_ELF_PREFIX_BYTES, SupportProof,
+    ChildEnvironment, Deadline, LinuxNativeIo, MAX_ELF_PREFIX_BYTES, NativeError, SupportProof,
 };
 use super::super::payload::{
     Architecture, MatchingFiles, Package, PayloadError, PayloadInstaller, PayloadPlan,
@@ -92,12 +93,19 @@ pub trait Payloads {
         now_ms: u64,
         deadline: &Deadline,
     ) -> Result<(), PayloadError>;
+    /// Where the last apply saved what it replaced, if it saved anything (WP-4.32).
+    fn backup(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadPreview {
     pub version: String,
     pub resuming: bool,
+    /// WP-4.32: what is in the install paths can't be built on. It is moved into the backup
+    /// folder and the install starts fresh.
+    pub replacing: bool,
 }
 
 /// The user-manager unit for the installed agent.
@@ -683,7 +691,8 @@ impl Support for NativeSupport {
         }));
         match self.io.dead_runtime() {
             Ok(Some(_)) => rows.push(SupportCheck::new("Stopped Crosspane runtime", CheckState::Note("The owned dead runtime will be cleaned under the install lock when you install".into()))),
-            Err(_) => rows.push(SupportCheck::new("Crosspane runtime", CheckState::Unconfirmed("Runtime state is active or couldn't be proved safe to recover; it will be retained".into()))),
+            // WP-4.32: a running Crosspane is the ordinary update case; it is restarted on the new files.
+            Err(_) => rows.push(SupportCheck::new("Crosspane runtime", CheckState::Note("Crosspane is running; it is restarted on the new files after the install".into()))),
             Ok(None) => {},
         }
         self.checks.publish(rows);
@@ -714,7 +723,31 @@ impl Support for NativeSupport {
 /// The real user-file installer.
 pub struct NativePayloads {
     installer: PayloadInstaller,
-    held: Option<(OperationId, PayloadPlan)>,
+    held: Option<(OperationId, Held)>,
+    /// An earlier apply in this run didn't finish: the next plan starts fresh (WP-4.32).
+    start_fresh: bool,
+}
+
+/// A kept plan: the ordinary one, or a fresh start over whatever is in the install paths.
+enum Held {
+    Plan(Box<PayloadPlan>),
+    Fresh,
+}
+
+/// WP-4.32: these mean "what is in the install paths can't be built on". The installer owns
+/// those paths, so they are cleared into the backup folder and the install starts fresh.
+/// Anything else (no support, no session, a busy lock, an invalid package, time) is not about
+/// the install paths, and stays what it is.
+fn start_fresh_over(error: &PayloadError) -> bool {
+    matches!(
+        error,
+        PayloadError::Foreign
+            | PayloadError::Pending
+            | PayloadError::OutcomeUnknown
+            | PayloadError::Native(
+                NativeError::Foreign | NativeError::OutcomeUnknown | NativeError::Unavailable
+            )
+    )
 }
 
 impl NativePayloads {
@@ -722,7 +755,26 @@ impl NativePayloads {
         Ok(Self {
             installer: PayloadInstaller::new(io)?,
             held: None,
+            start_fresh: false,
         })
+    }
+
+    /// Clear the install paths into the backup folder, then install from nothing.
+    fn fresh(
+        &mut self,
+        proof: &SupportProof,
+        package: &Package,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<(), PayloadError> {
+        self.installer.reclaim(proof)?;
+        deadline.check()?;
+        let plan = self
+            .installer
+            .plan(proof, package, operation, MatchingFiles::Preserve)?;
+        self.installer.apply(proof, package, plan, deadline)?;
+        self.start_fresh = false;
+        Ok(())
     }
 }
 
@@ -741,7 +793,17 @@ impl Payloads for NativePayloads {
         {
             return Err(PayloadError::Pending);
         }
-        self.installer.detect(proof, package)
+        let rows = self.installer.detect(proof, package)?;
+        // Matching files with no finished install record behind them are installed (recorded)
+        // once more; nothing else would ever confirm them.
+        if rows
+            .iter()
+            .all(|row| row.before == crosspane_installer_core::ResourceObservation::Matching)
+            && !self.installer.recorded(proof)?
+        {
+            return Err(PayloadError::Pending);
+        }
+        Ok(rows)
     }
 
     fn observe(
@@ -760,17 +822,38 @@ impl Payloads for NativePayloads {
         resume: bool,
     ) -> Result<PayloadPreview, PayloadError> {
         self.held = None;
-        let plan = if resume {
-            self.installer.resume_plan(proof, package)?
+        let attempt = if self.start_fresh {
+            Err(PayloadError::Foreign)
+        } else if resume {
+            self.installer.resume_plan(proof, package)
         } else {
             self.installer
-                .plan(proof, package, operation, MatchingFiles::Preserve)?
+                .plan(proof, package, operation, MatchingFiles::Preserve)
         };
-        let preview = PayloadPreview {
-            version: plan.receipt().product_version.clone(),
-            resuming: resume,
+        let (held, preview) = match attempt {
+            Ok(plan) => {
+                let preview = PayloadPreview {
+                    version: plan.receipt().product_version.clone(),
+                    resuming: resume,
+                    replacing: false,
+                };
+                (Held::Plan(Box::new(plan)), preview)
+            }
+            // An unfinished earlier install is first offered as a resume (the caller asks).
+            Err(PayloadError::Pending) if !resume && !self.start_fresh => {
+                return Err(PayloadError::Pending);
+            }
+            Err(error) if start_fresh_over(&error) => (
+                Held::Fresh,
+                PayloadPreview {
+                    version: package.manifest().product_version.clone(),
+                    resuming: false,
+                    replacing: true,
+                },
+            ),
+            Err(error) => return Err(error),
         };
-        self.held = Some((operation, plan));
+        self.held = Some((operation, held));
         Ok(preview)
     }
 
@@ -788,9 +871,21 @@ impl Payloads for NativePayloads {
         if planned != operation {
             return Err(PayloadError::Pending);
         }
-        self.installer
-            .apply(proof, package, plan, deadline)
-            .map(|_| ())
+        let result = match plan {
+            Held::Plan(plan) => match self.installer.apply(proof, package, *plan, deadline) {
+                Ok(_) => Ok(()),
+                // The kept plan no longer fits what is there: start fresh, once, right now.
+                Err(error) if start_fresh_over(&error) => {
+                    self.fresh(proof, package, operation, deadline)
+                }
+                Err(error) => Err(error),
+            },
+            Held::Fresh => self.fresh(proof, package, operation, deadline),
+        };
+        if result.is_err() {
+            self.start_fresh = true;
+        }
+        result
     }
 
     fn verify(
@@ -804,6 +899,10 @@ impl Payloads for NativePayloads {
         self.installer
             .verify(proof, package, reply.id, now_ms, reply, deadline)
             .map(|_| ())
+    }
+
+    fn backup(&self) -> Option<PathBuf> {
+        self.installer.backup_used()
     }
 }
 

@@ -168,7 +168,8 @@ impl ProcessProbe for Probe {
                 .unwrap()
                 .map(|e| e.unwrap().path())
                 .find(|p| fs::metadata(p).is_ok_and(|m| Some(m.ino()) == inode))
-                .unwrap()
+                // Moved out of the install folder altogether (into a backup): never the agent path.
+                .unwrap_or_else(|| self.root.join("moved-away"))
         } else {
             target
         };
@@ -683,7 +684,10 @@ fn scratch_proofs_target_validation_and_links_refuse_before_mutation() {
     }
 }
 #[test]
-fn fresh_existing_agent_or_unknown_runtime_never_mutates() {
+fn fresh_plans_never_mutate_and_unknown_runtime_leftovers_refuse() {
+    // WP-4.32: an agent file with no record, or a running agent's bootstrap, is an install
+    // to do (setup owns its install paths). Planning still writes nothing. A runtime that is
+    // neither a running agent nor a dead one's exact leftovers still refuses.
     let p = package(1);
     for kind in 0..3 {
         let f = Fixture::new();
@@ -696,12 +700,12 @@ fn fresh_existing_agent_or_unknown_runtime_never_mutates() {
                 put(&f.io.target().socket_path(), b"unknown", 0o600);
             }
         }
-        assert!(matches!(
-            f.install
-                .plan(&f.proof, &p, OperationId(1), MatchingFiles::Adopt),
-            Err(PayloadError::Foreign)
-        ));
+        let plan = f
+            .install
+            .plan(&f.proof, &p, OperationId(1), MatchingFiles::Adopt);
+        assert_eq!(plan.is_ok(), kind < 2, "{kind}");
         assert!(!f.record(true).exists());
+        assert!(!f.record(false).exists());
     }
 }
 #[test]
@@ -728,25 +732,39 @@ fn matching_adoption_and_modified_files_are_preserved() {
     f.install
         .verify(&f.proof, &p, 19, 100, &f.reply("0.0.1"), &deadline())
         .unwrap();
-    assert!(matches!(
-        f.install.plan(
+    // WP-4.32: a newer package replaces the adopted file too; setup owns the install path.
+    let newer = f
+        .install
+        .plan(
             &f.proof,
             &package(2),
             OperationId(2),
-            MatchingFiles::Preserve
-        ),
-        Err(PayloadError::Foreign)
-    ));
+            MatchingFiles::Preserve,
+        )
+        .unwrap();
+    assert_eq!(
+        newer.receipt().resources[8].ownership,
+        ResourceOwnership::Created
+    );
     assert_eq!(fs::read(&f.install.targets()[8]).unwrap(), contents(1)[8]);
+    // A modified file is saved into the backup folder before it is replaced.
     let g = Fixture::new();
     g.verified(&p, 1);
     put(&g.install.targets()[2], b"user edit", 0o755);
-    assert!(
-        g.install
-            .plan(&g.proof, &package(2), OperationId(2), MatchingFiles::Adopt)
-            .is_err()
+    assert_eq!(
+        g.install.detect(&g.proof, &p).unwrap()[2].ownership,
+        ResourceOwnership::Foreign
     );
+    let plan = g
+        .install
+        .plan(&g.proof, &p, OperationId(2), MatchingFiles::Adopt)
+        .unwrap();
     assert_eq!(fs::read(&g.install.targets()[2]).unwrap(), b"user edit");
+    g.install.apply(&g.proof, &p, plan, &deadline()).unwrap();
+    assert_eq!(fs::read(&g.install.targets()[2]).unwrap(), contents(1)[2]);
+    let backup = g.install.backup_used().unwrap();
+    assert!(backup.starts_with(g.io.target().paths().state_home.join("crosspane/backups")));
+    assert_eq!(fs::read(backup.join("crosspane-ui")).unwrap(), b"user edit");
 }
 #[test]
 fn repeat_install_preserves_existing_inodes_and_owned_receipts() {
@@ -1099,15 +1117,29 @@ fn rendered_hashes_keep_owned_repeat_files_and_preserve_hand_edits() {
     put(path, b"hand-edited unit\n", 0o644);
     let rows = f.install.detect(&f.proof, &p).unwrap();
     assert_eq!(rows[5].ownership, ResourceOwnership::Foreign);
-    assert!(matches!(
-        f.install
-            .plan(&f.proof, &p, OperationId(3), MatchingFiles::Preserve),
-        Err(PayloadError::Foreign)
-    ));
+    // WP-4.32: a fresh plan installs over the hand edit, saving it first.
+    let fresh = f
+        .install
+        .plan(&f.proof, &p, OperationId(3), MatchingFiles::Preserve)
+        .unwrap();
     assert_eq!(fs::read(path).unwrap(), b"hand-edited unit\n");
+    // A plan made before the edit still never writes over it.
     assert_eq!(
         f.install.apply(&f.proof, &p, plan, &deadline()),
         Err(PayloadError::Foreign)
+    );
+    assert_eq!(fs::read(path).unwrap(), b"hand-edited unit\n");
+    f.install.apply(&f.proof, &p, fresh, &deadline()).unwrap();
+    assert_eq!(fs::read(path).unwrap(), records[0].bytes);
+    assert_eq!(
+        fs::read(
+            f.install
+                .backup_used()
+                .unwrap()
+                .join("crosspane-agent.service")
+        )
+        .unwrap(),
+        b"hand-edited unit\n"
     );
 }
 
@@ -1326,19 +1358,22 @@ fn fresh_observations_cannot_claim_matching_files_created_after_plan() {
     f.install
         .verify(&f.proof, &p, 19, 100, &f.reply("0.0.1"), &deadline())
         .unwrap();
+    // WP-4.32: the matching file was there when op 2 planned; setup owns the install path, so
+    // the install it recorded covers it.
     assert_eq!(
         f.install.detect(&f.proof, &package(2)).unwrap()[8].ownership,
-        ResourceOwnership::Foreign
+        ResourceOwnership::Created
     );
-    assert!(matches!(
-        f.install.plan(
-            &f.proof,
-            &package(2),
-            OperationId(3),
-            MatchingFiles::Preserve
-        ),
-        Err(PayloadError::Foreign)
-    ));
+    assert!(
+        f.install
+            .plan(
+                &f.proof,
+                &package(2),
+                OperationId(3),
+                MatchingFiles::Preserve
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -2765,4 +2800,316 @@ fn applied_receipt_changed_after_preview_refuses_before_replacement() {
         Err(PayloadError::Pending)
     );
     assert_eq!(fs::read(&f.install.targets()[0]).unwrap(), contents(1)[0]);
+}
+
+/// WP-4.32: setup owns its install paths. Every stuck shape seen live ends installed, with what
+/// was there saved in the backup folder and nothing outside the install paths touched.
+mod owned_install_paths {
+    use super::*;
+    use crosspane_installer::platform::linux::integration::{NativePayloads, Payloads};
+    use crosspane_installer_core::ResourceObservation;
+
+    /// One installer run against the scratch home: detect, plan (resume first when asked, as
+    /// the worker does), apply. Returns the backup folder it reported.
+    fn run_install(f: &Fixture, p: &Package, op: u64) -> Option<PathBuf> {
+        let mut payloads = NativePayloads::new(f.io.clone()).unwrap();
+        match payloads.detect(&f.proof, p) {
+            Ok(rows) => assert!(
+                !rows
+                    .iter()
+                    .all(|r| r.before == ResourceObservation::Matching
+                        && r.ownership == ResourceOwnership::Created),
+                "detect said current before installing"
+            ),
+            Err(error) => assert!(
+                matches!(
+                    error,
+                    PayloadError::Pending
+                        | PayloadError::Foreign
+                        | PayloadError::OutcomeUnknown
+                        | PayloadError::Native(_)
+                ),
+                "{error:?}"
+            ),
+        }
+        let operation = OperationId(op);
+        let preview = match payloads.plan(&f.proof, p, operation, false) {
+            Err(PayloadError::Pending) => payloads.plan(&f.proof, p, operation, true),
+            other => other,
+        }
+        .unwrap();
+        assert_eq!(preview.version, p.manifest().product_version);
+        payloads.apply(&f.proof, p, operation, &deadline()).unwrap();
+        payloads.backup()
+    }
+
+    /// The new agent answers, the install is recorded, and a later run has nothing to do.
+    fn finish(f: &Fixture, p: &Package, instance: u64) {
+        for (index, bytes) in installed_contents(f, version_of(p)).iter().enumerate() {
+            assert_eq!(
+                &fs::read(&f.install.targets()[index]).unwrap(),
+                bytes,
+                "{index}"
+            );
+        }
+        f.bootstrap_instance(instance);
+        let mut payloads = NativePayloads::new(f.io.clone()).unwrap();
+        payloads
+            .verify(
+                &f.proof,
+                p,
+                &f.reply(&p.manifest().product_version),
+                100,
+                &deadline(),
+            )
+            .unwrap();
+        let rows = NativePayloads::new(f.io.clone())
+            .unwrap()
+            .detect(&f.proof, p)
+            .unwrap();
+        assert!(
+            rows.iter()
+                .all(|r| r.before == ResourceObservation::Matching
+                    && r.ownership == ResourceOwnership::Created)
+        );
+    }
+
+    fn version_of(p: &Package) -> u8 {
+        p.manifest()
+            .product_version
+            .rsplit('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn live_runtime(f: &Fixture, instance: u64) -> std::os::unix::net::UnixListener {
+        f.bootstrap_instance(instance);
+        let listener = std::os::unix::net::UnixListener::bind(f.io.target().socket_path()).unwrap();
+        fs::set_permissions(
+            f.io.target().socket_path(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        listener
+    }
+
+    fn state(f: &Fixture) -> PathBuf {
+        f.io.target().paths().state_home.join("crosspane/installer")
+    }
+
+    /// The live Linux case (owner, 2026-10-05): an earlier build's install is running and
+    /// healthy from its unit. Its Applied payload-outcome.json, a quarantine record, the install
+    /// lock and a "payload planned" resume hint sit in the installer folder, and the runtime
+    /// holds a live agent.sock and bootstrap.json. The newer build upgrades it by itself.
+    #[test]
+    fn a_running_older_build_with_its_unfinished_records_is_upgraded() {
+        let f = Fixture::new();
+        f.applied(&package(1), 1);
+        let quarantine: Vec<_> = fs::read_dir(state(&f))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with("quarantine-"))
+            .collect();
+        assert_eq!(quarantine.len(), 1);
+        put(
+            &state(&f).join("resume-hint.json"),
+            br#"{"schema":1,"step":"payload","phase":"planned"}"#,
+            0o600,
+        );
+        let _live = live_runtime(&f, 9);
+        // Upgraded by the next build, or reinstalled by the same build that was cut off.
+        for (p, op) in [(package(2), 2), (package(2), 3), (package(3), 4)] {
+            run_install(&f, &p, op);
+            // The running agent is replaced only by a new instance; the old one can't confirm it.
+            let outcome: Value =
+                serde_json::from_slice(&fs::read(f.record(false)).unwrap()).unwrap();
+            assert_eq!(outcome["previous_instance"], json!(9));
+            assert!(state(&f).join("resume-hint.json").exists());
+            assert!(f.io.target().socket_path().exists());
+        }
+        // An install record that can't be continued is kept in the backup, not deleted.
+        let backups = f.io.target().paths().state_home.join("crosspane/backups");
+        assert!(fs::read_dir(&backups).unwrap().any(|folder| {
+            folder
+                .unwrap()
+                .path()
+                .join("installer/payload-outcome.json")
+                .exists()
+        }));
+        finish(&f, &package(3), 10);
+    }
+
+    /// The same, with the earlier build's install finished (Verified) and a stale previous copy
+    /// next to the agent from an older run.
+    #[test]
+    fn a_finished_older_install_with_stray_leftovers_is_upgraded() {
+        let f = Fixture::new();
+        f.verified(&package(1), 1);
+        // Left by run 1 and not accounted for any more: it blocks continuing run 1's records.
+        let stray = f.sibling(1, 0, true);
+        put(&stray, b"older leftover", 0o755);
+        let _live = live_runtime(&f, 9);
+        let backup = run_install(&f, &package(2), 2).unwrap();
+        assert_eq!(
+            fs::read(backup.join("leftovers/.crosspane-previous-1-0")).unwrap(),
+            b"older leftover"
+        );
+        assert!(!stray.exists());
+        finish(&f, &package(2), 10);
+    }
+
+    /// Killed at every publication point of an earlier run (same build and a newer build),
+    /// the next run ends installed.
+    #[test]
+    fn a_run_killed_anywhere_in_publication_converges() {
+        let points = [
+            Interruption::Intent,
+            Interruption::Staged(0),
+            Interruption::BackedUp(3),
+            Interruption::Exchange(0),
+            Interruption::Replaced(2),
+            Interruption::Write,
+            Interruption::Publish,
+            Interruption::Outcome,
+            Interruption::BeforeJournal(true, 0),
+            Interruption::AfterJournal(false, 1),
+        ];
+        for newer in [false, true] {
+            for point in points {
+                let mut f = Fixture::new();
+                f.verified(&package(1), 1);
+                let first = if newer { package(2) } else { package(3) };
+                let plan = f
+                    .install
+                    .plan(&f.proof, &first, OperationId(2), MatchingFiles::Preserve)
+                    .unwrap();
+                f.install.scratch_interrupt(Some(point)).unwrap();
+                let _ = f.install.apply(&f.proof, &first, plan, &deadline());
+                f.install.scratch_interrupt(None).unwrap();
+                let p = if newer { package(4) } else { first };
+                run_install(&f, &p, 3);
+                finish(&f, &p, 10);
+            }
+        }
+    }
+
+    /// Bytes no install recorded, at every install path, with a running agent: saved, then
+    /// replaced.
+    #[test]
+    fn unrecorded_files_at_every_install_path_are_saved_and_replaced() {
+        let f = Fixture::new();
+        for (index, path) in f.install.targets().iter().enumerate() {
+            put(
+                path,
+                format!("hand-made {index}").as_bytes(),
+                if index < 5 { 0o755 } else { 0o644 },
+            );
+        }
+        let _live = live_runtime(&f, 9);
+        let backup = run_install(&f, &package(1), 1).unwrap();
+        for (index, path) in f.install.targets().iter().enumerate() {
+            let name = path.file_name().unwrap();
+            assert_eq!(
+                fs::read(backup.join(name)).unwrap(),
+                format!("hand-made {index}").as_bytes()
+            );
+        }
+        finish(&f, &package(1), 10);
+    }
+
+    /// A link at an install path is moved aside, never followed; whatever it points to stays.
+    /// So are directories, wrong modes and extra hard links.
+    #[test]
+    fn links_directories_modes_and_hard_links_are_moved_aside_never_followed() {
+        let f = Fixture::new();
+        let outside = f.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let targets = f.install.targets().to_vec();
+        for (index, path) in targets.iter().enumerate() {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            match index % 4 {
+                0 => {
+                    let aim = outside.join(format!("aim-{index}"));
+                    fs::write(&aim, b"outside").unwrap();
+                    symlink(&aim, path).unwrap();
+                }
+                1 => fs::create_dir_all(path.join("inner")).unwrap(),
+                2 => put(path, b"group writable", 0o775),
+                _ => {
+                    let other = outside.join(format!("link-{index}"));
+                    fs::write(&other, b"hard").unwrap();
+                    fs::hard_link(&other, path).unwrap();
+                }
+            }
+        }
+        let backup = run_install(&f, &package(1), 1).unwrap();
+        for (index, path) in targets.iter().enumerate() {
+            let saved = backup.join(path.file_name().unwrap());
+            let meta = fs::symlink_metadata(&saved).unwrap();
+            match index % 4 {
+                0 => assert!(meta.file_type().is_symlink()),
+                1 => assert!(meta.is_dir()),
+                _ => assert!(meta.is_file()),
+            }
+        }
+        for entry in fs::read_dir(&outside).unwrap() {
+            assert!(fs::read(entry.unwrap().path()).is_ok_and(|b| b == b"outside" || b == b"hard"));
+        }
+        finish(&f, &package(1), 10);
+    }
+
+    /// An unreadable or torn record is kept in the backup; the install starts fresh.
+    #[test]
+    fn torn_records_are_set_aside() {
+        for intent in [false, true] {
+            let f = Fixture::new();
+            f.verified(&package(1), 1);
+            put(&f.record(intent), b"{\"torn", 0o600);
+            let backup = run_install(&f, &package(2), 2).unwrap();
+            assert_eq!(
+                fs::read(backup.join(format!(
+                    "installer/{}",
+                    f.record(intent).file_name().unwrap().to_str().unwrap()
+                )))
+                .unwrap(),
+                b"{\"torn"
+            );
+            finish(&f, &package(2), 10);
+        }
+    }
+
+    /// Twice in a row: the second run has nothing to do. At most three backup folders stay.
+    #[test]
+    fn repeated_runs_converge_and_keep_three_backups() {
+        let f = Fixture::new();
+        let root = f.io.target().paths().state_home.join("crosspane/backups");
+        for (n, old) in ["20200101-000000", "20210101-000000", "20220101-000000"]
+            .iter()
+            .enumerate()
+        {
+            put(
+                &root.join(old).join("note"),
+                format!("{n}").as_bytes(),
+                0o600,
+            );
+            fs::set_permissions(root.join(old), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for dir in [root.clone(), root.parent().unwrap().to_owned()] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        put(&f.install.targets()[8], b"hand-made icon", 0o644);
+        let backup = run_install(&f, &package(1), 1).unwrap();
+        finish(&f, &package(1), 10);
+        let mut kept: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        kept.sort();
+        assert_eq!(kept.len(), KEEP_BACKUPS);
+        assert!(kept.contains(&backup));
+        assert!(!root.join("20200101-000000").exists());
+        assert!(root.join("20220101-000000/note").exists());
+    }
 }

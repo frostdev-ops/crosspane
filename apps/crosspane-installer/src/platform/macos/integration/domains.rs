@@ -168,6 +168,9 @@ pub struct InstallPreview {
     pub version: String,
     /// The running agent will be stopped (and its sessions with it) before its files change.
     pub interrupts_agent: bool,
+    /// WP-4.32: what is in the install paths can't be built on. It is saved into the backup
+    /// folder (after Crosspane's own sign-in item is stopped) and the install starts fresh.
+    pub replacing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +183,8 @@ pub enum InstallApplied {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallError {
-    /// Something Crosspane didn't put there is in the way. It is left exactly as it is.
+    /// What is in the install paths can't be built on as it is. Setup clears it into the
+    /// backup folder by itself (WP-4.32); this only reaches the person if that can't be done.
     Foreign,
     /// The person turned Crosspane's login item off in System Settings.
     UserDisabled,
@@ -228,6 +232,10 @@ pub trait Installs: Send {
         status: Option<&AgentReply>,
         deadline: &Deadline,
     ) -> Result<ObservationSource, InstallError>;
+    /// Where the last apply saved what it replaced, if it saved anything (WP-4.32).
+    fn backup(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// A freshly admitted agent: the endpoint, process and signature the exchange rests on. Opaque;

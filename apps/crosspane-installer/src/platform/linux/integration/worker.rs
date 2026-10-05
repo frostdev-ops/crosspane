@@ -468,11 +468,21 @@ impl Worker {
                     NativeOutcome::Detected { needs_action: true },
                     "Crosspane's files need to be installed for your account.",
                 ),
-                Err(PayloadError::Pending) => self.emit(
+                // WP-4.32: setup owns the places it installs to. Whatever is there that it can't
+                // build on is saved aside and replaced by the install itself.
+                Err(
+                    PayloadError::Pending
+                    | PayloadError::Foreign
+                    | PayloadError::OutcomeUnknown
+                    | PayloadError::Native(
+                        NativeError::Foreign
+                        | NativeError::OutcomeUnknown
+                        | NativeError::Unavailable,
+                    ),
+                ) => self.emit(
                     job,
                     NativeOutcome::Detected { needs_action: true },
-                    "An earlier install didn't finish. What is already in place is checked again \
-                     before anything is finished.",
+                    "Crosspane's files need to be installed or updated for your account.",
                 ),
                 Err(error) => self.emit_stop(job.clone(), payload_problem(job.stage, error)),
             },
@@ -489,7 +499,18 @@ impl Worker {
                         self.held.payload = Some(job.operation);
                         resume::write(&self.io, proof, "payload", "planned");
                         let prefix = self.io.target().paths().prefix.display().to_string();
-                        let text = if resuming || preview.resuming {
+                        let text = if preview.replacing {
+                            format!(
+                                "Install Crosspane {} for your account only: programs in \
+                                 {prefix}/bin, a startup entry in your user systemd folder, and \
+                                 menu entries in your applications folder. What an older or \
+                                 unfinished install left there is saved in \
+                                 ~/.local/state/crosspane/backups first. Your settings, pairings \
+                                 and identity stay as they are, and nothing outside your home \
+                                 folder changes.",
+                                preview.version
+                            )
+                        } else if resuming || preview.resuming {
                             format!(
                                 "Finish the interrupted install of Crosspane {}. What is already \
                                  in place is kept; only what is missing is written.",
@@ -532,11 +553,15 @@ impl Worker {
                 {
                     Ok(()) => {
                         resume::write(&self.io, proof, "payload", "applied");
-                        self.emit(
-                            job,
-                            NativeOutcome::Applied(ApplyOutcome::Applied),
-                            "Crosspane's files were written. They are checked next.",
-                        );
+                        let text = match self.payloads.backup() {
+                            Some(folder) => format!(
+                                "Crosspane's files were written. Replaced an older copy of \
+                                 Crosspane (saved in {}). They are checked next.",
+                                folder.display()
+                            ),
+                            None => "Crosspane's files were written. They are checked next.".into(),
+                        };
+                        self.emit(job, NativeOutcome::Applied(ApplyOutcome::Applied), text);
                     }
                     Err(PayloadError::OutcomeUnknown) => self.emit(
                         job,
@@ -730,7 +755,8 @@ impl Worker {
                     self.emit(
                         job,
                         NativeOutcome::Applied(ApplyOutcome::Refused),
-                        "A service or agent that Crosspane didn't set up is already in place. \
+                        "Crosspane's startup entry doesn't load as written: another \
+                         crosspane-agent.service, or an override folder for it, takes priority. \
                          Nothing was changed.",
                     );
                     return;
@@ -1565,14 +1591,13 @@ fn payload_problem(stage: JobStage, error: PayloadError) -> Stop {
             } else {
                 NativeOutcome::Waiting(WaitKind::User)
             },
-            "Some files where Crosspane installs weren't put there by Crosspane. They are left \
-             exactly as they are, and nothing was changed."
+            "Crosspane can't write to a folder it installs into: a folder on the way is a link \
+             to somewhere else, or other accounts can change it. Nothing was changed."
                 .into(),
         ),
         PayloadError::Pending => (
             NativeOutcome::Waiting(WaitKind::Contract),
-            "An earlier install is unfinished. It is checked again before anything continues."
-                .into(),
+            "The install is checked again before anything continues.".into(),
         ),
         other => (
             if stage == JobStage::Apply {
@@ -1593,8 +1618,8 @@ fn service_problem(stage: JobStage, error: ServiceError) -> Stop {
             } else {
                 NativeOutcome::Failed
             },
-            "A service or agent that Crosspane didn't set up is already in place. Nothing was \
-             changed."
+            "Crosspane's startup entry doesn't load as written: another crosspane-agent.service, \
+             or an override folder for it, takes priority. Nothing was changed."
                 .into(),
         ),
         ServiceError::OutcomeUnknown => (

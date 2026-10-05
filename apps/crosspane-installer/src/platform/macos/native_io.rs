@@ -280,6 +280,10 @@ impl MacTarget {
     pub fn installer_dir(&self) -> PathBuf {
         self.state_dir().join("Installer")
     }
+    /// WP-4.32: where setup saves whatever it moved out of its install paths.
+    pub fn backups_dir(&self) -> PathBuf {
+        self.state_dir().join("Backups")
+    }
     pub fn source(&self) -> ObservationSource {
         if self.scratch {
             ObservationSource::Demo
@@ -299,6 +303,7 @@ impl MacTarget {
             "Library/LaunchAgents/.io.frostdev.crosspane.agent.plist.crosspane-stage",
             "Library/Logs/Crosspane",
             "Library/Application Support/Crosspane/Installer",
+            "Library/Application Support/Crosspane/Backups",
         ]
         .map(|p| self.paths.home.join(p))
         .to_vec()

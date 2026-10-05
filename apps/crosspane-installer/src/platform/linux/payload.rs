@@ -18,10 +18,13 @@ use std::{
     os::fd::OwnedFd,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+mod reclaim;
+pub use reclaim::KEEP_BACKUPS;
 
 pub const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_MEMBER_BYTES: usize = 64 * 1024 * 1024;
@@ -567,6 +570,12 @@ pub struct PayloadPlan {
     resuming: bool,
     superseding_applied: bool,
     dead_runtime: Option<DeadRuntime>,
+    /// WP-4.32: install paths whose current bytes no receipt accounts for. They are copied into
+    /// the backup folder before they are replaced.
+    unrecorded: Vec<usize>,
+    /// WP-4.32: the agent path is empty while an agent still runs (its file was moved aside).
+    /// The new files go in next to it; the restart that follows brings up the new agent.
+    live_agent: bool,
 }
 impl PayloadPlan {
     pub fn receipt(&self) -> &InstallReceipt {
@@ -610,6 +619,8 @@ pub struct PayloadInstaller {
     state: PathBuf,
     interruption: Option<Interruption>,
     hook: Option<ScratchHook>,
+    /// This installer's backup folder, once something was saved (WP-4.32).
+    backup: Mutex<Option<PathBuf>>,
 }
 impl std::fmt::Debug for PayloadInstaller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -671,6 +682,7 @@ impl PayloadInstaller {
             state,
             interruption: None,
             hook: None,
+            backup: Mutex::new(None),
         })
     }
     pub fn targets(&self) -> &[PathBuf] {
@@ -1060,14 +1072,15 @@ impl PayloadInstaller {
         proof: &SupportProof,
         package: &Package,
         choice: MatchingFiles,
-    ) -> Result<(Vec<Item>, Vec<ResourceReceipt>)> {
+        owned: bool,
+    ) -> Result<(Vec<Item>, Vec<ResourceReceipt>, Vec<usize>)> {
         proof.check(&self.io)?;
         self.io.validate_target()?;
         if package.manifest.architecture != Architecture::native()? {
             return Err(PayloadError::Invalid);
         }
         let previous = self.load(proof, false)?;
-        let (mut items, mut resources) = (Vec::new(), Vec::new());
+        let (mut items, mut resources, mut unrecorded) = (Vec::new(), Vec::new(), Vec::new());
         for (i, path) in self.paths.iter().enumerate() {
             let current = self.snapshot(proof, path, Self::mode(i), MAX_MEMBER_BYTES)?;
             let old = current.as_ref().map(|s| s.hash);
@@ -1080,7 +1093,8 @@ impl PayloadInstaller {
                         && p.receipt.resources[i].after == ResourceObservation::Matching
                 })
                 .map(|p| p.items[i].ownership);
-            let ownership = if old.is_none() || known == Some(ResourceOwnership::Created) {
+            // What the receipts account for. Repair and removal judge by this alone.
+            let recorded = if old.is_none() || known == Some(ResourceOwnership::Created) {
                 ResourceOwnership::Created
             } else if old == Some(new)
                 && (known == Some(ResourceOwnership::Adopted) || choice == MatchingFiles::Adopt)
@@ -1089,6 +1103,23 @@ impl PayloadInstaller {
             } else {
                 ResourceOwnership::Foreign
             };
+            // WP-4.32: installing, the installer owns its install paths. Whatever is there is
+            // replaced (an unrecorded copy is saved in the backup folder first); only a
+            // matching file that was adopted stays adopted.
+            let ownership = if !owned {
+                recorded
+            } else if old.is_some()
+                && old == Some(new)
+                && (known == Some(ResourceOwnership::Adopted)
+                    || (known.is_none() && choice == MatchingFiles::Adopt))
+            {
+                ResourceOwnership::Adopted
+            } else {
+                ResourceOwnership::Created
+            };
+            if owned && old.is_some() && old != Some(new) && known.is_none() {
+                unrecorded.push(i);
+            }
             let before = match old {
                 None => ResourceObservation::Absent,
                 Some(value) if value == new => ResourceObservation::Matching,
@@ -1110,18 +1141,27 @@ impl PayloadInstaller {
                 replacement: None,
             });
         }
-        if previous.is_none() {
+        if previous.is_none() && !owned {
             if items[0].old.is_some() {
                 return Err(PayloadError::Foreign);
             }
             self.fresh_absence()?;
         }
-        Ok((items, resources))
+        Ok((items, resources, unrecorded))
     }
+    /// What is installed, as the receipts account for it: a file no receipt accounts for is
+    /// `Foreign` here. Installing replaces it anyway (WP-4.32); repair and removal don't.
     pub fn detect(&self, proof: &SupportProof, package: &Package) -> Result<Vec<ResourceReceipt>> {
         Ok(self
-            .observations(proof, package, MatchingFiles::Preserve)?
+            .observations(proof, package, MatchingFiles::Preserve, false)?
             .1)
+    }
+    /// A finished, agent-verified install is recorded, with no unfinished intent next to it.
+    pub fn recorded(&self, proof: &SupportProof) -> Result<bool> {
+        Ok(self.load(proof, true)?.is_none()
+            && self
+                .load(proof, false)?
+                .is_some_and(|journal| journal.phase == Phase::Verified))
     }
     pub fn plan(
         &self,
@@ -1169,7 +1209,7 @@ impl PayloadInstaller {
             }
         }
         self.interrupt(Interruption::Planning)?;
-        let (items, resources) = self.observations(proof, package, matching)?;
+        let (items, resources, unrecorded) = self.observations(proof, package, matching, true)?;
         if self.generation(proof)? != generation {
             return Err(PayloadError::Pending);
         }
@@ -1180,15 +1220,32 @@ impl PayloadInstaller {
         }) {
             return Err(PayloadError::Foreign);
         }
+        // A fresh agent path needs no agent running, or the exact leftovers of a dead one. An
+        // agent that still runs although its file is gone keeps running until the restart
+        // that follows the install.
+        let (dead_runtime, live_agent) = if items[0].old.is_none() {
+            match self.io.dead_runtime() {
+                Ok(dead) => (dead, false),
+                Err(_)
+                    if self
+                        .io
+                        .metadata(&self.io.target().runtime_dir().join("bootstrap.json"))
+                        .is_ok_and(|record| record.is_some()) =>
+                {
+                    (None, true)
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            (None, false)
+        };
         Ok(PayloadPlan {
             generation,
             resuming: false,
             superseding_applied,
-            dead_runtime: if items[0].old.is_none() {
-                self.io.dead_runtime()?
-            } else {
-                None
-            },
+            unrecorded,
+            live_agent,
+            dead_runtime,
             journal: Journal {
                 receipt: InstallReceipt {
                     schema_version: 1,
@@ -1231,6 +1288,8 @@ impl PayloadInstaller {
             generation,
             resuming: true,
             superseding_applied: false,
+            unrecorded: Vec::new(),
+            live_agent: false,
         })
     }
     // An Applied receipt is publication evidence, not agent health. A newer package may
@@ -1457,7 +1516,7 @@ impl PayloadInstaller {
         }
         self.bind(&plan.journal, package)?;
         self.recheck(proof, &plan.journal, plan.resuming)?;
-        if plan.journal.items[0].old.is_none() {
+        if plan.journal.items[0].old.is_none() && !plan.live_agent {
             self.fresh_absence()?;
         }
         let lockpath = self.state.join("install.lock");
@@ -1487,7 +1546,7 @@ impl PayloadInstaller {
             return Err(PayloadError::Pending);
         }
         self.recheck(proof, &plan.journal, plan.resuming)?;
-        if plan.journal.items[0].old.is_none() {
+        if plan.journal.items[0].old.is_none() && !plan.live_agent {
             if self.io.dead_runtime()? != plan.dead_runtime {
                 return Err(PayloadError::Foreign);
             }
@@ -1497,6 +1556,15 @@ impl PayloadInstaller {
             self.fresh_absence()?;
         }
         let mut journal = plan.journal;
+        if plan.live_agent && clean.is_none() {
+            // Only a new instance confirms the new files.
+            journal.previous_instance = self.previous_instance(deadline)?;
+        }
+        // WP-4.32: unrecorded bytes are saved before anything replaces them.
+        for &index in &plan.unrecorded {
+            let old = journal.items[index].old.ok_or(PayloadError::Invalid)?;
+            self.save_copy(proof, index, old)?;
+        }
         if let Some(clean) = clean {
             clean.revalidate_for(&self.io, deadline)?;
             if plan.resuming && journal.previous_instance != Some(clean.instance_id()) {
@@ -1593,7 +1661,7 @@ impl PayloadInstaller {
                 deadline.check()?;
                 proof.check(&self.io)?;
                 if i == 0 && item.old.is_some() && clean.is_none() {
-                    journal.previous_instance = self.current_instance(deadline)?;
+                    journal.previous_instance = self.previous_instance(deadline)?;
                 }
                 // Only this staged inode in this parent may become our replacement on resume.
                 journal.items[i].replacement.get_or_insert(replacement);

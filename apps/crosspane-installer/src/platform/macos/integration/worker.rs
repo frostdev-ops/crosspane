@@ -436,7 +436,12 @@ impl Worker {
                 match self.installs.plan(job.operation, status, &deadline) {
                     Ok(Some(preview)) => {
                         self.held.install = Some(job.operation);
-                        let interrupt = if preview.interrupts_agent {
+                        let interrupt = if preview.replacing {
+                            " If Crosspane is running, it is stopped first. What an older or \
+                             unfinished install left there is saved in ~/Library/Application \
+                             Support/Crosspane/Backups first; your settings, pairings and \
+                             identity stay as they are."
+                        } else if preview.interrupts_agent {
                             " The Crosspane that is running now is stopped first, which ends any \
                              session in progress."
                         } else {
@@ -478,11 +483,19 @@ impl Worker {
                 let deadline = self.deadline(APPLY_MS);
                 let plan_operation = consent.map_or(job.operation, |c| c.plan);
                 match self.installs.apply(plan_operation, &deadline) {
-                    Ok(super::domains::InstallApplied::Requested) => self.emit(
-                        job,
-                        NativeOutcome::Applied(ApplyOutcome::Applied),
-                        "Crosspane was installed and started. It is checked next.",
-                    ),
+                    Ok(super::domains::InstallApplied::Requested) => {
+                        let text = match self.installs.backup() {
+                            Some(folder) => format!(
+                                "Crosspane was installed and started. Replaced an older copy of \
+                                 Crosspane (saved in {}). It is checked next.",
+                                folder.display()
+                            ),
+                            None => {
+                                "Crosspane was installed and started. It is checked next.".into()
+                            }
+                        };
+                        self.emit(job, NativeOutcome::Applied(ApplyOutcome::Applied), text);
+                    }
                     Ok(super::domains::InstallApplied::Unknown)
                     | Err(InstallError::OutcomeUnknown) => {
                         self.emit(
@@ -1056,8 +1069,8 @@ fn install_problem(stage: JobStage, error: InstallError) -> Stop {
     match error {
         InstallError::Foreign => refused(
             stage,
-            "Something where Crosspane installs wasn't put there by Crosspane. It is left exactly \
-             as it is, and nothing was changed.",
+            "Crosspane's install folders couldn't be cleared for the new copy. Check again to \
+             retry.",
         ),
         InstallError::UserDisabled => refused(
             stage,
@@ -1079,13 +1092,8 @@ fn install_problem(stage: JobStage, error: InstallError) -> Stop {
             "What was checked changed before it could be used. Nothing was changed; review again.",
         ),
         InstallError::OutcomeUnknown => wait_user(
-            "The earlier install cannot be verified against this build. Use Uninstall (keeping identity), \
-             then install again. If uninstall cannot verify the files, inspect and remove \
-             ~/Applications/Crosspane.app, ~/.local/bin/crosspanectl, and the Crosspane sign-in item \
-             in ~/Library/LaunchAgents before a fresh install. Keep the private recovery records \
-             for inspection. If using manual removal, also move the payload.json and launch-agent.json \
-             receipts out of ~/Library/Application Support/Crosspane/Installer, keeping a copy. \
-             Nothing was removed automatically.",
+            "The install didn't finish this time. Check again: setup stops Crosspane, saves what \
+             is there in ~/Library/Application Support/Crosspane/Backups and installs fresh.",
         ),
         InstallError::Unobservable | InstallError::Unavailable => wait_contract(
             "The sign-in item or the installed files can't be read just now. Nothing was assumed.",

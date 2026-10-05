@@ -737,6 +737,85 @@ impl MacNativeIo {
             .and_then(|_| self.boundary("complete", &path, deadline));
         result.map_err(|_| NativeError::OutcomeUnknown)
     }
+    /// WP-4.32: move whatever is at `from` (any kind of entry; a link is moved, never followed)
+    /// into the directory `to_dir` as `name`, or `name.N` when that is taken. Both must lie in
+    /// setup's own install or backup paths. Returns where it went, or `None` when nothing was
+    /// there.
+    pub fn move_aside(
+        &self,
+        proof: &SupportProof,
+        from: &Path,
+        to_dir: &Path,
+        name: &str,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<PathBuf>> {
+        let _serial = self.mutation.try_lock().map_err(|_| NativeError::Busy)?;
+        proof.check(self, deadline)?;
+        let from = admitted_spelling(from)?;
+        let to_dir = admitted_spelling(to_dir)?;
+        if !self.target.writable(&from) || !self.target.writable(&to_dir.join(name)) {
+            return Err(NativeError::Foreign);
+        }
+        let (source, entry) = match self.parent(&from) {
+            Ok(found) => found,
+            Err(NativeError::Unavailable) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match rfs::statat(&source.fd, &entry, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(_) => return Err(NativeError::Unavailable),
+        }
+        let destination = walk(&self.target, &to_dir)?.ok_or(NativeError::Unavailable)?;
+        self.boundary("move-aside", &from, deadline)?;
+        let mut target = name.to_owned();
+        for attempt in 1..=100 {
+            if !bounded(&target, 255) {
+                return Err(NativeError::Invalid);
+            }
+            match rfs::renameat_with(
+                &source.fd,
+                entry.as_str(),
+                &destination.fd,
+                target.as_str(),
+                rfs::RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {
+                    self.filesystem
+                        .execute(FilesystemOperation::DirectorySync(source.fd.as_fd()))?;
+                    self.filesystem
+                        .execute(FilesystemOperation::DirectorySync(destination.fd.as_fd()))?;
+                    source.revalidate(self)?;
+                    destination.revalidate(self)?;
+                    return Ok(Some(to_dir.join(target)));
+                }
+                Err(rustix::io::Errno::EXIST) => target = format!("{name}.{attempt}"),
+                Err(_) => return Err(NativeError::Unavailable),
+            }
+        }
+        Err(NativeError::Busy)
+    }
+    /// WP-4.32: remove one old folder below setup's backups folder, never following a link.
+    pub fn remove_backup(
+        &self,
+        proof: &SupportProof,
+        name: &str,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let _serial = self.mutation.try_lock().map_err(|_| NativeError::Busy)?;
+        proof.check(self, deadline)?;
+        let root = self.target.backups_dir();
+        if !bounded(name, 255) || name.contains('/') || name == "." || name == ".." {
+            return Err(NativeError::Invalid);
+        }
+        let anchor = walk(&self.target, &root)?.ok_or(NativeError::Unavailable)?;
+        remove_tree(&anchor.fd, name, 0, deadline)?;
+        native(rfs::fsync(&anchor.fd))
+    }
+    /// Whether `pid` is observed running (bounded `ps`); an unclear answer is an error.
+    pub(crate) fn pid_running(&self, pid: u32, deadline: &Deadline) -> NativeResult<bool> {
+        self.pid_observed_live(pid, deadline)
+    }
     pub fn lock(&self, proof: &SupportProof, deadline: &Deadline) -> NativeResult<InstallerLock> {
         let _serial = self.mutation.try_lock().map_err(|_| NativeError::Busy)?;
         proof.check(self, deadline)?;
@@ -1331,4 +1410,41 @@ impl MacNativeIo {
         })();
         result.map_err(|_| NativeError::OutcomeUnknown)
     }
+}
+
+/// Depth-bounded removal below an admitted directory; links and files are unlinked, never followed.
+fn remove_tree(dir: &OwnedFd, name: &str, depth: usize, deadline: &Deadline) -> NativeResult<()> {
+    deadline.check()?;
+    if depth > 32 {
+        return Err(NativeError::Oversize);
+    }
+    let stat = native(rfs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW))?;
+    if stat.st_mode as u32 & 0o170000 != 0o040000 {
+        return native(rfs::unlinkat(dir, name, AtFlags::empty()));
+    }
+    let child = native(rfs::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ))?;
+    let opened = native(rfs::fstat(&child))?;
+    if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino) {
+        return Err(NativeError::Foreign);
+    }
+    let mut names = Vec::new();
+    for entry in native(rfs::Dir::read_from(&child))? {
+        let entry = native(entry)?;
+        let entry = entry
+            .file_name()
+            .to_str()
+            .map_err(|_| NativeError::Invalid)?;
+        if entry != "." && entry != ".." {
+            names.push(entry.to_owned());
+        }
+    }
+    for entry in names {
+        remove_tree(&child, &entry, depth + 1, deadline)?;
+    }
+    native(rfs::unlinkat(dir, name, AtFlags::REMOVEDIR))
 }

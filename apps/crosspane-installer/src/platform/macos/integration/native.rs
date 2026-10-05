@@ -353,8 +353,35 @@ impl Agents for NativeAgents {
 /// A plan that was previewed and is waiting for consent.
 struct Kept {
     operation: OperationId,
-    launch: MacLaunchAgent,
-    plan: LaunchPlan,
+    plan: KeptPlan,
+}
+
+/// The ordinary install plan, or a fresh start over whatever is in the install paths.
+enum KeptPlan {
+    Plan {
+        launch: Box<MacLaunchAgent>,
+        plan: Box<LaunchPlan>,
+    },
+    Fresh,
+}
+
+/// How long a stopping agent gets to report a clean exit before its sign-in item is booted out
+/// once more and the install continues without that report (WP-4.32).
+const CLEAN_STOP_MS: u64 = if cfg!(test) { 1_000 } else { 20_000 };
+
+/// WP-4.32: these mean "what is in the install paths can't be built on". Setup owns those
+/// paths: it stops its own sign-in item, saves what is there into the backup folder and starts
+/// fresh. Anything else (an unsupported Mac or build, the sign-in item turned off by the person,
+/// launchd that can't be read, time) is not about the install paths, and stays what it is.
+fn start_fresh_over(error: &InstallError) -> bool {
+    matches!(
+        error,
+        InstallError::Foreign
+            | InstallError::Refused
+            | InstallError::OutcomeUnknown
+            | InstallError::Unavailable
+            | InstallError::Failed
+    )
 }
 
 /// An install whose first start was requested and is waiting to be confirmed from the agent.
@@ -367,8 +394,14 @@ pub struct NativeInstalls {
     env: Arc<NativeEnv>,
     kept: Option<Kept>,
     running: Option<Running>,
+    /// An apply in this run didn't finish: the next plan starts fresh (WP-4.32).
+    start_fresh: bool,
+    /// Where this run saved what it replaced.
+    backup: Option<std::path::PathBuf>,
 }
 
+/// What stops planning on the ordinary path. A sign-in item or files that aren't this install's
+/// own (Conflict, AdoptionRequired) are not a stop any more: they are replaced, saved first.
 fn blocker(state: LaunchState) -> Option<InstallError> {
     match state {
         LaunchState::Conflict | LaunchState::AdoptionRequired => Some(InstallError::Foreign),
@@ -411,6 +444,106 @@ impl NativeInstalls {
             env,
             kept: None,
             running: None,
+            start_fresh: false,
+            backup: None,
+        }
+    }
+
+    /// This run's own install is waiting for its new agent, which doesn't answer yet.
+    fn own_start_pending(&self, error: &InstallError) -> bool {
+        *error == InstallError::Unavailable && self.awaiting_confirmation()
+    }
+
+    /// The ordinary plan, with every blocker as an error.
+    fn ordinary(
+        &self,
+        operation: OperationId,
+        status: Option<&AgentReply>,
+        deadline: &Deadline,
+    ) -> Result<(MacLaunchAgent, LaunchPlan, Standing), InstallError> {
+        let (launch, plan, standing) = self.plan_launch(operation, status, deadline)?;
+        if let Some(error) = blocker(plan.state()) {
+            return Err(error);
+        }
+        Ok((launch, plan, standing))
+    }
+
+    /// Execute a consented launch plan, waiting for the old agent's clean stop within this
+    /// bounded apply. `None` means it could not finish that way and should start fresh.
+    fn execute(
+        &mut self,
+        launch: MacLaunchAgent,
+        plan: LaunchPlan,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<Option<InstallApplied>, InstallError> {
+        let consent = plan
+            .consent(operation.0, operation.0, false, false)
+            .map_err(|_| InstallError::Foreign)?;
+        let mut pending = match launch.execute(plan, consent, deadline) {
+            Ok(pending) => pending,
+            Err(NativeError::Timeout | NativeError::Cancelled) => {
+                return Err(InstallError::OutcomeUnknown);
+            }
+            Err(error) => return Err(map_native(error)),
+        };
+        // The old agent stops first; wait for that, within this same bounded apply. If it
+        // doesn't report a clean exit in time, the install starts fresh (its sign-in item is
+        // booted out once more and it is not waited for any longer).
+        let started = std::time::Instant::now();
+        while pending.phase() == LaunchPhase::WaitingForCleanStop {
+            if deadline.check().is_err() {
+                self.running = Some(Running { launch, pending });
+                return Ok(Some(InstallApplied::Unknown));
+            }
+            if started.elapsed() >= Duration::from_millis(CLEAN_STOP_MS) {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(250));
+            if launch.resume_clean_stop(&mut pending, deadline).is_err() {
+                break;
+            }
+        }
+        match pending.phase() {
+            LaunchPhase::BootstrapRequested | LaunchPhase::Observed => {
+                self.running = Some(Running { launch, pending });
+                Ok(Some(InstallApplied::Requested))
+            }
+            _ if deadline.check().is_err() => {
+                self.running = Some(Running { launch, pending });
+                Ok(Some(InstallApplied::Unknown))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Stop Crosspane's own sign-in item, save whatever is in the install paths into a new
+    /// backup folder, then install from nothing.
+    fn fresh(
+        &mut self,
+        operation: OperationId,
+        deadline: &Deadline,
+    ) -> Result<InstallApplied, InstallError> {
+        self.running = None;
+        let io = self.env.io().map_err(map_native)?;
+        let launch = MacLaunchAgent::admit(
+            io,
+            self.env.inventory.clone(),
+            self.env.probes.approval.clone(),
+            deadline,
+        )
+        .map_err(map_admission)?;
+        match launch.reclaim(deadline) {
+            Ok(Some(reclaimed)) => self.backup = Some(reclaimed.folder),
+            Ok(None) => {}
+            Err(NativeError::Unsupported) => return Err(InstallError::UserDisabled),
+            Err(NativeError::Unavailable) => return Err(InstallError::Unobservable),
+            Err(error) => return Err(map_native(error)),
+        }
+        let (launch, plan, _) = self.ordinary(operation, None, deadline)?;
+        match self.execute(launch, plan, operation, deadline)? {
+            Some(applied) => Ok(applied),
+            None => Err(InstallError::OutcomeUnknown),
         }
     }
 
@@ -517,11 +650,15 @@ impl Installs for NativeInstalls {
         deadline: &Deadline,
     ) -> Result<InstallState, InstallError> {
         let operation = OperationId(1);
-        let (_, plan, standing) = self.plan_launch(operation, status, deadline)?;
-        if let Some(error) = blocker(plan.state()) {
-            return Err(error);
+        match self.ordinary(operation, status, deadline) {
+            Ok((_, _, standing)) => Ok(self.standing(standing)),
+            // Setup saves what is there and installs fresh: that is an install to do. The agent
+            // this run just started may not answer yet; that is a wait, never a new install.
+            Err(error) if start_fresh_over(&error) && !self.own_start_pending(&error) => {
+                Ok(InstallState::Needed)
+            }
+            Err(error) => Err(error),
         }
-        Ok(self.standing(standing))
     }
 
     fn plan(
@@ -531,21 +668,42 @@ impl Installs for NativeInstalls {
         deadline: &Deadline,
     ) -> Result<Option<InstallPreview>, InstallError> {
         self.kept = None;
-        let (launch, plan, standing) = self.plan_launch(operation, status, deadline)?;
-        if let Some(error) = blocker(plan.state()) {
-            return Err(error);
-        }
-        if self.standing(standing) == InstallState::Current {
-            return Ok(None);
-        }
-        let preview = InstallPreview {
-            version: self.env.inventory.product_version.clone(),
-            interrupts_agent: plan.interrupts_agent(),
+        let attempt = if self.start_fresh {
+            Err(InstallError::Foreign)
+        } else {
+            self.ordinary(operation, status, deadline)
+        };
+        let (kept, preview) = match attempt {
+            Ok((launch, plan, standing)) => {
+                if self.standing(standing) == InstallState::Current {
+                    return Ok(None);
+                }
+                let preview = InstallPreview {
+                    version: self.env.inventory.product_version.clone(),
+                    interrupts_agent: plan.interrupts_agent(),
+                    replacing: false,
+                };
+                (
+                    KeptPlan::Plan {
+                        launch: Box::new(launch),
+                        plan: Box::new(plan),
+                    },
+                    preview,
+                )
+            }
+            Err(error) if start_fresh_over(&error) && !self.own_start_pending(&error) => (
+                KeptPlan::Fresh,
+                InstallPreview {
+                    version: self.env.inventory.product_version.clone(),
+                    interrupts_agent: true,
+                    replacing: true,
+                },
+            ),
+            Err(error) => return Err(error),
         };
         self.kept = Some(Kept {
             operation,
-            launch,
-            plan,
+            plan: kept,
         });
         Ok(Some(preview))
     }
@@ -558,45 +716,21 @@ impl Installs for NativeInstalls {
         let Some(kept) = self.kept.take().filter(|k| k.operation == operation) else {
             return Err(InstallError::Refused);
         };
-        // Adopting something Crosspane didn't create is never part of this consent.
-        let consent = kept
-            .plan
-            .consent(operation.0, operation.0, false, false)
-            .map_err(|_| InstallError::Foreign)?;
-        let mut pending = match kept.launch.execute(kept.plan, consent, deadline) {
-            Ok(pending) => pending,
-            Err(NativeError::Timeout | NativeError::Cancelled) => {
-                return Err(InstallError::OutcomeUnknown);
+        self.backup = None;
+        let result = match kept.plan {
+            KeptPlan::Plan { launch, plan } => {
+                match self.execute(*launch, *plan, operation, deadline) {
+                    Ok(Some(applied)) => Ok(applied),
+                    // The ordinary plan no longer fits what is there: start fresh, now.
+                    Ok(None) => self.fresh(operation, deadline),
+                    Err(error) if start_fresh_over(&error) => self.fresh(operation, deadline),
+                    Err(error) => Err(error),
+                }
             }
-            Err(error) => return Err(map_native(error)),
+            KeptPlan::Fresh => self.fresh(operation, deadline),
         };
-        // The old agent stops first; wait for that, within this same bounded apply.
-        while pending.phase() == LaunchPhase::WaitingForCleanStop {
-            if deadline.check().is_err() {
-                self.running = Some(Running {
-                    launch: kept.launch,
-                    pending,
-                });
-                return Ok(InstallApplied::Unknown);
-            }
-            thread::sleep(Duration::from_millis(250));
-            if kept
-                .launch
-                .resume_clean_stop(&mut pending, deadline)
-                .is_err()
-            {
-                break;
-            }
-        }
-        let outcome = match pending.phase() {
-            LaunchPhase::BootstrapRequested | LaunchPhase::Observed => InstallApplied::Requested,
-            _ => InstallApplied::Unknown,
-        };
-        self.running = Some(Running {
-            launch: kept.launch,
-            pending,
-        });
-        Ok(outcome)
+        self.start_fresh = !matches!(result, Ok(InstallApplied::Requested));
+        result
     }
 
     fn verify(
@@ -655,6 +789,10 @@ impl Installs for NativeInstalls {
                 Err(map_native(error))
             }
         }
+    }
+
+    fn backup(&self) -> Option<std::path::PathBuf> {
+        self.backup.clone()
     }
 }
 
@@ -945,7 +1083,7 @@ fn effect_phrase(effect: RemovalEffect) -> Option<&'static str> {
         RemovalEffect::RemoveOwnedAfterVerification => "remove Crosspane's own files",
         RemovalEffect::KeepRecovery => "keep the recovery files",
         RemovalEffect::KeepIdentity => "keep this Mac's identity and pairings",
-        RemovalEffect::KeepForeign => "leave files Crosspane didn't create untouched",
+        RemovalEffect::KeepForeign => "leave other files untouched",
         RemovalEffect::PruneEmptyOwnedAfterVerification | RemovalEffect::Absent => return None,
     })
 }
@@ -1439,8 +1577,8 @@ fn guidance_text(error: NativeError) -> String {
             "Crosspane's sign-in item is turned off, and repair never turns it back on."
         }
         RepairGuidance::RestoreOrRemoveFileOrUninstallThenInstall => {
-            "Something where Crosspane installs wasn't put there by Crosspane, or no longer \
-             matches what setup created."
+            "Crosspane's installed files differ from what setup recorded. Running setup again \
+             saves them in ~/Library/Application Support/Crosspane/Backups and installs fresh."
         }
         RepairGuidance::UninstallThenInstall => {
             "Repair needs the Crosspane that setup installed to be running, with its files as \

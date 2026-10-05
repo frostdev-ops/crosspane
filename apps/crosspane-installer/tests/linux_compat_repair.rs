@@ -927,7 +927,7 @@ fn clean_stop_rechecks_changed_bootstrap_before_payload_or_start_dispatch() {
 }
 
 #[test]
-fn retained_bootstrap_without_clean_stop_keeps_ordinary_routes_refused() {
+fn retained_bootstrap_without_clean_stop_keeps_service_routes_refused() {
     let f = Fixture::new();
     let _clean = f.clean_stop();
     let proof = f.proof();
@@ -950,13 +950,28 @@ fn retained_bootstrap_without_clean_stop_keeps_ordinary_routes_refused() {
         .installer
         .plan(&proof, &package, OperationId(2), MatchingFiles::Preserve)
         .unwrap();
+    // WP-4.32: setup owns its install paths, so the ordinary install goes ahead over a stopped
+    // agent's retained bootstrap. That stopped instance can never confirm the new files.
     let before = f.bytes();
-    assert!(
-        f.installer
-            .apply(&proof, &package, plan, &deadline())
-            .is_err()
-    );
-    assert_eq!(f.bytes(), before);
+    f.installer
+        .apply(&proof, &package, plan, &deadline())
+        .unwrap();
+    assert_ne!(f.bytes(), before);
+    let retained: Value = serde_json::from_slice(
+        &fs::read(f.io.target().runtime_dir().join("bootstrap.json")).unwrap(),
+    )
+    .unwrap();
+    let outcome: Value = serde_json::from_slice(
+        &fs::read(
+            f.io.target()
+                .paths()
+                .state_home
+                .join("crosspane/installer/payload-outcome.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(outcome["previous_instance"], retained["instance_id"]);
 }
 
 #[test]

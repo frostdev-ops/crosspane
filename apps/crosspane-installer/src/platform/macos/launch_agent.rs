@@ -220,6 +220,9 @@ mod detection;
 mod executor;
 #[path = "launch_agent/intent.rs"]
 mod intent;
+#[path = "launch_agent/reclaim.rs"]
+mod reclaim;
 use detection::checked_reply;
 use intent::digest;
 pub use intent::render_plist;
+pub use reclaim::{KEEP_BACKUPS, Reclaimed};

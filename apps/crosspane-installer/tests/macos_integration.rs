@@ -212,6 +212,7 @@ impl Installs for FakeInstalls {
         Ok((!w.installed).then(|| InstallPreview {
             version: "0.0.1".into(),
             interrupts_agent: false,
+            replacing: false,
         }))
     }
 
@@ -881,14 +882,16 @@ fn install_detection_maps_each_state_to_an_honest_outcome() {
 }
 
 #[test]
-fn a_foreign_or_disabled_install_is_explained_and_left_alone() {
+fn an_uncleared_or_disabled_install_is_explained_without_ownership_words() {
     let mut rig = Rig::new();
+    // WP-4.32: the native adapter clears its install paths itself; this only remains for a
+    // failure to do that, and it never speaks of who put what there.
     rig.set(|w| w.detect = Some(Err(InstallError::Foreign)));
     let (_, foreign) = rig.run(INSTALL, JobStage::Detect, None, None);
-    assert!(
-        foreign.detail.contains("left exactly as it is"),
-        "{foreign:?}"
-    );
+    assert!(foreign.detail.contains("Check again"), "{foreign:?}");
+    for word in ["put there", "left exactly", "didn't create"] {
+        assert!(!foreign.detail.contains(word), "{foreign:?}");
+    }
     rig.set(|w| w.detect = Some(Err(InstallError::UserDisabled)));
     let (_, disabled) = rig.run(INSTALL, JobStage::Detect, None, None);
     assert!(disabled.detail.contains("Login Items"), "{disabled:?}");
@@ -1062,6 +1065,7 @@ fn an_interrupting_plan_says_the_running_agent_is_stopped_first() {
         w.plan = Some(Ok(Some(InstallPreview {
             version: "0.0.2".into(),
             interrupts_agent: true,
+            replacing: false,
         })))
     });
     let (_, plan) = rig.run(INSTALL, JobStage::Plan, None, None);

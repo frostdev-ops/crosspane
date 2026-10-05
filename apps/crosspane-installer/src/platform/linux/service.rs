@@ -495,6 +495,36 @@ impl LinuxService {
                 .map(String::as_str)
                 .ok_or(ServiceError::Unknown)
         };
+        // WP-4.32: right after setup replaced the unit file, the manager still describes the
+        // earlier unit until a reload. That earlier unit is not judged; the reload comes first,
+        // and every property is checked against the new unit after it.
+        if get("NeedDaemonReload")? == "yes"
+            && get("Id")? == UNIT
+            && get("LoadState")? == "loaded"
+            && get("FragmentPath")? == self.resources[0].target.to_string_lossy()
+        {
+            let active = get("ActiveState")?;
+            let main_pid = get("MainPID")?
+                .parse::<u32>()
+                .map_err(|_| ServiceError::Unknown)?;
+            if !matches!(
+                active,
+                "active" | "inactive" | "failed" | "activating" | "deactivating"
+            ) || (active == "active" && main_pid == 0)
+                || (active == "inactive" && main_pid != 0)
+            {
+                return Err(ServiceError::Unknown);
+            }
+            return Ok(ServiceFacts {
+                fragment: self.resources[0].target.clone(),
+                enabled: get("UnitFileState")? == "enabled",
+                active_state: active.into(),
+                sub_state: get("SubState")?.into(),
+                main_pid,
+                needs_reload: true,
+                source: self.io.target().source(),
+            });
+        }
         for (key, expected) in [
             ("Id", UNIT),
             ("LoadState", "loaded"),

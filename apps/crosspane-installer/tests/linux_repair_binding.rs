@@ -691,16 +691,15 @@ fn repair_is_offered_only_for_a_compatible_install_with_a_running_original() {
     let offer = repairer.inspect(None, NOW);
     assert!(matches!(offer.repair, Availability::Unavailable(_)));
 
-    // A file the person edited is not Crosspane's to replace: remove and reinstall.
+    // An edited file is beyond repair's record: setup itself replaces it (WP-4.32), saving
+    // it first. Repair says so, without ownership words.
     fs::write(&f.installer.targets()[2], b"owned fixture user edit").unwrap();
     let offer = repairer.inspect(Some(&package), NOW);
     let Availability::Unavailable(text) = offer.repair else {
         panic!("{offer:?}")
     };
-    assert!(
-        text.contains("Remove Crosspane and install it again"),
-        "{text}"
-    );
+    assert!(text.contains("Run setup again"), "{text}");
+    assert!(!text.contains("put there"), "{text}");
     assert!(f.mutations().is_empty());
     assert_eq!(
         fs::read(&f.installer.targets()[2]).unwrap(),
