@@ -708,6 +708,9 @@ pub struct Agent {
     lifecycle_paths: Option<crate::paths::Paths>,
     /// What the agent counts and remembers for `status.result.installer` (WP-4.5).
     tracker: installer::Tracker,
+    /// Native startup entries retained solely because their original monitor is unavailable.
+    #[cfg(windows)]
+    pub(crate) windows_mirror_pending: usize,
     /// Every input fed to the engine, in order (tests only).
     #[cfg(test)]
     fed: Vec<Input>,
@@ -981,6 +984,8 @@ impl Agent {
             startup: installer::StartupFacts::unknown(node),
             lifecycle_paths: None,
             tracker: installer::Tracker::new(),
+            #[cfg(windows)]
+            windows_mirror_pending: 0,
             #[cfg(test)]
             fed: Vec::new(),
             #[cfg(test)]
@@ -1614,6 +1619,12 @@ impl Agent {
             }
             crate::parking_worker::Outcome::Started { .. } => {}
             crate::parking_worker::Outcome::Parked { window, result } => {
+                #[cfg(windows)]
+                if completion.notice
+                    == Some(crosspane_platform_windows::model::parking::PENDING_REPARK_REASON)
+                {
+                    self.tracker.pending_repark_refused(*window, completion.id);
+                }
                 self.home_parked(*window, result);
                 if feed && self.parking_latest.get(window) == Some(&completion.id) {
                     self.parking_latest.remove(window);
@@ -1637,6 +1648,10 @@ impl Agent {
                 }
             }
             crate::parking_worker::Outcome::Panicked => {}
+        }
+        #[cfg(windows)]
+        if let Some(text) = completion.notice {
+            self.say(text.to_owned());
         }
     }
 
@@ -2939,7 +2954,7 @@ impl Agent {
     }
 
     /// Tell the user: a line in the log, the notice history and `crosspanectl status`.
-    fn say(&mut self, text: String) {
+    pub(crate) fn say(&mut self, text: String) {
         tracing::info!(notice = %text);
         if self.notices.len() == NOTICE_HISTORY {
             self.notices.pop_front();
@@ -6808,6 +6823,14 @@ mod installer {
                 .or_insert(id);
         }
 
+        #[cfg(windows)]
+        pub fn pending_repark_refused(&mut self, window: WindowId, id: u64) {
+            // Exact backend refusal proves this attempt created no new journal entry.
+            if self.parked.get(&window) == Some(&id) {
+                self.parked.remove(&window);
+            }
+        }
+
         pub fn restore_started(&mut self, id: u64) {
             self.last_restore = Some(id);
             self.restores.insert(id, None);
@@ -7088,6 +7111,10 @@ mod installer {
                 LockState::Locked => "locked",
                 LockState::Unknown => "unknown",
             };
+            let recovery_pending = t.recovery_pending();
+            #[cfg(windows)]
+            let recovery_pending = recovery_pending
+                .saturating_add(u32::try_from(self.windows_mirror_pending).unwrap_or(u32::MAX));
             #[allow(unused_mut)]
             let mut status = json!({
                 "schema_version": SCHEMA_VERSION,
@@ -7102,7 +7129,7 @@ mod installer {
                 },
                 "config_revision": self.startup.config_revision,
                 "node": self.node.to_string(),
-                "recovery_pending": t.recovery_pending(),
+                "recovery_pending": recovery_pending,
                 "startup_recovery": self.platform.startup_recovery.as_str(),
                 "gate": {
                     "open": self.platform.gate.is_open(),
@@ -12851,6 +12878,8 @@ mod home_tests {
             if matches!(
                 &event,
                 Event::Parking(crate::parking_worker::Completion {
+                    #[cfg(windows)]
+                    notice: None,
                     outcome: crate::parking_worker::Outcome::Restored { .. },
                     ..
                 })
@@ -18794,6 +18823,48 @@ mod home_tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_pending_repark_notice_preserves_true_startup_and_active_entry_counts() {
+        let mut h = home();
+        h.rig.agent.windows_mirror_pending = 1;
+        h.rig.agent.platform.startup_recovery = crate::platform::StartupRecovery::Failed;
+        let pending = WindowId(10);
+        let active = WindowId(20);
+        h.rig.agent.tracker.parking_started(pending, 1);
+        h.rig.agent.tracker.parking_started(active, 2);
+        let reason = crosspane_platform_windows::model::parking::PENDING_REPARK_REASON;
+        h.rig.agent.parking_completed(
+            crate::parking_worker::Completion {
+                id: 1,
+                outcome: crate::parking_worker::Outcome::Parked {
+                    window: pending,
+                    result: Err(Failure::Other),
+                },
+                notice: Some(reason),
+            },
+            false,
+        );
+        let status = status_installer(&h);
+        assert_eq!(status["recovery_pending"], json!(2));
+        assert_eq!(status["startup_recovery"], json!("failed"));
+        assert_eq!(h.rig.agent.notices.back().map(String::as_str), Some(reason));
+        let notices = h.rig.agent.notices.len();
+        h.rig.agent.parking_completed(
+            crate::parking_worker::Completion {
+                id: 2,
+                outcome: crate::parking_worker::Outcome::Parked {
+                    window: active,
+                    result: Err(Failure::Other),
+                },
+                notice: None,
+            },
+            false,
+        );
+        assert_eq!(status_installer(&h)["recovery_pending"], json!(2));
+        assert_eq!(h.rig.agent.notices.len(), notices);
+    }
+
     #[test]
     fn startup_recovery_reports_what_the_platform_kept_and_is_apart_from_recovery_pending() {
         use crate::platform::StartupRecovery;
@@ -18900,6 +18971,8 @@ mod home_tests {
             if matches!(
                 &event,
                 Event::Parking(crate::parking_worker::Completion {
+                    #[cfg(windows)]
+                    notice: None,
                     outcome: crate::parking_worker::Outcome::Parked { .. },
                     ..
                 })
@@ -18911,6 +18984,8 @@ mod home_tests {
         assert!(matches!(
             &parked,
             Event::Parking(crate::parking_worker::Completion {
+                #[cfg(windows)]
+                notice: None,
                 outcome: crate::parking_worker::Outcome::Parked { .. },
                 ..
             })

@@ -345,6 +345,15 @@ struct Started {
     shutdown_watch: windows::shutdown::Watch,
 }
 
+#[cfg(windows)]
+fn windows_mirror_startup_notice(pending: &mut Option<usize>, say: impl FnOnce(String)) {
+    if let Some(count) = pending.take().filter(|n| *n > 0) {
+        say(format!(
+            "Crosspane couldn't return {count} window(s) to a monitor that is no longer connected; they stay where they are."
+        ));
+    }
+}
+
 fn start_agent(
     paths: &Paths,
     lifecycle: &mut lifecycle::Lifecycle,
@@ -354,6 +363,11 @@ fn start_agent(
     // The revision is of the very bytes this run is configured from (WP-4.5).
     let (config, config_revision) = Config::load_revision(paths)?;
     *failure = lifecycle::Failure::Platform;
+    // Native-tuple crash recovery must precede even winit's observer registrations/DPI setup.
+    #[cfg(windows)]
+    let recovered_mirror = platform::recover_windows_mirror_before_host(&paths.state_dir, &config)?;
+    #[cfg(windows)]
+    let windows_mirror_pending = recovered_mirror.pending;
     // Winit registers both Raw Input classes at EventLoop construction. On Windows the
     // host relinquishes those registrations before ANY native platform observer exists,
     // preserving capture's mouse target as well as the required release/panic target.
@@ -365,6 +379,9 @@ fn start_agent(
             None
         }
     };
+    #[cfg(windows)]
+    let mut platform = platform::create(&paths.state_dir, &config, recovered_mirror)?;
+    #[cfg(not(windows))]
     let mut platform = platform::create(&paths.state_dir, &config)?;
     #[cfg(windows)]
     let acceptance_scratch = platform.acceptance_scratch;
@@ -579,6 +596,12 @@ fn start_agent(
     );
     agent.set_clipboard(clipboard);
     agent.set_startup(startup_facts);
+    #[cfg(windows)]
+    {
+        agent.windows_mirror_pending = windows_mirror_pending;
+        let mut notice = Some(windows_mirror_pending);
+        windows_mirror_startup_notice(&mut notice, |text| agent.say(text));
+    }
     agent.set_lifecycle_paths(paths.clone());
     agent.start_discovery();
     *failure = lifecycle::Failure::Socket;
@@ -2657,5 +2680,25 @@ mod macos_launch_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_mirror_startup_notice_tests {
+    #[test]
+    fn pending_startup_notice_is_once_and_empty_startup_is_silent() {
+        let mut notice = Some(1);
+        let mut said = Vec::new();
+        super::windows_mirror_startup_notice(&mut notice, |text| said.push(text));
+        super::windows_mirror_startup_notice(&mut notice, |text| said.push(text));
+        assert_eq!(
+            said,
+            [
+                "Crosspane couldn't return 1 window(s) to a monitor that is no longer connected; they stay where they are."
+            ]
+        );
+        let mut empty = Some(0);
+        super::windows_mirror_startup_notice(&mut empty, |text| said.push(text));
+        assert_eq!(said.len(), 1);
     }
 }

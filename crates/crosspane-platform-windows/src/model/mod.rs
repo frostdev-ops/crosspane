@@ -16,6 +16,7 @@ pub mod journal;
 pub mod keystore;
 pub mod link;
 pub mod overlay;
+pub mod parking;
 pub mod session;
 pub mod tray;
 #[cfg(feature = "video")]

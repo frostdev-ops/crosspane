@@ -745,10 +745,128 @@ fn windows_hotkeys_after_host_with(
     Ok(backend)
 }
 
+/// The native recovery owner is constructed before winit or any source/capture/hook.
+#[cfg(windows)]
+pub(crate) struct WindowsRecoveredMirror {
+    pub(crate) parking: crosspane_platform_windows::parking::WindowsMirrorParking,
+    pub(crate) startup: StartupRecovery,
+    pub(crate) pending: usize,
+}
+#[cfg(windows)]
+struct WindowsMirrorStore {
+    directory: std::path::PathBuf,
+    empty_required: bool,
+}
+#[cfg(windows)]
+impl WindowsMirrorStore {
+    fn read_image(&self, name: &str) -> Result<Option<Vec<u8>>, PlatformError> {
+        use std::io::Read;
+        let path = self.directory.join(name);
+        // Reuse exactly the existing private admission/pinning implementation. The admitted
+        // leaf's no-delete pin and ancestor pins remain live across the bounded std file read.
+        let _parents = crate::windows::security::pin_parent(&path)
+            .map_err(|_| PlatformError::Backend("mirror private parent admission".into()))?;
+        let Some(_leaf) = crate::windows::security::private_file(&path)
+            .map_err(|_| PlatformError::Backend("mirror private leaf admission".into()))?
+        else {
+            return Ok(None);
+        };
+        let file = std::fs::File::open(&path)
+            .map_err(|_| PlatformError::Backend("mirror journal read".into()))?;
+        let mut bytes = Vec::new();
+        file.take(crosspane_platform_windows::model::parking::MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| PlatformError::Backend("mirror journal read".into()))?;
+        if bytes.len() > crosspane_platform_windows::model::parking::MAX_BYTES {
+            return Err(PlatformError::Backend("mirror journal byte bound".into()));
+        }
+        Ok(Some(bytes))
+    }
+}
+#[cfg(windows)]
+impl crosspane_platform_windows::parking::MirrorJournalStore for WindowsMirrorStore {
+    fn read(
+        &mut self,
+    ) -> Result<crosspane_platform_windows::parking::MirrorJournalImages, PlatformError> {
+        use crosspane_platform_windows::model::parking::{COMMITTED_NAME, Journal, PENDING_NAME};
+        let images = crosspane_platform_windows::parking::MirrorJournalImages {
+            committed: self.read_image(COMMITTED_NAME)?,
+            pending: self.read_image(PENDING_NAME)?,
+        };
+        // E1/destination scratch is forbidden from inspecting a persisted owner's source HWND.
+        // Fully validate the same journal but refuse outstanding entries before native work.
+        if self.empty_required && !Journal::load(&images)?.0.entries().is_empty() {
+            return Err(PlatformError::Backend(
+                "scratch startup refused: outstanding mirror recovery".into(),
+            ));
+        }
+        Ok(images)
+    }
+    fn commit(&mut self, document: &[u8]) -> Result<(), PlatformError> {
+        use crosspane_platform_windows::model::parking::{COMMITTED_NAME, MAX_BYTES, PENDING_NAME};
+        if document.len() > MAX_BYTES {
+            return Err(PlatformError::Backend("mirror journal byte bound".into()));
+        }
+        // write_private writes/flushed its private same-directory temporary before publishing.
+        // A failure in either publish faults the parking stream; no native mutation follows.
+        for name in [PENDING_NAME, COMMITTED_NAME] {
+            crate::paths::write_private(&self.directory.join(name), document).map_err(|_| {
+                PlatformError::Backend("mirror journal publication failed; retained".into())
+            })?;
+        }
+        Ok(())
+    }
+}
+#[cfg(windows)]
+pub(crate) fn recover_windows_mirror_before_host(
+    state_dir: &std::path::Path,
+    config: &crate::config::Config,
+) -> anyhow::Result<WindowsRecoveredMirror> {
+    use anyhow::Context;
+    // Scratch validation precedes even host construction and any native source field queries.
+    let e1 = acceptance_e1(state_dir, config)?;
+    let destination = acceptance_e2_destination(state_dir, config)?;
+    let scratch = e1 || destination;
+    let store = WindowsMirrorStore {
+        directory: state_dir.to_owned(),
+        empty_required: scratch,
+    };
+    let mut parking =
+        crosspane_platform_windows::parking::WindowsMirrorParking::new(Box::new(store))
+            .context("Windows mirror journal (required)")?;
+    let (startup, pending) = if scratch {
+        (StartupRecovery::None, 0)
+    } else {
+        let recovery = parking
+            .recover_startup()
+            .context("Windows pre-host mirror recovery (required)")?;
+        tracing::info!(
+            restored = recovery.restored,
+            retired = recovery.retired,
+            pending = recovery.pending,
+            "Windows mirror recovery"
+        );
+        (
+            if recovery.pending > 0 {
+                StartupRecovery::Failed
+            } else {
+                StartupRecovery::combine(&[Ok(recovery.restored)])
+            },
+            recovery.pending,
+        )
+    };
+    Ok(WindowsRecoveredMirror {
+        parking,
+        startup,
+        pending,
+    })
+}
+
 #[cfg(windows)]
 pub fn create(
     state_dir: &std::path::Path,
     config: &crate::config::Config,
+    mut recovered: WindowsRecoveredMirror,
 ) -> anyhow::Result<Platform> {
     use anyhow::Context;
     use crosspane_platform_windows::{
@@ -793,10 +911,23 @@ pub fn create(
     let windows = if scratch_only {
         None
     } else {
-        optional(
-            "windows",
-            WindowsWindowSource::new(displays.ids(), displays.monitor_reader()),
+        Some(
+            WindowsWindowSource::new(displays.ids(), displays.monitor_reader())
+                .context("Windows window source (required for mirror recovery binding)")?,
         )
+    };
+    let parking = if let Some(windows) = windows.as_ref() {
+        recovered
+            .parking
+            .bind_source(
+                windows.resolver(),
+                displays.ids(),
+                displays.monitor_reader(),
+            )
+            .context("Windows mirror source binding (required)")?;
+        Some(Box::new(recovered.parking) as Box<dyn WindowParking>)
+    } else {
+        None
     };
     let frames = windows.as_ref().and_then(|windows| {
         optional(
@@ -825,7 +956,7 @@ pub fn create(
         // required=[] is benign in the agent: no OS request/subscription, notice or retry.
         permissions: Box::new(UnsupportedWindows),
         windows: windows.map(|backend| Box::new(backend) as Box<dyn WindowSource>),
-        parking: None,
+        parking,
         frames: frames.map(|backend| Box::new(backend) as Box<dyn FrameCapture>),
         tray: optional("tray", WindowsTray::new())
             .map(|backend| Box::new(backend) as Box<dyn TrayHost>),
@@ -834,7 +965,7 @@ pub fn create(
         gpu: None,
         home: None,
         proxy_placement: None,
-        startup_recovery: StartupRecovery::combine(&[]),
+        startup_recovery: recovered.startup,
         acceptance_scratch: scratch_only,
         host_placement_mapping,
     })
@@ -1933,5 +2064,89 @@ mod windows_destination_hotkey_tests {
             drop(result);
             assert_eq!(*drops.lock().unwrap(), usize::from(fail != 0));
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+#[allow(clippy::unwrap_used)]
+mod windows_mirror_store_tests {
+    use super::*;
+    use crosspane_platform_windows::{
+        model::parking::{
+            COMMITTED_NAME, Journal, MAX_BYTES, MirrorEntry, NativeIdentity, PENDING_NAME,
+        },
+        parking::MirrorJournalStore,
+    };
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "crosspane-mirror-store-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            crate::windows::security::create_private_directory(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn mirror_store_publishes_both_known_names_and_caps_private_reads() {
+        let directory = Directory::new();
+        let mut store = WindowsMirrorStore {
+            directory: directory.0.clone(),
+            empty_required: false,
+        };
+        let bytes = Journal::empty().bytes().unwrap();
+        store.commit(&bytes).unwrap();
+        let images = store.read().unwrap();
+        assert_eq!(images.committed.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(images.pending.as_deref(), Some(bytes.as_slice()));
+        crate::paths::write_private(&directory.0.join(COMMITTED_NAME), &vec![0; MAX_BYTES + 1])
+            .unwrap();
+        assert!(store.read().is_err());
+        assert_eq!(
+            std::fs::read(directory.0.join(PENDING_NAME)).unwrap(),
+            bytes
+        );
+    }
+    #[test]
+    fn admitted_destination_scratch_refuses_outstanding_native_tuples_without_native_query() {
+        let directory = Directory::new();
+        let mut store = WindowsMirrorStore {
+            directory: directory.0.clone(),
+            empty_required: true,
+        };
+        let empty = Journal::empty().bytes().unwrap();
+        store.commit(&empty).unwrap();
+        assert!(store.read().is_ok());
+        let entry = MirrorEntry {
+            identity: NativeIdentity {
+                hwnd: 7,
+                pid: 8,
+                tid: 9,
+                process_created: 10,
+            },
+            original: crosspane_platform_windows::model::journal::Original {
+                rect_physical: [0, 0, 400, 300],
+                monitor_path: "owned-model".into(),
+                show: crosspane_platform_windows::model::journal::Show::Normal,
+                dpi: 96,
+            },
+            visible_original: [0, 0, 400, 300],
+            may_have_mutated: true,
+        };
+        let bytes = Journal::empty().insert(entry).unwrap().bytes().unwrap();
+        store.commit(&bytes).unwrap();
+        assert!(store.read().is_err());
+        assert_eq!(
+            std::fs::read(directory.0.join(COMMITTED_NAME)).unwrap(),
+            bytes
+        );
     }
 }

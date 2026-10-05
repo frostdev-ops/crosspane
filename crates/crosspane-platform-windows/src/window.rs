@@ -11,9 +11,10 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, VecDeque},
+    collections::VecDeque,
     fmt,
     mem::size_of,
+    path::PathBuf,
     ptr::{null, null_mut},
     sync::{
         Arc, Mutex,
@@ -46,6 +47,9 @@ use crate::model::{
     winevent::{self, RawWinEvent},
 };
 
+#[cfg(test)]
+use std::collections::BTreeSet;
+
 const BOUND: Duration = Duration::from_secs(2);
 const RAW_LIMIT: usize = 4096;
 /// Must return current physical monitor facts within the platform call bound.
@@ -77,13 +81,25 @@ impl fmt::Debug for WindowResolver {
 impl WindowResolver {
     pub fn resolve(&self, id: WindowId) -> Option<NativeWindow> {
         self.resolve_with(id, |expected| {
+            // Restricted sources must admit PID/lifetime/image BEFORE even IsWindow or fields.
+            if !self
+                .state
+                .admission
+                .as_ref()
+                .is_none_or(|a| a.allows(expected.hwnd))
+            {
+                return None;
+            }
             // SAFETY: checks only the admitted handle's existence before fresh identity queries.
             if unsafe { IsWindow(hwnd(expected.hwnd)) } == 0 {
                 return None;
             }
-            identity(hwnd(expected.hwnd), Some(expected))
-                .ok()
-                .map(|i| i.0)
+            let fresh = identity(hwnd(expected.hwnd), Some(expected)).ok()?.0;
+            self.state
+                .admission
+                .as_ref()
+                .is_none_or(|a| a.allows(expected.hwnd))
+                .then_some(fresh)
         })
     }
 
@@ -123,6 +139,7 @@ impl WindowResolver {
 }
 
 struct State {
+    admission: Option<Admission>,
     windows: Mutex<Windows>,
     updated: Mutex<Instant>,
     alive: AtomicBool,
@@ -185,12 +202,28 @@ impl WindowsWindowSource {
         Self::start(ids, monitors, None)
     }
 
+    /// Own claims are independently opened and pinned; no inherited handle is trusted.
+    /// All nonadmitted HWNDs are filtered by PID before any window field is acquired.
+    #[cfg_attr(test, allow(dead_code))] // Other existing probes compile this adapter in isolation.
+    pub fn new_restricted(
+        ids: Arc<Mutex<DisplayIds>>,
+        monitors: MonitorReader,
+        allowlist: OwnedProcessAllowlist,
+    ) -> Result<Self, PlatformError> {
+        Self::start(
+            ids,
+            monitors,
+            Some(Admission::Restricted(Arc::new(allowlist))),
+        )
+    }
+
     fn start(
         ids: Arc<Mutex<DisplayIds>>,
         monitors: MonitorReader,
         admission: Option<Admission>,
     ) -> Result<Self, PlatformError> {
         let state = Arc::new(State {
+            admission: admission.clone(),
             windows: Mutex::new(Windows::default()),
             updated: Mutex::new(Instant::now()),
             alive: AtomicBool::new(true),
@@ -296,7 +329,7 @@ impl WindowsWindowSource {
         Self::start(
             ids,
             monitors,
-            Some(Admission {
+            Some(Admission::Fixture {
                 hwnds: BTreeSet::from([identity.hwnd]),
                 pid: identity.pid,
                 identity,
@@ -371,15 +404,178 @@ fn string(text: &[u16]) -> String {
     String::from_utf16_lossy(&text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())])
 }
 
+/// An explicitly owned process claim, supplied by the scratch launcher.
+#[derive(Clone, Debug)]
+pub struct OwnedProcessClaim {
+    pub pid: u32,
+    pub process_created: u64,
+    pub executable: PathBuf,
+}
+/// Independent read-only process handles retained for the entire restricted source lifetime.
+pub struct OwnedProcessAllowlist {
+    processes: Vec<OwnedProcess>,
+}
+impl fmt::Debug for OwnedProcessAllowlist {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedProcessAllowlist")
+            .field("claims", &self.processes.len())
+            .finish_non_exhaustive()
+    }
+}
+struct OwnedProcess {
+    claim: OwnedProcessClaim,
+    // A Windows process handle is thread-independent. Store its integer representation so no
+    // non-Send native pointer or unsafe Send impl crosses the source/resolver thread boundary.
+    handle: usize,
+}
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        // SAFETY: exactly one owner closes this successful OpenProcess handle after all Arc users.
+        unsafe { CloseHandle(self.handle as HANDLE) };
+    }
+}
+impl OwnedProcess {
+    fn verify(&self) -> bool {
+        let process = self.handle as HANDLE;
+        // SAFETY: query only the process independently retained at claim admission; zero wait.
+        if unsafe { WaitForSingleObject(process, 0) } != WAIT_TIMEOUT {
+            return false;
+        }
+        let mut created = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: valid retained process handle and initialized exact FILETIME output storage.
+        if unsafe { GetProcessTimes(process, &mut created, &mut exit, &mut kernel, &mut user) } == 0
+            || ((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+                != self.claim.process_created
+        {
+            return false;
+        }
+        let mut image = vec![0_u16; 32768];
+        let mut length = image.len() as u32;
+        // SAFETY: only the admitted, alive creation-matched process image is queried, bounded buffer.
+        if unsafe { QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &mut length) } == 0 {
+            return false;
+        }
+        let image = PathBuf::from(String::from_utf16_lossy(&image[..length as usize]));
+        std::fs::canonicalize(image).is_ok_and(|image| image == self.claim.executable)
+    }
+}
+fn admitted_pid<T>(
+    pid: impl FnOnce() -> u32,
+    find: impl FnOnce(u32) -> Option<T>,
+    verify: impl FnOnce(T) -> bool,
+) -> bool {
+    let pid = pid();
+    pid != 0 && find(pid).is_some_and(verify)
+}
+impl OwnedProcessAllowlist {
+    #[cfg_attr(test, allow(dead_code))] // Other existing probes compile this adapter in isolation.
+    pub fn admit(claims: Vec<OwnedProcessClaim>) -> Result<Self, PlatformError> {
+        if claims.is_empty() || claims.len() > 128 {
+            return Err(backend("owned process claims"));
+        }
+        let mut processes: Vec<OwnedProcess> = Vec::with_capacity(claims.len());
+        for mut claim in claims {
+            if claim.pid == 0
+                || claim.process_created == 0
+                || !claim.executable.is_absolute()
+                || processes.iter().any(|p| p.claim.pid == claim.pid)
+            {
+                return Err(backend("owned process claims"));
+            }
+            claim.executable = std::fs::canonicalize(&claim.executable)
+                .map_err(|_| backend("owned process image"))?;
+            // SAFETY: caller claimed this exact PID; rights permit metadata and lifetime queries only.
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    claim.pid,
+                )
+            };
+            if handle.is_null() {
+                return Err(backend("owned process admission"));
+            }
+            let process = OwnedProcess {
+                claim,
+                handle: handle as usize,
+            };
+            if !process.verify() {
+                return Err(backend("owned process identity"));
+            }
+            processes.push(process);
+        }
+        Ok(Self { processes })
+    }
+    fn expected_for(&self, window: u64) -> Result<Identity, PlatformError> {
+        let mut pid = 0;
+        // SAFETY: the ONLY not-yet-admitted HWND query is PID/TID metadata.
+        let tid = unsafe { GetWindowThreadProcessId(hwnd(window), &mut pid) };
+        let process = self.processes.iter().find(|p| p.claim.pid == pid);
+        if tid == 0 || !admitted_pid(|| pid, |_| process, OwnedProcess::verify) {
+            return Err(PlatformError::NotFound);
+        }
+        let process = process.ok_or(PlatformError::NotFound)?;
+        let mut after_pid = 0;
+        // SAFETY: recheck metadata after the owned process/lifetime/image queries.
+        let after_tid = unsafe { GetWindowThreadProcessId(hwnd(window), &mut after_pid) };
+        if after_pid != pid || after_tid != tid {
+            return Err(PlatformError::NotFound);
+        }
+        Ok(Identity {
+            hwnd: window,
+            pid,
+            tid,
+            process_created: process.claim.process_created,
+        })
+    }
+    fn allows(&self, window: u64) -> bool {
+        self.expected_for(window).is_ok()
+    }
+}
 #[derive(Clone)]
-struct Admission {
-    hwnds: BTreeSet<u64>,
-    pid: u32,
-    identity: Identity,
+enum Admission {
+    #[cfg_attr(test, allow(dead_code))] // Existing exact-HWND probes use Fixture admission.
+    Restricted(Arc<OwnedProcessAllowlist>),
+    #[cfg(test)]
+    Fixture {
+        hwnds: BTreeSet<u64>,
+        pid: u32,
+        identity: Identity,
+    },
 }
 impl Admission {
     fn allows(&self, window: u64) -> bool {
-        self.hwnds.contains(&window)
+        match self {
+            Self::Restricted(allowlist) => allowlist.allows(window),
+            #[cfg(test)]
+            Self::Fixture { hwnds, .. } => hwnds.contains(&window),
+        }
+    }
+    fn expected_for(&self, window: u64) -> Result<Identity, PlatformError> {
+        match self {
+            Self::Restricted(a) => a.expected_for(window),
+            #[cfg(test)]
+            Self::Fixture {
+                identity, hwnds, ..
+            } => {
+                if hwnds.contains(&window) {
+                    Ok(*identity)
+                } else {
+                    Err(PlatformError::NotFound)
+                }
+            }
+        }
+    }
+    fn hook_pid(&self) -> u32 {
+        match self {
+            Self::Restricted(a) if a.processes.len() == 1 => a.processes[0].claim.pid,
+            Self::Restricted(_) => 0,
+            #[cfg(test)]
+            Self::Fixture { pid, .. } => *pid,
+        }
     }
 }
 
@@ -530,7 +726,7 @@ impl Native {
             state: Arc::clone(&context.state),
             dpi,
         };
-        let pid = context.admission.as_ref().map_or(0, |a| a.pid);
+        let pid = context.admission.as_ref().map_or(0, Admission::hook_pid);
         for (first, last) in [
             (
                 winevent::EVENT_SYSTEM_FOREGROUND,
@@ -591,16 +787,35 @@ impl Drop for Native {
     }
 }
 
+fn with_identity_owner<T>(
+    window: u64,
+    pid: u32,
+    tid: u32,
+    expected: Option<Identity>,
+    query: impl FnOnce() -> Result<T, PlatformError>,
+) -> Result<T, PlatformError> {
+    if tid == 0
+        || pid == 0
+        || expected.is_some_and(|e| e.pid != pid || e.tid != tid || e.hwnd != window)
+    {
+        return Err(PlatformError::NotFound);
+    }
+    query()
+}
 fn identity(window: HWND, expected: Option<Identity>) -> Result<(Identity, String), PlatformError> {
     let mut pid = 0;
-    // SAFETY: reads metadata only; pid points to a writable scalar.
+    // SAFETY: PID/TID metadata only; reject changed restricted ownership before any process image.
     let tid = unsafe { GetWindowThreadProcessId(window, &mut pid) };
-    if tid == 0 || pid == 0 {
-        return Err(PlatformError::NotFound);
-    }
-    if expected.is_some_and(|e| e.pid != pid || e.tid != tid || e.hwnd != number(window)) {
-        return Err(PlatformError::NotFound);
-    }
+    with_identity_owner(number(window), pid, tid, expected, || {
+        identity_metadata(window, pid, tid, expected)
+    })
+}
+fn identity_metadata(
+    window: HWND,
+    pid: u32,
+    tid: u32,
+    expected: Option<Identity>,
+) -> Result<(Identity, String), PlatformError> {
     // SAFETY: read-only limited process query, no process-memory access.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
@@ -643,44 +858,66 @@ fn identity(window: HWND, expected: Option<Identity>) -> Result<(Identity, Strin
     Ok((actual, app))
 }
 
+fn admitted_field<T>(
+    expected: Identity,
+    admission: Option<&Admission>,
+    query: impl FnOnce() -> T,
+) -> Result<T, PlatformError> {
+    if let Some(a) = admission
+        && a.expected_for(expected.hwnd)? != expected
+    {
+        return Err(PlatformError::NotFound);
+    }
+    Ok(query())
+}
+
 fn snapshot(
     window: HWND,
     native: &Native,
     monitors: &[MonitorProbe],
     ids: &Mutex<DisplayIds>,
     expected: Option<Identity>,
+    admission: Option<&Admission>,
 ) -> Result<Observation, PlatformError> {
     let (before, app_id) = identity(window, expected)?;
     let mut bounds = RECT::default();
     let mut cloaked = 0_u32;
-    // SAFETY: both DWM attributes use initialized fixed-size output buffers.
-    let okay = unsafe {
-        DwmGetWindowAttribute(
-            window,
-            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
-            (&mut bounds as *mut RECT).cast(),
-            size_of::<RECT>() as u32,
-        ) >= 0
-            && DwmGetWindowAttribute(
+    let bounds_ok = admitted_field(before, admission, || {
+        // SAFETY: exact RECT output storage, restricted ownership revalidated before this query.
+        (unsafe {
+            DwmGetWindowAttribute(
+                window,
+                DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                (&mut bounds as *mut RECT).cast(),
+                size_of::<RECT>() as u32,
+            )
+        }) >= 0
+    })?;
+    let cloaked_ok = admitted_field(before, admission, || {
+        // SAFETY: exact u32 output storage, restricted ownership revalidated before this query.
+        (unsafe {
+            DwmGetWindowAttribute(
                 window,
                 DWMWA_CLOAKED as u32,
                 (&mut cloaked as *mut u32).cast(),
                 size_of::<u32>() as u32,
-            ) >= 0
-    };
-    if !okay {
+            )
+        }) >= 0
+    })?;
+    if !bounds_ok || !cloaked_ok {
         return Err(backend("window geometry"));
     }
     let mut monitor = MONITORINFOEXW::default();
     monitor.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
-    // SAFETY: public monitor metadata read into its exact extended structure.
-    if unsafe {
-        GetMonitorInfoW(
-            MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST),
-            &mut monitor.monitorInfo,
-        )
-    } == 0
-    {
+    let native_monitor = admitted_field(before, admission, || {
+        // SAFETY: admitted target monitor observation only.
+        unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) }
+    })?;
+    let monitor_ok = admitted_field(before, admission, || {
+        // SAFETY: exact extended monitor output storage after target ownership revalidation.
+        unsafe { GetMonitorInfoW(native_monitor, &mut monitor.monitorInfo) }
+    })?;
+    if monitor_ok == 0 {
         return Err(backend("window monitor"));
     }
     let (display, frame) = window::logical_frame(
@@ -693,30 +930,49 @@ fn snapshot(
     .map_err(|_| backend("window display geometry"))?;
     let mut title = vec![0_u16; 32768];
     let mut class = [0_u16; 256];
-    // SAFETY: read-only User32 caption/class queries with bounded output buffers.
-    // GetWindowText retrieves foreign process captions without sending WM_GETTEXT.
-    let (title_len, class_len, style, ex_style, owner, root, visible, iconic) = unsafe {
-        (
-            GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32),
-            GetClassNameW(window, class.as_mut_ptr(), class.len() as i32),
-            GetWindowLongPtrW(window, GWL_STYLE) as u32,
-            GetWindowLongPtrW(window, GWL_EXSTYLE) as u32,
-            GetWindow(window, GW_OWNER),
-            GetAncestor(window, GA_ROOT) == window,
-            IsWindowVisible(window) != 0,
-            IsIconic(window) != 0,
-        )
-    };
-    // SAFETY: read-only documented desktop-membership call on this native thread.
-    let current_desktop = unsafe {
-        native
-            .desktop
-            .as_ref()
-            .ok_or_else(|| backend("virtual desktop manager"))?
-            .IsWindowOnCurrentVirtualDesktop(windows::Win32::Foundation::HWND(window))
-    }
+    let title_len = admitted_field(before, admission, || {
+        // SAFETY: bounded caption buffer after exact restricted owner revalidation.
+        unsafe { GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32) }
+    })?;
+    let class_len = admitted_field(before, admission, || {
+        // SAFETY: bounded class buffer after exact restricted owner revalidation.
+        unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) }
+    })?;
+    let style = admitted_field(before, admission, || {
+        // SAFETY: read-only admitted target style.
+        unsafe { GetWindowLongPtrW(window, GWL_STYLE) as u32 }
+    })?;
+    let ex_style = admitted_field(before, admission, || {
+        // SAFETY: read-only admitted target extended style.
+        unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 }
+    })?;
+    let owner = admitted_field(before, admission, || {
+        // SAFETY: admitted target ownership-handle query only.
+        unsafe { GetWindow(window, GW_OWNER) }
+    })?;
+    let root = admitted_field(before, admission, || {
+        // SAFETY: admitted target ancestor-handle comparison only.
+        unsafe { GetAncestor(window, GA_ROOT) == window }
+    })?;
+    let visible = admitted_field(before, admission, || {
+        // SAFETY: admitted target visibility query only.
+        unsafe { IsWindowVisible(window) != 0 }
+    })?;
+    let iconic = admitted_field(before, admission, || {
+        // SAFETY: admitted target iconic-state query only.
+        unsafe { IsIconic(window) != 0 }
+    })?;
+    let desktop = native
+        .desktop
+        .as_ref()
+        .ok_or_else(|| backend("virtual desktop manager"))?;
+    let current_desktop = admitted_field(before, admission, || {
+        // SAFETY: documented read-only desktop-membership query on this native thread.
+        unsafe { desktop.IsWindowOnCurrentVirtualDesktop(windows::Win32::Foundation::HWND(window)) }
+    })?
     .ok()
     .map(|b| b.as_bool());
+    admitted_field(before, admission, || ())?;
     if identity(window, Some(before))?.0 != before {
         return Err(backend("window identity changed"));
     }
@@ -777,14 +1033,23 @@ fn observe(
     {
         return Ok(());
     }
-    let result = snapshot(
-        hwnd(id),
-        native,
-        monitors,
-        ids,
-        context.admission.as_ref().map(|a| a.identity),
-    );
+    let expected = context
+        .admission
+        .as_ref()
+        .map(|a| a.expected_for(id))
+        .transpose();
+    let result = expected.and_then(|expected| {
+        snapshot(
+            hwnd(id),
+            native,
+            monitors,
+            ids,
+            expected,
+            context.admission.as_ref(),
+        )
+    });
     let events = match result {
+        Ok(_) if !context.allows(id) => Vec::new(),
         Ok(observation) => context
             .state
             .windows
@@ -793,7 +1058,7 @@ fn observe(
             .observe(observation),
         Err(_) => {
             // SAFETY: this is an admitted HWND; absence is checked without reading content.
-            if unsafe { IsWindow(hwnd(id)) } == 0 {
+            if context.allows(id) && unsafe { IsWindow(hwnd(id)) } == 0 {
                 context
                     .state
                     .windows
@@ -861,7 +1126,17 @@ fn activate(
     if !context.state.fields_open.load(Ordering::Acquire) {
         return Err(PlatformError::Locked);
     }
-    let observation = snapshot(hwnd(expected.hwnd), native, probes, ids, Some(expected))?;
+    let observation = snapshot(
+        hwnd(expected.hwnd),
+        native,
+        probes,
+        ids,
+        Some(expected),
+        context.admission.as_ref(),
+    )?;
+    if !context.allows(expected.hwnd) {
+        return Err(PlatformError::NotFound);
+    }
     let state = observation.state();
     if !window::may_activate(
         expected,
@@ -880,7 +1155,9 @@ fn activate(
         // SAFETY: same validated non-hidden, current-desktop target as above.
         unsafe { ShowWindowAsync(hwnd(expected.hwnd), SW_RESTORE) };
     }
-    if identity(hwnd(expected.hwnd), Some(expected))?.0 != expected {
+    if !context.allows(expected.hwnd)
+        || identity(hwnd(expected.hwnd), Some(expected))?.0 != expected
+    {
         return Err(PlatformError::NotFound);
     }
     call.check(&context.state)?;
@@ -888,7 +1165,9 @@ fn activate(
     unsafe { SetForegroundWindow(hwnd(expected.hwnd)) };
     loop {
         call.check(&context.state)?;
-        if identity(hwnd(expected.hwnd), Some(expected))?.0 != expected {
+        if !context.allows(expected.hwnd)
+            || identity(hwnd(expected.hwnd), Some(expected))?.0 != expected
+        {
             return Err(PlatformError::NotFound);
         }
         call.check(&context.state)?;
@@ -1077,6 +1356,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn state() -> Arc<State> {
         Arc::new(State {
+            admission: None,
             windows: Mutex::new(Windows::default()),
             updated: Mutex::new(Instant::now()),
             alive: AtomicBool::new(true),
@@ -1087,6 +1367,67 @@ mod tests {
     }
 
     #[test]
+    fn restricted_snapshot_changed_pid_refuses_before_process_image_or_fields() {
+        let expected = Identity {
+            hwnd: 7,
+            pid: 8,
+            tid: 9,
+            process_created: 10,
+        };
+        let calls = RefCell::new(Vec::new());
+        calls.borrow_mut().push("initial-owned-admission");
+        let result = with_identity_owner(7, 88, 99, Some(expected), || {
+            calls.borrow_mut().push("process-image");
+            calls.borrow_mut().push("caption/class/fields");
+            Ok(())
+        });
+        assert!(matches!(result, Err(PlatformError::NotFound)));
+        assert_eq!(*calls.borrow(), ["initial-owned-admission"]);
+    }
+
+    #[test]
+    fn restricted_pid_admission_precedes_all_fields_and_lifetime_checks() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let admitted = admitted_pid(
+            || {
+                calls.borrow_mut().push("pid");
+                99
+            },
+            |pid| (pid == 7).then_some(()),
+            |()| {
+                calls.borrow_mut().push("process/creation/image");
+                true
+            },
+        );
+        if admitted {
+            calls.borrow_mut().push("caption/class/fields");
+        }
+        assert_eq!(*calls.borrow(), ["pid"]);
+        for alive_and_matching in [false, true] {
+            calls.borrow_mut().clear();
+            let admitted = admitted_pid(
+                || {
+                    calls.borrow_mut().push("pid");
+                    7
+                },
+                |pid| (pid == 7).then_some(()),
+                |()| {
+                    calls.borrow_mut().push("process/creation/image");
+                    alive_and_matching
+                },
+            );
+            if admitted {
+                calls.borrow_mut().push("caption/class/fields");
+            }
+            assert_eq!(
+                calls.borrow().contains(&"caption/class/fields"),
+                alive_and_matching
+            );
+        }
+    }
+
+    #[test]
     #[allow(clippy::unwrap_used)]
     fn window_callback_allowlist_and_object_filter_precede_any_field_api() {
         let state = state();
@@ -1094,7 +1435,7 @@ mod tests {
             raw: Mutex::new(VecDeque::new()),
             state,
             start: Instant::now(),
-            admission: Some(Admission {
+            admission: Some(Admission::Fixture {
                 hwnds: BTreeSet::from([7]),
                 pid: 8,
                 identity: Identity {

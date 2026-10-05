@@ -75,12 +75,16 @@ struct Job {
 pub(crate) struct Completion {
     pub(crate) id: u64,
     pub(crate) outcome: Outcome,
+    #[cfg(windows)]
+    pub(crate) notice: Option<&'static str>,
 }
 
 impl Completion {
     pub(crate) fn unavailable(id: u64, command: Command) -> Self {
         Self {
             id,
+            #[cfg(windows)]
+            notice: None,
             outcome: match command {
                 Command::Restore { window, .. } => Outcome::Restored { window, ok: false },
                 _ => Outcome::Parked {
@@ -242,6 +246,8 @@ impl Worker {
                                 Completion {
                                     id: 0,
                                     outcome: Outcome::Panicked,
+                                    #[cfg(windows)]
+                                    notice: None,
                                 },
                                 &sink,
                             );
@@ -404,6 +410,8 @@ fn claim(shared: &Shared, events: &mpsc::Sender<Event>, abandoned: &AtomicBool) 
         state.emit(
             Completion {
                 id: job.id,
+                #[cfg(windows)]
+                notice: None,
                 outcome: Outcome::Started {
                     window: job.command.window(),
                     kind: job.command.kind(),
@@ -420,6 +428,8 @@ fn claim(shared: &Shared, events: &mpsc::Sender<Event>, abandoned: &AtomicBool) 
 }
 
 fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
+    #[cfg(windows)]
+    let mut notice = None;
     let outcome = match job.command {
         Command::Park {
             window,
@@ -457,6 +467,12 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
             }
             .map_err(|error| {
                 tracing::warn!(%error, operation = job.id, "parking operation failed");
+                #[cfg(windows)]
+                if matches!(job.command, Command::Park { .. }) && matches!(&error,
+                    PlatformError::Unsupported(reason) if *reason == crosspane_platform_windows::model::parking::PENDING_REPARK_REASON)
+                {
+                    notice = Some(crosspane_platform_windows::model::parking::PENDING_REPARK_REASON);
+                }
                 match error {
                     PlatformError::Locked => Failure::Locked,
                     PlatformError::SecureInput => Failure::SecureInput,
@@ -482,6 +498,8 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
     Completion {
         id: job.id,
         outcome,
+        #[cfg(windows)]
+        notice,
     }
 }
 
@@ -1065,5 +1083,84 @@ pub(crate) mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(controls.journal.load(Ordering::SeqCst));
         assert!(controls.observed.try_recv().is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_pending_notice_tests {
+    use super::*;
+    struct Refused(&'static str);
+    impl WindowParking for Refused {
+        fn park(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError> {
+            Err(PlatformError::Unsupported(self.0))
+        }
+        fn resize(&mut self, _: WindowId, _: PixelSize, _: f64) -> Result<Parked, PlatformError> {
+            Err(PlatformError::Unsupported(self.0))
+        }
+        fn geometry(&self, _: WindowId) -> Result<Parked, PlatformError> {
+            Err(PlatformError::Unsupported("owned fake geometry"))
+        }
+        fn set_fullscreen(&mut self, _: WindowId, _: bool) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn restore(&mut self, _: WindowId) -> Result<(), PlatformError> {
+            Ok(())
+        }
+        fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+    #[test]
+    fn only_exact_pending_park_refusal_carries_local_notice_and_engine_failure_is_unchanged() {
+        let reason = crosspane_platform_windows::model::parking::PENDING_REPARK_REASON;
+        let park = Command::Park {
+            window: WindowId(7),
+            size: PixelSize::new(400, 300),
+            scale: 1.0,
+        };
+        let done = operation(
+            &mut Refused(reason),
+            Job {
+                id: 1,
+                command: park,
+            },
+        );
+        assert_eq!(done.notice, Some(reason));
+        assert!(matches!(
+            done.outcome,
+            Outcome::Parked {
+                result: Err(Failure::Other),
+                ..
+            }
+        ));
+        assert_eq!(
+            operation(
+                &mut Refused("different unsupported reason"),
+                Job {
+                    id: 2,
+                    command: park
+                }
+            )
+            .notice,
+            None
+        );
+        let resize = Command::Resize {
+            window: WindowId(7),
+            size: PixelSize::new(400, 300),
+            scale: 1.0,
+            fullscreen: false,
+        };
+        assert_eq!(
+            operation(
+                &mut Refused(reason),
+                Job {
+                    id: 3,
+                    command: resize
+                }
+            )
+            .notice,
+            None
+        );
+        assert_eq!(Completion::unavailable(4, park).notice, None);
     }
 }
