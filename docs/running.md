@@ -172,6 +172,16 @@ Everything is also available from the command line:
 - `crosspanectl release` takes input back at once. `crosspanectl panic` ends every session and
   disarms crossing until `crosspanectl rearm`.
 
+**Windows (preview).** High-resolution and horizontal wheel deltas retain their wheel units.
+Pixel-only scrolling uses an approximate conversion based on the target's wheel settings and
+20 logical pixels per line or character; applications may scroll by different amounts. Windows
+precision-touchpad capture and AltGr interoperability still need attended native validation.
+Lock-state snapshots are unknown in this preview, so crossing from Windows leaves the target's
+lock states unchanged. A target refuses to guess a requested toggle when its own state is unknown.
+Win+L locks the local Windows machine. Ctrl-Alt-Del opens Windows security locally by design;
+interact with the security or lock screen on that machine. Remote secure-desktop control is
+unsupported, and Crosspane closes its input gate there.
+
 **Project a window (E2).**
 - From the machine that has it: `crosspanectl windows` lists this machine's windows, and
   `crosspanectl project <id> <peer>` moves one to the peer.

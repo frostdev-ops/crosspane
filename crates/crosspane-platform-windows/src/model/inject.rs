@@ -18,7 +18,7 @@ use crosspane_types::{
     geom::PointDevice,
     hid::{HidUsage, MouseButton, ScanPrefix, hid_to_windows},
     id::DisplayId,
-    input::{LockKeys, ScrollDelta},
+    input::{LockKeys, ScrollDelta, ScrollPhase},
 };
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -90,6 +90,105 @@ impl RepeatSettings {
     }
 }
 
+/// `[P]` Pixel-only scrolling uses a 20 logical-pixel line/character heuristic.
+/// This makes continuous sources usable, but does not promise native pixel parity.
+/// Zero, page-scroll and unreadable OS settings conservatively use three lines/characters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollSettings {
+    units_per_pixel: [f64; 2],
+}
+impl ScrollSettings {
+    pub fn new(chars: Option<u32>, lines: Option<u32>) -> Self {
+        let scale = |setting: Option<u32>| {
+            let count = setting.filter(|n| *n != 0 && *n != u32::MAX).unwrap_or(3);
+            120.0 / (f64::from(count) * 20.0)
+        };
+        Self {
+            units_per_pixel: [scale(chars), scale(lines)],
+        }
+    }
+}
+impl Default for ScrollSettings {
+    fn default() -> Self {
+        Self::new(None, None)
+    }
+}
+
+#[derive(Default)]
+struct ScrollAccumulator {
+    settings: ScrollSettings,
+    remainder: [f64; 2],
+    direction: [i8; 2],
+}
+impl ScrollAccumulator {
+    fn reset(&mut self) {
+        self.remainder = [0.0; 2];
+        self.direction = [0; 2];
+    }
+    fn packets(&mut self, delta: ScrollDelta) -> Result<Vec<Packet>, PlatformError> {
+        let pixels = delta.pixels.map(|p| [p.x, p.y]);
+        if pixels.is_some_and(|p| p.iter().any(|n| !n.is_finite())) {
+            self.reset();
+            return Err(PlatformError::Unsupported("nonfinite scroll delta"));
+        }
+        let ending = matches!(
+            delta.phase,
+            ScrollPhase::Ended | ScrollPhase::Cancelled | ScrollPhase::MomentumEnded
+        );
+        if ending || delta.phase == ScrollPhase::Began {
+            self.reset();
+        }
+        let mut wheel = [delta.v120_x, delta.v120_y];
+        for (axis, units) in wheel.iter_mut().enumerate() {
+            if *units != 0 {
+                // A v120 source is authoritative for this axis; never add pixels or debt.
+                self.remainder[axis] = 0.0;
+                self.direction[axis] = units.signum() as i8;
+            } else if let Some(pixels) = pixels {
+                let value = pixels[axis];
+                let direction = if value > 0.0 {
+                    1
+                } else if value < 0.0 {
+                    -1
+                } else {
+                    0
+                };
+                if direction != 0 && direction != self.direction[axis] {
+                    self.remainder[axis] = 0.0;
+                    self.direction[axis] = direction;
+                }
+                let total = value * self.settings.units_per_pixel[axis] + self.remainder[axis];
+                let whole = total
+                    .trunc()
+                    .clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+                *units = whole as i32;
+                self.remainder[axis] = if total < f64::from(i32::MIN) || total > f64::from(i32::MAX)
+                {
+                    // A clamped emission never leaves an unbounded catch-up backlog.
+                    0.0
+                } else {
+                    total - whole
+                };
+            }
+        }
+        for (axis, stopped) in [delta.stop_x, delta.stop_y].into_iter().enumerate() {
+            if stopped {
+                self.remainder[axis] = 0.0;
+                self.direction[axis] = 0;
+            }
+        }
+        if ending {
+            self.reset();
+        }
+        Ok(scroll_packets(ScrollDelta {
+            v120_x: wheel[0],
+            v120_y: wheel[1],
+            pixels: None,
+            ..delta
+        }))
+    }
+}
+
 pub fn key_packet(usage: HidUsage, down: bool) -> Result<Packet, PlatformError> {
     let scan = hid_to_windows(usage).ok_or(PlatformError::Unsupported("unmapped physical key"))?;
     if scan.prefix == ScanPrefix::E1 {
@@ -113,6 +212,8 @@ pub struct Driver<P: InjectionPort> {
     focus: Option<(Foreground, u64)>,
     settings: RepeatSettings,
     repeat: Option<(HidUsage, u64)>,
+    scroll: ScrollAccumulator,
+    scroll_focus: Option<(Foreground, u64)>,
 }
 impl<P: InjectionPort> std::fmt::Debug for Driver<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -131,6 +232,8 @@ impl<P: InjectionPort> Driver<P> {
             focus: None,
             settings,
             repeat: None,
+            scroll: ScrollAccumulator::default(),
+            scroll_focus: None,
         }
     }
     pub fn port(&self) -> &P {
@@ -153,6 +256,14 @@ impl<P: InjectionPort> Driver<P> {
     }
     pub fn cancel_repeat(&mut self) {
         self.repeat = None;
+    }
+    pub fn set_scroll_settings(&mut self, settings: ScrollSettings) {
+        self.reset_scroll();
+        self.scroll.settings = settings;
+    }
+    pub fn reset_scroll(&mut self) {
+        self.scroll.reset();
+        self.scroll_focus = None;
     }
 
     /// Target-bound LOCAL settlement, distinct from deliberately permissive ordinary cleanup.
@@ -318,6 +429,34 @@ impl<P: InjectionPort> Driver<P> {
         self.port.submit(packet)
     }
 
+    pub fn scroll(&mut self, delta: ScrollDelta) -> Result<(), PlatformError> {
+        let foreground = self.guard()?;
+        let context = (foreground, self.gate.epoch());
+        if self.scroll_focus != Some(context) {
+            self.reset_scroll();
+            self.scroll_focus = Some(context);
+        }
+        let packets = match self.scroll.packets(delta) {
+            Ok(packets) => packets,
+            Err(error) => {
+                self.reset_scroll();
+                return Err(error);
+            }
+        };
+        for packet in packets {
+            // Each axis is separately guarded, including a fence between the two submissions.
+            if (self.guard()?, self.gate.epoch()) != context {
+                self.reset_scroll();
+                return Err(PlatformError::SecureInput);
+            }
+            if let Err(error) = self.port.submit(packet) {
+                self.reset_scroll();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub fn repeat(&mut self, now_ms: u64) -> Result<(), PlatformError> {
         let Some((usage, due)) = self.repeat else {
             return Ok(());
@@ -337,6 +476,7 @@ impl<P: InjectionPort> Driver<P> {
 
     pub fn release_keys(&mut self) -> Result<(), PlatformError> {
         self.cancel_repeat();
+        self.reset_scroll();
         let keys: BTreeSet<_> = self.keys.union(&self.toggle_ups).copied().collect();
         let mut failure = None;
         for usage in keys {
@@ -348,6 +488,7 @@ impl<P: InjectionPort> Driver<P> {
     }
     pub fn release_buttons(&mut self) -> Result<(), PlatformError> {
         self.cancel_repeat();
+        self.reset_scroll();
         let buttons: Vec<_> = self.buttons.iter().copied().collect();
         let mut failure = None;
         for button in buttons {
@@ -364,6 +505,7 @@ impl<P: InjectionPort> Driver<P> {
     }
     pub fn recover_keys(&mut self, keys: &[HidUsage]) -> Result<(), PlatformError> {
         self.cancel_repeat();
+        self.reset_scroll();
         let mut failure = None;
         for &usage in keys {
             if let Err(e) = key_packet(usage, false) {
@@ -379,6 +521,7 @@ impl<P: InjectionPort> Driver<P> {
     }
     pub fn recover_buttons(&mut self, buttons: &[MouseButton]) -> Result<(), PlatformError> {
         self.cancel_repeat();
+        self.reset_scroll();
         let mut failure = None;
         for &button in buttons {
             if !(1..=5).contains(&button.0) {
@@ -425,9 +568,8 @@ impl<P: InjectionPort> Driver<P> {
     }
 }
 
-/// `[E]` VIRTUALDESK absolute endpoints are 0..65535, with negative physical origins supported.
+/// `[E]` Nonzero v120 values retain fractional detents; zero does not submit native input.
 /// <https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput>
-/// `[P]` v120 already retains fractional detents; pixels are not added or guessed into wheel units.
 pub fn scroll_packets(delta: ScrollDelta) -> Vec<Packet> {
     let mut packets = Vec::new();
     if delta.v120_x != 0 {
@@ -436,7 +578,7 @@ pub fn scroll_packets(delta: ScrollDelta) -> Vec<Packet> {
             v120: delta.v120_x,
         });
     }
-    if delta.v120_y != 0 || packets.is_empty() {
+    if delta.v120_y != 0 {
         packets.push(Packet::Wheel {
             horizontal: false,
             v120: delta.v120_y,

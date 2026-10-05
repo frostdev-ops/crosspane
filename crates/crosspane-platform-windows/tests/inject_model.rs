@@ -3,8 +3,9 @@
 use crosspane_platform::{error::PlatformError, session::IoGate};
 use crosspane_platform_windows::model::inject::*;
 use crosspane_types::{
+    geom::VectorLogical,
     hid::{HidUsage, MouseButton},
-    input::LockKeys,
+    input::{LockKeys, ScrollDelta, ScrollPhase},
 };
 use std::collections::VecDeque;
 
@@ -13,6 +14,7 @@ struct Fake {
     foreground: VecDeque<Result<Foreground, PlatformError>>,
     sends: Vec<Packet>,
     failed: bool,
+    lock_state: Option<LockKeys>,
 }
 impl InjectionPort for Fake {
     fn foreground(&mut self) -> Result<Foreground, PlatformError> {
@@ -27,11 +29,11 @@ impl InjectionPort for Fake {
         }
     }
     fn locks(&mut self) -> Result<LockKeys, PlatformError> {
-        Ok(LockKeys {
+        Ok(self.lock_state.unwrap_or(LockKeys {
             caps_lock: Some(false),
             num_lock: Some(false),
             scroll_lock: Some(false),
-        })
+        }))
     }
 }
 fn focus(window: u64, integrity: u32) -> Foreground {
@@ -403,11 +405,7 @@ fn absolute_device_mapping_negative_origin_retained_ids_and_invalid_points() {
 }
 
 #[test]
-fn fractional_wheel_units_do_not_add_pixels_and_zero_stop_is_forwarded() {
-    use crosspane_types::{
-        geom::VectorLogical,
-        input::{ScrollDelta, ScrollPhase},
-    };
+fn fractional_wheel_units_do_not_add_pixels_or_submit_zero_stops() {
     let delta = ScrollDelta {
         v120_x: -15,
         v120_y: 60,
@@ -429,7 +427,7 @@ fn fractional_wheel_units_do_not_add_pixels_and_zero_stop_is_forwarded() {
             }
         ]
     );
-    assert_eq!(
+    assert!(
         scroll_packets(ScrollDelta {
             v120_x: 0,
             v120_y: 0,
@@ -437,10 +435,232 @@ fn fractional_wheel_units_do_not_add_pixels_and_zero_stop_is_forwarded() {
             phase: ScrollPhase::Ended,
             stop_x: true,
             stop_y: true
-        }),
-        [Packet::Wheel {
-            horizontal: false,
-            v120: 0
-        }]
+        })
+        .is_empty()
     );
+}
+
+fn pixels(x: f64, y: f64) -> ScrollDelta {
+    ScrollDelta {
+        v120_x: 0,
+        v120_y: 0,
+        pixels: Some(VectorLogical::new(x, y)),
+        phase: ScrollPhase::Changed,
+        stop_x: false,
+        stop_y: false,
+    }
+}
+
+fn wheel(horizontal: bool, v120: i32) -> Packet {
+    Packet::Wheel { horizontal, v120 }
+}
+
+#[test]
+fn pixel_only_sources_use_each_axis_setting_and_v120_precedence() {
+    let mut d = driver(Fake::default());
+    d.set_scroll_settings(ScrollSettings::new(Some(6), Some(3)));
+    d.scroll(pixels(-12.0, 12.0)).unwrap();
+    d.scroll(ScrollDelta {
+        v120_x: -15,
+        ..pixels(500.0, 10.0)
+    })
+    .unwrap();
+    assert_eq!(
+        d.port().sends,
+        [
+            wheel(true, -12),
+            wheel(false, 24),
+            wheel(true, -15),
+            wheel(false, 20)
+        ]
+    );
+    for setting in [None, Some(0), Some(u32::MAX)] {
+        let mut d = driver(Fake::default());
+        d.set_scroll_settings(ScrollSettings::new(setting, setting));
+        d.scroll(pixels(10.0, -10.0)).unwrap();
+        assert_eq!(d.port().sends, [wheel(true, 20), wheel(false, -20)]);
+    }
+}
+
+#[test]
+fn signed_subunits_accumulate_independently_and_sign_changes_drop_debt() {
+    let mut d = driver(Fake::default());
+    d.scroll(pixels(0.2, -0.3)).unwrap();
+    assert!(d.port().sends.is_empty());
+    d.scroll(pixels(0.2, -0.3)).unwrap();
+    assert_eq!(d.port().sends, [wheel(false, -1)]);
+    d.scroll(pixels(0.2, 0.0)).unwrap();
+    assert_eq!(d.port().sends, [wheel(false, -1), wheel(true, 1)]);
+    d.port_mut().sends.clear();
+    d.reset_scroll();
+    d.scroll(pixels(0.4, 0.0)).unwrap();
+    d.scroll(pixels(-0.2, 0.0)).unwrap();
+    d.scroll(pixels(-0.3, 0.0)).unwrap();
+    assert_eq!(d.port().sends, [wheel(true, -1)]);
+}
+
+#[test]
+fn lifecycle_and_per_axis_stops_reset_fractional_debt() {
+    for phase in [
+        ScrollPhase::Began,
+        ScrollPhase::Ended,
+        ScrollPhase::Cancelled,
+        ScrollPhase::MomentumEnded,
+    ] {
+        let mut d = driver(Fake::default());
+        d.scroll(pixels(0.4, 0.4)).unwrap();
+        d.scroll(ScrollDelta {
+            phase,
+            ..pixels(0.1, 0.1)
+        })
+        .unwrap();
+        assert!(d.port().sends.is_empty());
+    }
+    let mut d = driver(Fake::default());
+    d.scroll(pixels(0.3, 0.3)).unwrap();
+    d.scroll(ScrollDelta {
+        stop_x: true,
+        ..pixels(0.0, 0.0)
+    })
+    .unwrap();
+    d.scroll(pixels(0.3, 0.3)).unwrap();
+    assert_eq!(d.port().sends, [wheel(false, 1)]);
+    d.port_mut().sends.clear();
+    d.reset_scroll();
+    for phase in [ScrollPhase::MomentumBegan, ScrollPhase::MomentumChanged] {
+        d.scroll(ScrollDelta {
+            phase,
+            ..pixels(0.3, 0.0)
+        })
+        .unwrap();
+    }
+    assert_eq!(d.port().sends, [wheel(true, 1)]);
+}
+
+#[test]
+fn nonfinite_pixels_are_rejected_and_large_emissions_clamp_without_backlog() {
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut d = driver(Fake::default());
+        d.scroll(pixels(0.4, 0.4)).unwrap();
+        assert!(
+            d.scroll(ScrollDelta {
+                v120_x: 1,
+                ..pixels(value, 1.0)
+            })
+            .is_err()
+        );
+        d.scroll(pixels(0.1, 0.1)).unwrap();
+        assert!(d.port().sends.is_empty());
+    }
+    let mut d = driver(Fake::default());
+    d.scroll(pixels(f64::MAX, -f64::MAX)).unwrap();
+    d.scroll(pixels(0.1, -0.1)).unwrap();
+    assert_eq!(
+        d.port().sends,
+        [wheel(true, i32::MAX), wheel(false, i32::MIN)]
+    );
+}
+
+#[test]
+fn scroll_remainders_reset_on_generation_gate_release_and_submission_failures() {
+    for reset in 0..6 {
+        let mut d = driver(Fake::default());
+        d.scroll(pixels(0.4, 0.0)).unwrap();
+        match reset {
+            0 => {
+                d.release_keys().unwrap();
+            }
+            1 => {
+                d.release_buttons().unwrap();
+            }
+            2 => {
+                d.gate().set_engine_permits(false);
+                assert!(d.scroll(pixels(0.0, 0.0)).is_err());
+                d.gate().set_engine_permits(true);
+            }
+            3 => {
+                d.gate().set_engine_permits(false);
+                d.gate().set_engine_permits(true);
+            }
+            4 => {
+                let mut changed = focus(1, 0x2000);
+                changed.generation = 1;
+                d.port_mut().foreground.push_back(Ok(changed));
+            }
+            _ => {
+                d.port_mut().failed = true;
+                assert!(d.scroll(pixels(0.2, 0.0)).is_err());
+                d.port_mut().failed = false;
+                d.port_mut().sends.clear();
+            }
+        }
+        d.scroll(pixels(0.1, 0.0)).unwrap();
+        assert!(d.port().sends.is_empty(), "reset case {reset}");
+    }
+}
+
+#[test]
+fn fresh_fence_between_scroll_axes_refuses_the_second_submission() {
+    let mut d = driver(Fake {
+        foreground: [
+            Ok(focus(1, 0x2000)),
+            Ok(focus(1, 0x2000)),
+            Ok(focus(2, 0x2000)),
+        ]
+        .into(),
+        ..Default::default()
+    });
+    assert!(matches!(
+        d.scroll(pixels(10.0, 10.0)),
+        Err(PlatformError::SecureInput)
+    ));
+    assert_eq!(d.port().sends, [wheel(true, 20)]);
+    d.scroll(pixels(0.1, 0.1)).unwrap();
+    assert_eq!(d.port().sends, [wheel(true, 20)]);
+}
+
+#[test]
+fn unrelated_key_and_button_releases_and_equal_lock_requests_keep_pixel_fractions() {
+    let mut d = driver(Fake::default());
+    d.scroll(pixels(0.4, 0.0)).unwrap();
+    d.key(HidUsage::keyboard(0x73), false, 0).unwrap();
+    d.button(MouseButton::PRIMARY, false).unwrap();
+    d.set_locks(LockKeys {
+        caps_lock: Some(false),
+        ..LockKeys::default()
+    })
+    .unwrap();
+    d.port_mut().sends.clear();
+    d.scroll(pixels(0.1, 0.0)).unwrap();
+    assert_eq!(d.port().sends, [wheel(true, 1)]);
+}
+
+#[test]
+fn unknown_lock_requests_leave_unchanged_and_known_requests_never_guess_actual_state() {
+    let mut d = driver(Fake {
+        lock_state: Some(LockKeys::default()),
+        ..Fake::default()
+    });
+    assert_eq!(d.locks().unwrap(), LockKeys::default());
+    d.set_locks(LockKeys::default()).unwrap();
+    for wanted in [
+        LockKeys {
+            caps_lock: Some(true),
+            ..LockKeys::default()
+        },
+        LockKeys {
+            num_lock: Some(false),
+            ..LockKeys::default()
+        },
+        LockKeys {
+            scroll_lock: Some(true),
+            ..LockKeys::default()
+        },
+    ] {
+        assert!(matches!(
+            d.set_locks(wanted),
+            Err(PlatformError::SecureInput)
+        ));
+    }
+    assert!(d.port().sends.is_empty());
 }

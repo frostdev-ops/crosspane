@@ -14,7 +14,7 @@ use crate::model::{
     hook::DragSettlementResult,
     inject::{
         Driver, Foreground, InjectionPort, LocalSettlementOutcome, Packet, RepeatSettings,
-        absolute_move, scroll_packets,
+        ScrollSettings, absolute_move,
     },
 };
 use crosspane_platform::{
@@ -285,6 +285,20 @@ impl InjectionPort for NativePort {
         let input = encode(packet, self.tag);
         #[cfg(test)]
         {
+            if let Some(owned) = self.owned_fixture
+                && matches!(packet, Packet::Wheel { .. })
+            {
+                // SAFETY: owned fixture admission only; compare handles, never read content.
+                unsafe {
+                    let mut point = windows_sys::Win32::Foundation::POINT::default();
+                    if GetCursorPos(&mut point) == 0
+                        || WindowFromPoint(point) as usize != owned
+                        || GetForegroundWindow() as usize != owned
+                    {
+                        return Err(PlatformError::SecureInput);
+                    }
+                }
+            }
             self.submitted += 1;
             if let Some(sender) = &mut self.sender {
                 return if sender(input) == 1 {
@@ -303,14 +317,10 @@ impl InjectionPort for NativePort {
         }
     }
     fn locks(&mut self) -> Result<LockKeys, PlatformError> {
-        // SAFETY: read-only lock states. No virtual-key injection occurs.
-        unsafe {
-            Ok(LockKeys {
-                caps_lock: Some(GetKeyState(VK_CAPITAL as i32) & 1 != 0),
-                num_lock: Some(GetKeyState(VK_NUMLOCK as i32) & 1 != 0),
-                scroll_lock: Some(GetKeyState(VK_SCROLL as i32) & 1 != 0),
-            })
-        }
+        // `[U]` The calling thread has no proven foreground keyboard-queue relationship.
+        // GetKeyState is queue-relative; do not turn a potentially stale bit into a toggle.
+        // <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getkeystate>
+        Ok(LockKeys::default())
     }
 }
 
@@ -848,6 +858,26 @@ pub fn injectors(
         }
         RepeatSettings::new(delay, speed)?
     };
+    let mut lines = 0u32;
+    let mut chars = 0u32;
+    // SAFETY: read-only SPI queries write initialized u32 storage; no settings change.
+    let scroll_settings = unsafe {
+        let lines = (SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            (&mut lines as *mut u32).cast(),
+            0,
+        ) != 0)
+            .then_some(lines);
+        let chars = (SystemParametersInfoW(
+            SPI_GETWHEELSCROLLCHARS,
+            0,
+            (&mut chars as *mut u32).cast(),
+            0,
+        ) != 0)
+            .then_some(chars);
+        ScrollSettings::new(chars, lines)
+    };
     // SAFETY: read-only query on our process token.
     let own = unsafe { integrity(GetCurrentProcess())? };
     let generation = Arc::new(AtomicU64::new(0));
@@ -876,8 +906,10 @@ pub fn injectors(
         #[cfg(test)]
         tainted: None,
     };
+    let mut driver = Driver::new(port, gate, own, settings);
+    driver.set_scroll_settings(scroll_settings);
     let shared = Arc::new(Shared {
-        driver: Mutex::new(Driver::new(port, gate, own, settings)),
+        driver: Mutex::new(driver),
         cancel,
         stop,
     });
@@ -978,11 +1010,7 @@ impl PointerInjector for WindowsPointerInjector {
         lock(&self.0.shared.driver)?.button(button, down)
     }
     fn scroll(&mut self, delta: ScrollDelta) -> Result<(), PlatformError> {
-        let mut driver = lock(&self.0.shared.driver)?;
-        for packet in scroll_packets(delta) {
-            driver.submit_guarded(packet)?;
-        }
-        Ok(())
+        lock(&self.0.shared.driver)?.scroll(delta)
     }
     fn release_all(&mut self) -> Result<(), PlatformError> {
         self.0.shared.cancel.fetch_add(1, Ordering::AcqRel);
@@ -1054,7 +1082,7 @@ fn validate_monitors(probes: &[MonitorProbe]) -> Result<(), PlatformError> {
 #[cfg(test)]
 mod probe_tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicI64, AtomicU32};
     use windows_sys::Win32::{
         Foundation::{HWND, POINT, RECT},
         Graphics::Gdi::{ClientToScreen, MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
@@ -1259,6 +1287,13 @@ mod probe_tests {
         untagged_keys: AtomicU32,
         untagged_chars: AtomicU32,
         untagged_buttons: AtomicU32,
+        wheels: AtomicU32,
+        wheel_x: AtomicI64,
+        wheel_y: AtomicI64,
+        altgr_downs: AtomicU32,
+        altgr_ups: AtomicU32,
+        control_downs: AtomicU32,
+        control_ups: AtomicU32,
     }
     unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: usize, l: isize) -> isize {
         // SAFETY: WM_NCCREATE carries our create parameters; the pinned Counts outlives the HWND.
@@ -1293,11 +1328,13 @@ mod probe_tests {
                         | WM_SYSKEYUP
                         | WM_LBUTTONDOWN
                         | WM_LBUTTONUP
+                        | WM_MOUSEWHEEL
+                        | WM_MOUSEHWHEEL
                 );
                 if input && GetMessageExtraInfo() as usize != 0x43504e49 {
                     state.tainted.store(true, Ordering::Release);
                     match message {
-                        WM_LBUTTONDOWN | WM_LBUTTONUP => {
+                        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                             state.untagged_buttons.fetch_add(1, Ordering::AcqRel);
                         }
                         _ => {
@@ -1309,6 +1346,12 @@ mod probe_tests {
                 match message {
                     WM_KEYDOWN | WM_SYSKEYDOWN => {
                         state.downs.fetch_add(1, Ordering::AcqRel);
+                        let scan = (l as usize >> 16) & 0x1ff;
+                        if scan == 0x138 {
+                            state.altgr_downs.fetch_add(1, Ordering::AcqRel);
+                        } else if scan == 0x1d {
+                            state.control_downs.fetch_add(1, Ordering::AcqRel);
+                        }
                         // Only source-tagged injected fixture keys reach this branch.
                         if (l as usize >> 16) & 0xff == 0x1e {
                             state.expected_chars.fetch_add(1, Ordering::AcqRel);
@@ -1317,6 +1360,12 @@ mod probe_tests {
                     }
                     WM_KEYUP | WM_SYSKEYUP => {
                         state.ups.fetch_add(1, Ordering::AcqRel);
+                        let scan = (l as usize >> 16) & 0x1ff;
+                        if scan == 0x138 {
+                            state.altgr_ups.fetch_add(1, Ordering::AcqRel);
+                        } else if scan == 0x1d {
+                            state.control_ups.fetch_add(1, Ordering::AcqRel);
+                        }
                         return 0;
                     }
                     WM_LBUTTONDOWN => {
@@ -1325,6 +1374,17 @@ mod probe_tests {
                     }
                     WM_LBUTTONUP => {
                         state.click_ups.fetch_add(1, Ordering::AcqRel);
+                        return 0;
+                    }
+                    WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                        state.wheels.fetch_add(1, Ordering::AcqRel);
+                        let delta = i64::from((w >> 16) as u16 as i16);
+                        let axis = if message == WM_MOUSEHWHEEL {
+                            &state.wheel_x
+                        } else {
+                            &state.wheel_y
+                        };
+                        axis.fetch_add(delta, Ordering::AcqRel);
                         return 0;
                     }
                     _ => {}
@@ -1608,6 +1668,429 @@ mod probe_tests {
             validate_monitors(std::slice::from_ref(&probe))?;
             Ok((vec![probe.clone()], ids.clone()))
         })
+    }
+
+    fn fixture_locks() -> [bool; 3] {
+        // SAFETY: test-only, read-only query of this thread's queue state; values are not logged.
+        unsafe { [VK_CAPITAL, VK_NUMLOCK, VK_SCROLL].map(|vk| GetKeyState(i32::from(vk)) & 1 != 0) }
+    }
+
+    struct LockObserver {
+        requests: Option<mpsc::Sender<mpsc::Sender<[bool; 3]>>>,
+        thread: Option<JoinHandle<()>>,
+    }
+    impl LockObserver {
+        fn start() -> Self {
+            let (requests, receive) = mpsc::channel::<mpsc::Sender<[bool; 3]>>();
+            let thread = thread::spawn(move || {
+                // SAFETY: creates this nonforeground thread's own queue once. It never
+                // attaches queues or consumes the foreground fixture's keyboard messages.
+                unsafe {
+                    let mut message = MSG::default();
+                    PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
+                }
+                while let Ok(reply) = receive.recv() {
+                    let _ = reply.send(fixture_locks());
+                }
+            });
+            Self {
+                requests: Some(requests),
+                thread: Some(thread),
+            }
+        }
+        fn read(&self) -> [bool; 3] {
+            let (reply, receive) = mpsc::channel();
+            self.requests.as_ref().unwrap().send(reply).unwrap();
+            receive.recv_timeout(Duration::from_secs(1)).unwrap()
+        }
+    }
+    impl Drop for LockObserver {
+        fn drop(&mut self) {
+            self.requests.take();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn pump_restore() {
+        let until = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < until {
+            // SAFETY: pumps only this owned fixture thread's queue; no data is logged.
+            unsafe {
+                let mut message = MSG::default();
+                while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    struct RestoreLocks<'a> {
+        fixture: &'a Fixture,
+        keys: &'a mut WindowsKeyInjector,
+        originals: [bool; 3],
+        failures: Arc<AtomicU32>,
+    }
+    impl RestoreLocks<'_> {
+        fn owned(&self) -> bool {
+            // SAFETY: compares only our retained fixture handle; no window content is read.
+            (unsafe { GetForegroundWindow() == self.fixture.hwnd })
+                && !self.fixture.counts.tainted.load(Ordering::Acquire)
+        }
+        fn toggle(&mut self, index: usize) -> Result<(), PlatformError> {
+            if !self.owned() {
+                return Err(PlatformError::SecureInput);
+            }
+            let usage = HidUsage::keyboard([0x39, 0x53, 0x47][index]);
+            let down = self.keys.key(usage, true);
+            let up = if self.owned() {
+                self.keys.key(usage, false)
+            } else {
+                Err(PlatformError::SecureInput)
+            };
+            down.and(up)
+        }
+        fn restore(&mut self) {
+            if !self.owned() {
+                self.failures.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
+            if self.keys.release_all().is_err() {
+                self.failures.fetch_add(1, Ordering::AcqRel);
+            }
+            pump_restore();
+            for index in 0..3 {
+                if fixture_locks()[index] != self.originals[index] {
+                    if self.toggle(index).is_err() {
+                        self.failures.fetch_add(1, Ordering::AcqRel);
+                    }
+                    pump_restore();
+                }
+            }
+            if fixture_locks() != self.originals {
+                self.failures.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+    impl Drop for RestoreLocks<'_> {
+        fn drop(&mut self) {
+            // Unconditional best effort on normal return and assertion unwinding, owned-only.
+            self.restore();
+        }
+    }
+
+    #[test]
+    #[ignore = "Limited win-gui owned fixture only; explicit nonce and W1.10 opt-in"]
+    fn owned_e1_scroll_probe() {
+        assert_eq!(
+            std::env::var("CROSSPANE_W110_PROBE").as_deref(),
+            Ok("scroll")
+        );
+        assert!(limited());
+        let fixture = Fixture::new(&format!("CrosspaneW110ScrollLock{}", nonce()));
+        let _watchdog = Watchdog::start(fixture.hwnd, false);
+        fixture.activate();
+        own_process(fixture.hwnd);
+        modifiers_clear();
+        let probe = fixture.monitor();
+        let mut ids = DisplayIds::default();
+        let display = ids.assign(&probe.device_path).unwrap();
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let refresh = owned_mapping(probe.clone(), ids.clone());
+        let (keys, mut pointer) =
+            injectors(gate, std::slice::from_ref(&probe), &mut ids, refresh).unwrap();
+        {
+            let mut driver = lock(&keys.0.shared.driver).unwrap();
+            driver.port_mut().owned_fixture = Some(fixture.hwnd as usize);
+            driver.port_mut().tainted = Some(fixture.counts.tainted.clone());
+        }
+        let point = {
+            // SAFETY: transforms only our retained fixture client rectangle to screen position.
+            unsafe {
+                let mut r = RECT::default();
+                assert_ne!(GetClientRect(fixture.hwnd, &mut r), 0);
+                let mut p = POINT {
+                    x: (r.right - r.left) / 2,
+                    y: (r.bottom - r.top) / 2,
+                };
+                assert_ne!(ClientToScreen(fixture.hwnd, &mut p), 0);
+                PointDevice::new(
+                    f64::from(p.x - probe.rc_monitor[0]),
+                    f64::from(p.y - probe.rc_monitor[1]),
+                )
+            }
+        };
+        pointer.move_to(display, point).unwrap();
+        fixture.pump(Duration::from_millis(50));
+        // Submission acknowledgement is not routing settlement. Observe only owned-handle
+        // equality for another bounded interval, with no further input while it is unresolved.
+        let until = Instant::now() + Duration::from_millis(250);
+        let mut observations = 0u32;
+        loop {
+            observations += 1;
+            // SAFETY: cursor position and handle equality only; no content or coordinates logged.
+            let admitted = unsafe {
+                let mut cursor = POINT::default();
+                assert!(
+                    GetForegroundWindow() == fixture.hwnd,
+                    "owned foreground lost"
+                );
+                assert_ne!(GetCursorPos(&mut cursor), 0);
+                WindowFromPoint(cursor) == fixture.hwnd
+            };
+            if admitted || Instant::now() >= until {
+                break;
+            }
+            fixture.pump(Duration::from_millis(10));
+        }
+        println!("OWNED_WHEEL bounded_routing_observations={}", observations);
+        // SAFETY: normal focus of this thread's own window; equality queries read no content.
+        unsafe {
+            SetFocus(fixture.hwnd);
+            let mut cursor = POINT::default();
+            assert_ne!(GetCursorPos(&mut cursor), 0);
+            println!(
+                "OWNED_WHEEL targeting foreground={} focus={} pointer={} packets={}",
+                u32::from(GetForegroundWindow() == fixture.hwnd),
+                u32::from(GetFocus() == fixture.hwnd),
+                u32::from(WindowFromPoint(cursor) == fixture.hwnd),
+                lock(&keys.0.shared.driver).unwrap().port().submitted
+            );
+            assert!(
+                GetFocus() == fixture.hwnd,
+                "owned fixture focus unavailable"
+            );
+            assert!(
+                WindowFromPoint(cursor) == fixture.hwnd,
+                "owned pointer target unavailable"
+            );
+        }
+        use crosspane_types::{geom::VectorLogical, input::ScrollPhase};
+        let delta = ScrollDelta {
+            v120_x: -15,
+            v120_y: 30,
+            pixels: Some(VectorLogical::new(900.0, 900.0)),
+            phase: ScrollPhase::Changed,
+            stop_x: false,
+            stop_y: false,
+        };
+        pointer.scroll(delta).unwrap();
+        fixture.pump(Duration::from_millis(50));
+        println!(
+            "OWNED_WHEEL observation packets={} x_units={} y_units={}",
+            fixture.counts.wheels.load(Ordering::Acquire),
+            fixture.counts.wheel_x.load(Ordering::Acquire),
+            fixture.counts.wheel_y.load(Ordering::Acquire)
+        );
+        assert_eq!(fixture.counts.wheel_x.load(Ordering::Acquire), -15);
+        assert_eq!(fixture.counts.wheel_y.load(Ordering::Acquire), 30);
+        // A known test scale isolates native delivery from the separate production SPI query.
+        lock(&keys.0.shared.driver)
+            .unwrap()
+            .set_scroll_settings(ScrollSettings::default());
+        for _ in 0..2 {
+            pointer
+                .scroll(ScrollDelta {
+                    v120_x: 0,
+                    v120_y: 0,
+                    pixels: Some(VectorLogical::new(0.3, -0.3)),
+                    ..delta
+                })
+                .unwrap();
+        }
+        fixture.pump(Duration::from_millis(50));
+        assert_eq!(fixture.counts.wheel_x.load(Ordering::Acquire), -14);
+        assert_eq!(fixture.counts.wheel_y.load(Ordering::Acquire), 29);
+        let wheels = fixture.counts.wheels.load(Ordering::Acquire);
+        pointer
+            .scroll(ScrollDelta {
+                v120_x: 0,
+                v120_y: 0,
+                pixels: None,
+                phase: ScrollPhase::Ended,
+                stop_x: true,
+                stop_y: true,
+            })
+            .unwrap();
+        fixture.pump(Duration::from_millis(50));
+        assert_eq!(fixture.counts.wheels.load(Ordering::Acquire), wheels);
+        println!("OWNED_WHEEL verified_packets={}", wheels);
+    }
+
+    fn observe_owned_locks(fixture: &Fixture, keys: &mut WindowsKeyInjector) {
+        let observer = LockObserver::start();
+        let originals = fixture_locks();
+        let failures = Arc::new(AtomicU32::new(0));
+        let mut restore = RestoreLocks {
+            fixture,
+            keys,
+            originals,
+            failures: failures.clone(),
+        };
+        let mut background_current = 0u32;
+        let mut background_stale = 0u32;
+        for index in 0..3 {
+            let before = observer.read();
+            if let Err(error) = restore.toggle(index) {
+                drop(restore);
+                println!(
+                    "OWNED_LOCK refusal completed_trials={} submitted={} downs={} ups={} restore_failures={}",
+                    background_current + background_stale,
+                    lock(&keys.0.shared.driver).unwrap().port().submitted,
+                    fixture.counts.downs.load(Ordering::Acquire),
+                    fixture.counts.ups.load(Ordering::Acquire),
+                    failures.load(Ordering::Acquire)
+                );
+                panic!("owned lock trial refused: {error}");
+            }
+            fixture.pump(Duration::from_millis(70));
+            let foreground = fixture_locks();
+            assert!(
+                foreground[index] != originals[index],
+                "owned lock did not toggle"
+            );
+            let after = observer.read();
+            if after[index] == foreground[index] {
+                background_current += 1;
+            } else {
+                background_stale += 1;
+                assert!(
+                    after[index] == before[index],
+                    "background state was inconsistent"
+                );
+            }
+            restore.restore();
+            assert!(
+                fixture_locks() == originals,
+                "owned original lock restoration failed"
+            );
+        }
+        drop(restore);
+        assert_eq!(failures.load(Ordering::Acquire), 0);
+        assert!(
+            fixture_locks() == originals,
+            "owned original lock restoration failed"
+        );
+        assert_eq!(fixture.counts.downs.load(Ordering::Acquire), 6);
+        assert_eq!(fixture.counts.ups.load(Ordering::Acquire), 6);
+        println!(
+            "OWNED_LOCK balanced_lock_downs=6 ups=6 background_current={} background_stale={} restore_failures=0",
+            background_current, background_stale
+        );
+    }
+
+    #[test]
+    #[ignore = "Limited win-gui owned foreground lock fixture only; explicit W1.10 opt-in"]
+    fn owned_e1_lock_probe() {
+        assert_eq!(
+            std::env::var("CROSSPANE_W110_PROBE").as_deref(),
+            Ok("locks")
+        );
+        assert!(limited());
+        let fixture = Fixture::new(&format!("CrosspaneW110Locks{}", nonce()));
+        let _watchdog = Watchdog::start(fixture.hwnd, false);
+        fixture.activate();
+        own_process(fixture.hwnd);
+        modifiers_clear();
+        let probe = fixture.monitor();
+        let mut ids = DisplayIds::default();
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let refresh = owned_mapping(probe.clone(), ids.clone());
+        let (mut keys, _pointer) =
+            injectors(gate, std::slice::from_ref(&probe), &mut ids, refresh).unwrap();
+        {
+            let mut driver = lock(&keys.0.shared.driver).unwrap();
+            driver.port_mut().owned_fixture = Some(fixture.hwnd as usize);
+            driver.port_mut().tainted = Some(fixture.counts.tainted.clone());
+        }
+        observe_owned_locks(&fixture, &mut keys);
+        modifiers_clear();
+    }
+
+    #[test]
+    #[ignore = "Limited win-gui metadata only; active installed layout, no layout changes"]
+    fn owned_altgr_metadata_probe() {
+        assert_eq!(
+            std::env::var("CROSSPANE_W110_PROBE").as_deref(),
+            Ok("altgr")
+        );
+        assert!(limited());
+        let _nonce = nonce();
+        // SAFETY: read-only installed/current layout queries and translation of fixture constants.
+        // VkKeyScanEx does not generate input, change layouts or inspect owner typing.
+        let (installed, active_applicable) = unsafe {
+            let count = GetKeyboardLayoutList(0, null_mut());
+            assert!((1..=128).contains(&count));
+            let mut layouts = vec![null_mut(); count as usize];
+            let read = GetKeyboardLayoutList(count, layouts.as_mut_ptr());
+            assert_eq!(read, count);
+            let applicable = |layout| {
+                [0x40u16, 0x20ac, 0x7c].into_iter().any(|character| {
+                    let mapping = VkKeyScanExW(character, layout);
+                    mapping != -1 && ((mapping as u16 >> 8) & 6) == 6
+                })
+            };
+            let installed = layouts
+                .into_iter()
+                .filter(|layout| applicable(*layout))
+                .count();
+            (installed, applicable(GetKeyboardLayout(0)))
+        };
+        if !active_applicable {
+            println!(
+                "OWNED_ALTGR applicable_installed={} active_applicable=0 observed=0 deferred_W6_1=1",
+                installed
+            );
+            return;
+        }
+        let fixture = Fixture::new(&format!("CrosspaneW110AltGr{}", nonce()));
+        let _watchdog = Watchdog::start(fixture.hwnd, false);
+        fixture.activate();
+        own_process(fixture.hwnd);
+        modifiers_clear();
+        let probe = fixture.monitor();
+        let mut ids = DisplayIds::default();
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let refresh = owned_mapping(probe.clone(), ids.clone());
+        let (mut keys, _pointer) =
+            injectors(gate, std::slice::from_ref(&probe), &mut ids, refresh).unwrap();
+        {
+            let mut driver = lock(&keys.0.shared.driver).unwrap();
+            driver.port_mut().owned_fixture = Some(fixture.hwnd as usize);
+            driver.port_mut().tainted = Some(fixture.counts.tainted.clone());
+        }
+        let down = keys.key(HidUsage::keyboard(0xe6), true);
+        let up = keys.key(HidUsage::keyboard(0xe6), false);
+        down.and(up).unwrap();
+        fixture.pump(Duration::from_millis(100));
+        keys.release_all().unwrap();
+        modifiers_clear();
+        let count = |counter: &AtomicU32| counter.load(Ordering::Acquire);
+        assert_eq!(
+            count(&fixture.counts.altgr_downs),
+            count(&fixture.counts.altgr_ups)
+        );
+        assert_eq!(
+            count(&fixture.counts.control_downs),
+            count(&fixture.counts.control_ups)
+        );
+        println!(
+            "OWNED_ALTGR applicable_installed={} active_applicable=1 altgr_downs={} altgr_ups={} ctrl_downs={} ctrl_ups={} hardware_classification_unproven=1",
+            installed,
+            count(&fixture.counts.altgr_downs),
+            count(&fixture.counts.altgr_ups),
+            count(&fixture.counts.control_downs),
+            count(&fixture.counts.control_ups)
+        );
     }
 
     #[test]

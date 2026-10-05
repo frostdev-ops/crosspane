@@ -48,8 +48,8 @@ use windows_sys::Win32::{
     },
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-            KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, SendInput,
+            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+            KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, SendInput,
         },
         Input::{
             GetRawInputData, GetRegisteredRawInputDevices, RAWINPUT, RAWINPUTDEVICE,
@@ -1321,14 +1321,10 @@ impl Drop for Native {
 }
 
 fn lock_keys() -> LockKeys {
-    // SAFETY: read-only lock-key state on the native owner thread.
-    unsafe {
-        LockKeys {
-            caps_lock: Some(GetKeyState(0x14) & 1 != 0),
-            num_lock: Some(GetKeyState(0x90) & 1 != 0),
-            scroll_lock: Some(GetKeyState(0x91) & 1 != 0),
-        }
-    }
+    // `[U]` This background capture queue has no proven current foreground toggle snapshot.
+    // GetKeyState is queue-relative, so unknown values must leave peer locks unchanged.
+    // <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getkeystate>
+    LockKeys::default()
 }
 
 fn snapshot(shared: &Shared) -> (Vec<KeySnapshot>, [bool; 256]) {
