@@ -1,4 +1,4 @@
-//! Per-window public WGC mirror capture. No picker, display capture or permission prompt.
+//! Public WGC window and retained-monitor mirror capture. No picker or permission prompt.
 //!
 //! The unpackaged backend keeps the capture border required. Borderless consent needs
 //! the packaging capability and an attended RequestAccessAsync path (W4.1).
@@ -7,7 +7,8 @@
 
 use crate::{
     model::frame_capture::{
-        Latest, TargetState, crop_rect, end_reason, surface_ready, validate_crop,
+        Latest, MonitorSnapshotReader, MonitorTarget, TargetState, crop_rect, end_reason,
+        failure_reason, refresh_monitor, resolve_monitor, surface_ready, validate_crop,
     },
     window::{NativeWindow, WindowResolver},
 };
@@ -51,6 +52,7 @@ use windows::{
                 Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
                 DXGI_ERROR_WAS_STILL_DRAWING, IDXGIDevice,
             },
+            Gdi::HMONITOR,
         },
         System::WinRT::{
             Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
@@ -91,6 +93,7 @@ fn size(value: SizeInt32) -> Result<PixelSize, PlatformError> {
 struct Shared {
     gate: Arc<IoGate>,
     resolver: WindowResolver,
+    monitor_reader: Option<MonitorSnapshotReader>,
     alive: AtomicBool,
     fault: AtomicBool,
 }
@@ -124,7 +127,7 @@ impl Call {
 enum Operation {
     Start {
         id: StreamId,
-        window: WindowId,
+        target: CaptureTarget,
         crop: Option<PixelRect>,
         fps: u32,
         sink: Arc<dyn EventSink<FrameEvent>>,
@@ -149,9 +152,29 @@ impl fmt::Debug for WindowsFrameCapture {
 }
 impl WindowsFrameCapture {
     pub fn new(gate: Arc<IoGate>, resolver: WindowResolver) -> Result<Self, PlatformError> {
+        Self::with_reader(gate, resolver, None)
+    }
+
+    /// The platform retains WindowsDisplays; this weak reader supplies fresh coherent
+    /// facts for display streams without adding a render/platform dependency or cache.
+    #[cfg_attr(test, allow(dead_code))] // Existing private include fixtures use the window facade.
+    pub fn new_with_monitor_reader(
+        gate: Arc<IoGate>,
+        resolver: WindowResolver,
+        monitor_reader: MonitorSnapshotReader,
+    ) -> Result<Self, PlatformError> {
+        Self::with_reader(gate, resolver, Some(monitor_reader))
+    }
+
+    fn with_reader(
+        gate: Arc<IoGate>,
+        resolver: WindowResolver,
+        monitor_reader: Option<MonitorSnapshotReader>,
+    ) -> Result<Self, PlatformError> {
         let shared = Arc::new(Shared {
             gate,
             resolver,
+            monitor_reader,
             alive: AtomicBool::new(true),
             fault: AtomicBool::new(false),
         });
@@ -241,9 +264,14 @@ impl FrameCapture for WindowsFrameCapture {
         if !self.shared.permitted(epoch) {
             return Err(PlatformError::Locked);
         }
-        let CaptureTarget::Window(window) = target else {
-            return Err(PlatformError::Unsupported("Windows display capture"));
-        };
+        match target {
+            CaptureTarget::Window(_) => {}
+            CaptureTarget::Display(_) if self.shared.monitor_reader.is_some() => {}
+            CaptureTarget::Display(_) => {
+                return Err(PlatformError::Unsupported("Windows display capture"));
+            }
+            _ => return Err(PlatformError::Unsupported("Windows capture target")),
+        }
         validate_crop(crop)?;
         let _ = Latest::<()>::new(max_fps)?;
         // Resolve on the bounded worker, before any WGC activation, never on the caller.
@@ -254,7 +282,7 @@ impl FrameCapture for WindowsFrameCapture {
             .ok_or_else(|| backend("WGC stream IDs exhausted"))?;
         self.call(Operation::Start {
             id,
-            window,
+            target,
             crop,
             fps: max_fps,
             sink,
@@ -519,9 +547,75 @@ impl Drop for Held {
         let _ = self.0.Close();
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Binding {
+    Window { id: WindowId, native: NativeWindow },
+    Display(MonitorTarget),
+}
+impl Binding {
+    fn resolve(shared: &Shared, target: CaptureTarget) -> Result<Self, PlatformError> {
+        match target {
+            CaptureTarget::Window(id) => shared
+                .resolver
+                .resolve(id)
+                .map(|native| Self::Window { id, native })
+                .ok_or(PlatformError::NotFound),
+            CaptureTarget::Display(id) => {
+                let reader = shared
+                    .monitor_reader
+                    .as_ref()
+                    .ok_or(PlatformError::Unsupported(
+                        "Windows display capture without monitor reader",
+                    ))?;
+                resolve_monitor(&reader()?, id).map(Self::Display)
+            }
+            _ => Err(PlatformError::Unsupported("Windows capture target")),
+        }
+    }
+
+    fn refresh(&self, shared: &Shared) -> Result<Self, PlatformError> {
+        match self {
+            Self::Window { id, .. } => {
+                let fresh = Self::resolve(shared, CaptureTarget::Window(*id))?;
+                if *self == fresh {
+                    Ok(fresh)
+                } else {
+                    Err(PlatformError::NotFound)
+                }
+            }
+            Self::Display(monitor) => {
+                let reader = shared
+                    .monitor_reader
+                    .as_ref()
+                    .ok_or(PlatformError::Unsupported(
+                        "Windows display capture without monitor reader",
+                    ))?;
+                refresh_monitor(&reader()?, monitor).map(Self::Display)
+            }
+        }
+    }
+
+    fn unchanged(&self, shared: &Shared) -> bool {
+        self.refresh(shared).is_ok_and(|fresh| fresh == *self)
+    }
+
+    fn state(&self) -> TargetState {
+        match self {
+            Self::Window { native, .. } => {
+                // SAFETY: query only the freshly identity-checked window, no mutation.
+                if unsafe { IsIconic(handle(*native)) }.as_bool() {
+                    TargetState::Minimized
+                } else {
+                    TargetState::Live
+                }
+            }
+            Self::Display(_) => TargetState::Live,
+        }
+    }
+}
+
 struct Stream {
-    target: WindowId,
-    binding: NativeWindow,
+    binding: Binding,
     epoch: u64,
     abandoned: Arc<AtomicBool>,
     sink: Arc<dyn EventSink<FrameEvent>>,
@@ -549,30 +643,36 @@ impl Stream {
         shared: &Shared,
         graphics: &Graphics,
         call: &Call,
-        target: WindowId,
+        target: CaptureTarget,
         crop: Option<PixelRect>,
         fps: u32,
         sink: Arc<dyn EventSink<FrameEvent>>,
     ) -> Result<Self, PlatformError> {
         call.check(shared)?;
-        let binding = shared
-            .resolver
-            .resolve(target)
-            .ok_or(PlatformError::NotFound)?;
-        // SAFETY: only the resolver's identity-checked admitted handle is queried.
-        if unsafe { IsIconic(handle(binding)) }.as_bool() {
+        let mut binding = Binding::resolve(shared, target)?;
+        call.check(shared)?;
+        if binding.state() == TargetState::Minimized {
             return Err(backend("WGC target minimized"));
         }
         let interop: IGraphicsCaptureItemInterop =
             factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
-                .map_err(|e| api("WGC HWND interop", e))?;
+                .map_err(|e| api("WGC item interop", e))?;
         call.check(shared)?;
-        if shared.resolver.resolve(target) != Some(binding) {
-            return Err(PlatformError::NotFound);
-        }
-        // SAFETY: fresh admitted identity, no display/foreign HWND source or picker.
-        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(handle(binding)) }
-            .map_err(|e| api("WGC window item", e))?;
+        binding = binding.refresh(shared)?;
+        call.check(shared)?;
+        let item: GraphicsCaptureItem = match &binding {
+            Binding::Window { native, .. } => {
+                // SAFETY: fresh resolver-admitted window identity, no picker or foreign source.
+                unsafe { interop.CreateForWindow(handle(*native)) }
+                    .map_err(|e| api("WGC window item", e))?
+            }
+            Binding::Display(monitor) => {
+                // SAFETY: exact retained DisplayId from a fresh coherent W1.5c observation.
+                // HMONITOR is observation-scoped; rechecked before starting and each delivery.
+                unsafe { interop.CreateForMonitor(HMONITOR(monitor.handle as *mut _)) }
+                    .map_err(|e| api("WGC monitor item", e))?
+            }
+        };
         let pool_size = item.Size().map_err(|e| api("WGC item size", e))?;
         size(pool_size)?;
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -603,8 +703,7 @@ impl Stream {
                 return Err(api("WGC close event", e));
             }
         };
-        let stream = Self {
-            target,
+        let mut stream = Self {
             binding,
             epoch: call.epoch,
             abandoned: Arc::clone(&call.abandoned),
@@ -626,15 +725,25 @@ impl Stream {
             .map_err(|e| api("disable WGC cursor", e))?;
         // Leave the border REQUIRED. Setter readback cannot establish borderless consent.
         call.check(shared)?;
-        if shared.resolver.resolve(target) != Some(binding) {
-            return Err(PlatformError::NotFound);
-        }
+        stream.refresh(shared)?;
+        call.check(shared)?;
         stream
             .session
             .StartCapture()
             .map_err(|e| api("start WGC", e))?;
         call.check(shared)?;
         Ok(stream)
+    }
+
+    fn refresh(&mut self, shared: &Shared) -> Result<(), PlatformError> {
+        if !shared.permitted(self.epoch) {
+            return Err(PlatformError::Locked);
+        }
+        self.binding = self.binding.refresh(shared)?;
+        if !shared.permitted(self.epoch) {
+            return Err(PlatformError::Locked);
+        }
+        Ok(())
     }
 
     fn poll(
@@ -656,9 +765,7 @@ impl Stream {
                     if content != self.pool_size {
                         self.latest.clear();
                         drop(held);
-                        if shared.resolver.resolve(self.target) != Some(self.binding) {
-                            return Err(PlatformError::NotFound);
-                        }
+                        self.refresh(shared)?;
                         if !shared.permitted(self.epoch) {
                             return Err(PlatformError::Locked);
                         }
@@ -755,6 +862,7 @@ impl Stream {
         if std::env::var("CROSSPANE_WINDOWS_WGC_DESCRIPTOR").as_deref() == Ok("1") {
             return Ok(None); // Owned metadata only: never copy/map pixels.
         }
+        self.refresh(shared)?;
         let context = match graphics.gpu.context.try_lock() {
             Ok(context) => context,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
@@ -852,7 +960,7 @@ fn worker(
             let result = call.check(shared).and_then(|()| match &call.operation {
                 Operation::Start {
                     id,
-                    window,
+                    target,
                     crop,
                     fps,
                     sink,
@@ -861,7 +969,7 @@ fn worker(
                         shared,
                         &graphics,
                         &call,
-                        *window,
+                        *target,
                         *crop,
                         *fps,
                         Arc::clone(sink),
@@ -871,9 +979,7 @@ fn worker(
                 }
                 Operation::Crop(id, crop) => {
                     let stream = streams.get_mut(id).ok_or(PlatformError::NotFound)?;
-                    if shared.resolver.resolve(stream.target) != Some(stream.binding) {
-                        return Err(PlatformError::NotFound);
-                    }
+                    stream.refresh(shared)?;
                     call.check(shared)?;
                     stream.latest.clear();
                     stream.crop = *crop;
@@ -895,18 +1001,20 @@ fn worker(
             let Some(stream) = streams.get_mut(&id) else {
                 continue;
             };
-            let binding = shared.resolver.resolve(stream.target);
-            let target = if stream.closed.load(Ordering::Acquire) || binding != Some(stream.binding)
-            {
-                TargetState::Gone
-            } else {
-                // SAFETY: query only the freshly resolved target identity, no window mutation.
-                if unsafe { IsIconic(handle(stream.binding)) }.as_bool() {
-                    TargetState::Minimized
-                } else {
-                    TargetState::Live
-                }
-            };
+            if stream.closed.load(Ordering::Acquire) {
+                end(shared, &mut streams, id, StreamEndReason::TargetGone);
+                continue;
+            }
+            if let Err(error) = stream.refresh(shared) {
+                let reason = failure_reason(
+                    shared.permitted(stream.epoch),
+                    shared.gate.epoch() == stream.epoch,
+                    &error,
+                );
+                end(shared, &mut streams, id, reason);
+                continue;
+            }
+            let target = stream.binding.state();
             if let Some(reason) = end_reason(
                 shared.gate.is_open(),
                 shared.gate.epoch() == stream.epoch,
@@ -919,15 +1027,27 @@ fn worker(
                 end(shared, &mut streams, id, StreamEndReason::Requested);
                 continue;
             }
-            if let Ok(content) = size(stream.pool_size)
-                && let Some(shape) =
-                    stream
-                        .cursor
-                        .sample(stream.binding, content, stream.crop, || {
+            let binding = stream.binding.clone();
+            let shape = size(stream.pool_size)
+                .ok()
+                .and_then(|content| match &binding {
+                    Binding::Window { native, .. } => {
+                        stream.cursor.sample(*native, content, stream.crop, || {
                             shared.permitted(stream.epoch)
                         })
+                    }
+                    Binding::Display(monitor) => {
+                        stream
+                            .cursor
+                            .sample_monitor(monitor.bounds, content, stream.crop, || {
+                                shared.permitted(stream.epoch) && binding.unchanged(shared)
+                            })
+                    }
+                });
+            if let Some(shape) = shape
                 && shared.permitted(stream.epoch)
-                && shared.resolver.resolve(stream.target) == Some(stream.binding)
+                && binding.unchanged(shared)
+                && shared.permitted(stream.epoch)
             {
                 let event = match shape {
                     crate::model::cursor::Shape::Image(image) => FrameEvent::Cursor {
@@ -951,8 +1071,13 @@ fn worker(
                         end(shared, &mut streams, id, StreamEndReason::Blocked);
                         continue;
                     }
-                    if shared.resolver.resolve(stream.target) != Some(stream.binding) {
-                        end(shared, &mut streams, id, StreamEndReason::TargetGone);
+                    if let Err(error) = stream.refresh(shared) {
+                        let reason = failure_reason(
+                            shared.permitted(stream.epoch),
+                            shared.gate.epoch() == stream.epoch,
+                            &error,
+                        );
+                        end(shared, &mut streams, id, reason);
                         continue;
                     }
                     frame.at = crate::clock::now();
@@ -969,13 +1094,11 @@ fn worker(
                 Err(error) => {
                     #[cfg(test)]
                     eprintln!("OWNED_WGC stream failure: {error}");
-                    let reason = if !shared.permitted(stream.epoch) {
-                        StreamEndReason::Blocked
-                    } else if matches!(error, PlatformError::NotFound) {
-                        StreamEndReason::TargetGone
-                    } else {
-                        StreamEndReason::Failed
-                    };
+                    let reason = failure_reason(
+                        shared.permitted(stream.epoch),
+                        shared.gate.epoch() == stream.epoch,
+                        &error,
+                    );
                     end(shared, &mut streams, id, reason);
                 }
             }

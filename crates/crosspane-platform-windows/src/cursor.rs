@@ -300,4 +300,65 @@ impl StreamCursor {
         }
         self.history.observe(true, shape)
     }
+
+    /// Monitor capture has no HWND/root guard. Fresh retained monitor geometry and
+    /// stream permission are supplied by the caller; bitmap reads occur only inside
+    /// the physical captured area, with the same post-read checks as window capture.
+    pub(crate) fn sample_monitor(
+        &mut self,
+        bounds: PixelRect,
+        size: PixelSize,
+        crop: Option<PixelRect>,
+        permitted: impl Fn() -> bool,
+    ) -> Option<Shape> {
+        if !permitted() {
+            return None;
+        }
+        let _dpi = Dpi::enter()?;
+        let over = |info: &CURSORINFO| {
+            over_content(
+                (info.ptScreenPos.x, info.ptScreenPos.y),
+                [bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y],
+                size,
+                crop,
+                true,
+            )
+        };
+        let mut before = CURSORINFO {
+            cbSize: size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: only public current cursor metadata, no window fields or bitmap yet.
+        if unsafe { GetCursorInfo(&mut before) } == 0 {
+            return None;
+        }
+        if !over(&before) {
+            return self.history.observe(false, Shape::Default);
+        }
+        if !permitted() {
+            return None;
+        }
+        let shape = if before.flags & CURSOR_SHOWING == 0 {
+            Shape::Hidden
+        } else {
+            self.image(before.hCursor)
+                .map(Shape::Image)
+                .unwrap_or(Shape::Default)
+        };
+        let mut after = CURSORINFO {
+            cbSize: size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: recheck public cursor guards after the owned copy, before delivery.
+        if unsafe { GetCursorInfo(&mut after) } == 0 || !permitted() {
+            return None;
+        }
+        if !over(&after) {
+            return self.history.observe(false, Shape::Default);
+        }
+        if after.hCursor != before.hCursor || after.flags != before.flags {
+            return None;
+        }
+        self.history.observe(true, shape)
+    }
 }

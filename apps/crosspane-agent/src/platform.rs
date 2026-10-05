@@ -801,7 +801,11 @@ pub fn create(
     let frames = windows.as_ref().and_then(|windows| {
         optional(
             "frame capture",
-            WindowsFrameCapture::new(gate.clone(), windows.resolver()),
+            WindowsFrameCapture::new_with_monitor_reader(
+                gate.clone(),
+                windows.resolver(),
+                displays.monitor_snapshot_reader(),
+            ),
         )
     });
     Ok(Platform {

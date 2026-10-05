@@ -8,7 +8,7 @@
 //! Mirrored/ambiguous identities are refused rather than fabricated. No output is created.
 #![allow(unsafe_code)]
 
-pub use crate::model::displays::MonitorSnapshot;
+pub use crate::model::{displays::MonitorSnapshot, frame_capture::MonitorSnapshotReader};
 use crate::{
     inject::MonitorRefresh,
     model::{
@@ -314,6 +314,16 @@ impl WindowsDisplays {
     }
     pub fn ids(&self) -> Arc<Mutex<DisplayIds>> {
         Arc::clone(&self.owner.ids)
+    }
+    #[cfg_attr(test, allow(dead_code))] // Existing private include fixtures use only probe readers.
+    pub fn monitor_snapshot_reader(&self) -> MonitorSnapshotReader {
+        let owner = Arc::downgrade(&self.owner);
+        Arc::new(move || {
+            owner
+                .upgrade()
+                .ok_or_else(|| backend("monitor owner dropped"))?
+                .request(None)
+        })
     }
     pub fn monitor_reader(&self) -> MonitorReader {
         // Weak helpers cannot form owner -> sink -> helper -> owner cycles. The platform

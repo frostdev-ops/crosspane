@@ -1,11 +1,18 @@
 //! OS-free newest-frame pacing, target-local crop and terminal-state mapping.
 
+use super::displays::MonitorSnapshot;
 use crosspane_platform::{PlatformError, StreamEndReason};
 use crosspane_types::{
     geom::{PixelRect, PixelSize},
+    id::DisplayId,
     time::MonoTime,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
+/// Fresh coherent monitor facts from the retained owner. WindowsDisplays supplies a
+/// weak reader: after the platform drops it, requests fail rather than use cached facts.
+pub type MonitorSnapshotReader =
+    Arc<dyn Fn() -> Result<MonitorSnapshot, PlatformError> + Send + Sync>;
 
 /// Holds only the newest native frame. Replaced values are returned so their
 /// owner can release the OS buffer immediately.
@@ -107,5 +114,103 @@ pub fn end_reason(open: bool, same_epoch: bool, target: TargetState) -> Option<S
         // The window is still alive, but WGC cannot supply it while minimized.
         TargetState::Minimized => Some(StreamEndReason::Failed),
         TargetState::Gone => Some(StreamEndReason::TargetGone),
+    }
+}
+
+/// A retained display identity plus fresh physical virtual-screen bounds. Geometry is
+/// observation-scoped; it is deliberately excluded from the native binding identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorTarget {
+    pub id: DisplayId,
+    pub handle: usize,
+    pub device_path: String,
+    pub bounds: PixelRect,
+}
+impl MonitorTarget {
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.id == other.id && self.handle == other.handle && self.device_path == other.device_path
+    }
+}
+
+/// Resolve only the requested retained ID. Never allocate an ID or choose a primary,
+/// nearest or last-known monitor. DisplayInfo.name and MonitorProbe.name are the exact
+/// MONITORINFOEX GDI source name committed by the same W1.5c observation.
+pub fn resolve_monitor(
+    snapshot: &MonitorSnapshot,
+    id: DisplayId,
+) -> Result<MonitorTarget, PlatformError> {
+    let handle = *snapshot.monitors.get(&id).ok_or(PlatformError::NotFound)?;
+    let invalid = || PlatformError::Backend("ambiguous capture monitor mapping".into());
+    if handle == 0 || snapshot.monitors.values().filter(|h| **h == handle).count() != 1 {
+        return Err(invalid());
+    }
+    let mut displays = snapshot.displays.iter().filter(|d| d.id == id);
+    let display = displays.next().ok_or_else(invalid)?;
+    if displays.next().is_some()
+        || display.name.is_empty()
+        || snapshot
+            .displays
+            .iter()
+            .filter(|d| d.name == display.name)
+            .count()
+            != 1
+    {
+        return Err(invalid());
+    }
+    let mut probes = snapshot.probes.iter().filter(|p| p.name == display.name);
+    let probe = probes.next().ok_or_else(invalid)?;
+    if probes.next().is_some()
+        || probe.device_path.is_empty()
+        || snapshot
+            .probes
+            .iter()
+            .filter(|p| p.device_path == probe.device_path)
+            .count()
+            != 1
+    {
+        return Err(invalid());
+    }
+    let [left, top, right, bottom] = probe.rc_monitor;
+    let width = i64::from(right) - i64::from(left);
+    let height = i64::from(bottom) - i64::from(top);
+    if !(1..=i64::from(i32::MAX)).contains(&width)
+        || !(1..=i64::from(i32::MAX)).contains(&height)
+        || display.geometry.pixel_size != PixelSize::new(width as u32, height as u32)
+    {
+        return Err(PlatformError::Backend(
+            "invalid capture monitor geometry".into(),
+        ));
+    }
+    Ok(MonitorTarget {
+        id,
+        handle,
+        device_path: probe.device_path.clone(),
+        bounds: PixelRect::new((left, top).into(), (right, bottom).into()),
+    })
+}
+
+/// Fail closed when fresh native facts are unavailable. A missing binding is distinct
+/// from a query/WGC failure, and the gate and epoch always take precedence.
+pub fn failure_reason(open: bool, same_epoch: bool, error: &PlatformError) -> StreamEndReason {
+    if !open || !same_epoch {
+        StreamEndReason::Blocked
+    } else if matches!(error, PlatformError::NotFound) {
+        StreamEndReason::TargetGone
+    } else {
+        StreamEndReason::Failed
+    }
+}
+
+/// A replaced native handle/path is a lost capture target even when its retained
+/// public ID reconnects. A later start may capture that new binding explicitly.
+pub fn refresh_monitor(
+    snapshot: &MonitorSnapshot,
+    previous: &MonitorTarget,
+) -> Result<MonitorTarget, PlatformError> {
+    let fresh = resolve_monitor(snapshot, previous.id)?;
+    if previous.same_binding(&fresh) {
+        Ok(fresh)
+    } else {
+        Err(PlatformError::NotFound)
     }
 }
