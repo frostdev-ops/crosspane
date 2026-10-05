@@ -801,7 +801,7 @@ impl Runner {
                         113,
                         vec![],
                         format!(
-                            "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                            "Bad request.\nCould not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
                             self.uid
                         )
                         .into_bytes(),

@@ -66,6 +66,42 @@ fn selected_authority_and_absence_remain_exact() {
     );
 }
 #[test]
+fn absent_job_accepts_only_the_exact_macos_27_prefix() {
+    let real_missing = b"Bad request.\nCould not find service \"io.frostdev.crosspane.agent\" in domain for user gui: 501\n";
+    assert_eq!(
+        parser::job(Some(113), b"", real_missing, selected()),
+        J::Absent
+    );
+    for code in [None, Some(0), Some(1), Some(112), Some(114)] {
+        assert_eq!(parser::job(code, b"", real_missing, selected()), J::Unknown);
+    }
+    assert_eq!(
+        parser::job(Some(113), b"unexpected stdout", real_missing, selected()),
+        J::Unknown
+    );
+    let text = std::str::from_utf8(real_missing).unwrap();
+    for invalid in [
+        format!("Bad request.\n{text}"),
+        text.replace("Bad request.", "Bad request"),
+        text.replace("Bad request.\n", "Bad request.\r\n"),
+        text.replace("gui: 501", "gui: 502"),
+        text.replace(LABEL, "io.frostdev.crosspane.other"),
+        format!("{text}extra\n"),
+        format!("{text}\n"),
+        text.trim_end().to_owned(),
+        format!("warning\n{text}"),
+    ] {
+        assert_eq!(
+            parser::job(Some(113), b"", invalid.as_bytes(), selected()),
+            J::Unknown,
+            "{invalid:?}"
+        );
+    }
+    // An absent-job error does not prove a print-disabled result.
+    assert_eq!(parser::disabled(Some(113), b"", real_missing, LABEL), None);
+}
+
+#[test]
 fn disabled_ignores_other_jobs_but_never_guesses_the_selected_row() {
     let parse = |body: &str| parser::disabled(Some(0), body.as_bytes(), b"", LABEL);
     assert_eq!(

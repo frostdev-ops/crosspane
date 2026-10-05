@@ -36,7 +36,9 @@ pub(crate) fn job(
         return J::Unknown;
     }
     let missing = format!("Could not find service \"{label}\" in domain for user gui: {uid}\n");
-    if code == Some(113) && stdout.is_empty() && stderr == missing.as_bytes() {
+    // macOS 27 adds this exact prefix; strip it once without relaxing the absence proof.
+    let missing_stderr = stderr.strip_prefix(b"Bad request.\n").unwrap_or(stderr);
+    if code == Some(113) && stdout.is_empty() && missing_stderr == missing.as_bytes() {
         return J::Absent;
     }
     let text = String::from_utf8_lossy(stdout);
