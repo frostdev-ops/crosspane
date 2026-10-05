@@ -8,6 +8,8 @@
 
 #[cfg(windows)]
 pub mod hotkey;
+#[cfg(windows)]
+pub mod inject;
 pub mod keystore;
 pub mod model;
 #[cfg(windows)]

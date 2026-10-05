@@ -5,6 +5,7 @@
 pub mod geometry;
 pub mod hook;
 pub mod hotkey;
+pub mod inject;
 pub mod journal;
 pub mod keystore;
 pub mod overlay;
