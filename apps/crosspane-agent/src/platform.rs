@@ -338,6 +338,9 @@ pub struct Platform {
     /// Proof that the native factory admitted its exact isolated acceptance contract.
     #[cfg(windows)]
     pub(crate) acceptance_scratch: bool,
+    /// Only the admitted owned-window source fixture omits clipboard and unused input.
+    #[cfg(windows)]
+    pub(crate) acceptance_source: bool,
     /// Fresh Windows placement rows. The refresh closure is weak; `displays` owns its worker.
     #[cfg(windows)]
     pub host_placement_mapping: Option<crosspane_render::proxy::HostPlacementMapping>,
@@ -712,6 +715,106 @@ fn acceptance_e2_destination(
     Ok(true)
 }
 
+/// Never-default source acceptance: every observed/captured window belongs to one pinned fixture.
+#[cfg(windows)]
+fn acceptance_e2_source(
+    state_dir: &std::path::Path,
+    config: &crate::config::Config,
+) -> anyhow::Result<Option<Vec<crosspane_platform_windows::window::OwnedProcessClaim>>> {
+    use anyhow::{Context, ensure};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        path::PathBuf,
+    };
+    let Some(value) = std::env::var_os("CROSSPANE_ACCEPTANCE_E2_SOURCE") else {
+        return Ok(None);
+    };
+    ensure!(
+        value == "1"
+            && std::env::var_os("CROSSPANE_ACCEPTANCE_E1_ONLY").is_none()
+            && std::env::var_os("CROSSPANE_ACCEPTANCE_E2_DESTINATION").is_none(),
+        "invalid or conflicting source acceptance switch"
+    );
+    let appdata = PathBuf::from(std::env::var_os("APPDATA").context("source scratch APPDATA")?);
+    let local =
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").context("source scratch LOCALAPPDATA")?);
+    let runtime =
+        PathBuf::from(std::env::var_os("CROSSPANE_RUNTIME_DIR").context("source scratch runtime")?);
+    let root = appdata.parent().context("source scratch root")?;
+    let suffix = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("crosspane-WP-W2.5b-"))
+        .context("source acceptance requires a unique scratch root")?;
+    ensure!(
+        suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+        "source acceptance requires a unique scratch identity"
+    );
+    ensure!(
+        root.parent().map(std::fs::canonicalize).transpose()?
+            == Some(std::fs::canonicalize(std::env::temp_dir())?),
+        "source acceptance root must be under the temporary directory"
+    );
+    ensure!(
+        appdata == root.join("roaming")
+            && local == root.join("local")
+            && runtime == root.join("runtime")
+            && state_dir == local.join("Crosspane"),
+        "source acceptance requires isolated config, state and runtime paths"
+    );
+    let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    ensure!(
+        config.force_file_keystore
+            && config.name == format!("wp-w2-5b-src-{suffix}")
+            && config.port == 0
+            && config.acceptance_bind_ip == Some(loopback)
+            && config.peers.len() == 1
+            && config.peers[0].addr.ip() == loopback
+            && config.peers[0].addr.port() != 0
+            && !config.crossing
+            && !config.drag.across
+            && ["CROSSPANE_DISCOVERY", "CROSSPANE_AUDIO", "CROSSPANE_GPU"]
+                .into_iter()
+                .all(|name| std::env::var(name).as_deref() == Ok("0")),
+        "source acceptance requires a pinned IPv4 fixture, private identity and disabled unused sharing"
+    );
+    let document =
+        std::env::var("CROSSPANE_E2_SOURCE_CLAIM").context("source fixture claim missing")?;
+    Ok(Some(vec![owned_source_claim(
+        &document,
+        &root.join("fixture/owned-window.exe"),
+    )?]))
+}
+
+#[cfg(windows)]
+fn owned_source_claim(
+    document: &str,
+    executable: &std::path::Path,
+) -> anyhow::Result<crosspane_platform_windows::window::OwnedProcessClaim> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Claim {
+        pid: u32,
+        process_created: u64,
+        executable: std::path::PathBuf,
+    }
+    anyhow::ensure!(document.len() <= 8192, "owned source claim byte bound");
+    let claim: Claim = serde_json::from_str(document)
+        .map_err(|_| anyhow::anyhow!("invalid owned source claim"))?;
+    anyhow::ensure!(
+        claim.pid != 0
+            && claim.process_created != 0
+            && claim.executable.is_absolute()
+            && claim.executable == executable,
+        "source claim must name the exact scratch fixture"
+    );
+    Ok(crosspane_platform_windows::window::OwnedProcessClaim {
+        pid: claim.pid,
+        process_created: claim.process_created,
+        executable: claim.executable,
+    })
+}
+
 /// Required release/panic observer, only after the host has relinquished Raw Input.
 /// Configuration and the initial-state subscription must both succeed before startup commits.
 #[cfg(windows)]
@@ -822,7 +925,8 @@ pub(crate) fn recover_windows_mirror_before_host(
     // Scratch validation precedes even host construction and any native source field queries.
     let e1 = acceptance_e1(state_dir, config)?;
     let destination = acceptance_e2_destination(state_dir, config)?;
-    let scratch = e1 || destination;
+    let source = acceptance_e2_source(state_dir, config)?.is_some();
+    let scratch = e1 || destination || source;
     let store = WindowsMirrorStore {
         directory: state_dir.to_owned(),
         empty_required: scratch,
@@ -830,7 +934,7 @@ pub(crate) fn recover_windows_mirror_before_host(
     let mut parking =
         crosspane_platform_windows::parking::WindowsMirrorParking::new(Box::new(store))
             .context("Windows mirror journal (required)")?;
-    let (startup, pending) = if scratch {
+    let (startup, pending) = if e1 || destination {
         (StartupRecovery::None, 0)
     } else {
         let recovery = parking
@@ -872,7 +976,9 @@ pub fn create(
     };
     let e1_only = acceptance_e1(state_dir, config)?;
     let e2_destination = acceptance_e2_destination(state_dir, config)?;
-    let scratch_only = e1_only || e2_destination;
+    let source_claims = acceptance_e2_source(state_dir, config)?;
+    let source_only = source_claims.is_some();
+    let scratch_only = e1_only || e2_destination || source_only;
     let gate = IoGate::new();
     let session = WindowsSession::new(gate.clone())
         .context("Windows session state (required: Crosspane fails closed without it)")?;
@@ -880,20 +986,29 @@ pub fn create(
     let snapshot = displays.snapshot().context("Windows display snapshot")?;
     let host_placement_mapping = Some(windows_placement_mapping(displays.monitor_refresh()));
     let mut ids = snapshot.ids;
-    let capture = optional(
-        "capture",
-        WindowsCapture::new(gate.clone(), &snapshot.probes, &mut ids),
-    )
-    .map(|backend| Box::new(backend) as Box<dyn InputCapture>);
-    let (keys, pointer) = match optional(
-        "injection",
-        inject::injectors(
-            gate.clone(),
-            &snapshot.probes,
-            &mut ids,
-            displays.monitor_refresh(),
-        ),
-    ) {
+    let capture = if source_only {
+        None
+    } else {
+        optional(
+            "capture",
+            WindowsCapture::new(gate.clone(), &snapshot.probes, &mut ids),
+        )
+        .map(|backend| Box::new(backend) as Box<dyn InputCapture>)
+    };
+    let injectors = if source_only {
+        None
+    } else {
+        optional(
+            "injection",
+            inject::injectors(
+                gate.clone(),
+                &snapshot.probes,
+                &mut ids,
+                displays.monitor_refresh(),
+            ),
+        )
+    };
+    let (keys, pointer) = match injectors {
         Some((keys, pointer)) => (
             Some(Box::new(keys) as Box<dyn KeyInjector>),
             Some(Box::new(pointer) as Box<dyn PointerInjector>),
@@ -902,9 +1017,20 @@ pub fn create(
     };
     let overlay = optional("overlay", WindowsOverlay::new(&snapshot.probes, &mut ids))
         .map(|backend| Box::new(backend) as Box<dyn OverlayHost>);
-    // Window enumeration reads titles, so the explicitly isolated acceptance fixture omits
-    // these E2 source backends. Production always attempts every landed backend.
-    let windows = if scratch_only {
+    // Source acceptance admits and retains native process identity BEFORE the first fields query.
+    // E1/destination omit source observation; production retains unrestricted normal behavior.
+    let windows = if let Some(claims) = source_claims {
+        let allowlist = crosspane_platform_windows::window::OwnedProcessAllowlist::admit(claims)
+            .context("owned Windows source process admission")?;
+        Some(
+            WindowsWindowSource::new_restricted(
+                displays.ids(),
+                displays.monitor_reader(),
+                allowlist,
+            )
+            .context("restricted Windows source (required)")?,
+        )
+    } else if scratch_only {
         None
     } else {
         Some(
@@ -928,11 +1054,16 @@ pub fn create(
     let frames = windows.as_ref().and_then(|windows| {
         optional(
             "frame capture",
-            WindowsFrameCapture::new_with_monitor_reader(
-                gate.clone(),
-                windows.resolver(),
-                displays.monitor_snapshot_reader(),
-            ),
+            if source_only {
+                // The owned source permits per-window WGC only, never the VM's monitor.
+                WindowsFrameCapture::new(gate.clone(), windows.resolver())
+            } else {
+                WindowsFrameCapture::new_with_monitor_reader(
+                    gate.clone(),
+                    windows.resolver(),
+                    displays.monitor_snapshot_reader(),
+                )
+            },
         )
     });
     Ok(Platform {
@@ -963,6 +1094,7 @@ pub fn create(
         proxy_placement: None,
         startup_recovery: recovered.startup,
         acceptance_scratch: scratch_only,
+        acceptance_source: source_only,
         host_placement_mapping,
     })
 }
@@ -2144,5 +2276,33 @@ mod windows_mirror_store_tests {
             std::fs::read(directory.0.join(COMMITTED_NAME)).unwrap(),
             bytes
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_source_claim_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[test]
+    fn owned_source_claim_refuses_expansion_and_preserves_exact_creation() {
+        let executable = std::path::Path::new(r"C:\scratch\fixture\owned-window.exe");
+        let valid =
+            serde_json::json!({ "pid": 11, "process_created": u64::MAX, "executable": executable });
+        let claim = owned_source_claim(&valid.to_string(), executable).unwrap();
+        assert_eq!(claim.pid, 11);
+        assert_eq!(claim.process_created, u64::MAX);
+        for field in ["pid", "process_created"] {
+            let mut invalid = valid.clone();
+            invalid[field] = serde_json::json!(0);
+            assert!(owned_source_claim(&invalid.to_string(), executable).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid["executable"] = serde_json::json!(r"C:\other\owner.exe");
+        assert!(owned_source_claim(&invalid.to_string(), executable).is_err());
+        let mut invalid = valid.clone();
+        invalid["other"] = serde_json::json!(1);
+        assert!(owned_source_claim(&invalid.to_string(), executable).is_err());
+        assert!(owned_source_claim(&format!("[{}]", valid), executable).is_err());
+        assert!(owned_source_claim(&" ".repeat(8193), executable).is_err());
     }
 }

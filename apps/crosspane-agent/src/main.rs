@@ -494,15 +494,22 @@ fn start_agent(
     }
     // `start_agent` runs on process MAIN before AppKit's loop; construct the facade here,
     // then transfer its Rust handle to the serialized worker. Advertise only after readiness.
-    let clipboard = platform::clipboard_host(platform.gate.clone()).and_then(|host| {
-        match clipboard::Worker::start(host, tx.clone()) {
+    #[cfg(windows)]
+    let clipboard_host = if platform.acceptance_source {
+        None
+    } else {
+        platform::clipboard_host(platform.gate.clone())
+    };
+    #[cfg(not(windows))]
+    let clipboard_host = platform::clipboard_host(platform.gate.clone());
+    let clipboard =
+        clipboard_host.and_then(|host| match clipboard::Worker::start(host, tx.clone()) {
             Ok(worker) => Some(worker),
             Err(reason) => {
                 tracing::info!(?reason, "clipboard worker unavailable");
                 None
             }
-        }
-    });
+        });
     if clipboard.is_some() {
         features.push(crosspane_protocol::clip::CLIP_FEATURE.to_owned());
     }

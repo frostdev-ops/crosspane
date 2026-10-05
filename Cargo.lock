@@ -814,6 +814,7 @@ dependencies = [
  "crosspane-security",
  "crosspane-transport",
  "crosspane-types",
+ "crosspanectl",
  "pollster",
  "rtrb",
  "rustix 1.1.5",

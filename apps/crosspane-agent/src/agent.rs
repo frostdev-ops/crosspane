@@ -2914,6 +2914,12 @@ impl Agent {
                     key.projection.0,
                     peer_name(self, peer)
                 );
+                #[cfg(windows)]
+                let text = if *parking == crosspane_protocol::projection::ParkingKind::Mirror {
+                    format!("{text}: mirror mode: the window stays visible on Windows")
+                } else {
+                    text
+                };
                 self.projections.insert(*key, text.clone());
                 text
             }
@@ -8947,6 +8953,8 @@ mod audio_tests {
             startup_recovery: crate::platform::StartupRecovery::None,
             #[cfg(windows)]
             acceptance_scratch: false,
+            #[cfg(windows)]
+            acceptance_source: false,
             #[cfg(windows)]
             host_placement_mapping: None,
         };
@@ -20769,7 +20777,11 @@ mod mirror_notice_tests {
         });
         assert_eq!(
             rig.agent.notices.back().unwrap(),
-            "projecting window 69 to source-machine (Mirror)"
+            if cfg!(windows) {
+                "projecting window 69 to source-machine (Mirror): mirror mode: the window stays visible on Windows"
+            } else {
+                "projecting window 69 to source-machine (Mirror)"
+            }
         );
     }
 }
