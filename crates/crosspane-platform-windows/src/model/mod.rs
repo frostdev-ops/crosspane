@@ -10,4 +10,5 @@ pub mod keystore;
 pub mod overlay;
 pub mod session;
 pub mod tray;
+pub mod window;
 pub mod winevent;

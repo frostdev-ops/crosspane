@@ -31,6 +31,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_System_LibraryLoader",
+    "Win32_System_JobObjects",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",
     "Win32_System_StationsAndDesktops",

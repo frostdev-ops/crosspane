@@ -18,6 +18,8 @@ pub mod session;
 pub mod stubs;
 #[cfg(windows)]
 pub mod tray;
+#[cfg(windows)]
+pub mod window;
 
 #[cfg(windows)]
 pub use stubs::UnsupportedWindows;
