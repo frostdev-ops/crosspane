@@ -38,6 +38,7 @@ struct Sample {
 #[derive(Default)]
 pub(super) struct Detector {
     anchor: Option<Sample>,
+    latched: bool,
 }
 
 impl Detector {
@@ -56,8 +57,7 @@ impl Detector {
             old.window.window == window.window
                 && old.window.pid == window.pid
                 && old.offset.distance_to(now.offset) <= 1.0
-                && (old.window.frame.size.width - window.frame.size.width).abs() <= 1.0
-                && (old.window.frame.size.height - window.frame.size.height).abs() <= 1.0
+                && old.window.frame.size == window.frame.size
         });
         let detected = stable
             && self
@@ -66,8 +66,10 @@ impl Detector {
         // The first stable sample lets slow native motion accumulate the four-point threshold.
         if !stable {
             self.anchor = Some(now);
+            self.latched = false;
         }
-        detected
+        self.latched |= detected;
+        self.latched
     }
 }
 
@@ -90,15 +92,28 @@ pub(super) struct Move {
     pre_edge: HashMap<PortalId, RectLogical>,
     pressed: HashSet<PortalId>,
     emitted: HashMap<PortalId, MonoTime>,
+    last_lookup: Option<MonoTime>,
 }
 
 impl Move {
-    pub fn should_lookup(&self, held: bool, portals: &[Portal], pointer: CGPoint) -> bool {
+    pub fn should_lookup(&self, held: bool, portals: &[Portal], _pointer: CGPoint) -> bool {
         held && !portals.is_empty()
-            && (self.moving || portals.iter().any(|p| distance(*p, pointer) <= 64.0))
+    }
+
+    pub fn lookup_due(&mut self, at: MonoTime) -> bool {
+        if self
+            .last_lookup
+            .is_some_and(|last| at.saturating_duration_since(last) < Duration::from_millis(20))
+        {
+            return false;
+        }
+        self.last_lookup = Some(at);
+        true
     }
 
     pub fn sample(&mut self, window: Option<WindowFact>, pointer: CGPoint, portals: &[Portal]) {
+        let was_moving = self.moving;
+        let old_window = self.window;
         if self.window.map(|w| (w.window, w.pid)) != window.map(|w| (w.window, w.pid)) {
             self.detector = Detector::default();
             self.moving = false;
@@ -107,7 +122,7 @@ impl Move {
         self.window = window;
         self.pointer = pointer;
         if let Some(window) = window {
-            self.moving |= self
+            self.moving = self
                 .detector
                 .sample(window, PointLogical::new(pointer.x, pointer.y));
             for portal in portals {
@@ -115,6 +130,21 @@ impl Move {
                     self.pre_edge.insert(portal.portal.id, window.frame);
                 }
             }
+        }
+        if was_moving != self.moving {
+            if !self.moving {
+                self.pre_edge.clear();
+            }
+            let reason = if self.moving {
+                "stable move"
+            } else if old_window.map(|w| (w.window, w.pid)) != window.map(|w| (w.window, w.pid)) {
+                "window identity changed"
+            } else if old_window.map(|w| w.frame.size) != window.map(|w| w.frame.size) {
+                "window size changed"
+            } else {
+                "grab offset changed"
+            };
+            tracing::debug!(window = ?old_window.or(window).map(|w| w.window), latched = self.moving, reason, "drag detector state changed");
         }
     }
 
@@ -124,6 +154,17 @@ impl Move {
         hits: &[(PortalId, f64)],
         at: MonoTime,
     ) -> Vec<CaptureEvent> {
+        // Only an outward hit starts a press; a pressed drag tolerates pinned or inward motion
+        // within the edge band. Ordinary E1 continues to use portal_hit unchanged.
+        let mut hits = hits.to_vec();
+        for portal in portals {
+            if self.pressed.contains(&portal.portal.id)
+                && !hits.iter().any(|(id, _)| *id == portal.portal.id)
+                && let Some(position) = super::drag_hit(*portal, self.pointer)
+            {
+                hits.push((portal.portal.id, position));
+            }
+        }
         let now: HashSet<_> = if self.moving {
             hits.iter().map(|(id, _)| *id).collect()
         } else {
@@ -131,25 +172,37 @@ impl Move {
         };
         let mut events = Vec::new();
         for &portal in self.pressed.difference(&now) {
+            tracing::debug!(window = ?self.window.map(|w| w.window), portal = portal.0, reason = if self.moving { "left edge band or span" } else { "move latch broken" }, "drag portal released");
             events.push(CaptureEvent::EdgeReleased { portal, at });
             self.emitted.remove(&portal);
         }
-        if let Some(window) = self.window.filter(|_| self.moving) {
-            for &(portal, position) in hits {
+        if let (Some(window), Some(sample)) =
+            (self.window.filter(|_| self.moving), self.detector.anchor)
+        {
+            for &(portal, position) in &hits {
                 if self.emitted.get(&portal).is_some_and(|last| {
                     at.saturating_duration_since(*last) < Duration::from_millis(20)
                 }) {
                     continue;
                 }
                 if portals.iter().any(|p| p.portal.id == portal) {
+                    if !self.pressed.contains(&portal) {
+                        tracing::debug!(
+                            window = window.window.0,
+                            portal = portal.0,
+                            "drag portal pressed"
+                        );
+                    }
                     self.emitted.insert(portal, at);
                     events.push(CaptureEvent::DragAtEdge {
                         portal,
                         position,
                         window: window.window,
+                        // The pointer may be newer than the rate-limited window observation.
+                        // Keep the coherent latched grab rather than mixing those two samples.
                         grab: PointDevice::new(
-                            (self.pointer.x - window.frame.origin.x) * window.scale,
-                            (self.pointer.y - window.frame.origin.y) * window.scale,
+                            sample.offset.x * window.scale,
+                            sample.offset.y * window.scale,
                         ),
                         at,
                     });
@@ -173,14 +226,21 @@ impl Move {
             && self.pressed.is_empty()
             && self.pre_edge.is_empty()
             && self.emitted.is_empty()
+            && self.last_lookup.is_none()
         {
             return Vec::new();
         }
         let events = self
             .pressed
             .iter()
-            .map(|&portal| CaptureEvent::EdgeReleased { portal, at })
+            .map(|&portal| {
+                tracing::debug!(window = ?self.window.map(|w| w.window), portal = portal.0, reason = "gesture ended", "drag portal released");
+                CaptureEvent::EdgeReleased { portal, at }
+            })
             .collect();
+        if self.moving {
+            tracing::debug!(window = ?self.window.map(|w| w.window), latched = false, reason = "gesture ended", "drag detector state changed");
+        }
         *self = Self::default();
         events
     }
@@ -441,3 +501,267 @@ pub(super) fn correct_tiling(
 #[cfg(test)]
 #[path = "../../tests/drag/detector.rs"]
 mod tests;
+
+#[cfg(test)]
+mod wp267 {
+    use super::*;
+    use objc2_core_foundation::CGSize;
+
+    fn portal() -> Portal {
+        Portal {
+            portal: crosspane_platform::CapturePortal {
+                id: PortalId(1),
+                display: crosspane_types::id::DisplayId(1),
+                edge: Edge::Right,
+                from: 40.0,
+                to: 160.0,
+            },
+            display: super::super::Display {
+                id: crosspane_types::id::DisplayId(1),
+                bounds: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(500.0, 400.0)),
+                scale: 2.0,
+            },
+        }
+    }
+
+    fn fact(point: CGPoint) -> WindowFact {
+        WindowFact {
+            window: WindowId(42),
+            pid: 7,
+            frame: RectLogical::new(
+                PointLogical::new(point.x - 80.0, point.y - 12.0),
+                SizeLogical::new(200.0, 100.0),
+            ),
+            scale: 2.0,
+        }
+    }
+
+    fn at(ms: u64) -> MonoTime {
+        MonoTime::from_nanos(ms * 1_000_000)
+    }
+
+    fn pressed() -> Move {
+        let mut drag = Move::default();
+        for x in [100.0, 104.0, 499.0] {
+            let pointer = CGPoint::new(x, 50.0);
+            drag.sample(Some(fact(pointer)), pointer, &[portal()]);
+        }
+        assert!(matches!(
+            drag.update(&[portal()], &[(PortalId(1), 0.5)], at(0))
+                .as_slice(),
+            [CaptureEvent::DragAtEdge {
+                window: WindowId(42),
+                ..
+            }]
+        ));
+        drag
+    }
+
+    #[test]
+    fn lookup_starts_far_from_edge_only_while_held_with_portals() {
+        let drag = Move::default();
+        let point = CGPoint::new(100.0, 50.0);
+        assert!(!drag.should_lookup(false, &[portal()], point));
+        assert!(!drag.should_lookup(true, &[], point));
+        assert!(drag.should_lookup(true, &[portal()], point));
+    }
+
+    #[test]
+    fn far_edge_latch_then_pinned_push_emits_steady_drag_at_edge() {
+        let mut drag = pressed();
+        for ms in [20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 260] {
+            let pointer = CGPoint::new(499.0, 50.0);
+            drag.sample(Some(fact(pointer)), pointer, &[portal()]);
+            assert!(matches!(
+                drag.update(&[portal()], &[], at(ms)).as_slice(),
+                [CaptureEvent::DragAtEdge { grab, position, .. }]
+                    if *grab == PointDevice::new(160.0, 24.0) && *position == 0.5
+            ));
+            assert!(drag.at_edge(PortalId(1)).is_some());
+        }
+    }
+
+    #[test]
+    fn one_point_jitter_keeps_pressed_edge_without_outward_delta() {
+        let mut drag = pressed();
+        for (i, x) in [500.0, 499.5, 499.0, 500.5, 501.0].into_iter().enumerate() {
+            let pointer = CGPoint::new(x, 50.0);
+            drag.sample(Some(fact(pointer)), pointer, &[portal()]);
+            assert!(matches!(
+                drag.update(&[portal()], &[], at((i as u64 + 1) * 20))
+                    .as_slice(),
+                [CaptureEvent::DragAtEdge { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn leaving_edge_band_or_span_releases_once() {
+        for pointer in [CGPoint::new(498.9, 50.0), CGPoint::new(499.0, 80.1)] {
+            let mut drag = pressed();
+            drag.sample(Some(fact(pointer)), pointer, &[portal()]);
+            assert!(matches!(
+                drag.update(&[portal()], &[], at(20)).as_slice(),
+                [CaptureEvent::EdgeReleased {
+                    portal: PortalId(1),
+                    ..
+                }]
+            ));
+            assert!(drag.update(&[portal()], &[], at(40)).is_empty());
+        }
+    }
+
+    #[test]
+    fn size_change_breaks_latch_even_below_one_point() {
+        let mut drag = pressed();
+        let pointer = CGPoint::new(499.0, 50.0);
+        let mut resized = fact(pointer);
+        resized.frame.size.width += 0.5;
+        drag.sample(Some(resized), pointer, &[portal()]);
+        assert!(matches!(
+            drag.update(&[portal()], &[(PortalId(1), 0.5)], at(20))
+                .as_slice(),
+            [CaptureEvent::EdgeReleased { .. }]
+        ));
+        assert!(drag.at_edge(PortalId(1)).is_none());
+    }
+
+    #[test]
+    fn identity_pid_and_grab_break_release_and_physical_up_clears() {
+        let pointer = CGPoint::new(499.0, 50.0);
+        for change in 0..3 {
+            let mut drag = pressed();
+            let mut changed = fact(pointer);
+            match change {
+                0 => changed.window = WindowId(43),
+                1 => changed.pid = 8,
+                _ => changed.frame.origin.y -= 1.01,
+            }
+            drag.sample(Some(changed), pointer, &[portal()]);
+            assert!(matches!(
+                drag.update(&[portal()], &[(PortalId(1), 0.5)], at(20))
+                    .as_slice(),
+                [CaptureEvent::EdgeReleased { .. }]
+            ));
+        }
+        let mut drag = pressed();
+        assert!(matches!(
+            drag.clear(at(20)).as_slice(),
+            [CaptureEvent::EdgeReleased { .. }]
+        ));
+        assert!(drag.clear(at(40)).is_empty());
+        drag.sample(Some(fact(pointer)), pointer, &[portal()]);
+        assert!(
+            drag.update(&[portal()], &[(PortalId(1), 0.5)], at(60))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ordinary_e1_still_requires_outward_delta_at_every_edge() {
+        for (edge, point, dx, dy) in [
+            (Edge::Left, CGPoint::new(0.0, 50.0), -1.0, 0.0),
+            (Edge::Right, CGPoint::new(500.0, 50.0), 1.0, 0.0),
+            (Edge::Top, CGPoint::new(50.0, 0.0), 0.0, -1.0),
+            (Edge::Bottom, CGPoint::new(50.0, 400.0), 0.0, 1.0),
+        ] {
+            let mut portal = portal();
+            portal.portal.edge = edge;
+            assert_eq!(super::super::portal_hit(portal, point, dx, dy), Some(0.5));
+            assert_eq!(super::super::portal_hit(portal, point, -dx, -dy), None);
+            assert_eq!(super::super::portal_hit(portal, point, 0.0, 0.0), None);
+        }
+    }
+
+    #[test]
+    fn lookup_due_keeps_pressed_state_and_checks_current_pointer_between_reads() {
+        let mut drag = pressed();
+        assert!(drag.lookup_due(at(0)));
+        for ms in [1, 19] {
+            drag.pointer = CGPoint::new(499.5, 50.0);
+            assert!(!drag.lookup_due(at(ms)));
+            assert!(drag.update(&[portal()], &[], at(ms)).is_empty());
+            assert!(drag.at_edge(PortalId(1)).is_some());
+        }
+        assert!(drag.lookup_due(at(20)));
+        assert!(matches!(
+            drag.update(&[portal()], &[], at(20)).as_slice(),
+            [CaptureEvent::DragAtEdge { .. }]
+        ));
+        drag.pointer = CGPoint::new(498.9, 50.0);
+        assert!(!drag.lookup_due(at(21)));
+        assert!(matches!(
+            drag.update(&[portal()], &[], at(21)).as_slice(),
+            [CaptureEvent::EdgeReleased { .. }]
+        ));
+        drag.clear(at(22));
+        assert!(
+            drag.lookup_due(at(22)),
+            "a new gesture starts a fresh lookup cadence"
+        );
+    }
+
+    #[test]
+    fn pinned_latch_without_initial_outward_hit_does_not_press() {
+        let mut drag = Move::default();
+        for x in [100.0, 104.0, 499.0, 499.0] {
+            let pointer = CGPoint::new(x, 50.0);
+            drag.sample(Some(fact(pointer)), pointer, &[portal()]);
+        }
+        assert!(drag.update(&[portal()], &[], at(20)).is_empty());
+    }
+
+    #[test]
+    fn skipped_lookup_retains_coherent_grab_while_band_uses_current_pointer() {
+        let mut drag = pressed();
+        assert!(drag.lookup_due(at(10)));
+        drag.pointer = CGPoint::new(500.0, 50.0);
+        assert!(!drag.lookup_due(at(20)));
+        assert!(matches!(
+            drag.update(&[portal()], &[], at(20)).as_slice(),
+            [CaptureEvent::DragAtEdge { grab, .. }] if *grab == PointDevice::new(160.0, 24.0)
+        ));
+    }
+
+    #[test]
+    fn drag_band_all_edges_respects_density_span_and_one_point_limit() {
+        for (edge, point, normal) in [
+            (Edge::Left, CGPoint::new(0.0, 50.0), CGPoint::new(1.0, 0.0)),
+            (
+                Edge::Right,
+                CGPoint::new(500.0, 50.0),
+                CGPoint::new(1.0, 0.0),
+            ),
+            (Edge::Top, CGPoint::new(50.0, 0.0), CGPoint::new(0.0, 1.0)),
+            (
+                Edge::Bottom,
+                CGPoint::new(50.0, 400.0),
+                CGPoint::new(0.0, 1.0),
+            ),
+        ] {
+            let mut portal = portal();
+            portal.portal.edge = edge;
+            assert_eq!(super::super::drag_hit(portal, point), Some(0.5));
+            assert_eq!(
+                super::super::drag_hit(
+                    portal,
+                    CGPoint::new(point.x + normal.x, point.y + normal.y)
+                ),
+                Some(0.5)
+            );
+            assert_eq!(
+                super::super::drag_hit(
+                    portal,
+                    CGPoint::new(point.x + 1.01 * normal.x, point.y + 1.01 * normal.y)
+                ),
+                None
+            );
+            let outside = if normal.x != 0.0 {
+                CGPoint::new(point.x, 80.01)
+            } else {
+                CGPoint::new(80.01, point.y)
+            };
+            assert_eq!(super::super::drag_hit(portal, outside), None);
+        }
+    }
+}

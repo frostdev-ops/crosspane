@@ -252,12 +252,12 @@ fn portal() -> Portal {
 }
 
 #[test]
-fn lookup_is_event_driven_held_and_portal_bounded_with_64_point_approach() {
+fn lookup_is_event_driven_held_and_portal_bounded_across_the_whole_display() {
     let monitor = Move::default();
     let p = portal();
     assert!(!monitor.should_lookup(true, &[], CGPoint::new(500.0, 30.0)));
     assert!(!monitor.should_lookup(false, &[p], CGPoint::new(500.0, 30.0)));
-    assert!(!monitor.should_lookup(true, &[p], CGPoint::new(435.0, 30.0)));
+    assert!(monitor.should_lookup(true, &[p], CGPoint::new(435.0, 30.0)));
     assert!(monitor.should_lookup(true, &[p], CGPoint::new(436.0, 30.0)));
 }
 

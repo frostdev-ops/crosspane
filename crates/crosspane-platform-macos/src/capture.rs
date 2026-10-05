@@ -329,6 +329,26 @@ fn portal_hit(portal: Portal, point: CGPoint, dx: f64, dy: f64) -> Option<f64> {
         .then(|| (device - portal.portal.from) / (portal.portal.to - portal.portal.from))
 }
 
+/// A pressed title-bar drag remains at the edge even when the OS pins its pointer.
+fn drag_hit(portal: Portal, point: CGPoint) -> Option<f64> {
+    let bounds = portal.display.bounds;
+    let (distance, along) = match portal.portal.edge {
+        Edge::Left => ((point.x - bounds.origin.x).abs(), point.y - bounds.origin.y),
+        Edge::Right => (
+            (point.x - bounds.origin.x - bounds.size.width).abs(),
+            point.y - bounds.origin.y,
+        ),
+        Edge::Top => ((point.y - bounds.origin.y).abs(), point.x - bounds.origin.x),
+        Edge::Bottom => (
+            (point.y - bounds.origin.y - bounds.size.height).abs(),
+            point.x - bounds.origin.x,
+        ),
+    };
+    let device = along * portal.display.scale;
+    (distance <= 1.0 && device >= portal.portal.from && device <= portal.portal.to)
+        .then(|| (device - portal.portal.from) / (portal.portal.to - portal.portal.from))
+}
+
 /// Pointer buttons (numbers 0..=255) the tap has seen go down without a matching up. A cache of
 /// what is believed held: `CGEventSource::button_state` is the authority and reconciles it
 /// whenever it may be stale, since a disabled or timed-out tap can miss an up.
@@ -2055,12 +2075,15 @@ impl TapState {
                 };
                 self.edge_input(input, &hits, at);
                 if kind == CGEventType::LeftMouseDragged && self.suppressed_buttons[0] == 0 {
+                    self.drag.pointer = location;
                     if self.drag.should_lookup(true, &self.portals, location) {
-                        match (self.window_at)(location) {
-                            Ok(window) => self.drag.sample(window, location, &self.portals),
-                            Err(error) => {
-                                tracing::debug!(%error, "drag window lookup unavailable");
-                                self.drag.sample(None, location, &self.portals);
+                        if self.drag.lookup_due(at) {
+                            match (self.window_at)(location) {
+                                Ok(window) => self.drag.sample(window, location, &self.portals),
+                                Err(error) => {
+                                    tracing::debug!(%error, "drag window lookup unavailable");
+                                    self.drag.sample(None, location, &self.portals);
+                                }
                             }
                         }
                     } else {
