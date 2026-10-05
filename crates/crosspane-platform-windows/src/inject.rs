@@ -11,8 +11,10 @@
 
 use crate::model::{
     geometry::{DisplayIds, MonitorProbe, displays},
+    hook::DragSettlementResult,
     inject::{
-        Driver, Foreground, InjectionPort, Packet, RepeatSettings, absolute_move, scroll_packets,
+        Driver, Foreground, InjectionPort, LocalSettlementOutcome, Packet, RepeatSettings,
+        absolute_move, scroll_packets,
     },
 };
 use crosspane_platform::{
@@ -482,6 +484,329 @@ fn timer(
 pub struct WindowsKeyInjector(Arc<Runtime>);
 /// `[P]` Same source as the associated key injector; caller retains IDs across monitor updates.
 pub struct WindowsPointerInjector(Arc<Runtime>);
+
+/// Opaque local-drag settlement capability on the existing shared source. It cannot submit an
+/// arbitrary button or mint a window identity. Ordinary injected releases remain unchanged.
+pub struct DragSettlement(Arc<Runtime>);
+impl std::fmt::Debug for DragSettlement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DragSettlement(..)")
+    }
+}
+impl WindowsPointerInjector {
+    pub fn drag_settlement(&self) -> DragSettlement {
+        DragSettlement(self.0.clone())
+    }
+}
+impl DragSettlement {
+    pub(crate) fn same_gate(&self, gate: &Arc<IoGate>) -> bool {
+        self.0
+            .shared
+            .driver
+            .try_lock()
+            .is_ok_and(|d| Arc::ptr_eq(d.gate(), gate))
+    }
+
+    /// Source lookup is already unlocked. LL callbacks never acquire this internal Driver lock;
+    /// it spans exactly one SendInput, never a capture-owner reply wait. Busy means no dispatch.
+    pub(crate) fn settle(
+        &self,
+        target: crate::window::NativeWindow,
+        nonce: usize,
+        reserve: impl FnOnce() -> Result<(), PlatformError>,
+        final_check: impl FnOnce() -> Result<(), PlatformError>,
+    ) -> Result<LocalSettlementOutcome, PlatformError> {
+        self.0.shared.cancel.fetch_add(1, Ordering::AcqRel);
+        let mut driver = self.0.shared.driver.try_lock().map_err(|_| unavailable())?;
+        if nonce == 0 || nonce == driver.port().tag {
+            return Err(unavailable());
+        }
+        let expected = driver.port_mut().observe()?;
+        if [
+            expected.window,
+            u64::from(expected.process),
+            u64::from(expected.thread),
+            expected.born,
+        ] != [
+            target.hwnd,
+            u64::from(target.pid),
+            u64::from(target.tid),
+            target.process_created,
+        ] {
+            return Err(PlatformError::SecureInput);
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            driver.settle_local_button(expected, reserve, |port| {
+                let epoch = port.expected_gate_epoch;
+                // A refused check proves this ONE local up was not submitted. No generic Err
+                // after entering SendInput is ever translated into a resend obligation.
+                let refused = if !port.gate.is_open() || port.gate.epoch() != epoch {
+                    Some(PlatformError::Locked)
+                } else if !port.observe().is_ok_and(|f| f == expected) {
+                    Some(PlatformError::SecureInput)
+                } else if !port.gate.is_open() || port.gate.epoch() != epoch {
+                    Some(PlatformError::Locked)
+                } else {
+                    None
+                };
+                if let Some(error) = refused.or_else(|| final_check().err()) {
+                    return LocalSettlementOutcome {
+                        result: DragSettlementResult::KnownZero,
+                        error: Some(error),
+                    };
+                }
+                let input = encode(
+                    Packet::Button {
+                        button: MouseButton::PRIMARY,
+                        down: false,
+                    },
+                    nonce,
+                );
+                #[cfg(test)]
+                let count = if let Some(sender) = &mut port.sender {
+                    sender(input)
+                } else {
+                    // SAFETY: one fully initialized local-primary UP; fresh target/gate checks
+                    // and capture-owned protected tail precede the only dispatch.
+                    unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) }
+                };
+                #[cfg(not(test))]
+                // SAFETY: one fully initialized local-primary UP, with the same checks above.
+                let count = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+                match count {
+                    1 => LocalSettlementOutcome {
+                        result: DragSettlementResult::Accepted,
+                        error: None,
+                    },
+                    0 => LocalSettlementOutcome {
+                        result: DragSettlementResult::KnownZero,
+                        error: Some(unavailable()),
+                    },
+                    _ => LocalSettlementOutcome {
+                        result: DragSettlementResult::Uncertain,
+                        error: Some(unavailable()),
+                    },
+                }
+            })
+        }));
+        outcome.unwrap_or_else(|_| {
+            Ok(LocalSettlementOutcome {
+                result: DragSettlementResult::Uncertain,
+                error: Some(unavailable()),
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    fn expected() -> Foreground {
+        Foreground {
+            window: 1,
+            process: 2,
+            thread: 3,
+            born: 4,
+            generation: 5,
+            integrity: 0x2000,
+        }
+    }
+    fn target() -> crate::window::NativeWindow {
+        crate::window::NativeWindow {
+            hwnd: 1,
+            pid: 2,
+            tid: 3,
+            process_created: 4,
+            generation: 99,
+        }
+    }
+    fn capability(
+        observer: impl FnMut() -> Result<Foreground, PlatformError> + Send + 'static,
+        sender: impl FnMut(INPUT) -> u32 + Send + 'static,
+    ) -> (DragSettlement, Arc<IoGate>) {
+        let gate = IoGate::new();
+        gate.set_session_permits(true);
+        gate.set_engine_permits(true);
+        let cancel = Arc::new(AtomicU64::new(0));
+        let port = NativePort {
+            gate: gate.clone(),
+            generation: Arc::new(AtomicU64::new(5)),
+            expected: None,
+            expected_gate_epoch: 0,
+            cancel: cancel.clone(),
+            repeat_fence: None,
+            repeat_owner: 0,
+            tag: 0x43504e49,
+            probes: Vec::new(),
+            ids: DisplayIds::default(),
+            refresh: Arc::new(|| Err(PlatformError::NotFound)),
+            owned_fixture: None,
+            submitted: 0,
+            observer: Some(Box::new(observer)),
+            sender: Some(Box::new(sender)),
+            tainted: None,
+        };
+        let shared = Arc::new(Shared {
+            driver: Mutex::new(Driver::new(
+                port,
+                gate.clone(),
+                0x2000,
+                RepeatSettings::new(0, 0).unwrap(),
+            )),
+            cancel,
+            stop: Arc::new(AtomicBool::new(false)),
+        });
+        (
+            DragSettlement(Arc::new(Runtime {
+                shared,
+                thread: None,
+                started: Instant::now(),
+            })),
+            gate,
+        )
+    }
+
+    #[test]
+    fn drag_native_final_identity_and_integrity_fences_refuse_without_dispatch() {
+        for changed_at in 1..=4 {
+            for field in 0..6 {
+                let mut calls = 0;
+                let sends = Arc::new(AtomicU32::new(0));
+                let count = sends.clone();
+                let reserved = std::cell::Cell::new(false);
+                let (cap, _) = capability(
+                    move || {
+                        calls += 1;
+                        let mut f = expected();
+                        if calls == changed_at {
+                            match field {
+                                0 => f.window += 1,
+                                1 => f.process += 1,
+                                2 => f.thread += 1,
+                                3 => f.born += 1,
+                                4 => f.generation += 1,
+                                _ => f.integrity = 0x3000,
+                            }
+                        }
+                        Ok(f)
+                    },
+                    move |_| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        1
+                    },
+                );
+                let result = cap.settle(
+                    target(),
+                    1001,
+                    || {
+                        reserved.set(true);
+                        Ok(())
+                    },
+                    || Ok(()),
+                );
+                assert!(
+                    result.is_err()
+                        || result
+                            .as_ref()
+                            .is_ok_and(|r| r.result == DragSettlementResult::KnownZero
+                                && r.error.is_some())
+                );
+                assert_eq!(sends.load(Ordering::SeqCst), 0);
+                assert_eq!(reserved.get(), changed_at >= 3);
+            }
+        }
+    }
+
+    #[test]
+    fn drag_native_nonce_survives_shared_source_and_exact_count_is_only_a_report() {
+        for count in [0, 1, 2] {
+            let seen = Arc::new(AtomicU32::new(0));
+            let sent = seen.clone();
+            let (cap, _) = capability(
+                || Ok(expected()),
+                move |input| {
+                    // SAFETY: encode selected and initialized the mouse union member.
+                    unsafe {
+                        assert_eq!(input.Anonymous.mi.dwExtraInfo, 1001);
+                        assert_eq!(input.Anonymous.mi.dwFlags, MOUSEEVENTF_LEFTUP);
+                    }
+                    sent.fetch_add(1, Ordering::SeqCst);
+                    count
+                },
+            );
+            let outcome = cap.settle(target(), 1001, || Ok(()), || Ok(())).unwrap();
+            assert_eq!(
+                outcome.result,
+                match count {
+                    0 => DragSettlementResult::KnownZero,
+                    1 => DragSettlementResult::Accepted,
+                    _ => DragSettlementResult::Uncertain,
+                }
+            );
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
+            assert!(
+                lock(&cap.0.shared.driver)
+                    .unwrap()
+                    .held_buttons()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn drag_native_busy_closed_gate_and_final_activation_cancel_submit_nothing() {
+        let seen = Arc::new(AtomicU32::new(0));
+        let sent = seen.clone();
+        let (cap, gate) = capability(
+            || Ok(expected()),
+            move |_| {
+                sent.fetch_add(1, Ordering::SeqCst);
+                1
+            },
+        );
+        {
+            let _held = lock(&cap.0.shared.driver).unwrap();
+            assert!(
+                cap.settle(
+                    target(),
+                    1001,
+                    || panic!("must not reserve while busy"),
+                    || Ok(())
+                )
+                .is_err()
+            );
+        }
+        gate.set_engine_permits(false);
+        assert!(matches!(
+            cap.settle(
+                target(),
+                1001,
+                || panic!("must not reserve while locked"),
+                || Ok(())
+            ),
+            Err(PlatformError::Locked)
+        ));
+        gate.set_engine_permits(true);
+        let outcome = cap
+            .settle(target(), 1001, || Ok(()), || Err(PlatformError::Locked))
+            .unwrap();
+        assert_eq!(outcome.result, DragSettlementResult::KnownZero);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn drag_native_sender_panic_is_uncertain_and_never_adds_blind_up_to_injected_ledger() {
+        let (cap, _) = capability(|| Ok(expected()), |_| panic!("fake native uncertainty"));
+        let outcome = cap.settle(target(), 1001, || Ok(()), || Ok(())).unwrap();
+        assert_eq!(outcome.result, DragSettlementResult::Uncertain);
+        assert!(outcome.error.is_some());
+        let mut driver = lock(&cap.0.shared.driver).unwrap();
+        assert!(driver.held_buttons().is_empty());
+        driver.release_buttons().unwrap();
+    }
+}
 
 /// The caller acquires fresh native probes and its retained allocator snapshot coherently for
 /// the same observation. `[P]` This is a trusted read-only acquisition seam, never a default ID

@@ -96,6 +96,53 @@ pub struct Decision {
     pub events: Vec<CaptureEvent>,
 }
 
+/// Native dispatch facts, never inferred from a generic submission error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Native owner consumes these facts; pure tests compile this exact source.
+pub(crate) enum DragSettlementResult {
+    Accepted,
+    KnownZero,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Native drag configuration is cfg-gated; the model remains OS-free.
+#[repr(u8)]
+enum DragPhase {
+    Reserved = 1,
+    Dispatching = 2,
+    InjectedFirst = 3,
+    PhysicalFirst = 4,
+    Uncertain = 5,
+}
+
+/// The ONE primary token's event-order provenance. The LL callback uses this same O(1) table.
+/// The first local UP passes; only its matching counterpart is swallowed. SendInput counts
+/// cannot prove which event was delivered. Zero is idle, not a separate button ledger.
+#[allow(dead_code)]
+pub(crate) fn drag_up_transition(order: u8, tagged: bool) -> (u8, bool) {
+    match (order, tagged) {
+        (2 | 5, true) => (3, false),
+        (4, true) => (0, true),
+        (1, false) => (0, false),
+        (2 | 5, false) => (4, false),
+        (3, false) => (0, true),
+        _ => (order, false),
+    }
+}
+impl DragPhase {
+    fn from_order(order: u8) -> Option<Self> {
+        match order {
+            1 => Some(Self::Reserved),
+            2 => Some(Self::Dispatching),
+            3 => Some(Self::InjectedFirst),
+            4 => Some(Self::PhysicalFirst),
+            5 => Some(Self::Uncertain),
+            _ => None,
+        }
+    }
+}
+
 /// The supplied portal rectangles are complete global physical strips, not logical rectangles.
 /// CaptureId uniqueness is the frozen engine contract; old suppression tokens survive end.
 #[derive(Debug)]
@@ -108,6 +155,10 @@ pub struct HookState {
     suppressed_buttons: [Option<CaptureId>; 256],
     buttons: [bool; 256],
     point: Option<(i32, i32)>,
+    // Provenance for the existing suppressed-primary token, not another button ledger.
+    drag_phase: Option<DragPhase>,
+    drag_nonce: usize,
+    drag_report: Option<DragSettlementResult>,
 }
 
 impl Default for HookState {
@@ -127,6 +178,9 @@ impl HookState {
             suppressed_buttons: [None; 256],
             buttons: [false; 256],
             point: None,
+            drag_phase: None,
+            drag_nonce: 0,
+            drag_report: None,
         }
     }
 
@@ -171,10 +225,24 @@ impl HookState {
         lock_keys: LockKeys,
         now: MonoTime,
     ) -> Result<(CaptureStart, Vec<CaptureEvent>), PlatformError> {
+        self.begin_inner(id, portal, held, buttons, lock_keys, now, false)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Same frozen activation facts plus the private mode.
+    fn begin_inner(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        held: &[KeySnapshot],
+        buttons: &[bool; 256],
+        lock_keys: LockKeys,
+        now: MonoTime,
+        drag: bool,
+    ) -> Result<(CaptureStart, Vec<CaptureEvent>), PlatformError> {
         if self.capture.is_some() {
             return Err(PlatformError::Backend("capture already active".into()));
         }
-        if buttons.iter().any(|down| *down) {
+        if buttons.iter().any(|down| *down) || (!drag && self.drag_phase.is_some()) {
             return Err(PlatformError::PointerButtonHeld);
         }
         let display = self
@@ -226,6 +294,147 @@ impl HookState {
         let (start, mut events) = self.begin(id, portal, held, buttons, lock_keys, now)?;
         events.retain(|event| !matches!(event, CaptureEvent::EdgeReleased { portal: consumed, .. } if *consumed == portal));
         Ok((start, events))
+    }
+
+    /// Reserve the one locally owned physical down BEFORE attempting its synthetic up.
+    #[allow(dead_code)] // Native owner and source-included pure contract tests only.
+    pub(crate) fn protect_drag_tail(
+        &mut self,
+        id: CaptureId,
+        button: MouseButton,
+        nonce: usize,
+    ) -> Result<(), PlatformError> {
+        if button != MouseButton::PRIMARY
+            || nonce == 0
+            || self.capture.is_some()
+            || !self.buttons[0]
+            || self.buttons[1..].iter().any(|held| *held)
+            || self.suppressed_buttons[0].is_some()
+            || self.drag_phase.is_some()
+        {
+            return Err(PlatformError::PointerButtonHeld);
+        }
+        self.suppressed_buttons[0] = Some(id);
+        self.drag_phase = Some(DragPhase::Reserved);
+        self.drag_nonce = nonce;
+        self.drag_report = None;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mark_drag_dispatch(&mut self, id: CaptureId) -> Result<(), PlatformError> {
+        if self.suppressed_buttons[0] != Some(id) || self.drag_phase != Some(DragPhase::Reserved) {
+            return Err(PlatformError::Backend(
+                "drag reservation unavailable".into(),
+            ));
+        }
+        self.drag_phase = Some(DragPhase::Dispatching);
+        Ok(())
+    }
+
+    /// A send-count report is never settlement proof. Zero with no tagged UP rolls back an
+    /// intact reservation, or completes PhysicalFirst without waiting for an impossible tag.
+    #[allow(dead_code)]
+    pub(crate) fn record_drag_settlement(
+        &mut self,
+        id: CaptureId,
+        result: DragSettlementResult,
+    ) -> Result<(), PlatformError> {
+        if self.suppressed_buttons[0] != Some(id)
+            || self.drag_report.is_some()
+            || !matches!(
+                self.drag_phase,
+                Some(DragPhase::Dispatching | DragPhase::InjectedFirst | DragPhase::PhysicalFirst)
+            )
+        {
+            return Err(PlatformError::Backend("drag dispatch unavailable".into()));
+        }
+        self.drag_report = Some(result);
+        match result {
+            DragSettlementResult::Accepted => {}
+            DragSettlementResult::Uncertain if self.drag_phase == Some(DragPhase::Dispatching) => {
+                self.drag_phase = Some(DragPhase::Uncertain)
+            }
+            DragSettlementResult::KnownZero
+                if self.drag_phase != Some(DragPhase::InjectedFirst) =>
+            {
+                self.suppressed_buttons[0] = None;
+                self.drag_phase = None;
+                self.drag_nonce = 0;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Only the capture-owned unique nonce, never the ordinary injector tag, admits this UP.
+    #[allow(dead_code)]
+    pub(crate) fn drag_tagged_up(&mut self, nonce: usize) -> Decision {
+        let mut decision = Decision {
+            suppress: false,
+            events: Vec::new(),
+        };
+        if nonce == 0 || self.drag_nonce != nonce {
+            return decision;
+        }
+        let (order, suppress) = drag_up_transition(self.drag_phase.map_or(0, |p| p as u8), true);
+        decision.suppress = suppress;
+        self.drag_phase = DragPhase::from_order(order);
+        if order == 0 {
+            self.suppressed_buttons[0] = None;
+            self.drag_nonce = 0;
+        }
+        decision
+    }
+
+    /// Cancellation before any dispatch; this cannot release an accepted/uncertain up's tail.
+    #[allow(dead_code)]
+    pub(crate) fn cancel_unsubmitted_drag(&mut self, id: CaptureId) -> Result<(), PlatformError> {
+        if self.suppressed_buttons[0] != Some(id) || self.drag_phase != Some(DragPhase::Reserved) {
+            return Err(PlatformError::Backend("drag already dispatched".into()));
+        }
+        self.suppressed_buttons[0] = None;
+        self.drag_phase = None;
+        self.drag_nonce = 0;
+        Ok(())
+    }
+
+    /// Accepted is report consistency only; InjectedFirst is the observed-UP proof. Caller
+    /// separately admits the original identity and matching actual MOVESIZEEND.
+    #[allow(dead_code, clippy::too_many_arguments)] // Frozen activation facts plus primary button.
+    pub(crate) fn native_begin_drag(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        button: MouseButton,
+        held: &[KeySnapshot],
+        buttons: &[bool; 256],
+        locks: LockKeys,
+        at: MonoTime,
+    ) -> Result<(CaptureStart, Vec<CaptureEvent>), PlatformError> {
+        if button != MouseButton::PRIMARY
+            || self.drag_phase != Some(DragPhase::InjectedFirst)
+            || self.drag_report != Some(DragSettlementResult::Accepted)
+            || self.suppressed_buttons[0] != Some(id)
+            || !self.buttons[0]
+            || !buttons[0]
+            || buttons[1..].iter().any(|held| *held)
+        {
+            return Err(PlatformError::PointerButtonHeld);
+        }
+        let mut settled = *buttons;
+        settled[0] = false;
+        let (start, mut events) = self.begin_inner(id, portal, held, &settled, locks, at, true)?;
+        self.buttons[0] = true;
+        events.retain(|event| !matches!(event, CaptureEvent::EdgeReleased { portal: consumed, .. } if *consumed == portal));
+        Ok((start, events))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn drag_tail_pending(&self) -> bool {
+        self.drag_phase
+            .is_some_and(|p| p != DragPhase::PhysicalFirst)
+            && self.suppressed_buttons[0].is_some()
     }
 
     fn release_edges(&mut self, at: MonoTime) -> Vec<CaptureEvent> {
@@ -316,6 +525,25 @@ impl HookState {
             MouseKind::Button { n, down } => {
                 let i = usize::from(n);
                 self.buttons[i] = down;
+                // The original physical UP already passed. Only its tagged counterpart is
+                // still ours; a later local down must not borrow that suppression token.
+                if i == 0 && down && self.drag_phase == Some(DragPhase::PhysicalFirst) {
+                    decision.suppress = false;
+                    return decision;
+                }
+                if i == 0 && !down && self.drag_phase.is_some() {
+                    let (order, suppress) =
+                        drag_up_transition(self.drag_phase.map_or(0, |p| p as u8), false);
+                    if !suppress {
+                        self.drag_phase = DragPhase::from_order(order);
+                        if order == 0 {
+                            self.suppressed_buttons[0] = None;
+                            self.drag_nonce = 0;
+                        }
+                        decision.suppress = false;
+                        return decision;
+                    }
+                }
                 if down {
                     decision.events.extend(self.release_edges(mouse.at));
                 }
@@ -323,6 +551,10 @@ impl HookState {
                     decision.suppress = true;
                     if !down {
                         self.suppressed_buttons[i] = None;
+                        if i == 0 {
+                            self.drag_phase = None;
+                            self.drag_nonce = 0;
+                        }
                     }
                     !down && self.capture.is_some_and(|(id, _)| id == token)
                 } else if let Some((id, _)) = self.capture {
@@ -436,9 +668,13 @@ impl HookState {
             .into_iter()
             .filter(|key| !self.suppressed_keys.contains_key(key))
             .collect();
+        let protected_primary = self.buttons[0];
         self.buttons = *buttons;
+        if self.drag_phase.is_some() {
+            self.buttons[0] = protected_primary;
+        }
         for (i, &down) in buttons.iter().enumerate() {
-            if !down {
+            if !down && !(i == 0 && self.drag_phase.is_some()) {
                 self.suppressed_buttons[i] = None;
             }
         }

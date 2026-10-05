@@ -18,7 +18,7 @@ use std::{
     ptr::{null, null_mut},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -31,6 +31,7 @@ use crosspane_platform::{
 };
 use crosspane_types::{
     geom::{PixelRect, PointDevice},
+    hid::MouseButton,
     id::DisplayId,
     input::LockKeys,
     time::MonoTime,
@@ -62,7 +63,9 @@ use windows_sys::Win32::{
 use crate::model::{
     capture::{self as model, Probe, ProbeAction, Resource, Watchdog},
     geometry::{DisplayIds, MonitorProbe, displays},
-    hook::{HookState, KeyIn, KeySnapshot, MouseIn, MouseKind},
+    hook::{
+        DragSettlementResult, HookState, KeyIn, KeySnapshot, MouseIn, MouseKind, drag_up_transition,
+    },
 };
 
 const RECORDS: usize = 2048;
@@ -181,6 +184,13 @@ struct Shared {
     key_tokens: [AtomicU64; 768],
     buttons: [AtomicU8; 5],
     button_tokens: [AtomicU64; 5],
+    // Provenance for the existing primary token. Callback event order, not SendInput count,
+    // determines which UP passes. No separate button ledger or callback locks are introduced.
+    drag_order: AtomicU8,
+    drag_first: AtomicU8,
+    drag_nonce: AtomicUsize,
+    raw_x: AtomicI64,
+    raw_y: AtomicI64,
     ring: Ring,
     sink: OnceLock<Arc<dyn EventSink<CaptureEvent>>>,
     events: Mutex<VecDeque<(Option<u64>, CaptureEvent)>>,
@@ -224,6 +234,11 @@ impl Shared {
             key_tokens: std::array::from_fn(|_| AtomicU64::new(0)),
             buttons: std::array::from_fn(|_| AtomicU8::new(0)),
             button_tokens: std::array::from_fn(|_| AtomicU64::new(0)),
+            drag_order: AtomicU8::new(0),
+            drag_first: AtomicU8::new(0),
+            drag_nonce: AtomicUsize::new(0),
+            raw_x: AtomicI64::new(0),
+            raw_y: AtomicI64::new(0),
             ring: Ring::new(),
             sink: OnceLock::new(),
             events: Mutex::new(VecDeque::with_capacity(4097)),
@@ -337,6 +352,76 @@ impl Shared {
     }
     fn admits(&self, token: Option<u64>, started: Option<u64>) -> bool {
         token.is_none() || (token == started && self.active_token() == token)
+    }
+
+    fn reserve_drag(
+        &self,
+        id: CaptureId,
+        generation: u64,
+        nonce: usize,
+    ) -> Result<(), PlatformError> {
+        if self.drag_order.load(Ordering::Acquire) != 0
+            || self.buttons[1..]
+                .iter()
+                .any(|b| b.load(Ordering::Acquire) != 0)
+            || self.buttons[0].load(Ordering::Acquire) != 1
+            || self.generation.load(Ordering::Acquire) != generation
+        {
+            return Err(PlatformError::PointerButtonHeld);
+        }
+        self.active.store(id.0, Ordering::Release);
+        self.drag_first.store(0, Ordering::Release);
+        self.drag_nonce.store(nonce, Ordering::Release);
+        self.button_tokens[0].store((generation & !3) | model::ACTIVE, Ordering::Release);
+        self.buttons[0].store(2, Ordering::Release);
+        self.drag_order.store(2, Ordering::Release);
+        Ok(())
+    }
+    fn report_drag(&self, result: DragSettlementResult) {
+        let order = self.drag_order.load(Ordering::Acquire);
+        match result {
+            DragSettlementResult::KnownZero if matches!(order, 2 | 4) => {
+                if order == 2 {
+                    self.buttons[0].store(1, Ordering::Release);
+                }
+                self.drag_order.store(0, Ordering::Release);
+                self.drag_nonce.store(0, Ordering::Release);
+            }
+            DragSettlementResult::Uncertain if order == 2 => {
+                self.drag_order.store(5, Ordering::Release)
+            }
+            _ => {}
+        }
+    }
+    fn drag_up(&self, tagged: bool, nonce: usize) -> Option<bool> {
+        let old = self.drag_order.load(Ordering::Acquire);
+        if old == 0 || (tagged && (nonce == 0 || nonce != self.drag_nonce.load(Ordering::Acquire)))
+        {
+            return None;
+        }
+        let (next, swallow) = drag_up_transition(old, tagged);
+        if tagged && old == next {
+            return None;
+        }
+        self.drag_order.store(next, Ordering::Release);
+        if matches!(old, 2 | 5) && matches!(next, 3 | 4) {
+            self.drag_first.store(next, Ordering::Release);
+        }
+        if next == 0 {
+            self.drag_nonce.store(0, Ordering::Release);
+        }
+        if !tagged {
+            self.buttons[0].store(0, Ordering::Release);
+        }
+        Some(swallow)
+    }
+    fn drag_ready(&self, actual_end: bool) -> bool {
+        actual_end
+            && self.drag_order.load(Ordering::Acquire) == 3
+            && self.buttons[0].load(Ordering::Acquire) == 2
+            && self.buttons[1..]
+                .iter()
+                .all(|b| b.load(Ordering::Acquire) == 0)
     }
 }
 
@@ -484,6 +569,15 @@ unsafe extern "system" fn mouse_callback(code: i32, message: WPARAM, parameter: 
             // SAFETY: system-provided record and retained owner-thread TLS Arc.
             let (shared, mouse) = unsafe { (&*shared, &*(parameter as *const MSLLHOOKSTRUCT)) };
             if mouse.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0 {
+                let nonce = shared.drag_nonce.load(Ordering::Acquire);
+                if nonce != 0
+                    && mouse.dwExtraInfo == nonce
+                    && message as u32 == WM_LBUTTONUP
+                    && let Some(swallow) = shared.drag_up(true, nonce)
+                {
+                    shared.callback_record(4, nonce as u64, None);
+                    suppress = swallow;
+                }
                 return;
             }
             shared.mouse_hook_count.fetch_add(1, Ordering::AcqRel);
@@ -504,6 +598,24 @@ unsafe extern "system" fn mouse_callback(code: i32, message: WPARAM, parameter: 
             };
             if let Some((index, up)) = button {
                 let state = shared.buttons[index].load(Ordering::Relaxed);
+                if index == 0
+                    && up
+                    && let Some(swallow) = shared.drag_up(false, 0)
+                {
+                    suppress = swallow;
+                    let token = shared.button_tokens[0].load(Ordering::Acquire);
+                    let point = u64::from(mouse.pt.x as u32) | (u64::from(mouse.pt.y as u32) << 32);
+                    shared.callback_record(
+                        2 | ((message as u64) << 8),
+                        point,
+                        if swallow {
+                            id.map(|s| (s.0, token))
+                        } else {
+                            None
+                        },
+                    );
+                    return;
+                }
                 let (next, swallow) = model::key_transition(state, id.is_some(), up);
                 let token = model::ledger_token(
                     state,
@@ -565,6 +677,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
                     shared.fault.store(true, Ordering::Release);
                     return;
                 }
+                shared
+                    .raw_x
+                    .fetch_add(i64::from(mouse.lLastX), Ordering::AcqRel);
+                shared
+                    .raw_y
+                    .fetch_add(i64::from(mouse.lLastY), Ordering::AcqRel);
                 if let Some(id) = shared.active_token() {
                     shared.enqueue(
                         Some(id),
@@ -591,6 +709,14 @@ enum Command {
     Begin {
         id: CaptureId,
         portal: PortalId,
+        generation: u64,
+        epoch: u64,
+        reply: mpsc::SyncSender<Result<CaptureStart, PlatformError>>,
+    },
+    BeginDrag {
+        id: CaptureId,
+        portal: PortalId,
+        button: MouseButton,
         generation: u64,
         epoch: u64,
         reply: mpsc::SyncSender<Result<CaptureStart, PlatformError>>,
@@ -624,6 +750,28 @@ impl WindowsCapture {
         gate: Arc<IoGate>,
         probes: &[MonitorProbe],
         ids: &mut DisplayIds,
+    ) -> Result<Self, PlatformError> {
+        Self::construct(gate, probes, ids, None)
+    }
+
+    /// Additive drag detection using the SAME retained source and SAME injection gate/runtime.
+    pub fn new_with_drag(
+        gate: Arc<IoGate>,
+        probes: &[MonitorProbe],
+        ids: &mut DisplayIds,
+        drag: crate::drag::DragConfig,
+    ) -> Result<Self, PlatformError> {
+        if !drag.same_gate(&gate) {
+            return Err(error("drag source gate unavailable or mismatched"));
+        }
+        Self::construct(gate, probes, ids, Some(drag))
+    }
+
+    fn construct(
+        gate: Arc<IoGate>,
+        probes: &[MonitorProbe],
+        ids: &mut DisplayIds,
+        drag: Option<crate::drag::DragConfig>,
     ) -> Result<Self, PlatformError> {
         if OWNER
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -664,7 +812,7 @@ impl WindowsCapture {
         let geometry = monitors.clone();
         if thread::Builder::new()
             .name("crosspane-capture".into())
-            .spawn(move || owner_thread(owner, geometry, receive, ready))
+            .spawn(move || owner_thread(owner, geometry, receive, ready, drag))
             .is_err()
         {
             OWNER.store(false, Ordering::Release);
@@ -795,6 +943,43 @@ impl InputCapture for WindowsCapture {
         let result = self.request(|reply| Command::Begin {
             id,
             portal,
+            generation,
+            epoch,
+            reply,
+        });
+        if result.is_err() {
+            self.shared.terminate(EndReason::Aborted);
+        }
+        result
+    }
+    fn begin_drag(
+        &mut self,
+        id: CaptureId,
+        portal: PortalId,
+        button: MouseButton,
+    ) -> Result<CaptureStart, PlatformError> {
+        if !self.shared.gate.is_open() {
+            return Err(PlatformError::Locked);
+        }
+        let current = self.shared.generation.load(Ordering::Acquire);
+        if current & 3 != model::IDLE
+            || self.shared.sink.get().is_none()
+            || self.shared.end_claim.load(Ordering::Acquire)
+            || self.shared.probe_owed.load(Ordering::Acquire)
+            || self.shared.drag_order.load(Ordering::Acquire) != 0
+        {
+            return Err(error("drag capture not ready"));
+        }
+        let generation = current | model::PENDING;
+        self.shared
+            .generation
+            .compare_exchange(current, generation, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| error("drag activation cancelled"))?;
+        let epoch = self.shared.gate.epoch();
+        let result = self.request(|reply| Command::BeginDrag {
+            id,
+            portal,
+            button,
             generation,
             epoch,
             reply,
@@ -1241,6 +1426,47 @@ fn submit_probe(_shared: &Shared, nonce: usize, up_only: bool) -> u32 {
     }
 }
 
+fn prepare_capture(
+    shared: &Shared,
+    native: &Native,
+    probe_tx: &mpsc::SyncSender<Option<(usize, u64)>>,
+    generation: u64,
+    epoch: u64,
+    point: POINT,
+    nonce: usize,
+) -> Result<(), PlatformError> {
+    shared.probe_at.store(0, Ordering::Release);
+    shared.ack.store(0, Ordering::Release);
+    shared.active_epoch.store(epoch, Ordering::Release);
+    shared.warming.store(true, Ordering::Release);
+    model::acquire(|r, add| {
+        if add
+            && (generation != shared.generation.load(Ordering::Acquire)
+                || !shared.gate.is_open()
+                || shared.gate.epoch() != epoch)
+        {
+            return Err(PlatformError::Locked);
+        }
+        // Lifetime observation hooks stay installed to contain the matching physical tail.
+        if add || matches!(r, Resource::CursorWindow | Resource::PointerClip) {
+            native.step(r, add, point)?;
+        }
+        if add
+            && (generation != shared.generation.load(Ordering::Acquire)
+                || !shared.gate.is_open()
+                || shared.gate.epoch() != epoch)
+        {
+            return Err(PlatformError::Locked);
+        }
+        Ok(())
+    })?;
+    shared.nonce.store(nonce, Ordering::Release);
+    shared.ack.store(0, Ordering::Release);
+    probe_tx
+        .try_send(Some((nonce, epoch)))
+        .map_err(|_| error("probe unavailable"))
+}
+
 struct Pending {
     id: CaptureId,
     portal: PortalId,
@@ -1248,6 +1474,9 @@ struct Pending {
     epoch: u64,
     started: u64,
     point: POINT,
+    drag: Option<crate::window::NativeWindow>,
+    nonce: usize,
+    prepared: bool,
     reply: mpsc::SyncSender<Result<CaptureStart, PlatformError>>,
 }
 
@@ -1256,10 +1485,11 @@ fn owner_thread(
     monitors: Vec<(DisplayId, [i32; 4])>,
     commands: mpsc::Receiver<Command>,
     ready: mpsc::SyncSender<Result<(), PlatformError>>,
+    drag: Option<crate::drag::DragConfig>,
 ) {
     // Unwinding retains native ownership until this function's guard releases it.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_owner(&shared, &monitors, commands, &ready)
+        run_owner(&shared, &monitors, commands, &ready, drag)
     }));
     if result.is_err() {
         shared.fault.store(true, Ordering::Release);
@@ -1274,6 +1504,7 @@ fn run_owner(
     monitors: &[(DisplayId, [i32; 4])],
     commands: mpsc::Receiver<Command>,
     ready: &mpsc::SyncSender<Result<(), PlatformError>>,
+    drag: Option<crate::drag::DragConfig>,
 ) {
     // SAFETY: changes only our owner thread; all cursor/monitor coordinates are physical.
     if unsafe {
@@ -1318,6 +1549,13 @@ fn run_owner(
             return;
         }
     }
+    let mut drag = match drag.map(crate::drag::Observer::new).transpose() {
+        Ok(drag) => drag,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
     let mut hook = HookState::new();
     let mut pending: Option<Pending> = None;
     let mut monitor = false;
@@ -1378,6 +1616,7 @@ fn run_owner(
     let _ = ready.send(Ok(()));
     let mut raw_check = 0;
     while !shared.shutdown.load(Ordering::Acquire)
+        || shared.drag_order.load(Ordering::Acquire) != 0
         || shared
             .keys
             .iter()
@@ -1403,18 +1642,67 @@ fn run_owner(
         while let Some(record) = shared.ring.pop() {
             process_record(shared, &mut hook, record, monitor);
         }
+        if let Some(drag) = &mut drag {
+            let mut point = POINT::default();
+            let dx = shared.raw_x.swap(0, Ordering::AcqRel);
+            let dy = shared.raw_y.swap(0, Ordering::AcqRel);
+            if !shared.shutdown.load(Ordering::Acquire)
+                && !shared.fault.load(Ordering::Acquire)
+                // SAFETY: read-only global pointer position, no foreign window contents.
+                && unsafe { GetCursorPos(&mut point) } != 0
+            {
+                let primary_only = shared.buttons[0].load(Ordering::Acquire) == 1
+                    && shared.buttons[1..]
+                        .iter()
+                        .all(|b| b.load(Ordering::Acquire) == 0);
+                match drag.sample(
+                    (point.x, point.y),
+                    if dx == 0 && dy == 0 {
+                        None
+                    } else {
+                        Some((dx as f64, dy as f64))
+                    },
+                    primary_only,
+                    event_time(),
+                ) {
+                    Ok(events) => {
+                        for event in events {
+                            shared.enqueue(None, event);
+                        }
+                    }
+                    Err(_) => shared.fault.store(true, Ordering::Release),
+                }
+            }
+        }
         let active = shared.active_id();
         if old_active.is_some() && active.is_none() {
             hook.end(EndReason::Lost, event_time());
             native.release_capture();
             let _ = probe_tx.try_send(None);
+            if let Some(drag) = &mut drag {
+                for event in drag.retire(event_time()) {
+                    shared.enqueue(None, event);
+                }
+            }
         }
         old_active = active;
         if shared.fault.load(Ordering::Acquire) {
             shared.terminate(EndReason::Lost);
-            break;
+            hook.end(EndReason::Lost, event_time());
+            native.release_capture();
+            let _ = probe_tx.try_send(None);
+            if let Some(p) = pending.take() {
+                let _ = p.reply.send(Err(error("drag observation lost")));
+            }
+            // Narrow fault exception: only the ONE reserved primary's counterpart remains
+            // contained. No activation/input delivery/probes occur after terminal failure.
+            if shared.drag_order.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+            continue;
         }
-        if let Some(p) = pending.take() {
+        if let Some(mut p) = pending.take() {
             if shared.generation.load(Ordering::Acquire) != p.generation
                 || !shared.gate.is_open()
                 || shared.gate.epoch() != p.epoch
@@ -1424,18 +1712,75 @@ fn run_owner(
                 native.release_capture();
                 let _ = probe_tx.try_send(None);
                 let _ = p.reply.send(Err(PlatformError::Timeout));
+                if let Some(drag) = &mut drag {
+                    for event in drag.retire(event_time()) {
+                        shared.enqueue(None, event);
+                    }
+                }
+            } else if p.drag.is_some()
+                && (shared.drag_first.load(Ordering::Acquire) == 4
+                    || shared.buttons[0].load(Ordering::Acquire) != 2)
+            {
+                let _ = p.reply.send(Err(PlatformError::PointerButtonHeld));
+                if let Some(drag) = &mut drag {
+                    for event in drag.retire(event_time()) {
+                        shared.enqueue(None, event);
+                    }
+                }
+            } else if !p.prepared {
+                if p.drag.is_some_and(|target| {
+                    shared.drag_ready(drag.as_ref().is_some_and(|d| d.ended(target)))
+                }) {
+                    match prepare_capture(
+                        shared,
+                        &native,
+                        &probe_tx,
+                        p.generation,
+                        p.epoch,
+                        p.point,
+                        p.nonce,
+                    ) {
+                        Ok(()) => {
+                            p.prepared = true;
+                            pending = Some(p);
+                        }
+                        Err(e) => {
+                            native.release_capture();
+                            shared.warming.store(false, Ordering::Release);
+                            let _ = p.reply.send(Err(e));
+                            if let Some(drag) = &mut drag {
+                                for event in drag.retire(event_time()) {
+                                    shared.enqueue(None, event);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    pending = Some(p);
+                }
             } else if shared.ack.load(Ordering::Acquire) == 3 {
-                let (held, buttons) = snapshot(shared);
-                if buttons.iter().any(|b| *b)
-                    || shared
-                        .buttons
-                        .iter()
-                        .any(|b| b.load(Ordering::Acquire) != 0)
+                let (held, mut buttons) = snapshot(shared);
+                if p.drag.is_some() {
+                    buttons[0] = shared.buttons[0].load(Ordering::Acquire) == 2
+                        && shared.drag_order.load(Ordering::Acquire) == 3;
+                }
+                if buttons
+                    .iter()
+                    .enumerate()
+                    .any(|(i, b)| *b && !(p.drag.is_some() && i == 0))
+                    || shared.buttons.iter().enumerate().any(|(i, b)| {
+                        b.load(Ordering::Acquire) != 0 && !(p.drag.is_some() && i == 0)
+                    })
                 {
                     shared.warming.store(false, Ordering::Release);
                     native.release_capture();
                     let _ = probe_tx.try_send(None);
                     let _ = p.reply.send(Err(PlatformError::PointerButtonHeld));
+                    if let Some(drag) = &mut drag {
+                        for event in drag.retire(event_time()) {
+                            shared.enqueue(None, event);
+                        }
+                    }
                     continue;
                 }
                 if !native.capture_healthy(p.point) {
@@ -1443,10 +1788,31 @@ fn run_owner(
                     native.release_capture();
                     let _ = probe_tx.try_send(None);
                     let _ = p.reply.send(Err(error("capture readiness lost")));
+                    if let Some(drag) = &mut drag {
+                        for event in drag.retire(event_time()) {
+                            shared.enqueue(None, event);
+                        }
+                    }
                     continue;
                 }
-                match hook.native_begin(p.id, p.portal, &held, &buttons, lock_keys(), event_time())
-                {
+                let activation = if let Some(target) = p.drag {
+                    if !drag.as_ref().is_some_and(|d| d.ended(target)) {
+                        Err(PlatformError::NotFound)
+                    } else {
+                        hook.native_begin_drag(
+                            p.id,
+                            p.portal,
+                            MouseButton::PRIMARY,
+                            &held,
+                            &buttons,
+                            lock_keys(),
+                            event_time(),
+                        )
+                    }
+                } else {
+                    hook.native_begin(p.id, p.portal, &held, &buttons, lock_keys(), event_time())
+                };
+                match activation {
                     Ok((start, events)) => {
                         clip_point = Some(p.point);
                         shared.active_epoch.store(p.epoch, Ordering::Release);
@@ -1458,6 +1824,11 @@ fn run_owner(
                             native.release_capture();
                             let _ = probe_tx.try_send(None);
                             let _ = p.reply.send(Err(PlatformError::Timeout));
+                            if let Some(drag) = &mut drag {
+                                for event in drag.retire(event_time()) {
+                                    shared.enqueue(None, event);
+                                }
+                            }
                             continue;
                         }
                         shared.warming.store(false, Ordering::Release);
@@ -1479,6 +1850,11 @@ fn run_owner(
                         {
                             shared.terminate(EndReason::Lost);
                             let _ = p.reply.send(Err(PlatformError::Locked));
+                            if let Some(drag) = &mut drag {
+                                for event in drag.retire(event_time()) {
+                                    shared.enqueue(None, event);
+                                }
+                            }
                         } else {
                             let _ = p.reply.send(Ok(start));
                         }
@@ -1488,6 +1864,11 @@ fn run_owner(
                         native.release_capture();
                         let _ = probe_tx.try_send(None);
                         let _ = p.reply.send(Err(e));
+                        if let Some(drag) = &mut drag {
+                            for event in drag.retire(event_time()) {
+                                shared.enqueue(None, event);
+                            }
+                        }
                     }
                 }
             } else {
@@ -1495,8 +1876,34 @@ fn run_owner(
             }
         }
         while let Ok(command) = commands.try_recv() {
+            let (drag_button, command) = match command {
+                Command::BeginDrag {
+                    id,
+                    portal,
+                    button,
+                    generation,
+                    epoch,
+                    reply,
+                } => (
+                    Some(button),
+                    Command::Begin {
+                        id,
+                        portal,
+                        generation,
+                        epoch,
+                        reply,
+                    },
+                ),
+                other => (None, other),
+            };
             match command {
                 Command::Portals(next, reply) => {
+                    if let Some(drag) = &mut drag
+                        && let Err(e) = drag.set_portals(&next, event_time())
+                    {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
                     let result = hook.set_portals(next.clone(), event_time()).map(|events| {
                         for event in events {
                             shared.enqueue(None, event);
@@ -1518,6 +1925,11 @@ fn run_owner(
                     native.release_capture();
                     let _ = probe_tx.try_send(None);
                     hook.end(EndReason::Requested, event_time());
+                    if let Some(drag) = &mut drag {
+                        for event in drag.retire(event_time()) {
+                            shared.enqueue(None, event);
+                        }
+                    }
                     let result = warp.map_or(Ok(()), |(display, point)| {
                         let rect = monitors
                             .iter()
@@ -1597,7 +2009,9 @@ fn run_owner(
                             }
                         }
                         let (_, buttons) = snapshot(shared);
-                        if buttons.iter().any(|b| *b) {
+                        if buttons.iter().enumerate().any(|(i, b)| {
+                            *b && !(drag_button == Some(MouseButton::PRIMARY) && i == 0)
+                        }) {
                             return Err(PlatformError::PointerButtonHeld);
                         }
                         // SAFETY: read-only admission; refuse an existing application-owned clip
@@ -1623,38 +2037,74 @@ fn run_owner(
                                 return Err(error("pointer clip already owned or unavailable"));
                             }
                         }
-                        let nonce = nonce()?;
-                        shared.probe_at.store(0, Ordering::Release);
-                        shared.ack.store(0, Ordering::Release);
-                        shared.active_epoch.store(epoch, Ordering::Release);
-                        shared.warming.store(true, Ordering::Release);
-                        model::acquire(|r, add| {
-                            if add
-                                && (generation != shared.generation.load(Ordering::Acquire)
-                                    || !shared.gate.is_open()
-                                    || shared.gate.epoch() != epoch)
+                        let probe_nonce = nonce()?;
+                        let drag_target = if let Some(button) = drag_button {
+                            if button != MouseButton::PRIMARY {
+                                return Err(PlatformError::PointerButtonHeld);
+                            }
+                            let observer = drag.as_mut().ok_or(PlatformError::Unsupported(
+                                "drag configuration unavailable",
+                            ))?;
+                            let target = observer.target(portal)?;
+                            let tag = nonce()?;
+                            observer.consume(target);
+                            let outcome = observer.config.settlement.settle(
+                                target.1,
+                                tag,
+                                || {
+                                    hook.protect_drag_tail(id, button, tag)?;
+                                    if let Err(e) = shared.reserve_drag(id, generation, tag) {
+                                        let _ = hook.cancel_unsubmitted_drag(id);
+                                        return Err(e);
+                                    }
+                                    hook.mark_drag_dispatch(id)
+                                },
+                                || {
+                                    if generation != shared.generation.load(Ordering::Acquire)
+                                        || !shared.gate.is_open()
+                                        || shared.gate.epoch() != epoch
+                                    {
+                                        return Err(PlatformError::Locked);
+                                    }
+                                    if shared.buttons[1..]
+                                        .iter()
+                                        .any(|b| b.load(Ordering::Acquire) != 0)
+                                    {
+                                        return Err(PlatformError::PointerButtonHeld);
+                                    }
+                                    Ok(())
+                                },
+                            )?;
+                            // The callbacks may have run reentrantly during SendInput. Drain
+                            // their authoritative order before interpreting the count report.
+                            while let Some(record) = shared.ring.pop() {
+                                process_record(shared, &mut hook, record, monitor);
+                            }
+                            let recorded = hook.record_drag_settlement(id, outcome.result);
+                            shared.report_drag(outcome.result);
+                            if let Some(e) = outcome.error
+                                && (outcome.result == DragSettlementResult::Uncertain
+                                    || shared.drag_first.load(Ordering::Acquire) != 4)
                             {
-                                return Err(PlatformError::Locked);
+                                return Err(e);
                             }
-                            // Observation hooks/raw mouse belong to the backend lifetime, so a
-                            // failed activation releases only its cursor/clip, not physical tails.
-                            if add || matches!(r, Resource::CursorWindow | Resource::PointerClip) {
-                                native.step(r, add, point)?;
+                            if shared.drag_first.load(Ordering::Acquire) == 4 {
+                                return Err(PlatformError::PointerButtonHeld);
                             }
-                            if add
-                                && (generation != shared.generation.load(Ordering::Acquire)
-                                    || !shared.gate.is_open()
-                                    || shared.gate.epoch() != epoch)
-                            {
-                                return Err(PlatformError::Locked);
-                            }
-                            Ok(())
-                        })?;
-                        shared.nonce.store(nonce, Ordering::Release);
-                        shared.ack.store(0, Ordering::Release);
-                        probe_tx
-                            .try_send(Some((nonce, epoch)))
-                            .map_err(|_| error("probe unavailable"))?;
+                            recorded?;
+                            Some(target.1)
+                        } else {
+                            prepare_capture(
+                                shared,
+                                &native,
+                                &probe_tx,
+                                generation,
+                                epoch,
+                                point,
+                                probe_nonce,
+                            )?;
+                            None
+                        };
                         Ok(Pending {
                             id,
                             portal,
@@ -1662,6 +2112,9 @@ fn run_owner(
                             epoch,
                             started: now(shared.start),
                             point,
+                            drag: drag_target,
+                            nonce: probe_nonce,
+                            prepared: drag_target.is_none(),
                             reply: reply.clone(),
                         })
                     })();
@@ -1671,9 +2124,15 @@ fn run_owner(
                             shared.warming.store(false, Ordering::Release);
                             native.release_capture();
                             let _ = reply.send(Err(e));
+                            if let Some(drag) = &mut drag {
+                                for event in drag.retire(event_time()) {
+                                    shared.enqueue(None, event);
+                                }
+                            }
                         }
                     }
                 }
+                Command::BeginDrag { .. } => unreachable!("normalized owned command"),
             }
         }
         let next_locks = lock_keys();
@@ -1788,6 +2247,10 @@ fn probe_thread(shared: Arc<Shared>, commands: mpsc::Receiver<Option<(usize, u64
 }
 
 fn process_record(shared: &Shared, hook: &mut HookState, record: Record, monitor: bool) {
+    if record.kind & 255 == 4 {
+        hook.drag_tagged_up(record.data as usize);
+        return;
+    }
     let at = event_time();
     let decision = if record.kind & 255 == 1 {
         let flags = (record.kind >> 8) as u32;
@@ -1975,6 +2438,88 @@ mod tests {
         assert!(shared.fault.load(Ordering::Acquire));
         shared.enqueue(Some(5), CaptureEvent::Started { id: CaptureId(0) });
         assert_eq!(lock(&shared.events).len(), 4097);
+    }
+
+    fn reserved_drag() -> Shared {
+        let shared = Shared::new(IoGate::new());
+        shared.buttons[0].store(1, Ordering::Release);
+        let generation = model::reserve(&shared.generation).unwrap();
+        shared.reserve_drag(CaptureId(7), generation, 1001).unwrap();
+        shared
+    }
+    #[test]
+    fn drag_callback_event_order_exactly_one_up_passes_in_every_send_report_order() {
+        for tagged_first in [false, true] {
+            for result in [
+                DragSettlementResult::Accepted,
+                DragSettlementResult::Uncertain,
+            ] {
+                let shared = reserved_drag();
+                assert_eq!(shared.drag_up(true, 999), None);
+                assert_eq!(
+                    shared.drag_up(tagged_first, if tagged_first { 1001 } else { 0 }),
+                    Some(false)
+                );
+                shared.report_drag(result);
+                assert_eq!(
+                    shared.drag_first.load(Ordering::Acquire),
+                    if tagged_first { 3 } else { 4 }
+                );
+                assert_eq!(
+                    shared.drag_up(!tagged_first, if tagged_first { 0 } else { 1001 }),
+                    Some(true)
+                );
+                assert_eq!(shared.drag_order.load(Ordering::Acquire), 0);
+                assert_eq!(shared.drag_up(true, 1001), None);
+            }
+        }
+    }
+    #[test]
+    fn drag_callback_zero_after_physical_up_finishes_without_impossible_tag_or_capture() {
+        let shared = reserved_drag();
+        assert_eq!(shared.drag_up(false, 0), Some(false));
+        shared.report_drag(DragSettlementResult::KnownZero);
+        assert_eq!(shared.drag_order.load(Ordering::Acquire), 0);
+        assert_eq!(shared.buttons[0].load(Ordering::Acquire), 0);
+        assert!(!shared.drag_ready(true));
+        assert_eq!(shared.drag_first.load(Ordering::Acquire), 4);
+        let shared = reserved_drag();
+        shared.report_drag(DragSettlementResult::KnownZero);
+        assert_eq!(shared.buttons[0].load(Ordering::Acquire), 1);
+        assert_eq!(shared.drag_up(false, 0), None); // Original local up passes normally.
+    }
+    #[test]
+    fn drag_native_start_requires_observed_tagged_up_actual_end_and_primary_only() {
+        let shared = reserved_drag();
+        shared.report_drag(DragSettlementResult::Accepted);
+        assert!(!shared.drag_ready(true));
+        assert_eq!(shared.drag_up(true, 1001), Some(false));
+        assert!(!shared.drag_ready(false));
+        assert!(shared.drag_ready(true));
+        shared.buttons[1].store(1, Ordering::Release);
+        assert!(!shared.drag_ready(true));
+        shared.buttons[1].store(0, Ordering::Release);
+        assert_eq!(shared.drag_up(false, 0), Some(true));
+        assert!(!shared.drag_ready(true));
+    }
+    #[test]
+    fn drag_callback_terminal_activation_keeps_counterpart_but_no_post_ended_input() {
+        for tagged_first in [false, true] {
+            let shared = reserved_drag();
+            shared.drag_up(tagged_first, if tagged_first { 1001 } else { 0 });
+            shared.report_drag(DragSettlementResult::Uncertain);
+            shared.terminate(EndReason::Aborted);
+            shared.shutdown.store(true, Ordering::Release);
+            assert!(shared.active_id().is_none());
+            assert!(!shared.end_pending.load(Ordering::Acquire));
+            assert_ne!(shared.drag_order.load(Ordering::Acquire), 0); // Owner lifetime retained.
+            assert_eq!(
+                shared.drag_up(!tagged_first, if tagged_first { 0 } else { 1001 }),
+                Some(true)
+            );
+            assert_eq!(shared.drag_order.load(Ordering::Acquire), 0);
+            assert!(lock(&shared.events).is_empty());
+        }
     }
 
     fn limited() -> bool {

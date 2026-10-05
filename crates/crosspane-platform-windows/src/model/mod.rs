@@ -5,6 +5,7 @@
 pub mod capture;
 pub mod cursor;
 pub mod displays;
+pub mod drag;
 pub mod frame_capture;
 pub mod geometry;
 pub mod hook;

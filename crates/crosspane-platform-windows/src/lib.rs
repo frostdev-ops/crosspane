@@ -15,6 +15,8 @@ pub mod cursor;
 #[cfg(windows)]
 pub mod displays;
 #[cfg(windows)]
+pub mod drag;
+#[cfg(windows)]
 pub mod frame_capture;
 #[cfg(windows)]
 pub mod hotkey;

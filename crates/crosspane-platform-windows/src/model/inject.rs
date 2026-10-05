@@ -12,6 +12,7 @@
 //! | Failed up | Retain it as owed; never claim delivery |
 
 use super::geometry::{DisplayIds, MonitorProbe, displays};
+use super::hook::DragSettlementResult;
 use crosspane_platform::{IoGate, PlatformError};
 use crosspane_types::{
     geom::PointDevice,
@@ -60,6 +61,13 @@ pub trait InjectionPort: Send {
     fn foreground(&mut self) -> Result<Foreground, PlatformError>;
     fn submit(&mut self, packet: Packet) -> Result<(), PlatformError>;
     fn locks(&mut self) -> Result<LockKeys, PlatformError>;
+}
+
+/// The dedicated local-up path distinguishes exact native zero from generic uncertainty.
+#[allow(dead_code)] // Native-only consumer; exact source is included by pure contract tests.
+pub(crate) struct LocalSettlementOutcome {
+    pub result: DragSettlementResult,
+    pub error: Option<PlatformError>,
 }
 
 /// `[E]` Read-only keyboard settings: delay 0..3 and speed 0..31.
@@ -145,6 +153,67 @@ impl<P: InjectionPort> Driver<P> {
     }
     pub fn cancel_repeat(&mut self) {
         self.repeat = None;
+    }
+
+    /// Target-bound LOCAL settlement, distinct from deliberately permissive ordinary cleanup.
+    /// No injected down/up ledger is added: its original down belongs to the capture seat.
+    #[allow(dead_code)]
+    pub(crate) fn settle_local_button(
+        &mut self,
+        expected: Foreground,
+        reserve: impl FnOnce() -> Result<(), PlatformError>,
+        send: impl FnOnce(&mut P) -> LocalSettlementOutcome,
+    ) -> Result<LocalSettlementOutcome, PlatformError> {
+        self.cancel_repeat();
+        let epoch = self.gate.epoch();
+        self.check_local_target(expected)?; // Refusal here has no tail reservation.
+        if let Err(e) = reserve().and_then(|()| {
+            self.check_local_target(expected)?;
+            if self.gate.epoch() != epoch {
+                return Err(PlatformError::Locked);
+            }
+            Ok(())
+        }) {
+            return Ok(LocalSettlementOutcome {
+                result: DragSettlementResult::KnownZero,
+                error: Some(e),
+            });
+        }
+        // The adapter returns exact SendInput(1) count or terminal uncertainty. Generic Err is
+        // not promoted to zero; unwinding is caught outside this method with the tail protected.
+        Ok(send(&mut self.port))
+    }
+
+    fn check_local_target(&mut self, expected: Foreground) -> Result<(), PlatformError> {
+        let epoch = self.gate.epoch();
+        if !self.gate.is_open() {
+            return Err(PlatformError::Locked);
+        }
+        if !self.buttons.is_empty() {
+            return Err(PlatformError::Backend(
+                "injected pointer obligation outstanding".into(),
+            ));
+        }
+        let observed = self
+            .port
+            .foreground()
+            .map_err(|_| PlatformError::SecureInput)?;
+        if observed != expected
+            || observed.window == 0
+            || observed.process == 0
+            || observed.thread == 0
+            || observed.born == 0
+            || observed.integrity > self.own_integrity
+            || self
+                .focus
+                .is_some_and(|(owned, old_epoch)| owned != observed || old_epoch != epoch)
+        {
+            return Err(PlatformError::SecureInput);
+        }
+        if !self.gate.is_open() || self.gate.epoch() != epoch {
+            return Err(PlatformError::Locked);
+        }
+        Ok(())
     }
 
     fn empty(&self) -> bool {
