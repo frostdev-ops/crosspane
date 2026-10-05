@@ -315,6 +315,13 @@ impl ProxyHost {
             use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
             builder.with_activation_policy(ActivationPolicy::Accessory);
         }
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            // Winit attempts PER_MONITOR_AWARE_V2 before its older-OS fallbacks. This must
+            // happen before any proxy HWND is created; geometry stays in physical pixels.
+            builder.with_dpi_aware(true);
+        }
         Self::from_loop(builder.build()?)
     }
 

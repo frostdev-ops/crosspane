@@ -22,7 +22,15 @@ mod gpu;
 use gpu::Presenter;
 
 fn device() -> Result<Option<(wgpu::Device, wgpu::Queue)>> {
+    #[cfg(not(target_os = "windows"))]
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    #[cfg(target_os = "windows")]
+    let instance = {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::DX12;
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        wgpu::Instance::new(descriptor)
+    };
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         compatible_surface: None,
         force_fallback_adapter: false,

@@ -117,6 +117,16 @@ impl App {
             use winit::platform::wayland::WindowAttributesExtWayland;
             attributes.with_name("crosspane-proxy", "Crosspane")
         };
+        #[cfg(target_os = "windows")]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            // The frozen Open describes an independent, decorated toplevel, with no owner
+            // or popup relation. Winit supplies the normal resizable overlapped style.
+            attributes
+                .with_class_name("CrosspaneProxy")
+                .with_skip_taskbar(false)
+                .with_drag_and_drop(false)
+        };
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -152,6 +162,12 @@ impl App {
         };
         #[cfg(not(target_os = "macos"))]
         let _ = place;
+        #[cfg(target_os = "windows")]
+        if place.is_some() {
+            // Crosspane's seam-preserving logical desktop cannot be converted by multiplying
+            // a global point by the current DPI. The agent must supply its monitor mapping.
+            tracing::debug!(id, "Windows proxy placement awaits logical monitor mapping");
+        }
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
@@ -313,6 +329,11 @@ impl App {
             }
             HostCommand::SetFullscreen { id, fullscreen } => {
                 if let Some(window) = self.windows.get(&id) {
+                    #[cfg(target_os = "windows")]
+                    window
+                        .window
+                        .set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
+                    #[cfg(not(target_os = "windows"))]
                     window
                         .window
                         .set_fullscreen(fullscreen.then(|| Fullscreen::Borderless(None)));
@@ -484,13 +505,13 @@ fn set_cursor(
     hotspot: (u32, u32),
     pixels: &[u8],
 ) {
-    match cursor::shape(
-        size.width,
-        size.height,
-        hotspot,
-        pixels,
-        window.scale_factor(),
-    ) {
+    #[cfg(target_os = "windows")]
+    let scale = 1.0;
+    #[cfg(not(target_os = "windows"))]
+    let scale = window.scale_factor();
+    // Windows CreateIconIndirect uses the supplied bitmap's physical pixels directly.
+    // Downsampling it by the window's DPI would make the source cursor too small.
+    match cursor::shape(size.width, size.height, hotspot, pixels, scale) {
         // The pointer over a proxy is this machine's own: it never disappears. A hidden remote
         // cursor (an app hides it while typing until the mouse moves, which injected motion may
         // not count as) shows the default arrow instead.
@@ -712,6 +733,14 @@ fn proxy_instance_descriptor(mut descriptor: wgpu::InstanceDescriptor) -> wgpu::
     // The proxy uses Vulkan/Metal. Unintended EGL initialization registers a driver atexit
     // cleanup whose GLES debug callback logs after tracing's TLS destruction, aborting the agent.
     descriptor.backends = wgpu::Backends::PRIMARY;
+    #[cfg(target_os = "windows")]
+    {
+        // DX12 includes WARP when no hardware adapter is available in the VM.
+        descriptor.backends = wgpu::Backends::DX12;
+        // The proxy needs only SM5 shaders. Use the OS-provided compiler instead of loading
+        // an ambient dxcompiler.dll whose version may be incompatible with wgpu.
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+    }
     descriptor
 }
 
@@ -909,7 +938,7 @@ fn pixel_size(size: PhysicalSize<u32>) -> PixelSize {
 /// display the content is on (the native display ID) and where on it, so every geometry event
 /// is reported. Elsewhere (Wayland: no window position, no display ID) a report says only
 /// whether the proxy is visible, and the agent's own placement producer supplies the rest.
-const TRACKS_GEOMETRY: bool = cfg!(target_os = "macos");
+const TRACKS_GEOMETRY: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// Why `HostEvent::Placed` is being considered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1359,6 +1388,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn proxy_backends_exclude_egl_and_keep_vulkan_and_metal() {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.flags = wgpu::InstanceFlags::empty();
@@ -1367,6 +1397,26 @@ mod tests {
         assert!(!descriptor.backends.intersects(wgpu::Backends::GL));
         assert!(descriptor.backends.contains(wgpu::Backends::VULKAN));
         assert!(descriptor.backends.contains(wgpu::Backends::METAL));
+        assert_eq!(descriptor.flags, wgpu::InstanceFlags::empty());
+        assert_eq!(
+            descriptor.memory_budget_thresholds.for_resource_creation,
+            Some(75)
+        );
+        assert!(descriptor.display.is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn proxy_windows_defaults_to_dx12_and_preserves_descriptor_options() {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.flags = wgpu::InstanceFlags::empty();
+        descriptor.memory_budget_thresholds.for_resource_creation = Some(75);
+        let descriptor = proxy_instance_descriptor(descriptor);
+        assert_eq!(descriptor.backends, wgpu::Backends::DX12);
+        assert!(matches!(
+            descriptor.backend_options.dx12.shader_compiler,
+            wgpu::Dx12Compiler::Fxc
+        ));
         assert_eq!(descriptor.flags, wgpu::InstanceFlags::empty());
         assert_eq!(
             descriptor.memory_budget_thresholds.for_resource_creation,

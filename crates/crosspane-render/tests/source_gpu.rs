@@ -14,10 +14,18 @@ fn gpu() -> Result<Option<SourceGpu>> {
     gpu_with_features(true)
 }
 fn gpu_with_features(optional: bool) -> Result<Option<SourceGpu>> {
+    #[cfg(not(target_os = "windows"))]
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
+    #[cfg(target_os = "windows")]
+    let instance = {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::DX12;
+        descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+        wgpu::Instance::new(descriptor)
+    };
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         ..Default::default()
