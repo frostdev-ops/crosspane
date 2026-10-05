@@ -1493,6 +1493,47 @@ impl Agent {
         }))
     }
 
+    #[cfg(windows)]
+    fn windows_proxy_place(
+        &self,
+        place: Option<ProxyPlacement>,
+    ) -> Option<crosspane_render::proxy::HostPlace> {
+        let place = place?;
+        let converted = (|| {
+            let rows = (self.platform.host_placement_mapping.as_ref()?)()?;
+            let mut matching = rows.iter().filter(|row| row.id == place.display.0);
+            let row = matching.next()?;
+            if matching.next().is_some() || !row.geometry.is_valid() {
+                return None;
+            }
+            let g = row.geometry;
+            let cached = self
+                .local_displays
+                .iter()
+                .find(|display| display.id == place.display)?;
+            if cached.geometry != g
+                || place.x < 0
+                || place.y < 0
+                || f64::from(place.x) >= f64::from(g.pixel_size.width)
+                || f64::from(place.y) >= f64::from(g.pixel_size.height)
+            {
+                return None;
+            }
+            let point =
+                g.device_to_logical(PointDevice::new(f64::from(place.x), f64::from(place.y)));
+            Some(crosspane_render::proxy::HostPlace {
+                content: (point.x, point.y).into(),
+            })
+        })();
+        if converted.is_none() {
+            tracing::warn!(
+                count = self.local_displays.len(),
+                "Windows proxy placement unavailable; OS placement"
+            );
+        }
+        converted
+    }
+
     /// `platform::create` completed startup recovery before handing us this backend.
     fn parking_start(&mut self) {
         if self.parking_available {
@@ -2504,6 +2545,8 @@ impl Agent {
                         return;
                     }
                 };
+                #[cfg(windows)]
+                let host_place = self.windows_proxy_place(place);
                 if HYPRLAND_PLACEMENT && let Some(place) = place {
                     self.drag_places.insert(key, place);
                     self.placement.blocked.insert(key);
@@ -2517,9 +2560,9 @@ impl Agent {
                         title,
                         size,
                         accent: node_accent(key.source),
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", windows))]
                         place: host_place,
-                        #[cfg(not(target_os = "macos"))]
+                        #[cfg(not(any(target_os = "macos", windows)))]
                         place: None,
                     })
                     .is_ok()
@@ -5848,6 +5891,9 @@ pub fn subscribe_platform(platform: &mut Platform, tx: &Sender<Event>) {
             tracing::warn!(error = %e, "window events unavailable");
         }
     }
+    // Windows startup already required successful configuration and subscription after
+    // host construction. GlobalHotkeys::subscribe is called once; Unix remains optional.
+    #[cfg(not(windows))]
     if let Some(hotkeys) = &mut platform.hotkeys {
         let hotkey_tx = sink(tx);
         if let Err(e) = hotkeys.subscribe(std::sync::Arc::new(move |ev| {
@@ -8589,6 +8635,8 @@ mod audio_tests {
             startup_recovery: crate::platform::StartupRecovery::None,
             #[cfg(windows)]
             acceptance_scratch: false,
+            #[cfg(windows)]
+            host_placement_mapping: None,
         };
         let e2 = E2Wiring {
             source_media: source_tx.into(),
@@ -8632,6 +8680,56 @@ mod audio_tests {
             _dest: dest,
             _dir: dir,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_destination_placement_uses_fresh_geometry_or_opens_without_place() {
+        let mut rig = rig(false);
+        let display = DisplayInfo {
+            id: DisplayId(42),
+            name: "fixture".into(),
+            geometry: crosspane_types::geom::DisplayGeometry {
+                physical_size: crosspane_types::geom::SizeMm::new(300.0, 200.0),
+                pixel_size: PixelSize::new(1920, 2160),
+                scale: 2.0,
+                logical_origin: crosspane_types::geom::PointLogical::new(1920.0, 0.0),
+            },
+            refresh_millihz: 60_000,
+            color_space: crosspane_types::color::ColorSpace::Srgb,
+            hdr: false,
+        };
+        rig.agent.local_displays = vec![display.clone()];
+        let rows = vec![crosspane_render::proxy::HostMonitorMapping {
+            id: display.id.0,
+            native_id: "fixture".into(),
+            geometry: display.geometry,
+            physical_origin: (1920, 0).into(),
+        }];
+        rig.agent.platform.host_placement_mapping = Some(Arc::new(move || Some(rows.clone())));
+        let place = ProxyPlacement {
+            display: DisplayId(42),
+            x: 200,
+            y: 200,
+            drag: false,
+        };
+        let point = rig.agent.windows_proxy_place(Some(place)).unwrap().content;
+        assert_eq!((point.x, point.y), (2020.0, 100.0));
+        assert!(rig.agent.windows_proxy_place(None).is_none());
+        for invalid in [
+            ProxyPlacement {
+                display: DisplayId(43),
+                ..place
+            },
+            ProxyPlacement { x: -1, ..place },
+            ProxyPlacement { x: 1920, ..place },
+        ] {
+            assert!(rig.agent.windows_proxy_place(Some(invalid)).is_none());
+        }
+        rig.agent.local_displays[0].geometry.scale = 1.0;
+        assert!(rig.agent.windows_proxy_place(Some(place)).is_none());
+        rig.agent.platform.host_placement_mapping = Some(Arc::new(|| None));
+        assert!(rig.agent.windows_proxy_place(Some(place)).is_none());
     }
 
     #[test]

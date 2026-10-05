@@ -338,6 +338,9 @@ pub struct Platform {
     /// Proof that the native factory admitted its exact isolated acceptance contract.
     #[cfg(windows)]
     pub(crate) acceptance_scratch: bool,
+    /// Fresh Windows placement rows. The refresh closure is weak; `displays` owns its worker.
+    #[cfg(windows)]
+    pub host_placement_mapping: Option<crosspane_render::proxy::HostPlacementMapping>,
 }
 
 /// A wgpu device for the source side's GPU work (docs/wp/GPU-v0.md, decision 3).
@@ -480,6 +483,12 @@ pub fn video_codecs(
             crosspane_platform_macos::video::VtCodecs::new(),
         ));
     }
+    #[cfg(all(windows, feature = "video"))]
+    {
+        return Some(std::sync::Arc::new(
+            crosspane_platform_windows::video::MfCodecs::new(),
+        ));
+    }
     #[allow(unreachable_code)]
     None
 }
@@ -590,6 +599,152 @@ fn acceptance_e1(
     Ok(true)
 }
 
+/// Each call takes one bounded observation on the retained display worker. Called on the
+/// host event-loop thread (and the engine thread for explicit placement), without agent locks.
+/// Never cache geometry: a dead owner or failed observation yields OS-selected placement.
+#[cfg(windows)]
+fn windows_placement_mapping(
+    refresh: crosspane_platform_windows::inject::MonitorRefresh,
+) -> crosspane_render::proxy::HostPlacementMapping {
+    Arc::new(move || {
+        let (probes, ids) = refresh().ok()?;
+        match windows_monitor_rows(&probes, ids) {
+            Ok(rows) => Some(rows),
+            Err(_) => {
+                tracing::warn!(
+                    count = probes.len(),
+                    "Windows placement observation refused"
+                );
+                None
+            }
+        }
+    })
+}
+
+#[cfg(windows)]
+fn windows_monitor_rows(
+    probes: &[crosspane_platform_windows::model::geometry::MonitorProbe],
+    mut ids: crosspane_platform_windows::model::geometry::DisplayIds,
+) -> Result<Vec<crosspane_render::proxy::HostMonitorMapping>, PlatformError> {
+    use crosspane_platform_windows::model::geometry;
+    use std::collections::BTreeSet;
+    let refused = || PlatformError::Backend("invalid Windows placement observation".into());
+    let layout = geometry::displays(probes, &mut ids).map_err(|_| refused())?;
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_native = BTreeSet::new();
+    let mut rows = Vec::new();
+    for probe in probes.iter().filter(|probe| !probe.twin) {
+        let id = ids.assign(&probe.device_path).map_err(|_| refused())?;
+        if !seen_ids.insert(id) || probe.name.is_empty() || !seen_native.insert(&probe.name) {
+            return Err(refused());
+        }
+        let display = layout
+            .displays
+            .iter()
+            .find(|display| display.id == id)
+            .ok_or_else(refused)?;
+        if !display.geometry.is_valid() {
+            return Err(refused());
+        }
+        rows.push(crosspane_render::proxy::HostMonitorMapping {
+            id: id.0,
+            native_id: probe.name.clone(),
+            geometry: display.geometry,
+            physical_origin: (probe.rc_monitor[0], probe.rc_monitor[1]).into(),
+        });
+    }
+    if rows.is_empty() || rows.len() != layout.displays.len() {
+        return Err(refused());
+    }
+    Ok(rows)
+}
+
+/// Separate, never-default destination fixture. No owner enumeration/capture or native key store.
+#[cfg(windows)]
+fn acceptance_e2_destination(
+    state_dir: &std::path::Path,
+    config: &crate::config::Config,
+) -> anyhow::Result<bool> {
+    use anyhow::{Context, ensure};
+    use std::path::PathBuf;
+    let Some(value) = std::env::var_os("CROSSPANE_ACCEPTANCE_E2_DESTINATION") else {
+        return Ok(false);
+    };
+    ensure!(
+        value == "1" && std::env::var_os("CROSSPANE_ACCEPTANCE_E1_ONLY").is_none(),
+        "invalid or conflicting E2 acceptance switch"
+    );
+    let appdata = PathBuf::from(std::env::var_os("APPDATA").context("scratch APPDATA")?);
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").context("scratch LOCALAPPDATA")?);
+    let runtime =
+        PathBuf::from(std::env::var_os("CROSSPANE_RUNTIME_DIR").context("scratch runtime")?);
+    let root = appdata.parent().context("scratch root")?;
+    let suffix = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("crosspane-WP-W2.5a-"))
+        .context("E2 acceptance requires a uniquely named scratch root")?;
+    ensure!(
+        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "E2 acceptance requires a unique scratch identity"
+    );
+    ensure!(
+        root.parent().map(std::fs::canonicalize).transpose()?
+            == Some(std::fs::canonicalize(std::env::temp_dir())?),
+        "E2 acceptance root must be under the temporary directory"
+    );
+    ensure!(
+        appdata == root.join("roaming")
+            && local == root.join("local")
+            && runtime == root.join("runtime")
+            && state_dir == local.join("Crosspane"),
+        "E2 acceptance requires isolated config, state and runtime paths"
+    );
+    ensure!(
+        config.force_file_keystore
+            && config.name == format!("wp-w2-5a-dst-{suffix}")
+            && config.peers.len() == 1
+            && config.peers[0].addr.ip().is_loopback()
+            && config.peers[0].addr.port() != 0
+            && !config.crossing
+            && !config.drag.across
+            && ["CROSSPANE_DISCOVERY", "CROSSPANE_AUDIO", "CROSSPANE_GPU"]
+                .into_iter()
+                .all(|name| std::env::var(name).as_deref() == Ok("0")),
+        "E2 acceptance requires an explicit loopback fixture peer, file identity and confined input"
+    );
+    Ok(true)
+}
+
+/// Required release/panic observer, only after the host has relinquished Raw Input.
+/// Configuration and the initial-state subscription must both succeed before startup commits.
+#[cfg(windows)]
+pub fn windows_hotkeys_after_host(
+    sink: Arc<dyn crosspane_platform::EventSink<crosspane_platform::HotkeyEvent>>,
+) -> Result<Box<dyn GlobalHotkeys>, PlatformError> {
+    windows_hotkeys_after_host_with(
+        || {
+            crosspane_platform_windows::hotkey::WindowsHotkeys::new()
+                .map(|backend| Box::new(backend) as Box<dyn GlobalHotkeys>)
+        },
+        sink,
+    )
+}
+
+#[cfg(windows)]
+fn windows_hotkeys_after_host_with(
+    factory: impl FnOnce() -> Result<Box<dyn GlobalHotkeys>, PlatformError>,
+    sink: Arc<dyn crosspane_platform::EventSink<crosspane_platform::HotkeyEvent>>,
+) -> Result<Box<dyn GlobalHotkeys>, PlatformError> {
+    let mut backend = factory()?;
+    // There is no configurable release chord: preserve the engine's exact default.
+    let chord =
+        crosspane_engine::EngineConfig::new(crosspane_types::id::NodeId([0; 32])).release_chord;
+    backend.set_chord(&chord)?;
+    backend.subscribe(sink)?;
+    Ok(backend)
+}
+
 #[cfg(windows)]
 pub fn create(
     state_dir: &std::path::Path,
@@ -598,16 +753,18 @@ pub fn create(
     use anyhow::Context;
     use crosspane_platform_windows::{
         capture::WindowsCapture, displays::WindowsDisplays, frame_capture::WindowsFrameCapture,
-        hotkey::WindowsHotkeys, inject, link::WindowsLinkInfo, overlay::WindowsOverlay,
-        session::WindowsSession, stubs::UnsupportedWindows, tray::WindowsTray,
-        window::WindowsWindowSource,
+        inject, link::WindowsLinkInfo, overlay::WindowsOverlay, session::WindowsSession,
+        stubs::UnsupportedWindows, tray::WindowsTray, window::WindowsWindowSource,
     };
     let e1_only = acceptance_e1(state_dir, config)?;
+    let e2_destination = acceptance_e2_destination(state_dir, config)?;
+    let scratch_only = e1_only || e2_destination;
     let gate = IoGate::new();
     let session = WindowsSession::new(gate.clone())
         .context("Windows session state (required: Crosspane fails closed without it)")?;
     let displays = WindowsDisplays::new().context("Windows displays")?;
     let snapshot = displays.snapshot().context("Windows display snapshot")?;
+    let host_placement_mapping = Some(windows_placement_mapping(displays.monitor_refresh()));
     let mut ids = snapshot.ids;
     let capture = optional(
         "capture",
@@ -633,7 +790,7 @@ pub fn create(
         .map(|backend| Box::new(backend) as Box<dyn OverlayHost>);
     // Window enumeration reads titles, so the explicitly isolated acceptance fixture omits
     // these E2 source backends. Production always attempts every landed backend.
-    let windows = if e1_only {
+    let windows = if scratch_only {
         None
     } else {
         optional(
@@ -657,20 +814,10 @@ pub fn create(
         keys,
         pointer,
         overlay,
-        hotkeys: optional(
-            "hotkeys",
-            WindowsHotkeys::new().and_then(|mut backend| {
-                // There is no configurable release chord: use the engine's exact default,
-                // configured before subscribe so both release and panic have an observer.
-                let chord =
-                    crosspane_engine::EngineConfig::new(crosspane_types::id::NodeId([0; 32]))
-                        .release_chord;
-                backend.set_chord(&chord)?;
-                Ok(backend)
-            }),
-        )
-        .map(|backend| Box::new(backend) as Box<dyn GlobalHotkeys>),
-        keystore: if e1_only { None } else { keystore() },
+        // Startup constructs and subscribes this required observer after the host has
+        // relinquished winit's keyboard/mouse registrations. A failure aborts startup.
+        hotkeys: None,
+        keystore: if scratch_only { None } else { keystore() },
         // required=[] is benign in the agent: no OS request/subscription, notice or retry.
         permissions: Box::new(UnsupportedWindows),
         windows: windows.map(|backend| Box::new(backend) as Box<dyn WindowSource>),
@@ -684,7 +831,8 @@ pub fn create(
         home: None,
         proxy_placement: None,
         startup_recovery: StartupRecovery::combine(&[]),
-        acceptance_scratch: e1_only,
+        acceptance_scratch: scratch_only,
+        host_placement_mapping,
     })
 }
 
@@ -1590,6 +1738,196 @@ mod acceptance_bind_tests {
             config.acceptance_bind_ip = Some(ip);
             assert!(acceptance_bind_ip(&config, false).is_err());
             assert!(acceptance_bind_ip(&config, true).is_err());
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_destination_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crosspane_platform_windows::model::geometry::{DisplayIds, MonitorProbe};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn probe(path: &str, name: &str, bounds: [i32; 4], dpi: u32, primary: bool) -> MonitorProbe {
+        MonitorProbe {
+            device_path: path.into(),
+            name: name.into(),
+            rc_monitor: bounds,
+            rc_work: bounds,
+            primary,
+            dpi,
+            refresh_millihz: 60_000,
+            edid: None,
+            twin: false,
+            quarter_turns: 0,
+        }
+    }
+
+    #[test]
+    fn windows_destination_rows_join_retained_ids_and_mixed_dpi_seams() {
+        let a = probe("a", "A", [0, 0, 1920, 1080], 96, true);
+        let b = probe("b", "B", [1920, 0, 3840, 2160], 192, false);
+        let mut ids = DisplayIds::default();
+        let b_id = ids.assign("b").unwrap();
+        let rows = windows_monitor_rows(&[b.clone(), a], ids.clone()).unwrap();
+        let b_row = rows.iter().find(|row| row.id == b_id.0).unwrap();
+        assert_eq!(b_row.native_id, "B");
+        assert_eq!(b_row.physical_origin, (1920, 0).into());
+        assert_eq!(b_row.geometry.logical_origin, (1920.0, 0.0).into());
+        assert_eq!(
+            b_row.geometry.device_to_logical((200.0, 200.0).into()),
+            (2020.0, 100.0).into()
+        );
+        let rows = windows_monitor_rows(
+            &[
+                probe("a", "A", [0, 0, 2560, 1440], 192, true),
+                probe("b", "B", [2560, 200, 4480, 1280], 96, false),
+            ],
+            ids.clone(),
+        )
+        .unwrap();
+        let b_row = rows.iter().find(|row| row.id == b_id.0).unwrap();
+        assert_eq!(
+            b_row.geometry.device_to_logical((100.0, 100.0).into()),
+            (1380.0, 200.0).into()
+        );
+        let rows = windows_monitor_rows(
+            &[
+                probe("a", "A", [0, 0, 1920, 1080], 96, true),
+                probe("b", "B", [-1920, 0, 0, 1080], 96, false),
+            ],
+            ids,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == b_id.0)
+                .unwrap()
+                .physical_origin,
+            (-1920, 0).into()
+        );
+    }
+
+    #[test]
+    fn windows_destination_rows_refuse_invalid_or_ambiguous_observations() {
+        let a = probe("a", "A", [0, 0, 1920, 1080], 96, true);
+        assert!(windows_monitor_rows(&[], DisplayIds::default()).is_err());
+        assert!(windows_monitor_rows(&[a.clone(), a.clone()], DisplayIds::default()).is_err());
+        let b = probe("b", "A", [1920, 0, 3840, 1080], 96, false);
+        assert!(windows_monitor_rows(&[a.clone(), b], DisplayIds::default()).is_err());
+        let mut invalid = a;
+        invalid.dpi = 0;
+        assert!(windows_monitor_rows(&[invalid], DisplayIds::default()).is_err());
+    }
+
+    #[test]
+    fn windows_destination_provider_refreshes_once_and_never_keeps_last_good() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mapping = windows_placement_mapping(Arc::new(move || {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok((
+                    vec![probe("a", "A", [0, 0, 1920, 1080], 96, true)],
+                    DisplayIds::default(),
+                ))
+            } else {
+                Err(PlatformError::NotFound)
+            }
+        }));
+        assert_eq!(mapping().unwrap().len(), 1);
+        assert!(mapping().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn windows_destination_video_selection_matches_feature() {
+        assert_eq!(video_codecs(None).is_some(), cfg!(feature = "video"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_destination_hotkey_tests {
+    use super::*;
+    use crosspane_platform::{Chord, EventSink, HotkeyEvent};
+    use std::sync::Mutex;
+
+    struct Fake {
+        fail: u8,
+        calls: Arc<Mutex<Vec<u8>>>,
+        drops: Arc<Mutex<usize>>,
+    }
+    impl GlobalHotkeys for Fake {
+        fn set_chord(&mut self, chord: &Chord) -> Result<(), PlatformError> {
+            let expected =
+                crosspane_engine::EngineConfig::new(crosspane_types::id::NodeId([0; 32]))
+                    .release_chord;
+            assert!(chord == &expected);
+            self.calls
+                .lock()
+                .unwrap_or_else(|_| panic!("fixture calls lock poisoned"))
+                .push(1);
+            if self.fail == 1 {
+                Err(PlatformError::Backend("fixture configure refusal".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn subscribe(&mut self, _: Arc<dyn EventSink<HotkeyEvent>>) -> Result<(), PlatformError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|_| panic!("fixture calls lock poisoned"))
+                .push(2);
+            if self.fail == 2 {
+                Err(PlatformError::Backend("fixture subscribe refusal".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            *self
+                .drops
+                .lock()
+                .unwrap_or_else(|_| panic!("fixture drop lock poisoned")) += 1;
+        }
+    }
+
+    #[test]
+    fn windows_destination_hotkeys_require_creation_configuration_subscription() {
+        // No live hook/observer factory is called: each failure boundary is injected.
+        for fail in 0..=3 {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let drops = Arc::new(Mutex::new(0));
+            let observed = calls.clone();
+            let released = drops.clone();
+            let result = windows_hotkeys_after_host_with(
+                move || {
+                    if fail == 0 {
+                        Err(PlatformError::Backend("fixture creation refusal".into()))
+                    } else {
+                        Ok(Box::new(Fake {
+                            fail,
+                            calls: observed,
+                            drops: released,
+                        }))
+                    }
+                },
+                Arc::new(|_: HotkeyEvent| {}),
+            );
+            assert_eq!(result.is_ok(), fail == 3);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                match fail {
+                    0 => vec![],
+                    1 => vec![1],
+                    _ => vec![1, 2],
+                }
+            );
+            assert_eq!(*drops.lock().unwrap(), usize::from(fail == 1 || fail == 2));
+            drop(result);
+            assert_eq!(*drops.lock().unwrap(), usize::from(fail != 0));
         }
     }
 }

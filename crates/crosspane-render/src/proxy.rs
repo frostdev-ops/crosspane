@@ -356,6 +356,12 @@ impl ProxyHost {
     }
 
     fn from_loop(event_loop: EventLoop<HostCommand>) -> Result<(Self, HostHandle), HostError> {
+        // Windows winit 0.30.13 registers both Raw Input classes during construction. Its
+        // immediate Never call removes them once, before the agent creates its exclusive
+        // capture/hotkey observers; this host consumes only window events. Never repeat this
+        // call after those observers exist (including on resume, focus or proxy recreation).
+        #[cfg(windows)]
+        event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
         event_loop.set_control_flow(ControlFlow::Wait);
         let handle = HostHandle {
             proxy: event_loop.create_proxy(),

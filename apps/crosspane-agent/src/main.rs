@@ -352,6 +352,17 @@ fn start_agent(
     // The revision is of the very bytes this run is configured from (WP-4.5).
     let (config, config_revision) = Config::load_revision(paths)?;
     *failure = lifecycle::Failure::Platform;
+    // Winit registers both Raw Input classes at EventLoop construction. On Windows the
+    // host relinquishes those registrations before ANY native platform observer exists,
+    // preserving capture's mouse target as well as the required release/panic target.
+    #[cfg(windows)]
+    let mut host = match crosspane_render::proxy::ProxyHost::new() {
+        Ok(host) => Some(host),
+        Err(e) => {
+            tracing::warn!(error = %e, "no proxy window host: this node can't show projected windows");
+            None
+        }
+    };
     let mut platform = platform::create(&paths.state_dir, &config)?;
     #[cfg(windows)]
     let acceptance_scratch = platform.acceptance_scratch;
@@ -361,6 +372,7 @@ fn start_agent(
         platform::acceptance_bind_ip(&config, acceptance_scratch)?,
         config.port,
     );
+    #[cfg(not(windows))]
     tracing::info!(backends = ?platform, "platform ready");
     remove_old_burst_marker(&paths.state_dir);
     // `_lock` stays held while the key store is waited for, so a second agent still refuses to
@@ -415,6 +427,19 @@ fn start_agent(
     let (tx, rx) = std::sync::mpsc::channel();
     #[cfg(windows)]
     let shutdown_watch = windows::shutdown::Watch::for_agent(tx.clone())?;
+    #[cfg(windows)]
+    {
+        *failure = lifecycle::Failure::Platform;
+        let hotkey_tx = tx.clone();
+        platform.hotkeys = Some(
+            platform::windows_hotkeys_after_host(Arc::new(move |event| {
+                let _ = hotkey_tx.send(agent::Event::Input(crosspane_engine::Input::Hotkey(event)));
+            }))
+            .context("Windows release/panic hotkeys (required for startup)")?,
+        );
+        tracing::info!(backends = ?platform, "platform ready");
+        *failure = lifecycle::Failure::Other;
+    }
     agent::subscribe_platform(&mut platform, &tx);
 
     // E2 video (WP-2.14): this node's encoder/decoder, if it has one and video isn't turned off.
@@ -493,6 +518,7 @@ fn start_agent(
 
     // E2: the proxy window host owns the main thread (winit's rule on macOS); without a display
     // the node can still project its own windows, just not show others'.
+    #[cfg(not(windows))]
     let host = match crosspane_render::proxy::ProxyHost::new() {
         #[allow(unused_mut)]
         Ok(mut host) => {
@@ -508,6 +534,12 @@ fn start_agent(
             None
         }
     };
+    #[cfg(windows)]
+    if let Some((host, _)) = &mut host
+        && let Some(mapping) = platform.host_placement_mapping.clone()
+    {
+        host.set_placement_mapping(mapping);
+    }
     let proxy_ids = media::ProxyIds::default();
     let (source_media, source_worker) = media::start_source(net.transport(), video.clone());
     let (dest_media, dest_worker) = media::start_destination(
