@@ -45,6 +45,7 @@ pub enum Disabled {
 pub enum LaunchState {
     Absent,
     Owned,
+    LoadedStopped,
     AdoptionRequired,
     Conflict,
     UserDisabled,
@@ -64,12 +65,8 @@ pub enum LoginEvidence {
     SameSession,
     DifferentInteractiveSession,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Job {
-    Absent,
-    Running(u32),
-    Unknown,
-}
+use super::launchd_observation::JobObservation as Job;
+
 #[derive(Clone, PartialEq, Eq)]
 struct Snapshot {
     identity: Option<FileIdentity>,

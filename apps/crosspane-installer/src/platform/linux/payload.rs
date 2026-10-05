@@ -1,5 +1,5 @@
 //! Local development payloads. Archive metadata never grants ownership of an arbitrary path.
-use super::native_io::{Deadline, LinuxNativeIo, NativeError, SupportProof};
+use super::native_io::{DeadRuntime, Deadline, LinuxNativeIo, NativeError, SupportProof};
 use crate::agent_contract::{
     AgentReply, BackendName, BackendState, DecodedReply, InstallerStatusV1, ObservationSource,
     StartupRecovery, StatusAdmission,
@@ -565,6 +565,7 @@ pub struct PayloadPlan {
     journal: Journal,
     generation: Option<[u8; 32]>,
     resuming: bool,
+    dead_runtime: Option<DeadRuntime>,
 }
 impl PayloadPlan {
     pub fn receipt(&self) -> &InstallReceipt {
@@ -1027,23 +1028,10 @@ impl PayloadInstaller {
         Ok(())
     }
     fn fresh_absence(&self) -> Result<()> {
-        // No process scan or guessed PID. Existing bootstrap/socket means running or unknown.
-        match self.io.metadata(self.io.target().runtime_dir()) {
-            Ok(None) => Ok(()),
-            Ok(Some(_))
-                if self
-                    .io
-                    .metadata(&self.io.target().socket_path())
-                    .is_ok_and(|s| s.is_none())
-                    && self
-                        .io
-                        .metadata(&self.io.target().runtime_dir().join("bootstrap.json"))
-                        .is_ok_and(|s| s.is_none()) =>
-            {
-                Ok(())
-            }
-            _ => Err(PayloadError::Foreign),
-        }
+        self.io
+            .dead_runtime()
+            .map(|_| ())
+            .map_err(|_| PayloadError::Foreign)
     }
     fn current_instance(&self, deadline: &Deadline) -> Result<Option<u64>> {
         if self
@@ -1051,6 +1039,9 @@ impl PayloadInstaller {
             .metadata(&self.io.target().runtime_dir().join("bootstrap.json"))?
             .is_some()
         {
+            if self.io.dead_runtime().is_ok_and(|state| state.is_some()) {
+                return Ok(None);
+            }
             Ok(Some(self.io.bootstrap(deadline)?.0.instance_id))
         } else {
             self.fresh_absence()?;
@@ -1176,6 +1167,11 @@ impl PayloadInstaller {
         Ok(PayloadPlan {
             generation,
             resuming: false,
+            dead_runtime: if items[0].old.is_none() {
+                self.io.dead_runtime()?
+            } else {
+                None
+            },
             journal: Journal {
                 receipt: InstallReceipt {
                     schema_version: 1,
@@ -1207,6 +1203,13 @@ impl PayloadInstaller {
             return Err(PayloadError::Pending);
         }
         Ok(PayloadPlan {
+            dead_runtime: if journal.items[0].old.is_none() {
+                // Reading an interrupted journal grants no cleanup authority. Apply revalidates
+                // absence or exact dead state under the lock before any publication.
+                self.io.dead_runtime().ok().flatten()
+            } else {
+                None
+            },
             journal,
             generation,
             resuming: true,
@@ -1406,7 +1409,7 @@ impl PayloadInstaller {
         let lockpath = self.state.join("install.lock");
         self.parent(proof, &lockpath, true)?
             .ok_or(PayloadError::Foreign)?;
-        let _lock = self.io.lock(proof, &lockpath)?;
+        let lock = self.io.install_lease(proof)?;
         if self.generation(proof)? != plan.generation {
             return Err(PayloadError::Pending);
         }
@@ -1427,6 +1430,15 @@ impl PayloadInstaller {
             return Err(PayloadError::Pending);
         }
         self.recheck(proof, &plan.journal, plan.resuming)?;
+        if plan.journal.items[0].old.is_none() {
+            if self.io.dead_runtime()? != plan.dead_runtime {
+                return Err(PayloadError::Foreign);
+            }
+            if let Some(dead) = &plan.dead_runtime {
+                self.io.clean_dead_runtime(proof, dead, &lock)?;
+            }
+            self.fresh_absence()?;
+        }
         let mut journal = plan.journal;
         if let Some(clean) = clean {
             clean.revalidate_for(&self.io, deadline)?;

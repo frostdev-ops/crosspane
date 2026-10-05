@@ -293,7 +293,7 @@ pub fn parse_rules(bytes: &[u8], ipv6: bool) -> Inspection<RuleInventory> {
                 None
             };
             match actual.and_then(|actual| parse_rule(tuple, actual, ipv6).ok()) {
-                Some(Some(rule)) if inventory.rules.len() < 256 => inventory.rules.push(rule),
+                Some(Some(rule)) if inventory.rules.len() < 4096 => inventory.rules.push(rule),
                 Some(None) => (),
                 _ => inventory.uncertain = true,
             }
@@ -447,7 +447,7 @@ fn json(bytes: &[u8]) -> Inspection<Vec<serde_json::Value>> {
     let value: serde_json::Value = serde_json::from_str(text(bytes, MAX_FIREWALL_COMMAND_BYTES)?)
         .map_err(|_| InspectionIssue::Malformed)?;
     let list = value.as_array().ok_or(InspectionIssue::Malformed)?;
-    if list.len() > 256 {
+    if list.len() > 4096 {
         return Err(InspectionIssue::Oversize);
     }
     Ok(list.clone())
@@ -463,8 +463,10 @@ pub fn parse_links(addresses: &[u8], default4: &[u8], default6: &[u8]) -> Inspec
     let routes: Vec<_> = json(default4)?.into_iter().chain(json(default6)?).collect();
     let mut defaults = Vec::new();
     for route in routes {
-        if route.get("dst").and_then(|v| v.as_str()) != Some("default") {
-            return Err(InspectionIssue::Malformed);
+        match route.get("dst").and_then(|v| v.as_str()) {
+            Some("default") => {}
+            Some(_) => continue,
+            None => return Err(InspectionIssue::Malformed),
         }
         let dev = route
             .get("dev")
@@ -475,6 +477,14 @@ pub fn parse_links(addresses: &[u8], default4: &[u8], default6: &[u8]) -> Inspec
     }
     let mut links = Vec::new();
     for link in json(addresses)? {
+        if link
+            .get("link_type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|kind| kind != "ether")
+            || link.get("linkinfo").is_some_and(|v| !v.is_null())
+        {
+            continue;
+        }
         let interface = link
             .get("ifname")
             .and_then(|v| v.as_str())
@@ -522,7 +532,7 @@ pub fn parse_links(addresses: &[u8], default4: &[u8], default6: &[u8]) -> Inspec
             if !links.contains(&row) {
                 links.push(row);
             }
-            if links.len() > 64 {
+            if links.len() > 1024 {
                 return Err(InspectionIssue::Oversize);
             }
         }
@@ -542,7 +552,7 @@ pub fn observe(
         .command(FirewallRead::Activity, deadline)
         .ok()
         .and_then(|o| {
-            if !o.stderr.is_empty() || o.stdout.len() > MAX_FIREWALL_COMMAND_BYTES {
+            if o.stdout.len() > MAX_FIREWALL_COMMAND_BYTES {
                 return None;
             }
             match (o.code, o.stdout.as_slice()) {
@@ -572,7 +582,7 @@ pub fn observe(
             let output = reader
                 .command(request, deadline)
                 .map_err(InspectionIssue::Unreadable)?;
-            if output.code != Some(0) || !output.stderr.is_empty() {
+            if output.code != Some(0) {
                 return Err(InspectionIssue::Malformed);
             }
             outputs.push(output.stdout);

@@ -373,21 +373,31 @@ impl Worker {
     fn support_step(&mut self, job: JobIntent) {
         match job.stage {
             JobStage::Detect => match self.proof() {
-                Ok(_) => self.emit(
+                Ok(proof) => self.emit(
                     job,
                     NativeOutcome::Detected {
                         needs_action: false,
                     },
-                    "This computer can run Crosspane.",
+                    format!(
+                        "This user session is selected. {}",
+                        proof.advisory().notes.join(" ")
+                    ),
                 ),
                 Err((unsupported, text)) => {
                     self.emit_stop(job.clone(), gate(job.stage, unsupported, text))
                 }
             },
             JobStage::Verify => match self.proof() {
-                Ok(_) => {
+                Ok(proof) => {
                     let outcome = self.verified();
-                    self.emit(job, outcome, "Support is current.");
+                    self.emit(
+                        job,
+                        outcome,
+                        format!(
+                            "This user session is current. {}",
+                            proof.advisory().notes.join(" ")
+                        ),
+                    );
                 }
                 Err((unsupported, text)) => {
                     self.emit_stop(job.clone(), gate(job.stage, unsupported, text))
@@ -706,6 +716,15 @@ impl Worker {
                         );
                         return;
                     }
+                }
+                Err(ServiceError::Native(super::super::native_io::NativeError::Unsupported)) => {
+                    let text = proof.advisory().notes.join(" ");
+                    self.emit(
+                        job,
+                        NativeOutcome::Unsupported,
+                        format!("Crosspane can't start with the observed compatibility. {text}"),
+                    );
+                    return;
                 }
                 Err(ServiceError::Foreign) => {
                     self.emit(

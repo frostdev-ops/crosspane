@@ -6,7 +6,22 @@ use clap::Parser;
 use crosspane_installer::gui::{ReviewOptions, run};
 use crosspane_ui_kit::art::BrandBytes;
 
+#[derive(Parser)]
+struct DiagnoseOptions {
+    #[arg(long)]
+    diagnose: bool,
+    #[arg(long)]
+    payload: Option<std::path::PathBuf>,
+}
 fn main() {
+    if std::env::args_os().any(|arg| arg == "--diagnose") {
+        let options = DiagnoseOptions::parse();
+        if let Err(error) = crosspane_installer::diagnose::run(options.payload) {
+            eprintln!("Crosspane Installer diagnose: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let options = ReviewOptions::parse();
     let brand = BrandBytes {
         backdrop: include_bytes!("../../crosspane-ui/assets/backdrop.png"),

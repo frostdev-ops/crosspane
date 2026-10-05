@@ -3,6 +3,9 @@
 //! Explicit scratch roots, fake GUI/signature/process observations; no real native commands.
 use crosspane_installer::agent_contract;
 use crosspane_installer::{live, view};
+#[path = "../src/platform/macos/launchd_observation.rs"]
+#[allow(dead_code)]
+mod launchd_observation;
 #[path = "../src/platform/macos/repair/test_native.rs"]
 mod native_binding;
 #[path = "../src/platform/macos/native_io.rs"]
@@ -868,7 +871,14 @@ impl Runner {
                 b"".to_vec(),
             ));
         }
-        assert_eq!(spec.max_output(), 64 * 1024);
+        assert_eq!(
+            spec.max_output(),
+            if spec.is_mutation() {
+                64 * 1024
+            } else {
+                1024 * 1024
+            }
+        );
         match spec.args()[0].as_str() {
             "print" => {
                 assert_eq!(spec.args(), &["print", &service]);

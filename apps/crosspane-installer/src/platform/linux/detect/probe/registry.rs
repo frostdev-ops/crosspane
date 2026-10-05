@@ -18,7 +18,14 @@ pub const REQUIRED_PROTOCOLS: &[(&str, u32)] = &[
     ("ext_image_copy_capture_manager_v1", 1),
     ("ext_output_image_capture_source_manager_v1", 1),
 ];
+pub const MAX_REGISTRY_GLOBALS: usize = 4096;
 fn global(interface: &str, version: u32) -> Result<(), ProbeIssue> {
+    if !REQUIRED_PROTOCOLS
+        .iter()
+        .any(|(name, _)| *name == interface)
+    {
+        return Ok(());
+    }
     logind::bounded_text(interface, 128)?;
     if interface.is_empty() || version == 0 {
         return Err(ProbeIssue::Malformed);
@@ -27,7 +34,7 @@ fn global(interface: &str, version: u32) -> Result<(), ProbeIssue> {
 }
 /// Availability only: globals are never bound and no input/capture/output object is created.
 pub fn protocols_satisfy(globals: &[(String, u32)]) -> Result<bool, ProbeIssue> {
-    if globals.len() > 256 {
+    if globals.len() > MAX_REGISTRY_GLOBALS {
         return Err(ProbeIssue::Oversize);
     }
     for (interface, version) in globals {
@@ -66,15 +73,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Registry {
                         return Err(ProbeIssue::Malformed);
                     }
                     state.bytes += interface.len() + 8;
-                    if state.globals.len() >= 256 || state.bytes > MAX_PROBE_BYTES {
+                    if state.globals.len() >= MAX_REGISTRY_GLOBALS || state.bytes > MAX_PROBE_BYTES
+                    {
                         return Err(ProbeIssue::Oversize);
                     }
                     state.globals.insert(name, (interface, version));
                 }
                 wl_registry::Event::GlobalRemove { name } => {
-                    state.globals.remove(&name).ok_or(ProbeIssue::Malformed)?;
+                    state.globals.remove(&name);
                 }
-                _ => return Err(ProbeIssue::Malformed),
+                _ => {}
             }
             Ok(())
         })();
@@ -104,14 +112,14 @@ pub(crate) fn read(stream: UnixStream, clock: CallerClock) -> Result<RegistryFac
     let _registry = connection.display().get_registry(&queue.handle(), ());
     let result = queue.roundtrip(&mut state);
     let receipt = clock();
-    if let Some(error) = state.error {
-        return Err(error);
-    }
-    result.map_err(|_| ProbeIssue::Unavailable)?;
+    let completeness = state.error.map_or_else(
+        || result.map(|_| ()).map_err(|_| ProbeIssue::Unavailable),
+        Err,
+    );
     let globals: Vec<_> = state.globals.into_values().collect();
     Ok(RegistryFacts {
         protocols: Fact {
-            value: protocols_satisfy(&globals),
+            value: completeness.and_then(|()| protocols_satisfy(&globals)),
             source: ObservationSource::Demo,
             observed_at_ms: receipt,
         },

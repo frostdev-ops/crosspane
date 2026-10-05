@@ -143,7 +143,11 @@ impl CommandSpec {
                 (
                     PathBuf::from("/bin/launchctl"),
                     args,
-                    MAX_COMMAND_BYTES,
+                    if mutation {
+                        MAX_COMMAND_BYTES
+                    } else {
+                        super::super::launchd_observation::MAX_LAUNCHD_BYTES
+                    },
                     mutation,
                 )
             }

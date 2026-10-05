@@ -71,6 +71,7 @@ pub struct ServicePlan {
     action: ServiceAction,
     before: ServiceFacts,
     previous_instance: Option<u64>,
+    dead_runtime: Option<super::native_io::DeadRuntime>,
 }
 #[derive(Debug)]
 pub struct ServiceResult {
@@ -430,14 +431,15 @@ impl LinuxService {
             "/usr/bin/systemctl".into(),
             argv,
             self.environment.clone(),
-            MAX_COMMAND_BYTES,
+            if verb == "show" {
+                super::detect::MAX_PROBE_BYTES
+            } else {
+                MAX_COMMAND_BYTES
+            },
         )?)
     }
     fn query(&self, verb: &str, deadline: &Deadline) -> Result<CommandOutput> {
         let result = self.io.run(&self.command(verb)?, deadline)?;
-        if !result.stderr.is_empty() {
-            return Err(ServiceError::Unknown);
-        }
         Ok(result)
     }
     fn properties(&self, deadline: &Deadline) -> Result<BTreeMap<String, String>> {
@@ -448,9 +450,19 @@ impl LinuxService {
         let text = std::str::from_utf8(&output.stdout).map_err(|_| ServiceError::Unknown)?;
         let mut map = BTreeMap::new();
         for line in text.lines() {
-            let (key, value) = line.split_once('=').ok_or(ServiceError::Unknown)?;
-            if !MANAGER_PROPERTIES.split(',').any(|p| p == key)
-                || value.chars().any(char::is_control)
+            let Some((key, value)) = line.split_once('=') else {
+                if MANAGER_PROPERTIES
+                    .split(',')
+                    .any(|p| line == p || line.starts_with(&format!("{p} ")))
+                {
+                    return Err(ServiceError::Unknown);
+                }
+                continue;
+            };
+            if !MANAGER_PROPERTIES.split(',').any(|p| p == key) {
+                continue;
+            }
+            if value.chars().any(char::is_control)
                 || map.insert(key.into(), canonical(key, value)).is_some()
             {
                 return Err(ServiceError::Unknown);
@@ -801,6 +813,9 @@ impl LinuxService {
         deadline: &Deadline,
     ) -> Result<ServicePlan> {
         proof.check(&self.io)?;
+        if matches!(action, ServiceAction::Start | ServiceAction::Restart) {
+            proof.check_agent_compatibility()?;
+        }
         if let Some(clean) = clean {
             if !matches!(action, ServiceAction::Start | ServiceAction::Restart) {
                 return Err(ServiceError::Foreign);
@@ -841,42 +856,26 @@ impl LinuxService {
         if action == ServiceAction::Start && previous_instance.is_some() && clean.is_none() {
             return Err(ServiceError::Foreign);
         }
-        if matches!(action, ServiceAction::Start | ServiceAction::Restart)
+        let dead_runtime = if matches!(action, ServiceAction::Start | ServiceAction::Restart)
             && previous_instance.is_none()
         {
-            self.absent_agent(deadline)?;
-        }
+            self.absent_agent(deadline)?
+        } else {
+            None
+        };
         proof.check(&self.io)?;
         *self.pending.lock().map_err(|_| ServiceError::Unknown)? = None;
         Ok(ServicePlan {
             action,
             before,
             previous_instance,
+            dead_runtime,
         })
     }
-    fn absent_agent(&self, deadline: &Deadline) -> Result<()> {
+    fn absent_agent(&self, deadline: &Deadline) -> Result<Option<super::native_io::DeadRuntime>> {
         deadline.check()?;
-        if self.io.metadata(self.io.target().runtime_dir())?.is_none() {
-            return Ok(());
-        }
-        if self
-            .io
-            .metadata(&self.io.target().runtime_dir().join("bootstrap.json"))?
-            .is_some()
-        {
-            // Stale or unmanaged progress cannot authorize a new start-capable operation.
-            return Err(if self.io.bootstrap(deadline).is_ok() {
-                ServiceError::Foreign
-            } else {
-                ServiceError::Unknown
-            });
-        }
-        if self.io.metadata(&self.io.target().socket_path())?.is_some() {
-            return Err(ServiceError::Foreign);
-        }
-        Ok(())
+        self.io.dead_runtime().map_err(|_| ServiceError::Foreign)
     }
-    /// Exactly one command per consumed plan; failures never cause an automatic resend.
     pub fn apply(
         &self,
         proof: &SupportProof,
@@ -917,7 +916,15 @@ impl LinuxService {
         if matches!(plan.action, ServiceAction::Start | ServiceAction::Restart)
             && plan.previous_instance.is_none()
         {
-            self.absent_agent(deadline)?;
+            if self.absent_agent(deadline)? != plan.dead_runtime {
+                return Err(ServiceError::Foreign);
+            }
+            if let Some(dead) = &plan.dead_runtime {
+                self.io.clean_dead_runtime(proof, dead, &lease)?;
+                if self.absent_agent(deadline)?.is_some() {
+                    return Err(ServiceError::Unknown);
+                }
+            }
         }
         proof.check(&self.io)?;
         if let Some(clean) = clean {

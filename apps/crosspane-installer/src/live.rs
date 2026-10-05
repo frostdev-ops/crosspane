@@ -376,6 +376,8 @@ pub enum CheckState {
     Failed(String),
     /// The fact couldn't be read or proved, with the issue in plain words.
     Unconfirmed(String),
+    /// Incomplete advisory evidence; the fact stays unknown and setup may continue.
+    Note(String),
 }
 
 /// One row of the support checklist shown under the "can run Crosspane" card.

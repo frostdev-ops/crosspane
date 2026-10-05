@@ -646,7 +646,7 @@ mod session_tests {
             second.check(&scratch.io).unwrap();
         }
         #[test]
-        fn every_structural_negative_and_pending_issues_no_proof() {
+        fn compatibility_is_advisory_and_session_authority_still_gates_proof() {
             let scratch = Scratch::new();
             for field in 0..15 {
                 let (env, mut p) = pass(&scratch);
@@ -726,7 +726,14 @@ mod session_tests {
                 };
                 let result = assemble_support(&scratch.io, env, p, r, &deadline());
                 assert_eq!(result.report.eligibility, expected, "{field}");
-                assert!(result.proof.is_none());
+                if matches!(field, 0..=3 | 6 | 7 | 14) {
+                    let proof = result.proof.expect("session authority is sufficient");
+                    assert_eq!(proof.advisory().eligibility, expected);
+                    assert_eq!(proof.check_agent_compatibility().is_ok(), field == 14);
+                    assert!(!proof.advisory().notes.is_empty());
+                } else {
+                    assert!(result.proof.is_none(), "{field}");
+                }
                 assert!(scratch.fake.calls.lock().unwrap().is_empty());
             }
         }
@@ -1008,9 +1015,9 @@ mod session_tests {
                 .detect(runtime(), &Deadline::new(1000, cancellation).unwrap());
             assert_eq!(
                 result.report.eligibility,
-                Eligibility::Pending(ProbeIssue::Foreign)
+                Eligibility::Pending(ProbeIssue::Unavailable)
             );
-            // Scratch system-bus admission is already Foreign; cancellation must not replace it.
+            // No session identity was observed; cancelled compatibility is not authority.
             assert_eq!(
                 result.report.installed_agent.value,
                 Err(ProbeIssue::Cancelled)
@@ -1513,10 +1520,10 @@ mod session_tests {
                 }
                 assert_eq!(decode_units(rows), Err(ProbeIssue::Malformed));
             }
-            let exact: UnitRows = (0..64)
+            let exact: UnitRows = (0..MAX_UNIT_ROWS)
                 .map(|i| row(&format!("u{i}"), &format!("/unit/u{i}")))
                 .collect();
-            assert_eq!(decode_units(exact.clone()).unwrap().len(), 64);
+            assert_eq!(decode_units(exact.clone()).unwrap().len(), MAX_UNIT_ROWS);
             let mut oversized = exact;
             oversized.push(row("extra", "/unit/extra"));
             assert_eq!(decode_units(oversized), Err(ProbeIssue::Oversize));
@@ -1533,7 +1540,11 @@ mod session_tests {
                     _ => &mut r.8,
                 };
                 *target = "x".repeat(513);
-                assert_eq!(decode_units(rows), Err(ProbeIssue::Oversize));
+                if matches!(index, 0 | 2 | 3) {
+                    assert_eq!(decode_units(rows), Err(ProbeIssue::Oversize));
+                } else {
+                    assert!(decode_units(rows).is_ok(), "unused field {index}");
+                }
             }
         }
         #[test]
@@ -1934,14 +1945,14 @@ mod session_tests {
             }
             for key in ["BindsTo", "Requires"] {
                 let mut steps = script();
-                properties(&mut steps[2]).insert(key.into(), value(vec!["x".to_string(); 65]));
+                properties(&mut steps[2])
+                    .insert(key.into(), value(vec!["x".to_string(); MAX_UNIT_ROWS + 1]));
                 steps.truncate(3);
                 assert_eq!(manager(steps).0.value, Err(ProbeIssue::Oversize));
             }
             let mut steps = script();
-            properties(&mut steps[1]).insert("Ignored".into(), value("x".repeat(MAX_PROBE_BYTES)));
-            steps.truncate(2);
-            assert_eq!(manager(steps).0.value, Err(ProbeIssue::Oversize));
+            properties(&mut steps[1]).insert("Ignored".into(), value("x".repeat(64 * 1024)));
+            assert_eq!(manager(steps).0.value.unwrap().uwsm_managed.value, Ok(true));
         }
         #[test]
         fn uwsm_instance_decoding_preserves_escaped_identity_and_all_configured_arguments() {
@@ -2001,24 +2012,21 @@ mod session_tests {
                 );
             }
             assert_eq!(
-                protocols_satisfy(&vec![("valid".into(), 1); 256]),
+                protocols_satisfy(&vec![("valid".into(), 1); MAX_REGISTRY_GLOBALS]),
                 Ok(false)
             );
             assert_eq!(
-                protocols_satisfy(&vec![("valid".into(), 1); 257]),
+                protocols_satisfy(&vec![("valid".into(), 1); MAX_REGISTRY_GLOBALS + 1]),
                 Err(ProbeIssue::Oversize)
             );
-            for entries in [
-                vec![("".into(), 1)],
-                vec![("bad\n".into(), 1)],
-                vec![("wl_seat".into(), 0)],
-            ] {
-                assert_eq!(protocols_satisfy(&entries), Err(ProbeIssue::Malformed));
-            }
             assert_eq!(
-                protocols_satisfy(&[("x".repeat(129), 1)]),
-                Err(ProbeIssue::Oversize)
+                protocols_satisfy(&[("wl_seat".into(), 0)]),
+                Err(ProbeIssue::Malformed)
             );
+            for entries in [vec![("".into(), 1)], vec![("bad\n".into(), 1)]] {
+                assert_eq!(protocols_satisfy(&entries), Ok(false));
+            }
+            assert_eq!(protocols_satisfy(&[("x".repeat(129), 1)]), Ok(false));
         }
         #[test]
         fn capture_managers_are_independently_required_at_backend_minimum_versions() {
@@ -2074,7 +2082,6 @@ mod session_tests {
                 "",
                 "0.56.0",
                 "Other 0.56.0 built from branch main",
-                "Hyprland 0.56.0",
                 "Hyprland 0.56 built from branch main",
                 "Hyprland 0.56.0.1 built from branch main",
                 "Hyprland 0.56.0-dev built from branch main",
@@ -2085,6 +2092,16 @@ mod session_tests {
                     parse_hyprland_version(value.as_bytes()),
                     Err(ProbeIssue::Malformed)
                 );
+            }
+            for header in [
+                "Hyprland 0.56.0",
+                "Hyprland v0.56.0",
+                "Hyprland version 0.56.0",
+                "Hyprland 0.56.0+abc123",
+            ] {
+                let mut bytes = header.as_bytes().to_vec();
+                bytes.extend_from_slice(b"\nunused metadata: \xff");
+                assert_eq!(parse_hyprland_version(&bytes), Ok([0, 56, 0]));
             }
             assert_eq!(parse_hyprland_version(&[0xff]), Err(ProbeIssue::Malformed));
             assert_eq!(
@@ -2288,7 +2305,7 @@ mod session_tests {
             );
             server.finish();
             assert_eq!(result.value.unwrap().protocols.value, Ok(false));
-            for variant in 0..4 {
+            for variant in 0..3 {
                 let (stream, server) = OwnedPeer::new(move |mut peer| {
                     let (_, _, body) = wl_request(&mut peer);
                     let registry = u32::from_ne_bytes(body.try_into().unwrap());
@@ -2312,7 +2329,7 @@ mod session_tests {
                 );
                 server.finish();
                 assert_eq!(
-                    result.value,
+                    result.value.unwrap().protocols.value,
                     Err(ProbeIssue::Malformed),
                     "variant {variant}"
                 );
@@ -2320,7 +2337,9 @@ mod session_tests {
         }
         #[test]
         fn registry_global_row_and_string_limits_close_owned_stream_without_binding() {
-            for (count, interface) in [(257, "valid".to_string()), (1, "x".repeat(129))] {
+            {
+                let count = (MAX_REGISTRY_GLOBALS + 1) as u32;
+                let interface = "valid".to_string();
                 let (stream, server) = OwnedPeer::new(move |mut peer| {
                     let (_, _, body) = wl_request(&mut peer);
                     let registry = u32::from_ne_bytes(body.try_into().unwrap());
@@ -2337,8 +2356,27 @@ mod session_tests {
                     clock(),
                 );
                 server.finish();
-                assert_eq!(result.value, Err(ProbeIssue::Oversize));
+                let facts = result.value.unwrap();
+                assert_eq!(facts.pid, std::process::id());
+                assert_eq!(facts.protocols.value, Err(ProbeIssue::Oversize));
             }
+        }
+        #[test]
+        fn irrelevant_registry_metadata_does_not_erase_required_protocols() {
+            let (stream, server) = registry_peer(|peer, registry| {
+                for (index, (name, version)) in REQUIRED_PROTOCOLS.iter().enumerate() {
+                    wl_global(peer, registry, index as u32 + 1, name, *version);
+                }
+                wl_global(peer, registry, 1000, &"x".repeat(129), 1);
+                wl_event(peer, registry, 1, &2000u32.to_ne_bytes());
+            });
+            let result = registry_from_stream(
+                stream,
+                &Deadline::new(500, Cancellation::default()).unwrap(),
+                clock(),
+            );
+            server.finish();
+            assert_eq!(result.value.unwrap().protocols.value, Ok(true));
         }
         #[test]
         fn manager_registry_auth_and_reads_share_deadline_cancel_without_other_socket_effects() {
@@ -3670,6 +3708,7 @@ mod session_tests {
     }
     fn runtime() -> RuntimeFacts {
         RuntimeFacts {
+            dependency_graph: known(true),
             libraries: vec![LibraryFact {
                 name: "libavcodec.so.62".into(),
                 required: true,
@@ -3794,9 +3833,7 @@ mod session_tests {
             b"ID=\"arch",
             b"ID=",
             b"ID=a/b",
-            b"ID=arch\nBROKEN",
             b"ID=\xff",
-            b"ID=arch\nA=one\0two",
         ] {
             assert_eq!(
                 parse_os_release(bytes),
@@ -3809,20 +3846,23 @@ mod session_tests {
             Err(ProbeIssue::Oversize)
         );
         assert!(parse_os_release(format!("ID={}\n", "a".repeat(65)).as_bytes()).is_err());
-        assert!(parse_os_release(format!("ID=arch\nX={}\n", "a".repeat(4097)).as_bytes()).is_err());
-        assert!(parse_os_release(format!("ID=arch\n{}=x\n", "A".repeat(129)).as_bytes()).is_err());
+        assert_eq!(
+            parse_os_release(format!("ID=arch\nX={}\n", "a".repeat(4097)).as_bytes()),
+            Ok(OsFamily::Arch)
+        );
+        assert_eq!(
+            parse_os_release(format!("ID=arch\n{}=x\n", "A".repeat(129)).as_bytes()),
+            Ok(OsFamily::Arch)
+        );
         let many = format!(
             "ID=arch\n{}",
             (0..256).map(|i| format!("X{i}=y\n")).collect::<String>()
         );
-        assert_eq!(
-            parse_os_release(many.as_bytes()),
-            Err(ProbeIssue::Malformed)
-        );
+        assert_eq!(parse_os_release(many.as_bytes()), Ok(OsFamily::Arch));
     }
 
     #[test]
-    fn os_release_rejects_broken_quotes_in_any_assignment_and_every_identifier() {
+    fn os_release_rejects_broken_consumed_identifiers_and_ignores_unrelated_assignments() {
         for assignment in [
             r#"ID_LIKE="arch "broken""#,
             r#"ID_LIKE="arch "broken"""#,
@@ -3842,9 +3882,14 @@ mod session_tests {
             "NAME=Arch\u{b}",
         ] {
             let bytes = format!("ID=arch\n{assignment}\n");
+            let malformed = assignment.starts_with("ID_LIKE=");
             assert_eq!(
                 parse_os_release(bytes.as_bytes()),
-                Err(ProbeIssue::Malformed),
+                if malformed {
+                    Err(ProbeIssue::Malformed)
+                } else {
+                    Ok(OsFamily::Arch)
+                },
                 "{assignment}"
             );
             let mut s = session();
@@ -3855,7 +3900,11 @@ mod session_tests {
             };
             assert_eq!(
                 classify(&s, &runtime()),
-                Eligibility::Pending(ProbeIssue::Malformed)
+                if malformed {
+                    Eligibility::Pending(ProbeIssue::Malformed)
+                } else {
+                    Eligibility::Supported
+                }
             );
         }
         for key in ["ID", "ID_LIKE"] {
@@ -4054,12 +4103,16 @@ ID_LIKE="arch \linux""#,
             );
         }
         // Line count stays bounded; the byte bound still applies first.
-        let filler = (0..1024).map(|i| format!("V{i}=x\n")).collect::<String>();
+        let filler = (0..MAX_ENVIRONMENT_LINES)
+            .map(|i| format!("V{i}=x\n"))
+            .collect::<String>();
         assert_eq!(
             parse_manager_environment(format!("{MANAGER}{filler}").as_bytes()),
             Err(ProbeIssue::Oversize)
         );
-        let filler = (0..1021).map(|i| format!("V{i}=x\n")).collect::<String>();
+        let filler = (0..MAX_ENVIRONMENT_LINES - 3)
+            .map(|i| format!("V{i}=x\n"))
+            .collect::<String>();
         assert!(parse_manager_environment(format!("{MANAGER}{filler}").as_bytes()).is_ok());
     }
 
@@ -5085,6 +5138,9 @@ mod runtime_tests {
         let bytes = elf(&["libconcealed.so.1"], None);
         let facts = inspect(&reader, &bytes, &[], None, &deadline());
         assert_eq!(facts.ffmpeg.value, Err(ProbeIssue::Unavailable));
+        assert_eq!(facts.opus.value, Ok(true));
+        assert_eq!(facts.xkb.value, Ok(true));
+        assert_eq!(facts.dependency_graph.value, Err(ProbeIssue::Unavailable));
         assert_eq!(
             facts.libraries[0].resolved.value,
             Err(ProbeIssue::Unavailable)
@@ -5147,7 +5203,8 @@ mod runtime_tests {
         let facts = inspect(&reader, &elf(&refs, None), &[], None, &deadline());
         assert_eq!(facts.libraries.len(), MAX_GRAPH_LIBRARIES);
         assert_eq!(reader.calls.borrow().len(), MAX_GRAPH_LIBRARIES);
-        assert_eq!(facts.opus.value, Err(ProbeIssue::Oversize));
+        assert_eq!(facts.opus.value, Ok(true));
+        assert_eq!(facts.dependency_graph.value, Err(ProbeIssue::Oversize));
     }
 
     #[test]
@@ -5296,7 +5353,7 @@ mod runtime_tests {
             let reader = Reader::fixed();
             let facts = inspect(&reader, bytes, &[], None, &super::runtime_tests::deadline());
             assert!(matches!(
-                facts.opus.value,
+                facts.dependency_graph.value,
                 Err(ProbeIssue::Malformed | ProbeIssue::Oversize)
             ));
         }

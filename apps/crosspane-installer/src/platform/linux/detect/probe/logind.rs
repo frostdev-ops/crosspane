@@ -36,7 +36,7 @@ impl Bus {
             last_receipt: 0,
         })
     }
-    // Replies are limited to 64 KiB before decoding; decoded rows/keys/strings are bounded.
+    // Replies are limited to 1 MiB before decoding; consumed rows/keys/strings stay bounded.
     pub fn call<T: DeserializeOwned + Type>(
         &mut self,
         destination: &str,
@@ -94,14 +94,12 @@ pub(crate) fn bus_issue(error: zbus::Error) -> ProbeIssue {
 }
 /// A real systemd 261 `org.freedesktop.systemd1.Service` GetAll returns 369 properties (Unit: 102,
 /// login1 Session: 29); the 64 KiB reply bound and per-key bounds still apply.
-pub const MAX_PROPERTIES: usize = 512;
+pub const MAX_PROPERTIES: usize = 4096;
 fn validate_properties(values: &Properties) -> Result<(), ProbeIssue> {
-    if values.len() > MAX_PROPERTIES || values.keys().any(|s| s.len() > 128) {
+    if values.len() > MAX_PROPERTIES {
         return Err(ProbeIssue::Oversize);
     }
-    for key in values.keys() {
-        bounded_text(key, 128)?;
-    }
+    // Only property()'s literal consumed keys feed authority. Other GetAll fields are ignored.
     Ok(())
 }
 pub(crate) fn property<T: TryFrom<OwnedValue> + Type>(

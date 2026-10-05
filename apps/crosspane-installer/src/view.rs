@@ -28,6 +28,7 @@ pub enum RowState {
     Verified,
     Failed,
     Unsupported,
+    Note,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

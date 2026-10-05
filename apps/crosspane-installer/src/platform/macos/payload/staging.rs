@@ -23,6 +23,7 @@ pub struct PayloadPlan {
     pub(super) ctl: Tree,
     pub(super) original: Option<Arc<OriginalAgent>>,
     pub(super) baseline_instance: Option<u64>,
+    pub(super) dead_runtime: Option<super::super::native_io::DeadRuntime>,
     pub(super) state: PayloadState,
     pub(super) manifest: [u8; 32],
     pub(super) target: TargetPaths,
@@ -78,7 +79,7 @@ impl MacPayload {
         search_path: &[PathBuf],
         deadline: &Deadline,
     ) -> NativeResult<CliInventory> {
-        if search_path.len() > 32 {
+        if search_path.len() > 4096 {
             return Err(NativeError::Oversize);
         }
         let selected = self.ctl();
@@ -134,6 +135,7 @@ impl MacPayload {
         }
         self.support.check(&self.io, deadline)?;
         let baseline_instance = self.bootstrap_token(deadline)?;
+        let dead_runtime = self.io.dead_runtime(deadline).ok().flatten();
         self.admit_tree(&self.io.target().paths().payload_root, true, deadline)?;
         let recovery = self.recovery(deadline)?;
         if recovery.unfinished() {
@@ -187,6 +189,7 @@ impl MacPayload {
             ctl,
             original,
             baseline_instance,
+            dead_runtime,
             state,
             manifest: self.digest,
             target: self.io.target().paths().clone(),
@@ -217,10 +220,15 @@ impl MacPayload {
         {
             return Err(NativeError::Foreign);
         }
-        if plan.state == PayloadState::Matching && plan.repair.is_none() {
+        if plan.state == PayloadState::Matching
+            && plan.repair.is_none()
+            && plan.dead_runtime.is_none()
+        {
             return Ok(None);
         }
-        if plan.app.root.is_some() {
+        if plan.app.root.is_some()
+            && !(plan.state == PayloadState::Matching && plan.repair.is_none())
+        {
             let original = plan.original.as_ref().ok_or(NativeError::Refused)?;
             clean_stop
                 .ok_or(NativeError::Refused)?
@@ -229,7 +237,14 @@ impl MacPayload {
         self.admit_tree(&self.io.target().paths().payload_root, true, deadline)?;
         // Only private bookkeeping parents/lock precede the flushed intent; no payload target yet.
         self.parents(&self.io.target().installer_dir(), deadline)?;
-        let _lock = self.io.lock(&self.support, deadline)?;
+        let lock = self.io.lock(&self.support, deadline)?;
+        if let Some(dead) = &plan.dead_runtime {
+            self.io
+                .clean_dead_runtime(&self.support, dead, &lock, deadline)?;
+        }
+        if plan.state == PayloadState::Matching && plan.repair.is_none() {
+            return Ok(None);
+        }
         let recovery = self.recovery(deadline)?;
         if recovery.unfinished() {
             return Err(NativeError::OutcomeUnknown);

@@ -318,32 +318,7 @@ pub trait Uninstaller {
 // ---- production adapters ----------------------------------------------------------------------
 
 pub fn unsupported_text(reason: UnsupportedReason) -> String {
-    match reason {
-        UnsupportedReason::OperatingSystem => {
-            "This installer supports Arch-based Linux, such as Omarchy, for now.".into()
-        }
-        UnsupportedReason::Architecture => {
-            "This processor isn't supported by this installer yet.".into()
-        }
-        UnsupportedReason::HyprlandVersion => {
-            "Crosspane needs Hyprland 0.56 or newer on this computer.".into()
-        }
-        UnsupportedReason::RequiredProtocols => {
-            "This Hyprland session doesn't offer the Wayland features Crosspane needs.".into()
-        }
-        UnsupportedReason::Uwsm => {
-            "Setup supports Hyprland sessions managed by uwsm for now. Yours isn't.".into()
-        }
-        UnsupportedReason::SessionType => {
-            "Crosspane needs a Wayland session. This one is something else.".into()
-        }
-        UnsupportedReason::VideoFeature => {
-            "The staged Crosspane build doesn't include video support.".into()
-        }
-        UnsupportedReason::RuntimeLibrary => {
-            "A library Crosspane needs isn't installed on this computer.".into()
-        }
-    }
+    detect::unsupported_text(reason)
 }
 
 pub fn pending_text(issue: ProbeIssue) -> String {
@@ -534,6 +509,9 @@ fn required_libraries(runtime: &RuntimeFacts) -> CheckState {
             "libei support hasn't been verified yet".into(),
         ));
     }
+    if let Err(issue) = runtime.dependency_graph.value {
+        parts.push(unconfirmed("the dependency graph", issue));
+    }
     let found = runtime.libraries.iter().filter(|l| l.required).count();
     worst(parts, Some(format!("{found} found")))
 }
@@ -544,6 +522,12 @@ fn bounded_name(name: &str) -> String {
 }
 
 /// One row per check, mapped from a finished detection report.
+fn advisory(state: CheckState) -> CheckState {
+    match state {
+        CheckState::Unconfirmed(issue) => CheckState::Note(format!("{issue}; setup can continue")),
+        other => other,
+    }
+}
 pub fn support_checks(report: &SupportReport) -> Vec<SupportCheck> {
     let session = &report.session;
     let os = match &session.os.value {
@@ -572,14 +556,14 @@ pub fn support_checks(report: &SupportReport) -> Vec<SupportCheck> {
         Err(issue) => unconfirmed("the Hyprland version", issue),
     };
     let states = [
-        os,
-        processor,
-        hyprland,
-        yes_no(
+        advisory(os),
+        advisory(processor),
+        advisory(hyprland),
+        advisory(yes_no(
             &session.protocols,
             "Hyprland's Wayland protocols",
             UnsupportedReason::RequiredProtocols,
-        ),
+        )),
         yes_no(
             &session.uwsm_managed,
             "how this session is managed",
@@ -587,12 +571,12 @@ pub fn support_checks(report: &SupportReport) -> Vec<SupportCheck> {
         ),
         graphical_session_active(report),
         signed_in_session(report),
-        required_libraries(&report.runtime),
-        yes_no(
+        advisory(required_libraries(&report.runtime)),
+        advisory(yes_no(
             &report.runtime.video_feature,
             "the staged payload's features",
             UnsupportedReason::VideoFeature,
-        ),
+        )),
     ];
     LINUX_CHECKS
         .iter()
@@ -619,11 +603,16 @@ pub struct NativeSupport {
 }
 
 impl NativeSupport {
-    fn runtime_facts(&self, package: Option<&Package>, deadline: &Deadline) -> RuntimeFacts {
+    pub(super) fn runtime_facts(
+        &self,
+        package: Option<&Package>,
+        deadline: &Deadline,
+    ) -> RuntimeFacts {
         let source = self.io.target().source();
         let now = (self.clock)();
         let unverified = || detect::Fact::issue(ProbeIssue::Unverified, source, now);
         let empty = RuntimeFacts {
+            dependency_graph: unverified(),
             libraries: Vec::new(),
             video_feature: unverified(),
             ffmpeg: unverified(),
@@ -686,15 +675,25 @@ impl Support for NativeSupport {
             };
         let runtime = self.runtime_facts(package, deadline);
         let result = probes.detect(runtime, deadline);
-        self.checks.publish(support_checks(&result.report));
+        let mut rows = support_checks(&result.report);
+        let font = detect::fonts::discover(&self.io, &self.env, deadline);
+        rows.push(SupportCheck::new("System font", match font {
+            Ok(_) => CheckState::Passed(None),
+            Err(_) => CheckState::Note("A system font couldn't be confirmed; setup can continue with the font already loaded".into()),
+        }));
+        match self.io.dead_runtime() {
+            Ok(Some(_)) => rows.push(SupportCheck::new("Stopped Crosspane runtime", CheckState::Note("The owned dead runtime will be cleaned under the install lock when you install".into()))),
+            Err(_) => rows.push(SupportCheck::new("Crosspane runtime", CheckState::Unconfirmed("Runtime state is active or couldn't be proved safe to recover; it will be retained".into()))),
+            Ok(None) => {},
+        }
+        self.checks.publish(rows);
+        if let Some(proof) = result.proof {
+            return SupportOutcome::Supported(proof);
+        }
         match result.report.eligibility {
-            Eligibility::Supported => match result.proof {
-                Some(proof) => SupportOutcome::Supported(proof),
-                None => SupportOutcome::Pending(
-                    "Support was observed but couldn't be admitted. Nothing will be changed."
-                        .into(),
-                ),
-            },
+            Eligibility::Supported => SupportOutcome::Pending(
+                "Support was observed but couldn't be admitted. Nothing will be changed.".into(),
+            ),
             Eligibility::NotSupported(reason) => SupportOutcome::NotSupported(format!(
                 "Not supported yet. {} Nothing will be changed.",
                 unsupported_text(reason)
@@ -845,7 +844,7 @@ impl Services for NativeServices {
             .map_err(|_| ServiceError::Unknown)?;
         let service = LinuxService::new(
             self.io.clone(),
-            super::session_of(&self.env),
+            super::manager_session_of(self.env.values()),
             resources,
             deadline,
         )?;
@@ -863,6 +862,11 @@ impl Services for NativeServices {
         action: ServiceAction,
         deadline: &Deadline,
     ) -> Result<ServiceResult, ServiceError> {
+        if matches!(action, ServiceAction::Start | ServiceAction::Restart) {
+            proof
+                .check_agent_compatibility()
+                .map_err(ServiceError::Native)?;
+        }
         let service = self.bound()?.clone();
         let plan = service.plan(proof, action, deadline)?;
         service.apply(proof, plan, deadline)
@@ -1221,6 +1225,7 @@ mod checklist_tests {
         };
         let unverified = || Fact::issue(ProbeIssue::Unverified, LIVE, 1);
         let runtime = RuntimeFacts {
+            dependency_graph: ok(true),
             libraries: vec![library("libopus.so.0"), library("libxkbcommon.so.0")],
             video_feature: ok(true),
             ffmpeg: ok(true),
@@ -1420,7 +1425,9 @@ mod checklist_tests {
             assert_eq!(rows.len(), 1, "{label}: {rows:?}");
             assert_eq!(rows[0].0, label);
             match &rows[0].1 {
-                CheckState::Unconfirmed(text) => assert!(text.contains(issue), "{label}: {text}"),
+                CheckState::Unconfirmed(text) | CheckState::Note(text) => {
+                    assert!(text.contains(issue), "{label}: {text}")
+                }
                 other => panic!("{label}: {other:?}"),
             }
         }
@@ -1431,6 +1438,7 @@ mod checklist_tests {
         let mut report = supported();
         let unverified = || Fact::issue(ProbeIssue::Unverified, LIVE, 1);
         report.runtime = RuntimeFacts {
+            dependency_graph: unverified(),
             libraries: Vec::new(),
             video_feature: unverified(),
             ffmpeg: unverified(),

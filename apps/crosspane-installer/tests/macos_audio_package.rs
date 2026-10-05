@@ -6,6 +6,9 @@ use crosspane_installer::agent_contract;
 #[path = "../src/platform/macos/audio_package.rs"]
 #[allow(dead_code)]
 mod audio_package;
+#[path = "../src/platform/macos/launchd_observation.rs"]
+#[allow(dead_code)]
+mod launchd_observation;
 #[path = "../src/platform/macos/native_io.rs"]
 #[allow(dead_code, unused_imports)]
 mod native_io;

@@ -2,6 +2,9 @@
 #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
 //! Explicit scratch roots, fake GUI/signature/process observations; no real native commands.
 use crosspane_installer::agent_contract;
+#[path = "../src/platform/macos/launchd_observation.rs"]
+#[allow(dead_code)]
+mod launchd_observation;
 #[path = "../src/platform/macos/native_io.rs"]
 #[allow(dead_code, unused_imports)]
 mod native_io;
@@ -710,6 +713,7 @@ impl Fixture {
 #[derive(Default)]
 struct Behavior {
     job_pid: u32,
+    loaded_stopped: bool,
     disabled: u8,
     bootstrap: u8,
     bootout: u8,
@@ -766,7 +770,14 @@ impl Runner {
                 b"".to_vec(),
             ));
         }
-        assert_eq!(spec.max_output(), 64 * 1024);
+        assert_eq!(
+            spec.max_output(),
+            if spec.is_mutation() {
+                64 * 1024
+            } else {
+                1024 * 1024
+            }
+        );
         match spec.args()[0].as_str() {
             "print" => {
                 assert_eq!(spec.args(), &["print", &service]);
@@ -774,7 +785,18 @@ impl Runner {
                 if let Some(value) = &b.print_override {
                     return Ok(value.clone());
                 }
-                Ok(if b.job_pid == 0 {
+                Ok(if b.loaded_stopped {
+                    output(
+                        0,
+                        format!(
+                            "{service} = {{\n path = {}\n program = {}\n state = not running\n}}\n",
+                            plist.display(),
+                            self.exe.display()
+                        )
+                        .into_bytes(),
+                        vec![],
+                    )
+                } else if b.job_pid == 0 {
                     output(
                         113,
                         vec![],
@@ -828,6 +850,7 @@ impl Runner {
                 }
                 if b.bootout != 1 {
                     b.job_pid = 0;
+                    b.loaded_stopped = false;
                     self.stopped.store(true, Ordering::Release);
                     if b.bootout != 2 {
                         let original =
@@ -865,6 +888,7 @@ impl Runner {
                     parse_bootstrap(&read_owned(&runtime.join("bootstrap.json"))).unwrap();
                 let next = previous.instance_id + 1;
                 b.job_pid = previous.pid + 1;
+                b.loaded_stopped = false;
                 self.pid.store(u64::from(b.job_pid), Ordering::Release);
                 self.stopped.store(false, Ordering::Release);
                 let phase = if b.bootstrap == 4 {
@@ -1923,7 +1947,7 @@ fn nested_duplicate_or_unbalanced_job_fields_never_admit_an_actionable_service()
                 &f.deadline(),
             )
             .unwrap();
-        if case == 11 {
+        if matches!(case, 3 | 7 | 8 | 9 | 11) {
             assert_eq!(plan.state(), LaunchState::AdoptionRequired);
             assert!(plan.consent(1, 1, true, true).is_ok());
         } else {
@@ -1952,8 +1976,12 @@ fn whole_disabled_key_requires_supported_quoting_and_cannot_hide_selected_disabl
         ));
         let mut a = adapter(&f, Approval::Unknown);
         let plan = a.plan(1, 1, None, &f.deadline()).unwrap();
-        assert_eq!(plan.state(), LaunchState::Unobservable, "{key}");
-        assert!(plan.consent(1, 1, true, true).is_err());
+        if key.contains(AGENT_LABEL) {
+            assert_eq!(plan.state(), LaunchState::Unobservable, "{key}");
+            assert!(plan.consent(1, 1, true, true).is_err());
+        } else {
+            assert_eq!(plan.state(), LaunchState::Absent, "unrelated {key}");
+        }
         assert_eq!(f.runner.count("bootstrap"), 0);
         assert!(!f.home.join("Applications").exists());
     }
@@ -2805,4 +2833,111 @@ fn matching_prebootstrap_helper_refusal_preserves_published_receipt_without_any_
     ))
     .unwrap();
     assert_eq!(payload["phase"], "Verified");
+}
+
+#[test]
+fn owned_loaded_stopped_job_recovers_only_a_matching_payload() {
+    let f = Fixture::new(false);
+    let mut first = adapter(&f, Approval::Allowed);
+    let mut pending = execute_new(&f, &mut first);
+    assert!(
+        finish(&f, &first, &mut pending, 2, 1)
+            .payload_verified
+            .is_some()
+    );
+    f.runner.behavior.lock().unwrap().loaded_stopped = true;
+    f.runner.stopped.store(true, Ordering::Release);
+    let original = f.io.metadata(&f.io.target().agent_path()).unwrap();
+    let mut a = adapter(&f, Approval::Allowed);
+    let plan = a.plan(2, 2, None, &f.deadline()).unwrap();
+    assert_eq!(plan.state(), LaunchState::LoadedStopped);
+    assert!(!plan.interrupts_agent());
+    let consent = plan.consent(2, 2, false, false).unwrap();
+    let pending = a.execute(plan, consent, &f.deadline()).unwrap();
+    assert_eq!(pending.error(), None);
+    assert_eq!(f.runner.count("bootout"), 1);
+    assert_eq!(f.runner.count("bootstrap"), 2);
+    assert_eq!(
+        f.io.metadata(&f.io.target().agent_path()).unwrap(),
+        original
+    );
+}
+#[test]
+fn loaded_stopped_job_cannot_authorize_payload_replacement() {
+    let f = Fixture::new(false);
+    let mut first = adapter(&f, Approval::Allowed);
+    let mut pending = execute_new(&f, &mut first);
+    finish(&f, &first, &mut pending, 2, 1);
+    f.runner.behavior.lock().unwrap().loaded_stopped = true;
+    f.runner.stopped.store(true, Ordering::Release);
+    bytes(
+        &f.home.join(".local/bin/crosspanectl"),
+        &macho(false, 2),
+        0o755,
+    );
+    let original = read_owned(&f.home.join(".local/bin/crosspanectl"));
+    let mut a = adapter(&f, Approval::Allowed);
+    assert!(matches!(
+        a.plan(2, 2, None, &f.deadline()),
+        Err(NativeError::Refused)
+    ));
+    assert_eq!(f.runner.count("bootout"), 0);
+    assert_eq!(f.runner.count("bootstrap"), 1);
+    assert_eq!(
+        read_owned(&f.home.join(".local/bin/crosspanectl")),
+        original
+    );
+}
+#[test]
+fn loaded_stopped_job_change_before_bootout_refuses() {
+    let f = Fixture::new(false);
+    let mut first = adapter(&f, Approval::Allowed);
+    let mut pending = execute_new(&f, &mut first);
+    finish(&f, &first, &mut pending, 2, 1);
+    f.runner.behavior.lock().unwrap().loaded_stopped = true;
+    f.runner.stopped.store(true, Ordering::Release);
+    let mut a = adapter(&f, Approval::Allowed);
+    let plan = a.plan(2, 2, None, &f.deadline()).unwrap();
+    let consent = plan.consent(2, 2, false, false).unwrap();
+    f.runner.behavior.lock().unwrap().loaded_stopped = false;
+    assert!(matches!(
+        a.execute(plan, consent, &f.deadline()),
+        Err(NativeError::Foreign)
+    ));
+    assert_eq!(f.runner.count("bootout"), 0);
+    assert_eq!(f.runner.count("bootstrap"), 1);
+}
+
+#[test]
+fn loaded_stopped_job_change_under_install_lock_refuses_before_bootout() {
+    let f = Fixture::new(false);
+    let mut first = adapter(&f, Approval::Allowed);
+    let mut pending = execute_new(&f, &mut first);
+    finish(&f, &first, &mut pending, 2, 1);
+    f.runner.behavior.lock().unwrap().loaded_stopped = true;
+    f.runner.stopped.store(true, Ordering::Release);
+    let locks = Arc::new(AtomicU64::new(0));
+    let observed_locks = locks.clone();
+    let runner = f.runner.clone();
+    let io = f.hooked(Arc::new(move |stage, _, identity| {
+        // Execute first persists the consent intent. Change the selected job when
+        // recovery takes its second lease, after the unlocked observation.
+        if stage == "lock" && observed_locks.fetch_add(1, Ordering::AcqRel) == 1 {
+            runner.behavior.lock().unwrap().loaded_stopped = false;
+        }
+        Ok(identity)
+    }));
+    let mut a = MacLaunchAgent::admit(
+        io,
+        inventory(),
+        Arc::new(ApprovalFixture(Approval::Allowed)),
+        &f.deadline(),
+    )
+    .unwrap();
+    let plan = a.plan(2, 2, None, &f.deadline()).unwrap();
+    let consent = plan.consent(2, 2, false, false).unwrap();
+    let pending = a.execute(plan, consent, &f.deadline()).unwrap();
+    assert_eq!(pending.error(), Some(NativeError::Foreign));
+    assert_eq!(f.runner.count("bootout"), 0);
+    assert_eq!(f.runner.count("bootstrap"), 1);
 }

@@ -6,18 +6,37 @@ pub struct HyprlandFacts {
     pub version: Fact<[u16; 3]>,
     pub pid: u32,
 }
-/// Parses the actual normal `/version` response; malformed/unknown versions remain pending.
+/// Reads the version token in the known header; unrelated build metadata is advisory.
 pub fn parse_hyprland_version(bytes: &[u8]) -> Result<[u16; 3], ProbeIssue> {
     if bytes.len() > MAX_PROBE_BYTES {
         return Err(ProbeIssue::Oversize);
     }
-    let text = std::str::from_utf8(bytes).map_err(|_| ProbeIssue::Malformed)?;
-    let header = text.lines().next().ok_or(ProbeIssue::Malformed)?;
-    let version = header
-        .strip_prefix("Hyprland ")
-        .and_then(|s| s.split_once(" built from branch "))
-        .map(|v| v.0)
+    let header = bytes
+        .split(|b| *b == b'\n')
+        .next()
         .ok_or(ProbeIssue::Malformed)?;
+    let header = std::str::from_utf8(header).map_err(|_| ProbeIssue::Malformed)?;
+    let tail = header
+        .strip_prefix("Hyprland version ")
+        .or_else(|| header.strip_prefix("Hyprland "))
+        .ok_or(ProbeIssue::Malformed)?;
+    let token = tail
+        .split_ascii_whitespace()
+        .next()
+        .ok_or(ProbeIssue::Malformed)?;
+    let token = token.strip_prefix('v').unwrap_or(token);
+    let version = if let Some((version, metadata)) = token.split_once('+') {
+        if metadata.is_empty()
+            || !metadata
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        {
+            return Err(ProbeIssue::Malformed);
+        }
+        version
+    } else {
+        token
+    };
     let mut parts = version.split('.');
     let mut result = [0; 3];
     for value in &mut result {

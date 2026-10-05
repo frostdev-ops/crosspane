@@ -507,7 +507,11 @@ impl Fixture {
             "/usr/bin/systemctl".into(),
             argv,
             self.environment(),
-            MAX_COMMAND_BYTES,
+            if verb == "show" {
+                crosspane_installer::platform::linux::detect::MAX_PROBE_BYTES
+            } else {
+                MAX_COMMAND_BYTES
+            },
         )
         .unwrap()
     }
@@ -970,18 +974,22 @@ fn systemd_261_tolerances_never_admit_other_values_or_absent_scalars() {
         );
         assert_eq!(f.mutations(), 0);
     }
-    // Unknown keys and duplicates still refuse.
+    // Unrelated properties are ignored; duplicate consumed authority stays unknown.
     for extra in ["Foreign=x\n", "Type=simple\n"] {
         let f = Fixture::new("");
         systemd_261(&f);
         let mut stdout = shown_properties(&f.runner.properties.lock().unwrap(), true);
         stdout.extend_from_slice(extra.as_bytes());
         *f.runner.failure.lock().unwrap() = Some((Some(0), stdout, vec![]));
-        assert_eq!(
-            f.service().observe(&deadline()).unwrap_err(),
-            ServiceError::Unknown,
-            "{extra}"
-        );
+        if extra.starts_with("Foreign") {
+            assert!(f.service().observe(&deadline()).is_ok());
+        } else {
+            assert_eq!(
+                f.service().observe(&deadline()).unwrap_err(),
+                ServiceError::Unknown,
+                "{extra}"
+            );
+        }
     }
 }
 
@@ -1607,7 +1615,7 @@ fn stale_or_unmanaged_bootstrap_and_expired_proof_block_fresh_start() {
     fs::write(path, serde_json::to_vec(&bootstrap).unwrap()).unwrap();
     assert!(matches!(
         service.plan(&f.proof(), ServiceAction::Start, &deadline()),
-        Err(ServiceError::Unknown)
+        Err(ServiceError::Foreign)
     ));
     let proof = f.proof();
     let plan = service
@@ -1914,4 +1922,86 @@ fn outstanding_manager_operation_retains_payload_lease_until_fake_child_finishes
     assert!(f.runner.calls.lock().unwrap().len() > queries);
     drop(plan);
     assert_eq!(f.mutations(), 1);
+}
+
+fn dead_service_runtime(f: &Fixture) {
+    f.bootstrap(9, "ready");
+    let path = f.io.target().runtime_dir().join("bootstrap.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["pid"] = json!(i32::MAX as u32);
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let listener = UnixListener::bind(f.io.target().socket_path()).unwrap();
+    fs::set_permissions(
+        f.io.target().socket_path(),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    drop(listener);
+}
+#[test]
+fn fresh_service_start_recovers_only_exact_dead_state_under_the_install_lease() {
+    let f = Fixture::new("-dead");
+    dead_service_runtime(&f);
+    let proof = f.proof();
+    let service = f.service();
+    let plan = service
+        .plan(&proof, ServiceAction::Start, &deadline())
+        .unwrap();
+    assert!(f.io.target().socket_path().exists());
+    assert!(f.io.target().runtime_dir().join("bootstrap.json").exists());
+    let result = service.apply(&proof, plan, &deadline()).unwrap();
+    assert_eq!(result.outcome, MutationOutcome::Unknown);
+    assert_eq!(f.mutations(), 1);
+    assert!(!f.io.target().socket_path().exists());
+    assert!(!f.io.target().runtime_dir().join("bootstrap.json").exists());
+}
+#[test]
+fn service_start_retains_changed_or_foreign_runtime_without_dispatching() {
+    for variant in 0..3 {
+        let f = Fixture::new("-runtime-race");
+        dead_service_runtime(&f);
+        let proof = f.proof();
+        let service = f.service();
+        let plan = service
+            .plan(&proof, ServiceAction::Start, &deadline())
+            .unwrap();
+        match variant {
+            0 => {
+                fs::remove_file(f.io.target().socket_path()).unwrap();
+                let listener = UnixListener::bind(f.io.target().socket_path()).unwrap();
+                fs::set_permissions(
+                    f.io.target().socket_path(),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+                drop(listener);
+            }
+            1 => fs::write(f.io.target().runtime_dir().join("foreign"), b"foreign").unwrap(),
+            _ => {
+                let path = f.io.target().runtime_dir().join("bootstrap.json");
+                let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                value["pid"] = json!(std::process::id());
+                fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+        }
+        assert!(service.apply(&proof, plan, &deadline()).is_err());
+        assert_eq!(f.mutations(), 0);
+        assert!(f.io.target().socket_path().exists());
+        assert!(f.io.target().runtime_dir().join("bootstrap.json").exists());
+    }
+}
+#[test]
+fn successful_systemd_warnings_and_large_irrelevant_fields_preserve_exact_authority() {
+    let f = Fixture::new("-show-note");
+    let mut stdout = shown_properties(&f.runner.properties.lock().unwrap(), true);
+    stdout.extend_from_slice(
+        format!(
+            "FutureProperty={}\nFutureProperty=duplicate\nunrelated annotation\n",
+            "x".repeat(100_000)
+        )
+        .as_bytes(),
+    );
+    *f.runner.failure.lock().unwrap() = Some((Some(0), stdout, b"informational warning".to_vec()));
+    assert!(f.service().observe(&deadline()).is_ok());
+    assert_eq!(f.mutations(), 0);
 }

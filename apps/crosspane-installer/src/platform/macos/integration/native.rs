@@ -112,7 +112,7 @@ impl NativeEnv {
         }
     }
 
-    fn io(&self) -> NativeResult<Arc<MacNativeIo>> {
+    pub(super) fn io(&self) -> NativeResult<Arc<MacNativeIo>> {
         MacNativeIo::new(
             self.target.clone(),
             self.probes.runner.clone(),
@@ -245,7 +245,8 @@ impl NativeSupport {
                 "Crosspane {}",
                 self.env.inventory.product_version
             )));
-            io.admit_support(&main, deadline)?;
+            io.admit_support(&main, deadline)?
+                .check_agent_compatibility()?;
             Ok::<_, NativeError>(io.target().source())
         })();
         (Some(io), attempt)
@@ -260,7 +261,7 @@ impl Support for NativeSupport {
         let (io, attempt) = self.admit(deadline, &mut build);
         // The checklist only: admitted support proves every fact; otherwise one more read-only
         // observation says which fact stood in the way. It never changes the outcome below.
-        let checks = match (&io, &attempt) {
+        let mut checks = match (&io, &attempt) {
             (Some(io), result) => {
                 let paths = io.target().paths();
                 let location = CheckState::Passed(Some("inside your home folder".into()));
@@ -296,6 +297,19 @@ impl Support for NativeSupport {
             ),
             (None, Ok(_)) => Vec::new(),
         };
+        if let Some(io) = &io
+            && io.target().source() == ObservationSource::Live
+        {
+            // Source-included scratch harnesses do not provide or read host fonts.
+            #[cfg(not(test))]
+            checks.push(SupportCheck::new("System font", match super::super::fonts::discover_system_font() {
+                Ok(_) => CheckState::Passed(None),
+                Err(_) => CheckState::Note("A system font couldn't be confirmed; setup can continue with the font already loaded".into()),
+            }));
+            if io.dead_runtime(deadline).is_ok_and(|state| state.is_some()) {
+                checks.push(SupportCheck::new("Stopped Crosspane runtime", CheckState::Note("The owned dead runtime will be cleaned under the install lock when you install".into())));
+            }
+        }
         self.checks.publish(checks);
         match attempt {
             Ok(source) => SupportOutcome::Supported(source),
@@ -360,7 +374,7 @@ fn blocker(state: LaunchState) -> Option<InstallError> {
         LaunchState::Conflict | LaunchState::AdoptionRequired => Some(InstallError::Foreign),
         LaunchState::UserDisabled => Some(InstallError::UserDisabled),
         LaunchState::Unobservable => Some(InstallError::Unobservable),
-        LaunchState::Absent | LaunchState::Owned => None,
+        LaunchState::Absent | LaunchState::Owned | LaunchState::LoadedStopped => None,
     }
 }
 
@@ -953,7 +967,7 @@ impl RemovalCurrentReader for NativeReader {
 /// A fresh Status from the running agent, through a port admitted just for this read. The call
 /// ids come from `ids` and only ever increase, so the coordinators' monotonic receipts accept
 /// each read after the one before it.
-fn read_status(
+pub(super) fn read_status(
     env: &NativeEnv,
     ids: &AtomicU64,
     deadline: &Deadline,

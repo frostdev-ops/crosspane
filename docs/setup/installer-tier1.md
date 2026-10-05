@@ -121,3 +121,36 @@ your home folder". Gatekeeper may require the normal user approval for this loca
 these scripts never bypass it or change TCC, launch agents, the keychain, or audio devices.
 The package test regenerates and compares the inventory, checks its exact bytes in the outer
 binary (absent from the bootstrap), checks all hashes/modes and verifies the nested code signature.
+
+
+## Installer strictness gate (WP-4.29)
+
+Before each installer merge, build the new diagnostic binary in the disposable worktree, then run
+`scripts/installer/real-check.sh` against the existing staged payloads. The Linux diagnostic is the
+approved read-only real-session exception to the masked implementation environment:
+
+```sh
+scripts/lead/impl-env.sh env CARGO_BUILD_JOBS=4 cargo build -p crosspane-installer --locked
+scripts/installer/real-check.sh --mac-payload /absolute/path/on/the/Mac/to/Contents/Resources/payload
+```
+
+The script defaults to `target/debug/crosspane-installer` and `~/installer-builds/linux-tier1` on
+Linux. Set `--linux-installer` or `--linux-payload` to select other prepared inputs. On the Mac it
+uses the WP-4.29 mirror, with `nice -n 20 taskpolicy -b` and one cargo invocation; pass
+`--mac-installer` to use an already built diagnostic binary instead. The Mac payload must already
+exist. Run this gate after other Mac cargo commands finish. `--linux-only` is a local diagnostic
+shortcut; the before-merge gate covers both machines.
+
+Each `--diagnose` report includes support/session/runtime/font evidence, owned payload state,
+service or LaunchAgent state, and matched agent Status. It starts no GUI, sends only read-only
+queries, and never installs, starts, stops, cleans, authorizes, or changes settings. Reports go to
+`target/installer-real-check/{linux,macos}.json`. An S issue remains a safety refusal; an E issue is
+a visible evidence note; exact dead-runtime recovery is R and observation alone never cleans it.
+The script fails on an E hard stop and summarizes S stops separately. Unknown evidence is never
+reported as ready. Known incompatibility still prevents the affected startup/tutorial action.
+
+A Mac development binary without an embedded approved inventory reports the signature-bound
+payload and agent observations as S/unknown. For full signed-payload coverage, use a newly staged
+installer containing the approved inventory with `--mac-installer`; the runtime payload cannot
+supply or replace that trust root. Font failure is E in the report. The GUI still needs at least one
+safe, parsable system font to draw its notes.

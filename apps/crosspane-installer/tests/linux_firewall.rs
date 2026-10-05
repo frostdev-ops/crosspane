@@ -3793,3 +3793,36 @@ mod current_tests {
         }
     }
 }
+
+#[test]
+fn large_network_observation_ignores_unrelated_virtual_metadata_and_nondefault_routes() {
+    let mut rows = vec![
+        json!({"link_type":"loopback","unfamiliar":true}),
+        json!({"linkinfo":{"info_kind":"veth"},"ifname":"virtual@other"}),
+    ];
+    rows.extend((0..400).map(|i| link(&format!("eth{i}"), "192.168.4.1", 24)));
+    let links = parse_links(
+        &links_bytes(rows),
+        br#"[{"dst":"192.168.0.0/16","future":true},{"dst":"default","dev":"eth0"}]"#,
+        b"[]",
+    )
+    .unwrap();
+    assert_eq!(links.len(), 400);
+    assert!(links[0].default_route);
+    assert!(
+        parse_links(
+            &links_bytes(vec![link("eth0", "192.168.4.1", 24); 4097]),
+            b"[]",
+            b"[]"
+        )
+        .is_err()
+    );
+    assert!(
+        parse_links(
+            &links_bytes(vec![link("eth0", "192.168.4.1", 24)]),
+            br#"[{"dst":"default","dev":null}]"#,
+            b"[]"
+        )
+        .is_err()
+    );
+}

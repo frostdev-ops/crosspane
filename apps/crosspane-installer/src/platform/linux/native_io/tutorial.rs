@@ -114,6 +114,7 @@ impl LinuxNativeIo {
     ) -> Result<TutorialCommand> {
         deadline.check()?;
         proof.check(self)?;
+        proof.check_agent_compatibility()?;
         self.validate_target()?;
         if environment.nonce != self.target.nonce
             || environment.manager.is_some()

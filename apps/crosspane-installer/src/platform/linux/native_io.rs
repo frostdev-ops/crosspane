@@ -4,6 +4,8 @@ pub use cleanup::CleanupLease;
 pub use cleanup::CleanupProof;
 pub(crate) use cleanup::RepairJournalSnapshot;
 mod removal;
+mod runtime;
+pub(crate) use runtime::DeadRuntime;
 pub mod tutorial;
 use crate::agent_contract::{BootstrapV1, InstanceStatus, ObservationSource, parse_bootstrap};
 pub use removal::{ExitReader, ProcessExit, ProcessWatch};
@@ -33,14 +35,14 @@ pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
 pub const MAX_NATIVE_TIMEOUT_MS: u64 = 120_000;
 pub const SUPPORT_LIFETIME: Duration = Duration::from_secs(5);
-pub const MAX_OS_RELEASE_BYTES: usize = 64 * 1024;
+pub const MAX_OS_RELEASE_BYTES: usize = 1024 * 1024;
 pub const MAX_FONT_BYTES: usize = 16 * 1024 * 1024;
 /// ELF bytes read for dependency metadata. Real images keep PT_DYNAMIC near their end (the release
 /// agent at ~25 MiB, libavcodec ~20 MiB, libicudata ~33 MiB), so this equals the payload member
 /// bound (`payload::MAX_MEMBER_BYTES`) rather than a small header prefix.
 pub const MAX_ELF_PREFIX_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_UFW_BYTES: usize = 1024 * 1024;
-pub const MAX_FIREWALL_COMMAND_BYTES: usize = 256 * 1024;
+pub const MAX_FIREWALL_COMMAND_BYTES: usize = 1024 * 1024;
 static READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Read-only system namespaces; ELF returns a prefix, never executes or resolves a program.
@@ -667,22 +669,42 @@ pub struct SupportObservations {
     pub seat: String,
     pub active: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionAuthority {
+    uid: u32,
+    uwsm_managed: bool,
+    graphical_target_active: bool,
+    graphical_sessions: usize,
+    session_id: String,
+    session_type: String,
+    seat: String,
+    active: bool,
+}
+impl From<&SupportObservations> for SessionAuthority {
+    fn from(facts: &SupportObservations) -> Self {
+        Self {
+            uid: facts.uid,
+            uwsm_managed: facts.uwsm_managed,
+            graphical_target_active: facts.graphical_target_active,
+            graphical_sessions: facts.graphical_sessions,
+            session_id: facts.session_id.clone(),
+            session_type: facts.session_type.clone(),
+            seat: facts.seat.clone(),
+            active: facts.active,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct SupportProof {
     nonce: u64,
     issued: Instant,
-    facts: SupportObservations,
+    facts: SessionAuthority,
     valid: Arc<AtomicBool>,
+    advisory: super::detect::CompatibilityReport,
 }
 impl SupportProof {
     pub(crate) fn admit(io: &LinuxNativeIo, facts: SupportObservations) -> Result<Self> {
         if facts.uid != io.target.paths.uid
-            || !matches!(facts.architecture.as_str(), "x86_64" | "aarch64")
-            || facts.architecture != std::env::consts::ARCH
-            || !facts.arch_based
-            || facts.hyprland_version < [0, 56, 0]
-            || !facts.protocols_ready
-            || !facts.runtime_libraries_ready
             || !facts.uwsm_managed
             || !facts.graphical_target_active
             || facts.graphical_sessions != 1
@@ -698,17 +720,37 @@ impl SupportProof {
         Ok(Self {
             nonce: io.target.nonce,
             issued: Instant::now(),
-            facts,
+            facts: SessionAuthority::from(&facts),
             valid: Arc::new(AtomicBool::new(true)),
+            advisory: super::detect::CompatibilityReport::default(),
         })
     }
     pub fn revalidate(&self, io: &LinuxNativeIo, current: &SupportObservations) -> Result<()> {
         self.check(io)?;
-        if current != &self.facts {
+        if SessionAuthority::from(current) != self.facts {
             self.valid.store(false, Ordering::Release);
             return Err(NativeError::Unsupported);
         }
         io.validate_target()
+    }
+    pub(crate) fn with_advisory(mut self, report: super::detect::CompatibilityReport) -> Self {
+        self.advisory = report;
+        self
+    }
+    pub fn advisory(&self) -> &super::detect::CompatibilityReport {
+        &self.advisory
+    }
+    /// Call only at steps that need the agent's capabilities. An unknown fact remains a note;
+    /// a positive incompatibility is still a refusal and is never presented as ready.
+    pub fn check_agent_compatibility(&self) -> Result<()> {
+        if matches!(
+            self.advisory.eligibility,
+            super::detect::Eligibility::NotSupported(_)
+        ) {
+            Err(NativeError::Unsupported)
+        } else {
+            Ok(())
+        }
     }
     pub fn check(&self, io: &LinuxNativeIo) -> Result<()> {
         self.check_target(&io.target)
@@ -978,6 +1020,11 @@ impl CommandSpec {
             || output_limit
                 > if firewall_read(&executable, &argv) {
                     MAX_FIREWALL_COMMAND_BYTES
+                } else if executable == Path::new("/usr/bin/systemctl")
+                    && (argv == ["--user", "show-environment"]
+                        || argv.get(1).is_some_and(|verb| verb == "show"))
+                {
+                    super::detect::MAX_PROBE_BYTES
                 } else {
                     MAX_COMMAND_BYTES
                 }
@@ -1903,7 +1950,24 @@ impl LinuxNativeIo {
             peer_uid: std::sync::Mutex::new(None),
             read_interleave: None,
         });
-        let proof = io.scratch_support(proof.facts.clone()).unwrap();
+        let facts = &proof.facts;
+        let proof = io
+            .scratch_support(SupportObservations {
+                uid: facts.uid,
+                architecture: String::new(),
+                arch_based: false,
+                hyprland_version: [0; 3],
+                protocols_ready: false,
+                runtime_libraries_ready: false,
+                uwsm_managed: facts.uwsm_managed,
+                graphical_target_active: facts.graphical_target_active,
+                graphical_sessions: facts.graphical_sessions,
+                session_id: facts.session_id.clone(),
+                session_type: facts.session_type.clone(),
+                seat: facts.seat.clone(),
+                active: facts.active,
+            })
+            .unwrap();
         for path in [
             io.target.paths.config_home.join("crosspane"),
             io.target.paths.state_home.join("crosspane/installer"),
@@ -3331,11 +3395,11 @@ mod tests {
     fn system_read_namespaces_and_bounds_are_closed() {
         assert_eq!(
             SystemRead::OsRelease.path_and_limit().unwrap(),
-            ("/etc/os-release".into(), 65536)
+            ("/etc/os-release".into(), MAX_OS_RELEASE_BYTES)
         );
         assert_eq!(
             SystemRead::OsReleaseFallback.path_and_limit().unwrap(),
-            ("/usr/lib/os-release".into(), 65536)
+            ("/usr/lib/os-release".into(), MAX_OS_RELEASE_BYTES)
         );
         for path in [
             "/usr/share/fonts/fixture.ttf",

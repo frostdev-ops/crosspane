@@ -324,6 +324,7 @@ impl LiveController {
                         }
                         CheckState::Failed(reason) => (RowState::Failed, reason.clone()),
                         CheckState::Unconfirmed(issue) => (RowState::Waiting, issue.clone()),
+                        CheckState::Note(issue) => (RowState::Note, issue.clone()),
                     }
                 };
                 RowView {

@@ -1,7 +1,7 @@
 use super::{Architecture, EffectiveEnvironment, OsFamily, ProbeIssue};
 use std::collections::BTreeMap;
 
-pub const MAX_PROBE_BYTES: usize = 64 * 1024;
+pub const MAX_PROBE_BYTES: usize = 1024 * 1024;
 pub const MAX_SESSIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,27 +176,20 @@ fn assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIssue> {
     if bytes.len() > MAX_PROBE_BYTES {
         return Err(ProbeIssue::Oversize);
     }
-    let source = std::str::from_utf8(bytes).map_err(|_| ProbeIssue::Malformed)?;
-    if source
-        .lines()
-        .any(|line| line.chars().any(char::is_control))
-    {
-        return Err(ProbeIssue::Malformed);
-    }
     let mut values = BTreeMap::new();
-    for line in source
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.starts_with('#'))
-    {
-        let (key, value) = line.split_once('=').ok_or(ProbeIssue::Malformed)?;
-        if !valid_key(key) {
-            return Err(ProbeIssue::Malformed);
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Some(split) = line.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let key = &line[..split];
+        if !matches!(key, b"ID" | b"ID_LIKE") {
+            continue;
         }
+        let key = std::str::from_utf8(key).map_err(|_| ProbeIssue::Malformed)?;
+        let value = std::str::from_utf8(&line[split + 1..]).map_err(|_| ProbeIssue::Malformed)?;
         let value = shell_value(value)?;
         if value.len() > MAX_VALUE_BYTES
             || value.chars().any(char::is_control)
-            || values.len() >= 256
             || values.insert(key.into(), value).is_some()
         {
             return Err(ProbeIssue::Malformed);
@@ -206,7 +199,7 @@ fn assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIssue> {
 }
 const MAX_VALUE_BYTES: usize = 4096;
 /// `systemctl --user show-environment` lines considered; bytes stay bounded by MAX_PROBE_BYTES.
-pub const MAX_ENVIRONMENT_LINES: usize = 1024;
+pub const MAX_ENVIRONMENT_LINES: usize = 16 * 1024;
 /// The only manager variables detection reads. Each must decode exactly or the read is malformed.
 const STRICT_ENVIRONMENT: [&str; 4] = [
     "XDG_RUNTIME_DIR",
@@ -295,6 +288,9 @@ fn manager_assignments(bytes: &[u8]) -> Result<BTreeMap<String, String>, ProbeIs
         else {
             continue;
         };
+        if !STRICT_ENVIRONMENT.contains(&key) {
+            continue;
+        }
         match manager_value(&line[split + 1..]) {
             Ok(value) => {
                 if values.insert(key.to_owned(), value).is_some() {

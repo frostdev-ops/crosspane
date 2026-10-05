@@ -144,7 +144,7 @@ impl NativeRepairer {
         })?;
         LinuxService::new(
             self.io.clone(),
-            super::session_of(&self.env),
+            super::manager_session_of(self.env.values()),
             resources,
             deadline,
         )

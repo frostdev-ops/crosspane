@@ -29,6 +29,7 @@ impl MacLaunchAgent {
             deadline,
         )?;
         let support = io.admit_support(&main, deadline)?;
+        support.check_agent_compatibility()?;
         let xml = render_plist(io.target())?;
         Ok(Self {
             io,
@@ -140,6 +141,10 @@ impl MacLaunchAgent {
             LaunchState::UserDisabled
         } else if snapshot.disabled == Disabled::Unknown || snapshot.job == Job::Unknown {
             LaunchState::Unobservable
+        } else if snapshot.job == Job::LoadedStopped && !owned {
+            LaunchState::Conflict
+        } else if snapshot.job == Job::LoadedStopped {
+            LaunchState::LoadedStopped
         } else if snapshot.identity.is_none() {
             LaunchState::Absent
         } else if owned {
@@ -150,6 +155,10 @@ impl MacLaunchAgent {
         let payload = self
             .payload
             .plan(revision, operation, original.clone(), deadline)?;
+        if snapshot.job == Job::LoadedStopped && payload.state() != PayloadState::Matching {
+            // Loaded-but-stopped does not prove a clean exit of the previously installed app.
+            return Err(NativeError::Refused);
+        }
         let installed_main = self
             .io
             .metadata(&self.io.target().agent_path())?
@@ -267,118 +276,34 @@ pub(super) fn checked_reply(
     };
     selected.instance.admit_status(&health.installer().instance)
 }
-fn output_text(output: &CommandOutput) -> NativeResult<&str> {
-    if output.stdout.len() + output.stderr.len() > LIMIT {
-        return Err(NativeError::Oversize);
-    }
-    std::str::from_utf8(&output.stdout).map_err(|_| NativeError::Invalid)
-}
 fn query_job(io: &MacNativeIo, output: &CommandOutput) -> NativeResult<Job> {
-    let text = output_text(output)?;
-    let missing = format!(
-        "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
-        io.target().paths().uid
-    );
-    if output.code == Some(113) && text.is_empty() && output.stderr == missing.as_bytes() {
-        return Ok(Job::Absent);
-    }
-    if output.code != Some(0) || !output.stderr.is_empty() {
-        return Ok(Job::Unknown);
-    }
-    let header = format!("gui/{}/{AGENT_LABEL} = {{", io.target().paths().uid);
-    if text.lines().next().map(str::trim) != Some(header.as_str())
-        || text.lines().last().map(str::trim) != Some("}")
-    {
-        return Ok(Job::Unknown);
-    }
-    let mut fields = std::collections::BTreeMap::new();
-    let mut depth = 1usize;
-    for line in text.lines().skip(1).map(str::trim) {
-        let pair = line.split_once(" = ");
-        if let Some((key, value)) = pair
-            && depth == 1
-            && matches!(key, "path" | "program" | "pid")
-        {
-            if fields.insert(key, value).is_some() {
-                return Ok(Job::Unknown);
-            }
-            if value != "{" {
-                continue;
-            }
-        }
-        if line == "}" {
-            let Some(next) = depth.checked_sub(1) else {
-                return Ok(Job::Unknown);
-            };
-            depth = next;
-        } else if let Some((key, "{")) = pair {
-            if depth == 0
-                || depth == 32
-                || key.is_empty()
-                || !key
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b" ._-".contains(&b))
-            {
-                return Ok(Job::Unknown);
-            }
-            depth += 1;
-        } else if depth == 0 || line.contains(['{', '}']) {
-            return Ok(Job::Unknown);
-        }
-    }
-    if depth != 0 {
-        return Ok(Job::Unknown);
-    }
-    let field = |name: &str| fields.get(name).copied();
-    if field("path") != MacLaunchAgent::plist(io).to_str()
-        || field("program") != io.target().agent_path().to_str()
-    {
-        return Ok(Job::Unknown);
-    }
-    Ok(field("pid")
-        .and_then(|p| p.parse::<u32>().ok())
-        .filter(|p| *p != 0)
-        .map(Job::Running)
-        .unwrap_or(Job::Unknown))
+    let plist = MacLaunchAgent::plist(io);
+    let program = io.target().agent_path();
+    Ok(super::super::launchd_observation::job(
+        output.code,
+        &output.stdout,
+        &output.stderr,
+        super::super::launchd_observation::SelectedJob {
+            uid: io.target().paths().uid,
+            label: AGENT_LABEL,
+            plist: &plist,
+            program: &program,
+        },
+    ))
 }
 fn query_disabled(output: &CommandOutput) -> NativeResult<Disabled> {
-    let text = output_text(output)?;
-    if output.code != Some(0)
-        || !output.stderr.is_empty()
-        || text.lines().next().map(str::trim) != Some("disabled services = {")
-        || text.lines().last().map(str::trim) != Some("}")
-    {
-        return Ok(Disabled::Unknown);
-    }
-    let mut found = None;
-    for line in text
-        .lines()
-        .skip(1)
-        .take(text.lines().count().saturating_sub(2))
-    {
-        let Some((key, value)) = line.trim().split_once(" => ") else {
-            return Ok(Disabled::Unknown);
-        };
-        let Some(key) = key.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-            return Ok(Disabled::Unknown);
-        };
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        {
-            return Ok(Disabled::Unknown);
-        }
-        let value = match value {
-            "true" => Disabled::Yes,
-            "false" => Disabled::No,
-            _ => return Ok(Disabled::Unknown),
-        };
-        if key == AGENT_LABEL && found.replace(value).is_some() {
-            return Ok(Disabled::Unknown);
-        }
-    }
-    Ok(found.unwrap_or(Disabled::No))
+    Ok(
+        match super::super::launchd_observation::disabled(
+            output.code,
+            &output.stdout,
+            &output.stderr,
+            AGENT_LABEL,
+        ) {
+            Some(true) => Disabled::Yes,
+            Some(false) => Disabled::No,
+            None => Disabled::Unknown,
+        },
+    )
 }
 
 impl MacLaunchAgent {

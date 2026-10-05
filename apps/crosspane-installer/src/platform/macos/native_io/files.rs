@@ -144,6 +144,7 @@ impl SocketEndpoint {
 /// File close releases the lock. It carries no authority to delete/adopt the corresponding path.
 #[derive(Debug)]
 pub struct InstallerLock {
+    nonce: u64,
     _file: File,
 }
 
@@ -794,6 +795,7 @@ impl MacNativeIo {
             }
             self.boundary("complete", &path, deadline)?;
             Ok(InstallerLock {
+                nonce: self.target.nonce,
                 _file: File::from(fd),
             })
         })();
@@ -1173,5 +1175,160 @@ impl MacNativeIo {
             .execute(FilesystemOperation::DirectorySync(parent.fd.as_fd()))?;
         self.boundary("complete", &path, deadline)?;
         Ok(identity)
+    }
+}
+
+/// Exact private leaves from a dead process; this is not a clean-stop receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeadRuntime {
+    directory: (u64, u64),
+    bootstrap: FileIdentity,
+    socket: FileIdentity,
+    bytes: Vec<u8>,
+    pid: u32,
+}
+fn runtime_pid_dead(pid: u32) -> NativeResult<()> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or(NativeError::Foreign)?;
+    match rustix::process::test_kill_process(pid) {
+        Err(rustix::io::Errno::SRCH) => Ok(()),
+        _ => Err(NativeError::Foreign),
+    }
+}
+impl MacNativeIo {
+    pub(crate) fn dead_runtime(&self, deadline: &Deadline) -> NativeResult<Option<DeadRuntime>> {
+        deadline.check()?;
+        self.validate_target()?;
+        let runtime = self.target.runtime_dir();
+        if self.metadata(runtime)?.is_none() {
+            return Ok(None);
+        }
+        let path = runtime.join("bootstrap.json");
+        let bootstrap = self.metadata(&path)?;
+        let socket = self.metadata(&self.target.socket_path())?;
+        if bootstrap.is_none() && socket.is_none() {
+            return Ok(None);
+        }
+        let (bootstrap, socket) = bootstrap.zip(socket).ok_or(NativeError::Foreign)?;
+        bootstrap.regular(self.target.paths.uid, true)?;
+        socket.socket(self.target.paths.uid)?;
+        if socket.links != 1 {
+            return Err(NativeError::Foreign);
+        }
+        let bytes = self.read(&path, 4096, true, deadline)?;
+        let record = parse_bootstrap(&bytes).map_err(|_| NativeError::Foreign)?;
+        if admitted_spelling(Path::new(&record.runtime_dir))? != runtime {
+            return Err(NativeError::Foreign);
+        }
+        if self.pid_observed_live(record.pid, deadline)? {
+            return Err(NativeError::Foreign);
+        }
+        runtime_pid_dead(record.pid)?;
+        let endpoint = self.socket_endpoint()?;
+        if endpoint.identity != socket {
+            return Err(NativeError::Foreign);
+        }
+        let entries = self.entries(runtime, 2, deadline)?;
+        if entries
+            != [
+                ("agent.sock".into(), socket.clone()),
+                ("bootstrap.json".into(), bootstrap.clone()),
+            ]
+        {
+            return Err(NativeError::Foreign);
+        }
+        #[cfg(test)]
+        let connect_path = self
+            .target
+            .test_path
+            .as_ref()
+            .map(|map| map(endpoint.path()))
+            .unwrap_or_else(|| endpoint.path().to_owned());
+        #[cfg(not(test))]
+        let connect_path = endpoint.path().to_owned();
+        let address = native(rustix::net::SocketAddrUnix::new(&connect_path))?;
+        let fd = native(rustix::net::socket(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            None,
+        ))?;
+        native(rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC))?;
+        let stream = std::os::unix::net::UnixStream::from(fd);
+        native(stream.set_nonblocking(true))?;
+        if rustix::net::connect(&stream, &address) != Err(rustix::io::Errno::CONNREFUSED) {
+            return Err(NativeError::Foreign);
+        }
+        endpoint.revalidate(self)?;
+        if self.metadata(&path)? != Some(bootstrap.clone())
+            || self.read(&path, 4096, true, deadline)? != bytes
+        {
+            return Err(NativeError::Foreign);
+        }
+        runtime_pid_dead(record.pid)?;
+        Ok(Some(DeadRuntime {
+            directory: endpoint.parent.identity(),
+            bootstrap,
+            socket,
+            bytes,
+            pid: record.pid,
+        }))
+    }
+    pub(crate) fn clean_dead_runtime(
+        &self,
+        proof: &SupportProof,
+        expected: &DeadRuntime,
+        lock: &InstallerLock,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let _serial = self.mutation.try_lock().map_err(|_| NativeError::Busy)?;
+        proof.check(self, deadline)?;
+        if lock.nonce != self.target.nonce
+            || self.dead_runtime(deadline)?.as_ref() != Some(expected)
+        {
+            return Err(NativeError::Foreign);
+        }
+        let endpoint = self.socket_endpoint()?;
+        if endpoint.parent.identity() != expected.directory || endpoint.identity != expected.socket
+        {
+            return Err(NativeError::Foreign);
+        }
+        runtime_pid_dead(expected.pid)?;
+        proof.check(self, deadline)?;
+        endpoint.revalidate(self)?;
+        self.boundary("dead-runtime-unlink", endpoint.path(), deadline)?;
+        endpoint.revalidate(self)?;
+        runtime_pid_dead(expected.pid)?;
+        if self.metadata(endpoint.path())? != Some(expected.socket.clone()) {
+            return Err(NativeError::Foreign);
+        }
+        let result = (|| {
+            native(rfs::unlinkat(
+                &endpoint.parent.fd,
+                "agent.sock",
+                AtFlags::empty(),
+            ))?;
+            let path = self.target.runtime_dir().join("bootstrap.json");
+            if self.metadata(&path)? != Some(expected.bootstrap.clone())
+                || self.read(&path, 4096, true, deadline)? != expected.bytes
+            {
+                return Err(NativeError::Foreign);
+            }
+            runtime_pid_dead(expected.pid)?;
+            proof.check(self, deadline)?;
+            endpoint.parent.revalidate(self)?;
+            native(rfs::unlinkat(
+                &endpoint.parent.fd,
+                "bootstrap.json",
+                AtFlags::empty(),
+            ))?;
+            native(rfs::fsync(&endpoint.parent.fd))?;
+            if self.metadata(endpoint.path())?.is_some() || self.metadata(&path)?.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        })();
+        result.map_err(|_| NativeError::OutcomeUnknown)
     }
 }

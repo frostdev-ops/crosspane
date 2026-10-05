@@ -120,7 +120,7 @@ impl NativeUninstaller {
             .map_err(|_| "The staged payload doesn't describe this install.".to_owned())?;
         LinuxService::new(
             self.io.clone(),
-            super::session_of(&self.env),
+            super::manager_session_of(self.env.values()),
             resources,
             deadline,
         )

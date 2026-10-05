@@ -1031,7 +1031,7 @@ fn scratch_admission_cannot_be_reused_for_another_or_production_target() {
     assert_eq!(proof.check(&a.io), Err(NativeError::Unsupported));
 }
 #[test]
-fn complete_support_admission_fails_closed_for_unknown_or_unsupported_facts() {
+fn session_authority_fails_closed_without_gating_compatibility() {
     let fixture = Fixture::plain();
     for index in 0..13 {
         let mut f = facts(&fixture.io);
@@ -1050,10 +1050,15 @@ fn complete_support_admission_fails_closed_for_unknown_or_unsupported_facts() {
             11 => f.active = false,
             _ => f.architecture = "unsupported".into(),
         }
-        assert!(matches!(
-            fixture.io.scratch_support(f),
-            Err(NativeError::Unsupported)
-        ));
+        let admitted = fixture.io.scratch_support(f);
+        if matches!(index, 0..=3 | 12) {
+            assert!(admitted.is_ok(), "compatibility {index}");
+        } else {
+            assert!(
+                matches!(admitted, Err(NativeError::Unsupported)),
+                "authority {index}"
+            );
+        }
     }
     assert!(fixture.runner.calls.lock().unwrap().is_empty());
     assert!(!fixture.root.join("run").exists());

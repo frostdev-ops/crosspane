@@ -117,7 +117,7 @@ pub(super) fn compose_support(
             Some(pid) => compositor_matches(pid, hyprland.pid, &pass.lineage.value),
             None => Err(ProbeIssue::Unverified),
         },
-        _ => Ok(()),
+        (Err(issue), _, _) | (_, Err(issue), _) | (_, _, Err(issue)) => Err(*issue),
     };
     let backends = Fact {
         value: pass
@@ -151,13 +151,12 @@ pub(super) fn compose_support(
     let mut eligibility = classify(&session, &runtime);
     let environment = &session.selected_environment;
     let admission = (|| {
-        if eligibility != Eligibility::Supported {
-            return Ok(None);
-        }
-        deadline.check().map_err(issue)?;
+        session_authority(&session)?;
+        correlation?;
         if !admitted_pass || environment.runtime_dir != io.target().paths().runtime_home {
             return Err(ProbeIssue::Foreign);
         }
+        deadline.check().map_err(issue)?;
         let selected = session
             .selected_session
             .value
@@ -168,7 +167,7 @@ pub(super) fn compose_support(
         let architecture = match session.architecture.value {
             Ok(Architecture::X86_64) => "x86_64",
             Ok(Architecture::Aarch64) => "aarch64",
-            _ => return Err(ProbeIssue::Unverified),
+            _ => "",
         };
         let chosen = &selected.session;
         if environment.wayland_display.is_empty()
@@ -180,10 +179,25 @@ pub(super) fn compose_support(
             uid: session.uid,
             architecture: architecture.into(),
             arch_based: session.os.value == Ok(OsFamily::Arch),
-            hyprland_version: session.hyprland_version.value?,
-            protocols_ready: session.protocols.value?,
-            // Supported above already requires every required resolution and all seven booleans.
-            runtime_libraries_ready: true,
+            hyprland_version: session.hyprland_version.value.unwrap_or_default(),
+            protocols_ready: session.protocols.value == Ok(true),
+            runtime_libraries_ready: runtime.dependency_graph.value == Ok(true)
+                && runtime.libraries.iter().any(|v| v.required)
+                && runtime
+                    .libraries
+                    .iter()
+                    .filter(|v| v.required)
+                    .all(|v| v.resolved.value.is_ok())
+                && [
+                    &runtime.ffmpeg,
+                    &runtime.opus,
+                    &runtime.pipewire_library,
+                    &runtime.xkb,
+                    &runtime.wayland_library,
+                    &runtime.software_video,
+                ]
+                .iter()
+                .all(|fact| fact.value == Ok(true)),
             uwsm_managed: session.uwsm_managed.value?,
             graphical_target_active: session.graphical_target_active.value?,
             graphical_sessions: session.graphical_sessions.value?,
@@ -192,14 +206,18 @@ pub(super) fn compose_support(
             seat: chosen.seat.clone().ok_or(ProbeIssue::Unverified)?,
             active: chosen.active == Some(true),
         };
-        let proof = SupportProof::admit(io, facts).map_err(issue)?;
+        let proof = SupportProof::admit(io, facts)
+            .map_err(issue)?
+            .with_advisory(compatibility_report(&session, &runtime));
         deadline.check().map_err(issue)?;
         Ok(Some(proof))
     })();
     let proof = match admission {
         Ok(proof) => proof,
         Err(error) => {
-            eligibility = Eligibility::Pending(error);
+            if !matches!(eligibility, Eligibility::NotSupported(_)) {
+                eligibility = Eligibility::Pending(error);
+            }
             None
         }
     };

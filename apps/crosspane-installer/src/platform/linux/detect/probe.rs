@@ -18,9 +18,12 @@ pub use lineage::{
 pub use logind::{
     LogindFacts, MAX_PROPERTIES, Properties, decode_session, decode_user, logind_from_stream,
 };
-pub use manager::{ManagerFacts, UnitRows, decode_units, manager_from_stream};
+pub use manager::{MAX_UNIT_ROWS, ManagerFacts, UnitRows, decode_units, manager_from_stream};
 pub use os::{OsFacts, os_from_reader};
-pub use registry::{REQUIRED_PROTOCOLS, RegistryFacts, protocols_satisfy, registry_from_stream};
+pub use registry::{
+    MAX_REGISTRY_GLOBALS, REQUIRED_PROTOCOLS, RegistryFacts, protocols_satisfy,
+    registry_from_stream,
+};
 use std::{
     net::Shutdown,
     os::unix::net::UnixStream,

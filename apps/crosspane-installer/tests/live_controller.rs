@@ -2936,3 +2936,34 @@ fn a_screen_with_several_waiting_steps_shows_one_check_again_that_rechecks_each(
     assert_eq!(shown.len(), 1, "{shown:?}");
     assert_eq!(shown[0].id, ids::retry(StepId(25)));
 }
+
+#[test]
+fn advisory_check_is_a_visible_note_and_does_not_claim_verified_evidence() {
+    let slot = SupportChecksSlot::new(SUPPORT);
+    let mut h = H::with_checks(description(), Some(slot.clone()));
+    h.tick();
+    h.next();
+    let (detect, _) = h.job(SUPPORT, JobStage::Detect);
+    slot.publish(vec![SupportCheck::new(
+        "Runtime evidence",
+        CheckState::Note("Couldn't confirm an optional fact; setup can continue".into()),
+    )]);
+    h.report(
+        &detect,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    let (verify, _) = h.job(SUPPORT, JobStage::Verify);
+    slot.publish(vec![SupportCheck::new(
+        "Runtime evidence",
+        CheckState::Note("Couldn't confirm an optional fact; setup can continue".into()),
+    )]);
+    let live = h.live();
+    h.report(&verify, live);
+    assert_eq!(h.row(SUPPORT).state, RowState::Verified);
+    let rows = check_rows(&h);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, RowState::Note);
+    assert!(rows[0].detail.contains("Couldn't confirm"));
+}

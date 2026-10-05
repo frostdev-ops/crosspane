@@ -418,17 +418,15 @@ fn inspect_checked(
         });
     }
     let family = |prefixes: &[&str]| -> Result<bool, ProbeIssue> {
-        if let Some(error) = graph_issue {
-            return Err(error);
-        }
+        deadline.check().map_err(issue)?;
         for prefix in prefixes {
             let matches: Vec<_> = libraries
                 .iter()
                 .filter(|library| library.name.starts_with(prefix))
                 .collect();
             if matches.is_empty() {
-                return Ok(false);
-            } // complete graph: family not declared, not a failed read
+                return graph_issue.map_or(Ok(false), Err);
+            } // An incomplete graph cannot prove a missing family.
             for library in matches {
                 library.resolved.value.as_ref().map_err(|error| *error)?;
             }
@@ -461,6 +459,7 @@ fn inspect_checked(
     );
     RuntimeFacts {
         libraries,
+        dependency_graph: fact(graph_issue.map_or(Ok(true), Err)),
         video_feature: fact(video_feature),
         ffmpeg,
         opus,
@@ -837,7 +836,8 @@ mod tests {
         assert_eq!(facts.libraries.len(), MAX_GRAPH_LIBRARIES);
         assert_eq!(facts.opus.value, Ok(true));
         let facts = run(MAX_GRAPH_LIBRARIES - 3);
-        assert_eq!(facts.opus.value, Err(ProbeIssue::Oversize));
+        assert_eq!(facts.opus.value, Ok(true));
+        assert_eq!(facts.dependency_graph.value, Err(ProbeIssue::Oversize));
     }
 
     #[test]

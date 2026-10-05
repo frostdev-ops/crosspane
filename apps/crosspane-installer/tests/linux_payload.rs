@@ -15,6 +15,109 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+fn stopped_runtime(f: &Fixture, pid: u32) -> std::os::unix::net::UnixListener {
+    f.io.create_private_dir(&f.proof, f.io.target().runtime_dir())
+        .unwrap();
+    let socket = f.io.target().socket_path();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let bytes = serde_json::to_vec(&json!({"schema_version":1,"instance_id":9,"pid":pid,
+        "started_unix_ms":1,"phase":"ready","phase_seq":2,"keystore":"os_store",
+        "reason":null,"runtime_dir":f.io.target().runtime_dir()}))
+    .unwrap();
+    f.io.atomic_write(
+        &f.proof,
+        &f.io.target().runtime_dir().join("bootstrap.json"),
+        &bytes,
+    )
+    .unwrap();
+    listener
+}
+#[test]
+fn exact_dead_runtime_is_a_readonly_observation_until_locked_payload_apply() {
+    let f = Fixture::new();
+    drop(stopped_runtime(&f, i32::MAX as u32));
+    let p = package(1);
+    assert!(f.install.detect(&f.proof, &p).is_ok());
+    assert!(f.io.target().socket_path().exists());
+    let plan = f
+        .install
+        .plan(&f.proof, &p, OperationId(1), MatchingFiles::Preserve)
+        .unwrap();
+    f.install.apply(&f.proof, &p, plan, &deadline()).unwrap();
+    assert!(!f.io.target().socket_path().exists());
+    assert!(!f.io.target().runtime_dir().join("bootstrap.json").exists());
+    assert!(f.io.target().runtime_dir().exists());
+    assert!(f.io.target().agent_path().exists());
+}
+#[test]
+fn live_reused_pid_or_connectable_runtime_is_never_removed() {
+    for live_pid in [false, true] {
+        let f = Fixture::new();
+        let listener = stopped_runtime(
+            &f,
+            if live_pid {
+                std::process::id()
+            } else {
+                i32::MAX as u32
+            },
+        );
+        let _listener = if live_pid {
+            drop(listener);
+            None
+        } else {
+            Some(listener)
+        };
+        assert!(f.install.detect(&f.proof, &package(1)).is_err());
+        assert!(f.io.target().socket_path().exists());
+        assert!(f.io.target().runtime_dir().join("bootstrap.json").exists());
+        assert!(!f.io.target().agent_path().exists());
+    }
+}
+#[test]
+fn dead_runtime_drift_foreign_leaves_and_unsafe_permissions_refuse() {
+    for change in 0..5 {
+        let f = Fixture::new();
+        drop(stopped_runtime(&f, i32::MAX as u32));
+        let p = package(1);
+        let plan = f
+            .install
+            .plan(&f.proof, &p, OperationId(1), MatchingFiles::Preserve)
+            .unwrap();
+        let bootstrap = f.io.target().runtime_dir().join("bootstrap.json");
+        let socket = f.io.target().socket_path();
+        match change {
+            0 => {
+                fs::remove_file(&socket).unwrap();
+                drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+                fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            1 => {
+                fs::hard_link(&bootstrap, f.io.target().runtime_dir().join("foreign")).unwrap();
+            }
+            2 => {
+                fs::set_permissions(&bootstrap, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            3 => {
+                put(
+                    &f.io.target().runtime_dir().join("unrecognised"),
+                    b"keep",
+                    0o600,
+                );
+            }
+            _ => {
+                let mut value: Value =
+                    serde_json::from_slice(&fs::read(&bootstrap).unwrap()).unwrap();
+                value["runtime_dir"] = json!("/foreign");
+                put(&bootstrap, &serde_json::to_vec(&value).unwrap(), 0o600);
+            }
+        }
+        assert!(f.install.apply(&f.proof, &p, plan, &deadline()).is_err());
+        assert!(socket.exists());
+        assert!(bootstrap.exists());
+        assert!(!f.io.target().agent_path().exists());
+    }
+}
 static ID: AtomicU64 = AtomicU64::new(0);
 const START: &[u8] = b"Fri Oct  2 12:00:00 2026\n";
 // Producer literal; only explicit scratch coordinates and the staged build version vary.

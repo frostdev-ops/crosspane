@@ -98,6 +98,33 @@ impl MacLaunchAgent {
         {
             return Err(NativeError::Foreign);
         }
+        if pending.phase == LaunchPhase::Intent && pending.plan.snapshot.job == Job::LoadedStopped {
+            if pending.plan.state != LaunchState::LoadedStopped || !pending.plan.matching {
+                return Err(NativeError::Refused);
+            }
+            let lock = self.io.lock(support, deadline)?;
+            if self.snapshot(&self.io, deadline)? != pending.plan.snapshot {
+                return Err(NativeError::Foreign);
+            }
+            let output = Self::command(
+                &self.io,
+                NativeOperation::Launchctl(LaunchctlAction::Bootout),
+                Some(support),
+                deadline,
+            )?;
+            if output.code != Some(0) {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let after = self.snapshot(&self.io, deadline)?;
+            if after.job != Job::Absent
+                || after.identity != pending.plan.snapshot.identity
+                || after.bytes != pending.plan.snapshot.bytes
+                || after.disabled != pending.plan.snapshot.disabled
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            drop(lock);
+        }
         if let Some(original) = &pending.plan.original {
             if pending.phase == LaunchPhase::Intent {
                 let selected = pending.plan.selected.as_ref().ok_or(NativeError::Invalid)?;

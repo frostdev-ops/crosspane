@@ -717,6 +717,7 @@ pub(crate) fn check_wording(check: &RowView) -> String {
         RowState::Verified => format!("Passed ({detail})"),
         RowState::Failed | RowState::Unsupported => with("Failed"),
         RowState::Waiting | RowState::NeedsAction => with("Couldn't confirm"),
+        RowState::Note => with("Note"),
         RowState::Unchecked => "Not checked yet".to_owned(),
     }
 }
@@ -1222,6 +1223,7 @@ fn row_style(state: RowState) -> (&'static str, Color32, usize) {
         RowState::Verified => ("Verified", theme::FROST, 4),
         RowState::Failed => ("Failed", theme::WARNING, 5),
         RowState::Unsupported => ("Unsupported", theme::WARNING, 6),
+        RowState::Note => ("Note", theme::QUIET, 7),
     }
 }
 

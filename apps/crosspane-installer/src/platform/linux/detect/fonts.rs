@@ -1,7 +1,8 @@
 //! Bounded system-font selection; no bundled fonts, viewport, or explicit-review override.
 use crate::agent_contract::ObservationSource;
 use crate::platform::linux::native_io::{
-    ChildEnvironment, CommandSpec, Deadline, LinuxNativeIo, MAX_FONT_BYTES, NativeError, SystemRead,
+    ChildEnvironment, CommandOutput, CommandSpec, Deadline, LinuxNativeIo, MAX_FONT_BYTES,
+    NativeError, SystemRead,
 };
 use eframe::egui;
 use std::path::{Component, Path, PathBuf};
@@ -58,10 +59,7 @@ impl FontReader for NativeFonts<'_> {
             MAX_MATCH_BYTES,
         )?;
         let output = self.io.run(&command, deadline)?;
-        if output.code != Some(0) || !output.stderr.is_empty() {
-            return Err(NativeError::Unavailable);
-        }
-        Ok(output.stdout)
+        match_output(output)
     }
     fn read(&self, path: &Path, deadline: &Deadline) -> Result<Vec<u8>, NativeError> {
         Ok(self
@@ -150,4 +148,34 @@ pub fn discover_with(
         }
     }
     Err(last)
+}
+
+fn match_output(output: CommandOutput) -> Result<Vec<u8>, NativeError> {
+    if output.code != Some(0) {
+        return Err(NativeError::Unavailable);
+    }
+    Ok(output.stdout)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn successful_fontconfig_warning_preserves_the_admitted_font_path() {
+        let path = b"/usr/share/fonts/noto/NotoSans-Regular.ttf\n".to_vec();
+        let bytes = match_output(CommandOutput {
+            code: Some(0),
+            stdout: path,
+            stderr: b"Fontconfig warning: optional cache unavailable".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(matched_path(&bytes).unwrap(), Path::new(CANDIDATES[2]));
+        assert_eq!(
+            match_output(CommandOutput {
+                code: Some(1),
+                stdout: bytes,
+                stderr: vec![]
+            }),
+            Err(NativeError::Unavailable)
+        );
+    }
 }

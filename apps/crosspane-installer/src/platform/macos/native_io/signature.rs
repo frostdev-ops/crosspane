@@ -98,9 +98,7 @@ impl MacNativeIo {
         main.revalidate(self)?;
         let facts = self.support_observation(deadline)?;
         let gui = &facts.gui;
-        if facts.macos_major < 26
-            || !facts.apple_silicon
-            || !gui.active
+        if !gui.active
             || gui.console_uid != Some(self.target.paths.uid)
             || gui.interactive_uid != Some(self.target.paths.uid)
             || !bounded(&gui.console_session, 64)
@@ -114,7 +112,12 @@ impl MacNativeIo {
             nonce: self.target.nonce,
             issued: self.clock.now_ms(),
             wall: Instant::now(),
-            facts,
+            gui: facts.gui,
+            gui_tmpdir: facts.gui_tmpdir,
+            compatibility: CompatibilityReport {
+                macos_major: facts.macos_major,
+                apple_silicon: facts.apple_silicon,
+            },
             signing: main.clone(),
             valid: Arc::new(AtomicBool::new(true)),
         })
@@ -134,6 +137,13 @@ impl MacNativeIo {
             proof
                 .ok_or(NativeError::Unsupported)?
                 .check(self, deadline)?;
+        }
+        if spec.program() == Path::new("/bin/launchctl")
+            && spec.args().first().is_some_and(|arg| arg == "bootstrap")
+        {
+            proof
+                .ok_or(NativeError::Unsupported)?
+                .check_agent_compatibility()?;
         }
         if let Some(signature) = &spec.child_signature {
             signature.revalidate(self)?;

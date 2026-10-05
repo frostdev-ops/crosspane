@@ -95,6 +95,8 @@ pub struct LibraryFact {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeFacts {
     pub libraries: Vec<LibraryFact>,
+    /// Complete structural dependency traversal; never a load/ABI readiness claim.
+    pub dependency_graph: Fact<bool>,
     pub video_feature: Fact<bool>,
     pub ffmpeg: Fact<bool>,
     pub opus: Fact<bool>,
@@ -172,6 +174,115 @@ pub struct SupportReport {
     pub reduced_motion: Fact<bool>,
 }
 
+/// Compatibility is evidence alongside mutation authority, never a substitute for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompatibilityReport {
+    pub eligibility: Eligibility,
+    pub notes: Vec<String>,
+}
+
+impl Default for CompatibilityReport {
+    fn default() -> Self {
+        Self {
+            eligibility: Eligibility::Pending(ProbeIssue::Unverified),
+            notes: vec!["Compatibility has not been observed.".into()],
+        }
+    }
+}
+
+/// The session facts that authorize selected-user operations. Compatibility issues are not
+/// consulted here; missing identity, lifecycle or environment evidence still refuses.
+pub fn session_authority(session: &SessionFacts) -> Result<(), ProbeIssue> {
+    let required = |fact: &Fact<bool>| match fact.value {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ProbeIssue::Unverified),
+        Err(issue) => Err(issue),
+    };
+    required(&session.uwsm_managed)?;
+    required(&session.graphical_target_active)?;
+    match session.graphical_sessions.value {
+        Ok(1) => {}
+        Ok(_) => return Err(ProbeIssue::Ambiguous),
+        Err(issue) => return Err(issue),
+    }
+    let selected = session
+        .selected_session
+        .value
+        .as_ref()
+        .map_err(|issue| *issue)?
+        .as_ref()
+        .ok_or(ProbeIssue::Ambiguous)?;
+    let chosen = &selected.session;
+    if chosen.uid != Some(session.uid) {
+        return Err(ProbeIssue::Foreign);
+    }
+    if chosen.kind.as_deref() != Some("wayland")
+        || chosen.active != Some(true)
+        || chosen.seat.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(ProbeIssue::Unverified);
+    }
+    let effective = session
+        .manager_environment
+        .value
+        .as_ref()
+        .map_err(|issue| *issue)?;
+    if effective.runtime_dir != session.selected_environment.runtime_dir
+        || effective.wayland_display != session.selected_environment.wayland_display
+        || effective.hyprland_instance_signature
+            != session.selected_environment.hyprland_instance_signature
+    {
+        return Err(ProbeIssue::Foreign);
+    }
+    Ok(())
+}
+
+pub fn compatibility_report(session: &SessionFacts, runtime: &RuntimeFacts) -> CompatibilityReport {
+    let mut notes = Vec::new();
+    let mut note = |label: &str, issue: Option<ProbeIssue>| {
+        if let Some(issue) = issue {
+            notes.push(format!("Couldn't confirm {label}: saw {issue:?}."));
+        }
+    };
+    note("operating system", session.os.value.as_ref().err().copied());
+    note(
+        "architecture",
+        session.architecture.value.as_ref().err().copied(),
+    );
+    note("Hyprland version", session.hyprland_version.value.err());
+    for (label, fact) in [
+        ("required protocols", &session.protocols),
+        ("dependency graph", &runtime.dependency_graph),
+        ("video feature", &runtime.video_feature),
+        ("FFmpeg libraries", &runtime.ffmpeg),
+        ("Opus library", &runtime.opus),
+        ("PipeWire library", &runtime.pipewire_library),
+        ("keyboard library", &runtime.xkb),
+        ("Wayland library", &runtime.wayland_library),
+        ("software video", &runtime.software_video),
+        ("optional GPU", &runtime.gpu),
+        ("optional audio", &runtime.pipewire),
+        ("optional session manager", &runtime.session_manager),
+        ("secret service", &runtime.secret_service),
+    ] {
+        note(label, fact.value.err());
+    }
+    for library in &runtime.libraries {
+        if library.resolved.value.is_err() {
+            // A native SONAME may be untrusted. The issue and count suffice; never echo it.
+            note(
+                "a runtime dependency",
+                library.resolved.value.as_ref().err().copied(),
+            );
+        }
+    }
+    let eligibility = classify(session, runtime);
+    if let Eligibility::NotSupported(reason) = eligibility {
+        notes.push(unsupported_text(reason));
+    }
+    CompatibilityReport { eligibility, notes }
+}
+
 /// Structural eligibility only: never WorkspaceReady, backend-load proof, an open gate, usable
 /// audio, store unlock, or next-login evidence. Optional GPU and nonapplicable libei are ignored.
 pub fn classify(session: &SessionFacts, runtime: &RuntimeFacts) -> Eligibility {
@@ -202,6 +313,7 @@ pub fn classify(session: &SessionFacts, runtime: &RuntimeFacts) -> Eligibility {
     let booleans = [
         (&session.protocols, U::RequiredProtocols),
         (&session.uwsm_managed, U::Uwsm),
+        (&runtime.dependency_graph, U::RuntimeLibrary),
         (&runtime.video_feature, U::VideoFeature),
         (&runtime.ffmpeg, U::RuntimeLibrary),
         (&runtime.opus, U::RuntimeLibrary),
@@ -283,4 +395,33 @@ pub fn classify(session: &SessionFacts, runtime: &RuntimeFacts) -> Eligibility {
         }
     }
     pending.map_or(Eligibility::Supported, Eligibility::Pending)
+}
+
+pub fn unsupported_text(reason: UnsupportedReason) -> String {
+    match reason {
+        UnsupportedReason::OperatingSystem => {
+            "This installer supports Arch-based Linux, such as Omarchy, for now.".into()
+        }
+        UnsupportedReason::Architecture => {
+            "This processor isn't supported by this installer yet.".into()
+        }
+        UnsupportedReason::HyprlandVersion => {
+            "Crosspane needs Hyprland 0.56 or newer on this computer.".into()
+        }
+        UnsupportedReason::RequiredProtocols => {
+            "This Hyprland session doesn't offer the Wayland features Crosspane needs.".into()
+        }
+        UnsupportedReason::Uwsm => {
+            "Setup supports Hyprland sessions managed by uwsm for now. Yours isn't.".into()
+        }
+        UnsupportedReason::SessionType => {
+            "Crosspane needs a Wayland session. This one is something else.".into()
+        }
+        UnsupportedReason::VideoFeature => {
+            "The staged Crosspane build doesn't include video support.".into()
+        }
+        UnsupportedReason::RuntimeLibrary => {
+            "A library Crosspane needs isn't installed on this computer.".into()
+        }
+    }
 }

@@ -47,6 +47,7 @@ pub struct Activity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceState {
     Absent,
+    LoadedStopped,
     Running(u32),
     Unknown,
 }
@@ -889,132 +890,31 @@ fn resource(
     }
 }
 fn job(io: &MacNativeIo, output: &CommandOutput) -> ServiceState {
-    if output.code == Some(113)
-        && output.stdout.is_empty()
-        && output.stderr
-            == format!(
-                "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
-                io.target().paths().uid
-            )
-            .as_bytes()
-    {
-        return ServiceState::Absent;
-    }
-    if output.stdout.len() > 65536
-        || output.stderr.len() > 65536
-        || output.code != Some(0)
-        || !output.stderr.is_empty()
-    {
-        return ServiceState::Unknown;
-    }
-    let Ok(text) = std::str::from_utf8(&output.stdout) else {
-        return ServiceState::Unknown;
-    };
-    let expected = format!("gui/{}/{AGENT_LABEL} = {{", io.target().paths().uid);
-    if text.lines().next().map(str::trim) != Some(&expected)
-        || text.lines().last().map(str::trim) != Some("}")
-    {
-        return ServiceState::Unknown;
-    }
-    let mut fields = std::collections::BTreeMap::new();
-    let mut depth = 1usize;
-    let mut scopes = vec![BTreeSet::new()];
-    for line in text.lines().skip(1).map(str::trim) {
-        let pair = line.split_once(" = ").or_else(|| line.split_once(" => "));
-        if let Some((key, _)) = pair
-            && !scopes.last_mut().is_some_and(|scope| scope.insert(key))
-        {
-            return ServiceState::Unknown;
-        }
-        if let Some((key, value)) = pair
-            && depth == 1
-            && matches!(key, "path" | "program" | "pid")
-        {
-            if fields.insert(key, value).is_some() {
-                return ServiceState::Unknown;
-            }
-            if value != "{" {
-                continue;
-            }
-        }
-        if line == "}" {
-            let Some(next) = depth.checked_sub(1) else {
-                return ServiceState::Unknown;
-            };
-            depth = next;
-            scopes.pop();
-        } else if let Some((key, "{")) = pair {
-            if depth == 0
-                || depth == 32
-                || key.is_empty()
-                || !key
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b" ._-".contains(&b))
-            {
-                return ServiceState::Unknown;
-            }
-            depth += 1;
-            scopes.push(BTreeSet::new());
-        } else if depth == 0 || line.contains(['{', '}']) {
-            return ServiceState::Unknown;
-        }
-    }
-    if depth != 0 {
-        return ServiceState::Unknown;
-    }
     let plist = io
         .target()
         .paths()
         .home
         .join("Library/LaunchAgents/io.frostdev.crosspane.agent.plist");
-    if fields.get("path").copied() != plist.to_str()
-        || fields.get("program").copied() != io.target().agent_path().to_str()
-    {
-        return ServiceState::Unknown;
+    let program = io.target().agent_path();
+    match super::launchd_observation::job(
+        output.code,
+        &output.stdout,
+        &output.stderr,
+        super::launchd_observation::SelectedJob {
+            uid: io.target().paths().uid,
+            label: AGENT_LABEL,
+            plist: &plist,
+            program: &program,
+        },
+    ) {
+        super::launchd_observation::JobObservation::Absent => ServiceState::Absent,
+        super::launchd_observation::JobObservation::Running(pid) => ServiceState::Running(pid),
+        super::launchd_observation::JobObservation::LoadedStopped => ServiceState::LoadedStopped,
+        super::launchd_observation::JobObservation::Unknown => ServiceState::Unknown,
     }
-    fields
-        .get("pid")
-        .and_then(|p| p.parse().ok())
-        .filter(|p| *p > 0)
-        .map(ServiceState::Running)
-        .unwrap_or(ServiceState::Unknown)
 }
 fn disabled(output: &CommandOutput) -> Option<bool> {
-    if output.code != Some(0) || !output.stderr.is_empty() {
-        return None;
-    }
-    let text = std::str::from_utf8(&output.stdout).ok()?;
-    if text.lines().next()?.trim() != "disabled services = {" || text.lines().last()?.trim() != "}"
-    {
-        return None;
-    }
-    let mut value = None;
-    let mut keys = BTreeSet::new();
-    for line in text
-        .lines()
-        .skip(1)
-        .take(text.lines().count().saturating_sub(2))
-    {
-        let (key, raw) = line.trim().split_once(" => ")?;
-        let key = key.strip_prefix('"')?.strip_suffix('"')?;
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-            || !keys.insert(key)
-        {
-            return None;
-        }
-        let v = match raw {
-            "true" => true,
-            "false" => false,
-            _ => return None,
-        };
-        if key == AGENT_LABEL {
-            value = Some(v);
-        }
-    }
-    Some(value.unwrap_or(false))
+    super::launchd_observation::disabled(output.code, &output.stdout, &output.stderr, AGENT_LABEL)
 }
 
 pub const DELETE_IDENTITY_EXPLANATION: &str = "Deleting this machine's identity and pairings requires re-pairing. Remote peers may retain an offline trust entry; this is not remote revocation.";

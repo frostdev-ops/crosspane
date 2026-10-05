@@ -23,6 +23,7 @@ type ExecRows = Vec<(String, Vec<String>, bool, u64, u64, u64, u64, u32, i32, i3
 const DEST: &str = "org.freedesktop.systemd1";
 const ROOT: &str = "/org/freedesktop/systemd1";
 const GRAPHICAL: &str = "graphical-session.target";
+pub const MAX_UNIT_ROWS: usize = 4096;
 fn required<T: TryFrom<OwnedValue> + Type>(
     values: &Properties,
     key: &str,
@@ -30,7 +31,7 @@ fn required<T: TryFrom<OwnedValue> + Type>(
     property(values, key)?.ok_or(ProbeIssue::Unverified)
 }
 fn names(values: &[String], nonempty: bool) -> Result<(), ProbeIssue> {
-    if values.len() > MAX_SESSIONS {
+    if values.len() > MAX_UNIT_ROWS {
         return Err(ProbeIssue::Oversize);
     }
     for value in values {
@@ -41,20 +42,18 @@ fn names(values: &[String], nonempty: bool) -> Result<(), ProbeIssue> {
     }
     Ok(())
 }
-/// ListUnitsByPatterns' exact a(ssssssouso) signature. Every returned row is validated.
+/// ListUnitsByPatterns' exact a(ssssssouso) signature. Validate only consumed identity/state.
 pub fn decode_units(rows: UnitRows) -> Result<UnitRows, ProbeIssue> {
-    if rows.len() > MAX_SESSIONS {
+    if rows.len() > MAX_UNIT_ROWS {
         return Err(ProbeIssue::Oversize);
     }
     let mut ids = std::collections::BTreeSet::new();
     let mut paths = std::collections::HashSet::new();
     for row in &rows {
-        for value in [&row.0, &row.1, &row.2, &row.3, &row.4, &row.5, &row.8] {
+        for value in [&row.0, &row.2, &row.3] {
             bounded_text(value, 512)?;
         }
-        for path in [&row.6, &row.9] {
-            bounded_text(path.as_str(), 512)?;
-        }
+        bounded_text(row.6.as_str(), 512)?;
         if !matches!(
             row.2.as_str(),
             "stub" | "loaded" | "not-found" | "bad-setting" | "error" | "merged" | "masked"

@@ -5,6 +5,9 @@ use crosspane_installer::agent_contract::{
     self, BootstrapPhase, InstanceStatus, ObservationSource,
 };
 // Compile the implementation privately so hooks stay unavailable to application consumers.
+#[path = "../src/platform/macos/launchd_observation.rs"]
+#[allow(dead_code)]
+mod launchd_observation;
 #[path = "../src/platform/macos/native_io.rs"]
 #[allow(dead_code, unused_imports)]
 mod subject;
@@ -2151,7 +2154,7 @@ fn no_follow_reads_reject_symlink_hardlink_nonprivate_and_oversize() {
     );
 }
 #[test]
-fn unsupported_or_noninteractive_facts_cannot_mutate() {
+fn compatibility_is_separate_and_noninteractive_facts_cannot_mutate() {
     let f = Fixture::new();
     let baseline = f.support.0.lock().unwrap().clone();
     let main = f.main();
@@ -2183,9 +2186,26 @@ fn unsupported_or_noninteractive_facts_cannot_mutate() {
     let mut x = baseline.clone();
     x.gui_tmpdir = f.home.clone();
     changes.push(x);
-    for changed in changes {
+    for (index, changed) in changes.into_iter().enumerate() {
         *f.support.0.lock().unwrap() = changed;
-        assert!(f.io.admit_support(&main, &f.deadline()).is_err());
+        let admitted = f.io.admit_support(&main, &f.deadline());
+        if index < 2 {
+            let proof = admitted.unwrap();
+            assert_eq!(
+                proof.check_agent_compatibility(),
+                Err(NativeError::Unsupported)
+            );
+            assert_eq!(
+                f.io.execute(
+                    &f.command(LaunchctlAction::Bootstrap),
+                    Some(&proof),
+                    &f.deadline()
+                ),
+                Err(NativeError::Unsupported)
+            );
+        } else {
+            assert!(admitted.is_err());
+        }
     }
     assert_eq!(
         f.io.execute(&f.command(LaunchctlAction::Bootstrap), None, &f.deadline()),

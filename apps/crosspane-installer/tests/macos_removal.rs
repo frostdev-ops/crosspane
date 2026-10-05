@@ -1250,6 +1250,9 @@ mod audio_package;
 #[path = "../src/platform/macos/launch_agent.rs"]
 #[allow(dead_code, unused_imports)]
 mod launch_agent;
+#[path = "../src/platform/macos/launchd_observation.rs"]
+#[allow(dead_code)]
+mod launchd_observation;
 #[path = "../src/platform/macos/native_io.rs"]
 #[allow(dead_code, unused_imports)]
 mod native_io;
@@ -1891,7 +1894,7 @@ mod a2_tests {
         }
     }
     #[test]
-    fn r1_unrelated_disabled_duplicate_refuses_tracking() {
+    fn r1_unrelated_disabled_duplicates_do_not_erase_selected_tracking() {
         for repeated in ["true", "false"] {
             let r = Rig::new();
             let o = r.observer();
@@ -1899,15 +1902,15 @@ mod a2_tests {
                 "disabled services = {{\n \"unrelated.job\" => true\n \"unrelated.job\" => {repeated}\n}}\n"
             );
             *r.runner.disabled.lock().unwrap() = Ok(out(0, &map, ""));
-            assert_eq!(r.no_current(&o).inventory().disabled, None);
+            assert_eq!(r.no_current(&o).inventory().disabled, Some(false));
             assert!(
                 o.observe(Some(r.current()), 1, OperationId(1), &r.d())
-                    .is_err()
+                    .is_ok()
             );
         }
     }
     #[test]
-    fn r1_nested_print_duplicate_keys_refuse_tracking() {
+    fn r1_unrelated_print_duplicates_do_not_erase_selected_tracking() {
         for nested in [
             " detail = {\n nested = {\n key = first\n key = second\n }\n }\n",
             " detail = {\n nested = {\n key => first\n key => second\n }\n }\n",
@@ -1931,10 +1934,13 @@ mod a2_tests {
             text.push_str(nested);
             text.push_str("}\n");
             *r.runner.print.lock().unwrap() = Ok(out(0, &text, ""));
-            assert_eq!(r.no_current(&o).inventory().service, ServiceState::Unknown);
+            assert_eq!(
+                r.no_current(&o).inventory().service,
+                ServiceState::Running(4242)
+            );
             assert!(
                 o.observe(Some(r.current()), 1, OperationId(1), &r.d())
-                    .is_err()
+                    .is_ok()
             );
         }
     }
@@ -2352,8 +2358,16 @@ mod a2_tests {
     fn a2_parser_output_limits_fail_closed() {
         let r = Rig::new();
         let o = r.observer();
-        *r.runner.print.lock().unwrap() = Ok(out(0, &" ".repeat(65537), ""));
-        *r.runner.disabled.lock().unwrap() = Ok(out(0, &" ".repeat(65537), ""));
+        *r.runner.print.lock().unwrap() = Ok(out(
+            0,
+            &" ".repeat(crate::launchd_observation::MAX_LAUNCHD_BYTES + 1),
+            "",
+        ));
+        *r.runner.disabled.lock().unwrap() = Ok(out(
+            0,
+            &" ".repeat(crate::launchd_observation::MAX_LAUNCHD_BYTES + 1),
+            "",
+        ));
         assert_eq!(
             o.observe(None, 1, OperationId(1), &r.d()).unwrap_err(),
             NativeError::Oversize

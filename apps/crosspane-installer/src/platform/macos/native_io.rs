@@ -372,7 +372,9 @@ pub struct SupportProof {
     nonce: u64,
     issued: u64,
     wall: Instant,
-    facts: SupportObservation,
+    gui: GuiObservation,
+    gui_tmpdir: PathBuf,
+    compatibility: CompatibilityReport,
     signing: SignatureProof,
     valid: Arc<AtomicBool>,
 }
@@ -393,7 +395,8 @@ impl SupportProof {
         {
             return Err(NativeError::Unsupported);
         }
-        if io.support_observation(deadline)? != self.facts {
+        let current = io.support_observation(deadline)?;
+        if current.gui != self.gui || current.gui_tmpdir != self.gui_tmpdir {
             self.revoke();
             return Err(NativeError::Unsupported);
         }
@@ -401,6 +404,21 @@ impl SupportProof {
         self.signing.revalidate(io)?;
         Ok(())
     }
+    pub fn compatibility(&self) -> &CompatibilityReport {
+        &self.compatibility
+    }
+    pub fn check_agent_compatibility(&self) -> NativeResult<()> {
+        if self.compatibility.macos_major < 26 || !self.compatibility.apple_silicon {
+            Err(NativeError::Unsupported)
+        } else {
+            Ok(())
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompatibilityReport {
+    pub macos_major: u16,
+    pub apple_silicon: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtifactRole {
@@ -554,6 +572,7 @@ pub use commands::*;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use commands::{ChildSpawner, OwnedChild, run_owned_child};
+pub(crate) use files::DeadRuntime;
 pub use files::{DirectoryAnchor, InstallerLock, SocketEndpoint};
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -769,6 +788,7 @@ impl MacNativeIo {
         deadline: &Deadline,
         spawner: Arc<dyn TutorialSpawner>,
     ) -> NativeResult<AdmittedTutorialChild> {
+        proof.check_agent_compatibility()?;
         if signature.requirement.role != ArtifactRole::Tutorial
             || signature.path
                 != self
@@ -1025,7 +1045,8 @@ impl MacNativeIo {
         if !original.support.valid.load(Ordering::Acquire) {
             return Err(NativeError::Unsupported);
         }
-        if support.facts != original.support.facts {
+        if support.gui != original.support.gui || support.gui_tmpdir != original.support.gui_tmpdir
+        {
             return Err(NativeError::Foreign);
         }
         self.tutorial_proof_current(support)

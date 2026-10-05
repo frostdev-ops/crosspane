@@ -19,7 +19,9 @@ macro_rules! opaque_debug {
     )+};
 }
 
+mod diagnose;
 mod domains;
+pub(crate) use diagnose::diagnose;
 mod ports;
 mod repair;
 mod resume;
@@ -142,23 +144,49 @@ fn session_env() -> BTreeMap<String, String> {
     values
 }
 
-/// The session facts the manager adapters accept: only the five variables the environment was
-/// built from, never the full child environment (which also carries PATH, HOME and XDG paths).
-fn session_of(env: &ChildEnvironment) -> BTreeMap<String, String> {
-    env.values()
+/// Manager adapters receive only the user-bus address already admitted in the selected
+/// child environment. Graphical handles stay in support/agent evidence, outside manager commands.
+fn manager_session_of(values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    values
         .iter()
-        .filter(|(key, _)| {
-            matches!(
-                key.as_str(),
-                "DBUS_SESSION_BUS_ADDRESS"
-                    | "WAYLAND_DISPLAY"
-                    | "HYPRLAND_INSTANCE_SIGNATURE"
-                    | "XDG_SESSION_ID"
-                    | "XDG_SESSION_TYPE"
-            )
-        })
+        .filter(|(key, _)| key.as_str() == "DBUS_SESSION_BUS_ADDRESS")
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod manager_environment_tests {
+    use super::*;
+    #[test]
+    fn all_five_selected_session_variables_pass_only_the_already_selected_bus_to_manager() {
+        let selected = BTreeMap::from([
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/selected/private/bus".into(),
+            ),
+            ("WAYLAND_DISPLAY".into(), "wayland-fixture".into()),
+            (
+                "HYPRLAND_INSTANCE_SIGNATURE".into(),
+                "fixture-signature".into(),
+            ),
+            ("XDG_SESSION_ID".into(), "fixture-session".into()),
+            ("XDG_SESSION_TYPE".into(), "wayland".into()),
+        ]);
+        assert_eq!(
+            manager_session_of(&selected),
+            BTreeMap::from([(
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/selected/private/bus".into()
+            ),])
+        );
+        assert!(
+            manager_session_of(&BTreeMap::from([(
+                "WAYLAND_DISPLAY".into(),
+                "wayland-fixture".into()
+            ),]))
+            .is_empty()
+        );
+    }
 }
 
 fn machine_label() -> String {

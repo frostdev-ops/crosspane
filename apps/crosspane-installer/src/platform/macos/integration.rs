@@ -13,7 +13,9 @@
 //! with one typed reason and changes nothing. `compose` takes the same parts from tests, whose
 //! domains are in-memory.
 
+mod diagnose;
 mod domains;
+pub(crate) use diagnose::diagnose;
 mod native;
 mod ports;
 mod probes;

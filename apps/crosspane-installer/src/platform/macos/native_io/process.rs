@@ -71,6 +71,18 @@ impl MacNativeIo {
         let command = CommandSpec::new(&self.target, NativeOperation::Process { pid, field })?;
         self.execute(&command, None, deadline)
     }
+    /// An independently observed live PID vetoes dead-runtime recovery. A failed or
+    /// ambiguous process observation remains unknown; it never supplies death evidence.
+    pub(super) fn pid_observed_live(&self, pid: u32, deadline: &Deadline) -> NativeResult<bool> {
+        let output = self.ps(pid, PsField::Uid, deadline)?;
+        if output.code == Some(0) {
+            Ok(true)
+        } else if output.code == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+            Ok(false)
+        } else {
+            Err(NativeError::Unavailable)
+        }
+    }
     pub fn process_identity(
         &self,
         pid: u32,

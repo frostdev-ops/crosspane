@@ -3,6 +3,7 @@ pub mod audio_package;
 pub mod fonts;
 pub mod integration;
 pub mod launch_agent;
+mod launchd_observation;
 pub mod native_io;
 pub mod payload;
 pub mod permissions;

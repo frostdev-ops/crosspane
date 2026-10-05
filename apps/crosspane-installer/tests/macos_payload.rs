@@ -2,6 +2,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Explicit scratch roots, fake GUI/signature/process observations; no real native commands.
 use crosspane_installer::agent_contract;
+#[path = "../src/platform/macos/launchd_observation.rs"]
+#[allow(dead_code)]
+mod launchd_observation;
 #[path = "../src/platform/macos/native_io.rs"]
 #[allow(dead_code, unused_imports)]
 mod native_io;
@@ -456,7 +459,7 @@ struct Fixture {
     support: Arc<Support>,
     signatures: Arc<Signatures>,
     runner: Arc<Runner>,
-    _listener: UnixListener,
+    _listener: Option<UnixListener>,
 }
 impl Fixture {
     fn new(installed: bool) -> Self {
@@ -562,7 +565,7 @@ impl Fixture {
             support,
             signatures,
             runner,
-            _listener: listener,
+            _listener: Some(listener),
         };
         fixture.bootstrap(1, 4242, 0, "ready");
         fixture
@@ -954,7 +957,8 @@ fn unsupported_gui_or_bundle_signature_never_creates_payload_targets() {
                 _ => unreachable!(),
             }
         }
-        assert!(MacPayload::admit(f.io.clone(), inventory(), &f.deadline()).is_err());
+        let admitted = MacPayload::admit(f.io.clone(), inventory(), &f.deadline());
+        assert_eq!(admitted.is_ok(), case < 2);
         assert!(!f.home.join("Applications").exists());
     }
 }
@@ -2322,4 +2326,168 @@ fn existing_receipt_is_complete_old_or_new_at_actual_write_sync_rename_and_direc
             );
         }
     }
+}
+
+#[test]
+fn dead_private_runtime_is_cleaned_under_payload_consent_without_claiming_verified_publication() {
+    let mut f = Fixture::new(false);
+    drop(f._listener.take());
+    f.bootstrap(1, i32::MAX as u32, 0, "ready");
+    assert!(f.io.dead_runtime(&f.deadline()).unwrap().is_some());
+    let payload = f.payload();
+    let plan = payload.plan(1, 1, None, &f.deadline()).unwrap();
+    assert!(f.runtime.join("agent.sock").exists());
+    assert!(f.runtime.join("bootstrap.json").exists());
+    let consent = plan.consent(1, 1, false).unwrap();
+    let pending = payload
+        .install(plan, consent, None, &f.deadline())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.phase(), PayloadPhase::Published);
+    assert!(f.runtime.exists());
+    assert!(!f.runtime.join("agent.sock").exists());
+    assert!(!f.runtime.join("bootstrap.json").exists());
+    assert!(
+        !payload
+            .recovery(&f.deadline())
+            .unwrap()
+            .record
+            .unwrap()
+            .receipt
+            .unfinished
+            .is_empty()
+    );
+}
+#[test]
+fn dead_runtime_identity_change_after_consent_refuses_and_retains_the_changed_socket() {
+    let mut f = Fixture::new(false);
+    drop(f._listener.take());
+    f.bootstrap(1, i32::MAX as u32, 0, "ready");
+    let payload = f.payload();
+    let plan = payload.plan(1, 1, None, &f.deadline()).unwrap();
+    let consent = plan.consent(1, 1, false).unwrap();
+    remove_owned(&f.runtime.join("agent.sock"));
+    let replacement = UnixListener::bind(f.runtime.join("agent.sock")).unwrap();
+    chmod_owned(&f.runtime.join("agent.sock"), 0o600);
+    drop(replacement);
+    let socket = owned_stat(&f.runtime.join("agent.sock"));
+    assert!(payload.install(plan, consent, None, &f.deadline()).is_err());
+    assert!(same_inode(
+        &socket,
+        &owned_stat(&f.runtime.join("agent.sock"))
+    ));
+    assert!(f.runtime.join("bootstrap.json").exists());
+    assert!(!f.io.target().app_path().exists());
+}
+#[test]
+fn runtime_recovery_refuses_live_reused_pid_connectable_socket_foreign_neighbor_and_unsafe_modes() {
+    for variant in 0..5 {
+        let mut f = Fixture::new(false);
+        f.bootstrap(
+            1,
+            if variant == 0 {
+                std::process::id()
+            } else {
+                i32::MAX as u32
+            },
+            0,
+            "ready",
+        );
+        if variant != 1 {
+            drop(f._listener.take());
+        }
+        match variant {
+            2 => bytes(&f.runtime.join("unknown"), b"foreign", 0o600),
+            3 => chmod_owned(&f.runtime.join("bootstrap.json"), 0o644),
+            4 => f.bootstrap(1, i32::MAX as u32, 0, "ready"),
+            _ => {}
+        }
+        if variant == 4 {
+            let mut value: Value =
+                serde_json::from_slice(&fs::read(f.runtime.join("bootstrap.json")).unwrap())
+                    .unwrap();
+            value["runtime_dir"] = json!(f.home);
+            bytes(
+                &f.runtime.join("bootstrap.json"),
+                &serde_json::to_vec(&value).unwrap(),
+                0o600,
+            );
+        }
+        assert!(
+            f.io.dead_runtime(&f.deadline()).is_err(),
+            "variant {variant}"
+        );
+        assert!(f.runtime.join("agent.sock").exists());
+        assert!(f.runtime.join("bootstrap.json").exists());
+    }
+}
+#[test]
+fn long_cli_search_path_is_an_advisory_inventory_and_stays_finite() {
+    let f = Fixture::new(false);
+    let dirs = vec![PathBuf::from("/usr/local/bin"); 100];
+    assert_eq!(
+        f.payload()
+            .cli_inventory(&dirs, &f.deadline())
+            .unwrap()
+            .shadowing
+            .len(),
+        100
+    );
+    assert!(
+        f.payload()
+            .cli_inventory(&vec![PathBuf::from("/usr/local/bin"); 4097], &f.deadline())
+            .is_err()
+    );
+}
+
+#[test]
+fn positively_observed_live_pid_vetoes_recovery_before_any_socket_connection() {
+    let f = Fixture::new(false);
+    let pid = i32::MAX as u32;
+    f.runner.pid.store(u64::from(pid), Ordering::Release);
+    f.bootstrap(1, pid, 0, "ready");
+    assert_eq!(f.io.dead_runtime(&f.deadline()), Err(NativeError::Foreign));
+    let listener = f._listener.as_ref().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert!(f.runtime.join("bootstrap.json").exists());
+}
+
+#[test]
+fn unknown_process_observation_never_becomes_death_or_opens_the_socket() {
+    struct UnknownProcess(Arc<Runner>);
+    impl CommandRunner for UnknownProcess {
+        fn run(&self, spec: &CommandSpec, deadline: &Deadline) -> NativeResult<CommandOutput> {
+            if spec.program() == Path::new("/bin/ps") {
+                return Ok(CommandOutput {
+                    code: Some(1),
+                    stdout: vec![],
+                    stderr: b"unavailable".to_vec(),
+                });
+            }
+            self.0.run(spec, deadline)
+        }
+    }
+    let f = Fixture::new(false);
+    f.bootstrap(1, i32::MAX as u32, 0, "ready");
+    let io = MacNativeIo::new(
+        f.io.target().clone(),
+        Arc::new(UnknownProcess(f.runner.clone())),
+        f.support.clone(),
+        f.signatures.clone(),
+        f.clock.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        io.dead_runtime(&f.deadline()),
+        Err(NativeError::Unavailable)
+    );
+    let listener = f._listener.as_ref().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert!(f.runtime.join("bootstrap.json").exists());
 }

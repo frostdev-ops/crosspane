@@ -15,3 +15,5 @@ pub mod view;
 pub use motion::{reduced_motion, transition_fraction};
 pub use screens::WizardShell;
 pub use view::*;
+
+pub mod diagnose;
