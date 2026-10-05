@@ -597,8 +597,9 @@ pub fn create(
     use anyhow::Context;
     use crosspane_platform_windows::{
         capture::WindowsCapture, displays::WindowsDisplays, frame_capture::WindowsFrameCapture,
-        hotkey::WindowsHotkeys, inject, overlay::WindowsOverlay, session::WindowsSession,
-        stubs::UnsupportedWindows, tray::WindowsTray, window::WindowsWindowSource,
+        hotkey::WindowsHotkeys, inject, link::WindowsLinkInfo, overlay::WindowsOverlay,
+        session::WindowsSession, stubs::UnsupportedWindows, tray::WindowsTray,
+        window::WindowsWindowSource,
     };
     let e1_only = acceptance_e1(state_dir, config)?;
     let gate = IoGate::new();
@@ -676,7 +677,8 @@ pub fn create(
         frames: frames.map(|backend| Box::new(backend) as Box<dyn FrameCapture>),
         tray: optional("tray", WindowsTray::new())
             .map(|backend| Box::new(backend) as Box<dyn TrayHost>),
-        links: None,
+        links: optional("links", WindowsLinkInfo::new())
+            .map(|backend| Box::new(backend) as Box<dyn crosspane_platform::LinkInfo>),
         gpu: None,
         home: None,
         proxy_placement: None,
