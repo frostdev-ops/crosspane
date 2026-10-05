@@ -648,6 +648,10 @@ pub struct Agent {
     /// at the last readout.
     latency_overlay: bool,
     titles: HashMap<ProjectionKey, (String, u64)>,
+    /// Destination proxies whose latest source geometry keeps the real window visible.
+    mirrored_proxies: BTreeSet<ProjectionKey>,
+    /// Mirror visibility has been explained once for this projection, even if parking changes.
+    mirror_notices: BTreeSet<ProjectionKey>,
     /// This node's interfaces, and the link class of the path to each connected peer (03 §2).
     interfaces: Vec<crosspane_platform::Interface>,
     paths: HashMap<NodeId, LinkClass>,
@@ -943,6 +947,8 @@ impl Agent {
             paths: HashMap::new(),
             video_mbps: e2.video_mbps,
             titles: HashMap::new(),
+            mirrored_proxies: BTreeSet::new(),
+            mirror_notices: BTreeSet::new(),
             clocks: HashMap::new(),
             last_ping: Instant::now(),
             last_pong: HashMap::new(),
@@ -2624,13 +2630,30 @@ impl Agent {
                     let _ = host.send(HostCommand::SetFullscreen { id, fullscreen });
                 }
             }
-            Output::ProxyGeometry {
-                key,
-                size,
-                parking: _,
-            } => {
+            Output::ProxyGeometry { key, size, parking } => {
                 if let (Some(h), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
                     let _ = h.send(HostCommand::SetContentSize { id, size });
+                }
+                // A late geometry for a proxy that has closed must not recreate notice state.
+                if self.proxy_ids.id(key).is_none() {
+                    return;
+                }
+                let mirrored = parking == crosspane_protocol::projection::ParkingKind::Mirror;
+                let changed = if mirrored {
+                    self.mirrored_proxies.insert(key)
+                } else {
+                    self.mirrored_proxies.remove(&key)
+                };
+                if let Some((title, _)) = self.titles.get(&key).cloned() {
+                    if mirrored && self.mirror_notices.insert(key) {
+                        let from = self.peer_label(key.source);
+                        self.say(format!(
+                            "{title} from {from} is mirrored: it also stays visible on {from}"
+                        ));
+                    }
+                    if changed {
+                        self.set_proxy_title(key, title);
+                    }
                 }
             }
             Output::ProxyTitle { key, title } => {
@@ -2688,6 +2711,8 @@ impl Agent {
                 self.drag_places.remove(&key);
                 self.projections.remove(&key);
                 self.titles.remove(&key);
+                self.mirrored_proxies.remove(&key);
+                self.mirror_notices.remove(&key);
                 self.placement.closed(key);
                 self.placement_dirty = true;
                 let id = self.proxy_ids.close(key);
@@ -2880,6 +2905,8 @@ impl Agent {
             Notice::ProjectionEnded { key, reason } => {
                 self.tracker.projection_ended(self.node, *key, *reason);
                 self.projections.remove(key);
+                self.mirrored_proxies.remove(key);
+                self.mirror_notices.remove(key);
                 // Only this node's own projection: a peer's may carry the same number.
                 if key.source == self.node {
                     self.stale_stops.retain(|_, p| *p != key.projection);
@@ -3717,7 +3744,12 @@ impl Agent {
     /// Keep compositor matching in step with every title sent to the proxy host, including the
     /// optional latency decoration. A title update may change whether a proxy is unambiguous.
     fn set_proxy_title(&mut self, key: ProjectionKey, title: String) {
-        let title = proxy_title(title);
+        let badge = if self.mirrored_proxies.contains(&key) {
+            " (mirrored)"
+        } else {
+            ""
+        };
+        let title = proxy_title_badge(title, badge);
         self.placement.retitled(key, &title);
         self.placement_dirty = true;
         if let (Some(h), Some(id)) = (&self.host, self.proxy_ids.id(key)) {
@@ -5842,14 +5874,27 @@ impl Agent {
 
 /// Winit's Wayland title limit, applied before sending and matching titles so truncation cannot
 /// turn distinct cached strings into permanently missing or ambiguously named proxies.
-fn proxy_title(mut title: String) -> String {
-    if HYPRLAND_PLACEMENT && title.len() > 1024 {
-        let mut end = 1024;
-        while !title.is_char_boundary(end) {
-            end -= 1;
+fn proxy_title(title: String) -> String {
+    proxy_title_badge(title, "")
+}
+
+/// Keep the plain mirror badge visible within the existing title limit; the cached base title
+/// stays undecorated so a later hiding geometry restores it without stripping window content.
+fn proxy_title_badge(title: String, badge: &str) -> String {
+    proxy_title_badge_limit(title, badge, HYPRLAND_PLACEMENT.then_some(1024))
+}
+
+fn proxy_title_badge_limit(mut title: String, badge: &str, limit: Option<usize>) -> String {
+    if let Some(limit) = limit {
+        let mut end = limit.saturating_sub(badge.len());
+        if title.len() > end {
+            while !title.is_char_boundary(end) {
+                end -= 1;
+            }
+            title.truncate(end);
         }
-        title.truncate(end);
     }
+    title.push_str(badge);
     title
 }
 
@@ -20390,5 +20435,210 @@ mod media_continuity_tests {
         h.settle();
         assert_eq!(h.pictures(P)[2..], [(1, Some(33))]);
         assert_eq!(h.cursors(P)[2..], [(1, 133)]);
+    }
+}
+
+/// Real destination agent output/title plumbing; host and platform are owned fakes. The reused
+/// Rig's only network listener is exact IPv4 loopback, and it starts no discovery/OS backend.
+#[cfg(test)]
+mod mirror_notice_tests {
+    use super::*;
+    use crosspane_protocol::projection::{ParkingKind, ProjectionEndReason};
+    use std::sync::Mutex;
+
+    struct Host(Arc<Mutex<Vec<HostCommand>>>);
+    impl ProxyCommands for Host {
+        fn send(&self, command: HostCommand) -> Result<(), crosspane_render::proxy::HostError> {
+            self.0.lock().unwrap().push(command);
+            Ok(())
+        }
+    }
+    fn rig() -> (super::audio_tests::Rig, Arc<Mutex<Vec<HostCommand>>>) {
+        let mut rig = super::audio_tests::rig(false);
+        rig.agent.peers.insert(
+            rig.peer,
+            PeerInfo {
+                name: "source-machine".into(),
+                ..PeerInfo::default()
+            },
+        );
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        rig.agent.host = Some(Box::new(Host(commands.clone())));
+        (rig, commands)
+    }
+    fn open(agent: &mut Agent, key: ProjectionKey) {
+        agent.execute_one(Output::OpenProxy {
+            key,
+            title: "Owned fixture window".into(),
+            app_id: "fixture".into(),
+            size: PixelSize::new(400, 300),
+            place: None,
+        });
+    }
+    fn geometry(agent: &mut Agent, key: ProjectionKey, parking: ParkingKind) {
+        agent.execute_one(Output::ProxyGeometry {
+            key,
+            size: PixelSize::new(420, 320),
+            parking,
+        });
+    }
+    fn titles(commands: &Arc<Mutex<Vec<HostCommand>>>) -> Vec<String> {
+        commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|command| match command {
+                HostCommand::SetTitle { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn notices(agent: &Agent) -> Vec<&str> {
+        agent
+            .notices
+            .iter()
+            .filter(|text| text.contains(" is mirrored: "))
+            .map(String::as_str)
+            .collect()
+    }
+    fn key(rig: &super::audio_tests::Rig, projection: u64) -> ProjectionKey {
+        ProjectionKey {
+            source: rig.peer,
+            projection: ProjectionId(projection),
+        }
+    }
+
+    #[test]
+    fn first_mirror_geometry_says_once_and_badges_the_existing_proxy_title() {
+        let (mut rig, commands) = rig();
+        let key = key(&rig, 64);
+        open(&mut rig.agent, key);
+        geometry(&mut rig.agent, key, ParkingKind::Mirror);
+        assert_eq!(
+            notices(&rig.agent),
+            [
+                "source-machine › Owned fixture window from source-machine is mirrored: it also stays visible on source-machine"
+            ]
+        );
+        assert_eq!(
+            titles(&commands),
+            ["source-machine › Owned fixture window (mirrored)"]
+        );
+        assert_eq!(
+            rig.agent.titles[&key].0,
+            "source-machine › Owned fixture window"
+        );
+        assert!(
+            rig.agent.status()["notices"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(notices(&rig.agent)[0]))
+        );
+        assert!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command,
+            HostCommand::SetContentSize { size, .. } if *size == PixelSize::new(420, 320)))
+        );
+        // Existing source title updates and opt-in latency decoration still carry the badge.
+        rig.agent.execute_one(Output::ProxyTitle {
+            key,
+            title: "Renamed fixture".into(),
+        });
+        rig.agent.proxy_ids.presented(key, 1);
+        rig.agent.latency_titles();
+        let renamed_titles = titles(&commands);
+        assert!(renamed_titles[1].ends_with("Renamed fixture (mirrored)"));
+        assert!(renamed_titles[2].contains(" fps, ") && renamed_titles[2].ends_with(" (mirrored)"));
+        let original = format!("{} (mirrored)", "é".repeat(800));
+        rig.agent.execute_one(Output::ProxyTitle {
+            key,
+            title: original.clone(),
+        });
+        let base = rig.agent.badged(key.source, &original);
+        let bounded = proxy_title_badge_limit(base.clone(), " (mirrored)", Some(1024));
+        assert!(bounded.len() <= 1024 && bounded.ends_with(" (mirrored)"));
+        assert!(bounded.is_char_boundary(bounded.len() - " (mirrored)".len()));
+        let shown = titles(&commands).last().unwrap().clone();
+        assert_eq!(shown, proxy_title_badge(base.clone(), " (mirrored)"));
+        assert_eq!(rig.agent.titles[&key].0, base);
+        geometry(&mut rig.agent, key, ParkingKind::Twin);
+        assert_eq!(titles(&commands).last().unwrap(), &base);
+        // The window's own literal suffix remains intact when the agent's badge is removed.
+        assert_eq!(base, rig.agent.badged(key.source, &original));
+        assert_eq!(notices(&rig.agent).len(), 1);
+    }
+
+    #[test]
+    fn repeated_mirror_and_hiding_geometry_keep_one_notice_and_remove_the_badge() {
+        let (mut rig, commands) = rig();
+        let key = key(&rig, 65);
+        open(&mut rig.agent, key);
+        geometry(&mut rig.agent, key, ParkingKind::Mirror);
+        geometry(&mut rig.agent, key, ParkingKind::Mirror);
+        assert_eq!(notices(&rig.agent).len(), 1);
+        assert_eq!(titles(&commands).len(), 1);
+        // Twin is the existing hiding parking kind; the wire has no separate Hidden variant.
+        geometry(&mut rig.agent, key, ParkingKind::Twin);
+        assert_eq!(
+            titles(&commands).last().unwrap(),
+            "source-machine › Owned fixture window"
+        );
+        geometry(&mut rig.agent, key, ParkingKind::Mirror);
+        assert_eq!(notices(&rig.agent).len(), 1);
+        assert!(titles(&commands).last().unwrap().ends_with(" (mirrored)"));
+    }
+
+    #[test]
+    fn close_then_reproject_says_again_and_ignores_late_geometry() {
+        let (mut rig, commands) = rig();
+        let first = key(&rig, 66);
+        open(&mut rig.agent, first);
+        geometry(&mut rig.agent, first, ParkingKind::Mirror);
+        rig.agent.execute_one(Output::CloseProxy { key: first });
+        assert!(!rig.agent.mirrored_proxies.contains(&first));
+        assert!(!rig.agent.mirror_notices.contains(&first));
+        let before = commands.lock().unwrap().len();
+        geometry(&mut rig.agent, first, ParkingKind::Mirror);
+        assert_eq!(commands.lock().unwrap().len(), before);
+        assert_eq!(notices(&rig.agent).len(), 1);
+        // Re-admit the same key so this proves cleanup, rather than just a fresh-key insertion.
+        open(&mut rig.agent, first);
+        geometry(&mut rig.agent, first, ParkingKind::Mirror);
+        assert_eq!(notices(&rig.agent).len(), 2);
+        assert!(titles(&commands).last().unwrap().ends_with(" (mirrored)"));
+    }
+
+    #[test]
+    fn projection_end_clears_notice_state_without_changing_source_notices() {
+        let (mut rig, _) = rig();
+        let key = key(&rig, 68);
+        open(&mut rig.agent, key);
+        geometry(&mut rig.agent, key, ParkingKind::Mirror);
+        rig.agent.notice(&Notice::ProjectionEnded {
+            key,
+            reason: ProjectionEndReason::WindowClosed,
+        });
+        assert!(!rig.agent.mirrored_proxies.contains(&key));
+        assert!(!rig.agent.mirror_notices.contains(&key));
+        assert_eq!(
+            rig.agent.notices.back().unwrap(),
+            "projection 68 ended: WindowClosed"
+        );
+        // Source notice formatting is deliberately unchanged.
+        rig.agent.notice(&Notice::ProjectionStarted {
+            key: ProjectionKey {
+                source: rig.local,
+                projection: ProjectionId(69),
+            },
+            peer: rig.peer,
+            parking: ParkingKind::Mirror,
+        });
+        assert_eq!(
+            rig.agent.notices.back().unwrap(),
+            "projecting window 69 to source-machine (Mirror)"
+        );
     }
 }
