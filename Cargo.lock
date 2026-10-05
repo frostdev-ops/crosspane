@@ -1024,6 +1024,8 @@ dependencies = [
  "anyhow",
  "crosspane-media",
  "crosspane-types",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "pollster",
  "thiserror 2.0.21",
  "tracing",

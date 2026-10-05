@@ -282,6 +282,8 @@ pub enum HostEvent {
     /// Sent after `Opened` and whenever any of it changes.
     Placed {
         id: u64,
+        /// The own NSWindow's number on macOS; unavailable on other platforms.
+        window_number: Option<u32>,
         visible: bool,
         monitor: Option<u32>,
         origin: PointDevice,
@@ -528,7 +530,7 @@ fn check(handle: &HostHandle, events: &Receiver<HostEvent>) {
     };
 
     // The first report comes straight after `Opened`: nothing can come between them.
-    let HostEvent::Placed { id: ID, visible, monitor: Some(monitor), origin, size } =
+    let HostEvent::Placed { id: ID, visible, monitor: Some(monitor), origin, size, .. } =
         events.recv_timeout(Duration::from_secs(15)).expect("a report after Opened")
     else {
         panic!("Opened was not followed by a Placed that names a monitor");

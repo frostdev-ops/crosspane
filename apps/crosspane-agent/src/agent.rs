@@ -280,6 +280,9 @@ struct PlacementSource {
     lookup_retry: BTreeMap<ProjectionKey, (Instant, Instant, Duration)>,
     #[cfg(target_os = "macos")]
     lookup_rereport: BTreeSet<ProjectionKey>,
+    /// Current host-reported numbers, distinct from IDs pinned by the title fallback.
+    #[cfg(target_os = "macos")]
+    host_numbered: BTreeSet<ProjectionKey>,
 }
 
 impl PlacementSource {
@@ -300,6 +303,8 @@ impl PlacementSource {
             lookup_retry: BTreeMap::new(),
             #[cfg(target_os = "macos")]
             lookup_rereport: BTreeSet::new(),
+            #[cfg(target_os = "macos")]
+            host_numbered: BTreeSet::new(),
         }
     }
 
@@ -364,6 +369,7 @@ impl PlacementSource {
             self.lookup_warned.remove(&key);
             self.lookup_retry.remove(&key);
             self.lookup_rereport.remove(&key);
+            self.host_numbered.remove(&key);
         }
     }
 
@@ -1422,9 +1428,25 @@ impl Agent {
         {
             return;
         }
-        let windows = (self.platform.own_windows)().unwrap_or_default();
         let keys: Vec<_> = self.placement.proxies.keys().copied().collect();
+        let windows = if keys
+            .iter()
+            .any(|key| !self.placement.host_numbered.contains(key))
+        {
+            (self.platform.own_windows)().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         for key in keys {
+            if self.placement.host_numbered.contains(&key) {
+                self.placement.lookup_retry.remove(&key);
+                if self.placement.lookup_rereport.remove(&key)
+                    && let Some(window) = self.placement.native.get(&key).copied()
+                {
+                    self.pending.push_back(Input::ProxyWindow { key, window });
+                }
+                continue;
+            }
             let title = &self.placement.proxies[&key];
             let mut matches = windows.iter().filter(|(_, name)| name == title);
             let window = match (matches.next(), matches.next()) {
@@ -4772,6 +4794,25 @@ impl Agent {
     }
 
     fn on_host(&mut self, event: HostEvent) {
+        #[cfg(target_os = "macos")]
+        if let HostEvent::Placed {
+            id, window_number, ..
+        } = &event
+            && let Some(key) = self.proxy_ids.key(*id)
+            && self.placement.proxies.contains_key(&key)
+        {
+            if let Some(number) = window_number.filter(|number| *number != 0) {
+                let window = WindowId(u64::from(number));
+                self.placement.host_numbered.insert(key);
+                self.placement.lookup_retry.remove(&key);
+                let rereport = self.placement.lookup_rereport.remove(&key);
+                if self.placement.native.insert(key, window) != Some(window) || rereport {
+                    self.pending.push_back(Input::ProxyWindow { key, window });
+                }
+            } else if self.placement.host_numbered.remove(&key) {
+                self.placement_dirty = true;
+            }
+        }
         // Where the host can't say which display a proxy is on (Wayland), it says only whether the
         // proxy is visible; the placement source supplies the rest and is the only producer of
         // `ProxyEvent::Placed` there, so the host's own origin and size aren't used.
@@ -4870,6 +4911,7 @@ impl Agent {
                 monitor,
                 origin,
                 size,
+                ..
             } => (
                 id,
                 Box::new(move |key| {
@@ -16344,6 +16386,116 @@ mod home_tests {
     }
 
     #[cfg(target_os = "macos")]
+    mod wp269 {
+        use super::*;
+
+        thread_local! {
+            static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            static WINDOWS: std::cell::RefCell<Vec<(WindowId, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        fn own_windows() -> Result<Vec<(WindowId, String)>, PlatformError> {
+            LOOKUPS.with(|calls| calls.set(calls.get() + 1));
+            WINDOWS.with(|rows| Ok(rows.borrow().clone()))
+        }
+
+        fn fixture() -> Home {
+            LOOKUPS.with(|calls| calls.set(0));
+            WINDOWS.with(|rows| rows.borrow_mut().clear());
+            let mut h = home();
+            h.rig.agent.platform.own_windows = own_windows;
+            h
+        }
+
+        fn open(h: &mut Home, key: ProjectionKey, title: &str) -> u64 {
+            h.rig.agent.titles.insert(key, (title.into(), 0));
+            let id = h.rig.agent.proxy_ids.open(key);
+            h.rig.agent.observe(&Input::ProxyOpened {
+                key,
+                result: Ok((PixelSize::new(800, 600), 2.0)),
+            });
+            id
+        }
+
+        fn report(h: &mut Home, id: u64, window_number: Option<u32>) {
+            h.rig.agent.on_host(HostEvent::Placed {
+                id,
+                window_number,
+                visible: true,
+                monitor: Some(1),
+                origin: PointDevice::new(20.0, 40.0),
+                size: PixelSize::new(800, 600),
+            });
+        }
+
+        #[test]
+        fn reported_number_resolves_at_once_without_title_lookup() {
+            let mut h = fixture();
+            let key = proxy_key(1);
+            let id = open(&mut h, key, "fixture proxy");
+            report(&mut h, id, Some(0x123));
+            assert_eq!(LOOKUPS.with(|calls| calls.get()), 0);
+            assert_eq!(
+                h.rig.agent.placement.native.get(&key),
+                Some(&WindowId(0x123))
+            );
+            assert!(
+                matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key: got, window: WindowId(0x123) }) if got == key)
+            );
+            assert!(h.rig.agent.placement.lookup_retry.is_empty());
+            assert!(h.rig.agent.placement.lookup_warned.is_empty());
+        }
+
+        #[test]
+        fn identical_titles_resolve_to_distinct_reported_numbers() {
+            let mut h = fixture();
+            let a = proxy_key(1);
+            let b = proxy_key(2);
+            let first = open(&mut h, a, "same fixture title");
+            report(&mut h, first, Some(0x123));
+            let second = open(&mut h, b, "same fixture title");
+            report(&mut h, second, Some(0x456));
+            assert_eq!(h.rig.agent.placement.native.get(&a), Some(&WindowId(0x123)));
+            assert_eq!(h.rig.agent.placement.native.get(&b), Some(&WindowId(0x456)));
+            let bindings: Vec<_> = h
+                .rig
+                .agent
+                .pending
+                .iter()
+                .filter_map(|input| {
+                    if let Input::ProxyWindow { key, window } = input {
+                        Some((*key, *window))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(bindings, [(a, WindowId(0x123)), (b, WindowId(0x456))]);
+            assert_eq!(LOOKUPS.with(|calls| calls.get()), 0);
+        }
+
+        #[test]
+        fn missing_number_uses_existing_unique_title_fallback() {
+            let mut h = fixture();
+            let key = proxy_key(1);
+            let id = open(&mut h, key, "fallback fixture title");
+            WINDOWS.with(|rows| {
+                rows.borrow_mut()
+                    .push((WindowId(0x789), "fallback fixture title".into()))
+            });
+            report(&mut h, id, None);
+            assert_eq!(LOOKUPS.with(|calls| calls.get()), 1);
+            assert_eq!(
+                h.rig.agent.placement.native.get(&key),
+                Some(&WindowId(0x789))
+            );
+            assert!(
+                matches!(h.rig.agent.pending.pop_front(), Some(Input::ProxyWindow { key: got, window: WindowId(0x789) }) if got == key)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn mac_proxy_identity_requires_unique_own_pid_title_and_re_reports_after_retitle() {
         let mut h = home();
@@ -17377,6 +17529,7 @@ mod home_tests {
         // The host says visible (its own origin and size are Wayland's guess and are ignored).
         h.rig.agent.on_host(HostEvent::Placed {
             id,
+            window_number: None,
             visible: true,
             monitor: None,
             origin: PointDevice::new(777.0, 777.0),
@@ -17393,6 +17546,7 @@ mod home_tests {
         // Minimised: nowhere again. The same state twice says nothing.
         h.rig.agent.on_host(HostEvent::Placed {
             id,
+            window_number: None,
             visible: false,
             monitor: None,
             origin: PointDevice::new(0.0, 0.0),
@@ -17401,6 +17555,7 @@ mod home_tests {
         assert_eq!(placed(&mut h), [NOWHERE]);
         h.rig.agent.on_host(HostEvent::Placed {
             id,
+            window_number: None,
             visible: false,
             monitor: None,
             origin: PointDevice::new(0.0, 0.0),
@@ -17410,6 +17565,7 @@ mod home_tests {
         // A host that does name a monitor (macOS) is believed as before.
         h.rig.agent.on_host(HostEvent::Placed {
             id,
+            window_number: None,
             visible: true,
             monitor: Some(3),
             origin: PointDevice::new(5.0, 6.0),

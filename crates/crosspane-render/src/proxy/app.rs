@@ -354,7 +354,11 @@ impl App {
         let placed = window.placement.update(&sample);
         if let Some(placed) = placed {
             tracing::debug!(id, ?placed, ?trigger, "proxy placement");
-            (self.events)(placed.event(id));
+            #[cfg(target_os = "macos")]
+            let window_number = mac_window_number(&window.window);
+            #[cfg(not(target_os = "macos"))]
+            let window_number = None;
+            (self.events)(placed.event(id, window_number));
         }
     }
 
@@ -1338,15 +1342,33 @@ struct Placement {
 }
 
 impl Placement {
-    fn event(self, id: u64) -> HostEvent {
+    fn event(self, id: u64, window_number: Option<u32>) -> HostEvent {
         HostEvent::Placed {
             id,
+            window_number,
             visible: self.visible,
             monitor: self.monitor,
             origin: self.origin,
             size: self.size,
         }
     }
+}
+
+/// Read only the host's own AppKit object, on the event loop's main thread.
+#[cfg(target_os = "macos")]
+fn mac_window_number(window: &Window) -> Option<u32> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let _main = objc2::MainThreadMarker::new()?;
+    let RawWindowHandle::AppKit(handle) = window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+    // SAFETY: winit's AppKit handle supplies its live NSView. The borrowed Window keeps it
+    // alive throughout this main-thread query; no pointer or native object leaves this call.
+    let view = unsafe { handle.ns_view.cast::<objc2_app_kit::NSView>().as_ref() };
+    u32::try_from(view.window()?.windowNumber())
+        .ok()
+        .filter(|number| *number != 0)
 }
 
 /// The window as it is now.
@@ -2528,9 +2550,10 @@ mod tests {
             size: PixelSize::new(1280, 720),
         };
         assert_eq!(
-            placed.event(26),
+            placed.event(26, None),
             HostEvent::Placed {
                 id: 26,
+                window_number: None,
                 visible: false,
                 monitor: Some(69_733_248),
                 origin: PointDevice::new(12.0, -34.0),
