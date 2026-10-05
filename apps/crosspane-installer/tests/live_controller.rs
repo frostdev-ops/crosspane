@@ -778,6 +778,94 @@ fn an_install_step_waits_for_the_person_while_crosspane_is_in_use() {
     assert_eq!(apply.step, RESTART);
 }
 
+/// WP-4.31b, the Mac loop: the install step applied, its Verify had to wait for the new agent,
+/// the step was looked at again by itself, planned the same change again and was consented to
+/// again, every few seconds without end. Setup goes ahead with a step by itself once per run; a
+/// second plan is a plain question with its preview and one button.
+#[test]
+fn an_install_step_that_plans_again_after_applying_goes_ahead_by_itself_only_once() {
+    let is_apply = |jobs: &[NativeJob]| {
+        jobs.iter()
+            .any(|j| matches!(j, NativeJob::Step { job, .. } if job.stage == JobStage::Apply))
+    };
+    let mut d = description();
+    // Like the Mac install step, it reads the agent, so a wait is re-checked by itself.
+    d.steps[1].uses_status = true;
+    let mut h = H::with(d);
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    let mut applied = 0;
+    let mut last_plan = None;
+    // Run the loop's shape twice: detect, plan, (apply, verify waits) and around again.
+    for round in 0..2 {
+        h.status_reply();
+        let (detect, _) = h.job(PAYLOAD, JobStage::Detect);
+        h.report(&detect, NativeOutcome::Detected { needs_action: true });
+        h.status_reply();
+        let (plan, _) = h.job(PAYLOAD, JobStage::Plan);
+        h.report(
+            &plan,
+            NativeOutcome::Planned {
+                preview: format!("Install Crosspane and start it (round {round})"),
+            },
+        );
+        let mut jobs = h.take_jobs();
+        for _ in 0..10 {
+            h.advance(300);
+            h.tick();
+            jobs.extend(h.take_jobs());
+        }
+        if !is_apply(&jobs) {
+            last_plan = Some(plan);
+            break;
+        }
+        applied += 1;
+        let apply = jobs
+            .into_iter()
+            .find_map(|j| match j {
+                NativeJob::Step { job, consent, .. } if job.stage == JobStage::Apply => {
+                    Some((job, consent))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(apply.1.map(|c| c.plan), Some(plan.operation));
+        h.report(&apply.0, NativeOutcome::Applied(ApplyOutcome::Applied));
+        h.status_reply();
+        let (verify, _) = h.job(PAYLOAD, JobStage::Verify);
+        // The new agent isn't answering yet: the step waits and is looked at again by itself.
+        h.report(&verify, NativeOutcome::Waiting(WaitKind::Contract));
+    }
+    assert_eq!(applied, 1, "one automatic go-ahead per step per run");
+    let plan = last_plan.expect("the second plan is asked, not taken");
+    assert_eq!(h.view().screen, ScreenId::InstallPlan);
+    assert_eq!(h.row(PAYLOAD).state, RowState::NeedsAction);
+    let message = &h.view().message;
+    assert!(message.contains("Install Crosspane and start it (round 1)"));
+    assert!(message.contains("already did this once"));
+    assert!(!message.contains("in use"));
+    let primaries: Vec<u16> = h
+        .view()
+        .buttons
+        .iter()
+        .filter(|b| b.kind == ButtonKind::Primary)
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(primaries, vec![ids::consent(PAYLOAD)]);
+    // Nothing more happens by itself, however long the question stays up.
+    for _ in 0..20 {
+        h.advance(500);
+        h.tick();
+    }
+    assert!(!is_apply(&h.take_jobs()));
+    // The person's click is the consent, bound to this second preview.
+    h.click(ids::consent(PAYLOAD));
+    let (apply, consent) = h.job(PAYLOAD, JobStage::Apply);
+    assert_eq!(consent.map(|c| c.plan), Some(plan.operation));
+    assert_eq!(apply.step, PAYLOAD);
+}
+
 #[test]
 fn refused_and_unknown_mutations_wait_or_redetect_before_any_retry() {
     let mut h = H::new();
@@ -807,7 +895,11 @@ fn refused_and_unknown_mutations_wait_or_redetect_before_any_retry() {
             preview: "p2".into(),
         },
     );
-    // A new plan is a new preview: the go-ahead is recorded against it, never against "p".
+    // The start click covered one go: a step that asks again asks the person.
+    assert!(h.take_jobs().is_empty(), "the second plan is not taken");
+    assert!(h.view().message.contains("p2"));
+    h.click(ids::consent(PAYLOAD));
+    // A new plan is a new preview: the consent is recorded against it, never against "p".
     let (apply, consent) = h.job(PAYLOAD, JobStage::Apply);
     assert_eq!(consent.map(|c| c.plan), Some(plan.operation));
     h.report(&apply, NativeOutcome::Applied(ApplyOutcome::Refused));

@@ -572,6 +572,21 @@ impl LiveController {
             .join("\n\n")
     }
 
+    /// Why an install step that normally goes ahead by itself is asking instead.
+    fn why_install_asks(&self, screen: ScreenId) -> &'static str {
+        let repeated = self.page_steps(screen).into_iter().any(|step| {
+            self.step_state(step) == StepState::NeedsAction && self.auto_consented.contains(&step)
+        });
+        if !self.agent_quiet() {
+            "Crosspane is in use right now, so this waits for you. Continuing interrupts what is \
+             shared at the moment."
+        } else if repeated {
+            "Setup already did this once and it is needed again, so this time it waits for you."
+        } else {
+            "This waits for you."
+        }
+    }
+
     /// Whether any step on this page stopped with a problem the person has to fix.
     fn page_failed(&self, screen: ScreenId) -> bool {
         self.page_steps(screen).into_iter().any(|step| {
@@ -621,10 +636,7 @@ impl LiveController {
                 } else if asking {
                     (
                         "Ready for the next step".into(),
-                        format!(
-                            "{preview}\n\nCrosspane is in use right now, so this waits for you. \
-                             Continuing interrupts what is shared at the moment."
-                        ),
+                        format!("{preview}\n\n{}", self.why_install_asks(screen)),
                     )
                 } else if done {
                     ("Crosspane is installed".into(), String::new())

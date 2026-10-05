@@ -432,13 +432,21 @@ impl NativeInstalls {
         Some((selected, reply.clone()))
     }
 
+    /// An install this run applied: its first start was requested and the new agent hasn't
+    /// confirmed it yet. Only the flow's own Verify (through [`Installs::verify`]) can finish it.
+    fn awaiting_confirmation(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|r| r.pending.phase() == LaunchPhase::BootstrapRequested)
+    }
+
     /// Admit the launch flow and plan it for `operation`.
     fn plan_launch(
         &self,
         operation: OperationId,
         status: Option<&AgentReply>,
         deadline: &Deadline,
-    ) -> Result<(MacLaunchAgent, LaunchPlan, bool), InstallError> {
+    ) -> Result<(MacLaunchAgent, LaunchPlan, Standing), InstallError> {
         let io = self.env.io().map_err(map_native)?;
         let mut launch = MacLaunchAgent::admit(
             io.clone(),
@@ -465,11 +473,41 @@ impl NativeInstalls {
         {
             return Err(InstallError::Foreign);
         }
-        let is_current = plan.state() == LaunchState::Owned
-            && payload_state == PayloadState::Matching
-            && !payload_plan.resuming_publication();
-        Ok((launch, plan, is_current))
+        let published =
+            plan.state() == LaunchState::Owned && payload_state == PayloadState::Matching;
+        let standing = if !published {
+            Standing::Needed
+        } else if !payload_plan.resuming_publication() {
+            Standing::Current
+        } else {
+            Standing::Unconfirmed
+        };
+        Ok((launch, plan, standing))
     }
+
+    /// Where the install stands for detection. A publication still waiting for its new agent's
+    /// confirmation is an interrupted install to resume (WP-4.30) only when it isn't this run's
+    /// own: the one this run just applied is done, and its Verify confirms it. Planning it again
+    /// would stop the agent it just started and publish the same files once more, without end.
+    fn standing(&self, standing: Standing) -> InstallState {
+        match standing {
+            Standing::Current => InstallState::Current,
+            Standing::Unconfirmed if self.awaiting_confirmation() => InstallState::Current,
+            Standing::Unconfirmed | Standing::Needed => InstallState::Needed,
+        }
+    }
+}
+
+/// What a fresh read says about the install, before this run's own work is taken into account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// Crosspane's own files and sign-in item, matching this payload and verified.
+    Current,
+    /// Crosspane's own files and sign-in item, matching this payload, published but not yet
+    /// confirmed by the agent that started from them.
+    Unconfirmed,
+    /// Absent, stale, or not Crosspane's own yet.
+    Needed,
 }
 
 impl Installs for NativeInstalls {
@@ -479,15 +517,11 @@ impl Installs for NativeInstalls {
         deadline: &Deadline,
     ) -> Result<InstallState, InstallError> {
         let operation = OperationId(1);
-        let (_, plan, current) = self.plan_launch(operation, status, deadline)?;
+        let (_, plan, standing) = self.plan_launch(operation, status, deadline)?;
         if let Some(error) = blocker(plan.state()) {
             return Err(error);
         }
-        Ok(if current {
-            InstallState::Current
-        } else {
-            InstallState::Needed
-        })
+        Ok(self.standing(standing))
     }
 
     fn plan(
@@ -497,11 +531,11 @@ impl Installs for NativeInstalls {
         deadline: &Deadline,
     ) -> Result<Option<InstallPreview>, InstallError> {
         self.kept = None;
-        let (launch, plan, current) = self.plan_launch(operation, status, deadline)?;
+        let (launch, plan, standing) = self.plan_launch(operation, status, deadline)?;
         if let Some(error) = blocker(plan.state()) {
             return Err(error);
         }
-        if current {
+        if self.standing(standing) == InstallState::Current {
             return Ok(None);
         }
         let preview = InstallPreview {
@@ -596,9 +630,10 @@ impl Installs for NativeInstalls {
             }
         };
         // The Status was issued after the apply: say so to the adapter, which refuses anything
-        // issued earlier or from the old instance.
+        // issued earlier or from the old instance. Every Verify brings a newer Status, so a
+        // refusal here means this publication can't be confirmed any more (its payload already
+        // ended in an unknown state): it is dropped, and the install is judged from the disk.
         if running.pending.expect_health(reply.id).is_err() {
-            self.running = Some(running);
             return Err(InstallError::Unavailable);
         }
         match running.launch.observe(

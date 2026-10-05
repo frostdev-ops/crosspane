@@ -1,6 +1,6 @@
 //! Controller state, the core reduce/dispatch loop, native-result correlation and agent routing.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crosspane_installer_core::{
     Flow, FlowError, FlowEvent, JobIntent, JobStage, ObservationSource, StepId, StepState, Summary,
@@ -126,6 +126,10 @@ pub struct LiveController {
     /// The person started setup from the welcome screen. That click is the go-ahead for the
     /// install steps that only touch their own account; nothing is changed before it.
     pub(super) install_started: bool,
+    /// The install steps setup already went ahead with by itself in this run. Each step gets that
+    /// once: if it asks again (it planned another change after the first one), the person
+    /// answers, so a step that keeps re-planning can never repeat itself without end.
+    pub(super) auto_consented: BTreeSet<StepId>,
     /// The current screen moves on by itself once everything on it is done. Off after the person
     /// went back to it, so a deliberate visit isn't cut short.
     pub(super) auto_advance: bool,
@@ -244,6 +248,7 @@ impl LiveController {
             step_apply_calls: BTreeMap::new(),
             support_checks: None,
             install_started: false,
+            auto_consented: BTreeSet::new(),
             auto_advance: true,
             complete_since: None,
             agent_health_pending: false,
@@ -800,6 +805,8 @@ impl LiveController {
     /// click, recorded against that exact preview. Never for steps that need an administrator, a
     /// system permission or a firewall change, and never while the agent is in use (a restart or
     /// replacement would cut that short): then the step asks, with its preview, like any other.
+    /// Each step goes ahead by itself at most once per run; after that it asks (see
+    /// [`Self::auto_consented`]).
     fn auto_consent(&mut self) {
         if !self.install_started || !automatic_screen(self.screen) || !self.agent_quiet() {
             return;
@@ -807,7 +814,7 @@ impl LiveController {
         let ready: Vec<StepId> = self
             .graph
             .on_screen(self.screen)
-            .filter(|m| m.kind == StepKind::Native)
+            .filter(|m| m.kind == StepKind::Native && !self.auto_consented.contains(&m.id))
             .filter(|m| {
                 self.step_state(m.id) == StepState::NeedsAction
                     && self.previews.contains_key(&m.id)
@@ -816,6 +823,8 @@ impl LiveController {
             .map(|m| m.id)
             .collect();
         for step in ready {
+            // Recorded before the attempt: whatever happens to it, this was the step's one go.
+            self.auto_consented.insert(step);
             self.consent_click(step);
         }
         self.dispatch_intents();

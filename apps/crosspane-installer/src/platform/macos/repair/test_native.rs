@@ -307,3 +307,83 @@ fn install_keeps_publication_across_managed_restart_admission_failure() {
     assert_eq!(f.runner.count("bootstrap"), 1);
     assert_eq!(f.runner.count("bootout"), 0);
 }
+
+/// WP-4.31b, the Mac loop: after its own apply, the install step's first Verify finds the new
+/// agent not answering yet, the step is checked again from detection, and detection used to
+/// report the fresh, still unconfirmed publication as an interrupted install to resume. Setup
+/// then stopped the agent it had just started and published everything again, every few seconds.
+/// The publication this run made is done; only its Verify finishes it. Another run (a fresh
+/// adapter) still sees it as interrupted, as WP-4.30 wants.
+#[test]
+fn an_install_this_run_applied_is_detected_as_done_until_its_new_agent_confirms_it() {
+    let f = Fixture::new(false);
+    let env = || {
+        Arc::new(NativeEnv::new(
+            f.io.target().clone(),
+            inventory(),
+            MacProbes {
+                support: f.support.clone(),
+                signatures: f.signatures.clone(),
+                approval: Arc::new(ApprovalFixture(Approval::Allowed)),
+                runner: f.runner.clone(),
+            },
+            f.clock.clone(),
+        ))
+    };
+    let mut installs = NativeInstalls::new(env());
+    let op = crosspane_installer_core::OperationId(1);
+    assert!(installs.plan(op, None, &f.deadline()).unwrap().is_some());
+    assert_eq!(
+        installs.apply(op, &f.deadline()).unwrap(),
+        domains::InstallApplied::Requested
+    );
+    // The first Status after the bootstrap reaches no agent yet.
+    assert!(installs.verify(None, &f.deadline()).is_err());
+    // The new agent comes up.
+    f.runner.pid.store(4244, Ordering::Release);
+    f.runner.behavior.lock().unwrap().job_pid = 4244;
+    f.bootstrap(3, 4244, 1000, "ready");
+    f.clock.0.store(100, Ordering::Release);
+    assert_eq!(record(&f, "payload.json")["phase"], "Published");
+    // Checked again from detection: this run's own publication needs nothing more.
+    let (_, status) = current(&f, 101);
+    assert_eq!(
+        installs.detect(Some(&status), &f.deadline()).unwrap(),
+        domains::InstallState::Current
+    );
+    // And a plan asked for now has nothing to change.
+    let (_, status) = current(&f, 102);
+    assert!(
+        installs
+            .plan(
+                crosspane_installer_core::OperationId(2),
+                Some(&status),
+                &f.deadline()
+            )
+            .unwrap()
+            .is_none()
+    );
+    // Another installer run didn't make this publication: to it, it is an interrupted install.
+    let (_, status) = current(&f, 103);
+    assert_eq!(
+        NativeInstalls::new(env())
+            .detect(Some(&status), &f.deadline())
+            .unwrap(),
+        domains::InstallState::Needed
+    );
+    // This run's Verify confirms it against the new agent.
+    let (_, status) = current(&f, 104);
+    assert_eq!(
+        installs.verify(Some(&status), &f.deadline()).unwrap(),
+        ObservationSource::Demo
+    );
+    assert_eq!(record(&f, "payload.json")["phase"], "Verified");
+    let (_, status) = current(&f, 105);
+    assert_eq!(
+        installs.detect(Some(&status), &f.deadline()).unwrap(),
+        domains::InstallState::Current
+    );
+    // One start, and the agent it started was never stopped.
+    assert_eq!(f.runner.count("bootstrap"), 1);
+    assert_eq!(f.runner.count("bootout"), 0);
+}
