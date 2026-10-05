@@ -14,6 +14,7 @@
 //! Unknown keys are swallowed during capture but never translated through virtual-key guesses.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crosspane_input::Held;
 use crosspane_platform::{
@@ -143,6 +144,48 @@ impl DragPhase {
     }
 }
 
+/// Owner-only transfer on the existing one-primary-token atomics. No OS call or new ledger.
+/// The owner drains callback records first; InjectedFirst and a newer nonce are never retired.
+#[allow(dead_code, clippy::too_many_arguments)] // Borrowed native fields, not another state owner.
+pub(crate) fn expire_drag_shared(
+    expired: usize,
+    order: &AtomicU8,
+    first: &AtomicU8,
+    nonce: &AtomicUsize,
+    late: &AtomicUsize,
+    original: &AtomicU64,
+    primary: &AtomicU8,
+    token: &AtomicU64,
+) -> bool {
+    let phase = order.load(Ordering::Acquire);
+    if expired == 0 || nonce.load(Ordering::Acquire) != expired || !matches!(phase, 4 | 5) {
+        return false;
+    }
+    let owned = original.load(Ordering::Acquire);
+    if owned != 0 && token.load(Ordering::Acquire) == owned {
+        token.store(0, Ordering::Release);
+        if phase == 5 && primary.load(Ordering::Acquire) == 2 {
+            // No physical UP was observed: preserve the original local-held state.
+            primary.store(1, Ordering::Release);
+        }
+    }
+    late.store(expired, Ordering::Release);
+    original.store(0, Ordering::Release);
+    first.store(0, Ordering::Release);
+    nonce.store(0, Ordering::Release);
+    order.store(0, Ordering::Release);
+    true
+}
+
+/// Exact one-shot late-tag consumption, used by the real LL branch. Wrong/zero tags are inert.
+#[allow(dead_code)]
+pub(crate) fn consume_late_drag_tag(late: &AtomicUsize, nonce: usize) -> bool {
+    nonce != 0
+        && late
+            .compare_exchange(nonce, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
 /// The supplied portal rectangles are complete global physical strips, not logical rectangles.
 /// CaptureId uniqueness is the frozen engine contract; old suppression tokens survive end.
 #[derive(Debug)]
@@ -159,6 +202,9 @@ pub struct HookState {
     drag_phase: Option<DragPhase>,
     drag_nonce: usize,
     drag_report: Option<DragSettlementResult>,
+    drag_id: Option<CaptureId>,
+    drag_wait_at: Option<MonoTime>,
+    expired_drag_nonce: usize,
 }
 
 impl Default for HookState {
@@ -181,6 +227,9 @@ impl HookState {
             drag_phase: None,
             drag_nonce: 0,
             drag_report: None,
+            drag_id: None,
+            drag_wait_at: None,
+            expired_drag_nonce: 0,
         }
     }
 
@@ -318,6 +367,9 @@ impl HookState {
         self.drag_phase = Some(DragPhase::Reserved);
         self.drag_nonce = nonce;
         self.drag_report = None;
+        self.drag_id = Some(id);
+        self.drag_wait_at = None;
+        self.expired_drag_nonce = 0;
         Ok(())
     }
 
@@ -374,6 +426,11 @@ impl HookState {
             suppress: false,
             events: Vec::new(),
         };
+        if nonce != 0 && self.expired_drag_nonce == nonce {
+            self.expired_drag_nonce = 0;
+            decision.suppress = true;
+            return decision;
+        }
         if nonce == 0 || self.drag_nonce != nonce {
             return decision;
         }
@@ -385,6 +442,35 @@ impl HookState {
             self.drag_nonce = 0;
         }
         decision
+    }
+
+    /// One second from the physical UP receipt, or first eligible no-UP Uncertain owner tick.
+    /// InjectedFirst never expires: its real physical tail uses the existing hook-loss watchdog.
+    /// Expiry grants no settlement/activation evidence and remembers only one late tag.
+    #[allow(dead_code)]
+    pub(crate) fn expire_drag_tail(&mut self, at: MonoTime) -> Option<usize> {
+        if !matches!(
+            self.drag_phase,
+            Some(DragPhase::PhysicalFirst | DragPhase::Uncertain)
+        ) {
+            self.drag_wait_at = None;
+            return None;
+        }
+        let since = *self.drag_wait_at.get_or_insert(at);
+        if at.saturating_duration_since(since) < std::time::Duration::from_secs(1) {
+            return None;
+        }
+        let nonce = self.drag_nonce;
+        if self.suppressed_buttons[0] == self.drag_id {
+            self.suppressed_buttons[0] = None;
+        }
+        self.drag_phase = None;
+        self.drag_nonce = 0;
+        self.drag_report = None;
+        self.drag_id = None;
+        self.drag_wait_at = None;
+        self.expired_drag_nonce = nonce;
+        Some(nonce)
     }
 
     /// Cancellation before any dispatch; this cannot release an accepted/uncertain up's tail.
@@ -532,10 +618,16 @@ impl HookState {
                     return decision;
                 }
                 if i == 0 && !down && self.drag_phase.is_some() {
+                    let previous_phase = self.drag_phase;
                     let (order, suppress) =
                         drag_up_transition(self.drag_phase.map_or(0, |p| p as u8), false);
                     if !suppress {
                         self.drag_phase = DragPhase::from_order(order);
+                        if order == DragPhase::PhysicalFirst as u8
+                            && previous_phase != Some(DragPhase::PhysicalFirst)
+                        {
+                            self.drag_wait_at = Some(mouse.at);
+                        }
                         if order == 0 {
                             self.suppressed_buttons[0] = None;
                             self.drag_nonce = 0;

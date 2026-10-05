@@ -189,6 +189,8 @@ struct Shared {
     drag_order: AtomicU8,
     drag_first: AtomicU8,
     drag_nonce: AtomicUsize,
+    drag_late_nonce: AtomicUsize,
+    drag_token: AtomicU64,
     raw_x: AtomicI64,
     raw_y: AtomicI64,
     ring: Ring,
@@ -237,6 +239,8 @@ impl Shared {
             drag_order: AtomicU8::new(0),
             drag_first: AtomicU8::new(0),
             drag_nonce: AtomicUsize::new(0),
+            drag_late_nonce: AtomicUsize::new(0),
+            drag_token: AtomicU64::new(0),
             raw_x: AtomicI64::new(0),
             raw_y: AtomicI64::new(0),
             ring: Ring::new(),
@@ -372,6 +376,9 @@ impl Shared {
         self.active.store(id.0, Ordering::Release);
         self.drag_first.store(0, Ordering::Release);
         self.drag_nonce.store(nonce, Ordering::Release);
+        self.drag_late_nonce.store(0, Ordering::Release);
+        self.drag_token
+            .store((generation & !3) | model::ACTIVE, Ordering::Release);
         self.button_tokens[0].store((generation & !3) | model::ACTIVE, Ordering::Release);
         self.buttons[0].store(2, Ordering::Release);
         self.drag_order.store(2, Ordering::Release);
@@ -422,6 +429,18 @@ impl Shared {
             && self.buttons[1..]
                 .iter()
                 .all(|b| b.load(Ordering::Acquire) == 0)
+    }
+    fn expire_drag_tail(&self, nonce: usize) {
+        crate::model::hook::expire_drag_shared(
+            nonce,
+            &self.drag_order,
+            &self.drag_first,
+            &self.drag_nonce,
+            &self.drag_late_nonce,
+            &self.drag_token,
+            &self.buttons[0],
+            &self.button_tokens[0],
+        );
     }
 }
 
@@ -577,6 +596,14 @@ unsafe extern "system" fn mouse_callback(code: i32, message: WPARAM, parameter: 
                 {
                     shared.callback_record(4, nonce as u64, None);
                     suppress = swallow;
+                } else if message as u32 == WM_LBUTTONUP
+                    && crate::model::hook::consume_late_drag_tag(
+                        &shared.drag_late_nonce,
+                        mouse.dwExtraInfo,
+                    )
+                {
+                    shared.callback_record(4, mouse.dwExtraInfo as u64, None);
+                    suppress = true;
                 }
                 return;
             }
@@ -1637,6 +1664,9 @@ fn run_owner(
         }
         while let Some(record) = shared.ring.pop() {
             process_record(shared, &mut hook, record, monitor);
+        }
+        if let Some(nonce) = hook.expire_drag_tail(event_time()) {
+            shared.expire_drag_tail(nonce);
         }
         if let Some(drag) = &mut drag {
             let mut point = POINT::default();
