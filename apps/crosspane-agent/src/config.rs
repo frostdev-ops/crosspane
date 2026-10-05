@@ -16,6 +16,9 @@ pub struct Config {
     pub name: String,
     /// The UDP port to listen on.
     pub port: u16,
+    /// Acceptance-only loopback override; rejected unless platform scratch admission succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) acceptance_bind_ip: Option<std::net::IpAddr>,
     /// Peers to dial, by address. Discovery (WP-1.6) adds more later.
     pub peers: Vec<PeerAddr>,
     /// Push-to-cross delay in milliseconds (0–200).
@@ -71,6 +74,7 @@ impl Default for Config {
             push_to_cross_ms: 0,
             allow_file_keystore: cfg!(target_os = "macos"),
             force_file_keystore: false,
+            acceptance_bind_ip: None,
             crossing: true,
             drag: Drag::default(),
             mac_virtual_display: false,

@@ -335,6 +335,9 @@ pub struct Platform {
     pub own_windows: OwnWindowsRead,
     /// What the startup recovery of parked windows came to (WP-4.5).
     pub startup_recovery: StartupRecovery,
+    /// Proof that the native factory admitted its exact isolated acceptance contract.
+    #[cfg(windows)]
+    pub(crate) acceptance_scratch: bool,
 }
 
 /// A wgpu device for the source side's GPU work (docs/wp/GPU-v0.md, decision 3).
@@ -683,6 +686,7 @@ pub fn create(
         home: None,
         proxy_placement: None,
         startup_recovery: StartupRecovery::combine(&[]),
+        acceptance_scratch: e1_only,
     })
 }
 
@@ -1539,5 +1543,55 @@ mod startup_recovery_tests {
         assert_eq!(R::NothingParked.as_str(), "nothing_parked");
         assert_eq!(R::Failed.as_str(), "failed");
         assert_eq!(R::None.as_str(), "none");
+    }
+}
+
+/// A validated scratch admission requires explicit IPv4 loopback (127.0.0.1). Production keeps
+/// its existing wildcard bind, and cannot opt into this hidden acceptance override.
+pub(crate) fn acceptance_bind_ip(
+    config: &crate::config::Config,
+    admitted: bool,
+) -> anyhow::Result<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match (admitted, config.acceptance_bind_ip) {
+        (false, None) => Ok(Ipv6Addr::UNSPECIFIED.into()),
+        (true, Some(ip)) if ip == IpAddr::V4(Ipv4Addr::LOCALHOST) => Ok(ip),
+        _ => anyhow::bail!(
+            "acceptance bind requires admitted scratch and an explicit 127.0.0.1 address"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod acceptance_bind_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn production_wildcard_and_scratch_bind_admission_are_separate() {
+        let mut config = crate::config::Config::default();
+        assert_eq!(
+            acceptance_bind_ip(&config, false).unwrap(),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        );
+        assert!(acceptance_bind_ip(&config, true).is_err());
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        config.acceptance_bind_ip = Some(ip);
+        assert!(acceptance_bind_ip(&config, false).is_err());
+        assert_eq!(acceptance_bind_ip(&config, true).unwrap(), ip);
+        for ip in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            "127.0.0.2".parse().unwrap(),
+            "192.0.2.1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+            "::ffff:127.0.0.1".parse().unwrap(),
+            "::ffff:127.0.0.2".parse().unwrap(),
+        ] {
+            config.acceptance_bind_ip = Some(ip);
+            assert!(acceptance_bind_ip(&config, false).is_err());
+            assert!(acceptance_bind_ip(&config, true).is_err());
+        }
     }
 }

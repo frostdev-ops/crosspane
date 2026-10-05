@@ -819,7 +819,7 @@ fn local_class(interfaces: &[crosspane_platform::Interface], remote: SocketAddr)
         SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
     };
-    let source = std::net::UdpSocket::bind(unspecified)
+    let source = crate::net::udp_socket(unspecified)
         .and_then(|socket| socket.connect(remote).map(|()| socket))
         .and_then(|socket| socket.local_addr())
         .map(|local| canonical(local).ip());
@@ -8509,7 +8509,14 @@ mod audio_tests {
             displays: Vec::new(),
         };
         let pins: Arc<dyn crosspane_transport::PinStore> = Arc::new(trust.clone());
-        let net = Net::start(0, identity.clone(), pins, hello, tx.clone()).unwrap();
+        let net = Net::start(
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            identity.clone(),
+            pins,
+            hello,
+            tx.clone(),
+        )
+        .unwrap();
         let (engine, _) = Engine::new(
             EngineConfig::new(local),
             Box::new(MemoryJournal::default()),
@@ -8543,6 +8550,8 @@ mod audio_tests {
             #[cfg(target_os = "macos")]
             own_windows: || Ok(Vec::new()),
             startup_recovery: crate::platform::StartupRecovery::None,
+            #[cfg(windows)]
+            acceptance_scratch: false,
         };
         let e2 = E2Wiring {
             source_media: source_tx.into(),
@@ -9501,7 +9510,7 @@ mod home_tests {
             }
         }
 
-        /// Two real agent loops and authenticated QUIC links, dialing only ::1. All platform
+        /// Two real agent loops and authenticated QUIC links, dialing only 127.0.0.1. All platform
         /// operations, including clipboard, capture, proxy and parking, are Rust fakes.
         struct Pair {
             homes: [Home; 2],
@@ -9584,7 +9593,7 @@ mod home_tests {
                     a.feed(Input::LocalDisplays(vec![d.clone()]));
                     a.net.shutdown();
                     a.net = Net::start(
-                        0,
+                        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
                         identities[n].clone(),
                         Arc::new(a.trust.clone()),
                         Hello {
@@ -9599,7 +9608,7 @@ mod home_tests {
                 }
                 let mut pair = Self { homes, boards };
                 let addr = std::net::SocketAddr::from((
-                    std::net::Ipv6Addr::LOCALHOST,
+                    std::net::Ipv4Addr::LOCALHOST,
                     pair.homes[1].rig.agent.net.local_addr().port(),
                 ));
                 pair.homes[0].rig.agent.net.dial_once(addr);

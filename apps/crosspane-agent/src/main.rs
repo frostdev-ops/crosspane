@@ -347,6 +347,14 @@ fn start_agent(
     let (config, config_revision) = Config::load_revision(paths)?;
     *failure = lifecycle::Failure::Platform;
     let mut platform = platform::create(&paths.state_dir, &config)?;
+    #[cfg(windows)]
+    let acceptance_scratch = platform.acceptance_scratch;
+    #[cfg(not(windows))]
+    let acceptance_scratch = false;
+    let bind = std::net::SocketAddr::new(
+        platform::acceptance_bind_ip(&config, acceptance_scratch)?,
+        config.port,
+    );
     tracing::info!(backends = ?platform, "platform ready");
     remove_old_burst_marker(&paths.state_dir);
     // `_lock` stays held while the key store is waited for, so a second agent still refuses to
@@ -454,7 +462,7 @@ fn start_agent(
         displays: local_displays.clone(),
     };
     let pins: Arc<dyn crosspane_transport::PinStore> = Arc::new(trust.clone());
-    let net = net::Net::start(config.port, identity.clone(), pins, hello, tx.clone())?;
+    let net = net::Net::start(bind, identity.clone(), pins, hello, tx.clone())?;
     // A failed bind leaves `transport_slot` empty and the worker dropped with it.
     let _ = transport_slot.set(net.transport());
     #[cfg(target_os = "linux")]

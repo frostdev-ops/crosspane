@@ -125,6 +125,44 @@ impl fmt::Debug for Transport {
     }
 }
 
+// Windows IPv6 sockets default to IPv6-only. Select dual stack before binding on every OS.
+// <https://learn.microsoft.com/en-us/windows/win32/winsock/dual-stack-sockets>
+#[cfg(test)]
+static SOCKET_BINDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static DUAL_STACK_BINDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn udp_socket(bind: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if bind.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    socket.bind(&bind.into())?;
+    #[cfg(test)]
+    SOCKET_BINDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    if bind.is_ipv6() {
+        assert!(!socket.only_v6()?);
+        DUAL_STACK_BINDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(socket.into())
+}
+
+fn endpoint(
+    server: Option<quinn::ServerConfig>,
+    bind: SocketAddr,
+) -> std::io::Result<quinn::Endpoint> {
+    let socket = udp_socket(bind)?;
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+    // Quinn wraps this socket with UdpSocketState::new, which sets nonblocking before Tokio.
+    quinn::Endpoint::new(quinn::EndpointConfig::default(), server, socket, runtime)
+}
+
 impl Transport {
     /// Bind the endpoint. Must be called inside a tokio runtime.
     /// - Incoming connections from pinned peers are accepted automatically; others fail the TLS
@@ -178,8 +216,7 @@ impl Transport {
         client_config.transport_config(quic);
 
         // Fails with an I/O error if there is no tokio runtime.
-        let endpoint =
-            quinn::Endpoint::server(server_config, config.bind).map_err(TransportError::Bind)?;
+        let endpoint = endpoint(Some(server_config), config.bind).map_err(TransportError::Bind)?;
         let local_addr = endpoint.local_addr().map_err(TransportError::Bind)?;
 
         let inner = Arc::new(Inner::new(

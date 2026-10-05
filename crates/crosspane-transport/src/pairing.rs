@@ -639,7 +639,7 @@ impl PairingListener {
         config.transport_config(transport_config(1));
 
         // Fails with an I/O error if there is no tokio runtime.
-        let endpoint = Endpoint::server(config, addr).map_err(TransportError::Bind)?;
+        let endpoint = crate::endpoint(Some(config), addr).map_err(TransportError::Bind)?;
         let local_addr = endpoint.local_addr().map_err(TransportError::Bind)?;
         let (ready_tx, ready_rx) = mpsc::channel(MAX_PENDING);
         let accept_task = tokio::spawn(accept_loop(endpoint.clone(), ready_tx));
@@ -745,15 +745,23 @@ pub async fn pair_connect(
     addr: SocketAddr,
     identity: Arc<DeviceIdentity>,
 ) -> Result<PairingChannel, TransportError> {
-    let crypto = QuicClientConfig::try_from(client_tls(&identity)?).map_err(tls_error)?;
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(transport_config(0));
-
     let local = match addr {
         SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
     };
-    let endpoint = Endpoint::client(local).map_err(TransportError::Bind)?;
+    pair_connect_on(addr, identity, local).await
+}
+
+async fn pair_connect_on(
+    addr: SocketAddr,
+    identity: Arc<DeviceIdentity>,
+    local: SocketAddr,
+) -> Result<PairingChannel, TransportError> {
+    let crypto = QuicClientConfig::try_from(client_tls(&identity)?).map_err(tls_error)?;
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(transport_config(0));
+
+    let endpoint = crate::endpoint(None, local).map_err(TransportError::Bind)?;
     match timeout(CONNECT_TIMEOUT, dial(&endpoint, config, addr)).await {
         Ok(channel) => channel,
         Err(_) => Err(TransportError::Timeout),
@@ -981,5 +989,159 @@ mod tests {
         fn is_debug<T: fmt::Debug>() {}
         is_debug::<PairingListener>();
         is_debug::<PairingChannel>();
+    }
+}
+
+#[cfg(test)]
+mod owned_socket_tests {
+    use super::*;
+    use crate::{PinStore, Transport, TransportConfig};
+    use crosspane_protocol::{
+        link::LinkEvent,
+        msg::{ControlMessage, Hello},
+    };
+    use crosspane_types::id::NodeId;
+    use std::sync::atomic::Ordering;
+
+    struct Pins(Vec<(Vec<u8>, NodeId)>);
+    impl PinStore for Pins {
+        fn trusted(&self, spki: &[u8]) -> Option<NodeId> {
+            self.0
+                .iter()
+                .find(|(key, _)| key == spki)
+                .map(|(_, node)| *node)
+        }
+    }
+    fn hello() -> Hello {
+        Hello {
+            minor: 0,
+            name: "owned W1.8 loopback".into(),
+            features: vec!["e1".into()],
+            displays: Vec::new(),
+        }
+    }
+    fn binds() -> usize {
+        crate::SOCKET_BINDS.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "One Limited owned IPv6 loopback initialization; explicit W1.8 opt-in"]
+    async fn owned_ipv6_loopback_transport_initialization() {
+        assert_eq!(std::env::var("CROSSPANE_W18_LOOPBACK").as_deref(), Ok("1"));
+        let before = crate::DUAL_STACK_BINDS.load(Ordering::SeqCst);
+        let transport = Transport::bind(
+            TransportConfig {
+                bind: SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+                identity: Arc::new(DeviceIdentity::generate().unwrap()),
+                pins: Arc::new(Pins(Vec::new())),
+                hello: hello(),
+            },
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        assert_eq!(crate::DUAL_STACK_BINDS.load(Ordering::SeqCst), before + 1);
+        transport
+            .shutdown("owned IPv6 initialization complete")
+            .await;
+        println!("owned_ipv6_loopback_initialized=true; after_bind_only_v6_false=true; mdns=false");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Limited owned loopback transport/pairing only; explicit W1.8 opt-in"]
+    async fn owned_ipv4_loopback_transport_and_pairing_factories() {
+        assert_eq!(std::env::var("CROSSPANE_W18_LOOPBACK").as_deref(), Ok("1"));
+        let mut verified = 0;
+        for (local, peer_ip) in [(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )] {
+            let a = Arc::new(DeviceIdentity::generate().unwrap());
+            let b = Arc::new(DeviceIdentity::generate().unwrap());
+            let (tx_a, rx_a) = std::sync::mpsc::channel();
+            let (tx_b, rx_b) = std::sync::mpsc::channel();
+            let before = binds();
+            let left = Transport::bind(
+                TransportConfig {
+                    bind: SocketAddr::from((local, 0)),
+                    identity: a.clone(),
+                    pins: Arc::new(Pins(vec![(b.spki().to_vec(), b.node())])),
+                    hello: hello(),
+                },
+                Arc::new(move |e| {
+                    let _ = tx_a.send(e);
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                binds(),
+                before + 1,
+                "production Transport socket factory was not invoked"
+            );
+            let right = Transport::bind(
+                TransportConfig {
+                    bind: SocketAddr::new(peer_ip, 0),
+                    identity: b.clone(),
+                    pins: Arc::new(Pins(vec![(a.spki().to_vec(), a.node())])),
+                    hello: hello(),
+                },
+                Arc::new(move |e| {
+                    let _ = tx_b.send(e);
+                }),
+            )
+            .unwrap();
+            let node = timeout(Duration::from_secs(5), left.connect(right.local_addr()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(node, b.node());
+            for (rx, expected) in [(rx_a, b.node()), (rx_b, a.node())] {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let e = rx
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                        .unwrap();
+                    if let LinkEvent::Control {
+                        peer,
+                        msg: ControlMessage::Hello(_),
+                    } = e
+                    {
+                        assert_eq!(peer, expected);
+                        break;
+                    }
+                }
+            }
+            left.shutdown("owned loopback complete").await;
+            right.shutdown("owned loopback complete").await;
+            let before = binds();
+            let listener = PairingListener::bind(SocketAddr::from((local, 0)), a).unwrap();
+            assert_eq!(
+                binds(),
+                before + 1,
+                "production pairing listener socket factory was not invoked"
+            );
+            let remote = SocketAddr::new(peer_ip, listener.local_addr().port());
+            let (incoming, outgoing) = timeout(Duration::from_secs(5), async {
+                tokio::try_join!(
+                    listener.accept(),
+                    pair_connect_on(remote, b, SocketAddr::from((local, 0)))
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                binds(),
+                before + 2,
+                "production pairing client socket factory was not invoked"
+            );
+            drop(incoming);
+            drop(outgoing);
+            drop(listener);
+            verified += 1;
+        }
+        assert_eq!(verified, 1);
+        println!(
+            "owned_ipv4_loopback=true; transport_hello_both_directions=true; pairing_listener_client=true; production_socket_calls_verified=4; mdns=false"
+        );
     }
 }

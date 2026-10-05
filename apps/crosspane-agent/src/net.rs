@@ -2,7 +2,7 @@
 //! configured peers connected.
 
 use std::collections::HashSet;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ impl std::fmt::Debug for Net {
 
 impl Net {
     pub fn start(
-        port: u16,
+        bind: SocketAddr,
         identity: Arc<DeviceIdentity>,
         pins: Arc<dyn PinStore>,
         hello: Hello,
@@ -48,8 +48,8 @@ impl Net {
             .block_on(async move {
                 Transport::bind(
                     TransportConfig {
-                        // Dual-stack: IPv6 any also accepts IPv4 on Linux and macOS.
-                        bind: SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+                        // Production uses wildcard; admitted acceptance supplies exact loopback.
+                        bind,
                         identity,
                         pins,
                         hello,
@@ -59,7 +59,7 @@ impl Net {
                     }),
                 )
             })
-            .with_context(|| format!("listen on UDP port {port}"))?;
+            .with_context(|| format!("listen on UDP {bind}"))?;
         tracing::info!(addr = %transport.local_addr(), "listening");
         Ok(Net {
             runtime,
@@ -137,5 +137,55 @@ impl Net {
         let transport = self.transport.clone();
         self.runtime
             .block_on(async move { transport.shutdown("agent stopping").await });
+    }
+}
+
+// The route-class probe never sends a packet and stays blocking, as before. Quinn alone changes
+// its transport sockets to nonblocking. Keep the same explicit dual-stack setting on every OS.
+pub(super) fn udp_socket(bind: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if bind.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    socket.bind(&bind.into())?;
+    Ok(socket.into())
+}
+
+#[cfg(all(test, windows))]
+mod udp_factory_tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    #[ignore = "Limited owned loopback socket factory only; explicit W1.8 opt-in"]
+    fn owned_loopback_route_probe_dual_stack_factory() -> Result<()> {
+        anyhow::ensure!(
+            std::env::var("CROSSPANE_W18_LOOPBACK").as_deref() == Ok("1"),
+            "explicit loopback opt-in required"
+        );
+        anyhow::ensure!(
+            !crate::windows::security::is_elevated()?,
+            "acceptance must be non-elevated"
+        );
+        let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        for ip in [mapped, Ipv6Addr::LOCALHOST] {
+            let socket = udp_socket(SocketAddr::from((ip, 0)))?;
+            anyhow::ensure!(
+                !socket2::SockRef::from(&socket).only_v6()?,
+                "agent route-probe socket is IPv6-only after bind"
+            );
+            // The production route probe uses connect/local_addr only: no packet is sent.
+            socket.connect(SocketAddr::from((ip, 9)))?;
+            anyhow::ensure!(
+                socket.local_addr()?.ip().is_loopback() || socket.local_addr()?.ip() == mapped,
+                "route escaped loopback"
+            );
+        }
+        println!("owned_agent_probe_factory=true; after_bind_only_v6_false=2; sent_packets=0");
+        Ok(())
     }
 }

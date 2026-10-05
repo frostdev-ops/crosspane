@@ -32,6 +32,7 @@ wgpu.workspace = true
 pollster.workspace = true
 rtrb.workspace = true
 zeroize.workspace = true
+socket2 = "=0.6.5"
 xxhash-rust.workspace = true
 # `process` (the effective uid for `status`) is a workspace feature, so it is the same on both OSes.
 rustix.workspace = true
