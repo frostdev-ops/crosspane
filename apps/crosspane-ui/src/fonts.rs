@@ -1,18 +1,22 @@
 //! System font selection; no bundled/default egui fonts.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use eframe::egui::{FontData, FontDefinitions, FontFamily};
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(any(unix, test))]
 enum FontOs {
     Linux,
     Mac,
 }
 
+#[cfg(any(unix, test))]
 fn candidates(
     os: FontOs,
     matched: Option<PathBuf>,
@@ -35,6 +39,7 @@ fn candidates(
     paths.into_iter().filter(|path| exists(path)).collect()
 }
 
+#[cfg(unix)]
 fn fc_match() -> Option<PathBuf> {
     let mut child = Command::new("fc-match")
         .args(["-f", "%{file}", "sans-serif"])
@@ -65,16 +70,28 @@ fn fc_match() -> Option<PathBuf> {
 }
 
 pub fn load() -> Result<FontDefinitions> {
+    #[cfg(unix)]
     let os = if cfg!(target_os = "macos") {
         FontOs::Mac
     } else {
         FontOs::Linux
     };
+    #[cfg(unix)]
     let matched = match os {
         FontOs::Linux => fc_match(),
         FontOs::Mac => None,
     };
-    for path in candidates(os, matched, Path::is_file) {
+    #[cfg(unix)]
+    let paths = candidates(os, matched, Path::is_file);
+    #[cfg(windows)]
+    let paths = {
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| anyhow::anyhow!("SystemRoot is not an absolute directory"))?;
+        windows_candidates(&root, Path::is_file)
+    };
+    for path in paths {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
@@ -94,9 +111,36 @@ pub fn load() -> Result<FontDefinitions> {
     bail!("could not load a system font for Crosspane Settings")
 }
 
+#[cfg(any(windows, test))]
+fn windows_candidates(root: &Path, exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    ["segoeui.ttf", "tahoma.ttf"]
+        .into_iter()
+        .map(|name| root.join("Fonts").join(name))
+        .filter(|path| exists(path))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_fonts_use_installed_segoe_then_tahoma() {
+        let root = Path::new("owned-system-root");
+        let paths = windows_candidates(root, |_| true);
+        assert_eq!(
+            paths,
+            [
+                root.join("Fonts/segoeui.ttf"),
+                root.join("Fonts/tahoma.ttf")
+            ]
+        );
+        assert_eq!(
+            windows_candidates(root, |path| path.ends_with("tahoma.ttf")),
+            [root.join("Fonts/tahoma.ttf")]
+        );
+        assert!(windows_candidates(root, |_| false).is_empty());
+    }
 
     #[test]
     fn linux_candidate_order_with_injected_exists() {

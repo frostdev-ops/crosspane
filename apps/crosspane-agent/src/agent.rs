@@ -5663,17 +5663,32 @@ fn resolve<'a>(
 }
 
 /// Start the settings app: `crosspane-ui` next to this executable (the same bin directory, or
-/// Contents/MacOS in the app bundle), else from PATH. Its exit is reaped on a thread.
+/// Contents/MacOS in the app bundle). Unix may fall back to PATH; Windows requires the sibling.
+/// Its exit is reaped on a thread.
 fn open_settings_app() -> std::io::Result<()> {
     let program_name = if cfg!(windows) {
         "crosspane-ui.exe"
     } else {
         "crosspane-ui"
     };
+    #[cfg(windows)]
+    let program = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| std::io::Error::other("agent executable has no parent directory"))?
+        .join(program_name);
+    #[cfg(windows)]
+    if !program.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "crosspane-ui.exe is not beside the agent executable",
+        ));
+    }
+    #[cfg(unix)]
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(program_name)))
         .filter(|path| path.exists());
+    #[cfg(unix)]
     let program = beside.unwrap_or_else(|| std::path::PathBuf::from(program_name));
     let mut child = std::process::Command::new(program)
         .stdin(std::process::Stdio::null())
@@ -19069,6 +19084,94 @@ mod home_tests {
         h.rig.agent.tracker.spawn_settings = || Ok(());
         h.rig.agent.tray_action(TrayAction::OpenApp);
         assert_eq!(opened(&h), json!(2));
+    }
+
+    /// Run only from the Limited Windows smoke fixture's disposable copied test executable.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the owned Windows settings launcher fixture"]
+    fn windows_settings_launcher_uses_sibling_and_refuses_missing() {
+        let executable = std::env::current_exe().unwrap();
+        let bin = executable.parent().unwrap();
+        let root = bin.parent().unwrap();
+        let suffix = root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix("crosspane-WP-W1.5b-")
+            .unwrap();
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(executable.file_name().unwrap(), "launcher-test.exe");
+        assert_eq!(bin.file_name().unwrap(), "bin");
+        assert_eq!(
+            std::fs::canonicalize(root.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+        assert_eq!(
+            std::fs::canonicalize(bin).unwrap(),
+            std::fs::canonicalize(root).unwrap().join("bin")
+        );
+        for (name, leaf) in [
+            ("APPDATA", "roaming"),
+            ("LOCALAPPDATA", "local"),
+            ("CROSSPANE_RUNTIME_DIR", "runtime"),
+        ] {
+            assert_eq!(
+                std::path::PathBuf::from(std::env::var_os(name).unwrap()),
+                root.join(leaf)
+            );
+        }
+        for (name, value) in [
+            ("CROSSPANE_ACCEPTANCE_E1_ONLY", "1"),
+            ("CROSSPANE_UI_ACCEPTANCE_LIVE", "1"),
+            ("CROSSPANE_DISCOVERY", "0"),
+            ("CROSSPANE_AUDIO", "0"),
+            ("CROSSPANE_GPU", "0"),
+            ("CROSSPANE_UI_TAB", "machines"),
+        ] {
+            assert_eq!(std::env::var(name).as_deref(), Ok(value));
+        }
+        assert_eq!(
+            std::path::PathBuf::from(std::env::var_os("CROSSPANE_UI_SCREENSHOT").unwrap()),
+            root.join("screenshots/machines.png")
+        );
+        let sibling = bin.join("crosspane-ui.exe");
+        let fallback = root.join("path");
+        assert!(sibling.is_file());
+        assert!(fallback.join("crosspane-ui.exe").is_file());
+        assert_eq!(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap()).next(),
+            Some(fallback)
+        );
+        let settled = root.join("launcher-child-settled");
+        assert!(!settled.exists());
+        // Call the unchanged real resolver/spawner/reaper. The Limited fixture retains and
+        // creation-admits the exact child, verifies its sibling image/renderer/live Status,
+        // and writes this marker only after the native child handle signals exit zero.
+        open_settings_app().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !settled.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(settled).unwrap(),
+            "native_sibling_exit=0"
+        );
+        // Only the fixture's copied sibling is removed, after child settlement. A valid PATH
+        // executable remains present, so the explicit error proves no Windows PATH fallback.
+        std::fs::remove_file(sibling).unwrap();
+        let error = open_settings_app().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .contains("not beside the agent executable")
+        );
+        println!(
+            "actual_settings_launcher=true; sibling_exit=0; absent_sibling=NotFound; no_path_fallback=true"
+        );
     }
 
     #[cfg(target_os = "macos")]

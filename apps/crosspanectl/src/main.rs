@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
 #[cfg(windows)]
-mod windows;
+use crosspanectl::{windows_cli as windows, windows_ctl};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -466,7 +466,7 @@ fn exchange(request: &Value) -> Result<Value> {
 
 #[cfg(windows)]
 fn exchange(request: &Value) -> Result<Value> {
-    windows::exchange(request)
+    windows_ctl::exchange(request)
 }
 
 /// The result of a request, or its error.

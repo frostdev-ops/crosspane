@@ -22,6 +22,20 @@ pub fn load(ctx: &egui::Context) -> Art {
 /// Encode a captured frame as an RGBA PNG at `path`. A review aid, not part of the kit.
 pub fn save_screenshot(path: &Path, image: &ColorImage) -> Result<()> {
     let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    encode_screenshot(file, image)
+}
+
+#[cfg(windows)]
+pub fn save_acceptance_screenshot(path: &Path, image: &ColorImage) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .context("create new own-renderer screenshot")?;
+    encode_screenshot(file, image)
+}
+
+fn encode_screenshot(file: std::fs::File, image: &ColorImage) -> Result<()> {
     let mut encoder = png::Encoder::new(
         BufWriter::new(file),
         u32::try_from(image.size[0])?,

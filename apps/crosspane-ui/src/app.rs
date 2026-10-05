@@ -31,6 +31,10 @@ pub struct Settings {
     screenshot_frames: u32,
     screenshot_started: Option<Instant>,
     screenshot_requested: Option<Instant>,
+    #[cfg(windows)]
+    acceptance: Option<crate::windows::Acceptance>,
+    #[cfg(windows)]
+    live_status_seen: bool,
     tab: Tab,
     reachable: bool,
     status: Status,
@@ -80,6 +84,10 @@ impl Settings {
             screenshot_frames: 0,
             screenshot_started: None,
             screenshot_requested: None,
+            #[cfg(windows)]
+            acceptance: None,
+            #[cfg(windows)]
+            live_status_seen: false,
             tab,
             reachable: false,
             status: Status::default(),
@@ -112,6 +120,36 @@ impl Settings {
             settings.refresh_windows();
         }
         settings
+    }
+
+    #[cfg(windows)]
+    pub fn for_acceptance(mut self, mode: crate::windows::Acceptance) -> Self {
+        self.tab = match mode.tab {
+            "layout" => Tab::Layout,
+            "pairing" => Tab::Pairing,
+            "windows" => Tab::Windows,
+            _ => Tab::Machines,
+        };
+        self.acceptance = Some(mode);
+        self
+    }
+
+    fn capture_ready(&self) -> bool {
+        #[cfg(windows)]
+        if self.acceptance.is_some() {
+            return self.live_status_seen
+                && self.reachable
+                && match self.tab {
+                    Tab::Pairing => {
+                        self.pair_sent.is_some() && !self.pending.contains(&Target::PairStatus)
+                    }
+                    Tab::Windows => {
+                        !self.windows_need_refresh && !self.pending.contains(&Target::LocalWindows)
+                    }
+                    _ => true,
+                };
+        }
+        true
     }
 
     fn send(&mut self, target: Target, request: Request) {
@@ -214,7 +252,16 @@ impl Settings {
     fn receive(&mut self, target: Target, value: Value) -> Result<(), String> {
         match target {
             Target::Status => {
+                #[cfg(windows)]
+                if let Some(mode) = &self.acceptance {
+                    mode.check_status(&value)
+                        .map_err(|error| error.to_string())?;
+                }
                 self.status = decode(value)?;
+                #[cfg(windows)]
+                if self.acceptance.is_some() {
+                    self.live_status_seen = true;
+                }
                 self.confirmed = from_status(&self.status);
                 if self.place_accepted {
                     self.desk.revert(&self.confirmed);
@@ -925,6 +972,13 @@ impl eframe::App for Settings {
         self.poll();
         self.schedule();
         ctx.request_repaint_after(Duration::from_millis(500));
+        #[cfg(windows)]
+        if self.acceptance.as_ref().is_some_and(|mode| {
+            self.screenshot_requested.is_none() && mode.started.elapsed() > Duration::from_secs(35)
+        }) {
+            eprintln!("Crosspane screenshot: live scratch Status/tab readiness timed out");
+            std::process::exit(1);
+        }
         if let Some(path) = &self.screenshot {
             let captured = ctx.input(|input| {
                 input.events.iter().find_map(|event| {
@@ -936,11 +990,23 @@ impl eframe::App for Settings {
                 })
             });
             if let Some(image) = captured {
-                if let Err(error) = crate::art::save_screenshot(path, &image) {
+                #[cfg(windows)]
+                let saved = if self.acceptance.is_some() {
+                    crate::art::save_acceptance_screenshot(path, &image)
+                } else {
+                    crate::art::save_screenshot(path, &image)
+                };
+                #[cfg(unix)]
+                let saved = crate::art::save_screenshot(path, &image);
+                if let Err(error) = saved {
                     eprintln!("Crosspane screenshot: {error:#}");
                     std::process::exit(1);
                 }
                 self.screenshot = None;
+                #[cfg(windows)]
+                if self.acceptance.is_some() {
+                    eprintln!("scratch_ui_live_status=true; scratch_ui_capture=true");
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else if self
                 .screenshot_requested
@@ -973,7 +1039,8 @@ impl eframe::App for Settings {
             self.content(&mut content_ui);
             ui.allocate_rect(body, Sense::hover());
         });
-        if self.screenshot.is_some() && self.screenshot_requested.is_none() {
+        if self.screenshot.is_some() && self.screenshot_requested.is_none() && self.capture_ready()
+        {
             let started = *self.screenshot_started.get_or_insert_with(Instant::now);
             self.screenshot_frames = self.screenshot_frames.saturating_add(1);
             // Allow layout passes, font/texture uploads and the 160 ms selection animation

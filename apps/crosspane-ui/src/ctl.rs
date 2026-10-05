@@ -1,16 +1,24 @@
 //! The CLI's socket path and newline JSON exchange, run on a single background worker.
 
+#[cfg(unix)]
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(unix)]
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -121,10 +129,15 @@ impl Worker {
             .name("settings-ctl".into())
             .spawn(move || {
                 for job in requests {
+                    #[cfg(unix)]
                     let result = match &path {
                         Ok(path) => call(path, job.request),
                         Err(_) => Err(Failure::Unavailable),
                     };
+                    // An absent Windows runtime may be created when the agent starts later.
+                    // The authenticated shared client resolves/adopts it anew on each request.
+                    #[cfg(windows)]
+                    let result = call(job.request);
                     if results
                         .send(Reply {
                             target: job.target,
@@ -148,6 +161,12 @@ impl Worker {
     }
 }
 
+#[cfg(windows)]
+fn socket_path() -> Result<PathBuf> {
+    crosspanectl::windows_ctl::control_endpoint()
+}
+
+#[cfg(unix)]
 fn socket_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CROSSPANE_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir).join("agent.sock"));
@@ -161,7 +180,7 @@ fn socket_path() -> Result<PathBuf> {
     }
 }
 
-fn call(path: &Path, mut request: Request) -> std::result::Result<Value, Failure> {
+fn call(#[cfg(unix)] path: &Path, mut request: Request) -> std::result::Result<Value, Failure> {
     // The agent's frozen request parser expects SocketAddr. Resolve hostnames here, as the
     // CLI does, so neither DNS nor socket work happens in an egui frame.
     if let Request::PairJoin { addr, .. } = &mut request {
@@ -172,8 +191,20 @@ fn call(path: &Path, mut request: Request) -> std::result::Result<Value, Failure
             .ok_or_else(|| Failure::Message("no address for host:port".into()))?;
         *addr = resolved.to_string();
     }
-    let text = serde_json::to_vec(&request).map_err(|error| Failure::Message(error.to_string()))?;
-    let line = exchange(path, text).map_err(|_| Failure::Unavailable)?;
+    #[cfg(unix)]
+    let line = {
+        let text =
+            serde_json::to_vec(&request).map_err(|error| Failure::Message(error.to_string()))?;
+        exchange(path, text).map_err(|_| Failure::Unavailable)?
+    };
+    #[cfg(windows)]
+    let value = {
+        // Endpoint derivation and native server authentication are owned by the shared CLI
+        // client. Its exchange always validates user/logon before sending this request.
+        let request =
+            serde_json::to_value(&request).map_err(|error| Failure::Message(error.to_string()))?;
+        crosspanectl::windows_ctl::exchange(&request).map_err(|_| Failure::Unavailable)?
+    };
     #[derive(Deserialize)]
     struct Response {
         ok: bool,
@@ -182,7 +213,11 @@ fn call(path: &Path, mut request: Request) -> std::result::Result<Value, Failure
         #[serde(default)]
         error: Option<String>,
     }
+    #[cfg(unix)]
     let response: Response = serde_json::from_slice(&line)
+        .map_err(|error| Failure::Message(format!("bad response from agent: {error}")))?;
+    #[cfg(windows)]
+    let response: Response = serde_json::from_value(value)
         .map_err(|error| Failure::Message(format!("bad response from agent: {error}")))?;
     if response.ok {
         Ok(response.result)
@@ -193,6 +228,7 @@ fn call(path: &Path, mut request: Request) -> std::result::Result<Value, Failure
     }
 }
 
+#[cfg(unix)]
 fn exchange(path: &Path, mut text: Vec<u8>) -> std::io::Result<Vec<u8>> {
     let deadline = Instant::now() + TIMEOUT;
     let mut stream = UnixStream::connect(path)?;

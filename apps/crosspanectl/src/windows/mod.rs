@@ -30,8 +30,12 @@ fn runtime_dir() -> Result<PathBuf> {
     Ok(absolute_env("LOCALAPPDATA")?.join("Crosspane/runtime"))
 }
 
+pub fn control_endpoint() -> Result<PathBuf> {
+    security::endpoint(&runtime_dir()?)
+}
+
 pub fn exchange(request: &Value) -> Result<Value> {
-    let path = security::endpoint(&runtime_dir()?)?;
+    let path = control_endpoint()?;
     let identity = security::current_identity()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -1091,6 +1091,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "crosspane-ui-kit",
+ "crosspanectl",
  "eframe",
  "png",
  "serde",

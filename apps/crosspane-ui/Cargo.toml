@@ -17,3 +17,6 @@ eframe.workspace = true
 png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+crosspanectl = { path = "../crosspanectl" }
