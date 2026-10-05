@@ -425,6 +425,7 @@ fn start_agent(
         paths::open_journal(&paths.e2_journal_file()).context("open projection input journal")?;
     let mut engine_config = EngineConfig::new(node);
     engine_config.drag_across = config.drag.across;
+    engine_config.drag_push_to_cross = config.drag.push_to_cross();
     engine_config.push_to_cross =
         std::time::Duration::from_millis(config.push_to_cross_ms.min(200));
     for (name, profile) in &config.remap {

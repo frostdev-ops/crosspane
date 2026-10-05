@@ -51,7 +51,7 @@ impl EngineConfig {
             panic_hold: Duration::from_secs(1),
             push_to_cross: Duration::ZERO,
             drag_across: true,
-            drag_push_to_cross: Duration::from_millis(250),
+            drag_push_to_cross: Duration::from_millis(150),
             drag_commit_distance: 48.0,
             layout: LayoutOptions::default(),
             accel: AccelProfile::default(),
@@ -69,7 +69,7 @@ mod tests {
     fn drag_defaults_match_freeze() {
         let config = EngineConfig::new(NodeId([0; 32]));
         assert!(config.drag_across);
-        assert_eq!(config.drag_push_to_cross, Duration::from_millis(250));
+        assert_eq!(config.drag_push_to_cross, Duration::from_millis(150));
         assert_eq!(config.drag_commit_distance, 48.0);
         assert_eq!(config.push_to_cross, Duration::ZERO);
     }

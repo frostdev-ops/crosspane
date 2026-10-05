@@ -326,6 +326,7 @@ screen edge toward the peer. On Hyprland, release when the HUD says “Release t
 is projected there and ordinary pointer crossing resumes. Both peers must advertise `drag/0`;
 `[drag] across = false` in `config.toml` disables the offer. `crosspanectl status` shows the
 negotiated drag setting per peer and the active gesture's HUD label.
+`[drag] push_to_cross_ms = 150` sets the edge dwell in milliseconds, clamped to 0–2000.
 
 - **Notifications** that your notification daemon shows on the output where a projected window is
   parked appear in that projected window (they're captured with it). Pinning the daemon to a real

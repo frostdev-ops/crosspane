@@ -102,6 +102,7 @@ fn period(sample: Option<&Sample>, portals: &[CapturePortal], monitors: &[Monito
 pub(super) struct Detector {
     previous: Option<Sample>,
     moving: bool,
+    misses: u8,
     pub hit: Option<Hit>,
 }
 impl Detector {
@@ -111,6 +112,15 @@ impl Detector {
         portals: &[CapturePortal],
         monitors: &[Monitor],
     ) -> (Option<PortalId>, Option<Hit>) {
+        if sample.is_none() {
+            self.misses = self.misses.saturating_add(1);
+            if self.misses == 1 {
+                // Keep the gesture, but publish no observation with invented freshness.
+                return (None, None);
+            }
+        } else {
+            self.misses = 0;
+        }
         self.moving = sample
             .as_ref()
             .zip(self.previous.as_ref())
@@ -167,7 +177,8 @@ impl Gesture {
             return (None, None);
         }
         let result = self.detector.observe(sample, portals, monitors);
-        self.last = result.1.clone(); // Release/cancel invalidates the cached gesture immediately.
+        // A tolerated miss keeps the cache; a real release or second miss clears it.
+        self.last = self.detector.hit.clone();
         result
     }
     pub fn cancel_watch(&mut self) -> Option<PortalId> {
@@ -293,7 +304,8 @@ impl Shared {
         // Preserve ordered cancellation until consumed; overflow conservatively cancels too.
         if self.pending.len() >= 8 {
             self.pending.clear();
-            self.pending.push(None);
+            // Two misses reset even a detector that tolerates one failed poll.
+            self.pending.extend([None, None]);
         }
         self.pending.push(sample);
     }
@@ -626,6 +638,103 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn one_missed_drag_sample_preserves_move_portal_and_real_timestamp() {
+        let (portals, monitors) = layout(1.0);
+        let now = Instant::now();
+        let mut gesture = Gesture::default();
+        gesture.observe(Some(recorded(1067.0, 1.0, false)), &portals, &monitors, now);
+        let mut edge = recorded(1071.0, 1.0, false);
+        edge.at = MonoTime::from_nanos(20_000_000);
+        let observed = gesture
+            .observe(Some(edge.clone()), &portals, &monitors, now)
+            .1
+            .unwrap();
+        assert_eq!(observed.portal, PortalId(1));
+        let (released, observation) = gesture.observe(None, &portals, &monitors, now);
+        assert!(released.is_none());
+        assert!(observation.is_none());
+        assert!(gesture.detector.moving);
+        assert_eq!(gesture.detector.hit.as_ref().unwrap().portal, PortalId(1));
+        assert_eq!(gesture.last.as_ref().unwrap().sample.at, edge.at);
+        assert_eq!(
+            gesture.last.as_ref().unwrap().sample.received,
+            edge.received
+        );
+        // A stationary coherent sample after the miss keeps the native move active.
+        edge.at = MonoTime::from_nanos(60_000_000);
+        let (released, observation) = gesture.observe(Some(edge), &portals, &monitors, now);
+        assert!(released.is_none());
+        assert_eq!(
+            observation.unwrap().sample.at,
+            MonoTime::from_nanos(60_000_000)
+        );
+        assert_eq!(gesture.detector.misses, 0);
+        // A new isolated miss is tolerated too, rather than accumulating old failures.
+        assert!(gesture.observe(None, &portals, &monitors, now).0.is_none());
+        assert!(gesture.detector.hit.is_some());
+    }
+
+    #[test]
+    fn two_missed_drag_samples_or_changed_identity_reset_and_overflow_still_cancels() {
+        let (portals, monitors) = layout(1.0);
+        for why in ["two misses", "window", "workspace", "size", "overflow"] {
+            let mut detector = Detector::default();
+            detector.observe(Some(recorded(1067.0, 1.0, false)), &portals, &monitors);
+            let edge = recorded(1071.0, 1.0, false);
+            assert!(
+                detector
+                    .observe(Some(edge.clone()), &portals, &monitors)
+                    .1
+                    .is_some()
+            );
+            assert!(detector.observe(None, &portals, &monitors).0.is_none());
+            let released = if why == "overflow" {
+                // Reset the miss count so overflow must supply its own cancellation fence.
+                assert!(
+                    detector
+                        .observe(Some(edge.clone()), &portals, &monitors)
+                        .1
+                        .is_some()
+                );
+                let mut publication = Shared::default();
+                for _ in 0..9 {
+                    publication.publish(Some(edge.clone()));
+                }
+                assert!(publication.pending.len() <= 8);
+                // Overflow starts with two ordered misses, even if a valid sample follows.
+                assert!(publication.pending[0].is_none());
+                assert!(publication.pending[1].is_none());
+                publication
+                    .pending
+                    .into_iter()
+                    .fold(None, |released, sample| {
+                        released.or(detector.observe(sample, &portals, &monitors).0)
+                    })
+            } else {
+                let mut changed = edge.clone();
+                match why {
+                    "two misses" => (),
+                    "window" => changed.window = WindowId(0x456),
+                    "workspace" => changed.workspace = json!({"id":2}),
+                    "size" => changed.size[0] += 1.0,
+                    _ => unreachable!(),
+                }
+                detector
+                    .observe(
+                        (why != "two misses").then_some(changed),
+                        &portals,
+                        &monitors,
+                    )
+                    .0
+            };
+            assert_eq!(released, Some(PortalId(1)), "{why}");
+            assert!(!detector.moving, "{why}");
+            assert!(detector.hit.is_none(), "{why}");
+            assert!(detector.observe(None, &portals, &monitors).0.is_none());
+        }
+    }
+
     #[test]
     fn recorded_plain_pointer_keyboard_move_resize_workspace_and_client_reset() {
         let (portals, monitors) = layout(1.0);

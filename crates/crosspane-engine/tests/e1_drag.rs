@@ -801,10 +801,10 @@ fn project_permissions_unknown_windows_and_other_peers_are_not_drags() {
     assert!(h.capture.is_none());
 }
 #[test]
-fn stable_push_waits_250ms_and_edge_release_or_changed_classification_cancels() {
+fn stable_push_waits_150ms_and_edge_release_or_changed_classification_cancels() {
     let mut h = Harness::new(true, true, 1000, 1.0);
     h.drag_at();
-    h.now = 249;
+    h.now = 149;
     h.drag_at();
     assert!(h.capture.is_none());
     h.feed(
@@ -814,7 +814,7 @@ fn stable_push_waits_250ms_and_edge_release_or_changed_classification_cancels() 
             at: ms(h.now),
         }),
     );
-    h.now = 250;
+    h.now = 150;
     h.drag_at();
     assert!(h.capture.is_none());
     h.feed(0, Input::Windows(WindowEvent::Added(window(11))));
@@ -823,6 +823,87 @@ fn stable_push_waits_250ms_and_edge_release_or_changed_classification_cancels() 
     h.drag_at();
     assert!(h.capture.is_none());
 }
+#[test]
+fn drag_push_tick_commits_after_delay_with_a_recent_edge_sample() {
+    for last_sample in [90, 100] {
+        let mut h = Harness::new(true, true, 1000, 1.0);
+        h.seat.original_down(A);
+        h.drag_at();
+        h.now = last_sample;
+        h.drag_at();
+        assert_eq!(h.engines[0].next_deadline(), Some(ms(150)));
+        h.now = 149;
+        h.feed(0, Input::Tick);
+        assert!(h.capture.is_none());
+        assert_eq!(h.engines[0].next_deadline(), Some(ms(150)));
+        h.now = 150;
+        h.feed(0, Input::Tick);
+        assert!(h.capture.is_some(), "last sample {last_sample}");
+        assert!(
+            h.trace
+                .iter()
+                .any(|(_, output)| matches!(output, Output::BeginDrag { .. }))
+        );
+        assert!(
+            !h.trace
+                .iter()
+                .any(|(_, output)| matches!(output, Output::BeginCapture { .. }))
+        );
+        h.complete_begin(None);
+        h.finish();
+    }
+}
+
+#[test]
+fn drag_push_tick_does_not_commit_or_refresh_a_stale_edge_sample() {
+    for last_sample in [0, 89] {
+        let mut h = Harness::new(true, true, 1000, 1.0);
+        h.seat.original_down(A);
+        h.drag_at();
+        h.now = last_sample;
+        h.drag_at();
+        // At 149 ms the 89 ms sample is still recent, but dwell has not elapsed.
+        // That tick must not restamp it: it is stale when dwell expires at 150 ms.
+        for now in [149, 150, 200] {
+            h.now = now;
+            h.feed(0, Input::Tick);
+            assert!(h.capture.is_none(), "last sample {last_sample}, tick {now}");
+        }
+        assert!(!h.trace.iter().any(|(_, output)| matches!(
+            output,
+            Output::BeginDrag { .. } | Output::BeginCapture { .. }
+        )));
+        h.drag_at(); // A fresh real observation can still complete the existing dwell.
+        assert!(h.capture.is_some());
+        h.complete_begin(None);
+        h.finish();
+    }
+}
+
+#[test]
+fn drag_push_tick_consumes_a_due_stale_attempt_without_leaving_an_expired_deadline() {
+    let mut h = Harness::new(true, true, 1000, 1.0);
+    h.seat.original_down(A);
+    h.drag_at();
+    // No Tick can be scheduled at 150 ms from the initial 0 ms sample alone.
+    assert!(h.engines[0].next_deadline().is_none());
+    h.now = 90;
+    h.drag_at();
+    assert_eq!(h.engines[0].next_deadline(), Some(ms(150)));
+    h.now = 151; // Scheduling delayed the due attempt beyond this sample's 60 ms bound.
+    h.feed(0, Input::Tick);
+    assert!(h.capture.is_none());
+    assert!(h.engines[0].next_deadline().is_none());
+    h.now = 200;
+    h.feed(0, Input::Tick);
+    assert!(h.capture.is_none());
+    assert!(h.engines[0].next_deadline().is_none());
+    h.drag_at();
+    assert!(h.capture.is_some());
+    h.complete_begin(None);
+    h.finish();
+}
+
 #[test]
 fn failed_begin_drag_never_becomes_plain_crossing() {
     let mut h = Harness::new(true, true, 1000, 1.0);

@@ -57,11 +57,22 @@ pub struct PeerAddr {
 #[serde(default, deny_unknown_fields)]
 pub struct Drag {
     pub across: bool,
+    /// Window-drag edge dwell in milliseconds (0–2000).
+    pub push_to_cross_ms: u64,
 }
 
 impl Default for Drag {
     fn default() -> Self {
-        Self { across: true }
+        Self {
+            across: true,
+            push_to_cross_ms: 150,
+        }
+    }
+}
+
+impl Drag {
+    pub fn push_to_cross(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.push_to_cross_ms.min(2000))
     }
 }
 
@@ -247,6 +258,37 @@ mod tests {
         );
         assert_eq!(revision_of(Some(b"name = \"desk\"\n")), one);
         assert_ne!(revision_of(Some(b"name = \"desktop\"\n")), one);
+    }
+
+    #[test]
+    fn drag_push_delay_default_parse_and_clamp() {
+        for text in ["", "name = 'legacy'", "[drag]"] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.drag.push_to_cross_ms, 150);
+            assert_eq!(
+                config.drag.push_to_cross(),
+                std::time::Duration::from_millis(150)
+            );
+        }
+        for (configured, effective) in [
+            (0, 0),
+            (45, 45),
+            (2000, 2000),
+            (2001, 2000),
+            (i64::MAX as u64, 2000),
+        ] {
+            let text = format!("[drag]\nacross = false\npush_to_cross_ms = {configured}");
+            let config: Config = toml::from_str(&text).unwrap();
+            assert!(!config.drag.across);
+            assert_eq!(config.drag.push_to_cross_ms, configured);
+            assert_eq!(
+                config.drag.push_to_cross(),
+                std::time::Duration::from_millis(effective)
+            );
+            let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(roundtrip.drag.push_to_cross(), config.drag.push_to_cross());
+        }
+        assert!(toml::from_str::<Config>("[drag]\npush_to_cross_ms = -1").is_err());
     }
 
     #[test]

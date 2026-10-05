@@ -38,6 +38,7 @@ const REENTRY_GUARD: Duration = Duration::from_millis(150);
 /// How long after a target session ends the restored portals stay disarmed if the platform never
 /// reports an `EdgeReleased` for them (a pointer that was never inside the strip produces none).
 pub const REARM_FALLBACK: Duration = Duration::from_secs(1);
+const DRAG_SAMPLE_FRESH: Duration = Duration::from_millis(60);
 const HUD_TIMEOUT: Duration = Duration::from_millis(500);
 const START_TIMEOUT: Duration = Duration::from_secs(1);
 const END_TIMEOUT: Duration = Duration::from_millis(300);
@@ -364,6 +365,15 @@ struct Push {
     since: MonoTime,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DragPush {
+    push: Push,
+    offer: DragOffer,
+    grab: PointDevice,
+    at: MonoTime,
+    tick_deadline: Option<MonoTime>,
+}
+
 /// A portal restored under the pointer after this node stopped being an E1 target. The injected
 /// pointer still sits at the entry edge, so presses against it are not a deliberate crossing.
 /// Portal IDs are regenerated on layout changes, so the physical connection is the identity.
@@ -511,7 +521,7 @@ pub struct ControllerE1 {
     drag_peers: BTreeSet<NodeId>,
     drag_offer: Option<DragOffer>,
     drag_title: String,
-    drag_push: Option<(Push, DragOffer, PointDevice)>,
+    drag_push: Option<DragPush>,
     drag: Option<Drag>,
     drag_drop: Option<(Drag, MonoTime)>,
     drag_commit: Option<DragCommit>,
@@ -579,10 +589,20 @@ impl ControllerE1 {
         portal: PortalId,
         position: f64,
         grab: PointDevice,
-        at: MonoTime,
+        event_at: Option<MonoTime>,
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        // Ticks advance dwell without replacing the last real edge observation.
+        let (at, dwell_at) = match event_at {
+            Some(at) => (at, at),
+            None => {
+                let Some(pending) = self.drag_push else {
+                    return;
+                };
+                (pending.at, now)
+            }
+        };
         let offer = self
             .drag_offer
             .filter(|o| self.drag_peer(portal, position) == Some(o.peer));
@@ -623,8 +643,11 @@ impl ControllerE1 {
             return;
         }
         let push = match self.drag_push {
-            Some((push, previous, _)) if push.portal == portal && previous.same_gesture(offer) => {
-                Push { position, ..push }
+            Some(pending) if pending.push.portal == portal && pending.offer.same_gesture(offer) => {
+                Push {
+                    position,
+                    ..pending.push
+                }
             }
             Some(_) => {
                 self.drag_push = None;
@@ -636,8 +659,16 @@ impl ControllerE1 {
                 since: at,
             },
         };
-        self.drag_push = Some((push, offer, grab));
-        if at.saturating_duration_since(push.since) < self.config.drag_push_to_cross {
+        let deadline = push.since.saturating_add(self.config.drag_push_to_cross);
+        self.drag_push = Some(DragPush {
+            push,
+            offer,
+            grab,
+            at,
+            tick_deadline: (event_at.is_some() && deadline <= at.saturating_add(DRAG_SAMPLE_FRESH))
+                .then_some(deadline),
+        });
+        if dwell_at.saturating_duration_since(push.since) < self.config.drag_push_to_cross {
             return;
         }
         let (Some((hud_display, entry, point)), Some(_), Some((_, _, edge))) = (
@@ -695,7 +726,7 @@ impl ControllerE1 {
             .filter(|d| matches!(d.stage, DragStage::Pending))
             .map(|d| d.offer)
             .or(self.drag_drop.map(|(d, _)| d.offer))
-            .or(self.drag_push.map(|(_, offer, _)| offer))
+            .or(self.drag_push.map(|pending| pending.offer))
     }
 
     pub(crate) fn drag_subject(&self) -> Option<(WindowId, NodeId)> {
@@ -746,8 +777,8 @@ impl ControllerE1 {
             // AwaitingDrop has no capture and no held button; use the ordinary crossing.
             if self.drag.is_some() {
                 self.drag_clear(now, out);
-            } else if let Some((push, _, _)) = self.drag_push.take() {
-                self.begin_crossing(push, now, out);
+            } else if let Some(pending) = self.drag_push.take() {
+                self.begin_crossing(pending.push, now, out);
             }
         } else if let Some(drag) = &mut self.drag {
             if let Some(key) = key {
@@ -959,7 +990,9 @@ impl ControllerE1 {
                     self.drag_peers.remove(peer);
                     if self.drag.is_some_and(|d| d.offer.peer == *peer)
                         || self.drag_drop.is_some_and(|(d, _)| d.offer.peer == *peer)
-                        || self.drag_push.is_some_and(|(_, o, _)| o.peer == *peer)
+                        || self
+                            .drag_push
+                            .is_some_and(|pending| pending.offer.peer == *peer)
                     {
                         self.return_home(EndReason::Released, None, false, true, now, out);
                     }
@@ -1188,8 +1221,7 @@ impl ControllerE1 {
             self.home_deadline(),
             drag,
             self.drag_drop.map(|(_, until)| until),
-            self.drag_push
-                .map(|(push, _, _)| push.since.saturating_add(self.config.drag_push_to_cross)),
+            self.drag_push.and_then(|pending| pending.tick_deadline),
         ]
         .into_iter()
         .flatten()
@@ -1664,7 +1696,7 @@ impl ControllerE1 {
                 grab,
                 at,
                 ..
-            } => self.drag_press(*portal, *position, *grab, *at, now, out),
+            } => self.drag_press(*portal, *position, *grab, Some(*at), now, out),
             CaptureEvent::DragDroppedAtEdge {
                 portal,
                 position,
@@ -1699,15 +1731,17 @@ impl ControllerE1 {
                         );
                         commit.place.drag = false;
                         self.drag_commit = Some(commit);
-                        self.drag_push = Some((
-                            Push {
+                        self.drag_push = Some(DragPush {
+                            push: Push {
                                 portal: *portal,
                                 position: *position,
                                 since: now,
                             },
                             offer,
-                            *grab,
-                        ));
+                            grab: *grab,
+                            at: now,
+                            tick_deadline: None, // Drop completion uses ordinary crossing.
+                        });
                     } else {
                         self.hide_hud(now, out);
                     }
@@ -1800,7 +1834,10 @@ impl ControllerE1 {
                 if self.drag.is_some_and(|d| d.portal == *portal) && self.drag_activating() {
                     self.return_home(EndReason::Released, None, false, true, now, out);
                 }
-                if self.drag_push.is_some_and(|(p, _, _)| p.portal == *portal) {
+                if self
+                    .drag_push
+                    .is_some_and(|pending| pending.push.portal == *portal)
+                {
                     self.drag_push = None;
                 }
                 if self.drag_drop.is_some_and(|(d, _)| d.portal == *portal) {
@@ -2109,7 +2146,9 @@ impl ControllerE1 {
             self.peers.remove(peer);
             self.drag_peers.remove(peer);
             if self.drag_drop.is_some_and(|(d, _)| d.offer.peer == *peer)
-                || self.drag_push.is_some_and(|(_, o, _)| o.peer == *peer)
+                || self
+                    .drag_push
+                    .is_some_and(|pending| pending.offer.peer == *peer)
             {
                 self.drag_clear(now, out);
             }
@@ -2549,8 +2588,28 @@ impl ControllerE1 {
         {
             self.drag_clear(now, out);
         }
-        if let Some((push, _, grab)) = self.drag_push {
-            self.drag_press(push.portal, push.position, grab, now, now, out);
+        if let Some(mut pending) = self.drag_push
+            && pending
+                .tick_deadline
+                .is_some_and(|deadline| now >= deadline)
+        {
+            // Consume only a due attempt: stale or refused pushes cannot spin the receive loop.
+            // A later real edge sample can arm another deadline with the original dwell start.
+            pending.tick_deadline = None;
+            self.drag_push = Some(pending);
+            if now.saturating_duration_since(pending.at) <= DRAG_SAMPLE_FRESH
+                && now.saturating_duration_since(pending.push.since)
+                    >= self.config.drag_push_to_cross
+            {
+                self.drag_press(
+                    pending.push.portal,
+                    pending.push.position,
+                    pending.grab,
+                    None,
+                    now,
+                    out,
+                );
+            }
         }
         if self
             .hotkey
