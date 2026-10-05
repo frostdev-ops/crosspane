@@ -18,6 +18,7 @@ crosspane-input.workspace = true
 crosspane-media = { workspace = true, optional = true }
 crosspane-platform.workspace = true
 crosspane-types.workspace = true
+png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
@@ -39,6 +40,9 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_System_LibraryLoader",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_JobObjects",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Power",

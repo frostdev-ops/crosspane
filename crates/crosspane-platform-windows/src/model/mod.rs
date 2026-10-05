@@ -3,6 +3,7 @@
 //! "builds and unit-tests its pure logic"; P9 verifies the Windows behaviour it assumes.
 
 pub mod capture;
+pub mod clipboard;
 pub mod cursor;
 pub mod displays;
 pub mod drag;

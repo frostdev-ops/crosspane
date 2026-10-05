@@ -990,6 +990,7 @@ dependencies = [
  "crosspane-media",
  "crosspane-platform",
  "crosspane-types",
+ "png",
  "proptest",
  "serde",
  "serde_json",

@@ -9,6 +9,8 @@
 #[cfg(windows)]
 pub mod capture;
 #[cfg(windows)]
+pub mod clipboard;
+#[cfg(windows)]
 pub mod clock;
 #[cfg(windows)]
 pub mod cursor;
