@@ -8,6 +8,7 @@
 
 #[cfg(windows)]
 pub mod capture;
+#[cfg(windows)]
 pub mod frame_capture;
 #[cfg(windows)]
 pub mod hotkey;
