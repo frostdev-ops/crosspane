@@ -116,6 +116,8 @@ pub(crate) fn disabled(
     if stdout.len().saturating_add(stderr.len()) > MAX_LAUNCHD_BYTES || code != Some(0) {
         return None;
     }
+    // macOS 27 prints one leading empty line; do not trim arbitrary leading lines.
+    let stdout = stdout.strip_prefix(b"\n").unwrap_or(stdout);
     let text = String::from_utf8_lossy(stdout);
     if text.lines().next()?.trim() != "disabled services = {" || text.lines().last()?.trim() != "}"
     {
@@ -137,8 +139,8 @@ pub(crate) fn disabled(
             .map(|(k, v)| (k.trim(), v.trim()));
         if let Some((_, value)) = pair.filter(|(key, _)| *key == expected) {
             let value = match value {
-                "true" => true,
-                "false" => false,
+                "disabled" | "true" => true,
+                "enabled" | "false" => false,
                 _ => return None,
             };
             if found.replace(value).is_some() {

@@ -891,7 +891,7 @@ impl Runner {
                         113,
                         vec![],
                         format!(
-                            "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                            "Bad request.\nCould not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
                             self.uid
                         )
                         .into_bytes(),
@@ -920,8 +920,12 @@ impl Runner {
                 Ok(output(
                     0,
                     match b.disabled {
-                        0 => "disabled services = {\n}\n".into(),
-                        1 => format!("disabled services = {{\n \"{AGENT_LABEL}\" => true\n}}\n"),
+                        0 => format!(
+                            "\n\tdisabled services = {{\n\t\t\"{AGENT_LABEL}\" => enabled\n\t}}\n"
+                        ),
+                        1 => format!(
+                            "\n\tdisabled services = {{\n\t\t\"{AGENT_LABEL}\" => disabled\n\t}}\n"
+                        ),
                         _ => "unobservable format\n".into(),
                     }
                     .into_bytes(),

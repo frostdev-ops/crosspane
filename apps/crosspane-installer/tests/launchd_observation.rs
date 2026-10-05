@@ -174,3 +174,81 @@ fn unreadable_unrelated_bytes_are_ignored_but_selected_authority_remains_exact_u
         Some(false)
     );
 }
+
+#[test]
+fn real_print_disabled_whitespace_and_state_words_are_observed() {
+    // Captured whitespace and vocabulary, with synthetic service labels only.
+    let real = b"\n\tdisabled services = {\n\t\t\"io.test.enabled\" => enabled\n\t\t\"io.test.disabled\" => disabled\n\t}\n";
+    assert_eq!(
+        parser::disabled(Some(0), real, b"", "io.test.enabled"),
+        Some(false)
+    );
+    assert_eq!(
+        parser::disabled(Some(0), real, b"", "io.test.disabled"),
+        Some(true)
+    );
+    assert_eq!(parser::disabled(Some(0), real, b"", LABEL), Some(false));
+    for prefix in ["", "\n"] {
+        for (state, expected) in [
+            ("enabled", false),
+            ("disabled", true),
+            ("false", false),
+            ("true", true),
+        ] {
+            let output =
+                format!("{prefix}\tdisabled services = {{\n\t\t\"{LABEL}\" => {state}\n\t}}\n");
+            assert_eq!(
+                parser::disabled(Some(0), output.as_bytes(), b"", LABEL),
+                Some(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn real_print_disabled_shape_preserves_unknown_and_bounds() {
+    let valid = format!("\n\tdisabled services = {{\n\t\t\"{LABEL}\" => disabled\n\t}}\n");
+    for invalid in [
+        format!("\n{valid}"),
+        format!(" {valid}"),
+        format!("\r{valid}"),
+        valid.replace("disabled services", "other services"),
+        valid.replace("=> disabled", "=> unknown"),
+        valid.replace("=> disabled", "= disabled"),
+        valid.replace(&format!("\"{LABEL}\""), LABEL),
+        valid.replace("\t}\n", &format!("\t\t\"{LABEL}\" => disabled\n\t}}\n")),
+        valid.replace(
+            &format!("\t\t\"{LABEL}\""),
+            &format!("\t}}\n\t\t\"{LABEL}\""),
+        ),
+        format!("{valid}extra\n"),
+    ] {
+        assert_eq!(
+            parser::disabled(Some(0), invalid.as_bytes(), b"", LABEL),
+            None,
+            "{invalid:?}"
+        );
+    }
+    for code in [None, Some(1), Some(113)] {
+        assert_eq!(parser::disabled(code, valid.as_bytes(), b"", LABEL), None);
+    }
+    let oversized_stderr = vec![b'x'; parser::MAX_LAUNCHD_BYTES];
+    assert_eq!(
+        parser::disabled(Some(0), valid.as_bytes(), &oversized_stderr, LABEL),
+        None
+    );
+}
+
+#[test]
+fn loaded_jobs_match_real_tabbed_authority_rows_and_stopped_state() {
+    // Retain the observed row ordering/tabs, replacing identity and unrelated data.
+    let running = format!(
+        "gui/501/{LABEL} = {{\n\tactive count = 12\n\tpath = {PLIST}\n\tstate = running\n\n\tprogram = {PROGRAM}\n\tpid = 123\n\tsynthetic context = {{\n\t\tstate = active\n\t}}\n}}\n"
+    );
+    assert_eq!(parse(&running), J::Running(123));
+    let stopped = running
+        .replace("active count = 12", "active count = 0")
+        .replace("state = running", "state = not running")
+        .replace("\tpid = 123\n", "");
+    assert_eq!(parse(&stopped), J::LoadedStopped);
+}

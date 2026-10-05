@@ -829,8 +829,12 @@ impl Runner {
                 Ok(output(
                     0,
                     match b.disabled {
-                        0 => "disabled services = {\n}\n".into(),
-                        1 => format!("disabled services = {{\n \"{AGENT_LABEL}\" => true\n}}\n"),
+                        0 => format!(
+                            "\n\tdisabled services = {{\n\t\t\"{AGENT_LABEL}\" => enabled\n\t}}\n"
+                        ),
+                        1 => format!(
+                            "\n\tdisabled services = {{\n\t\t\"{AGENT_LABEL}\" => disabled\n\t}}\n"
+                        ),
                         _ => "unobservable format\n".into(),
                     }
                     .into_bytes(),
@@ -1351,7 +1355,7 @@ fn native_process_plist_and_disabled_parsers_fail_closed_on_wrong_or_ambiguous_o
             ));
         }
         if case == 3 {
-            b.disabled_override = Some(output(0, format!("disabled services = {{\n \"{AGENT_LABEL}\" => false\n \"{AGENT_LABEL}\" => false\n}}\n").into_bytes(), vec![]));
+            b.disabled_override = Some(output(0, format!("\n\tdisabled services = {{\n\t\t\"{AGENT_LABEL}\" => enabled\n\t\t\"{AGENT_LABEL}\" => enabled\n\t}}\n").into_bytes(), vec![]));
         }
         if case == 4 {
             b.print_override = Some(output(0, vec![b'x'; 64 * 1024 + 1], vec![]));
@@ -1971,7 +1975,7 @@ fn whole_disabled_key_requires_supported_quoting_and_cannot_hide_selected_disabl
         let f = Fixture::new(false);
         f.runner.behavior.lock().unwrap().disabled_override = Some(output(
             0,
-            format!("disabled services = {{\n {key} => true\n}}\n").into_bytes(),
+            format!("\n\tdisabled services = {{\n\t\t{key} => disabled\n\t}}\n").into_bytes(),
             vec![],
         ));
         let mut a = adapter(&f, Approval::Unknown);

@@ -1587,7 +1587,7 @@ mod a2_tests {
                 print: Mutex::new(Ok(out(0, &print, ""))),
                 disabled: Mutex::new(Ok(out(
                     0,
-                    "disabled services = {\n \"io.frostdev.crosspane.agent\" => false\n}\n",
+                    "\n\tdisabled services = {\n\t\t\"io.frostdev.crosspane.agent\" => enabled\n\t}\n",
                     "",
                 ))),
                 calls: Mutex::default(),
@@ -2285,7 +2285,7 @@ mod a2_tests {
             113,
             "",
             &format!(
-                "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                "Bad request.\nCould not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
                 r.runner.uid
             ),
         ));
@@ -2337,7 +2337,7 @@ mod a2_tests {
         let o = r.observer();
         for (text, expect) in [
             (
-                "disabled services = {\n \"io.frostdev.crosspane.agent\" => true\n}\n",
+                "\n\tdisabled services = {\n\t\t\"io.frostdev.crosspane.agent\" => disabled\n\t}\n",
                 Some(true),
             ),
             ("disabled services = {\n}\n", Some(false)),
@@ -4958,7 +4958,7 @@ mod a2_tests {
                 .unwrap();
             *r.runner.disabled.lock().unwrap() = Ok(out(
                 0,
-                "disabled services = {\n \"io.frostdev.crosspane.agent\" => true\n}\n",
+                "\n\tdisabled services = {\n\t\t\"io.frostdev.crosspane.agent\" => disabled\n\t}\n",
                 "",
             ));
             lease
@@ -4982,7 +4982,7 @@ mod a2_tests {
                 113,
                 "",
                 &format!(
-                    "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                    "Bad request.\nCould not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
                     r.runner.uid
                 ),
             ));
@@ -5343,7 +5343,7 @@ mod a2_tests {
                 113,
                 "",
                 &format!(
-                    "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                    "Bad request.\nCould not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
                     r.runner.uid
                 ),
             ));
@@ -5552,7 +5552,7 @@ mod a2_tests {
                 113,
                 "",
                 &format!(
-                    "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                    "Bad request.\nCould not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
                     r.runner.uid
                 ),
             ));
@@ -6214,7 +6214,7 @@ mod a2_tests {
                     "disable" => {
                         *self.base.disabled.lock().unwrap() = Ok(out(
                             0,
-                            "disabled services = {\n \"io.frostdev.crosspane.agent\" => true\n}\n",
+                            "\n\tdisabled services = {\n\t\t\"io.frostdev.crosspane.agent\" => disabled\n\t}\n",
                             "",
                         ));
                     }
@@ -6224,7 +6224,7 @@ mod a2_tests {
                             113,
                             "",
                             &format!(
-                                "Could not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
+                                "Bad request.\nCould not find service \"{AGENT_LABEL}\" in domain for user gui: {}\n",
                                 self.base.uid
                             ),
                         ));
