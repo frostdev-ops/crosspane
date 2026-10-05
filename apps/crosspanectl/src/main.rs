@@ -57,9 +57,15 @@ enum Command {
     /// Save the picture a projected window last showed here (decoded, before drawing) as a PPM
     /// file, for checking exactness; prints its path. SOURCE is the machine it comes from.
     Snapshot { source: String, projection: u64 },
-    /// Show the OS permission dialogs for whatever this machine still lacks (macOS: Screen
-    /// Recording, Accessibility, Input Monitoring).
+    /// Ask the OS for the first permission this machine still lacks (macOS: Accessibility, then
+    /// Input Monitoring, Screen Recording and Microphone), one per run.
     RequestPermissions,
+    /// Ask the OS for one permission: its prompt, or System Settings at its pane when the prompt
+    /// was already answered. Prints what was shown.
+    AskPermission { permission: PermissionArg },
+    /// Reset Crosspane's own entry for one macOS permission (tccutil reset for
+    /// io.frostdev.crosspane.agent only), so its prompt can show again. Then ask-permission.
+    ResetPermission { permission: PermissionArg },
     /// A lost or stolen device: forget it here and tell every other paired machine to forget it
     /// too (a signed revocation notice). It can only come back through a fresh pairing.
     Revoke { peer: String },
@@ -126,6 +132,27 @@ enum Command {
     },
 }
 
+/// An OS permission, by its `status` token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum PermissionArg {
+    Accessibility,
+    InputMonitoring,
+    ScreenRecording,
+    Microphone,
+}
+
+impl PermissionArg {
+    fn token(self) -> &'static str {
+        match self {
+            PermissionArg::Accessibility => "accessibility",
+            PermissionArg::InputMonitoring => "input_monitoring",
+            PermissionArg::ScreenRecording => "screen_recording",
+            PermissionArg::Microphone => "microphone",
+        }
+    }
+}
+
 #[cfg(test)]
 mod settings_tests {
     #![allow(clippy::unwrap_used)]
@@ -133,6 +160,33 @@ mod settings_tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn permission_commands_parse_and_word_their_answers() {
+        let cli =
+            Cli::try_parse_from(["crosspanectl", "ask-permission", "input_monitoring"]).unwrap();
+        let Command::AskPermission { permission } = cli.command else {
+            panic!("ask-permission");
+        };
+        assert_eq!(permission.token(), "input_monitoring");
+        let cli =
+            Cli::try_parse_from(["crosspanectl", "reset-permission", "screen_recording"]).unwrap();
+        let Command::ResetPermission { permission } = cli.command else {
+            panic!("reset-permission");
+        };
+        assert_eq!(permission.token(), "screen_recording");
+        assert!(Cli::try_parse_from(["crosspanectl", "ask-permission", "camera"]).is_err());
+        assert!(
+            ask_wording(&json!({"permission": "accessibility", "shown": "pane"}))
+                .contains("System Settings")
+        );
+        assert_eq!(
+            ask_wording(
+                &json!({"permission": null, "shown": "nothing", "note": "every permission is granted"})
+            ),
+            "every permission is granted"
+        );
+    }
 
     #[test]
     fn clipboard_allow_help_and_off_parse_without_changing_default_grants() {
@@ -294,6 +348,12 @@ fn main() -> Result<()> {
         Command::Diag { out } => return diag(out.clone()),
         Command::Forget { peer } => json!({"cmd": "forget", "peer": peer}),
         Command::RequestPermissions => json!({"cmd": "ask_permissions"}),
+        Command::AskPermission { permission } => {
+            json!({"cmd": "ask_permission", "permission": permission.token()})
+        }
+        Command::ResetPermission { permission } => {
+            json!({"cmd": "reset_permission", "permission": permission.token()})
+        }
         Command::Snapshot { source, projection } => {
             json!({"cmd": "snapshot", "projection": projection, "source": source})
         }
@@ -681,8 +741,46 @@ fn print_result(command: &Command, result: &Value) {
                 );
             }
         }
+        Command::RequestPermissions | Command::AskPermission { .. } => {
+            println!("{}", ask_wording(result));
+        }
+        Command::ResetPermission { permission } => println!(
+            "reset Crosspane's {0} entry; now run: crosspanectl ask-permission {0}",
+            permission.token()
+        ),
         _ => println!("{}", result.as_str().unwrap_or(&result.to_string())),
     }
+}
+
+/// What an ask showed, in words (the agent answers `{permission, shown, note?}`).
+fn ask_wording(result: &Value) -> String {
+    let Some(shown) = result["shown"].as_str() else {
+        return result.as_str().unwrap_or(&result.to_string()).to_owned();
+    };
+    let permission = result["permission"]
+        .as_str()
+        .unwrap_or("permission")
+        .replace('_', " ");
+    let mut text = match shown {
+        "prompt" => format!("asked for {permission}: answer the request on this machine"),
+        "pane" => format!(
+            "opened System Settings at {permission}: turn Crosspane on there (its request was \
+             already answered)"
+        ),
+        "prompt_then_pane" => format!(
+            "asked for {permission}: answer the request, or turn Crosspane on in the System \
+             Settings pane that opens"
+        ),
+        _ => result["note"]
+            .as_str()
+            .map_or_else(|| format!("{permission} is already granted"), str::to_owned),
+    };
+    if shown != "nothing"
+        && let Some(note) = result["note"].as_str()
+    {
+        text.push_str(&format!(" ({note})"));
+    }
+    text
 }
 
 fn print_status(s: &Value) {

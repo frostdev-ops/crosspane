@@ -157,9 +157,22 @@ pub enum Request {
     PairPick {
         index: usize,
     },
-    /// Ask the OS to show its permission requests for every missing permission (macOS: the
-    /// "Crosspane would like to…" dialogs, from the agent's own process so they name it).
+    /// Ask for the first missing OS permission only (WP-4.33), in the order Accessibility, Input
+    /// Monitoring, Screen Recording, Microphone. Answers like `AskPermission`.
     AskPermissions,
+    /// Ask for one OS permission (`screen_recording`, `accessibility`, `input_monitoring` or
+    /// `microphone`), from the agent's own process so the request names Crosspane. Answers what
+    /// was shown: `{"permission", "shown": "nothing" | "prompt" | "pane" | "prompt_then_pane",
+    /// "note"?}`. System Settings opens when the one-time prompt was already answered.
+    AskPermission {
+        permission: String,
+    },
+    /// Reset Crosspane's own entry for one OS permission (`tccutil reset <service>
+    /// io.frostdev.crosspane.agent`), so its prompt can show again. Only ever sent on an explicit
+    /// click; never another app's entry.
+    ResetPermission {
+        permission: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -254,6 +267,26 @@ fn handle(stream: UnixStream, events: &Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_requests_use_their_wire_shapes() {
+        for (text, cmd) in [
+            (
+                r#"{"cmd":"ask_permission","permission":"accessibility"}"#,
+                "ask_permission",
+            ),
+            (
+                r#"{"cmd":"reset_permission","permission":"screen_recording"}"#,
+                "reset_permission",
+            ),
+            (r#"{"cmd":"ask_permissions"}"#, "ask_permissions"),
+        ] {
+            let request: Request = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}"));
+            let value = serde_json::to_value(&request).unwrap_or_default();
+            assert_eq!(value["cmd"], cmd);
+        }
+        assert!(serde_json::from_str::<Request>(r#"{"cmd":"ask_permission"}"#).is_err());
+    }
 
     #[test]
     fn settings_update_uses_the_frozen_request_shape() {

@@ -599,11 +599,16 @@ pub struct Agent {
     notices: VecDeque<String>,
     last_trust_check: Instant,
     last_rtt_poll: Instant,
-    /// OS permissions granted when the backends were created (they are created once, at start).
-    granted: Vec<Permission>,
-    /// A different set seen once; it must be seen again before the agent restarts.
-    granted_changing: Option<Vec<Permission>>,
+    /// Watches the OS grants against those the backends were created with (they are created
+    /// once, at start) and decides the one restart that puts a change to use (WP-4.33).
+    grant_watch: Option<crate::os_permissions::GrantWatch>,
     last_permission_check: Instant,
+    /// The raw permission API answers last logged.
+    last_permission_raw: Option<String>,
+    /// The OS side of asking (prompts, panes, resets). Inert in tests.
+    tcc: Box<dyn crate::os_permissions::TccOps>,
+    /// Which one-time prompts this machine already showed.
+    ask_record: crate::os_permissions::AskRecord,
     started: Instant,
     restart_requested: bool,
     /// ctl requests waiting for a peer's answer (browse and pull), by engine request number.
@@ -736,7 +741,7 @@ const MAX_LAYOUT_VERSION: u64 = 1 << 48;
 const UNRESPONSIVE: Duration = Duration::from_secs(15);
 /// Above this smoothed RTT a "wired" path has a slower hop on the way (usually the peer's Wi-Fi).
 const WIRED_RTT: Duration = Duration::from_millis(3);
-const PERMISSION_CHECK: Duration = Duration::from_secs(2);
+const PERMISSION_CHECK: Duration = crate::os_permissions::POLL;
 /// How long a browse or pull waits for the peer's answer.
 const BROWSE_WAIT: Duration = Duration::from_secs(5);
 
@@ -851,7 +856,9 @@ struct Waiter {
     pull: bool,
     deadline: Instant,
 }
-const MIN_RUN_BEFORE_RESTART: Duration = Duration::from_secs(30);
+/// A grant change restarts the agent only after it has run this long, so a flapping permission
+/// state can't make it restart in a tight loop.
+const MIN_RUN_BEFORE_RESTART: Duration = Duration::from_secs(10);
 
 impl Agent {
     #[allow(clippy::too_many_arguments)]
@@ -886,9 +893,14 @@ impl Agent {
             notices: VecDeque::new(),
             last_trust_check: Instant::now(),
             last_rtt_poll: Instant::now(),
-            granted: Vec::new(),
-            granted_changing: None,
+            grant_watch: None,
             last_permission_check: Instant::now(),
+            last_permission_raw: None,
+            #[cfg(not(test))]
+            tcc: Box::new(crate::os_permissions::SystemTcc),
+            #[cfg(test)]
+            tcc: Box::new(crate::os_permissions::NoTcc),
+            ask_record: crate::os_permissions::AskRecord::default(),
             started: Instant::now(),
             restart_requested: false,
             waiters: HashMap::new(),
@@ -962,13 +974,19 @@ impl Agent {
     }
 
     pub fn set_lifecycle_paths(&mut self, paths: crate::paths::Paths) {
+        self.ask_record = crate::os_permissions::AskRecord::at(Some(
+            paths.state_dir.join(crate::os_permissions::ASK_RECORD),
+        ));
         self.lifecycle_paths = Some(paths);
     }
 
     /// Carry out `outputs` (crash recovery from `Engine::new` first), then run until the channel
     /// closes.
     pub fn run(mut self, startup: Vec<Output>, events: &Receiver<Event>) -> Stopped {
-        self.granted = self.granted_permissions();
+        self.log_permission_states(true);
+        self.grant_watch = Some(crate::os_permissions::GrantWatch::new(
+            self.permission_reading(),
+        ));
         // A release bind an earlier run left behind goes first, before any input is admitted
         // (04 §6, amendment A1). Crash recovery below only ever releases, so it isn't held back.
         self.home_startup();
@@ -2836,36 +2854,89 @@ impl Agent {
         self.notices.push_back(text);
     }
 
-    fn granted_permissions(&self) -> Vec<Permission> {
-        let p = &self.platform.permissions;
-        p.required()
-            .into_iter()
-            .filter(|&perm| p.state(perm) == PermissionState::Granted)
-            .collect()
+    /// The grants now, as the grant watch compares them.
+    fn permission_reading(&self) -> crate::os_permissions::Reading {
+        let raw = self.tcc.raw();
+        crate::os_permissions::Reading::of(self.platform.permissions.as_ref(), raw.as_ref())
     }
 
-    /// True when an OS permission was granted or revoked since start: the backends that depend on
-    /// it only change when the agent starts again (macOS often needs that for the grant to apply).
-    /// The change must be seen on two checks in a row and the agent must have run for a while, so
-    /// a flapping permission state can't make it restart in a loop.
+    /// Log every permission's state and the raw API answers behind them whenever they change
+    /// (and once at start). Names and yes/no only, never content.
+    fn log_permission_states(&mut self, start: bool) {
+        let p = &self.platform.permissions;
+        let states: Vec<String> = p
+            .required()
+            .into_iter()
+            .map(|perm| {
+                format!(
+                    "{}={}",
+                    crate::os_permissions::permission_token(perm),
+                    crate::os_permissions::state_token(p.state(perm))
+                )
+            })
+            .collect();
+        let raw = self.tcc.raw().map(|r| r.text).unwrap_or_default();
+        let line = format!("{} {raw}", states.join(" "));
+        if self.last_permission_raw.as_deref() == Some(line.as_str()) {
+            return;
+        }
+        if start {
+            tracing::info!(states = %line, "OS permission states at start");
+        } else {
+            tracing::info!(states = %line, "OS permission states changed");
+        }
+        self.last_permission_raw = Some(line);
+    }
+
+    /// True when the agent should restart to put a grant change to use (WP-4.33): the backends
+    /// that depend on a grant only change when the agent starts again, and macOS often needs a new
+    /// process for a grant to apply. Grants are read every second; the agent restarts once all
+    /// required grants are present (confirmed on a second read), or once any other change has held
+    /// for ten seconds, and never before it has run for a while, so a flapping state can't loop.
     fn permissions_changed(&mut self) -> bool {
-        if self.last_permission_check.elapsed() < PERMISSION_CHECK
-            || self.started.elapsed() < MIN_RUN_BEFORE_RESTART
-        {
+        if self.last_permission_check.elapsed() < PERMISSION_CHECK {
             return false;
         }
         self.last_permission_check = Instant::now();
-        let now = self.granted_permissions();
-        if now == self.granted {
-            self.granted_changing = None;
+        self.log_permission_states(false);
+        let reading = self.permission_reading();
+        let Some(watch) = self.grant_watch.as_mut() else {
+            return false;
+        };
+        let Some(reason) = watch.observe(Instant::now(), reading.clone()) else {
+            return false;
+        };
+        if self.started.elapsed() < MIN_RUN_BEFORE_RESTART {
             return false;
         }
-        if self.granted_changing.as_ref() != Some(&now) {
-            self.granted_changing = Some(now);
-            return false;
-        }
-        tracing::info!(before = ?self.granted, now = ?now, "OS permissions changed");
+        tracing::info!(
+            before = ?watch.baseline(),
+            now = ?reading,
+            ?reason,
+            "OS permissions changed; restarting to use them"
+        );
         true
+    }
+
+    /// Ask the OS for one permission, from this process so the request names Crosspane.
+    fn ask_permission(
+        &mut self,
+        permission: Option<Permission>,
+    ) -> Result<crate::os_permissions::Asked, String> {
+        let perms = self.platform.permissions.as_mut();
+        match permission {
+            Some(permission) => crate::os_permissions::ask(
+                perms,
+                self.tcc.as_mut(),
+                &mut self.ask_record,
+                permission,
+            ),
+            None => crate::os_permissions::ask_first_missing(
+                perms,
+                self.tcc.as_mut(),
+                &mut self.ask_record,
+            ),
+        }
     }
 
     /// A forgotten (or revoked) peer's connection ends at once (05 scenario 1), not at its next
@@ -3024,10 +3095,13 @@ impl Agent {
             })
             .collect();
         let status = self.pairing.status();
+        // In the order they are asked in: Accessibility first.
         let missing_permissions = {
             let p = &self.platform.permissions;
-            p.required()
+            let required = p.required();
+            crate::os_permissions::ASK_ORDER
                 .into_iter()
+                .filter(|perm| required.contains(perm))
                 .filter(|&perm| p.state(perm) != PermissionState::Granted)
                 .collect()
         };
@@ -3123,8 +3197,10 @@ impl Agent {
             }),
             TrayAction::PairConfirm(accept) => self.on_ctl(Request::PairConfirm { accept }),
             TrayAction::PairPick(index) => self.on_ctl(Request::PairPick { index }),
-            TrayAction::OpenSettings(permission) => {
-                crate::open_settings_pane(permission);
+            TrayAction::AskPermission(permission) => {
+                if let Err(e) = self.ask_permission(Some(permission)) {
+                    tracing::warn!(error = %e, "could not ask for the permission");
+                }
                 return;
             }
             TrayAction::OpenApp => {
@@ -4633,16 +4709,30 @@ impl Agent {
                 },
                 Err(e) => Response::err(e),
             },
-            Request::AskPermissions => {
-                let requested = crate::request_missing_permissions(&mut self.platform);
-                Response::ok(json!(if requested.is_empty() {
-                    "every permission is granted".to_owned()
-                } else {
-                    format!(
-                        "asked for {}; answer the dialogs on this machine",
-                        requested.join(", ")
+            Request::AskPermissions => match self.ask_permission(None) {
+                Ok(asked) => Response::ok(json!(asked)),
+                Err(e) => Response::err(e),
+            },
+            Request::AskPermission { permission } => {
+                match crate::os_permissions::permission_named(&permission)
+                    .and_then(|p| self.ask_permission(Some(p)))
+                {
+                    Ok(asked) => Response::ok(json!(asked)),
+                    Err(e) => Response::err(e),
+                }
+            }
+            Request::ResetPermission { permission } => {
+                match crate::os_permissions::permission_named(&permission).and_then(|p| {
+                    crate::os_permissions::reset(
+                        self.platform.permissions.as_ref(),
+                        self.tcc.as_mut(),
+                        &mut self.ask_record,
+                        p,
                     )
-                }))
+                }) {
+                    Ok(()) => Response::ok(json!({ "permission": permission, "reset": true })),
+                    Err(e) => Response::err(e),
+                }
             }
             Request::Restart => {
                 self.restart_requested = true;
@@ -16821,6 +16911,108 @@ mod home_tests {
         ) -> Result<(), PlatformError> {
             Ok(())
         }
+    }
+
+    /// Records what onboarding asked the OS side to do; does nothing real.
+    struct RecordingTcc(Arc<Mutex<Vec<String>>>);
+
+    impl crate::os_permissions::TccOps for RecordingTcc {
+        fn prior(&self, _permission: Permission) -> crate::os_permissions::Prior {
+            crate::os_permissions::Prior::Unknowable
+        }
+        fn open_pane(&mut self, permission: Permission) {
+            self.0.lock().unwrap().push(format!("pane {permission:?}"));
+        }
+        fn open_pane_unless_granted(&mut self, permission: Permission, _after: Duration) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("pane later {permission:?}"));
+        }
+        fn reset(&mut self, permission: Permission) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("reset {permission:?}"));
+            Ok(())
+        }
+        fn raw(&self) -> Option<crate::os_permissions::Raw> {
+            None
+        }
+    }
+
+    #[test]
+    fn ctl_asks_one_permission_per_request_and_resets_only_when_told() {
+        let granted = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut h = home();
+        h.rig.agent.platform.permissions = Box::new(MacLike(granted.clone()));
+        h.rig.agent.tcc = Box::new(RecordingTcc(calls.clone()));
+        let first = h.rig.agent.on_ctl(Request::AskPermissions);
+        assert!(first.ok);
+        assert_eq!(first.result["permission"], "accessibility");
+        assert_eq!(first.result["shown"], "prompt_then_pane");
+        assert_eq!(*calls.lock().unwrap(), ["pane later Accessibility"]);
+        // Input Monitoring waits for Accessibility: Accessibility is asked instead.
+        let im = h.rig.agent.on_ctl(Request::AskPermission {
+            permission: "input_monitoring".into(),
+        });
+        assert_eq!(im.result["permission"], "accessibility");
+        granted.lock().unwrap().push(Permission::Accessibility);
+        let im = h.rig.agent.on_ctl(Request::AskPermission {
+            permission: "input_monitoring".into(),
+        });
+        assert_eq!(im.result["permission"], "input_monitoring");
+        assert_eq!(im.result["shown"], "pane");
+        let bad = h.rig.agent.on_ctl(Request::AskPermission {
+            permission: "camera".into(),
+        });
+        assert!(!bad.ok);
+        assert!(
+            !calls.lock().unwrap().iter().any(|c| c.starts_with("reset")),
+            "nothing is reset unless asked to"
+        );
+        let reset = h.rig.agent.on_ctl(Request::ResetPermission {
+            permission: "screen_recording".into(),
+        });
+        assert!(reset.ok);
+        assert_eq!(
+            calls.lock().unwrap().last().map(String::as_str),
+            Some("reset ScreenRecording")
+        );
+        granted.lock().unwrap().extend([
+            Permission::InputMonitoring,
+            Permission::ScreenRecording,
+            Permission::Microphone,
+        ]);
+        let done = h.rig.agent.on_ctl(Request::AskPermissions);
+        assert_eq!(done.result["shown"], "nothing");
+    }
+
+    /// WP-4.33: a grant made while the agent runs is seen and restarts it once, as soon as the
+    /// required set is complete (the 11:08 Accessibility grant was never seen).
+    #[test]
+    fn a_grant_completed_while_running_restarts_the_agent() {
+        let granted = Arc::new(Mutex::new(vec![
+            Permission::ScreenRecording,
+            Permission::Microphone,
+        ]));
+        let mut h = home();
+        h.rig.agent.platform.permissions = Box::new(MacLike(granted.clone()));
+        let baseline = h.rig.agent.permission_reading();
+        h.rig.agent.grant_watch = Some(crate::os_permissions::GrantWatch::new(baseline));
+        h.rig.agent.started = Instant::now()
+            .checked_sub(MIN_RUN_BEFORE_RESTART * 2)
+            .unwrap();
+        let poll = |h: &mut Home| {
+            h.rig.agent.last_permission_check =
+                Instant::now().checked_sub(PERMISSION_CHECK).unwrap();
+            h.rig.agent.permissions_changed()
+        };
+        assert!(!poll(&mut h), "nothing changed");
+        granted
+            .lock()
+            .unwrap()
+            .extend([Permission::Accessibility, Permission::InputMonitoring]);
+        assert!(!poll(&mut h), "a change is confirmed on a second read");
+        assert!(poll(&mut h), "the complete set restarts the agent");
     }
 
     /// A session whose state the test sets.

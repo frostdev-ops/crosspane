@@ -209,6 +209,8 @@ struct H {
     fixture_sequence: u64,
     /// Where the last `next` (or `install`) left the flow.
     last: ScreenId,
+    /// The platform the fake agent's replies are decoded for.
+    platform: AgentPlatform,
 }
 
 impl H {
@@ -225,6 +227,7 @@ impl H {
         let clock = Arc::new(AtomicU64::new(1_000));
         let time = clock.clone();
         let clock_fn: Clock = Arc::new(move || time.load(Ordering::SeqCst));
+        let platform = description.platform;
         let c = LiveController::new(
             Box::new(Fake {
                 description,
@@ -247,6 +250,7 @@ impl H {
             effects: Vec::new(),
             fixture_sequence: 0,
             last: ScreenId::Welcome,
+            platform,
         }
     }
     fn advance(&mut self, ms: u64) {
@@ -413,12 +417,7 @@ impl H {
         self.tick();
     }
     fn health(&self) -> Box<HealthSnapshot> {
-        match parse_status(
-            &serde_json::to_vec(&self.status).unwrap(),
-            AgentPlatform::Linux,
-        )
-        .unwrap()
-        {
+        match parse_status(&serde_json::to_vec(&self.status).unwrap(), self.platform).unwrap() {
             StatusAdmission::Supported(h) => h,
             _ => panic!("fixture status not admitted"),
         }
@@ -443,7 +442,7 @@ impl H {
         let ack = decode_reply(
             &call.request,
             br#"{"ok":true,"result":"arbitrary producer prose"}"#,
-            AgentPlatform::Linux,
+            self.platform,
         )
         .unwrap();
         self.reply(call, Ok(ack));
@@ -3841,4 +3840,232 @@ fn advisory_check_is_a_visible_note_and_does_not_claim_verified_evidence() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].state, RowState::Note);
     assert!(rows[0].detail.contains("Couldn't confirm"));
+}
+
+// ---- macOS permission rows (WP-4.33) ----
+
+const PERMS: StepId = StepId(30);
+const AX_ROW: u16 = 960;
+const IM_ROW: u16 = 961;
+const SR_ROW: u16 = 962;
+const MIC_ROW: u16 = 963;
+/// Row `n`'s actions: Allow, It's on, Reset and ask again, Restart and check again.
+fn allow(row: u16) -> u16 {
+    2600 + (row - 960) * 10
+}
+fn its_on(row: u16) -> u16 {
+    allow(row) + 1
+}
+fn reset_and_ask(row: u16) -> u16 {
+    allow(row) + 2
+}
+fn restart_and_check(row: u16) -> u16 {
+    allow(row) + 3
+}
+
+/// A Mac whose agent reports `granted` and nothing else; audio (and so Microphone) is on.
+fn set_mac_permissions(h: &mut H, granted: &[&str]) {
+    let facts: Vec<Value> = [
+        "screen_recording",
+        "accessibility",
+        "input_monitoring",
+        "microphone",
+    ]
+    .iter()
+    .map(|name| {
+        json!({"name": name, "state": if granted.contains(name) { "granted" } else { "not_granted" }})
+    })
+    .collect();
+    h.status["result"]["installer"]["permissions"] = json!(facts);
+}
+
+/// Setup on a Mac, at the permissions screen with its step asking (Detect and Plan done).
+fn mac_at_permissions() -> H {
+    let mut d = description();
+    d.platform = AgentPlatform::Macos;
+    let mut step = native(PERMS, &[AGENT], ScreenId::Permissions, false);
+    step.uses_status = true;
+    step.agent_apply = Some(live::AgentApply::AskPermissions);
+    d.steps.push(step);
+    d.connect_after.push(PERMS);
+    d.practice_after.push(PERMS);
+    let mut h = H::with(d);
+    set_mac_permissions(&mut h, &[]);
+    h.install();
+    h.status_reply();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Permissions);
+    h.status_reply();
+    let (detect, _) = loop_for_job(&mut h, PERMS, JobStage::Detect);
+    h.report(&detect, NativeOutcome::Detected { needs_action: true });
+    let (plan, _) = loop_for_job(&mut h, PERMS, JobStage::Plan);
+    h.report(
+        &plan,
+        NativeOutcome::Planned {
+            preview: "Crosspane asks for one permission at a time".into(),
+        },
+    );
+    h
+}
+
+fn view_row(h: &H, id: u16) -> RowView {
+    h.view()
+        .rows
+        .iter()
+        .find(|r| r.id == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("row {id} missing: {:?}", h.view().rows))
+}
+
+#[test]
+fn each_missing_mac_permission_gets_its_own_row_and_allow_button() {
+    let mut h = mac_at_permissions();
+    // In the order they are asked: Accessibility first, Input Monitoring after it.
+    let ids: Vec<u16> = h.view().rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, [PERMS.0, AX_ROW, IM_ROW, SR_ROW, MIC_ROW]);
+    assert_eq!(view_row(&h, AX_ROW).state, RowState::NeedsAction);
+    assert_eq!(view_row(&h, IM_ROW).state, RowState::Waiting);
+    assert!(view_row(&h, IM_ROW).detail.contains("first"));
+    // One Allow per row; Input Monitoring's waits for Accessibility.
+    assert!(h.button(allow(AX_ROW)).unwrap().enabled);
+    assert!(!h.button(allow(IM_ROW)).unwrap().enabled);
+    assert!(h.button(allow(SR_ROW)).unwrap().enabled);
+    assert_eq!(h.button(allow(AX_ROW)).unwrap().label, "Allow");
+    // The old ask-for-everything button is gone; nothing has been asked.
+    assert!(h.button(ids::consent(PERMS)).is_none());
+    assert!(!h.has_call(|r| matches!(
+        r,
+        InstallerRequest::AskPermissions
+            | InstallerRequest::AskPermission { .. }
+            | InstallerRequest::ResetPermission { .. }
+    )));
+
+    h.click(allow(AX_ROW));
+    let ask = h.call(|r| {
+        *r == InstallerRequest::AskPermission {
+            permission: PermissionName::Accessibility,
+        }
+    });
+    // One permission per click, and one call at a time.
+    assert!(!h.button(allow(SR_ROW)).unwrap().enabled);
+    h.ack(&ask);
+    let row = view_row(&h, AX_ROW);
+    assert_eq!(row.state, RowState::Waiting);
+    assert!(row.detail.contains("System Settings"), "{}", row.detail);
+    assert!(h.button(its_on(AX_ROW)).is_some());
+    assert!(!h.has_call(|r| *r == InstallerRequest::AskPermissions));
+
+    // Accessibility is granted: its row turns into a check and Input Monitoring can be asked.
+    set_mac_permissions(&mut h, &["accessibility"]);
+    h.status_reply();
+    assert_eq!(view_row(&h, AX_ROW).state, RowState::Verified);
+    assert!(h.button(allow(AX_ROW)).is_none());
+    assert!(h.button(allow(IM_ROW)).unwrap().enabled);
+}
+
+#[test]
+fn a_permission_said_to_be_on_but_still_off_offers_restart_and_reset_only_on_click() {
+    let mut h = mac_at_permissions();
+    h.click(allow(SR_ROW));
+    let ask = h.call(|r| {
+        *r == InstallerRequest::AskPermission {
+            permission: PermissionName::ScreenRecording,
+        }
+    });
+    h.ack(&ask);
+    h.click(its_on(SR_ROW));
+    assert_eq!(view_row(&h, SR_ROW).state, RowState::Working);
+    assert!(h.button(reset_and_ask(SR_ROW)).is_none(), "not before ~5 s");
+    for _ in 0..12 {
+        h.advance(500);
+        h.status_reply();
+    }
+    let row = view_row(&h, SR_ROW);
+    assert_eq!(row.state, RowState::Waiting);
+    assert!(row.detail.contains("still reports"), "{}", row.detail);
+    assert!(h.button(restart_and_check(SR_ROW)).unwrap().enabled);
+    assert!(
+        !h.has_call(|r| matches!(r, InstallerRequest::ResetPermission { .. })),
+        "nothing is reset without a click"
+    );
+    h.click(reset_and_ask(SR_ROW));
+    let reset = h.call(|r| {
+        *r == InstallerRequest::ResetPermission {
+            permission: PermissionName::ScreenRecording,
+        }
+    });
+    h.ack(&reset);
+    // The reset is followed by a fresh ask for the same permission.
+    let again = h.call(|r| {
+        *r == InstallerRequest::AskPermission {
+            permission: PermissionName::ScreenRecording,
+        }
+    });
+    h.ack(&again);
+    assert!(h.button(reset_and_ask(SR_ROW)).is_none());
+}
+
+#[test]
+fn the_restart_offer_restarts_the_agent() {
+    let mut h = mac_at_permissions();
+    h.click(allow(MIC_ROW));
+    let ask = h.call(|r| matches!(r, InstallerRequest::AskPermission { .. }));
+    h.ack(&ask);
+    h.click(its_on(MIC_ROW));
+    for _ in 0..12 {
+        h.advance(500);
+        h.status_reply();
+    }
+    h.click(restart_and_check(MIC_ROW));
+    let restart = h.call(|r| *r == InstallerRequest::Restart);
+    h.ack(&restart);
+}
+
+#[test]
+fn the_permissions_screen_moves_on_by_itself_once_everything_is_granted() {
+    let mut h = mac_at_permissions();
+    set_mac_permissions(
+        &mut h,
+        &[
+            "screen_recording",
+            "accessibility",
+            "input_monitoring",
+            "microphone",
+        ],
+    );
+    h.status_reply();
+    // The step is checked again by itself, and verified only through the platform's Verify.
+    let (detect, _) = loop_for_job(&mut h, PERMS, JobStage::Detect);
+    h.report(
+        &detect,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    let (verify, evidence) = loop_for_job(&mut h, PERMS, JobStage::Verify);
+    assert!(evidence.is_some());
+    let live = h.live();
+    h.report(&verify, live);
+    assert_eq!(h.row(PERMS).state, RowState::Verified);
+    for _ in 0..20 {
+        if h.view().screen != ScreenId::Permissions {
+            break;
+        }
+        h.advance(100);
+        h.tick();
+    }
+    assert_ne!(h.view().screen, ScreenId::Permissions);
+    assert!(!h.has_call(|r| matches!(
+        r,
+        InstallerRequest::AskPermissions | InstallerRequest::AskPermission { .. }
+    )));
+}
+
+#[test]
+fn a_mac_without_audio_has_no_microphone_row() {
+    let mut h = mac_at_permissions();
+    h.status["result"]["installer"]["audio"]["enabled"] = json!(false);
+    h.status_reply();
+    assert!(h.view().rows.iter().all(|r| r.id != MIC_ROW));
+    assert!(h.button(allow(MIC_ROW)).is_none());
 }

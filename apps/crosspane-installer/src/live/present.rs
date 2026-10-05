@@ -3,6 +3,8 @@
 
 use crosspane_installer_core::{JobStage, Milestone, StepId, StepState};
 
+pub(super) mod permissions;
+
 use super::controller::{LiveController, automatic_screen, bounded, bounded_lines};
 use super::graph::{self, StepKind, steps};
 use super::practice::{CONFIRMATIONS, confirmation_label, confirmations};
@@ -384,6 +386,20 @@ impl LiveController {
             ScreenId::Summary => self.rows(),
             ScreenId::Welcome | ScreenId::RepairRemove => Vec::new(),
             ScreenId::Connect | ScreenId::MatchNumbers => self.connect_rows(),
+            // One row per permission, each with its own Allow (WP-4.33).
+            ScreenId::Permissions if self.permission_rows_active() => self
+                .page_steps(screen)
+                .into_iter()
+                .flat_map(|step| {
+                    if self.graph.meta(step).and_then(|m| m.agent_apply)
+                        == Some(super::AgentApply::AskPermissions)
+                    {
+                        self.permission_step_rows(step)
+                    } else {
+                        vec![self.row(step)]
+                    }
+                })
+                .collect(),
             ScreenId::Practice => self.practice_rows(),
             // These screens ask their question in their content; the step itself is shown only
             // while it isn't asking (checking, saving, or stopped with a reason).
@@ -649,6 +665,10 @@ impl LiveController {
                     )
                 }
             }
+            ScreenId::Permissions if self.permission_rows_active() => (
+                "Allow Crosspane on this Mac".into(),
+                self.permission_message(),
+            ),
             ScreenId::Permissions => (
                 "Allow Crosspane on this Mac".into(),
                 if asking {
@@ -909,7 +929,12 @@ impl LiveController {
             let Some(meta) = self.graph.meta(step) else {
                 continue;
             };
+            // The permission rows replace the permissions step's one ask-for-everything button.
+            let rows_instead = screen == ScreenId::Permissions
+                && meta.agent_apply == Some(super::AgentApply::AskPermissions)
+                && self.permission_rows_active();
             if meta.kind == StepKind::Native
+                && !rows_instead
                 && self.step_state(step) == StepState::NeedsAction
                 && self.previews.contains_key(&step)
                 && self.job(step, JobStage::Plan).is_some()
@@ -1098,6 +1123,9 @@ impl LiveController {
                 }
             }
             ScreenId::Practice => self.practice_controls(&mut buttons),
+            ScreenId::Permissions if self.permission_rows_active() => {
+                self.permission_buttons(&mut buttons);
+            }
             ScreenId::Summary => {
                 let ready = self.summary.milestone == Milestone::WorkspaceReady;
                 if ready {
@@ -1778,6 +1806,7 @@ impl LiveController {
                     self.practice_user(TutorialUserAction::SelectRemoteWindow { window });
                 }
             }
+            2600..=2639 => self.permission_button(id),
             5100..=5190 => self.follow_up(id - 5100, true),
             5200..=5290 => self.follow_up(id - 5200, false),
             _ => {}

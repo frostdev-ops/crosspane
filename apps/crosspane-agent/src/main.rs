@@ -11,6 +11,7 @@ mod lifecycle;
 mod macos_launch;
 mod media;
 mod net;
+mod os_permissions;
 mod pairing;
 mod parking_worker;
 mod paths;
@@ -73,7 +74,7 @@ enum Command {
     },
     /// Print the OS permission status as one JSON line.
     Permissions {
-        /// Start the OS's grant flow for every permission not yet granted.
+        /// Ask the OS for the first permission not yet granted (one per run, as the menu does).
         #[arg(long)]
         request: bool,
         /// Also open the System Settings pane for every permission not yet granted (macOS).
@@ -262,40 +263,13 @@ pub fn exit_on_panic<R>(thread: &str, f: impl FnOnce() -> R) -> R {
     }
 }
 
-/// Ask the OS for every missing permission (04 §2 onboarding). The requests come from the agent's
-/// own process, so the system dialogs name Crosspane. Returns what was asked for.
-pub fn request_missing_permissions(platform: &mut platform::Platform) -> Vec<&'static str> {
-    let perms = platform.permissions.as_mut();
-    let mut requested = Vec::new();
-    for permission in perms.required() {
-        if perms.state(permission) != PermissionState::Granted {
-            match perms.request(permission) {
-                Ok(()) => requested.push(permission_name(permission)),
-                Err(e) => tracing::warn!(error = %e, ?permission, "permission request failed"),
-            }
-        }
-    }
-    requested
-}
-
-/// At most once a day, show the OS permission dialogs for anything missing, so a fresh install
-/// asks on its own rather than waiting for the user to find the menu.
-fn request_permissions_daily(state_dir: &std::path::Path, platform: &mut platform::Platform) {
-    let marker = state_dir.join("permissions-requested");
-    let recent = std::fs::metadata(&marker)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|at| at.elapsed().ok())
-        .is_some_and(|age| age < std::time::Duration::from_secs(24 * 3600));
-    if recent {
-        return;
-    }
-    let requested = request_missing_permissions(platform);
-    if !requested.is_empty() {
-        tracing::info!(?requested, "asked the OS for missing permissions");
-        if let Err(e) = std::fs::write(&marker, b"") {
-            tracing::debug!(error = %e, "could not record the permission request");
-        }
+/// Delete the once-a-day burst's marker an older agent left (WP-4.33 removed the burst: the
+/// agent asks for a permission only on a click, one at a time).
+fn remove_old_burst_marker(state_dir: &std::path::Path) {
+    match std::fs::remove_file(state_dir.join(os_permissions::OLD_BURST_MARKER)) {
+        Ok(()) => tracing::info!("removed the old permission-burst marker"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::debug!(error = %e, "could not remove the old permission-burst marker"),
     }
 }
 
@@ -364,7 +338,7 @@ fn start_agent(
     *failure = lifecycle::Failure::Platform;
     let mut platform = platform::create(&paths.state_dir, &config)?;
     tracing::info!(backends = ?platform, "platform ready");
-    request_permissions_daily(&paths.state_dir, &mut platform);
+    remove_old_burst_marker(&paths.state_dir);
     // `_lock` stays held while the key store is waited for, so a second agent still refuses to
     // start.
     *failure = lifecycle::Failure::Keystore;
@@ -1056,40 +1030,31 @@ fn trust_at(paths: &Paths, action: TrustAction) -> Result<()> {
 
 fn permissions(request: bool, open_settings: bool) -> Result<()> {
     let mut perms = platform_permissions();
+    if request {
+        let record = Paths::new()
+            .ok()
+            .map(|p| p.state_dir.join(os_permissions::ASK_RECORD));
+        let asked = os_permissions::ask_first_missing(
+            perms.as_mut(),
+            &mut os_permissions::SystemTcc,
+            &mut os_permissions::AskRecord::at(record),
+        )
+        .map_err(anyhow::Error::msg)?;
+        eprintln!("{}", serde_json::to_string(&asked)?);
+    }
     let mut report = serde_json::Map::new();
     for permission in perms.required() {
-        let mut state = perms.state(permission);
-        if state != PermissionState::Granted {
-            if request {
-                perms.request(permission)?;
-            }
-            if open_settings {
-                open_settings_pane(permission);
-            }
-            state = perms.state(permission);
+        let state = perms.state(permission);
+        if state != PermissionState::Granted && open_settings {
+            open_settings_pane(permission);
         }
-        report.insert(permission_name(permission).into(), state_name(state).into());
+        report.insert(
+            os_permissions::permission_token(permission).into(),
+            os_permissions::state_token(state).into(),
+        );
     }
     println!("{}", serde_json::Value::Object(report));
     Ok(())
-}
-
-fn permission_name(permission: Permission) -> &'static str {
-    match permission {
-        Permission::ScreenRecording => "screen_recording",
-        Permission::Accessibility => "accessibility",
-        Permission::InputMonitoring => "input_monitoring",
-        Permission::Microphone => "microphone",
-        _ => "other",
-    }
-}
-
-fn state_name(state: PermissionState) -> &'static str {
-    match state {
-        PermissionState::Granted => "granted",
-        PermissionState::NotGranted => "not_granted",
-        PermissionState::Unknown => "unknown",
-    }
 }
 
 #[cfg(target_os = "macos")]

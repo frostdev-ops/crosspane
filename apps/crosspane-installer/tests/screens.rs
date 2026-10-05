@@ -1464,3 +1464,77 @@ fn checklist_rows_without_a_card_get_one_and_ids_stay_in_their_range() {
     let (card, _) = harness.card("Operating system  Not checked yet");
     assert!(card.is_positive());
 }
+
+/// WP-4.33: a permission row (ids from 960) draws its own actions (ids from 2600 + 10 per row)
+/// under its words, never in the footer or the links under the content, and they click through.
+#[test]
+fn permission_rows_draw_their_own_allow_and_links_inside_the_row() {
+    let mut harness = Harness::review(egui::vec2(1100.0, 760.0));
+    let mut view = demo::fixture(ScreenId::Permissions);
+    view.illustration.permission_row = None;
+    view.rows = vec![
+        RowView {
+            id: 30,
+            label: "Crosspane has the Mac permissions it needs".into(),
+            detail: "1 of 3 allowed. Allow each one below.".into(),
+            state: RowState::NeedsAction,
+            human_confirmed: false,
+        },
+        RowView {
+            id: 960,
+            label: "Device Control and Data Access".into(),
+            detail: "Answer the macOS request, or turn Crosspane on in System Settings.".into(),
+            state: RowState::Waiting,
+            human_confirmed: false,
+        },
+        RowView {
+            id: 962,
+            label: "Screen & System Audio Recording".into(),
+            detail: "Allowed.".into(),
+            state: RowState::Verified,
+            human_confirmed: false,
+        },
+    ];
+    view.buttons = vec![
+        ButtonView {
+            id: 2600,
+            role: ButtonRole::Confirm,
+            label: "Allow".into(),
+            enabled: true,
+            kind: ButtonKind::Choice,
+        },
+        ButtonView {
+            id: 2601,
+            role: ButtonRole::Confirm,
+            label: "It's on".into(),
+            enabled: true,
+            kind: ButtonKind::Link,
+        },
+    ];
+    harness.settle(&view);
+    let label = harness.rect("Device Control and Data Access");
+    let allow = harness.rect("Allow");
+    let next = harness.rect("Screen & System Audio Recording");
+    // Drawn inside the Accessibility row: below its words, above the next row.
+    assert!(
+        allow.min.y > label.min.y && allow.max.y < next.min.y,
+        "{allow:?}"
+    );
+    let its_on = harness.rect("It's on");
+    assert!(its_on.max.y < next.min.y, "{its_on:?}");
+    assert!(footer(&view).is_empty(), "nothing in the footer");
+    let actions = harness.click(&view, "Allow");
+    assert!(
+        actions
+            .iter()
+            .any(|a| a.intent == WizardIntent::Button(2600) && a.revision == view.revision),
+        "{actions:?}"
+    );
+    let actions = harness.click(&view, "It's on");
+    assert!(
+        actions
+            .iter()
+            .any(|a| a.intent == WizardIntent::Button(2601)),
+        "{actions:?}"
+    );
+}

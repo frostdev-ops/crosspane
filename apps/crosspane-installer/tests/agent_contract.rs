@@ -113,6 +113,18 @@ fn every_used_request_has_exact_golden_json_and_one_line() {
             json!({"cmd":"ask_permissions"}),
         ),
         (
+            InstallerRequest::AskPermission {
+                permission: PermissionName::InputMonitoring,
+            },
+            json!({"cmd":"ask_permission","permission":"input_monitoring"}),
+        ),
+        (
+            InstallerRequest::ResetPermission {
+                permission: PermissionName::ScreenRecording,
+            },
+            json!({"cmd":"reset_permission","permission":"screen_recording"}),
+        ),
+        (
             InstallerRequest::Dial {
                 addr: "[::1]:47811".parse().unwrap(),
             },
@@ -296,6 +308,12 @@ fn acknowledgements_and_pull_prose_have_no_completion_payload() {
         InstallerRequest::Release,
         InstallerRequest::Restart,
         InstallerRequest::AskPermissions,
+        InstallerRequest::AskPermission {
+            permission: PermissionName::Accessibility,
+        },
+        InstallerRequest::ResetPermission {
+            permission: PermissionName::Accessibility,
+        },
         InstallerRequest::Dial {
             addr: "127.0.0.1:47811".parse().unwrap(),
         },

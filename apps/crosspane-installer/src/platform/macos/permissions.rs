@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 pub const MICROPHONE_REASON: &str =
     "lets Crosspane hear the Crosspane speakers device; your real microphone is never opened";
 pub const MICROPHONE_DETAIL: &str = "Authorization is for the hidden Crosspane speakers input. Sharing the mic peer capability remains unavailable.";
-pub const ASK_EXPLANATION: &str = "Crosspane requests every missing required permission. Several system dialogs may appear. A started request does not mean permission was granted.";
+pub const ASK_EXPLANATION: &str = "Crosspane asks for one permission at a time. macOS shows its request, or opens System Settings at the right place when that request was already answered. A request that was shown does not mean permission was granted.";
 pub const NETWORK_EXPLANATION: &str = "Allow the signed Crosspane agent to find and connect to your other computer on the Local Network. A system prompt may appear. An empty search does not establish a privacy denial.";
 pub const HIDE_LABEL: &str = "Hide projected windows on a virtual display (recommended)";
 pub const MIRROR_LABEL: &str = "Mirror instead (windows stay visible on this Mac)";
@@ -50,6 +50,10 @@ impl SettingsPane {
             Self::ScreenRecording => {
                 "System Settings > Privacy & Security > Screen & System Audio Recording > Crosspane"
             }
+            // macOS 27 renamed the Accessibility pane (WP-4.33).
+            Self::Accessibility if running_macos_major().is_some_and(|major| major >= 27) => {
+                "System Settings > Privacy & Security > Device Control and Data Access > Crosspane"
+            }
             Self::Accessibility => {
                 "System Settings > Privacy & Security > Accessibility > Crosspane"
             }
@@ -67,6 +71,14 @@ impl SettingsPane {
             Self::Microphone => PermissionName::Microphone,
         }
     }
+}
+/// This Mac's macOS major version, read once (pane names change between versions).
+pub fn running_macos_major() -> Option<u64> {
+    static MAJOR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MAJOR.get_or_init(|| {
+        let version = objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion();
+        u64::try_from(version.majorVersion).ok()
+    })
 }
 #[derive(Clone, PartialEq, Eq)]
 struct Principal {

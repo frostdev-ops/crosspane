@@ -49,6 +49,8 @@ pub trait HomeSeat: Send {
 
 /// Move only an identified proxy; return the compositor's freshly confirmed content frame.
 pub trait ProxyPlacementSeat: Send {
+    // Only the Hyprland drag gesture places proxies (WP-2.58); a Mac never calls it.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn place(
         &self,
         window: &WindowInfo,
@@ -324,6 +326,8 @@ pub struct Platform {
     /// Home on the twin (WP-2.43): the release bind and the pointer read-back. `None` off
     /// Hyprland, and on Hyprland when the bind can't be spelled (the agent logs why).
     pub home: Option<Box<dyn HomeSeat>>,
+    /// Proxy placement for the drag gesture (WP-2.58): Hyprland only, never read on a Mac.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub proxy_placement: Option<Box<dyn ProxyPlacementSeat>>,
     #[cfg(target_os = "macos")]
     pub visible_frame: fn(DisplayId) -> Result<RectLogical, PlatformError>,

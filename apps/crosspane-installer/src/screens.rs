@@ -40,6 +40,20 @@ const CARD_MARGIN: egui::Margin = egui::Margin {
 /// One turn of the in-progress mark, when motion is allowed.
 const SPIN_MS: u64 = 1200;
 
+/// The macOS permission rows (WP-4.33): one ordinary row per permission, each with its own
+/// actions drawn inside it instead of in the footer or under the content.
+pub(crate) const PERMISSION_ROW_IDS: std::ops::Range<u16> = 960..964;
+/// The actions of the permission rows: row `PERMISSION_ROW_IDS.start + n` owns the ten ids from
+/// `PERMISSION_BUTTON_IDS.start + 10 * n`.
+pub(crate) const PERMISSION_BUTTON_IDS: std::ops::Range<u16> = 2600..2640;
+
+/// The permission row a button belongs to, if it is one of their actions.
+pub(crate) fn permission_button_row(id: u16) -> Option<u16> {
+    PERMISSION_BUTTON_IDS
+        .contains(&id)
+        .then(|| PERMISSION_ROW_IDS.start + (id - PERMISSION_BUTTON_IDS.start) / 10)
+}
+
 #[derive(Default)]
 pub struct WizardShell {
     layout: LayoutWidget,
@@ -651,7 +665,7 @@ impl WizardShell {
             ui.add_space(8.0);
         }
         if !view.rows.is_empty() {
-            rows(ui, &view.rows, frame.phase);
+            rows(ui, view, frame.phase, intents);
             ui.add_space(4.0);
         }
         self.fields(ui, view, intents);
@@ -1065,7 +1079,9 @@ fn choices(ui: &mut egui::Ui, view: &WizardView, intents: &mut Vec<WizardIntent>
     let choices: Vec<&ButtonView> = view
         .buttons
         .iter()
-        .filter(|button| button.kind == ButtonKind::Choice)
+        .filter(|button| {
+            button.kind == ButtonKind::Choice && permission_button_row(button.id).is_none()
+        })
         .collect();
     if choices.is_empty() {
         return;
@@ -1111,7 +1127,11 @@ fn links(ui: &mut egui::Ui, view: &WizardView, intents: &mut Vec<WizardIntent>) 
     let links: Vec<&ButtonView> = view
         .buttons
         .iter()
-        .filter(|button| button.kind == ButtonKind::Link && button.role != ButtonRole::Back)
+        .filter(|button| {
+            button.kind == ButtonKind::Link
+                && button.role != ButtonRole::Back
+                && permission_button_row(button.id).is_none()
+        })
         .collect();
     if links.is_empty() {
         return;
@@ -1182,8 +1202,10 @@ fn shows_detail(row: &RowView) -> bool {
     !row.detail.trim().is_empty() && !matches!(row.state, RowState::Unchecked | RowState::Verified)
 }
 
-/// The step list, in one quiet panel. Checklist entries are drawn under the step before them.
-fn rows(ui: &mut egui::Ui, rows: &[RowView], phase: Option<f32>) {
+/// The step list, in one quiet panel. Checklist entries are drawn under the step before them;
+/// a permission row's own actions are drawn inside it.
+fn rows(ui: &mut egui::Ui, view: &WizardView, phase: Option<f32>, intents: &mut Vec<WizardIntent>) {
+    let rows = &view.rows;
     egui::Frame::new()
         .fill(theme::alpha(theme::NAVY, 55))
         .stroke((1.0, theme::alpha(theme::GLACIER, 26)))
@@ -1205,7 +1227,15 @@ fn rows(ui: &mut egui::Ui, rows: &[RowView], phase: Option<f32>) {
                     .map_or(rows.len(), |n| checks_from + n);
                 let checks = &rows[checks_from..checks_to];
                 match row {
-                    Some(row) => step_row(ui, row, checks, phase),
+                    Some(row) => {
+                        let actions: Vec<&ButtonView> = view
+                            .buttons
+                            .iter()
+                            .filter(|b| permission_button_row(b.id) == Some(row.id))
+                            .collect();
+                        step_row(ui, row, checks, phase);
+                        row_actions(ui, view, &actions, intents);
+                    }
                     None => checklist(ui, checks, false),
                 }
                 at = checks_to;
@@ -1258,6 +1288,38 @@ fn step_row(ui: &mut egui::Ui, row: &RowView, checks: &[RowView], phase: Option<
             }
             checklist(ui, checks, row.state == RowState::Verified);
         });
+    });
+}
+
+/// A permission row's actions, under its words: its one filled "Allow" and quiet links.
+fn row_actions(
+    ui: &mut egui::Ui,
+    view: &WizardView,
+    actions: &[&ButtonView],
+    intents: &mut Vec<WizardIntent>,
+) {
+    if actions.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        // Line up with the row's words, past its mark.
+        ui.add_space(32.0);
+        ui.spacing_mut().item_spacing.x = 16.0;
+        for button in actions {
+            let response = ui
+                .push_id(("row-action", view.revision, button.id), |ui| {
+                    ui.add_enabled_ui(button.enabled, |ui| match button.kind {
+                        ButtonKind::Link => theme::link(ui, &button.label),
+                        _ => theme::primary(ui, &button.label, button.enabled),
+                    })
+                    .inner
+                })
+                .inner;
+            reveal_focus(&response);
+            if response.clicked() && button.enabled && ui.clip_rect().contains_rect(response.rect) {
+                intents.push(WizardIntent::Button(button.id));
+            }
+        }
     });
 }
 

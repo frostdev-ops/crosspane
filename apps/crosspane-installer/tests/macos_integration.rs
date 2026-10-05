@@ -2635,15 +2635,6 @@ mod flow {
             *at = value;
         }
 
-        pub fn grant_everything(&mut self) {
-            for fact in self.status["result"]["installer"]["permissions"]
-                .as_array_mut()
-                .unwrap()
-            {
-                fact["state"] = json!("granted");
-            }
-        }
-
         fn pair_externally(&mut self, grants: &[&str]) {
             self.status["result"]["installer"]["peers"] = json!([{
                 "node": peer().to_string(), "name": "other", "connected": true,
@@ -2702,32 +2693,87 @@ mod flow {
             });
         }
 
+        /// WP-4.33: one row per missing permission, in the order they are asked, each with its
+        /// own Allow. Each click asks the agent for that one permission; only a later status that
+        /// reports it granted turns the row into a check, and the step verifies once all are.
         pub fn permissions(&mut self) {
+            const ORDER: [(&str, PermissionName); 4] = [
+                ("accessibility", PermissionName::Accessibility),
+                ("input_monitoring", PermissionName::InputMonitoring),
+                ("screen_recording", PermissionName::ScreenRecording),
+                ("microphone", PermissionName::Microphone),
+            ];
             self.reach(ScreenId::Permissions);
-            self.until("a permission preview", |f| {
-                f.has_button(live::ids::consent(StepId(30)))
-            });
-            let preview = self.view().message.clone();
-            assert!(preview.contains("Screen Recording"), "{preview}");
+            let missing: Vec<(usize, &str, PermissionName)> = ORDER
+                .iter()
+                .enumerate()
+                .filter(|(_, (name, _))| {
+                    self.status["result"]["installer"]["permissions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f["name"] == *name && f["state"] != "granted")
+                })
+                .map(|(i, (name, p))| (i, *name, *p))
+                .collect();
             assert!(
-                !self
-                    .calls
-                    .iter()
-                    .any(|c| c.request == InstallerRequest::AskPermissions),
-                "nothing is asked before the click"
+                !missing.is_empty(),
+                "the fixture starts with grants missing"
             );
-            self.click(live::ids::consent(StepId(30)));
-            let ask = self.expect_call(|r| *r == InstallerRequest::AskPermissions);
-            self.ack(&ask);
-            self.tick();
-            // The acknowledgement is not completion: only a later status verifies.
-            for _ in 0..5 {
-                self.advance(PACE_MS);
+            let first = 2600 + 10 * missing[0].0 as u16;
+            self.until("the permission rows", |f| f.has_button(first));
+            assert!(
+                !self.has_button(live::ids::consent(StepId(30))),
+                "no ask-for-everything button"
+            );
+            for (index, name, permission) in missing {
+                let allow = 2600 + 10 * index as u16;
+                let row = 960 + index as u16;
+                assert!(
+                    !self.calls.iter().any(|c| matches!(
+                        c.request,
+                        InstallerRequest::AskPermission { .. }
+                            | InstallerRequest::AskPermissions
+                            | InstallerRequest::ResetPermission { .. }
+                    )),
+                    "nothing is asked before the click"
+                );
+                self.until("its Allow", |f| f.has_button(allow));
+                self.click(allow);
+                let ask =
+                    self.expect_call(|r| *r == InstallerRequest::AskPermission { permission });
+                self.ack(&ask);
                 self.tick();
+                // The acknowledgement is not completion: only a later status verifies.
+                for _ in 0..5 {
+                    self.advance(PACE_MS);
+                    self.tick();
+                }
+                assert_ne!(self.row(30).state, RowState::Verified);
+                for fact in self.status["result"]["installer"]["permissions"]
+                    .as_array_mut()
+                    .unwrap()
+                {
+                    if fact["name"] == name {
+                        fact["state"] = json!("granted");
+                    }
+                }
+                self.until("the row checked from status", |f| {
+                    f.view()
+                        .rows
+                        .iter()
+                        .any(|r| r.id == row && r.state == RowState::Verified)
+                        || f.verified(30)
+                });
             }
-            assert_ne!(self.row(30).state, RowState::Verified);
-            self.grant_everything();
             self.until("permissions verified from status", |f| f.verified(30));
+            assert!(
+                !self.calls.iter().any(|c| matches!(
+                    c.request,
+                    InstallerRequest::AskPermissions | InstallerRequest::ResetPermission { .. }
+                )),
+                "never an ask-all and never a reset without a click"
+            );
         }
 
         pub fn audio(&mut self) {

@@ -102,7 +102,9 @@ pub enum TrayAction {
     PairJoin(SocketAddr),
     PairConfirm(bool),
     PairPick(usize),
-    OpenSettings(Permission),
+    /// Ask the OS for this one permission: its prompt, or System Settings at its pane when the
+    /// prompt was already answered (WP-4.33).
+    AskPermission(Permission),
     /// Open the settings app (`crosspane-ui`).
     OpenApp,
 }
@@ -212,11 +214,11 @@ pub fn build(view: &TrayView) -> (TrayMenu, BTreeMap<TrayItemId, TrayAction>) {
     // Permissions (macOS onboarding).
     if !view.missing_permissions.is_empty() {
         items.push(TrayItem::Separator);
-        items.push(label("Needs permission (click to open Settings):"));
+        items.push(label("Needs permission (click to allow):"));
         for &permission in &view.missing_permissions {
             items.push(b.action(
                 permission_reason(permission),
-                TrayAction::OpenSettings(permission),
+                TrayAction::AskPermission(permission),
             ));
         }
     }
@@ -565,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_permissions_are_explained_and_open_settings() {
+    fn missing_permissions_are_explained_and_asked_one_at_a_time() {
         let view = TrayView {
             name: "mac".into(),
             peers: vec![peer(1, true)],
@@ -576,7 +578,7 @@ mod tests {
         assert_eq!(menu.state, TrayState::Attention);
         assert_eq!(
             action_of(&menu, &actions, "Accessibility —"),
-            TrayAction::OpenSettings(Permission::Accessibility)
+            TrayAction::AskPermission(Permission::Accessibility)
         );
     }
 

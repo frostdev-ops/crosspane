@@ -12,6 +12,7 @@ use super::graph::{self, Graph, StepKind};
 use super::ledger::Ledger;
 use super::practice::PracticeState;
 use super::present::MaintenanceState;
+use super::present::permissions::PermissionAsks;
 use super::shared::ConnectState;
 use super::{
     Clock, Consent, LiveError, NativeJob, NativeOutcome, NativeReport, Platform,
@@ -65,6 +66,8 @@ pub(super) enum OwnCall {
     Place,
     Settings,
     StepApply,
+    /// A permission row's ask, reset or restart (WP-4.33).
+    Permission,
 }
 
 pub(super) struct Health {
@@ -138,6 +141,8 @@ pub struct LiveController {
     /// The last own Status came from an agent too old to report its health, so whether it is in
     /// use (and what a restart would interrupt) can't be known.
     pub(super) agent_health_pending: bool,
+    /// The macOS permission rows' history and calls (WP-4.33).
+    pub(super) permission_asks: PermissionAsks,
 }
 
 /// How long a finished screen stays up before the next one, so its last check is seen.
@@ -252,6 +257,7 @@ impl LiveController {
             auto_advance: true,
             complete_since: None,
             agent_health_pending: false,
+            permission_asks: PermissionAsks::default(),
         };
         controller.view.demo = false;
         controller.rebuild_view();
@@ -670,6 +676,7 @@ impl LiveController {
             OwnCall::Place => self.place_reply(reply),
             OwnCall::Settings => self.settings_reply(reply),
             OwnCall::StepApply => self.step_apply_reply(reply),
+            OwnCall::Permission => self.permission_reply(reply),
         }
     }
 
@@ -754,6 +761,10 @@ impl LiveController {
     }
 
     pub(super) fn live_screen(&self) -> bool {
+        // The permission rows follow each grant as macOS reports it (WP-4.33).
+        if self.screen == ScreenId::Permissions && self.permission_rows_active() {
+            return true;
+        }
         matches!(
             self.screen,
             ScreenId::Connect
@@ -1104,6 +1115,7 @@ impl InstallerController for LiveController {
         self.status_wait_tick();
         self.repair_tick();
         self.connect_tick();
+        self.permissions_tick();
         self.auto_begin();
         self.dispatch_intents();
         self.auto_consent();

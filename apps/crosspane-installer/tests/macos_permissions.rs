@@ -468,7 +468,9 @@ fn ask_is_multi_dialog_agent_request_and_acknowledgement_is_not_grant() {
             .all(|r| r.state == PermissionState::NotGranted)
     );
     assert_eq!(g.view(f.now()).reason, Some(GuideReason::RequestStarted));
-    assert!(ASK_EXPLANATION.contains("Several system dialogs"));
+    // WP-4.33: one permission per click, never a burst of dialogs.
+    assert!(ASK_EXPLANATION.contains("one permission at a time"));
+    assert!(!ASK_EXPLANATION.contains("Several system dialogs"));
     assert_eq!(g.ask(&token, f.now()).unwrap_err(), GuideError::Stale);
 }
 #[test]

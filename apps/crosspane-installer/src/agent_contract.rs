@@ -310,7 +310,18 @@ pub enum InstallerRequest {
     Release,
     Panic,
     Restart,
+    /// Ask for the first missing OS permission only (WP-4.33).
     AskPermissions,
+    /// Ask for one OS permission: its prompt, or System Settings at its pane when the prompt was
+    /// already answered (WP-4.33). Acknowledged only; the grant shows in a later Status.
+    AskPermission {
+        permission: PermissionName,
+    },
+    /// Reset Crosspane's own entry for one OS permission so its prompt can show again (WP-4.33).
+    /// Only ever sent on the person's explicit click.
+    ResetPermission {
+        permission: PermissionName,
+    },
     Dial {
         addr: SocketAddr,
     },
