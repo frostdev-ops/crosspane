@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{
@@ -34,6 +34,41 @@ use crate::{main_thread::on_main, permissions};
 const POLL: Duration = Duration::from_millis(250);
 const QUERY_WAIT: Duration = Duration::from_millis(500);
 const MAIN_WAIT: Duration = Duration::from_millis(250);
+
+// Small helper windows cannot be projected reliably through Accessibility.
+const MIN_LISTED_WINDOW_SIZE_PT: f64 = 48.0;
+
+#[derive(Debug, Default)]
+struct WindowAdmission {
+    ids: HashSet<WindowId>,
+}
+
+impl WindowAdmission {
+    fn snapshot(
+        &mut self,
+        mut windows: Vec<WindowInfo>,
+        front: Option<i32>,
+    ) -> (Vec<WindowInfo>, Option<WindowId>) {
+        let present: HashSet<_> = windows.iter().map(|window| window.id).collect();
+        self.ids.retain(|id| present.contains(id));
+        // Admission lasts until disappearance: shrinking a projected window is not Removed.
+        windows.retain(|window| {
+            self.ids.contains(&window.id)
+                || (window.frame.size.width >= MIN_LISTED_WINDOW_SIZE_PT
+                    && window.frame.size.height >= MIN_LISTED_WINDOW_SIZE_PT
+                    && self.ids.insert(window.id))
+        });
+        // Keyboard focus is on an admitted showing window, not a helper or hidden window.
+        let focused = windows
+            .iter()
+            .find(|window| {
+                window.state != WindowState::Hidden
+                    && window.pid.and_then(|pid| i32::try_from(pid).ok()) == front
+            })
+            .map(|window| window.id);
+        (windows, focused)
+    }
+}
 
 static OWN_QUERY_BUSY: AtomicBool = AtomicBool::new(false);
 struct OwnQueryLease;
@@ -123,6 +158,7 @@ fn parse_own_window(dictionary: &CFDictionary, own_pid: u32) -> Option<(WindowId
 #[derive(Debug)]
 pub struct MacWindows {
     query: WindowQuery,
+    admission: Arc<Mutex<WindowAdmission>>,
     stop: Option<Arc<AtomicBool>>,
 }
 
@@ -130,6 +166,7 @@ impl MacWindows {
     pub fn new() -> Result<MacWindows, PlatformError> {
         Ok(Self {
             query: WindowQuery::new()?,
+            admission: Arc::default(),
             stop: None,
         })
     }
@@ -145,11 +182,11 @@ impl Drop for MacWindows {
 
 impl WindowSource for MacWindows {
     fn windows(&self) -> Result<Vec<WindowInfo>, PlatformError> {
-        Ok(snapshot(&self.query)?.0)
+        Ok(snapshot(&self.query, &self.admission)?.0)
     }
 
     fn focused(&self) -> Result<Option<WindowId>, PlatformError> {
-        Ok(snapshot(&self.query)?.1)
+        Ok(snapshot(&self.query, &self.admission)?.1)
     }
 
     fn activate(&mut self, window: WindowId) -> Result<(), PlatformError> {
@@ -200,8 +237,9 @@ impl WindowSource for MacWindows {
                 "WindowSource::subscribe called twice".into(),
             ));
         }
-        let initial = snapshot(&self.query)?;
+        let initial = snapshot(&self.query, &self.admission)?;
         let query = self.query.clone();
+        let admission = self.admission.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         std::thread::Builder::new()
@@ -220,7 +258,7 @@ impl WindowSource for MacWindows {
                     if worker_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let (next, next_focus) = match snapshot(&query) {
+                    let (next, next_focus) = match snapshot(&query, &admission) {
                         Ok(snapshot) => snapshot,
                         // A failed observation is not evidence that every window disappeared.
                         Err(error) => {
@@ -231,22 +269,7 @@ impl WindowSource for MacWindows {
                     if worker_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let previous: HashMap<_, _> = last.iter().map(|w| (w.id, w)).collect();
-                    for window in &next {
-                        match previous.get(&window.id) {
-                            None => sink.send(WindowEvent::Added(window.clone())),
-                            Some(old) if **old != *window => {
-                                sink.send(WindowEvent::Changed(window.clone()))
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                    let next_ids: HashSet<_> = next.iter().map(|w| w.id).collect();
-                    for window in &last {
-                        if !next_ids.contains(&window.id) {
-                            sink.send(WindowEvent::Removed(window.id));
-                        }
-                    }
+                    emit_window_changes(&last, &next, |event| sink.send(event));
                     if next_focus != focus {
                         sink.send(WindowEvent::Focused(next_focus));
                     }
@@ -257,6 +280,27 @@ impl WindowSource for MacWindows {
             .map_err(|e| PlatformError::Backend(format!("spawn window poll thread: {e}")))?;
         self.stop = Some(stop);
         Ok(())
+    }
+}
+
+fn emit_window_changes(
+    last: &[WindowInfo],
+    next: &[WindowInfo],
+    mut send: impl FnMut(WindowEvent),
+) {
+    let previous: HashMap<_, _> = last.iter().map(|window| (window.id, window)).collect();
+    for window in next {
+        match previous.get(&window.id) {
+            None => send(WindowEvent::Added(window.clone())),
+            Some(old) if **old != *window => send(WindowEvent::Changed(window.clone())),
+            Some(_) => {}
+        }
+    }
+    let next_ids: HashSet<_> = next.iter().map(|window| window.id).collect();
+    for window in last {
+        if !next_ids.contains(&window.id) {
+            send(WindowEvent::Removed(window.id));
+        }
     }
 }
 
@@ -503,11 +547,14 @@ fn map_window(
     }
 }
 
-fn snapshot(query: &WindowQuery) -> Result<(Vec<WindowInfo>, Option<WindowId>), PlatformError> {
+fn snapshot(
+    query: &WindowQuery,
+    admission: &Arc<Mutex<WindowAdmission>>,
+) -> Result<(Vec<WindowInfo>, Option<WindowId>), PlatformError> {
     // Every window, on screen or not: a window on another Space (an app's fullscreen Space, say) is
     // `Hidden`, not gone, so a projection of it never ends by `Removed` until it closes.
     let raw = query.list(true)?;
-    on_main(MAIN_WAIT, move |_| {
+    let (windows, front) = on_main(MAIN_WAIT, move |_| {
         autoreleasepool(|_| {
             let front = NSWorkspace::sharedWorkspace()
                 .frontmostApplication()
@@ -538,17 +585,14 @@ fn snapshot(query: &WindowQuery) -> Result<(Vec<WindowInfo>, Option<WindowId>), 
                     Some(map_window(raw, app_id, display, bounds))
                 })
                 .collect();
-            // Keyboard focus is on a window that is showing, not on one of the app's hidden ones.
-            let focused = windows
-                .iter()
-                .find(|w| {
-                    w.state != WindowState::Hidden
-                        && w.pid.and_then(|p| i32::try_from(p).ok()) == front
-                })
-                .map(|w| w.id);
-            (windows, focused)
+            (windows, front)
         })
-    })
+    })?;
+    // Never hold admission across AppKit/main-thread work, or commit a timed-out observation.
+    let mut admission = admission
+        .lock()
+        .map_err(|_| PlatformError::Backend("Mac window admission lock poisoned".into()))?;
+    Ok(admission.snapshot(windows, front))
 }
 
 pub(crate) fn display_for_frame(frame: RectLogical) -> Result<DisplayId, PlatformError> {
@@ -1160,6 +1204,94 @@ fn position_with(
 mod tests {
     use super::*;
     use objc2_core_graphics::CGRectCreateDictionaryRepresentation;
+
+    fn listed_window(width: f64, height: f64) -> WindowInfo {
+        map_window(
+            RawWindow {
+                id: WindowId(42),
+                pid: 123,
+                title: "fixture".into(),
+                owner: "fixture".into(),
+                frame: rect(-100.0, -200.0, width, height),
+                on_screen: true,
+            },
+            "io.test.fixture".into(),
+            None,
+            None,
+        )
+    }
+
+    fn changes(last: &[WindowInfo], next: &[WindowInfo]) -> Vec<WindowEvent> {
+        let mut events = Vec::new();
+        emit_window_changes(last, next, |event| events.push(event));
+        events
+    }
+
+    #[test]
+    fn listing_filter_requires_48_points_in_both_dimensions() {
+        for (width, height, expected) in [
+            (1.0, 1.0, false),
+            (1800.0, 39.0, false),
+            (39.0, 1800.0, false),
+            (47.99, 48.0, false),
+            (48.0, 47.99, false),
+            (48.0, 48.0, true),
+            (1800.0, 48.0, true),
+        ] {
+            let (windows, focus) =
+                WindowAdmission::default().snapshot(vec![listed_window(width, height)], Some(123));
+            assert_eq!(!windows.is_empty(), expected, "{width} x {height}");
+            assert_eq!(focus.is_some(), expected);
+        }
+    }
+
+    #[test]
+    fn listing_filter_tiny_from_creation_has_no_added_or_focus() {
+        let mut admission = WindowAdmission::default();
+        let (initial, focus) = admission.snapshot(vec![listed_window(1.0, 1.0)], Some(123));
+        assert!(initial.is_empty());
+        assert!(focus.is_none());
+        assert!(changes(&[], &initial).is_empty());
+        let (next, _) = admission.snapshot(vec![listed_window(1800.0, 39.0)], Some(123));
+        assert!(changes(&initial, &next).is_empty());
+    }
+
+    #[test]
+    fn listing_filter_tiny_growth_to_threshold_emits_added() {
+        let mut admission = WindowAdmission::default();
+        let (initial, _) = admission.snapshot(vec![listed_window(1.0, 1.0)], Some(123));
+        let (next, focus) = admission.snapshot(vec![listed_window(48.0, 48.0)], Some(123));
+        assert_eq!(focus, Some(WindowId(42)));
+        assert!(matches!(changes(&initial, &next).as_slice(),
+            [WindowEvent::Added(window)] if window.id == WindowId(42)));
+    }
+
+    #[test]
+    fn listing_filter_admitted_shrink_keeps_identity_without_removed() {
+        let mut admission = WindowAdmission::default();
+        let (initial, _) = admission.snapshot(vec![listed_window(300.0, 200.0)], Some(123));
+        let (next, focus) = admission.snapshot(vec![listed_window(1.0, 1.0)], Some(123));
+        assert_eq!(focus, Some(WindowId(42)));
+        assert_eq!(next[0].id, initial[0].id);
+        assert_eq!(next[0].frame.size, SizeLogical::new(1.0, 1.0));
+        assert!(matches!(changes(&initial, &next).as_slice(),
+            [WindowEvent::Changed(window)] if window.id == WindowId(42)));
+    }
+
+    #[test]
+    fn listing_filter_disappearance_retires_admission_before_id_reuse() {
+        let mut admission = WindowAdmission::default();
+        let (initial, _) = admission.snapshot(vec![listed_window(48.0, 48.0)], Some(123));
+        let (closed, _) = admission.snapshot(Vec::new(), Some(123));
+        assert!(matches!(
+            changes(&initial, &closed).as_slice(),
+            [WindowEvent::Removed(WindowId(42))]
+        ));
+        let (reused, focus) = admission.snapshot(vec![listed_window(1.0, 1.0)], Some(123));
+        assert!(reused.is_empty());
+        assert!(focus.is_none());
+        assert!(changes(&closed, &reused).is_empty());
+    }
 
     #[test]
     fn drag_verified_frame_lookup_refuses_lone_unrelated_and_equal_candidates() {
