@@ -5,7 +5,9 @@ use std::{fmt::Debug, path::PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) enum Class {
     S,
+    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
     E,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     R,
 }
 #[derive(Debug, Serialize)]
@@ -57,6 +59,7 @@ impl Report {
             issue,
         });
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn debug<T: Debug, E: Debug>(
         &mut self,
         step: &'static str,

@@ -13,6 +13,7 @@ mod present;
 mod shared;
 mod skipped;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use skipped::SkippedStore;
 
 use std::sync::{Arc, Mutex};

@@ -54,6 +54,32 @@ pipewire.workspace = true
 zbus.workspace = true
 wayland-client.workspace = true
 
+# WP-W4.1a0: public native foundations for the accepted Windows backend packages.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+tokio.workspace = true
+xxhash-rust.workspace = true
+
 # This crate's integration tests turn on its own test seam; normal builds never do.
 [dev-dependencies]
 crosspane-installer = { path = ".", features = ["test-hooks"] }

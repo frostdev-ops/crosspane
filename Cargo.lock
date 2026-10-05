@@ -880,7 +880,11 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "wayland-client",
+ "windows",
+ "windows-sys 0.61.2",
+ "xxhash-rust",
  "zbus",
 ]
 

@@ -322,7 +322,7 @@ impl Fixture {
         InstanceStatus {
             id: u64::MAX,
             pid: 4242,
-            uid: self.runner.uid,
+            uid: Some(self.runner.uid),
             exe: self.runner.exe.to_string_lossy().into_owned(),
             runtime_dir: self.runtime.to_string_lossy().into_owned(),
             started_unix_ms: 0,

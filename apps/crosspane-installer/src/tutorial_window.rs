@@ -7,7 +7,6 @@ use crosspane_ui_kit::theme;
 use eframe::egui;
 use std::{
     collections::BTreeMap,
-    fs::File,
     io::{self, Read, Write},
     path::PathBuf,
     sync::{
@@ -16,8 +15,10 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(unix)]
+use std::{fs::File, time::Instant};
 type Result<T> = std::result::Result<T, FixtureError>;
 
 #[derive(Parser, Debug)]
@@ -673,11 +674,13 @@ fn progress(result: io::Result<usize>) -> Result<Option<usize>> {
         Err(_) => Err(FixtureError::ChannelClosed),
     }
 }
+#[cfg(unix)]
 struct PracticeApp {
     practice: Practice,
     channel: ChildChannel,
     clock: FixtureClock,
 }
+#[cfg(unix)]
 impl eframe::App for PracticeApp {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.practice.viewport(ctx, &self.channel, (self.clock)());
@@ -693,6 +696,7 @@ impl eframe::App for PracticeApp {
         }
     }
 }
+#[cfg(unix)]
 fn platform_native(font: &std::path::Path) -> Box<dyn TutorialNative> {
     #[cfg(target_os = "linux")]
     {
@@ -709,6 +713,7 @@ fn platform_native(font: &std::path::Path) -> Box<dyn TutorialNative> {
         Box::new(UnavailableTutorial)
     }
 }
+#[cfg(unix)]
 pub fn run(options: TutorialOptions) -> Result<()> {
     let path = options.validate()?;
     // The parent supplies its admitted system font. Bound and parse it before opening a viewport.
@@ -755,4 +760,11 @@ pub fn run(options: TutorialOptions) -> Result<()> {
         }),
     )
     .map_err(|_| FixtureError::Unavailable)
+}
+
+#[cfg(not(unix))]
+pub fn run(options: TutorialOptions) -> Result<()> {
+    options.validate()?;
+    // W4.1b supplies the native Windows fixture path; do not open fonts, pipes or a viewport.
+    Err(FixtureError::Unavailable)
 }

@@ -133,7 +133,7 @@ impl GuideAdmission {
             instance: InstanceStatus {
                 id: bootstrap.instance_id,
                 pid: process.pid,
-                uid: process.uid,
+                uid: Some(process.uid),
                 exe: process.executable.to_string_lossy().into_owned(),
                 runtime_dir: io.target().runtime_dir().to_string_lossy().into_owned(),
                 started_unix_ms: bootstrap.started_unix_ms,

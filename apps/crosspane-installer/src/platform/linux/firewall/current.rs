@@ -74,7 +74,7 @@ fn status<'a>(
     let s = health.installer();
     if reply.id == 0
         || reply.source != target.source()
-        || s.instance.uid != target.paths().uid
+        || s.instance.uid != Some(target.paths().uid)
         || std::path::Path::new(&s.instance.exe) != target.agent_path()
         || std::path::Path::new(&s.instance.runtime_dir) != target.runtime_dir()
     {

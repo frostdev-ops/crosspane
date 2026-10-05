@@ -371,7 +371,7 @@ fn frozen_status_admits_all_fields_without_policy_or_identity_derivation() {
     let i = h.installer();
     assert_eq!(i.instance.id, u64::MAX);
     assert_eq!(i.instance.pid, 4242);
-    assert_eq!(i.instance.uid, 1000);
+    assert_eq!(i.instance.uid, Some(1000));
     assert_eq!(i.node, local());
     assert_eq!(i.config_revision, "9f86d081884c7d65");
     assert_eq!(i.backends.len(), 15);

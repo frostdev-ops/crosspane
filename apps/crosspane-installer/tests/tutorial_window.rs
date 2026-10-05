@@ -363,6 +363,7 @@ fn received_calls_expire_without_gui_poll_or_response_and_release_the_pump() {
 }
 
 #[test]
+#[cfg(unix)]
 fn malformed_font_subprocess_emits_only_fixed_codes_before_any_viewport() {
     use rustix::fs::{AtFlags, Mode, OFlags};
     struct OwnedFont {

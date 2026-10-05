@@ -36,7 +36,7 @@ macro_rules! wire_enum {
     ($name:ident { $($(#[$attr:meta])* $variant:ident),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
         #[serde(rename_all = "snake_case")]
-        pub enum $name { $($variant),+ }
+        pub enum $name { $($(#[$attr])* $variant),+ }
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 #[derive(Deserialize)]
@@ -79,7 +79,11 @@ macro_rules! error_enum {
 fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
     Option::deserialize(d)
 }
-wire_enum!(AgentPlatform { Linux, Macos });
+wire_enum!(AgentPlatform {
+    Linux,
+    Macos,
+    Windows
+});
 wire_enum!(BackendName {
     Capture,
     Keys,
@@ -146,7 +150,11 @@ wire_enum!(Capability {
     Browse,
     Present,
     Speaker,
-    Mic
+    Mic,
+    #[serde(rename = "clipboard.read")]
+    ClipboardRead,
+    #[serde(rename = "clipboard.write")]
+    ClipboardWrite
 });
 wire_enum!(GrantableCapability {
     Input,
@@ -159,7 +167,7 @@ wire_struct!(BuildStatus { version: String, features: Vec<String> });
 wire_struct!(InstanceStatus {
     id: u64,
     pid: u32,
-    uid: u32,
+    #[serde(deserialize_with = "nullable")] uid: Option<u32>,
     exe: String,
     runtime_dir: String,
     started_unix_ms: u64
@@ -938,6 +946,13 @@ fn validate_installer(
     platform: AgentPlatform,
 ) -> Result<bool, ContractError> {
     use BackendName::*;
+    // A required explicit Windows null is not a native identity proof. Unix keeps its uid.
+    if match platform {
+        AgentPlatform::Windows => i.instance.uid.is_some(),
+        AgentPlatform::Linux | AgentPlatform::Macos => i.instance.uid.is_none(),
+    } {
+        return Err(ContractError::InvalidValue);
+    }
     let names = [
         Capture, Keys, Pointer, Overlay, Hotkeys, Keystore, Windows, Parking, Frames, Tray, Links,
         Gpu, Home, Audio, Discovery,
@@ -967,6 +982,8 @@ fn validate_installer(
                 Capability::Present => "present",
                 Capability::Speaker => "speaker",
                 Capability::Mic => "mic",
+                Capability::ClipboardRead => "clipboard.read",
+                Capability::ClipboardWrite => "clipboard.write",
             })
             .collect();
         if !nodes.insert(p.node) || !sorted_unique(&grants) {
@@ -983,7 +1000,7 @@ fn validate_installer(
         PermissionName::InputMonitoring,
     ];
     Ok(match platform {
-        AgentPlatform::Linux => i.permissions.is_empty(),
+        AgentPlatform::Linux | AgentPlatform::Windows => i.permissions.is_empty(),
         AgentPlatform::Macos => {
             base.iter().all(|p| permissions.contains(p)) && (3..=4).contains(&permissions.len())
         }

@@ -2897,7 +2897,7 @@ impl LinuxNativeIo {
     ) -> Result<()> {
         if instance.id != bootstrap.instance_id
             || instance.pid != identity.pid
-            || instance.uid != identity.uid
+            || instance.uid != Some(identity.uid)
             || Path::new(&instance.exe) != identity.executable
             || Path::new(&instance.runtime_dir) != self.target.runtime
             || instance.started_unix_ms != bootstrap.started_unix_ms

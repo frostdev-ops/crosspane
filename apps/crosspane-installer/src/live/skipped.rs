@@ -1,8 +1,12 @@
 //! Deliberate deferrals. Neither the file nor a skipped row supplies proof.
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::collections::BTreeSet;
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::io::{Read, Write};
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crosspane_installer_core::{FlowEvent, StepId, StepState};
@@ -20,8 +24,10 @@ pub(super) fn optional(id: StepId) -> bool {
 }
 
 /// A bounded preference file at a selected installer's own path. Tests pass only private roots.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 pub(crate) struct SkippedStore(pub PathBuf);
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 impl SkippedStore {
     pub fn load(&self) -> BTreeSet<StepId> {
         let read = || -> Option<BTreeSet<StepId>> {
