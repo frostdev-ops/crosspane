@@ -1,10 +1,14 @@
-//! Clipboard part 1. One message-window owner performs every native data call. Win32 delayed
+//! One message-window owner performs every native data call and delayed-format submission. Win32 delayed
 //! rendering may hold OpenClipboard for up to 30 seconds; the caller's two-second timeout cannot
 //! shorten that OS wait. A timed-out command retains its reservation and RAII resources until
 //! the owner returns; later read/kinds calls refuse immediately rather than accumulating work.
+//! WM_RENDERFORMAT never opens the clipboard: the paster already owns its open lock.
+//! Fulfilment/cancellation use the same shared render ledger, outside the owner command queue.
 #![allow(unsafe_code)]
 
-use crate::model::clipboard::{self as model, Format, Formats, Snapshot, Watch};
+use crate::model::clipboard::{
+    self as model, Format, Formats, Render, RenderLedger, Snapshot, Watch,
+};
 use crosspane_platform::{
     ClipKinds, ClipboardEvent, ClipboardHost, EventSink, IoGate, LocalPasteId, PlatformError,
 };
@@ -23,7 +27,9 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, SetLastError, WPARAM},
+    Foundation::{
+        GetLastError, GlobalFree, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, SetLastError, WPARAM,
+    },
     System::{
         DataExchange::*,
         LibraryLoader::GetModuleHandleW,
@@ -40,6 +46,8 @@ const POLL: Duration = Duration::from_millis(10);
 type Sink = Arc<dyn EventSink<ClipboardEvent>>;
 struct Delivery {
     pending: Option<(Snapshot, usize, u64)>,
+    paste: Option<Render>,
+    lost: Option<u64>,
     sink: Option<Sink>,
     watch: Watch,
 }
@@ -53,6 +61,8 @@ struct Shared {
     wake: Condvar,
     cleaned: AtomicBool,
     native_failed: AtomicBool,
+    renders: Mutex<RenderLedger>,
+    render_wake: Condvar,
 }
 impl Shared {
     fn new(gate: Arc<IoGate>) -> Self {
@@ -63,12 +73,16 @@ impl Shared {
             dirty: AtomicBool::new(true),
             delivery: Mutex::new(Delivery {
                 pending: None,
+                paste: None,
+                lost: None,
                 sink: None,
                 watch: Watch::default(),
             }),
             wake: Condvar::new(),
             cleaned: AtomicBool::new(false),
             native_failed: AtomicBool::new(false),
+            renders: Mutex::new(RenderLedger::default()),
+            render_wake: Condvar::new(),
         }
     }
     fn reserve(self: &Arc<Self>) -> Result<Reservation, PlatformError> {
@@ -91,8 +105,14 @@ impl Shared {
     }
     fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        if let Ok(mut renders) = self.renders.lock() {
+            renders.close();
+        }
+        self.render_wake.notify_all();
         if let Ok(mut delivery) = self.delivery.lock() {
             delivery.pending = None;
+            delivery.paste = None;
+            delivery.lost = None;
             delivery.sink = None;
         }
         self.wake.notify_all();
@@ -104,6 +124,7 @@ impl Shared {
             .lock()
             .map_err(|_| backend("clipboard delivery poisoned"))?;
         delivery.pending = None;
+        delivery.paste = None;
         delivery.watch = Watch::default();
         delivery.sink = Some(sink);
         Ok(())
@@ -135,18 +156,50 @@ impl Shared {
         while self.check().is_ok() {
             let next = (|| {
                 let mut delivery = self.delivery.lock().map_err(|_| ())?;
-                while delivery.pending.is_none() && !self.stopped.load(Ordering::Acquire) {
+                while delivery.pending.is_none()
+                    && delivery.paste.is_none()
+                    && delivery.lost.is_none()
+                    && !self.stopped.load(Ordering::Acquire)
+                {
                     delivery = self.wake.wait(delivery).map_err(|_| ())?;
                 }
-                Ok::<_, ()>(self.next(&mut delivery))
+                let sink = delivery.sink.clone();
+                let event = if let Some(offer) = delivery.lost.take() {
+                    Some(ClipboardEvent::PromiseLost { offer })
+                } else if let Some(render) = delivery.paste.take() {
+                    Some(ClipboardEvent::PasteRequested {
+                        paste: render.paste,
+                        offer: render.offer,
+                        kind: if render.format == Format::Text {
+                            ClipKind::Text
+                        } else {
+                            ClipKind::Image
+                        },
+                    })
+                } else {
+                    self.next(&mut delivery)
+                        .map(|(_, kinds)| ClipboardEvent::Changed { kinds })
+                };
+                Ok::<_, ()>(sink.zip(event))
             })();
             match next {
-                Ok(Some((sink, kinds))) => {
-                    if catch_unwind(AssertUnwindSafe(|| {
-                        sink.send(ClipboardEvent::Changed { kinds })
-                    }))
-                    .is_err()
-                    {
+                Ok(Some((sink, event))) => {
+                    if let ClipboardEvent::PasteRequested { paste, .. } = &event {
+                        let valid = self.renders.lock().is_ok_and(|renders| {
+                            renders.pending(*paste).is_some_and(|r| {
+                                renders.valid(
+                                    r,
+                                    Instant::now(),
+                                    self.gate.epoch(),
+                                    self.gate.is_open(),
+                                )
+                            })
+                        });
+                        if !valid {
+                            continue;
+                        }
+                    }
+                    if catch_unwind(AssertUnwindSafe(|| sink.send(event))).is_err() {
                         eprintln!("Windows clipboard observer: sink failed");
                         self.stop();
                     }
@@ -159,6 +212,168 @@ impl Shared {
             }
         }
     }
+    fn reserve_data(self: &Arc<Self>) -> Result<Reservation, PlatformError> {
+        // Hold only this short decision lock through reservation. No native operation or sink.
+        let renders = self
+            .renders
+            .lock()
+            .map_err(|_| backend("clipboard rendering poisoned"))?;
+        if renders.rendering() {
+            return Err(PlatformError::Timeout);
+        }
+        self.reserve()
+    }
+    fn cancel_render(&self, offer: Option<u64>) {
+        if let Ok(mut renders) = self.renders.lock() {
+            renders.cancel(offer);
+        }
+        self.render_wake.notify_all();
+    }
+    fn revoke(&self, offer: u64) -> Result<bool, PlatformError> {
+        let revoked = self
+            .renders
+            .lock()
+            .map_err(|_| backend("clipboard rendering poisoned"))?
+            .withdraw(offer);
+        self.render_wake.notify_all();
+        Ok(revoked)
+    }
+    fn ownership(&self, ours: bool) -> Result<(), PlatformError> {
+        let lost = self
+            .renders
+            .lock()
+            .map_err(|_| backend("clipboard rendering poisoned"))?
+            .lost(ours);
+        self.render_wake.notify_all();
+        if let Some(offer) = lost {
+            let mut delivery = self
+                .delivery
+                .lock()
+                .map_err(|_| backend("clipboard delivery poisoned"))?;
+            if delivery.lost.is_some() {
+                return Err(backend("clipboard loss delivery occupied"));
+            }
+            delivery.lost = Some(offer);
+            self.wake.notify_one();
+        }
+        Ok(())
+    }
+    fn begin_render(&self, format: Format) -> Result<Option<Render>, PlatformError> {
+        self.check()?;
+        let render = self
+            .renders
+            .lock()
+            .map_err(|_| backend("clipboard rendering poisoned"))?
+            .begin(
+                format,
+                Instant::now(),
+                self.gate.epoch(),
+                self.gate.is_open(),
+            );
+        if let Some(render) = render {
+            let mut delivery = self
+                .delivery
+                .lock()
+                .map_err(|_| backend("clipboard delivery poisoned"))?;
+            if delivery.sink.is_none() {
+                drop(delivery);
+                self.cancel_render(Some(render.offer));
+            } else {
+                delivery.paste = Some(render);
+                self.wake.notify_one();
+            }
+        }
+        Ok(render)
+    }
+    fn fulfil(&self, paste: LocalPasteId, data: Option<Vec<u8>>) {
+        let data = data.map(Zeroizing::new);
+        let render = self
+            .renders
+            .lock()
+            .ok()
+            .and_then(|renders| renders.pending(paste));
+        let Some(render) = render else {
+            return;
+        };
+        // Conversion is outside all owner/delivery/ledger locks; a synchronous sink may fulfil.
+        let native = data
+            .and_then(|data| {
+                match render.format {
+                    Format::Text => model::text_native(&data),
+                    Format::Png => model::png(&data, model::IMAGE_CAP),
+                    Format::DibV5 => model::png_dibv5(&data),
+                    Format::Dib => Err(PlatformError::NotFound),
+                }
+                .ok()
+            })
+            .map(Zeroizing::new);
+        if let Ok(mut renders) = self.renders.lock() {
+            renders.answer(
+                paste,
+                native,
+                Instant::now(),
+                self.gate.epoch(),
+                self.gate.is_open(),
+            );
+        }
+        self.render_wake.notify_all();
+    }
+}
+trait RenderAccess {
+    fn ours(&self) -> bool;
+    fn write(&mut self, render: Render, data: &[u8]) -> Result<(), PlatformError>;
+}
+fn render_with(
+    _shared: &Shared,
+    _format: Format,
+    _port: &mut impl RenderAccess,
+) -> Result<(), PlatformError> {
+    if !_port.ours() {
+        return Ok(());
+    }
+    let Some(render) = _shared.begin_render(_format)? else {
+        return Ok(());
+    };
+    struct Finish<'a>(&'a Shared, LocalPasteId);
+    impl Drop for Finish<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut renders) = self.0.renders.lock() {
+                renders.finish(self.1);
+            }
+        }
+    }
+    let _finish = Finish(_shared, render.paste);
+    let mut renders = _shared
+        .renders
+        .lock()
+        .map_err(|_| backend("clipboard rendering poisoned"))?;
+    let data = loop {
+        if let Some(data) = renders.poll(
+            render,
+            Instant::now(),
+            _shared.gate.epoch(),
+            _shared.gate.is_open(),
+        ) {
+            break data;
+        }
+        let wait = POLL.min(render.deadline.saturating_duration_since(Instant::now()));
+        renders = _shared
+            .render_wake
+            .wait_timeout(renders, wait)
+            .map_err(|_| backend("clipboard rendering poisoned"))?
+            .0;
+    };
+    let allowed = renders.valid(
+        render,
+        Instant::now(),
+        _shared.gate.epoch(),
+        _shared.gate.is_open(),
+    );
+    drop(renders);
+    if let Some(data) = data.filter(|_| allowed && _port.ours()) {
+        _port.write(render, &data)?;
+    }
+    Ok(())
 }
 struct Reservation(Arc<Shared>);
 impl Drop for Reservation {
@@ -185,8 +400,128 @@ impl Permit {
 trait Access {
     fn open(&mut self) -> Result<bool, PlatformError>;
     fn close(&mut self) -> Result<(), PlatformError>;
-    fn snapshot(&mut self) -> Result<(Snapshot, Formats), PlatformError>;
-    fn data(&mut self, format: Format, limit: usize) -> Result<Zeroizing<Vec<u8>>, PlatformError>;
+    fn snapshot(&mut self) -> Result<(Snapshot, Formats), PlatformError> {
+        Err(backend("clipboard control metadata unavailable"))
+    }
+    fn data(
+        &mut self,
+        _format: Format,
+        _limit: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+        Err(backend("clipboard control cannot read data"))
+    }
+}
+trait ControlAccess: Access {
+    fn ours(&mut self) -> bool;
+    fn admit(&mut self) -> Result<(), PlatformError>;
+    fn empty(&mut self) -> Result<(), PlatformError>;
+    fn advertise(&mut self, format: Format) -> Result<(), PlatformError>;
+    fn recorded(&mut self);
+}
+fn promise_with(
+    port: &mut impl ControlAccess,
+    shared: &Shared,
+    permit: &Permit,
+    offer: u64,
+    kinds: ClipKinds,
+) -> Result<(), PlatformError> {
+    permit.check(shared)?;
+    RenderLedger::validate(kinds, shared.gate.is_open())?;
+    if shared
+        .delivery
+        .lock()
+        .map_err(|_| backend("clipboard delivery poisoned"))?
+        .lost
+        .is_some()
+    {
+        return Err(PlatformError::Timeout);
+    }
+    let mut opened = open_control(port, shared, Some(permit))?;
+    opened.port.admit()?;
+    permit.check(shared)?;
+    opened.port.empty()?;
+    // Preserve the exact admitted post-mutation sequence even when a later step fails.
+    opened.port.recorded();
+    let promise = shared
+        .renders
+        .lock()
+        .map_err(|_| backend("clipboard rendering poisoned"))?
+        .install(offer, kinds, permit.epoch, shared.gate.is_open())?;
+    let submitted = (|| {
+        for format in [
+            kinds.text.then_some(Format::Text),
+            kinds.image.then_some(Format::Png),
+            kinds.image.then_some(Format::DibV5),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            permit.check(shared)?;
+            opened.port.advertise(format)?;
+            opened.port.recorded();
+        }
+        permit.check(shared)
+    })();
+    if submitted.is_err() {
+        shared.revoke(promise.offer)?;
+    }
+    let closed = opened.close();
+    submitted?;
+    closed?;
+    permit.check(shared)
+}
+fn withdraw_with(
+    port: &mut impl ControlAccess,
+    shared: &Shared,
+    permit: Option<&Permit>,
+    offer: u64,
+) -> Result<(), PlatformError> {
+    let owned = shared
+        .renders
+        .lock()
+        .map_err(|_| backend("clipboard rendering poisoned"))?
+        .owned()
+        .filter(|p| p.offer == offer);
+    let Some(owned) = owned else {
+        return Ok(());
+    };
+    if !port.ours() {
+        shared.ownership(false)?;
+        return Ok(());
+    }
+    let mut opened = open_control(port, shared, permit)?;
+    if opened.port.ours() {
+        opened.port.admit()?;
+        if permit
+            .is_some_and(|p| p.abandoned.load(Ordering::Acquire) || Instant::now() >= p.deadline)
+        {
+            return Err(PlatformError::Timeout);
+        }
+        opened.port.empty()?;
+        opened.port.recorded();
+        shared
+            .renders
+            .lock()
+            .map_err(|_| backend("clipboard rendering poisoned"))?
+            .forget(owned);
+    } else {
+        shared.ownership(false)?;
+    }
+    opened.close()
+}
+fn render_all_with(port: &mut impl ControlAccess, shared: &Shared) -> Result<(), PlatformError> {
+    shared.cancel_render(None);
+    let mut opened = open_control(port, shared, None)?;
+    // GetClipboardOwner must be rechecked after OpenClipboard. Neither case fetches or writes.
+    let _still_ours = opened.port.ours();
+    opened.close()
+}
+fn destroy_notice(shared: &Shared, intentional: bool) -> Result<(), PlatformError> {
+    if intentional {
+        Ok(())
+    } else {
+        shared.ownership(false)
+    }
 }
 fn read_with(
     port: &mut impl Access,
@@ -246,7 +581,12 @@ struct OpenGuard<'a, T: Access> {
 impl<T: Access> OpenGuard<'_, T> {
     fn close(&mut self) -> Result<(), PlatformError> {
         self.active = false;
-        self.port.close()
+        let closed = self.port.close();
+        if closed.is_err() {
+            self.shared.native_failed.store(true, Ordering::Release);
+            self.shared.stop();
+        }
+        closed
     }
 }
 impl<T: Access> Drop for OpenGuard<'_, T> {
@@ -272,6 +612,8 @@ enum Operation {
     Kinds,
     Read(ClipKind, usize),
     Subscribe(Sink),
+    Promise(u64, ClipKinds),
+    Withdraw(u64),
 }
 enum Reply {
     Kinds(ClipKinds),
@@ -285,7 +627,7 @@ struct Command {
     reply: mpsc::SyncSender<Result<Reply, PlatformError>>,
 }
 
-/// Read/watch-only clipboard owner; delayed rendering and promise writing belong to part 2.
+/// One clipboard owner, one outstanding delayed render and an out-of-band fulfil/cancel path.
 pub struct WindowsClipboard {
     shared: Arc<Shared>,
     commands: mpsc::SyncSender<Command>,
@@ -356,7 +698,11 @@ impl WindowsClipboard {
         operation: Operation,
         bound: Duration,
     ) -> Result<Reply, PlatformError> {
-        let reservation = self.shared.reserve()?;
+        let reservation = if matches!(operation, Operation::Kinds | Operation::Read(..)) {
+            self.shared.reserve_data()?
+        } else {
+            self.shared.reserve()?
+        };
         let abandoned = Arc::new(AtomicBool::new(false));
         let permit = Permit {
             deadline: Instant::now() + bound,
@@ -413,12 +759,25 @@ impl WindowsClipboard {
     pub(crate) fn stop_verified(mut self) -> bool {
         self.finish()
     }
+    #[cfg(test)]
+    #[allow(dead_code)] // Used by the source-included Limited probe, absent in the lib-test root.
+    pub(crate) fn probe_fulfiller(
+        &self,
+    ) -> impl Fn(LocalPasteId, Option<Vec<u8>>) + Send + Sync + 'static {
+        let weak = Arc::downgrade(&self.shared);
+        move |paste, data| {
+            if let Some(shared) = weak.upgrade() {
+                shared.fulfil(paste, data);
+            }
+        }
+    }
 }
 fn backend_error_spawn() -> PlatformError {
     backend("spawn clipboard worker failed")
 }
 impl ClipboardHost for WindowsClipboard {
     fn subscribe(&mut self, sink: Sink) -> Result<(), PlatformError> {
+        self.shared.cancel_render(None);
         match self.request(Operation::Subscribe(sink))? {
             Reply::Unit => Ok(()),
             _ => Err(backend("clipboard reply type mismatch")),
@@ -448,22 +807,34 @@ impl ClipboardHost for WindowsClipboard {
             _ => Err(backend("clipboard reply type mismatch")),
         }
     }
-    fn promise(&mut self, _offer: u64, _kinds: ClipKinds) -> Result<(), PlatformError> {
-        if !self.shared.gate.is_open() {
-            Err(PlatformError::Locked)
-        } else {
-            Err(PlatformError::Unsupported(
-                "Windows clipboard promise part 2",
-            ))
+    fn promise(&mut self, offer: u64, kinds: ClipKinds) -> Result<(), PlatformError> {
+        RenderLedger::validate(kinds, self.shared.gate.is_open())?;
+        // Wake a blocked owner before the bounded command handoff. No mutex spans native I/O.
+        let owned = self
+            .shared
+            .renders
+            .lock()
+            .map_err(|_| backend("clipboard rendering poisoned"))?
+            .owned();
+        if let Some(owned) = owned {
+            self.shared.revoke(owned.offer)?;
+        }
+        match self.request(Operation::Promise(offer, kinds))? {
+            Reply::Unit => Ok(()),
+            _ => Err(backend("clipboard reply type mismatch")),
         }
     }
-    fn fulfil(&mut self, _paste: LocalPasteId, data: Option<Vec<u8>>) {
-        let _data = data.map(Zeroizing::new);
+    fn fulfil(&mut self, paste: LocalPasteId, data: Option<Vec<u8>>) {
+        self.shared.fulfil(paste, data);
     }
-    fn withdraw(&mut self, _offer: u64) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported(
-            "Windows clipboard promise part 2",
-        ))
+    fn withdraw(&mut self, offer: u64) -> Result<(), PlatformError> {
+        if !self.shared.revoke(offer)? {
+            return Ok(());
+        }
+        match self.request(Operation::Withdraw(offer))? {
+            Reply::Unit => Ok(()),
+            _ => Err(backend("clipboard reply type mismatch")),
+        }
     }
 }
 impl Drop for WindowsClipboard {
@@ -474,24 +845,72 @@ impl Drop for WindowsClipboard {
     }
 }
 
-thread_local! { static SIGNAL: Cell<*const AtomicBool> = const { Cell::new(null()) }; }
+thread_local! {
+    static SIGNAL: Cell<*const Shared> = const { Cell::new(null()) };
+    static PNG_FORMAT: Cell<u32> = const { Cell::new(0) };
+    static OWN_EMPTY: Cell<bool> = const { Cell::new(false) };
+}
 unsafe extern "system" fn window_proc(
     window: HWND,
     message: u32,
     wp: WPARAM,
     lp: LPARAM,
 ) -> LRESULT {
-    if message == WM_CLIPBOARDUPDATE {
-        SIGNAL.with(|signal| {
-            let pointer = signal.get();
-            if !pointer.is_null() {
-                // SAFETY: owner installs a stable Arc-backed atomic before window creation and
-                // retains it through DestroyWindow; callback performs only this O(1) signal.
-                unsafe {
-                    (*pointer).store(true, Ordering::Release);
+    let handled = SIGNAL.with(|signal| {
+        let pointer = signal.get();
+        if pointer.is_null() {
+            return false;
+        }
+        // SAFETY: stable Arc-backed context installed before CreateWindow; retained until after
+        // DestroyWindow. No Native borrow spans callbacks or reentrant Empty/SetClipboardData.
+        let shared = unsafe { &*pointer };
+        if message == WM_CLIPBOARDUPDATE {
+            shared.dirty.store(true, Ordering::Release);
+            return true;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<bool, PlatformError> {
+            match message {
+                WM_RENDERFORMAT => {
+                    let format = PNG_FORMAT.with(|png| {
+                        if wp as u32 == png.get() {
+                            Some(Format::Png)
+                        } else {
+                            match wp as u32 {
+                                n if n == u32::from(CF_UNICODETEXT) => Some(Format::Text),
+                                n if n == u32::from(CF_DIBV5) => Some(Format::DibV5),
+                                _ => None,
+                            }
+                        }
+                    });
+                    if let Some(format) = format {
+                        render_with(shared, format, &mut WinRender { window, shared })?;
+                    }
+                    Ok(true)
                 }
+                WM_RENDERALLFORMATS => {
+                    shared.cancel_render(None);
+                    render_all(window, shared)?;
+                    Ok(true)
+                }
+                WM_DESTROYCLIPBOARD => {
+                    destroy_notice(shared, OWN_EMPTY.with(Cell::get))?;
+                    Ok(true)
+                }
+                _ => Ok(false),
             }
-        });
+        }));
+        match result {
+            Ok(Ok(handled)) => handled,
+            _ => {
+                shared.native_failed.store(true, Ordering::Release);
+                shared.stop();
+                eprintln!("Windows clipboard render callback failed");
+                true
+            }
+        }
+    });
+    if handled {
+        return 0;
     }
     // SAFETY: original message arguments, no foreign window fields or content read.
     unsafe { DefWindowProcW(window, message, wp, lp) }
@@ -525,7 +944,7 @@ impl Native {
             listener: false,
             png: 0,
         };
-        SIGNAL.with(|signal| signal.set(&native.shared.dirty));
+        SIGNAL.with(|signal| signal.set(Arc::as_ptr(&native.shared)));
         let wc = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
@@ -562,6 +981,7 @@ impl Native {
         if native.png == 0 {
             return Err(os_error("register PNG format"));
         }
+        PNG_FORMAT.with(|png| png.set(native.png));
         // SAFETY: owned live message window, balanced RemoveClipboardFormatListener on owner.
         if unsafe { AddClipboardFormatListener(native.window) } == 0 {
             return Err(os_error("register clipboard listener"));
@@ -579,6 +999,8 @@ impl Native {
     fn observe(&mut self) -> Result<(), PlatformError> {
         let epoch = self.shared.gate.epoch();
         let (snapshot, _) = self.port().snapshot()?;
+        self.shared
+            .ownership(snapshot.owner == self.window as usize)?;
         if self.shared.gate.is_open() {
             self.shared.queue(snapshot, self.window as usize, epoch)?;
         }
@@ -610,7 +1032,28 @@ impl Native {
                 self.observe()?;
                 Ok(Reply::Unit)
             }
+            Operation::Promise(offer, kinds) => {
+                self.promise(*offer, *kinds, &command.permit)?;
+                Ok(Reply::Unit)
+            }
+            Operation::Withdraw(offer) => {
+                self.withdraw(*offer, Some(&command.permit))?;
+                Ok(Reply::Unit)
+            }
         }
+    }
+    fn control(&self) -> WinControl<'_> {
+        WinControl {
+            window: self.window,
+            png: self.png,
+            shared: &self.shared,
+        }
+    }
+    fn promise(&self, offer: u64, kinds: ClipKinds, permit: &Permit) -> Result<(), PlatformError> {
+        promise_with(&mut self.control(), &self.shared, permit, offer, kinds)
+    }
+    fn withdraw(&self, offer: u64, permit: Option<&Permit>) -> Result<(), PlatformError> {
+        withdraw_with(&mut self.control(), &self.shared, permit, offer)
     }
     fn run(&mut self, commands: mpsc::Receiver<Command>) {
         let mut last_epoch = self.shared.gate.epoch();
@@ -660,6 +1103,15 @@ impl Native {
 impl Drop for Native {
     fn drop(&mut self) {
         let mut cleaned = true;
+        let owned = self
+            .shared
+            .renders
+            .lock()
+            .ok()
+            .and_then(|renders| renders.owned());
+        if let Some(owned) = owned {
+            cleaned &= self.withdraw(owned.offer, None).is_ok();
+        }
         // SAFETY: all cleanup occurs on the creating thread, only for owned native resources.
         unsafe {
             if self.listener {
@@ -673,6 +1125,7 @@ impl Drop for Native {
             }
         }
         SIGNAL.with(|signal| signal.set(null()));
+        PNG_FORMAT.with(|png| png.set(0));
         cleaned &= !self.shared.native_failed.load(Ordering::Acquire);
         self.shared.cleaned.store(cleaned, Ordering::Release);
         if !cleaned {
@@ -684,6 +1137,222 @@ struct WinAccess {
     window: HWND,
     png: u32,
     shared: Arc<Shared>,
+}
+fn open_control<'a, T: Access>(
+    port: &'a mut T,
+    shared: &'a Shared,
+    permit: Option<&Permit>,
+) -> Result<OpenGuard<'a, T>, PlatformError> {
+    let started = Instant::now();
+    loop {
+        if permit
+            .is_some_and(|p| p.abandoned.load(Ordering::Acquire) || Instant::now() >= p.deadline)
+        {
+            return Err(PlatformError::Timeout);
+        }
+        let delay = model::retry_delay(started.elapsed().as_millis() as u64)?;
+        if port.open()? {
+            return Ok(OpenGuard {
+                port,
+                active: true,
+                shared,
+            });
+        }
+        thread::sleep(Duration::from_millis(delay));
+    }
+}
+fn empty_owned() -> Result<(), PlatformError> {
+    struct Intent(bool);
+    impl Drop for Intent {
+        fn drop(&mut self) {
+            OWN_EMPTY.with(|intent| intent.set(self.0));
+        }
+    }
+    let _intent = Intent(OWN_EMPTY.with(|intent| intent.replace(true)));
+    // SAFETY: caller holds OpenClipboard, has checked mutation admission, and keeps reentrant
+    // own-empty notification distinct from foreign ownership loss without holding a ledger lock.
+    if unsafe { EmptyClipboard() } == 0 {
+        Err(os_error("empty own clipboard"))
+    } else {
+        Ok(())
+    }
+}
+fn render_all(window: HWND, shared: &Shared) -> Result<(), PlatformError> {
+    render_all_with(
+        &mut WinControl {
+            window,
+            png: 0,
+            shared,
+        },
+        shared,
+    )
+}
+struct WinControl<'a> {
+    window: HWND,
+    png: u32,
+    shared: &'a Shared,
+}
+impl Access for WinControl<'_> {
+    fn open(&mut self) -> Result<bool, PlatformError> {
+        // SAFETY: own observer HWND; successful open has an owner-thread RAII close.
+        Ok(unsafe { OpenClipboard(self.window) } != 0)
+    }
+    fn close(&mut self) -> Result<(), PlatformError> {
+        // SAFETY: balances exactly this control port's open, on its owning thread.
+        if unsafe { CloseClipboard() } == 0 {
+            Err(os_error("close clipboard control"))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl ControlAccess for WinControl<'_> {
+    fn ours(&mut self) -> bool {
+        // SAFETY: scalar metadata only, no foreign HWND fields or content.
+        unsafe { GetClipboardOwner() == self.window }
+    }
+    fn admit(&mut self) -> Result<(), PlatformError> {
+        #[cfg(test)]
+        probe_admit_mutation()?;
+        Ok(())
+    }
+    fn empty(&mut self) -> Result<(), PlatformError> {
+        empty_owned()
+    }
+    fn advertise(&mut self, format: Format) -> Result<(), PlatformError> {
+        let id = match format {
+            Format::Text => u32::from(CF_UNICODETEXT),
+            Format::Png => self.png,
+            Format::DibV5 => u32::from(CF_DIBV5),
+            Format::Dib => return Err(PlatformError::NotFound),
+        };
+        if id == 0 {
+            return Err(backend("clipboard promise format unavailable"));
+        }
+        // SAFETY: our open and newly acquired clipboard ownership; NULL advertises delayed data.
+        // NULL return is ambiguous, so distinguish error and verify actual advertisement.
+        unsafe {
+            SetLastError(0);
+            SetClipboardData(id, null_mut());
+            if GetLastError() != 0 || IsClipboardFormatAvailable(id) == 0 {
+                return Err(os_error("promise clipboard format"));
+            }
+        }
+        Ok(())
+    }
+    fn recorded(&mut self) {
+        #[cfg(test)]
+        update_probe_owned(self.window as usize);
+        let _ = self.shared;
+    }
+}
+struct WinRender<'a> {
+    window: HWND,
+    shared: &'a Shared,
+}
+impl RenderAccess for WinRender<'_> {
+    fn ours(&self) -> bool {
+        // SAFETY: owner metadata only, no foreign fields or OpenClipboard in render callback.
+        unsafe { GetClipboardOwner() == self.window }
+    }
+    fn write(&mut self, render: Render, data: &[u8]) -> Result<(), PlatformError> {
+        let format = match render.format {
+            Format::Text => u32::from(CF_UNICODETEXT),
+            Format::Png => PNG_FORMAT.with(Cell::get),
+            Format::DibV5 => u32::from(CF_DIBV5),
+            Format::Dib => return Ok(()),
+        };
+        if format == 0 {
+            return Err(backend("clipboard render format unavailable"));
+        }
+        let mut memory = OwnedMemory::new(data, self.shared)?;
+        let allowed = self
+            .shared
+            .renders
+            .lock()
+            .map_err(|_| backend("clipboard rendering poisoned"))?
+            .valid(
+                render,
+                Instant::now(),
+                self.shared.gate.epoch(),
+                self.shared.gate.is_open(),
+            );
+        if !allowed || !self.ours() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        probe_admit_mutation()?;
+        // SAFETY: WM_RENDERFORMAT owns no OpenClipboard; the requester keeps it open. Exactly
+        // this promised format receives our GMEM_MOVEABLE handle. On success the OS owns it.
+        if unsafe { SetClipboardData(format, memory.handle) }.is_null() {
+            return Err(os_error("render clipboard data"));
+        }
+        memory.handle = null_mut();
+        #[cfg(test)]
+        update_probe_owned(self.window as usize);
+        Ok(())
+    }
+}
+struct OwnedMemory<'a> {
+    handle: HGLOBAL,
+    size: usize,
+    shared: &'a Shared,
+}
+impl<'a> OwnedMemory<'a> {
+    fn new(data: &[u8], shared: &'a Shared) -> Result<Self, PlatformError> {
+        // SAFETY: bounded pure converter output determines exact movable allocation size.
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, data.len()) };
+        if handle.is_null() {
+            return Err(os_error("allocate rendered clipboard memory"));
+        }
+        let memory = Self {
+            handle,
+            size: data.len(),
+            shared,
+        };
+        // SAFETY: own valid allocation, initialized in full before any clipboard transfer.
+        let pointer = unsafe { GlobalLock(handle) };
+        if pointer.is_null() {
+            return Err(os_error("lock rendered clipboard memory"));
+        }
+        // SAFETY: allocation is at least data.len(), source is live/nonoverlapping, and balanced
+        // unlock precedes transfer. It is not a borrowed clipboard HGLOBAL.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), pointer.cast::<u8>(), data.len());
+            SetLastError(0);
+            if GlobalUnlock(handle) == 0 && GetLastError() != 0 {
+                return Err(os_error("unlock rendered clipboard memory"));
+            }
+        }
+        Ok(memory)
+    }
+}
+impl Drop for OwnedMemory<'_> {
+    fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        // SAFETY: this untransferred allocation still belongs exclusively to us. Zero our exact
+        // initialized range; allocator padding was zero-initialized at allocation time.
+        unsafe {
+            let pointer = GlobalLock(self.handle);
+            if pointer.is_null() {
+                self.shared.native_failed.store(true, Ordering::Release);
+            } else {
+                std::ptr::write_bytes(pointer.cast::<u8>(), 0, self.size);
+                SetLastError(0);
+                if GlobalUnlock(self.handle) == 0 && GetLastError() != 0 {
+                    self.shared.native_failed.store(true, Ordering::Release);
+                }
+            }
+        }
+        // SAFETY: only an untransferred allocation is freed. OS-owned handles are cleared after
+        // successful SetClipboardData and never accessed again. No foreign resource cleanup.
+        if !unsafe { GlobalFree(self.handle) }.is_null() {
+            self.shared.native_failed.store(true, Ordering::Release);
+            eprintln!("Windows clipboard rendered allocation cleanup unverified");
+        }
+    }
 }
 impl Access for WinAccess {
     fn open(&mut self) -> Result<bool, PlatformError> {
@@ -817,6 +1486,11 @@ pub(crate) fn set_probe_fixture(owner: usize, sequence: u32) {
     }
 }
 #[cfg(test)]
+#[allow(dead_code)] // Source-included probe admission only; no native calls in ordinary cargo tests.
+pub(crate) fn probe_fixture() -> Option<(usize, u32)> {
+    PROBE_FIXTURE.lock().ok().and_then(|owner| *owner)
+}
+#[cfg(test)]
 fn probe_admit() -> Result<(), PlatformError> {
     let expected = PROBE_FIXTURE
         .lock()
@@ -842,6 +1516,48 @@ fn probe_admit() -> Result<(), PlatformError> {
     }
 }
 #[cfg(test)]
+fn probe_admit_mutation() -> Result<(), PlatformError> {
+    let expected = *PROBE_FIXTURE
+        .lock()
+        .map_err(|_| backend("probe admission poisoned"))?;
+    // SAFETY: caller already holds clipboard open, or is its WM_RENDERFORMAT owner callback
+    // while the authenticated fixture paster holds it. Only metadata is read before mutation.
+    let admitted = unsafe {
+        let sequence = GetClipboardSequenceNumber();
+        if let Some((owner, expected)) = expected {
+            let mut pid = 0;
+            sequence != 0
+                && sequence == expected
+                && GetClipboardOwner() as usize == owner
+                && IsWindow(owner as HWND) != 0
+                && GetWindowThreadProcessId(owner as HWND, &mut pid) != 0
+                && pid == std::process::id()
+        } else {
+            SetLastError(0);
+            let formats = CountClipboardFormats();
+            sequence != 0
+                && formats == 0
+                && GetLastError() == 0
+                && sequence == GetClipboardSequenceNumber()
+        }
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(PlatformError::Unsupported(
+            "clipboard fixture replaced before mutation",
+        ))
+    }
+}
+#[cfg(test)]
+fn update_probe_owned(owner: usize) {
+    // SAFETY: called after our admitted native operation, before another mutation is allowed.
+    let current = unsafe { (GetClipboardOwner() as usize, GetClipboardSequenceNumber()) };
+    if current.0 == owner && current.1 != 0 {
+        set_probe_fixture(owner, current.1);
+    }
+}
+#[cfg(test)]
 fn probe_matches(expected: (usize, u32), observed: (usize, u32, bool)) -> bool {
     expected.0 != 0 && expected.1 != 0 && observed.2 && expected == (observed.0, observed.1)
 }
@@ -863,6 +1579,427 @@ mod tests {
             epoch: shared.gate.epoch(),
             abandoned: Arc::new(AtomicBool::new(false)),
         }
+    }
+    struct RenderFake {
+        writes: usize,
+        ours: bool,
+    }
+    impl RenderAccess for RenderFake {
+        fn ours(&self) -> bool {
+            self.ours
+        }
+        fn write(&mut self, _: Render, data: &[u8]) -> Result<(), PlatformError> {
+            assert_eq!(
+                model::text(data, model::TEXT_CAP).unwrap(),
+                b"fixture\nvalue"
+            );
+            self.writes += 1;
+            Ok(())
+        }
+    }
+    fn promise(shared: &Shared) {
+        shared
+            .renders
+            .lock()
+            .unwrap()
+            .install(
+                41,
+                ClipKinds {
+                    text: true,
+                    image: true,
+                },
+                shared.gate.epoch(),
+                true,
+            )
+            .unwrap();
+    }
+    struct ControlFake {
+        opens: usize,
+        closes: usize,
+        empties: usize,
+        owner_checks: usize,
+        admissions: usize,
+        ours: bool,
+        replace_on_open: bool,
+        admitted: bool,
+        fail_empty: bool,
+        fail_advertise: bool,
+        formats: Vec<Format>,
+        reentrant: Arc<Shared>,
+    }
+    impl ControlFake {
+        fn new(shared: &Arc<Shared>) -> Self {
+            Self {
+                opens: 0,
+                closes: 0,
+                empties: 0,
+                owner_checks: 0,
+                admissions: 0,
+                ours: true,
+                replace_on_open: false,
+                admitted: true,
+                fail_empty: false,
+                fail_advertise: false,
+                formats: Vec::new(),
+                reentrant: shared.clone(),
+            }
+        }
+    }
+    impl Access for ControlFake {
+        fn open(&mut self) -> Result<bool, PlatformError> {
+            self.opens += 1;
+            if self.replace_on_open {
+                self.ours = false;
+            }
+            Ok(true)
+        }
+        fn close(&mut self) -> Result<(), PlatformError> {
+            self.closes += 1;
+            Ok(())
+        }
+        fn data(&mut self, _: Format, _: usize) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+            panic!("control fetched clipboard content")
+        }
+    }
+    impl ControlAccess for ControlFake {
+        fn ours(&mut self) -> bool {
+            self.owner_checks += 1;
+            self.ours
+        }
+        fn admit(&mut self) -> Result<(), PlatformError> {
+            self.admissions += 1;
+            if self.admitted {
+                Ok(())
+            } else {
+                Err(PlatformError::Unsupported("fake admission changed"))
+            }
+        }
+        fn empty(&mut self) -> Result<(), PlatformError> {
+            self.empties += 1;
+            destroy_notice(&self.reentrant, true)?;
+            if self.fail_empty {
+                Err(backend("fake empty failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn advertise(&mut self, format: Format) -> Result<(), PlatformError> {
+            self.formats.push(format);
+            if self.fail_advertise {
+                Err(backend("fake advertisement failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn recorded(&mut self) {}
+    }
+    #[test]
+    fn clipboard_promise_advertises_only_requested_formats_and_own_empty_is_not_loss() {
+        let shared = shared();
+        promise(&shared);
+        let mut port = ControlFake::new(&shared);
+        promise_with(
+            &mut port,
+            &shared,
+            &permit(&shared),
+            42,
+            ClipKinds {
+                text: true,
+                image: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (port.opens, port.closes, port.empties, port.admissions),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(port.formats, [Format::Text, Format::Png, Format::DibV5]);
+        assert_eq!(shared.renders.lock().unwrap().current().unwrap().offer, 42);
+        assert!(shared.delivery.lock().unwrap().lost.is_none());
+        assert!(shared.delivery.lock().unwrap().pending.is_none());
+    }
+    #[test]
+    fn clipboard_promise_preflight_and_native_failure_close_without_fetch_or_stale_authority() {
+        for mode in 0..4 {
+            let shared = shared();
+            let mut port = ControlFake::new(&shared);
+            let permit = permit(&shared);
+            match mode {
+                0 => permit.abandoned.store(true, Ordering::Release),
+                1 => port.admitted = false,
+                2 => port.fail_empty = true,
+                _ => port.fail_advertise = true,
+            }
+            assert!(
+                promise_with(
+                    &mut port,
+                    &shared,
+                    &permit,
+                    42,
+                    ClipKinds {
+                        text: true,
+                        image: false
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(port.closes, port.opens);
+            assert!(shared.renders.lock().unwrap().current().is_none());
+            if mode == 0 {
+                assert_eq!(port.opens, 0);
+            }
+            if mode == 1 {
+                assert_eq!(port.empties, 0);
+            }
+            permit.abandoned.store(true, Ordering::Release);
+        }
+    }
+    #[test]
+    fn clipboard_withdraw_rechecks_owner_after_open_and_never_clears_replacement() {
+        for replacement in [false, true] {
+            let shared = shared();
+            promise(&shared);
+            let mut port = ControlFake::new(&shared);
+            port.replace_on_open = replacement;
+            assert!(shared.revoke(41).unwrap());
+            withdraw_with(&mut port, &shared, Some(&permit(&shared)), 41).unwrap();
+            assert_eq!((port.opens, port.closes), (1, 1));
+            assert!(port.owner_checks >= 2);
+            assert_eq!(port.empties, usize::from(!replacement));
+            assert!(shared.renders.lock().unwrap().owned().is_none());
+            assert!(shared.delivery.lock().unwrap().lost.is_none());
+        }
+    }
+    #[test]
+    fn clipboard_withdraw_wrong_offer_or_foreign_owner_is_zero_mutation() {
+        let shared = shared();
+        promise(&shared);
+        let mut port = ControlFake::new(&shared);
+        withdraw_with(&mut port, &shared, None, 40).unwrap();
+        assert_eq!((port.opens, port.empties), (0, 0));
+        port.ours = false;
+        withdraw_with(&mut port, &shared, None, 41).unwrap();
+        assert_eq!((port.opens, port.empties), (0, 0));
+        assert_eq!(shared.delivery.lock().unwrap().lost, Some(41));
+    }
+    #[test]
+    fn clipboard_render_all_no_fetch_or_empty_and_drop_withdraws_only_retained_ours() {
+        let shared = shared();
+        promise(&shared);
+        let render = shared
+            .renders
+            .lock()
+            .unwrap()
+            .begin(Format::Text, Instant::now(), shared.gate.epoch(), true)
+            .unwrap();
+        let mut port = ControlFake::new(&shared);
+        render_all_with(&mut port, &shared).unwrap();
+        assert_eq!((port.opens, port.closes, port.empties), (1, 1, 0));
+        assert!(port.owner_checks > 0);
+        assert!(port.formats.is_empty());
+        assert!(
+            shared
+                .renders
+                .lock()
+                .unwrap()
+                .poll(render, Instant::now(), shared.gate.epoch(), true)
+                .unwrap()
+                .is_none()
+        );
+        shared.renders.lock().unwrap().finish(render.paste);
+        shared.stop();
+        withdraw_with(&mut port, &shared, None, 41).unwrap();
+        assert_eq!((port.opens, port.closes, port.empties), (2, 2, 1));
+        assert!(shared.renders.lock().unwrap().owned().is_none());
+        assert!(shared.delivery.lock().unwrap().lost.is_none());
+    }
+    #[test]
+    fn clipboard_render_callback_reentrant_fulfil_never_opens_or_holds_sink_ledger() {
+        let shared = shared();
+        promise(&shared);
+        let weak = Arc::downgrade(&shared);
+        let (sent, seen) = mpsc::sync_channel(1);
+        shared
+            .subscribe(Arc::new(move |event| {
+                if let ClipboardEvent::PasteRequested { paste, offer, kind } = event {
+                    assert_eq!((offer, kind), (41, ClipKind::Text));
+                    let shared = weak.upgrade().unwrap();
+                    assert!(matches!(shared.reserve_data(), Err(PlatformError::Timeout)));
+                    shared.fulfil(paste, Some(b"fixture\nvalue".to_vec()));
+                    sent.send(()).unwrap();
+                }
+            }))
+            .unwrap();
+        let worker_shared = shared.clone();
+        let worker = thread::spawn(move || worker_shared.deliver());
+        let mut port = RenderFake {
+            writes: 0,
+            ours: true,
+        };
+        render_with(&shared, Format::Text, &mut port).unwrap();
+        assert_eq!(port.writes, 1);
+        seen.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!shared.renders.lock().unwrap().rendering());
+        shared.stop();
+        worker.join().unwrap();
+    }
+    #[test]
+    fn clipboard_render_unanswered_wait_expires_total_budget_and_releases_slot() {
+        let shared = shared();
+        promise(&shared);
+        shared.subscribe(Arc::new(|_| {})).unwrap();
+        let owned = shared.clone();
+        let worker = thread::spawn(move || owned.deliver());
+        let mut port = RenderFake {
+            writes: 0,
+            ours: true,
+        };
+        let start = Instant::now();
+        render_with(&shared, Format::Text, &mut port).unwrap();
+        assert_eq!(port.writes, 0);
+        assert!(start.elapsed() >= model::RENDER_WAIT);
+        assert!(!shared.renders.lock().unwrap().rendering());
+        shared.stop();
+        worker.join().unwrap();
+    }
+    #[test]
+    fn clipboard_public_promise_and_withdraw_cancel_before_bounded_owner_handoff() {
+        for replace in [false, true] {
+            let shared = shared();
+            promise(&shared);
+            let render = shared
+                .renders
+                .lock()
+                .unwrap()
+                .begin(Format::Text, Instant::now(), shared.gate.epoch(), true)
+                .unwrap();
+            let (commands, receiver) = mpsc::sync_channel::<Command>(1);
+            let owned = shared.clone();
+            let worker = thread::spawn(move || {
+                let command = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert!(
+                    owned
+                        .renders
+                        .lock()
+                        .unwrap()
+                        .poll(render, Instant::now(), owned.gate.epoch(), true)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(owned.renders.lock().unwrap().current().is_none());
+                assert!(matches!(
+                    (&command.operation, replace),
+                    (Operation::Promise(42, _), true) | (Operation::Withdraw(41), false)
+                ));
+                command.reply.send(Ok(Reply::Unit)).unwrap();
+                drop(command);
+                owned.cleaned.store(true, Ordering::Release);
+            });
+            let mut backend = WindowsClipboard {
+                shared,
+                commands,
+                owner: Some(worker),
+                delivery: None,
+            };
+            if replace {
+                backend
+                    .promise(
+                        42,
+                        ClipKinds {
+                            text: true,
+                            image: false,
+                        },
+                    )
+                    .unwrap();
+            } else {
+                backend.withdraw(41).unwrap();
+            }
+            assert!(backend.stop_verified());
+        }
+    }
+    #[test]
+    fn clipboard_render_none_withdraw_drop_and_gate_reopen_are_empty_and_bounded() {
+        for mode in 0..4 {
+            let shared = shared();
+            promise(&shared);
+            let weak = Arc::downgrade(&shared);
+            let seen = Arc::new(AtomicUsize::new(0));
+            let count = seen.clone();
+            shared
+                .subscribe(Arc::new(move |event| {
+                    if let ClipboardEvent::PasteRequested { paste, .. } = event {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        let shared = weak.upgrade().unwrap();
+                        match mode {
+                            0 => shared.fulfil(paste, None),
+                            1 => {
+                                assert!(shared.revoke(41).unwrap());
+                            }
+                            2 => shared.stop(),
+                            _ => {
+                                shared.gate.set_session_permits(false);
+                                shared.gate.set_session_permits(true);
+                                shared.fulfil(paste, Some(vec![1]));
+                            }
+                        }
+                    }
+                }))
+                .unwrap();
+            let worker_shared = shared.clone();
+            let worker = thread::spawn(move || worker_shared.deliver());
+            let mut port = RenderFake {
+                writes: 0,
+                ours: true,
+            };
+            let start = Instant::now();
+            render_with(&shared, Format::Text, &mut port).unwrap();
+            assert_eq!(port.writes, 0);
+            assert!(!shared.renders.lock().unwrap().rendering());
+            assert_eq!(seen.load(Ordering::Relaxed), 1);
+            assert!(start.elapsed() < Duration::from_secs(1));
+            shared.stop();
+            worker.join().unwrap();
+        }
+    }
+    #[test]
+    fn clipboard_render_unknown_format_foreign_owner_and_second_slot_emit_nothing() {
+        let shared = shared();
+        promise(&shared);
+        shared
+            .subscribe(Arc::new(|_| panic!("unexpected fetch")))
+            .unwrap();
+        let mut port = RenderFake {
+            writes: 0,
+            ours: false,
+        };
+        render_with(&shared, Format::Text, &mut port).unwrap();
+        assert!(shared.delivery.lock().unwrap().paste.is_none());
+        port.ours = true;
+        render_with(&shared, Format::Dib, &mut port).unwrap();
+        assert!(shared.delivery.lock().unwrap().paste.is_none());
+        let first = shared
+            .renders
+            .lock()
+            .unwrap()
+            .begin(Format::Text, Instant::now(), shared.gate.epoch(), true)
+            .unwrap();
+        render_with(&shared, Format::Text, &mut port).unwrap();
+        assert!(shared.delivery.lock().unwrap().paste.is_none());
+        shared.renders.lock().unwrap().finish(first.paste);
+        assert_eq!(port.writes, 0);
+    }
+    #[test]
+    fn clipboard_render_ownership_loss_is_once_without_changed_or_foreign_clear() {
+        let shared = shared();
+        promise(&shared);
+        shared.subscribe(Arc::new(|_| {})).unwrap();
+        shared.ownership(true).unwrap();
+        assert!(shared.delivery.lock().unwrap().lost.is_none());
+        shared.ownership(false).unwrap();
+        shared.ownership(false).unwrap();
+        assert_eq!(shared.delivery.lock().unwrap().lost, Some(41));
+        assert!(shared.renders.lock().unwrap().current().is_none());
+        assert!(shared.delivery.lock().unwrap().pending.is_none());
     }
     struct Fake {
         opens: usize,

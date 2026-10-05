@@ -166,12 +166,48 @@ impl Fixture {
             if let Some(expected) = self.sequence {
                 return GetClipboardOwner() == self.window && sequence == expected;
             }
+            if let Some((owner, expected)) = clipboard::probe_fixture() {
+                let mut owner_pid = 0;
+                return expected == sequence
+                    && owner != 0
+                    && GetClipboardOwner() as usize == owner
+                    && IsWindow(owner as HWND) != 0
+                    && GetWindowThreadProcessId(owner as HWND, &mut owner_pid) != 0
+                    && owner_pid == std::process::id();
+            }
             if !initial {
                 return false;
             }
             SetLastError(0);
             let count = CountClipboardFormats();
             count == 0 && GetLastError() == 0 && sequence == GetClipboardSequenceNumber()
+        }
+    }
+    fn paste(&self, format: u32) -> Option<Option<Vec<u8>>> {
+        let _opened = self.open()?;
+        if !self.admitted(false) {
+            return None;
+        }
+        // SAFETY: exact authenticated fixture/observer owner and sequence while OpenClipboard
+        // is held; no foreign content call. Only our promised test bytes can be rendered.
+        let handle = unsafe { GetClipboardData(format) } as HGLOBAL;
+        if !self.admitted(false) {
+            return None;
+        }
+        if handle.is_null() {
+            return Some(None);
+        }
+        // SAFETY: supported test HGLOBAL belongs to OS, borrowed only while open. Exact bounded
+        // GlobalSize is checked; no raw pointer escapes and no foreign/window content is read.
+        unsafe {
+            let size = GlobalSize(handle);
+            assert!(size > 0 && size < 1024 * 1024);
+            let pointer = GlobalLock(handle);
+            assert!(!pointer.is_null());
+            let bytes = std::slice::from_raw_parts(pointer.cast::<u8>(), size).to_vec();
+            SetLastError(0);
+            assert!(GlobalUnlock(handle) != 0 || GetLastError() == 0);
+            Some(Some(bytes))
         }
     }
     fn write(&mut self, format: u32, bytes: &[u8]) -> Option<Vec<u8>> {
@@ -326,6 +362,134 @@ fn wait_kind(receive: &mpsc::Receiver<ClipboardEvent>, kind: ClipKind) {
         }
     }
 }
+fn promise_probe(backend: &mut clipboard::WindowsClipboard, fixture: &mut Fixture) -> bool {
+    let reply = backend.probe_fulfiller();
+    let (send, receive) = mpsc::channel();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = requests.clone();
+    backend
+        .subscribe(Arc::new(move |event| {
+            if let ClipboardEvent::PasteRequested { paste, offer, kind } = &event {
+                assert_eq!(*kind, ClipKind::Text);
+                count.fetch_add(1, Ordering::Relaxed);
+                reply(
+                    *paste,
+                    if *offer == 71 {
+                        Some(b"fixture\npromise".to_vec())
+                    } else {
+                        None
+                    },
+                );
+            }
+            let _ = send.send(event);
+        }))
+        .unwrap();
+    if backend
+        .promise(
+            71,
+            crosspane_platform::ClipKinds {
+                text: true,
+                image: false,
+            },
+        )
+        .is_err()
+    {
+        println!("CLIP_PROMISE [U] admission_changed_before_promise");
+        return false;
+    }
+    // Ownership transferred to our authenticated observer; the old fixture has no clear authority.
+    fixture.sequence = None;
+    let paster = Fixture::new();
+    let paster_cleaned = paster.cleaned.clone();
+    let Some(Some(data)) = paster.paste(u32::from(CF_UNICODETEXT)) else {
+        println!("CLIP_PROMISE [U] promise_replaced_before_owned_paste");
+        return false;
+    };
+    let expected = model::clipboard::text_native(b"fixture\npromise").unwrap();
+    assert!(
+        data.starts_with(&expected),
+        "own promised UTF16 CRLF mismatch"
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    if backend
+        .promise(
+            72,
+            crosspane_platform::ClipKinds {
+                text: true,
+                image: false,
+            },
+        )
+        .is_err()
+    {
+        println!("CLIP_PROMISE [U] admission_changed_before_empty_promise");
+        return false;
+    }
+    if !matches!(paster.paste(u32::from(CF_UNICODETEXT)), Some(None)) {
+        println!("CLIP_PROMISE [U] empty_promise_replaced_before_owned_paste");
+        return false;
+    }
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    backend.withdraw(72).unwrap();
+    {
+        let Some(_opened) = paster.open() else {
+            println!("CLIP_PROMISE [U] contention_before_withdraw_receipt");
+            return false;
+        };
+        if !paster.admitted(false) {
+            println!("CLIP_PROMISE [U] replacement_before_withdraw_receipt");
+            return false;
+        }
+        // SAFETY: exact authenticated observer owner/sequence while open; metadata only.
+        unsafe {
+            SetLastError(0);
+            assert_eq!(CountClipboardFormats(), 0);
+            assert_eq!(GetLastError(), 0);
+        }
+    }
+    if backend
+        .promise(
+            73,
+            crosspane_platform::ClipKinds {
+                text: true,
+                image: false,
+            },
+        )
+        .is_err()
+    {
+        println!("CLIP_PROMISE [U] admission_changed_before_loss_case");
+        return false;
+    }
+    let Some(_) = fixture.write(u32::from(CF_UNICODETEXT), &text_fixture()) else {
+        println!("CLIP_PROMISE [U] replacement_before_owned_copy");
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut losses = 0;
+    loop {
+        let event = receive
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if let ClipboardEvent::PromiseLost { offer } = event {
+            assert_eq!(offer, 73);
+            losses += 1;
+            break;
+        }
+    }
+    backend.withdraw(73).unwrap();
+    while let Ok(event) = receive.try_recv() {
+        if matches!(event, ClipboardEvent::PromiseLost { .. }) {
+            losses += 1;
+        }
+    }
+    assert_eq!(losses, 1);
+    drop(paster);
+    assert!(paster_cleaned.load(Ordering::Acquire));
+    println!(
+        "CLIP_PROMISE requests=2 text_native_bytes={} crlf=true none_empty=true withdraw_empty=true lost=1 paster_destroyed=true",
+        expected.len()
+    );
+    true
+}
 #[test]
 #[ignore = "explicit Limited win-gui, empty-or-authenticated-own clipboard only"]
 fn limited_empty_or_owned_clipboard_watch_and_read() {
@@ -417,6 +581,7 @@ fn limited_empty_or_owned_clipboard_watch_and_read() {
     wait_kind(&receive, ClipKind::Image);
     let converted = backend.read(ClipKind::Image, 1024).unwrap();
     assert!(converted == png, "owned DIB conversion mismatch");
+    let promised = promise_probe(&mut backend, &mut fixture);
     assert!(clipboard::WindowsClipboard::stop_verified(backend));
     assert!(
         fixture.clear(),
@@ -435,7 +600,8 @@ fn limited_empty_or_owned_clipboard_watch_and_read() {
         clipboard::probe_data_requests()
     );
     println!(
-        "CLIP_PROBE owner_admission=empty_then_exact_fixture listener_removed=true owner_joined=true delivery_joined=true fixture_cleared=true fixture_destroyed=true elapsed_ms={}",
+        "CLIP_PROBE owner_admission=empty_then_exact_fixture promise_cases_completed={} listener_removed=true owner_joined=true delivery_joined=true fixture_cleared=true fixture_destroyed=true elapsed_ms={}",
+        promised,
         started.elapsed().as_millis()
     );
 }

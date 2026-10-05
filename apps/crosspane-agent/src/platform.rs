@@ -443,10 +443,8 @@ pub fn clipboard_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::C
     .map(|host| Box::new(host) as Box<dyn crosspane_platform::ClipboardHost>);
     #[cfg(windows)]
     let host: Result<Box<dyn crosspane_platform::ClipboardHost>, PlatformError> = {
-        let _ = gate;
-        Err(PlatformError::Unsupported(
-            "Windows audio/clipboard backend",
-        ))
+        crosspane_platform_windows::clipboard::WindowsClipboard::new(gate)
+            .map(|host| Box::new(host) as Box<dyn crosspane_platform::ClipboardHost>)
     };
     match host {
         Ok(host) => Some(host),

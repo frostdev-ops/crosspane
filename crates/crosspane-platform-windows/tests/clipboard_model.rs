@@ -338,3 +338,250 @@ fn dib_decoded_work_and_png_output_caps_are_independent() {
     assert!(matches!(dib_png(&image, 8), Err(PlatformError::TooLarge)));
     assert_eq!(DIB_WORK_CAP, 64 * 1024 * 1024);
 }
+
+use crosspane_platform::LocalPasteId;
+use std::time::Instant;
+use zeroize::Zeroizing;
+fn promised() -> (RenderLedger, Instant) {
+    let mut ledger = RenderLedger::default();
+    let now = Instant::now();
+    ledger
+        .install(
+            41,
+            ClipKinds {
+                text: true,
+                image: true,
+            },
+            2,
+            true,
+        )
+        .unwrap();
+    (ledger, now)
+}
+#[test]
+fn render_only_advertised_formats_one_slot_and_fresh_ids() {
+    let (mut ledger, now) = promised();
+    let first = ledger.begin(Format::Text, now, 2, true).unwrap();
+    assert_eq!((first.offer, first.deadline), (41, now + RENDER_WAIT));
+    assert!(ledger.begin(Format::Png, now, 2, true).is_none());
+    ledger.finish(LocalPasteId(first.paste.0 + 1));
+    assert!(ledger.rendering());
+    ledger.finish(first.paste);
+    let next = ledger.begin(Format::DibV5, now, 2, true).unwrap();
+    assert!(next.paste.0 > first.paste.0);
+    ledger.finish(next.paste);
+    assert!(ledger.begin(Format::Dib, now, 2, true).is_none());
+    ledger
+        .install(
+            42,
+            ClipKinds {
+                text: false,
+                image: true,
+            },
+            2,
+            true,
+        )
+        .unwrap();
+    assert!(ledger.begin(Format::Text, now, 2, true).is_none());
+    assert!(ledger.begin(Format::Png, now, 3, true).is_none());
+    assert!(ledger.begin(Format::Png, now, 2, false).is_none());
+}
+#[test]
+fn render_fulfil_once_none_unknown_duplicate_and_exact_deadline() {
+    let (mut ledger, now) = promised();
+    let render = ledger.begin(Format::Png, now, 2, true).unwrap();
+    ledger.answer(
+        LocalPasteId(render.paste.0 + 1),
+        Some(Zeroizing::new(vec![9])),
+        now,
+        2,
+        true,
+    );
+    assert!(ledger.poll(render, now, 2, true).is_none());
+    ledger.answer(render.paste, Some(Zeroizing::new(vec![1])), now, 2, true);
+    ledger.answer(render.paste, Some(Zeroizing::new(vec![2])), now, 2, true);
+    assert_eq!(&**ledger.poll(render, now, 2, true).unwrap().unwrap(), &[1]);
+    assert!(ledger.valid(render, now, 2, true));
+    assert!(!ledger.valid(render, now + RENDER_WAIT, 2, true));
+    ledger.finish(render.paste);
+    let render = ledger.begin(Format::Png, now, 2, true).unwrap();
+    ledger.answer(render.paste, None, now, 2, true);
+    assert!(ledger.poll(render, now, 2, true).unwrap().is_none());
+}
+#[test]
+fn render_timeout_gate_epoch_and_cancel_discard_ready_data() {
+    for mode in 0..4 {
+        let (mut ledger, now) = promised();
+        let render = ledger.begin(Format::Text, now, 2, true).unwrap();
+        ledger.answer(render.paste, Some(Zeroizing::new(vec![1])), now, 2, true);
+        if mode == 0 {
+            ledger.cancel(Some(41));
+        }
+        let at = if mode == 1 { now + RENDER_WAIT } else { now };
+        let epoch = if mode == 2 { 4 } else { 2 };
+        let open = mode != 3;
+        assert!(ledger.poll(render, at, epoch, open).unwrap().is_none());
+        assert!(!ledger.valid(render, at, epoch, open));
+        ledger.finish(render.paste);
+    }
+}
+#[test]
+fn render_replacement_retires_old_reply_and_slot_until_callback_finishes() {
+    let (mut ledger, now) = promised();
+    let old = ledger.begin(Format::Text, now, 2, true).unwrap();
+    ledger
+        .install(
+            42,
+            ClipKinds {
+                text: true,
+                image: false,
+            },
+            2,
+            true,
+        )
+        .unwrap();
+    ledger.answer(old.paste, Some(Zeroizing::new(vec![1])), now, 2, true);
+    assert!(ledger.poll(old, now, 2, true).unwrap().is_none());
+    assert!(ledger.begin(Format::Text, now, 2, true).is_none());
+    ledger.finish(old.paste);
+    let new = ledger.begin(Format::Text, now, 2, true).unwrap();
+    assert_eq!(new.offer, 42);
+    assert!(new.generation > old.generation);
+    ledger.answer(old.paste, Some(Zeroizing::new(vec![2])), now, 2, true);
+    assert!(ledger.poll(new, now, 2, true).is_none());
+}
+#[test]
+fn render_actual_owner_loss_is_once_and_withdraw_or_drop_is_silent_empty() {
+    let (mut ledger, now) = promised();
+    let render = ledger.begin(Format::Text, now, 2, true).unwrap();
+    assert!(ledger.lost(true).is_none());
+    assert_eq!(ledger.lost(false), Some(41));
+    assert!(ledger.lost(false).is_none());
+    assert!(ledger.poll(render, now, 2, true).unwrap().is_none());
+    ledger.finish(render.paste);
+    ledger
+        .install(
+            42,
+            ClipKinds {
+                text: true,
+                image: false,
+            },
+            2,
+            true,
+        )
+        .unwrap();
+    let render = ledger.begin(Format::Text, now, 2, true).unwrap();
+    assert!(!ledger.withdraw(41));
+    assert_eq!(ledger.current().unwrap().offer, 42);
+    assert!(ledger.withdraw(42));
+    assert!(ledger.poll(render, now, 2, true).unwrap().is_none());
+    assert!(ledger.lost(false).is_none());
+    ledger.finish(render.paste);
+    ledger
+        .install(
+            43,
+            ClipKinds {
+                text: true,
+                image: false,
+            },
+            2,
+            true,
+        )
+        .unwrap();
+    let render = ledger.begin(Format::Text, now, 2, true).unwrap();
+    ledger.close();
+    assert!(ledger.poll(render, now, 2, true).unwrap().is_none());
+    ledger.finish(render.paste);
+    assert!(ledger.begin(Format::Text, now, 2, true).is_none());
+    assert!(
+        ledger
+            .install(
+                44,
+                ClipKinds {
+                    text: true,
+                    image: false
+                },
+                2,
+                true
+            )
+            .is_err()
+    );
+}
+#[test]
+fn render_cancel_after_poll_fences_delivery_and_late_fulfil() {
+    let (mut ledger, now) = promised();
+    let render = ledger.begin(Format::Text, now, 2, true).unwrap();
+    ledger.answer(render.paste, Some(Zeroizing::new(vec![1])), now, 2, true);
+    assert!(ledger.poll(render, now, 2, true).unwrap().is_some());
+    ledger.cancel(None);
+    assert!(!ledger.valid(render, now, 2, true));
+    assert!(ledger.pending(render.paste).is_none());
+    ledger.answer(render.paste, Some(Zeroizing::new(vec![2])), now, 2, true);
+    assert!(ledger.poll(render, now, 2, true).unwrap().is_none());
+}
+#[test]
+fn promise_empty_and_locked_priorities_preserve_existing_promise() {
+    let (mut ledger, _) = promised();
+    assert!(matches!(
+        ledger.install(42, ClipKinds::default(), 3, false),
+        Err(PlatformError::Locked)
+    ));
+    assert!(
+        matches!(ledger.install(42,ClipKinds::default(),2,true),Err(PlatformError::Backend(reason))if reason=="empty clipboard promise")
+    );
+    assert_eq!(ledger.current().unwrap().offer, 41);
+}
+#[test]
+fn render_text_native_is_crlf_nul_terminated_and_rejects_truncation() {
+    assert_eq!(
+        text_native(b"a\nb\r\nc\rd").unwrap(),
+        utf16("a\r\nb\r\nc\rd")
+    );
+    assert_eq!(
+        text_native("\u{1f642}".as_bytes()).unwrap(),
+        utf16("\u{1f642}")
+    );
+    for data in [&b"x\0y"[..], &[0xff][..], &[][..]] {
+        assert!(matches!(text_native(data), Err(PlatformError::NotFound)));
+    }
+    assert!(matches!(
+        text_native(&vec![b'x'; TEXT_CAP + 1]),
+        Err(PlatformError::TooLarge)
+    ));
+}
+#[test]
+fn render_png_to_dibv5_roundtrips_alpha_and_preserves_work_cap() {
+    let mut raw = dib(1, -1, 32, 124);
+    for (at, value) in [
+        (16, 3u32),
+        (40, 0xff0000),
+        (44, 0xff00),
+        (48, 0xff),
+        (52, 0xff000000),
+    ] {
+        raw[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    raw[124..128].copy_from_slice(&[3, 2, 1, 128]);
+    let png = dib_png(&raw, IMAGE_CAP).unwrap();
+    let native = png_dibv5(&png).unwrap();
+    assert_eq!(
+        decoded(dib_png(&native, IMAGE_CAP).unwrap()),
+        vec![1, 2, 3, 128]
+    );
+    assert!(png_dibv5(b"not a png").is_err());
+    assert!(matches!(
+        png_dibv5(&vec![0; IMAGE_CAP + 1]),
+        Err(PlatformError::TooLarge)
+    ));
+}
+
+#[test]
+fn render_png_oversized_header_is_refused_before_row_or_plane_allocation() {
+    let mut raw = Vec::new();
+    let mut encoder = png::Encoder::new(&mut raw, 16385, 1024);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    drop(encoder.write_header().unwrap());
+    assert!(raw.len() < 1024);
+    assert!(matches!(png_dibv5(&raw), Err(PlatformError::TooLarge)));
+}

@@ -7,6 +7,108 @@ pub const TEXT_CAP: usize = 1024 * 1024;
 pub const IMAGE_CAP: usize = 16 * 1024 * 1024;
 pub const DIB_WORK_CAP: usize = 64 * 1024 * 1024;
 
+/// Outbound wire text, rejecting embedded NUL instead of silently truncating it.
+pub fn text_native(data: &[u8]) -> Result<Vec<u8>, PlatformError> {
+    if data.len() > TEXT_CAP {
+        return Err(PlatformError::TooLarge);
+    }
+    let text = std::str::from_utf8(data).map_err(|_| PlatformError::NotFound)?;
+    if text.is_empty() || text.contains('\0') {
+        return Err(PlatformError::NotFound);
+    }
+    let mut native = Zeroizing::new(Vec::new());
+    native
+        .try_reserve_exact(data.len() * 4 + 2)
+        .map_err(|_| allocation())?;
+    let mut previous = 0;
+    for unit in text.encode_utf16() {
+        if unit == 10 && previous != 13 {
+            native.extend_from_slice(&13u16.to_le_bytes());
+        }
+        native.extend_from_slice(&unit.to_le_bytes());
+        previous = unit;
+    }
+    native.extend_from_slice(&0u16.to_le_bytes());
+    Ok(std::mem::take(&mut *native))
+}
+/// Decode into one bounded top-down sRGB BGRA plane. The codec has additional bounded row
+/// workspace; DIB_WORK_CAP bounds decoded pixels, rather than all allocator overhead.
+pub fn png_dibv5(data: &[u8]) -> Result<Vec<u8>, PlatformError> {
+    if data.len() > IMAGE_CAP {
+        return Err(PlatformError::TooLarge);
+    }
+    if data.is_empty() {
+        return Err(PlatformError::NotFound);
+    }
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    decoder.set_limits(png::Limits {
+        bytes: DIB_WORK_CAP,
+    });
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let info = decoder.read_header_info().map_err(|_| layout())?;
+    let (width, height) = (info.width, info.height);
+    if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+        return Err(layout());
+    }
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(PlatformError::TooLarge)?;
+    let work = pixels
+        .checked_mul(4)
+        .filter(|n| *n <= DIB_WORK_CAP)
+        .ok_or(PlatformError::TooLarge)?;
+    let mut reader = decoder.read_info().map_err(|_| layout())?;
+    let mut native = Zeroizing::new(Vec::new());
+    native
+        .try_reserve_exact(124 + work)
+        .map_err(|_| allocation())?;
+    native.resize(124 + work, 0);
+    let output = reader
+        .next_frame(&mut native[124..])
+        .map_err(|_| layout())?;
+    if output.width != width || output.height != height || output.bit_depth != png::BitDepth::Eight
+    {
+        return Err(layout());
+    }
+    let channels = match output.color_type {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        _ => return Err(layout()),
+    };
+    // Backwards expansion keeps the source bytes intact without a second full RGBA allocation.
+    for pixel in (0..pixels).rev() {
+        let at = 124 + pixel * channels;
+        let (r, g, b, a) = match channels {
+            1 => (native[at], native[at], native[at], 255),
+            2 => (native[at], native[at], native[at], native[at + 1]),
+            3 => (native[at], native[at + 1], native[at + 2], 255),
+            _ => (native[at], native[at + 1], native[at + 2], native[at + 3]),
+        };
+        native[124 + pixel * 4..128 + pixel * 4].copy_from_slice(&[b, g, r, a]);
+    }
+    for (at, value) in [
+        (0, 124),
+        (4, width),
+        (8, (-(height as i32)) as u32),
+        (16, 3),
+        (20, work as u32),
+        (40, 0x00ff0000),
+        (44, 0x0000ff00),
+        (48, 0x000000ff),
+        (52, 0xff000000),
+        (56, 0x73524742),
+    ] {
+        native[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    native[12..14].copy_from_slice(&1u16.to_le_bytes());
+    native[14..16].copy_from_slice(&32u16.to_le_bytes());
+    Ok(std::mem::take(&mut *native))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Formats {
     pub text: bool,
@@ -341,6 +443,247 @@ impl Watch {
             None
         } else {
             Some(snapshot.kinds)
+        }
+    }
+}
+
+use crosspane_platform::LocalPasteId;
+use std::time::{Duration, Instant};
+pub const RENDER_WAIT: Duration = Duration::from_secs(2);
+#[derive(Clone, Copy, Debug)]
+pub struct Promise {
+    pub offer: u64,
+    pub kinds: ClipKinds,
+    pub generation: u64,
+    pub epoch: u64,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Render {
+    pub paste: LocalPasteId,
+    pub offer: u64,
+    pub generation: u64,
+    pub epoch: u64,
+    pub deadline: Instant,
+    pub format: Format,
+}
+/// One promise and one outstanding render. No payload Debug implementation.
+#[derive(Default)]
+pub struct RenderLedger {
+    current: Option<Promise>,
+    next: u64,
+    generation: u64,
+    active: Option<Pending>,
+    closed: bool,
+    revoked: bool,
+}
+enum Answer {
+    Waiting,
+    Empty,
+    Data(Zeroizing<Vec<u8>>),
+    Taken,
+}
+struct Pending {
+    render: Render,
+    answer: Answer,
+}
+impl std::fmt::Debug for RenderLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderLedger")
+            .field("promised", &self.current.is_some())
+            .field("rendering", &self.active.is_some())
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
+}
+impl RenderLedger {
+    pub fn validate(kinds: ClipKinds, open: bool) -> Result<(), PlatformError> {
+        if !open {
+            return Err(PlatformError::Locked);
+        }
+        if !kinds.text && !kinds.image {
+            return Err(PlatformError::Backend("empty clipboard promise".into()));
+        }
+        Ok(())
+    }
+    pub fn install(
+        &mut self,
+        offer: u64,
+        kinds: ClipKinds,
+        epoch: u64,
+        open: bool,
+    ) -> Result<Promise, PlatformError> {
+        Self::validate(kinds, open)?;
+        if self.closed {
+            return Err(PlatformError::Backend(
+                "clipboard observer unavailable".into(),
+            ));
+        }
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| PlatformError::Backend("clipboard generation exhausted".into()))?;
+        self.cancel(None);
+        self.generation = generation;
+        self.revoked = false;
+        let promise = Promise {
+            offer,
+            kinds,
+            generation,
+            epoch,
+        };
+        self.current = Some(promise);
+        Ok(promise)
+    }
+    pub fn current(&self) -> Option<Promise> {
+        self.current.filter(|_| !self.revoked && !self.closed)
+    }
+    /// Retains cleanup identity after revocation; it never authorizes a render.
+    pub fn owned(&self) -> Option<Promise> {
+        self.current
+    }
+    pub fn rendering(&self) -> bool {
+        self.active.is_some()
+    }
+    pub fn begin(
+        &mut self,
+        format: Format,
+        now: Instant,
+        epoch: u64,
+        open: bool,
+    ) -> Option<Render> {
+        let current = self.current()?;
+        let advertised = match format {
+            Format::Text => current.kinds.text,
+            Format::Png | Format::DibV5 => current.kinds.image,
+            Format::Dib => false,
+        };
+        if !open || epoch != current.epoch || !advertised || self.rendering() {
+            return None;
+        }
+        self.next = self.next.checked_add(1)?;
+        let render = Render {
+            paste: LocalPasteId(self.next),
+            offer: current.offer,
+            generation: current.generation,
+            epoch,
+            deadline: now + RENDER_WAIT,
+            format,
+        };
+        self.active = Some(Pending {
+            render,
+            answer: Answer::Waiting,
+        });
+        Some(render)
+    }
+    pub fn answer(
+        &mut self,
+        paste: LocalPasteId,
+        data: Option<Zeroizing<Vec<u8>>>,
+        now: Instant,
+        epoch: u64,
+        open: bool,
+    ) {
+        let Some(render) = self.pending(paste) else {
+            return;
+        };
+        if !self.valid(render, now, epoch, open) {
+            self.cancel(Some(render.offer));
+            return;
+        }
+        if let Some(pending) = self.active.as_mut() {
+            pending.answer = data.map_or(Answer::Empty, Answer::Data);
+        }
+    }
+    pub fn poll(
+        &mut self,
+        render: Render,
+        now: Instant,
+        epoch: u64,
+        open: bool,
+    ) -> Option<Option<Zeroizing<Vec<u8>>>> {
+        if !self.valid(render, now, epoch, open) {
+            self.cancel(Some(render.offer));
+            return Some(None);
+        }
+        let pending = self.active.as_mut()?;
+        match std::mem::replace(&mut pending.answer, Answer::Taken) {
+            Answer::Waiting => {
+                pending.answer = Answer::Waiting;
+                None
+            }
+            Answer::Data(data) => Some(Some(data)),
+            Answer::Empty => {
+                pending.answer = Answer::Empty;
+                Some(None)
+            }
+            Answer::Taken => Some(None),
+        }
+    }
+    pub fn valid(&self, render: Render, now: Instant, epoch: u64, open: bool) -> bool {
+        open && now < render.deadline
+            && epoch == render.epoch
+            && self.current().is_some_and(|p| {
+                p.offer == render.offer && p.generation == render.generation && p.epoch == epoch
+            })
+            && self.active.as_ref().is_some_and(|p| {
+                p.render.paste == render.paste && !matches!(p.answer, Answer::Empty)
+            })
+    }
+    pub fn pending(&self, paste: LocalPasteId) -> Option<Render> {
+        self.active
+            .as_ref()
+            .filter(|p| p.render.paste == paste && matches!(p.answer, Answer::Waiting))
+            .map(|p| p.render)
+    }
+    pub fn cancel(&mut self, offer: Option<u64>) {
+        if let Some(pending) = self
+            .active
+            .as_mut()
+            .filter(|p| offer.is_none_or(|offer| offer == p.render.offer))
+        {
+            pending.answer = Answer::Empty;
+        }
+    }
+    pub fn withdraw(&mut self, offer: u64) -> bool {
+        if self.current.is_none_or(|p| p.offer != offer) {
+            return false;
+        }
+        self.revoked = true;
+        self.cancel(Some(offer));
+        true
+    }
+    pub fn lost(&mut self, ours: bool) -> Option<u64> {
+        if ours {
+            return None;
+        }
+        let promise = self.current.take()?;
+        self.cancel(Some(promise.offer));
+        if self.revoked || self.closed {
+            None
+        } else {
+            Some(promise.offer)
+        }
+    }
+    pub fn forget(&mut self, promise: Promise) {
+        if self
+            .current
+            .is_some_and(|p| p.generation == promise.generation)
+        {
+            self.current = None;
+        }
+    }
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.revoked = true;
+        self.cancel(None);
+    }
+    pub fn finish(&mut self, paste: LocalPasteId) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|p| p.render.paste == paste)
+        {
+            self.active = None;
         }
     }
 }
