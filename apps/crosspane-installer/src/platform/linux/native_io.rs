@@ -2424,6 +2424,27 @@ impl LinuxNativeIo {
             Err(_) => Err(NativeError::Unavailable),
         }
     }
+    /// Read-only absence for diagnose, including a missing parent. Present entries (even
+    /// dangling symlinks) are never absence; every existing ancestor uses the safe fd walk.
+    pub(crate) fn path_is_absent(&self, path: &Path) -> Result<bool> {
+        self.validate_target()?;
+        if !clean(path)
+            || !(path.starts_with(&self.target.paths.home)
+                || path.starts_with(&self.target.paths.runtime_home))
+        {
+            return Err(NativeError::Foreign);
+        }
+        let parent = path.parent().ok_or(NativeError::Invalid)?;
+        let name = path.file_name().ok_or(NativeError::Invalid)?;
+        let Some(dir) = self.walk_dir(parent, false)? else {
+            return Ok(true);
+        };
+        match rfs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(false),
+            Err(rustix::io::Errno::NOENT) => Ok(true),
+            Err(_) => Err(NativeError::Unavailable),
+        }
+    }
     pub fn create_private_dir(&self, proof: &SupportProof, path: &Path) -> Result<()> {
         proof.check(self)?;
         self.validate_target()?;

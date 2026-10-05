@@ -1,10 +1,124 @@
 //! The same readers as the GUI, without a worker/controller or any mutating call.
+use super::super::{
+    native_io::{CommandSpec, MANAGER_PROPERTIES},
+    service::{ServiceError, UNIT},
+};
 use super::*;
 use crate::agent_contract::StatusAdmission;
 use crate::diagnose::{
     Class::{E, R, S},
     Report,
 };
+
+/// Fresh absence is its own diagnostic state, never an installed-service or readiness proof.
+fn service_absent(
+    io: &LinuxNativeIo,
+    env: &ChildEnvironment,
+    deadline: &Deadline,
+) -> std::result::Result<(), NativeError> {
+    let paths = io.target().paths();
+    let resources = [
+        paths.config_home.join("systemd/user").join(UNIT),
+        paths
+            .data_home
+            .join("applications/crosspane-settings.desktop"),
+        paths
+            .data_home
+            .join("applications/crosspane-installer.desktop"),
+        paths
+            .config_home
+            .join("systemd/user/graphical-session.target.wants")
+            .join(UNIT),
+    ];
+    let absent = || {
+        for path in &resources {
+            deadline.check()?;
+            if !io.path_is_absent(path)? {
+                return Err(NativeError::Foreign);
+            }
+        }
+        Ok(())
+    };
+    absent()?;
+    // The same selected, pinned manager endpoint and read-only command as LinuxService.
+    let environment = io.manager_environment(manager_session_of(env.values()), deadline)?;
+    let command = CommandSpec::new(
+        "/usr/bin/systemctl".into(),
+        vec![
+            "--user".into(),
+            "show".into(),
+            "--all".into(),
+            UNIT.into(),
+            "-p".into(),
+            MANAGER_PROPERTIES.into(),
+        ],
+        environment,
+        detect::MAX_PROBE_BYTES,
+    )?;
+    let output = io.run(&command, deadline)?;
+    if output.code != Some(0) || !output.stderr.is_empty() {
+        return Err(NativeError::Unavailable);
+    }
+    let expected = BTreeMap::from([
+        ("Id", UNIT),
+        ("LoadState", "not-found"),
+        ("ActiveState", "inactive"),
+        ("SubState", "dead"),
+        ("FragmentPath", ""),
+        ("DropInPaths", ""),
+        ("UnitFileState", ""),
+        ("MainPID", "0"),
+    ]);
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| NativeError::Invalid)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            if expected
+                .keys()
+                .any(|key| line == *key || line.starts_with(&format!("{key} ")))
+            {
+                return Err(NativeError::Invalid);
+            }
+            continue;
+        };
+        if let Some(required) = expected.get(key)
+            && (value != *required || !seen.insert(key))
+        {
+            return Err(NativeError::Foreign);
+        }
+    }
+    if seen.len() != expected.len() {
+        return Err(NativeError::Unavailable);
+    }
+    // Do not turn a partial install appearing during the manager query into fresh absence.
+    absent()?;
+    deadline.check()
+}
+
+fn record_service_error(
+    io: &LinuxNativeIo,
+    env: &ChildEnvironment,
+    prepared: bool,
+    error: ServiceError,
+    deadline: &Deadline,
+    out: &mut Report,
+) {
+    let check = "selected unit authority and state";
+    if prepared
+        && error == ServiceError::Native(NativeError::Foreign)
+        && service_absent(io, env, deadline).is_ok()
+    {
+        out.record(
+            "service",
+            check,
+            S,
+            Ok::<_, NativeError>("Not installed yet; setup will install Crosspane's startup entry"),
+            false,
+        );
+    } else {
+        out.record::<bool, _>("service", check, S, Err(error), true);
+    }
+}
 
 pub(crate) fn diagnose(payload: Option<&Path>, out: &mut Report) {
     let io = selected_paths()
@@ -287,13 +401,9 @@ pub(crate) fn diagnose(payload: Option<&Path>, out: &mut Report) {
                     false,
                 );
             }
-            Err(error) => out.record::<bool, _>(
-                "service",
-                "selected unit authority and state",
-                S,
-                Err(error),
-                true,
-            ),
+            Err(error) => {
+                record_service_error(&io, &env, prepared.is_ok(), error, &read_deadline, out)
+            }
         }
     } else {
         out.issue(
@@ -376,5 +486,220 @@ pub(crate) fn diagnose(payload: Option<&Path>, out: &mut Report) {
             firewall.read(&read_deadline),
             false,
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::super::super::native_io::{
+        CommandOutput, CommandRunner, ProcessFacts, ProcessProbe,
+    };
+    use super::*;
+    use std::{
+        fs,
+        os::unix::{
+            fs::{DirBuilderExt, PermissionsExt, symlink},
+            net::UnixListener,
+        },
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    // Captured by the lead on the clean systemd 261 desktop, including order and final LF.
+    const NOT_FOUND: &[u8] = b"Id=crosspane-agent.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nFragmentPath=\nSourcePath=\nDropInPaths=\nUnitFileState=\nMainPID=0\n";
+    type Hook = Box<dyn FnOnce() + Send>;
+    struct Manager {
+        output: Mutex<CommandOutput>,
+        hook: Mutex<Option<Hook>>,
+        calls: AtomicUsize,
+    }
+    impl CommandRunner for Manager {
+        fn run(
+            &self,
+            command: &CommandSpec,
+            deadline: &Deadline,
+        ) -> std::result::Result<CommandOutput, NativeError> {
+            deadline.check()?;
+            assert_eq!(command.executable(), Path::new("/usr/bin/systemctl"));
+            assert_eq!(
+                command.argv(),
+                ["--user", "show", "--all", UNIT, "-p", MANAGER_PROPERTIES]
+            );
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(hook) = self.hook.lock().unwrap().take() {
+                hook();
+            }
+            let output = self.output.lock().unwrap();
+            Ok(CommandOutput {
+                code: output.code,
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+            })
+        }
+    }
+    impl ProcessProbe for Manager {
+        fn snapshot(&self, _: u32, _: &Deadline) -> std::result::Result<ProcessFacts, NativeError> {
+            panic!("diagnosing service absence must not inspect or stop a process");
+        }
+    }
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    fn private_dir(path: &Path) {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .unwrap();
+    }
+
+    #[test]
+    fn fresh_service_diagnosis_requires_exact_absence_and_admitted_not_found() {
+        let root = Scratch(PathBuf::from(format!(
+            "/tmp/crosspane-diagnose-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )));
+        let manager = Arc::new(Manager {
+            output: Mutex::new(CommandOutput {
+                code: Some(0),
+                stdout: NOT_FOUND.to_vec(),
+                stderr: Vec::new(),
+            }),
+            hook: Mutex::new(None),
+            calls: AtomicUsize::new(0),
+        });
+        let io = LinuxNativeIo::scratch(&root.0, manager.clone(), manager.clone()).unwrap();
+        let paths = io.target().paths();
+        // Same remaining configuration directory as the owner's cleaned machine.
+        private_dir(&paths.config_home.join("crosspane"));
+        private_dir(&paths.runtime_home.join("systemd"));
+        let socket_path = paths.runtime_home.join("systemd/private");
+        let _socket = UnixListener::bind(&socket_path).unwrap();
+        let env = ChildEnvironment::selected(io.target(), BTreeMap::new()).unwrap();
+        let unit = paths.config_home.join("systemd/user").join(UNIT);
+        let settings = paths
+            .data_home
+            .join("applications/crosspane-settings.desktop");
+        let installer = paths
+            .data_home
+            .join("applications/crosspane-installer.desktop");
+        let link = paths
+            .config_home
+            .join("systemd/user/graphical-session.target.wants")
+            .join(UNIT);
+        let foreign = ServiceError::Native(NativeError::Foreign);
+        let fact = |error, prepared| {
+            let mut report = Report::new();
+            record_service_error(
+                &io,
+                &env,
+                prepared,
+                error,
+                &Deadline::new(5000, Cancellation::default()).unwrap(),
+                &mut report,
+            );
+            let report = serde_json::to_value(report).unwrap();
+            assert_eq!(report["facts"].as_array().unwrap().len(), 1);
+            let fact = report["facts"][0].clone();
+            assert_eq!(fact["class"], "S");
+            assert_eq!(fact["check"], "selected unit authority and state");
+            fact
+        };
+        let blocked = || {
+            let fact = fact(foreign, true);
+            assert_eq!(fact["hard_stop"], true);
+            assert_eq!(fact["issue"], "Native(Foreign)");
+        };
+        // Installed-resource reads retain their strict ENOENT behavior.
+        assert_eq!(
+            io.read(&unit, 256, false).unwrap_err(),
+            NativeError::Foreign
+        );
+        let absent = fact(foreign, true);
+        assert_eq!(absent["hard_stop"], false);
+        assert_eq!(absent["issue"], serde_json::Value::Null);
+        assert_eq!(
+            absent["value"],
+            "Not installed yet; setup will install Crosspane's startup entry"
+        );
+        for path in [&unit, &settings, &installer, &link] {
+            private_dir(path.parent().unwrap());
+            fs::write(path, b"partial install").unwrap();
+            let calls = manager.calls.load(Ordering::Relaxed);
+            blocked();
+            assert_eq!(manager.calls.load(Ordering::Relaxed), calls);
+            fs::remove_file(path).unwrap();
+        }
+        // A dangling enable link is present, not a proof of absence.
+        symlink(&unit, &link).unwrap();
+        blocked();
+        fs::remove_file(&link).unwrap();
+        // Unsafe ancestors, incomplete/malformed/duplicate facts, stderr and errors refuse.
+        fs::set_permissions(
+            settings.parent().unwrap(),
+            fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        blocked();
+        fs::set_permissions(
+            settings.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        for stdout in [
+            String::from_utf8_lossy(NOT_FOUND)
+                .replace("not-found", "loaded")
+                .into_bytes(),
+            String::from_utf8_lossy(NOT_FOUND)
+                .replace("MainPID=0", "MainPID=42")
+                .into_bytes(),
+            String::from_utf8_lossy(NOT_FOUND)
+                .replace("FragmentPath=", "FragmentPath=/foreign/unit")
+                .into_bytes(),
+            String::from_utf8_lossy(NOT_FOUND)
+                .replace("DropInPaths=", "DropInPaths=/foreign/drop-in")
+                .into_bytes(),
+            String::from_utf8_lossy(NOT_FOUND)
+                .replace("UnitFileState=", "UnitFileState=enabled")
+                .into_bytes(),
+            String::from_utf8_lossy(NOT_FOUND)
+                .replace("SubState=dead\n", "")
+                .into_bytes(),
+            [NOT_FOUND, b"MainPID=0\n"].concat(),
+            [NOT_FOUND, b"MainPID malformed\n"].concat(),
+            vec![0xff],
+        ] {
+            manager.output.lock().unwrap().stdout = stdout;
+            blocked();
+        }
+        manager.output.lock().unwrap().stdout = NOT_FOUND.to_vec();
+        manager.output.lock().unwrap().code = Some(1);
+        blocked();
+        manager.output.lock().unwrap().code = Some(0);
+        manager.output.lock().unwrap().stderr = b"unavailable".to_vec();
+        blocked();
+        manager.output.lock().unwrap().stderr.clear();
+        assert_eq!(fact(foreign, false)["hard_stop"], true);
+        assert_eq!(fact(ServiceError::Unknown, true)["hard_stop"], true);
+        assert_eq!(fact(foreign, true)["hard_stop"], false); // existing safe, empty parents too
+        let appeared = unit.clone();
+        *manager.hook.lock().unwrap() = Some(Box::new(move || {
+            fs::write(appeared, b"appeared during query").unwrap()
+        }));
+        blocked();
+        fs::remove_file(&unit).unwrap();
+        // The native runner still revalidates the same manager socket after the query.
+        *manager.hook.lock().unwrap() = Some(Box::new(move || {
+            fs::rename(&socket_path, socket_path.with_extension("old")).unwrap();
+            let _replacement = UnixListener::bind(socket_path).unwrap();
+        }));
+        blocked();
     }
 }
