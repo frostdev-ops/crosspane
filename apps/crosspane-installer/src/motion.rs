@@ -82,7 +82,6 @@ pub(crate) fn illustration_duration(view: &WizardView) -> u64 {
         ScreenId::Welcome | ScreenId::HidingChoice => 600,
         ScreenId::Permissions if view.illustration.permission_row.is_some() => 500,
         ScreenId::Network if view.illustration.traffic_observed => 200,
-        ScreenId::Practice if view.illustration.practice.is_some() => 600,
         ScreenId::Summary if view.summary == SummaryView::WorkspaceReady => 200,
         _ => 0,
     }

@@ -353,14 +353,14 @@ fn elf(version: u8) -> Vec<u8> {
     v
 }
 fn contents(version: u8) -> Vec<Vec<u8>> {
-    (0..10)
+    (0..FILES.len())
         .map(|i| {
-            if i < 5 {
+            if i < 4 {
                 elf(version)
-            } else if i == 5 {
+            } else if i == 4 {
                 format!("[Service]\nExecStart={{{{agent_executable}}}} run\nEnvironment={{{{xdg_config_environment}}}}\nEnvironment={{{{xdg_state_environment}}}}\nEnvironment={{{{xdg_runtime_environment}}}}\nEnvironment={{{{crosspane_runtime_environment}}}}\n# fixture-version-{version}\n").into_bytes()
-            } else if i < 8 {
-                format!("[Desktop Entry]\nType=Application\nName=Crosspane\nExec={{{{{}_executable}}}}\n# fixture-version-{version}\n", if i == 6 { "settings" } else { "installer" }).into_bytes()
+            } else if i < 7 {
+                format!("[Desktop Entry]\nType=Application\nName=Crosspane\nExec={{{{{}_executable}}}}\n# fixture-version-{version}\n", if i == 5 { "settings" } else { "installer" }).into_bytes()
             } else {
                 format!("inert-resource-{i}-{version}\n").into_bytes()
             }
@@ -376,7 +376,7 @@ fn installed_contents(f: &Fixture, version: u8) -> Vec<Vec<u8>> {
         .into_iter()
         .enumerate()
     {
-        result[index + 5] = resource.bytes;
+        result[index + 4] = resource.bytes;
     }
     result
 }
@@ -445,6 +445,216 @@ fn archive(m: &Manifest, data: &[Vec<u8>]) -> Vec<u8> {
     a.extend(vec![0; 1024]);
     a
 }
+#[test]
+fn current_payload_accepts_no_tutorial_inventory() {
+    let data = contents(1);
+    let mut m = manifest(1, &data);
+    let selected: Vec<_> = m
+        .members
+        .iter()
+        .cloned()
+        .zip(data)
+        .filter(|(artifact, _)| artifact.name != "bin/crosspane-tutorial")
+        .collect();
+    m.members = selected
+        .iter()
+        .map(|(artifact, _)| artifact.clone())
+        .collect();
+    let mut a = member("manifest.json", &serde_json::to_vec(&m).unwrap());
+    for (artifact, bytes) in selected {
+        a.extend(member(&artifact.name, &bytes));
+    }
+    a.extend(vec![0; 1024]);
+    let current = read(&a).unwrap();
+    assert_eq!(current.manifest().members.len(), 9);
+    assert!(
+        current
+            .manifest()
+            .members
+            .iter()
+            .all(|artifact| artifact.name != "bin/crosspane-tutorial")
+    );
+}
+
+#[test]
+fn current_payload_rejects_installing_the_retired_tutorial() {
+    let mut data = contents(1);
+    let mut m = manifest(1, &data);
+    if !m
+        .members
+        .iter()
+        .any(|artifact| artifact.name == "bin/crosspane-tutorial")
+    {
+        let bytes = elf(1);
+        m.members.insert(
+            4,
+            Artifact {
+                name: "bin/crosspane-tutorial".into(),
+                size: bytes.len(),
+                sha256: hex(&bytes),
+                features: vec![],
+            },
+        );
+        data.insert(4, bytes);
+    }
+    let mut a = member("manifest.json", &serde_json::to_vec(&m).unwrap());
+    for (artifact, bytes) in m.members.iter().zip(data) {
+        a.extend(member(&artifact.name, &bytes));
+    }
+    a.extend(vec![0; 1024]);
+    assert!(read(&a).is_err());
+}
+
+// V1 a3aafbfb: exact ten-member journal, Tutorial at index 4. The receipt alone is not
+// authority: this fixture records the actual scratch leaf inode/parent/hash, as V1 did.
+fn legacy_v1(f: &Fixture) -> (PathBuf, Vec<u8>) {
+    let path = f.io.target().paths().prefix.join("bin/crosspane-tutorial");
+    let bytes = elf(1);
+    put(&path, &bytes, 0o755);
+    let meta = fs::metadata(&path).unwrap();
+    let parent = fs::metadata(path.parent().unwrap()).unwrap();
+    let mut journal: Value = serde_json::from_slice(&fs::read(f.record(false)).unwrap()).unwrap();
+    let mut row = journal["receipt"]["resources"][0].clone();
+    row["resource_id"] = json!("bin/crosspane-tutorial");
+    row["resolved_path"] = json!(path);
+    let mut item = journal["items"][0].clone();
+    let hash = sha256(&bytes);
+    item["new"] = json!(hash);
+    item["template"] = json!(hash);
+    item["replacement"] = json!({"file":[meta.dev(),meta.ino()],
+        "parent":[parent.dev(),parent.ino()],"hash":hash,"mode":493});
+    journal["receipt"]["resources"]
+        .as_array_mut()
+        .unwrap()
+        .insert(4, row);
+    journal["items"].as_array_mut().unwrap().insert(4, item);
+    // Old package hashes are advisory here and never make the retired executable installable.
+    journal["receipt"]["manifest_sha256"] = json!([44; 32].to_vec());
+    journal["receipt"]["payload_sha256"] = json!([45; 32].to_vec());
+    put(
+        &f.record(false),
+        &serde_json::to_vec(&journal).unwrap(),
+        0o600,
+    );
+    (path, bytes)
+}
+#[test]
+fn legacy_v1_journal_upgrade_backs_up_and_removes_tutorial() {
+    let f = Fixture::new();
+    f.verified(&package(1), 1);
+    let (obsolete, bytes) = legacy_v1(&f);
+    let detected = f.install.detect(&f.proof, &package(2)).unwrap();
+    assert_eq!(detected.len(), 10);
+    assert_eq!(
+        detected.last().unwrap().resource_id,
+        "bin/crosspane-tutorial"
+    );
+    use crosspane_installer::platform::linux::integration::{NativePayloads, Payloads};
+    let next = package(2);
+    let mut native = NativePayloads::new(f.io.clone()).unwrap();
+    assert!(
+        native
+            .plan(&f.proof, &next, OperationId(2), false)
+            .unwrap()
+            .replacing
+    );
+    native
+        .apply(&f.proof, &next, OperationId(2), &deadline())
+        .unwrap();
+    let backup = fs::read_dir(f.io.target().paths().state_home.join("crosspane/backups"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.join("crosspane-tutorial").exists())
+        .unwrap();
+    assert!(!obsolete.exists());
+    assert_eq!(fs::read(backup.join("crosspane-tutorial")).unwrap(), bytes);
+    f.bootstrap_instance(10);
+    f.install
+        .verify(
+            &f.proof,
+            &next,
+            19,
+            100,
+            &f.reply(&next.manifest().product_version),
+            &deadline(),
+        )
+        .unwrap();
+    assert!(!obsolete.exists());
+    assert_eq!(f.install.detect(&f.proof, &package(2)).unwrap().len(), 9);
+}
+#[test]
+fn legacy_v1_matching_current_files_still_require_obsolete_cleanup() {
+    let f = Fixture::new();
+    let current = package(1);
+    f.verified(&current, 1);
+    legacy_v1(&f);
+    let rows = f.install.detect(&f.proof, &current).unwrap();
+    assert!(
+        rows[..9]
+            .iter()
+            .all(|r| r.before == crosspane_installer_core::ResourceObservation::Matching)
+    );
+    assert_eq!(
+        rows[9].before,
+        crosspane_installer_core::ResourceObservation::Different
+    );
+    assert!(matches!(
+        f.install
+            .plan(&f.proof, &current, OperationId(2), MatchingFiles::Preserve),
+        Err(PayloadError::Foreign)
+    ));
+}
+#[test]
+fn legacy_v1_absent_tutorial_is_obsolete_not_missing() {
+    let f = Fixture::new();
+    f.verified(&package(1), 1);
+    let (obsolete, _) = legacy_v1(&f);
+    fs::remove_file(obsolete).unwrap();
+    let detected = f.install.detect(&f.proof, &package(1)).unwrap();
+    assert_eq!(detected.len(), 9);
+    assert!(
+        detected
+            .iter()
+            .all(|r| r.before != crosspane_installer_core::ResourceObservation::Absent)
+    );
+    assert!(f.install.recorded(&f.proof).unwrap());
+}
+#[test]
+fn legacy_v1_wrong_position_path_or_count_is_refused() {
+    for change in 0..3 {
+        let f = Fixture::new();
+        f.verified(&package(1), 1);
+        legacy_v1(&f);
+        let mut journal: Value =
+            serde_json::from_slice(&fs::read(f.record(false)).unwrap()).unwrap();
+        match change {
+            0 => {
+                journal["receipt"]["resources"]
+                    .as_array_mut()
+                    .unwrap()
+                    .swap(3, 4);
+                journal["items"].as_array_mut().unwrap().swap(3, 4);
+            }
+            1 => journal["receipt"]["resources"][4]["resolved_path"] = json!(f.root.join("wrong")),
+            _ => {
+                journal["receipt"]["resources"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            }
+        }
+        put(
+            &f.record(false),
+            &serde_json::to_vec(&journal).unwrap(),
+            0o600,
+        );
+        assert!(
+            f.install.detect(&f.proof, &package(1)).is_err(),
+            "case {change}"
+        );
+    }
+}
+
 fn package(version: u8) -> Package {
     let data = contents(version);
     let a = archive(&manifest(version, &data), &data);
@@ -568,44 +778,44 @@ fn exact_target_map_modes_and_private_receipts() {
     let paths = f.install.targets();
     let roots = f.io.target().paths();
     assert_eq!(
-        &paths[..5],
-        &FILES[..5]
+        &paths[..4],
+        &FILES[..4]
             .iter()
             .map(|n| roots.prefix.join(n))
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        paths[5],
+        paths[4],
         roots
             .config_home
             .join("systemd/user/crosspane-agent.service")
     );
     assert_eq!(
-        paths[6],
+        paths[5],
         roots
             .data_home
             .join("applications/crosspane-settings.desktop")
     );
     assert_eq!(
-        paths[7],
+        paths[6],
         roots
             .data_home
             .join("applications/crosspane-installer.desktop")
     );
     assert_eq!(
-        paths[8],
+        paths[7],
         roots
             .data_home
             .join("icons/hicolor/scalable/apps/crosspane.svg")
     );
-    assert_eq!(paths[9], roots.data_home.join("crosspane/LICENSE"));
+    assert_eq!(paths[8], roots.data_home.join("crosspane/LICENSE"));
     let expected = installed_contents(&f, 1);
     f.applied(&p, 1);
     for (i, path) in paths.iter().enumerate() {
         assert_eq!(fs::read(path).unwrap(), expected[i]);
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o7777,
-            if i < 5 { 0o755 } else { 0o644 }
+            if i < 4 { 0o755 } else { 0o644 }
         );
     }
     assert_eq!(
@@ -712,21 +922,21 @@ fn fresh_plans_never_mutate_and_unknown_runtime_leftovers_refuse() {
 fn matching_adoption_and_modified_files_are_preserved() {
     let f = Fixture::new();
     let p = package(1);
-    put(&f.install.targets()[8], &contents(1)[8], 0o644);
-    let before = fs::metadata(&f.install.targets()[8]).unwrap();
+    put(&f.install.targets()[7], &contents(1)[7], 0o644);
+    let before = fs::metadata(&f.install.targets()[7]).unwrap();
     use std::os::unix::fs::MetadataExt;
     let plan = f
         .install
         .plan(&f.proof, &p, OperationId(1), MatchingFiles::Adopt)
         .unwrap();
     assert_eq!(
-        plan.receipt().resources[8].ownership,
+        plan.receipt().resources[7].ownership,
         ResourceOwnership::Adopted
     );
     f.install.apply(&f.proof, &p, plan, &deadline()).unwrap();
     assert_eq!(
         before.ino(),
-        fs::metadata(&f.install.targets()[8]).unwrap().ino()
+        fs::metadata(&f.install.targets()[7]).unwrap().ino()
     );
     f.bootstrap();
     f.install
@@ -743,10 +953,10 @@ fn matching_adoption_and_modified_files_are_preserved() {
         )
         .unwrap();
     assert_eq!(
-        newer.receipt().resources[8].ownership,
+        newer.receipt().resources[7].ownership,
         ResourceOwnership::Created
     );
-    assert_eq!(fs::read(&f.install.targets()[8]).unwrap(), contents(1)[8]);
+    assert_eq!(fs::read(&f.install.targets()[7]).unwrap(), contents(1)[7]);
     // A modified file is saved into the backup folder before it is replaced.
     let g = Fixture::new();
     g.verified(&p, 1);
@@ -849,7 +1059,7 @@ fn crash_points_redetect_then_resume_and_keep_previous_payload() {
         f.install
             .verify(&f.proof, &p, 19, 100, &f.reply("0.0.2"), &deadline())
             .unwrap();
-        for i in 0..10 {
+        for i in 0..FILES.len() {
             assert!(!f.sibling(2, i, true).exists());
             assert!(!f.sibling(2, i, false).exists());
         }
@@ -1021,10 +1231,10 @@ fn rendered_resources_are_target_bound_and_escape_unit_and_desktop_literals() {
     for (index, (a, b)) in rendered.iter().zip(&other).enumerate() {
         assert_eq!(a.template_sha256, b.template_sha256);
         assert_ne!(a.rendered_sha256, b.rendered_sha256);
-        assert_eq!(a.target, f.install.targets()[index + 5]);
+        assert_eq!(a.target, f.install.targets()[index + 4]);
         assert_eq!(a.source, ObservationSource::Demo);
         assert_eq!(a.rendered_sha256, sha256(&a.bytes));
-        assert_eq!(a.template_sha256, sha256(&contents(1)[index + 5]));
+        assert_eq!(a.template_sha256, sha256(&contents(1)[index + 4]));
     }
     let base = f.root.to_str().unwrap().strip_suffix(suffix).unwrap();
     let unit = String::from_utf8(rendered[0].bytes.clone()).unwrap();
@@ -1052,7 +1262,7 @@ fn malformed_template_unknown_leftovers_and_newline_targets_fail_closed() {
     for case in 0..5 {
         let f = Fixture::new();
         let mut data = contents(1);
-        let mut text = String::from_utf8(data[5].clone()).unwrap();
+        let mut text = String::from_utf8(data[4].clone()).unwrap();
         match case {
             0 => text = text.replace("{{agent_executable}}", "{{unknown}}"),
             1 => text.push_str("{{unknown"),
@@ -1060,7 +1270,7 @@ fn malformed_template_unknown_leftovers_and_newline_targets_fail_closed() {
             3 => text.push_str("{{agent_executable}}"),
             _ => text.push('\0'),
         }
-        data[5] = text.into_bytes();
+        data[4] = text.into_bytes();
         let p = read(&archive(&manifest(1, &data), &data)).unwrap();
         assert_eq!(f.install.rendered_resources(&p), Err(PayloadError::Invalid));
         assert!(matches!(
@@ -1099,24 +1309,24 @@ fn rendered_hashes_keep_owned_repeat_files_and_preserve_hand_edits() {
     let journal: Value = serde_json::from_slice(&fs::read(f.record(false)).unwrap()).unwrap();
     for (i, r) in records.iter().enumerate() {
         assert_eq!(
-            journal["items"][i + 5]["template"],
+            journal["items"][i + 4]["template"],
             json!(r.template_sha256)
         );
-        assert_eq!(journal["items"][i + 5]["new"], json!(r.rendered_sha256));
+        assert_eq!(journal["items"][i + 4]["new"], json!(r.rendered_sha256));
     }
     let plan = f
         .install
         .plan(&f.proof, &p, OperationId(2), MatchingFiles::Preserve)
         .unwrap();
     assert!(
-        plan.receipt().resources[5..8]
+        plan.receipt().resources[4..7]
             .iter()
             .all(|r| r.ownership == ResourceOwnership::Created)
     );
-    let path = &f.install.targets()[5];
+    let path = &f.install.targets()[4];
     put(path, b"hand-edited unit\n", 0o644);
     let rows = f.install.detect(&f.proof, &p).unwrap();
-    assert_eq!(rows[5].ownership, ResourceOwnership::Foreign);
+    assert_eq!(rows[4].ownership, ResourceOwnership::Foreign);
     // WP-4.32: a fresh plan installs over the hand edit, saving it first.
     let fresh = f
         .install
@@ -1146,8 +1356,8 @@ fn rendered_hashes_keep_owned_repeat_files_and_preserve_hand_edits() {
 #[test]
 fn whole_directives_single_exec_and_undeclared_codes_fail_closed() {
     let f = Fixture::new();
-    for index in 5..8 {
-        let field = TEMPLATE_FIELDS[if index == 5 { 0 } else { index - 1 }];
+    for index in 4..7 {
+        let field = TEMPLATE_FIELDS[if index == 4 { 0 } else { index }];
         for case in 0..9 {
             let mut data = contents(1);
             let text = String::from_utf8(data[index].clone()).unwrap();
@@ -1157,7 +1367,7 @@ fn whole_directives_single_exec_and_undeclared_codes_fail_closed() {
                 2 => text.replace(field, &format!("prefix{field}")),
                 3 => text.replace(field, "/bin/false") + &format!("\n#{field}\n"),
                 4 => {
-                    text + if index == 5 {
+                    text + if index == 4 {
                         "\nExecStart=/bin/false\n"
                     } else {
                         "\nExec=/bin/false\n"
@@ -1167,7 +1377,7 @@ fn whole_directives_single_exec_and_undeclared_codes_fail_closed() {
                 6 => text + "\nName=undeclared %u\n",
                 7 => text + "\nName=undeclared %h\n",
                 _ => text.replace(
-                    if index == 5 {
+                    if index == 4 {
                         "[Service]"
                     } else {
                         "[Desktop Entry]"
@@ -1191,12 +1401,12 @@ fn whole_directives_single_exec_and_undeclared_codes_fail_closed() {
 #[test]
 fn native_parser_continuations_bom_non_ascii_and_cr_fail_closed() {
     let f = Fixture::new();
-    for index in 5..8 {
+    for index in 4..7 {
         for case in 0..4 {
             let mut data = contents(1);
             let text = String::from_utf8(data[index].clone()).unwrap();
             // Native parsers normalize these physical lines; our templates forbid that ambiguity.
-            let command = if index == 5 { "ExecStart=" } else { "Exec=" };
+            let command = if index == 4 { "ExecStart=" } else { "Exec=" };
             data[index] = match case {
                 0 => text.replace(command, &format!("Type=exec\\\n{command}")),
                 1 => text + &format!("\u{feff}{command}/bin/false\n"),
@@ -1248,7 +1458,7 @@ fn every_operational_health_clause_retains_every_backup_until_satisfied() {
     let p = package(2);
     f.applied(&p, 2);
     f.bootstrap_instance(10);
-    let before: Vec<_> = (0..10)
+    let before: Vec<_> = (0..FILES.len())
         .map(|i| fs::read(f.sibling(2, i, true)).unwrap())
         .collect();
     let mandatory = [
@@ -1334,7 +1544,7 @@ fn every_operational_health_clause_retains_every_backup_until_satisfied() {
     f.install
         .verify(&f.proof, &p, 19, 100, &reply, &deadline())
         .unwrap();
-    assert!((0..10).all(|i| !f.sibling(2, i, true).exists()));
+    assert!((0..FILES.len()).all(|i| !f.sibling(2, i, true).exists()));
 }
 
 #[test]
@@ -1345,14 +1555,14 @@ fn fresh_observations_cannot_claim_matching_files_created_after_plan() {
         .install
         .plan(&f.proof, &p, OperationId(1), MatchingFiles::Preserve)
         .unwrap();
-    let bytes = installed_contents(&f, 1)[8].clone();
-    put(&f.install.targets()[8], &bytes, 0o644);
+    let bytes = installed_contents(&f, 1)[7].clone();
+    put(&f.install.targets()[7], &bytes, 0o644);
     assert_eq!(
         f.install.apply(&f.proof, &p, plan, &deadline()),
         Err(PayloadError::Foreign)
     );
     assert!(!f.record(true).exists());
-    assert_eq!(fs::read(&f.install.targets()[8]).unwrap(), bytes);
+    assert_eq!(fs::read(&f.install.targets()[7]).unwrap(), bytes);
     f.applied(&p, 2);
     f.bootstrap();
     f.install
@@ -1361,7 +1571,7 @@ fn fresh_observations_cannot_claim_matching_files_created_after_plan() {
     // WP-4.32: the matching file was there when op 2 planned; setup owns the install path, so
     // the install it recorded covers it.
     assert_eq!(
-        f.install.detect(&f.proof, &package(2)).unwrap()[8].ownership,
+        f.install.detect(&f.proof, &package(2)).unwrap()[7].ownership,
         ResourceOwnership::Created
     );
     assert!(
@@ -1385,8 +1595,8 @@ fn matching_files_created_after_locked_recheck_are_never_owned_on_retry() {
             .install
             .plan(&f.proof, &p, OperationId(1), MatchingFiles::Preserve)
             .unwrap();
-        let selected = f.install.targets()[8].clone();
-        let bytes = installed_contents(&f, 1)[8].clone();
+        let selected = f.install.targets()[7].clone();
+        let bytes = installed_contents(&f, 1)[7].clone();
         let owner_path = selected.clone();
         let owner_bytes = bytes.clone();
         f.install
@@ -1403,7 +1613,7 @@ fn matching_files_created_after_locked_recheck_are_never_owned_on_retry() {
         );
         let identity = fs::metadata(&selected).unwrap().ino();
         let intent: Value = serde_json::from_slice(&fs::read(f.record(true)).unwrap()).unwrap();
-        assert_eq!(intent["items"][8]["replacement"], Value::Null);
+        assert_eq!(intent["items"][7]["replacement"], Value::Null);
         let reconstructed = PayloadInstaller::new(f.io.clone()).unwrap();
         assert!(matches!(
             reconstructed.resume_plan(&f.proof, &p),
@@ -1427,8 +1637,8 @@ fn exchange_matching_owner_file_is_not_the_admitted_staged_inode_on_resume() {
         .install
         .plan(&f.proof, &p, OperationId(1), MatchingFiles::Preserve)
         .unwrap();
-    let owner_path = f.install.targets()[8].clone();
-    let bytes = installed_contents(&f, 1)[8].clone();
+    let owner_path = f.install.targets()[7].clone();
+    let bytes = installed_contents(&f, 1)[7].clone();
     let stage = f.sibling(1, 8, false);
     let selected = owner_path.clone();
     let matching = bytes.clone();
@@ -1451,7 +1661,7 @@ fn exchange_matching_owner_file_is_not_the_admitted_staged_inode_on_resume() {
     assert_ne!(owner.ino(), recovery.ino());
     let record = fs::read(f.record(true)).unwrap();
     let journal: Value = serde_json::from_slice(&record).unwrap();
-    let admission = &journal["items"][8]["replacement"];
+    let admission = &journal["items"][7]["replacement"];
     let parent = fs::metadata(stage.parent().unwrap()).unwrap();
     assert_eq!(admission["file"], json!([recovery.dev(), recovery.ino()]));
     assert_eq!(admission["parent"], json!([parent.dev(), parent.ino()]));
@@ -1501,7 +1711,7 @@ fn pending_staged_identity_survives_reconstruction_and_retry_interleavings() {
             Err(PayloadError::OutcomeUnknown)
         );
         let stage = f.sibling(1, 8, false);
-        let target = f.install.targets()[8].clone();
+        let target = f.install.targets()[7].clone();
         let preserved = f.root.join("preserved-stage");
         let original = fs::metadata(&stage).unwrap();
         let bytes = fs::read(&stage).unwrap();
@@ -1585,7 +1795,7 @@ fn exchange_retry_final_check_preserves_late_stage_substitution_and_every_backup
         Err(PayloadError::OutcomeUnknown)
     );
     let stage = f.sibling(2, 8, false);
-    let target = f.install.targets()[8].clone();
+    let target = f.install.targets()[7].clone();
     let target_inode = fs::metadata(&target).unwrap().ino();
     let staged_inode = fs::metadata(&stage).unwrap().ino();
     let bytes = fs::read(&stage).unwrap();
@@ -1612,7 +1822,7 @@ fn exchange_retry_final_check_preserves_late_stage_substitution_and_every_backup
     );
     let substitute_inode = fs::metadata(&stage).unwrap().ino();
     assert_ne!(substitute_inode, staged_inode);
-    assert_eq!(fs::read(&target).unwrap(), old[8]);
+    assert_eq!(fs::read(&target).unwrap(), old[7]);
     assert_eq!(fs::metadata(&target).unwrap().ino(), target_inode);
     assert_eq!(fs::read(&preserved).unwrap(), bytes);
     assert_eq!(fs::metadata(&preserved).unwrap().ino(), staged_inode);
@@ -1644,7 +1854,7 @@ fn exchange_retry_final_check_preserves_late_stage_substitution_and_every_backup
         Err(PayloadError::Pending)
     ));
     assert_eq!(fs::read(f.record(false)).unwrap(), outcome);
-    assert_eq!(fs::read(&target).unwrap(), old[8]);
+    assert_eq!(fs::read(&target).unwrap(), old[7]);
     assert_eq!(fs::metadata(&target).unwrap().ino(), target_inode);
     assert_eq!(fs::metadata(&stage).unwrap().ino(), substitute_inode);
     for (i, expected) in old.iter().enumerate().take(9) {
@@ -1673,14 +1883,14 @@ fn every_persisted_replacement_hash_and_mode_is_validated_even_when_originally_m
         .iter()
         .map(|path| (fs::read(path).unwrap(), fs::metadata(path).unwrap().ino()))
         .collect();
-    for index in 0..10 {
+    for index in 0..FILES.len() {
         for wrong_mode in [false, true] {
             let mut journal = base.clone();
             let path = &f.install.targets()[index];
             let file = fs::metadata(path).unwrap();
             let parent = fs::metadata(path.parent().unwrap()).unwrap();
             let mut hash = journal["items"][index]["new"].clone();
-            let mode = if index < 5 { 0o755 } else { 0o644 };
+            let mode = if index < 4 { 0o755 } else { 0o644 };
             if !wrong_mode {
                 hash[0] = json!(hash[0].as_u64().unwrap() ^ 1);
             }
@@ -2136,7 +2346,7 @@ fn journal_publish_checkpoints_reconstruct_every_transition_and_retained_bytes()
         } else {
             10
         };
-        for i in 0..10 {
+        for i in 0..FILES.len() {
             assert_eq!(
                 &fs::read(&f.install.targets()[i]).unwrap(),
                 if i < completed { &new[i] } else { &old[i] }
@@ -2187,14 +2397,15 @@ fn journal_publish_checkpoints_reconstruct_every_transition_and_retained_bytes()
             reconstructed
                 .apply(&f.proof, &p, plan, &deadline())
                 .unwrap();
-            assert!((0..10).all(|i| fs::read(f.sibling(2, i, true)).unwrap() == old[i]));
+            assert!((0..FILES.len()).all(|i| fs::read(f.sibling(2, i, true)).unwrap() == old[i]));
             f.bootstrap_instance(10);
         }
         reconstructed
             .verify(&f.proof, &p, 19, 100, &f.reply("0.0.2"), &deadline())
             .unwrap();
         assert!(
-            (0..10).all(|i| !f.sibling(2, i, true).exists() && !f.sibling(2, i, false).exists())
+            (0..FILES.len())
+                .all(|i| !f.sibling(2, i, true).exists() && !f.sibling(2, i, false).exists())
         );
     }
 }
@@ -2216,7 +2427,7 @@ fn quarantine_identity_publish_checkpoints_retain_original_and_resume_cleanup() 
                 .verify(&f.proof, &p, 19, 100, &f.reply("0.0.2"), &deadline()),
             Err(PayloadError::OutcomeUnknown)
         );
-        for i in 0..10 {
+        for i in 0..FILES.len() {
             assert_eq!(
                 fs::read(f.sibling(2, i, true)).unwrap(),
                 installed_contents(&f, 1)[i]
@@ -2228,7 +2439,7 @@ fn quarantine_identity_publish_checkpoints_retain_original_and_resume_cleanup() 
         reconstructed
             .verify(&f.proof, &p, 19, 100, &f.reply("0.0.2"), &deadline())
             .unwrap();
-        assert!((0..10).all(|i| !f.sibling(2, i, true).exists()));
+        assert!((0..FILES.len()).all(|i| !f.sibling(2, i, true).exists()));
     }
 }
 
@@ -2253,7 +2464,7 @@ fn retirement_interruption_reconstructs_and_never_requires_old_executable_path()
     reconstructed
         .verify(&f.proof, &p, 19, 100, &f.reply("0.0.2"), &deadline())
         .unwrap();
-    assert!((0..10).all(|i| !f.sibling(2, i, true).exists()));
+    assert!((0..FILES.len()).all(|i| !f.sibling(2, i, true).exists()));
 }
 
 #[test]
@@ -3004,7 +3215,7 @@ mod owned_install_paths {
             put(
                 path,
                 format!("hand-made {index}").as_bytes(),
-                if index < 5 { 0o755 } else { 0o644 },
+                if index < 4 { 0o755 } else { 0o644 },
             );
         }
         let _live = live_runtime(&f, 9);
@@ -3099,7 +3310,7 @@ mod owned_install_paths {
         for dir in [root.clone(), root.parent().unwrap().to_owned()] {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        put(&f.install.targets()[8], b"hand-made icon", 0o644);
+        put(&f.install.targets()[7], b"hand-made icon", 0o644);
         let backup = run_install(&f, &package(1), 1).unwrap();
         finish(&f, &package(1), 10);
         let mut kept: Vec<_> = fs::read_dir(&root)

@@ -64,7 +64,7 @@ bash scripts/macos/build-audio-plugin.sh
 bash packaging/macos/installer/audio/build.sh "$root/target/macos-audio/CrosspaneAudio.driver" "$team" "$work/audio"
 bash scripts/macos/bundle.sh --bin target/release/crosspane-agent --id io.frostdev.crosspane.agent \
     --name Crosspane --out "$payload" --ui-element --extra target/release/crosspane-ui \
-    --extra target/release/crosspane-tutorial --entitlements packaging/macos/crosspane-agent.entitlements \
+    --entitlements packaging/macos/crosspane-agent.entitlements \
     --identity "$identity"
 audio=$payload/Crosspane.app/Contents/Resources/audio
 mkdir -p "$audio"

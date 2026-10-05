@@ -293,6 +293,12 @@ impl PayloadInstaller {
                 }
             }
         }
+        // Obsolete V1 leaf: ownership is the same fixed-path WP-4.32 rule, never an archive.
+        let obsolete = self.io.target().paths().prefix.join(LEGACY_TUTORIAL);
+        if self.io.metadata(&obsolete)?.is_some() {
+            let folder = self.backup_folder(proof)?;
+            moved |= self.move_aside(proof, &obsolete, &folder, "crosspane-tutorial")?;
+        }
         // The install paths themselves.
         for (index, path) in self.paths.iter().enumerate() {
             let Some((parent, entry)) = self.parent(proof, path, false)? else {
@@ -322,6 +328,10 @@ impl PayloadInstaller {
                 parents.entry(parent.to_owned()).or_default().push(name);
             }
         }
+        parents
+            .entry(self.io.target().paths().prefix.join("bin"))
+            .or_default()
+            .push("crosspane-tutorial");
         for (directory, installed) in parents {
             let Some((dir, _)) = self.parent(proof, &directory.join(installed[0]), false)? else {
                 continue;

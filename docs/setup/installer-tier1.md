@@ -17,7 +17,6 @@ bin/crosspane-agent
 bin/crosspanectl
 bin/crosspane-ui
 bin/crosspane-installer
-bin/crosspane-tutorial
 resources/crosspane-agent.service
 resources/crosspane-settings.desktop
 resources/crosspane-installer.desktop
@@ -86,7 +85,7 @@ scripts/lead/impl-env.sh env \
 The output parent must exist inside this checkout's `target/`, be user-owned, have no symlink
 ancestry, and not allow other users to write. The output directory must be fresh. The stager
 publishes it only after all validation succeeds; a failed build leaves no partially shipped app.
-It builds the release agent with `private-vdisplay,video`, settings, CLI and tutorial, and the
+It builds the release agent with `private-vdisplay,video`, settings and CLI, and the
 audio driver's install/remove packages. It bundles and signs libopus with the agent.
 
 The output contains `Crosspane Installer.app`, a build-time `ApprovedInventory.json` sample,
@@ -147,7 +146,7 @@ queries, and never installs, starts, stops, cleans, authorizes, or changes setti
 `target/installer-real-check/{linux,macos}.json`. An S issue remains a safety refusal; an E issue is
 a visible evidence note; exact dead-runtime recovery is R and observation alone never cleans it.
 The script fails on an E hard stop and summarizes S stops separately. Unknown evidence is never
-reported as ready. Known incompatibility still prevents the affected startup/tutorial action.
+reported as ready. Known incompatibility still prevents the affected startup action.
 
 A Mac development binary without an embedded approved inventory reports the signature-bound
 payload and agent observations as S/unknown. For full signed-payload coverage, use a newly staged

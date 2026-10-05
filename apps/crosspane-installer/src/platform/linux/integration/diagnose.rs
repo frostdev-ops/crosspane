@@ -496,6 +496,7 @@ mod tests {
         CommandOutput, CommandRunner, ProcessFacts, ProcessProbe,
     };
     use super::*;
+    use std::sync::Mutex;
     use std::{
         fs,
         os::unix::{

@@ -94,7 +94,7 @@ pub(super) struct ConnectState {
     pub placed: Option<Vec<Placement>>,
     pub layout_busy: bool,
     pub hiding: Option<HidingChoice>,
-    pub settings: Option<crate::tutorial_flow::SettingsTransition>,
+    pub settings: Option<crate::settings_transition::SettingsTransition>,
     /// The hiding choice was applied with its restart consent in the same click.
     pub hiding_restart_agreed: bool,
     /// The agent's settings already held the hiding choice when the step was detected, so it is
@@ -824,7 +824,7 @@ impl LiveController {
                 self.connect.grants = self.granted();
                 self.planned(
                     &job,
-                    "Choose what the other computer may do here. Practice needs all five; you \
+                    "Choose what the other computer may do here. You \
                      can change them later in Crosspane's settings.",
                 );
             }
@@ -1052,10 +1052,14 @@ impl LiveController {
         });
     }
 
-    /// Re-verify final health on every own Status once all practice holds, so readiness lapses
+    /// Re-verify final health on every own Status once all prerequisites hold, so readiness lapses
     /// honestly and is renewed without waiting for the five-second expiry.
     fn reverify_final(&mut self) {
-        if !self.graph.practice_steps().iter().all(|s| self.settled(*s)) {
+        if !self
+            .graph
+            .meta(steps::FINAL)
+            .is_some_and(|m| m.prerequisites.iter().all(|s| self.settled(*s)))
+        {
             return;
         }
         if let Some(job) = self.job(steps::FINAL, JobStage::Verify) {
@@ -1155,10 +1159,8 @@ impl LiveController {
                     if self.granted() == [true; 5] {
                         self.verified(&job, source, at);
                     } else {
-                        self.details.insert(
-                            step,
-                            "Practice needs all five permissions. Turn them on to continue.".into(),
-                        );
+                        self.details
+                            .insert(step, "Turn all five permissions on to continue.".into());
                         let _ = self.reduce(FlowEvent::Waiting {
                             step,
                             operation: job.operation,
@@ -1290,7 +1292,7 @@ impl LiveController {
             JobStage::Verify => {
                 let complete = self.connect.hiding_saved
                     || self.connect.settings.as_ref().is_some_and(|t| {
-                        *t.state() == crate::tutorial_flow::SettingsTransitionState::Complete
+                        *t.state() == crate::settings_transition::SettingsTransitionState::Complete
                     });
                 if let (true, Some((at, source))) = (
                     complete,
@@ -1313,8 +1315,10 @@ impl LiveController {
         };
         let hide = self.connect.hiding == Some(HidingChoice::Hide);
         let revision = self.view.revision;
-        let mut transition =
-            crate::tutorial_flow::SettingsTransition::new(snapshot.installer().node, revision);
+        let mut transition = crate::settings_transition::SettingsTransition::new(
+            snapshot.installer().node,
+            revision,
+        );
         if let Some(peer) = self.peer {
             let _ = transition.track_peers(&[peer]);
         }
@@ -1351,9 +1355,8 @@ impl LiveController {
     }
 
     pub(super) fn hiding_restart(&mut self) {
-        use crate::tutorial_flow::SettingsTransitionState as S;
-        let mut tracked = self.graph.practice_steps();
-        tracked.push(steps::FINAL);
+        use crate::settings_transition::SettingsTransitionState as S;
+        let tracked = [steps::FINAL];
         let id = self.alloc_call_id();
         let Some(transition) = self.connect.settings.as_mut() else {
             return;
@@ -1383,7 +1386,7 @@ impl LiveController {
     }
 
     pub(super) fn settings_reply(&mut self, reply: AgentReply) {
-        use crate::tutorial_flow::SettingsTransitionState as S;
+        use crate::settings_transition::SettingsTransitionState as S;
         let Some(transition) = self.connect.settings.as_mut() else {
             return;
         };
@@ -1444,7 +1447,7 @@ impl LiveController {
     }
 
     pub(super) fn settings_tick(&mut self) {
-        use crate::tutorial_flow::SettingsTransitionState as S;
+        use crate::settings_transition::SettingsTransitionState as S;
         let waiting = self
             .connect
             .settings
@@ -1469,7 +1472,7 @@ impl LiveController {
     }
 
     pub(super) fn hiding_restart_pending(&self) -> bool {
-        use crate::tutorial_flow::SettingsTransitionState as S;
+        use crate::settings_transition::SettingsTransitionState as S;
         self.connect.settings.as_ref().is_some_and(|t| {
             matches!(
                 t.state(),

@@ -29,12 +29,27 @@ pub use reclaim::KEEP_BACKUPS;
 pub const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_MEMBER_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
-pub const FILES: [&str; 10] = [
+pub const FILES: [&str; 9] = [
     "bin/crosspane-agent",
     "bin/crosspanectl",
     "bin/crosspane-ui",
     "bin/crosspane-installer",
-    "bin/crosspane-tutorial",
+    "resources/crosspane-agent.service",
+    "resources/crosspane-settings.desktop",
+    "resources/crosspane-installer.desktop",
+    "resources/crosspane-icon.svg",
+    "resources/LICENSE",
+];
+// V1 a3aafbfb placed this obsolete executable at journal index 4. Read-only compatibility:
+// it is never a member of a current package or an executable admission.
+pub(super) const LEGACY_TUTORIAL: &str = "bin/crosspane-tutorial";
+/// Fixed V1 cleanup order. The obsolete slot grants no current install/executable authority.
+pub const CLEANUP_FILES: [&str; 10] = [
+    "bin/crosspane-agent",
+    "bin/crosspanectl",
+    "bin/crosspane-ui",
+    "bin/crosspane-installer",
+    LEGACY_TUTORIAL,
     "resources/crosspane-agent.service",
     "resources/crosspane-settings.desktop",
     "resources/crosspane-installer.desktop",
@@ -115,8 +130,8 @@ fn template(raw: &[u8], index: usize) -> Result<&str> {
     }
     let text = std::str::from_utf8(raw).map_err(|_| PayloadError::Invalid)?;
     let fields = match index {
-        5 => &TEMPLATE_FIELDS[..5],
-        6 => &TEMPLATE_FIELDS[5..6],
+        4 => &TEMPLATE_FIELDS[..5],
+        5 => &TEMPLATE_FIELDS[5..6],
         _ => &TEMPLATE_FIELDS[6..],
     };
     let (mut section, mut seen, mut commands) = ("", 0u8, 0);
@@ -136,14 +151,14 @@ fn template(raw: &[u8], index: usize) -> Result<&str> {
         let directive = line.split_once('=').map(|(key, _)| key.trim());
         if directive.is_some_and(|key| key.starts_with("Exec") || key == "TryExec") {
             commands += 1;
-            let expected = if index == 5 {
+            let expected = if index == 4 {
                 format!("ExecStart={} run", fields[0])
             } else {
                 format!("Exec={}", fields[0])
             };
             if line != expected
                 || section
-                    != if index == 5 {
+                    != if index == 4 {
                         "[Service]"
                     } else {
                         "[Desktop Entry]"
@@ -156,9 +171,9 @@ fn template(raw: &[u8], index: usize) -> Result<&str> {
             let position = fields
                 .iter()
                 .position(|field| {
-                    line == if index == 5 && *field != fields[0] {
+                    line == if index == 4 && *field != fields[0] {
                         format!("Environment={field}")
-                    } else if index == 5 {
+                    } else if index == 4 {
                         format!("ExecStart={field} run")
                     } else {
                         format!("Exec={field}")
@@ -167,7 +182,7 @@ fn template(raw: &[u8], index: usize) -> Result<&str> {
                 .ok_or(PayloadError::Invalid)?;
             if seen & (1 << position) != 0
                 || section
-                    != if index == 5 {
+                    != if index == 4 {
                         "[Service]"
                     } else {
                         "[Desktop Entry]"
@@ -403,7 +418,7 @@ impl Package {
             let size = octal(&header[124..136])?;
             if size == 0
                 || size
-                    > if name == "manifest.json" || FILES[5..8].contains(&name) {
+                    > if name == "manifest.json" || FILES[4..7].contains(&name) {
                         MAX_RECORD_BYTES
                     } else {
                         MAX_MEMBER_BYTES
@@ -440,8 +455,8 @@ impl Package {
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit())
             || !["dev", "release"].contains(&manifest.profile.as_str())
-            || manifest.members.len() != 10
-            || files.len() != 10
+            || manifest.members.len() != FILES.len()
+            || files.len() != FILES.len()
             || manifest.libraries.is_empty()
             || manifest.libraries.len() > 32
         {
@@ -553,6 +568,8 @@ struct Journal {
     source: ObservationSource,
     previous_instance: Option<u64>,
     base_generation: Option<[u8; 32]>,
+    #[serde(skip)]
+    obsolete: Option<(ResourceReceipt, [u8; 32])>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -726,7 +743,7 @@ impl PayloadInstaller {
     pub fn new(io: Arc<LinuxNativeIo>) -> Result<Self> {
         io.validate_target()?;
         let p = io.target().paths();
-        let mut paths: Vec<_> = FILES[..5].iter().map(|name| p.prefix.join(name)).collect();
+        let mut paths: Vec<_> = FILES[..4].iter().map(|name| p.prefix.join(name)).collect();
         paths.extend([
             p.config_home.join("systemd/user/crosspane-agent.service"),
             p.data_home.join("applications/crosspane-settings.desktop"),
@@ -748,19 +765,24 @@ impl PayloadInstaller {
     pub fn targets(&self) -> &[PathBuf] {
         &self.paths
     }
+    pub(crate) fn cleanup_targets(&self) -> Vec<PathBuf> {
+        let mut paths = self.paths.clone();
+        paths.insert(4, self.io.target().paths().prefix.join(LEGACY_TUTORIAL));
+        paths
+    }
     fn materialize(&self, package: &Package, index: usize) -> Result<Vec<u8>> {
         let raw = package
             .files
             .get(FILES[index])
             .ok_or(PayloadError::Invalid)?;
-        if !(5..8).contains(&index) {
+        if !(4..7).contains(&index) {
             return Ok(raw.clone());
         }
         let p = self.io.target().paths();
         let environment =
             |name: &str, path: &Path| quoted(&format!("{name}={}", path.display()), false, false);
         let values = match index {
-            5 => vec![
+            4 => vec![
                 quoted(
                     &self.io.target().agent_path().to_string_lossy(),
                     false,
@@ -771,12 +793,12 @@ impl PayloadInstaller {
                 environment("XDG_RUNTIME_DIR", &p.runtime_home)?,
                 environment("CROSSPANE_RUNTIME_DIR", self.io.target().runtime_dir())?,
             ],
-            6 => vec![quoted(&self.paths[2].to_string_lossy(), true, true)?],
+            5 => vec![quoted(&self.paths[2].to_string_lossy(), true, true)?],
             _ => vec![quoted(&self.paths[3].to_string_lossy(), true, true)?],
         };
         let fields = match index {
-            5 => &TEMPLATE_FIELDS[..5],
-            6 => &TEMPLATE_FIELDS[5..6],
+            4 => &TEMPLATE_FIELDS[..5],
+            5 => &TEMPLATE_FIELDS[5..6],
             _ => &TEMPLATE_FIELDS[6..],
         };
         let mut text = template(raw, index)?.to_owned();
@@ -797,7 +819,7 @@ impl PayloadInstaller {
     /// Re-render only from this admitted target; c compares these bytes/hashes with loaded resources.
     pub fn rendered_resources(&self, package: &Package) -> Result<Vec<RenderedResource>> {
         self.io.validate_target()?;
-        (5..8)
+        (4..7)
             .map(|index| {
                 let bytes = self.materialize(package, index)?;
                 Ok(RenderedResource {
@@ -914,7 +936,7 @@ impl PayloadInstaller {
         }))
     }
     fn mode(index: usize) -> u32 {
-        if index < 5 { 0o755 } else { 0o644 }
+        if index < 4 { 0o755 } else { 0o644 }
     }
     fn sibling(&self, index: usize, op: OperationId, previous: bool) -> PathBuf {
         self.paths[index].with_file_name(format!(
@@ -1055,24 +1077,41 @@ impl PayloadInstaller {
         let Some(snapshot) = self.snapshot(proof, &path, 0o600, MAX_RECORD_BYTES)? else {
             return Ok(None);
         };
-        let j: Journal =
+        let mut j: Journal =
             serde_json::from_slice(&snapshot.bytes).map_err(|_| PayloadError::Foreign)?;
+        let legacy = j.items.len() == FILES.len() + 1;
+        let mut names = FILES.to_vec();
+        let mut paths = self.paths.clone();
+        if legacy {
+            names.insert(4, LEGACY_TUTORIAL);
+            paths.insert(4, self.io.target().paths().prefix.join(LEGACY_TUTORIAL));
+        }
         if j.receipt.schema_version != 1
             || j.receipt.operation_id.0 == 0
-            || j.items.len() != 10
-            || j.receipt.resources.len() != 10
+            || j.items.len() != names.len()
+            || j.receipt.resources.len() != names.len()
             || j.source != self.io.target().source()
             || j.receipt.resources.iter().enumerate().any(|(i, r)| {
                 let item = &j.items[i];
-                r.resource_id != FILES[i]
-                    || Path::new(&r.resolved_path) != self.paths[i]
+                r.resource_id != names[i]
+                    || Path::new(&r.resolved_path) != paths[i]
                     || r.ownership != item.ownership
-                    || item
-                        .replacement
-                        .is_some_and(|p| p.hash != item.new || p.mode != Self::mode(i))
+                    || item.replacement.is_some_and(|p| {
+                        p.hash != item.new
+                            || p.mode
+                                != if i < if legacy { 5 } else { 4 } {
+                                    0o755
+                                } else {
+                                    0o644
+                                }
+                    })
             })
         {
             return Err(PayloadError::Foreign);
+        }
+        if legacy {
+            let item = j.items.remove(4);
+            j.obsolete = Some((j.receipt.resources.remove(4), item.new));
         }
         Ok(Some(j))
     }
@@ -1082,8 +1121,9 @@ impl PayloadInstaller {
             || journal.receipt.product_version != package.manifest.product_version
             || journal.receipt.manifest_sha256 != package.manifest_hash
             || journal.receipt.payload_sha256 != package.archive_hash
-            || journal.items.len() != 10
-            || journal.receipt.resources.len() != 10
+            || journal.obsolete.is_some()
+            || journal.items.len() != FILES.len()
+            || journal.receipt.resources.len() != FILES.len()
             || journal.receipt.resources.iter().enumerate().any(|(i, r)| {
                 r.resource_id != FILES[i] || Path::new(&r.resolved_path) != self.paths[i]
             })
@@ -1212,9 +1252,25 @@ impl PayloadInstaller {
     /// What is installed, as the receipts account for it: a file no receipt accounts for is
     /// `Foreign` here. Installing replaces it anyway (WP-4.32); repair and removal don't.
     pub fn detect(&self, proof: &SupportProof, package: &Package) -> Result<Vec<ResourceReceipt>> {
-        Ok(self
+        let mut rows = self
             .observations(proof, package, MatchingFiles::Preserve, false)?
-            .1)
+            .1;
+        if let Some((mut row, expected)) = self.load(proof, false)?.and_then(|j| j.obsolete) {
+            let path = Path::new(&row.resolved_path);
+            if self.io.metadata(path)?.is_some() {
+                // Desired state is absence, so even exact V1 bytes need obsolete cleanup.
+                row.before = ResourceObservation::Different;
+                // A V1 receipt is advisory; the exact old bytes must still match its item.
+                let current = self.snapshot(proof, path, 0o755, MAX_MEMBER_BYTES)?;
+                if current.as_ref().is_none_or(|s| s.hash != expected)
+                    || row.after != ResourceObservation::Matching
+                {
+                    row.ownership = ResourceOwnership::Foreign;
+                }
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
     /// A finished, agent-verified install is recorded, with no unfinished intent next to it.
     pub fn recorded(&self, proof: &SupportProof) -> Result<bool> {
@@ -1239,6 +1295,10 @@ impl PayloadInstaller {
         }
         let mut superseding_applied = false;
         if let Some(previous) = self.load(proof, false)? {
+            if previous.obsolete.is_some() {
+                // The existing fresh-install route backs up the V1 leaf and records.
+                return Err(PayloadError::Foreign);
+            }
             if previous.phase != Phase::Verified {
                 if self.bind(&previous, package).is_ok() {
                     return Err(PayloadError::Pending);
@@ -1246,7 +1306,7 @@ impl PayloadInstaller {
                 self.settled_applied(proof, &previous)?;
                 superseding_applied = true;
             }
-            for i in 0..10 {
+            for i in 0..FILES.len() {
                 for backup in [false, true] {
                     let sibling = self.sibling(i, previous.receipt.operation_id, backup);
                     let retired = sibling.with_file_name(format!(
@@ -1321,6 +1381,7 @@ impl PayloadInstaller {
                 source: self.io.target().source(),
                 previous_instance: None,
                 base_generation: generation,
+                obsolete: None,
             },
         })
     }

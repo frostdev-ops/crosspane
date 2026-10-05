@@ -134,7 +134,7 @@ pub enum GraphError {
     NoReadinessFreshnessGate,
     #[error("step evidence requirements conflict")]
     InvalidStepRequirement,
-    #[error("only Connect, Arrange and Practice can be optional")]
+    #[error("only Connect and Arrange can be optional")]
     InvalidOptionalStep,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -205,7 +205,7 @@ impl Flow {
         Self::new_with_optional_steps(steps, &[])
     }
 
-    /// Opt-in only for the shared Connect/Arrange/Practice ids. Native installation,
+    /// Opt-in only for the shared Connect/Arrange ids. Native installation,
     /// permissions and the final fresh-health gate can never acquire skip authority.
     pub fn new_with_optional_steps(
         steps: Vec<StepSpec>,
@@ -282,7 +282,7 @@ impl Flow {
         }
         let optional: BTreeSet<_> = optional_ids.iter().copied().collect();
         if optional.iter().any(|id| {
-            !matches!(id.0, 60..=62 | 70..=78)
+            !matches!(id.0, 60..=62)
                 || !map.get(id).is_some_and(|step| {
                     !step.spec.required_for_installed && !step.spec.requires_fresh_observation
                 })

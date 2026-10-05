@@ -1,25 +1,22 @@
 //! The GUI-thread ports: the agent port that obtains a fresh support proof before every mutating
-//! call, and the practice-fixture launcher. Neither blocks a frame.
+//! call. Neither blocks a frame.
 //!
 //! A `SupportProof` is only valid for five seconds, so nothing caches one. The worker thread
 //! mints proofs on request; these ports ask for one immediately before each mutation.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
-use crosspane_installer_core::{AttemptId, ObservationSource};
+use crosspane_installer_core::ObservationSource;
 
-use super::super::native_io::{ChildEnvironment, LinuxNativeIo, NativeError, SupportProof};
+use super::super::native_io::{NativeError, SupportProof};
 use super::super::transport::LinuxAgentPort;
-use super::super::tutorial::{LinuxFixtureLaunch, LinuxFixturePort, launch as launch_fixture};
 use crate::agent_contract::{
     AgentCall, AgentPort, AgentReply, CallFailure, ContractError, InstallerRequest,
 };
-use crate::fixture::{FixtureCall, FixtureError, FixtureId, FixturePort, FixtureReceipt};
-use crate::live::{Clock, FixtureReadiness, NativeJob, PracticeFixtures};
+use crate::live::{Clock, NativeJob};
 
 /// What the GUI thread can send the worker.
 #[derive(Debug)]
@@ -213,136 +210,4 @@ impl AgentPort for AgentSlot {
     }
 }
 
-/// Launches the installed practice fixture once a fresh proof arrives. `launch` never blocks.
-pub struct LinuxPractice {
-    io: Arc<LinuxNativeIo>,
-    env: ChildEnvironment,
-    clock: Clock,
-    font: PathBuf,
-    broker: Arc<ProofBroker>,
-    tutorial_hash: Arc<Mutex<Option<[u8; 32]>>>,
-    ticket: Option<u64>,
-    launch: Option<LinuxFixtureLaunch>,
-    port: Option<LinuxFixturePort>,
-    failed: Option<FixtureError>,
-}
-
-impl LinuxPractice {
-    pub fn new(
-        io: Arc<LinuxNativeIo>,
-        env: ChildEnvironment,
-        clock: Clock,
-        font: PathBuf,
-        broker: Arc<ProofBroker>,
-        tutorial_hash: Arc<Mutex<Option<[u8; 32]>>>,
-    ) -> Self {
-        Self {
-            io,
-            env,
-            clock,
-            font,
-            broker,
-            tutorial_hash,
-            ticket: None,
-            launch: None,
-            port: None,
-            failed: None,
-        }
-    }
-}
-
-impl PracticeFixtures for LinuxPractice {
-    fn launch(&mut self, _attempt: AttemptId) -> Result<(), FixtureError> {
-        self.retire();
-        self.ticket = Some(self.broker.request().ok_or(FixtureError::Unavailable)?);
-        Ok(())
-    }
-
-    fn readiness(&mut self) -> FixtureReadiness {
-        if let Some(error) = self.failed {
-            return FixtureReadiness::Failed(error);
-        }
-        if self.port.is_some() {
-            return FixtureReadiness::Ready;
-        }
-        if let Some(ticket) = self.ticket {
-            match self.broker.take(ticket) {
-                None => return FixtureReadiness::Launching,
-                Some(Err(_)) => {
-                    self.ticket = None;
-                    self.failed = Some(FixtureError::Unavailable);
-                    return FixtureReadiness::Failed(FixtureError::Unavailable);
-                }
-                Some(Ok(proof)) => {
-                    self.ticket = None;
-                    let hash = self.tutorial_hash.lock().ok().and_then(|g| *g);
-                    let Some(hash) = hash else {
-                        self.failed = Some(FixtureError::Unavailable);
-                        return FixtureReadiness::Failed(FixtureError::Unavailable);
-                    };
-                    match launch_fixture(
-                        self.io.clone(),
-                        proof,
-                        self.env.clone(),
-                        hash,
-                        self.font.clone(),
-                        self.clock.clone(),
-                    ) {
-                        Ok(launch) => self.launch = Some(launch),
-                        Err(error) => {
-                            self.failed = Some(error);
-                            return FixtureReadiness::Failed(error);
-                        }
-                    }
-                }
-            }
-        }
-        match self.launch.as_mut().and_then(LinuxFixtureLaunch::poll) {
-            Some(Ok(port)) => {
-                self.launch = None;
-                self.port = Some(port);
-                FixtureReadiness::Ready
-            }
-            Some(Err(error)) => {
-                self.launch = None;
-                self.failed = Some(error);
-                FixtureReadiness::Failed(error)
-            }
-            None if self.launch.is_some() || self.ticket.is_some() => FixtureReadiness::Launching,
-            None => FixtureReadiness::Idle,
-        }
-    }
-
-    fn submit(&mut self, call: FixtureCall) -> Result<(), FixtureError> {
-        FixturePort::submit(self.port.as_mut().ok_or(FixtureError::Unavailable)?, call)
-    }
-
-    fn poll(&mut self) -> Vec<FixtureReceipt> {
-        self.port
-            .as_mut()
-            .map(LinuxFixturePort::poll_receipts)
-            .unwrap_or_default()
-    }
-
-    fn complete_closed(
-        &mut self,
-        attempt: AttemptId,
-        fixture: FixtureId,
-    ) -> Result<(), FixtureError> {
-        self.port
-            .as_mut()
-            .ok_or(FixtureError::Unavailable)?
-            .complete_closed(attempt, fixture)
-    }
-
-    fn retire(&mut self) {
-        self.ticket = None;
-        self.failed = None;
-        self.launch = None;
-        if let Some(mut port) = self.port.take() {
-            port.cancel();
-        }
-    }
-}
-
-opaque_debug!(ProofBroker, AgentSlot, LinuxPractice);
+opaque_debug!(ProofBroker, AgentSlot);

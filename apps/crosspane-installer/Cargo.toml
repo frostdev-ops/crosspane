@@ -8,10 +8,6 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "crosspane-tutorial"
-path = "src/tutorial.rs"
-
 [lints]
 workspace = true
 
@@ -36,7 +32,7 @@ png.workspace = true
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix.workspace = true
 
-# WP-4.16 (macOS tutorial adapter): own-window observation and CoreAudio output through objc2.
+# Shared macOS settings and permission adapters use the existing objc2 frameworks.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-app-kit.workspace = true

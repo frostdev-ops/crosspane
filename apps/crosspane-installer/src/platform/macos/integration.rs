@@ -1,5 +1,5 @@
 //! The Mac production binding: native adapters on one worker thread, the agent port and the
-//! practice fixture on the GUI thread, composed behind the shared `live::Platform` port.
+//! agent port on the GUI thread, composed behind the shared `live::Platform` port.
 //!
 //! Nothing here decides what a result means. `worker.rs` holds that policy; `native.rs` wraps each
 //! merged native module; `ports.rs` carries the GUI-thread ports, which ask the worker for a fresh
@@ -40,20 +40,19 @@ use crate::agent_contract::{AgentPlatform, AgentPort};
 use crate::gui::InstallerController;
 use crate::live::{
     Clock, LiveController, LiveError, NativeJob, NativeRefusal, NativeReport, NativeStep, Platform,
-    PlatformDescription, PracticeFixtures, SupportChecklist, SupportChecksSlot,
+    PlatformDescription, SupportChecklist, SupportChecksSlot,
 };
-use crate::tutorial_flow::TutorialSourcePolicy;
 use crate::view::{HidingChoice, ProgressGroup, ScreenId};
 
 pub use domains::{
     Admitted, Agents, AudioError, AudioPackages, AudioPreview, AudioState, Blocked, BlockedBy,
-    DomainFactory, Domains, FixtureChild, FixtureLauncher, InstallApplied, InstallError,
-    InstallPreview, InstallState, Installs, RepairFinish, RepairOffer, RepairStep, Repairer,
-    Support, SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
+    DomainFactory, Domains, InstallApplied, InstallError, InstallPreview, InstallState, Installs,
+    RepairFinish, RepairOffer, RepairStep, Repairer, Support, SupportOutcome, UninstallOffer,
+    UninstallResult, Uninstaller,
 };
 pub use native::MacProbes;
 use native::NativeEnv;
-pub use ports::{AgentBackend, AgentSlot, Broker, Command, MacPractice, NativeBackend};
+pub use ports::{AgentBackend, AgentSlot, Broker, Command, NativeBackend};
 pub use probes::{SecuritySignatures, SessionSupport};
 
 pub const SUPPORT: StepId = StepId(10);
@@ -78,20 +77,12 @@ pub enum InventoryAdmission {
 pub fn open() -> Result<(egui::FontDefinitions, Box<dyn InstallerController>)> {
     let clock = monotonic_clock();
     let font = discover_system_font().context("Cannot read a Mac system font")?;
-    let font_path = font.candidate.path().to_path_buf();
     let platform = match embedded_inventory() {
         InventoryAdmission::Present(inventory) => match production_env(*inventory, &clock) {
-            Ok(env) => MacPlatform::native(clock.clone(), env, font_path)?,
-            Err(reason) => {
-                MacPlatform::blocked(clock.clone(), reason, BlockedBy::Location, font_path)?
-            }
+            Ok(env) => MacPlatform::native(clock.clone(), env)?,
+            Err(reason) => MacPlatform::blocked(clock.clone(), reason, BlockedBy::Location)?,
         },
-        other => MacPlatform::blocked(
-            clock.clone(),
-            blocked_reason(&other),
-            BlockedBy::Inventory,
-            font_path,
-        )?,
+        other => MacPlatform::blocked(clock.clone(), blocked_reason(&other), BlockedBy::Inventory)?,
     };
     let controller = LiveController::new(Box::new(platform), clock).map_err(live_err)?;
     Ok((font.definitions, Box::new(controller)))
@@ -296,12 +287,8 @@ pub fn description() -> PlatformDescription {
             ),
         ],
         connect_after: vec![AGENT, PERMISSIONS],
-        practice_after: vec![AGENT, PERMISSIONS, AUDIO],
+        ready_after: vec![AGENT, PERMISSIONS, AUDIO],
         hiding_choice: true,
-        // Until the person chooses to hide, windows sent from this Mac are mirrored; the shared
-        // controller switches to the private display once that choice is verified.
-        source_policy: TutorialSourcePolicy::MacMirror,
-        speakers_device: Some("crosspane.{peer}.speaker".into()),
         resume_note: None,
     }
 }
@@ -313,7 +300,6 @@ pub struct Parts {
     /// Built on the worker thread, which then owns every domain.
     pub domains: DomainFactory,
     pub agent: AgentSource,
-    pub fixtures: FixtureSource,
 }
 
 pub enum AgentSource {
@@ -323,13 +309,6 @@ pub enum AgentSource {
     Injected(Box<dyn AgentBackend>),
 }
 
-pub enum FixtureSource {
-    /// The owned practice window, started once the worker has admitted its executable.
-    Native { font: PathBuf },
-    #[doc(hidden)]
-    Injected(Box<dyn PracticeFixtures>),
-}
-
 pub struct MacPlatform {
     skipped: Option<crate::live::SkippedStore>,
     desc: PlatformDescription,
@@ -337,7 +316,6 @@ pub struct MacPlatform {
     reports: Receiver<NativeReport>,
     broker: Arc<Broker>,
     agent: AgentSlot,
-    fixtures: Box<dyn PracticeFixtures>,
     stop: Arc<Cancellation>,
     /// Where the support domain writes each pass's checklist (production builds only).
     checks: Option<SupportChecksSlot>,
@@ -355,7 +333,7 @@ macro_rules! opaque_debug {
     )+};
 }
 
-opaque_debug!(MacPlatform, Parts, AgentSource, FixtureSource);
+opaque_debug!(MacPlatform, Parts, AgentSource);
 
 struct FnClock(Clock);
 
@@ -367,7 +345,7 @@ impl NativeClock for FnClock {
 
 impl MacPlatform {
     /// A launch that can't admit anything: every domain is [`Blocked`] with the typed reason.
-    fn blocked(clock: Clock, reason: &'static str, by: BlockedBy, font: PathBuf) -> Result<Self> {
+    fn blocked(clock: Clock, reason: &'static str, by: BlockedBy) -> Result<Self> {
         let checks = SupportChecksSlot::new(SUPPORT);
         let slot = checks.clone();
         let domains: DomainFactory =
@@ -377,7 +355,6 @@ impl MacPlatform {
                 clock,
                 domains,
                 agent: AgentSource::Native,
-                fixtures: FixtureSource::Native { font },
             },
             Some(checks),
         )
@@ -386,7 +363,7 @@ impl MacPlatform {
     /// The production composition: the merged native adapters over `env`, built from this Mac's
     /// selected target, the production probes and the build's embedded inventory. Crate-private:
     /// an inventory is never handed in from outside the build.
-    pub(crate) fn native(clock: Clock, env: NativeEnv, font: PathBuf) -> Result<Self> {
+    pub(crate) fn native(clock: Clock, env: NativeEnv) -> Result<Self> {
         let checks = SupportChecksSlot::new(SUPPORT);
         let config = env.target.state_dir().join("config.toml");
         let skipped = crate::live::SkippedStore(env.target.installer_dir().join("skipped.json"));
@@ -396,7 +373,6 @@ impl MacPlatform {
                 clock,
                 domains,
                 agent: AgentSource::Native,
-                fixtures: FixtureSource::Native { font },
             },
             Some(checks),
         )?;
@@ -408,7 +384,7 @@ impl MacPlatform {
     /// Compose from injected parts: the test seam. It exists only in this crate's own tests and
     /// when the non-default `test-hooks` feature is on (the installer's integration tests turn it
     /// on through a dev-dependency on this crate); a production build has no way to inject
-    /// domains, an agent port or fixtures.
+    /// domains or an agent port.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn compose(parts: Parts) -> Result<Self> {
         Self::start(parts, None)
@@ -423,12 +399,6 @@ impl MacPlatform {
         let backend: Box<dyn AgentBackend> = match parts.agent {
             AgentSource::Native => Box::new(NativeBackend::new(parts.clock.clone())),
             AgentSource::Injected(backend) => backend,
-        };
-        let fixtures: Box<dyn PracticeFixtures> = match parts.fixtures {
-            FixtureSource::Native { font } => {
-                Box::new(MacPractice::new(broker.clone(), parts.clock.clone(), font))
-            }
-            FixtureSource::Injected(fixtures) => fixtures,
         };
         let worker = worker::WorkerParts {
             clock: parts.clock.clone(),
@@ -452,7 +422,6 @@ impl MacPlatform {
             reports: reports_rx,
             agent: AgentSlot::new(backend, broker.clone(), parts.clock),
             broker,
-            fixtures,
             stop,
             checks,
             config: None,
@@ -499,15 +468,10 @@ impl Platform for MacPlatform {
         &mut self.agent
     }
 
-    fn fixtures(&mut self) -> &mut dyn PracticeFixtures {
-        self.fixtures.as_mut()
-    }
-
     fn shutdown(&mut self) {
         self.stop.cancel();
         self.broker.close();
         self.commands = None;
-        self.fixtures.retire();
     }
 
     fn support_checks(&mut self) -> Option<SupportChecklist> {

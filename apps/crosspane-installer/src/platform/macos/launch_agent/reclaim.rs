@@ -215,6 +215,25 @@ impl MacLaunchAgent {
         }))
     }
 
+    /// Legacy removal calls this only after its genuine clean-stop/erase checks. No bootout,
+    /// receipt promotion or byte deletion occurs here; the existing same-volume move is reused.
+    pub(crate) fn backup_legacy_app(
+        &self,
+        support: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<PathBuf> {
+        let folder = self.new_backup_folder(support, deadline)?;
+        self.io
+            .move_aside(
+                support,
+                &self.io.target().app_path(),
+                &folder,
+                "Crosspane.app",
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)
+    }
+
     fn new_backup_folder(
         &self,
         support: &SupportProof,

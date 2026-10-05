@@ -1,10 +1,10 @@
 //! Signed-agent permission guidance. No permission preflight or native dispatch lives here.
 //! WP-4.22 dispatches the enum-only OpenPane intent and correlates its completion; it must
-//! reduce Core observations and retire tutorial proofs before dispatching a restart.
+//! reduce Core observations and retire readiness proofs before dispatching a restart.
 use super::{native_io::*, transport::SelectedAgent};
 use crate::{
     agent_contract::*,
-    tutorial_flow::{SettingsTransition, SettingsTransitionState},
+    settings_transition::{SettingsTransition, SettingsTransitionState},
     view::{HidingChoice, ScreenId},
 };
 use crosspane_installer_core::FlowEvent;
@@ -880,7 +880,7 @@ impl PermissionGuide {
         self.bump()
     }
     /// Only a fresh user action can restart. The caller displays view.restart_warning before
-    /// consent, and retires every tutorial proof when receiving RetireActivity.
+    /// consent, and retires every readiness proof when receiving RetireActivity.
     pub fn restart(
         &mut self,
         token: &GuideToken,

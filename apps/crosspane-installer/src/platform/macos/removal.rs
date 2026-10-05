@@ -438,6 +438,7 @@ impl Sources {
         Ok(snapshot)
     }
     fn resources(&self, deadline: &Deadline) -> NativeResult<Vec<UserResource>> {
+        let legacy = self.payload.legacy_installed_receipt(deadline)?;
         let recovery = self.payload.recovery(deadline)?;
         let receipt = recovery
             .record
@@ -537,8 +538,14 @@ impl Sources {
                     launch_ownership(
                         &r.receipt,
                         &plist,
-                        &self.approved.product_version,
-                        self.payload.manifest_sha256(),
+                        legacy
+                            .as_ref()
+                            .map_or(self.approved.product_version.as_str(), |r| {
+                                r.product_version.as_str()
+                            }),
+                        legacy
+                            .as_ref()
+                            .map_or(self.payload.manifest_sha256(), |r| r.manifest),
                         sha(&xml),
                     )
                 }),
@@ -546,6 +553,16 @@ impl Sources {
         ));
         // Only exact manifest-derived directories may later be pruned, and only when empty.
         let app = self.io.target().app_path();
+        if legacy.is_some() {
+            // Metadata authorizes only the clean-first fixed-path backup below, never ownership.
+            rows.push(UserResource {
+                id: "keep.legacy-app".into(),
+                path: app.clone(),
+                state: ResourceState::Unknown,
+                identity: self.io.metadata(&app)?,
+                sha256: None,
+            });
+        }
         let expected: BTreeSet<_> = rows.iter().map(|r| r.path.clone()).collect();
         let mut directories = BTreeSet::from([app.clone()]);
         for file in expected.iter().filter(|p| p.starts_with(&app)) {
@@ -936,6 +953,7 @@ pub enum RemovalEffect {
     DisableOwnedAutostart,
     StopTrackedAgent,
     EraseOnlyAfterCleanExit,
+    BackupLegacyAppAfterCleanExit,
     // Root package alone owns these system paths; no user-file deletion authority.
     RemoveSharedDriverAfterPackageVerification,
     RemovePreviousAfterPackageVerification,
@@ -1126,6 +1144,9 @@ impl MacRemoval {
             resource: r.id.clone(),
             path: Some(r.path.clone()),
             effect: match r.state {
+                ResourceState::Unknown if r.id == "keep.legacy-app" && original.is_some() => {
+                    RemovalEffect::BackupLegacyAppAfterCleanExit
+                }
                 ResourceState::Absent => RemovalEffect::Absent,
                 ResourceState::Adopted | ResourceState::Foreign | ResourceState::Changed => {
                     RemovalEffect::KeepForeign
@@ -1621,6 +1642,7 @@ pub struct RemovalLeaseIntent {
 pub enum RemovalEvidence {
     None,
     Erase(crate::agent_contract::EraseIdentityV1),
+    IdentityRetained,
     Audio(AudioPackageAttempt),
 }
 struct ExitEvidence {
@@ -1641,9 +1663,11 @@ struct LeaseState {
     activity_floor: (u64, u64),
     exit: Option<ExitEvidence>,
     erased: bool,
+    identity_retained: bool,
     audio: Option<AudioPackageAttempt>,
     staging: Option<PackageStaging>,
     retained: Vec<(PathBuf, Option<FileIdentity>)>,
+    legacy_backup: Option<(PathBuf, FileIdentity)>,
 }
 opaque!(MacRemovalLease, RemovalLeaseIntent, RemovalEvidence);
 impl RemovalLeaseIntent {
@@ -1691,7 +1715,9 @@ impl MacRemoval {
                     pending: None,
                     activity_floor: self.activity_floor,
                     exit: None,
+                    legacy_backup: None,
                     erased: false,
+                    identity_retained: false,
                     audio: None,
                     staging: None,
                     retained: Vec::new(),
@@ -1925,6 +1951,9 @@ impl LeaseState {
         Ok(proof)
     }
     fn completed(&self, effect: RemovalEffect) -> bool {
+        if effect == RemovalEffect::EraseOnlyAfterCleanExit && self.identity_retained {
+            return true; // Explicitly refused before execution; identity remains in the report.
+        }
         self.preview
             .deltas
             .iter()
@@ -1945,6 +1974,12 @@ impl LeaseState {
                         .io
                         .metadata(&self.sources.io.target().agent_path())?
                         .is_some()
+            }
+            BackupLegacyAppAfterCleanExit => {
+                self.exit.is_some()
+                    && self.completed(StopTrackedAgent)
+                    && self.completed(EraseOnlyAfterCleanExit)
+                    && self.legacy_backup.is_none()
             }
             RemoveSharedDriverAfterPackageVerification | RemovePreviousAfterPackageVerification => {
                 (self.original.is_none() && self.inventory.service == ServiceState::Absent
@@ -1978,6 +2013,9 @@ impl LeaseState {
             delta.effect,
             KeepRecovery | KeepIdentity | KeepForeign | Absent
         ) && !matches!(outcome, RemovalOutcome::Completed | RemovalOutcome::Absent)
+            && !(delta.effect == EraseOnlyAfterCleanExit
+                && outcome == RemovalOutcome::Kept
+                && matches!(evidence, RemovalEvidence::IdentityRetained))
         {
             return Err(NativeError::Refused);
         }
@@ -2020,6 +2058,18 @@ impl LeaseState {
                 )?;
             }
             EraseOnlyAfterCleanExit => {
+                if matches!(evidence, RemovalEvidence::IdentityRetained)
+                    && outcome == RemovalOutcome::Kept
+                    && self.exit.is_some()
+                    && self
+                        .preview
+                        .deltas
+                        .iter()
+                        .any(|d| d.effect == BackupLegacyAppAfterCleanExit)
+                {
+                    self.identity_retained = true;
+                    return Ok(());
+                }
                 if !self.choices.delete_identity
                     || self.exit.is_none()
                     || self
@@ -2038,6 +2088,12 @@ impl LeaseState {
                 }
                 self.erased = true;
                 self.capture_retained(&["keep.identity.lock"], deadline)?;
+            }
+            BackupLegacyAppAfterCleanExit => {
+                if self.exit.is_none() || self.legacy_backup.is_none() {
+                    return Err(NativeError::Refused);
+                }
+                self.check_legacy_backup()?;
             }
             RemoveSharedDriverAfterPackageVerification | RemovePreviousAfterPackageVerification => {
                 if !self.choices.remove_driver {
@@ -2364,14 +2420,31 @@ impl LeaseState {
     }
     fn removed(&self, path: &std::path::Path) -> bool {
         self.preview.deltas.iter().zip(&self.rows).any(|(d, row)| {
-            d.path.as_deref() == Some(path)
-                && *row == RemovalOutcome::Completed
-                && matches!(
-                    d.effect,
+            *row == RemovalOutcome::Completed
+                && match d.effect {
+                    RemovalEffect::BackupLegacyAppAfterCleanExit => {
+                        d.path.as_ref().is_some_and(|root| path.starts_with(root))
+                    }
                     RemovalEffect::RemoveOwnedAfterVerification
-                        | RemovalEffect::PruneEmptyOwnedAfterVerification
-                )
+                    | RemovalEffect::PruneEmptyOwnedAfterVerification => {
+                        d.path.as_deref() == Some(path)
+                    }
+                    _ => false,
+                }
         })
+    }
+    fn check_legacy_backup(&self) -> NativeResult<()> {
+        if let Some((path, identity)) = &self.legacy_backup
+            && (self.sources.io.metadata(path)? != Some(identity.clone())
+                || self
+                    .sources
+                    .io
+                    .metadata(&self.sources.io.target().app_path())?
+                    .is_some())
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
     }
     fn check_tree(&self, deadline: &Deadline) -> NativeResult<()> {
         let root = self.sources.io.target().app_path();
@@ -2449,21 +2522,23 @@ impl LeaseState {
             return Err(NativeError::Foreign);
         }
         self.check_exit(deadline)?;
+        self.check_legacy_backup()?;
         self.check_audio(deadline)?;
         if let Some(attempt) = &self.audio {
             self.verify_package_staging(attempt, deadline)?;
         }
         for row in &self.inventory.resources {
-            let removed = self.preview.deltas.iter().zip(&self.rows).any(|(d, code)| {
-                d.path.as_ref() == Some(&row.path)
-                    && d.resource == row.id
-                    && *code == RemovalOutcome::Completed
-                    && matches!(
-                        d.effect,
-                        RemovalEffect::RemoveOwnedAfterVerification
-                            | RemovalEffect::PruneEmptyOwnedAfterVerification
-                    )
-            });
+            let removed = self.removed(&row.path)
+                || self.preview.deltas.iter().zip(&self.rows).any(|(d, code)| {
+                    d.path.as_ref() == Some(&row.path)
+                        && d.resource == row.id
+                        && *code == RemovalOutcome::Completed
+                        && matches!(
+                            d.effect,
+                            RemovalEffect::RemoveOwnedAfterVerification
+                                | RemovalEffect::PruneEmptyOwnedAfterVerification
+                        )
+                });
             if row.path
                 == self
                     .sources
@@ -2621,11 +2696,12 @@ fn removal_order(preview: &RemovalPreview) -> Vec<usize> {
             DisableOwnedAutostart => 0,
             StopTrackedAgent => 1,
             EraseOnlyAfterCleanExit => 2,
-            RemoveSharedDriverAfterPackageVerification => 3,
-            RemovePreviousAfterPackageVerification => 4,
-            RemoveOwnedAfterVerification => 5,
-            PruneEmptyOwnedAfterVerification => 6,
-            _ => 7,
+            BackupLegacyAppAfterCleanExit => 3,
+            RemoveSharedDriverAfterPackageVerification => 4,
+            RemovePreviousAfterPackageVerification => 5,
+            RemoveOwnedAfterVerification => 6,
+            PruneEmptyOwnedAfterVerification => 7,
+            _ => 8,
         };
         let depth = if delta.effect == PruneEmptyOwnedAfterVerification {
             std::cmp::Reverse(delta.path.as_ref().map_or(0, |p| p.components().count()))
@@ -2713,12 +2789,16 @@ impl MacRemovalLease {
         let dispatched = self.dispatch_effect(&intent, deadline);
         let (outcome, evidence) = match dispatched {
             Ok(Ok(evidence)) => {
-                let outcome = match intent.delta().effect {
-                    RemovalEffect::Absent => RemovalOutcome::Absent,
-                    RemovalEffect::KeepRecovery
-                    | RemovalEffect::KeepIdentity
-                    | RemovalEffect::KeepForeign => RemovalOutcome::Kept,
-                    _ => RemovalOutcome::Completed,
+                let outcome = if matches!(evidence, RemovalEvidence::IdentityRetained) {
+                    RemovalOutcome::Kept
+                } else {
+                    match intent.delta().effect {
+                        RemovalEffect::Absent => RemovalOutcome::Absent,
+                        RemovalEffect::KeepRecovery
+                        | RemovalEffect::KeepIdentity
+                        | RemovalEffect::KeepForeign => RemovalOutcome::Kept,
+                        _ => RemovalOutcome::Completed,
+                    }
                 };
                 (outcome, evidence)
             }
@@ -2803,11 +2883,59 @@ impl MacRemovalLease {
                     }
                     EraseOnlyAfterCleanExit => {
                         let clean = clean.ok_or(NativeError::Refused)?;
+                        if state
+                            .preview
+                            .deltas
+                            .iter()
+                            .any(|d| d.effect == BackupLegacyAppAfterCleanExit)
+                        {
+                            // Current compiled Agent rule, at the original installed image only.
+                            match io.admit_main_signature(
+                                &io.target().agent_path(),
+                                &state.sources.signing,
+                                limit,
+                            ) {
+                                Ok(_) => {}
+                                Err(NativeError::Foreign | NativeError::Unsupported) => {
+                                    return Ok(RemovalEvidence::IdentityRetained);
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
                         let receipt = io.erase_installed_identity(clean, &support, limit)?;
                         if !receipt.identity_and_pairings_removed() {
                             return Err(NativeError::OutcomeUnknown);
                         }
                         Ok(RemovalEvidence::Erase(receipt))
+                    }
+                    BackupLegacyAppAfterCleanExit => {
+                        let resource = original.as_ref().ok_or(NativeError::Foreign)?;
+                        let path = io.target().app_path();
+                        let before = resource.identity.as_ref().ok_or(NativeError::Foreign)?;
+                        if resource.id != "keep.legacy-app"
+                            || resource.path != path
+                            || delta.path.as_ref() != Some(&path)
+                            || io.metadata(&path)? != Some(before.clone())
+                            || state.sources.payload.legacy_receipt(limit)?.is_none()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        state.check_tree(limit)?;
+                        let backup = super::launch_agent::MacLaunchAgent::admit(
+                            io.clone(),
+                            state.sources.approved.clone(),
+                            Arc::new(super::launch_agent::UnobservableApproval),
+                            limit,
+                        )?
+                        .backup_legacy_app(&support, limit)?;
+                        let identity = io.metadata(&backup)?.ok_or(NativeError::OutcomeUnknown)?;
+                        if (identity.device, identity.inode, identity.mode, identity.uid)
+                            != (before.device, before.inode, before.mode, before.uid)
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        state.legacy_backup = Some((backup, identity));
+                        Ok(RemovalEvidence::None)
                     }
                     RemoveSharedDriverAfterPackageVerification
                     | RemovePreviousAfterPackageVerification => state.dispatch_audio(index, limit),

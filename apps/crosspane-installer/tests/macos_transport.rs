@@ -1830,211 +1830,47 @@ fn transport_admitted_refusal_survives_followup_status_timeout_without_uncertain
 }
 
 #[test]
-fn admitted_unknown_outcomes_drive_frozen_settings_and_tutorial_detection_without_replay() {
-    use crosspane_installer::tutorial_flow::*;
-    use crosspane_installer_core::{AttemptId, Flow, FlowEvent, StepId, StepSpec};
-    for settings in [true, false] {
-        let f = Fixture::new();
-        let status_value = wire_status(&f);
-        let status = line(&status_value);
-        let clock = f.clock.clone();
-        let server = Server::new(
-            &f,
-            Arc::new(move |bytes, socket| match command(bytes).as_str() {
-                "status" => send_owned(socket, &status),
-                "settings_update" | "release" => clock.set(5001),
-                other => panic!("unexpected owned command {other}"),
-            }),
-        );
-        let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 10)).unwrap();
-        port.emulate_live(); // In-memory source seam only; all native facts and sockets remain explicit scratch.
-        if settings {
-            let StatusAdmission::Supported(health) =
-                agent_contract::parse_status(&line(&status_value), AgentPlatform::Macos).unwrap()
-            else {
-                panic!("missing fixture health")
-            };
-            let mut transition =
-                SettingsTransition::new(crosspane_types::id::NodeId([0x11; 32]), 17);
-            transition
-                .detected(&health, ObservationSource::Live, 1, 1, 17)
-                .unwrap();
-            port.submit(transition.consent_update(1, 17, true).unwrap())
-                .unwrap();
-            let reply = drain(&mut port, 1).pop().unwrap();
-            assert_eq!(reply.source, ObservationSource::Live);
-            assert_eq!(reply.result, Err(CallFailure::TimeoutOutcomeUnknown));
-            let outcome = transition.reply(reply, 10).unwrap();
-            assert!(outcome.detect_after_unknown);
-            assert_eq!(transition.state(), &SettingsTransitionState::NeedsDetection);
-            assert!(transition.consent_update(2, 17, true).is_err());
-            transition
-                .detected(&health, ObservationSource::Live, 11, 11, 18)
-                .unwrap();
-            assert!(transition.consent_update(2, 17, true).is_err());
-            assert!(transition.consent_update(2, 18, true).is_ok());
-            assert_eq!(server.commands(), ["status", "settings_update"]);
-        } else {
-            let step = StepId(1);
-            let mut core = Flow::new(vec![
-                StepSpec {
-                    id: step,
-                    prerequisites: vec![],
-                    required_for_installed: false,
-                    required_for_ready: false,
-                    requires_fresh_observation: false,
-                    requires_activity: true,
-                    requires_human: true,
-                    requires_fixture: false,
-                },
-                StepSpec {
-                    id: StepId(99),
-                    prerequisites: vec![],
-                    required_for_installed: true,
-                    required_for_ready: true,
-                    requires_fresh_observation: true,
-                    requires_activity: false,
-                    requires_human: false,
-                    requires_fixture: false,
-                },
-            ])
-            .unwrap();
-            let detect = core.reduce(FlowEvent::Begin { step }, 1).unwrap().remove(0);
-            let verify = core
-                .reduce(
-                    FlowEvent::Detected {
-                        step,
-                        operation: detect.operation,
-                        needs_action: false,
-                    },
-                    1,
-                )
-                .unwrap()
-                .remove(0);
-            let attempt = TutorialAttempt {
-                step,
-                operation: verify.operation,
-                attempt: AttemptId(1),
-                local: crosspane_types::id::NodeId([0x11; 32]),
-                peer: None,
-                role: TutorialRole::Menu,
-            };
-            let mut tutorial = Tutorial::new();
-            let mut effects = tutorial
-                .begin(
-                    attempt.clone(),
-                    TutorialContext {
-                        machine_label: "owned fake Mac".into(),
-                        platform: AgentPlatform::Macos,
-                        source_policy: TutorialSourcePolicy::MacMirror,
-                        speakers: None,
-                    },
-                    verify,
-                    17,
-                    1,
-                )
-                .unwrap();
-            for round in 0..2 {
-                assert!(matches!(
-                    effects[0].kind,
-                    TutorialEffectKind::Core(FlowEvent::Observe { .. })
-                ));
-                let mut submitted = 0;
-                for effect in effects {
-                    assert_eq!(effect.binding.attempt, attempt);
-                    assert_eq!(effect.binding.view_revision, 17);
-                    match effect.kind {
-                        TutorialEffectKind::Core(event) => {
-                            assert!(!matches!(event, FlowEvent::Verified { .. }));
-                            core.reduce(event, if round == 0 { 1 } else { 10 }).unwrap();
-                        }
-                        TutorialEffectKind::Agent(call) => {
-                            tutorial.submitted(call.id).unwrap();
-                            port.submit(call).unwrap();
-                            submitted += 1;
-                        }
-                        TutorialEffectKind::WaitForUser
-                        | TutorialEffectKind::WaitForPeer
-                        | TutorialEffectKind::WaitForContract => {
-                            assert_ne!(tutorial.state(), TutorialState::Verified)
-                        }
-                        TutorialEffectKind::Fixture { .. }
-                        | TutorialEffectKind::DetectAfterUnknown => {
-                            panic!("unexpected pre-error menu effect")
-                        }
-                    }
-                }
-                assert_eq!(submitted, 1);
-                let reply = drain(&mut port, 1).pop().unwrap();
-                assert_eq!(reply.source, ObservationSource::Live);
-                if round == 1 {
-                    assert_eq!(reply.result, Err(CallFailure::TimeoutOutcomeUnknown));
-                }
-                effects = tutorial.reduce(TutorialEvent::Reply(reply), 10).unwrap();
-                if round == 0 {
-                    // Menu activity is human-driven; its explicit cancellation owns Release.
-                    for effect in effects {
-                        match effect.kind {
-                            TutorialEffectKind::Core(event) => {
-                                core.reduce(event, 10).unwrap();
-                            }
-                            TutorialEffectKind::WaitForUser
-                            | TutorialEffectKind::WaitForPeer
-                            | TutorialEffectKind::WaitForContract => {
-                                assert_ne!(tutorial.state(), TutorialState::Verified)
-                            }
-                            TutorialEffectKind::Agent(_)
-                            | TutorialEffectKind::Fixture { .. }
-                            | TutorialEffectKind::DetectAfterUnknown => {
-                                panic!("unexpected pre-cancel menu action")
-                            }
-                        }
-                    }
-                    effects = tutorial
-                        .reduce(
-                            TutorialEvent::User {
-                                attempt: AttemptId(1),
-                                view_revision: 17,
-                                action: TutorialUserAction::Cancel,
-                            },
-                            10,
-                        )
-                        .unwrap();
-                }
-            }
-            let mut detection = false;
-            let mut queries = 0;
-            assert!(matches!(
-                effects[0].kind,
-                TutorialEffectKind::Core(FlowEvent::Observe { .. })
-            ));
-            for effect in effects {
-                assert_eq!(effect.binding.attempt, attempt);
-                assert_eq!(effect.binding.view_revision, 17);
-                match effect.kind {
-                    TutorialEffectKind::Core(event) => {
-                        assert!(!matches!(event, FlowEvent::Verified { .. }));
-                        core.reduce(event, 10).unwrap();
-                    }
-                    TutorialEffectKind::Agent(call) => {
-                        assert_eq!(call.request, InstallerRequest::Status);
-                        queries += 1;
-                    }
-                    TutorialEffectKind::DetectAfterUnknown => detection = true,
-                    TutorialEffectKind::WaitForUser
-                    | TutorialEffectKind::WaitForPeer
-                    | TutorialEffectKind::WaitForContract => {
-                        assert_ne!(tutorial.state(), TutorialState::Verified)
-                    }
-                    TutorialEffectKind::Fixture { .. } => panic!("menu owns no native fixture"),
-                }
-            }
-            assert!(detection);
-            assert_eq!(queries, 1);
-            assert_eq!(tutorial.state(), TutorialState::Failed);
-            assert_eq!(server.commands(), ["status", "status", "release"]);
-        }
-    }
+fn admitted_unknown_outcomes_drive_settings_detection_without_replay() {
+    use crosspane_installer::settings_transition::*;
+    let f = Fixture::new();
+    let status_value = wire_status(&f);
+    let status = line(&status_value);
+    let clock = f.clock.clone();
+    let server = Server::new(
+        &f,
+        Arc::new(move |bytes, socket| match command(bytes).as_str() {
+            "status" => send_owned(socket, &status),
+            "settings_update" | "release" => clock.set(5001),
+            other => panic!("unexpected owned command {other}"),
+        }),
+    );
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 10)).unwrap();
+    port.emulate_live(); // In-memory source seam only; all native facts and sockets remain explicit scratch.
+
+    let StatusAdmission::Supported(health) =
+        agent_contract::parse_status(&line(&status_value), AgentPlatform::Macos).unwrap()
+    else {
+        panic!("missing fixture health")
+    };
+    let mut transition = SettingsTransition::new(crosspane_types::id::NodeId([0x11; 32]), 17);
+    transition
+        .detected(&health, ObservationSource::Live, 1, 1, 17)
+        .unwrap();
+    port.submit(transition.consent_update(1, 17, true).unwrap())
+        .unwrap();
+    let reply = drain(&mut port, 1).pop().unwrap();
+    assert_eq!(reply.source, ObservationSource::Live);
+    assert_eq!(reply.result, Err(CallFailure::TimeoutOutcomeUnknown));
+    let outcome = transition.reply(reply, 10).unwrap();
+    assert!(outcome.detect_after_unknown);
+    assert_eq!(transition.state(), &SettingsTransitionState::NeedsDetection);
+    assert!(transition.consent_update(2, 17, true).is_err());
+    transition
+        .detected(&health, ObservationSource::Live, 11, 11, 18)
+        .unwrap();
+    assert!(transition.consent_update(2, 17, true).is_err());
+    assert!(transition.consent_update(2, 18, true).is_ok());
+    assert_eq!(server.commands(), ["status", "settings_update"]);
 }
 
 #[test]
@@ -2339,7 +2175,7 @@ fn artifact_team_is_compared_with_independent_main_not_manifest_or_helper() {
     bytes(&helper, b"owned helper", 0o755);
     for role in [
         ArtifactRole::Settings,
-        ArtifactRole::Tutorial,
+        ArtifactRole::Installer,
         ArtifactRole::Ctl,
         ArtifactRole::Installer,
     ] {
@@ -2470,7 +2306,7 @@ fn status_each_instance_binding_and_post_exchange_restart_must_match() {
     x.pid += 1;
     cases.push(x);
     let mut x = baseline.clone();
-    x.uid += 1;
+    x.uid = Some(x.uid.unwrap() + 1);
     cases.push(x);
     let mut x = baseline.clone();
     x.exe = "/other/Crosspane".into();
@@ -2723,7 +2559,7 @@ fn command_and_output_debug_never_prints_raw_responses_or_child_arguments() {
     let signature =
         f.io.admit_artifact_signature(
             &helper,
-            &requirement(ArtifactRole::Tutorial),
+            &requirement(ArtifactRole::Installer),
             &f.main(),
             &f.deadline(),
         )
@@ -3255,7 +3091,7 @@ fn every_same_team_helper_still_requires_its_own_identity_verification_and_entit
     let main = f.main();
     for role in [
         ArtifactRole::Settings,
-        ArtifactRole::Tutorial,
+        ArtifactRole::Installer,
         ArtifactRole::Ctl,
         ArtifactRole::Installer,
     ] {

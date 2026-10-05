@@ -20,7 +20,7 @@ pub struct SettingsOutcome {
     pub observations: Vec<FlowEvent>,
     pub detect_after_unknown: bool,
 }
-/// Application uses a single monotonic call allocator across tutorial and settings runs.
+/// Application uses a single monotonic call allocator across settings runs.
 /// Native disk detection and consent are separate from the loaded revision reported by status.
 pub struct SettingsTransition {
     local: NodeId,

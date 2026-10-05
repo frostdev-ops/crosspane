@@ -2,6 +2,8 @@
 #![allow(dead_code, unused_imports, clippy::unwrap_used, clippy::expect_used)]
 //! Explicit scratch roots, fake GUI/signature/process observations; no real native commands.
 use crosspane_installer::agent_contract;
+#[path = "../src/legacy_payload.rs"]
+mod legacy_payload;
 use crosspane_installer::{live, view};
 #[path = "../src/platform/macos/launchd_observation.rs"]
 #[allow(dead_code)]
@@ -477,10 +479,6 @@ fn inventory() -> ApprovedInventory {
         (
             "Crosspane.app/Contents/MacOS/crosspane-ui",
             Some(PayloadRole::Settings),
-        ),
-        (
-            "Crosspane.app/Contents/MacOS/crosspane-tutorial",
-            Some(PayloadRole::Tutorial),
         ),
         (
             "Crosspane.app/Contents/Frameworks/libfixture.dylib",

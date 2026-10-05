@@ -1094,7 +1094,7 @@ impl MacNativeIo {
         proof.check(self, deadline)?;
         parent.revalidate(self)?;
         self.expected_at(&parent, &name, Some(expected))?;
-        self.tutorial_proof_current(proof)?;
+        self.support_proof_current(proof)?;
         deadline.check()?;
         self.filesystem.execute(FilesystemOperation::Rename {
             old_dir: parent.fd.as_fd(),
@@ -1109,7 +1109,7 @@ impl MacNativeIo {
             let displaced =
                 self.verify_displaced(&parent, &temporary, &mut file, expected, hash, deadline)?;
             // The original signing pathname is intentionally absent after displacement.
-            self.tutorial_proof_current(proof)?;
+            self.support_proof_current(proof)?;
             self.boundary("verified-unlink", &path, deadline)?;
             if self.verify_displaced(&parent, &temporary, &mut file, expected, hash, deadline)?
                 != displaced
@@ -1117,7 +1117,7 @@ impl MacNativeIo {
                 return Err(NativeError::Foreign);
             }
             self.expected_at(&parent, &name, None)?;
-            self.tutorial_proof_current(proof)?;
+            self.support_proof_current(proof)?;
             deadline.check()?;
             // Residual: a same-UID adversary can replace the private nonce after this check.
             native(rfs::unlinkat(

@@ -221,12 +221,12 @@ fn package() -> Package {
     );
     elf[20] = 1;
     elf[52] = 64;
-    let data: Vec<Vec<u8>> = (0..10)
+    let data: Vec<Vec<u8>> = (0..FILES.len())
         .map(|i| match i {
-            0..=4 => elf.clone(),
-            5 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
-            6 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
-            7 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
+            0..=3 => elf.clone(),
+            4 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
+            5 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
+            6 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
             _ => b"inert resource".to_vec(),
         })
         .collect();
@@ -612,7 +612,6 @@ fn an_applied_upgrade_restarts_only_its_recorded_deleted_instance_and_reports_su
         p.prefix.join("bin/crosspanectl"),
         p.prefix.join("bin/crosspane-ui"),
         p.prefix.join("bin/crosspane-installer"),
-        p.prefix.join("bin/crosspane-tutorial"),
         p.config_home.join("systemd/user/crosspane-agent.service"),
         p.data_home.join("applications/crosspane-settings.desktop"),
         p.data_home.join("applications/crosspane-installer.desktop"),
@@ -634,7 +633,7 @@ fn an_applied_upgrade_restarts_only_its_recorded_deleted_instance_and_reports_su
                 "resource_id":name,"resolved_path":path,"ownership":"Created",
                 "before":"Different","after":"Matching","outcome":"Unknown"
             })).collect::<Vec<_>>(), "unfinished":[47]},
-        "items": (0..10).map(|i| json!({"old":old,"new":new,"template":new,
+        "items": (0..FILES.len()).map(|i| json!({"old":old,"new":new,"template":new,
             "ownership":"Created","replacement":if i == 0 { json!({
                 "file":[meta.dev(),meta.ino()],"parent":[parent.dev(),parent.ino()],
                 "hash":new,"mode":493}) } else { Value::Null }

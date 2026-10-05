@@ -292,11 +292,85 @@ impl MacPayload {
         }
         Ok(())
     }
+    /// Advisory legacy classification, never completed-origin or installed-app ownership.
+    pub(crate) fn legacy_installed_receipt(
+        &self,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<crate::legacy_payload::LegacyReceipt>> {
+        let Some(legacy) = self.legacy_receipt(deadline)? else {
+            return Ok(None);
+        };
+        let (app, ctl, _) = self.installed(deadline)?;
+        if app.root.is_none()
+            || ctl.root.is_none()
+            || self.legacy_receipt(deadline)? != Some(legacy.clone())
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(Some(legacy))
+    }
+    /// The companion inventory is metadata only; its Tutorial signer is never admitted.
+    pub(crate) fn legacy_receipt(
+        &self,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<crate::legacy_payload::LegacyReceipt>> {
+        let Some(record) = self.recovery(deadline)?.record else {
+            return Ok(None);
+        };
+        if record.receipt.manifest_sha256 == self.digest {
+            return Ok(None);
+        }
+        let path = self.inventory_path(record.receipt.manifest_sha256);
+        let Some(identity) = self.io.metadata(&path)? else {
+            return Ok(None);
+        };
+        let bytes = self.io.read(&path, 256 * 1024, true, deadline)?;
+        let current = serde_json::to_vec(&self.approved).map_err(|_| NativeError::Invalid)?;
+        let Some(legacy) =
+            crate::legacy_payload::classify(&bytes, &current).map_err(|_| NativeError::Invalid)?
+        else {
+            return Ok(None);
+        };
+        let adopted = |i: usize| {
+            record
+                .receipt
+                .resources
+                .get(i)
+                .and_then(|r| match r.ownership {
+                    ResourceOwnership::Created => Some(false),
+                    ResourceOwnership::Adopted => Some(true),
+                    ResourceOwnership::Foreign => None,
+                })
+        };
+        let (Some(app), Some(ctl)) = (adopted(0), adopted(1)) else {
+            return Err(NativeError::Invalid);
+        };
+        let mut expected = self.receipt(
+            record.receipt.operation_id.0,
+            PayloadPhase::Verified,
+            app,
+            ctl,
+        );
+        expected.receipt.product_version = legacy.product_version.clone();
+        expected.receipt.manifest_sha256 = legacy.manifest;
+        expected.receipt.payload_sha256 = legacy.payload;
+        if record.receipt.operation_id.0 == 0
+            || record != expected
+            || self.io.metadata(&path)? != Some(identity)
+        {
+            return Err(NativeError::Invalid);
+        }
+        deadline.check()?;
+        Ok(Some(legacy))
+    }
     pub(super) fn recovery_origin(
         &self,
         recovery: &RecoveryInventory,
         deadline: &Deadline,
     ) -> NativeResult<Option<Arc<RecoveryOrigin>>> {
+        if self.legacy_receipt(deadline)?.is_some() {
+            return Ok(None);
+        }
         let Some(record) = &recovery.record else {
             return Ok(None);
         };

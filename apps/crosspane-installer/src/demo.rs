@@ -15,7 +15,7 @@ pub const MICROPHONE_DETAIL: &str =
 pub const REMOVE_AUDIO_LABEL: &str =
     "Remove the Crosspane audio driver (affects every user on this Mac)";
 
-pub const SCREENS: [(ScreenId, &str); 15] = [
+pub const SCREENS: [(ScreenId, &str); 14] = [
     (ScreenId::Welcome, "welcome"),
     (ScreenId::Compatibility, "compatibility"),
     (ScreenId::InstallPlan, "install-plan"),
@@ -28,20 +28,18 @@ pub const SCREENS: [(ScreenId, &str); 15] = [
     (ScreenId::MatchNumbers, "match-numbers"),
     (ScreenId::Grants, "grants"),
     (ScreenId::Layout, "layout"),
-    (ScreenId::Practice, "practice"),
     (ScreenId::Summary, "summary"),
     (ScreenId::RepairRemove, "repair-remove"),
 ];
 
 /// Other states of a screen, for review: the name and the screen it belongs to.
-pub const VARIANTS: [(&str, ScreenId); 10] = [
+pub const VARIANTS: [(&str, ScreenId); 9] = [
     ("install-failed", ScreenId::InstallPlan),
     ("install-prerequisites", ScreenId::InstallPlan),
     ("connect-searching", ScreenId::Connect),
     ("connect-waiting", ScreenId::Connect),
     ("connect-address", ScreenId::Connect),
     ("match-pick", ScreenId::MatchNumbers),
-    ("practice-choose", ScreenId::Practice),
     ("summary-waiting", ScreenId::Summary),
     ("summary-skipped", ScreenId::Summary),
     ("connect-skipped", ScreenId::Connect),
@@ -82,7 +80,6 @@ fn skipped_fixture(screen: ScreenId) -> WizardView {
     ];
     view.fields.clear();
     view.layout = None;
-    view.illustration.practice = None;
     view.link_caption = None;
     view
 }
@@ -99,7 +96,6 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
             for (id, label) in [
                 (940, "Connect another computer"),
                 (941, "Arrange your screens"),
-                (942, "Practise sharing input, windows and sound"),
             ] {
                 view.rows.push(row(
                     id,
@@ -121,19 +117,10 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
                     "Set up now",
                     ButtonKind::Link,
                 ),
-                button(
-                    crate::live::ids::REOPEN_PRACTICE,
-                    ButtonRole::Ordinary,
-                    "Set up now",
-                    ButtonKind::Link,
-                ),
             ]);
-            view.progress.completed.retain(|g| {
-                !matches!(
-                    g,
-                    ProgressGroup::Connect | ProgressGroup::Arrange | ProgressGroup::Practice
-                )
-            });
+            view.progress
+                .completed
+                .retain(|g| !matches!(g, ProgressGroup::Connect | ProgressGroup::Arrange));
         }
         "connect-skipped" => {
             view = skipped_fixture(ScreenId::Connect);
@@ -267,48 +254,6 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
                 })
                 .collect();
         }
-        "practice-choose" => {
-            view.message =
-                "Start the same practice on both computers. A small window checks that it worked."
-                    .into();
-            view.illustration.practice = None;
-            view.rows = vec![
-                RowView {
-                    human_confirmed: true,
-                    ..row(
-                        70,
-                        "Control the other computer from this keyboard and mouse",
-                        "",
-                        RowState::Verified,
-                    )
-                },
-                RowView {
-                    human_confirmed: true,
-                    ..row(
-                        71,
-                        "Let the other computer control this one",
-                        "",
-                        RowState::Verified,
-                    )
-                },
-            ];
-            view.buttons = [
-                (3002, "Send a window from this computer"),
-                (3003, "Receive a window sent from the other computer"),
-                (3004, "Let the other computer take a window from here"),
-                (3005, "Take a window from the other computer"),
-                (3006, "Play sound from this computer on the other one"),
-                (3007, "Hear the other computer's sound here"),
-                (3008, "Find the Crosspane menu and settings"),
-            ]
-            .iter()
-            .map(|(id, label)| button(*id, ButtonRole::Ordinary, label, ButtonKind::Choice))
-            .chain([
-                button(1, ButtonRole::Next, "Finish later", ButtonKind::Link),
-                button(2, ButtonRole::Back, "Back", ButtonKind::Link),
-            ])
-            .collect();
-        }
         "summary-waiting" => {
             view.title = "Crosspane is installed".into();
             view.message = "A few steps are left.".into();
@@ -319,10 +264,6 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
                 ProgressGroup::Connect,
                 ProgressGroup::Arrange,
             ];
-            for practice in view.rows.iter_mut().skip(5) {
-                practice.state = RowState::Unchecked;
-                practice.human_confirmed = false;
-            }
             view.buttons = vec![
                 button(6, ButtonRole::Next, "Finish setup", ButtonKind::Primary),
                 ButtonView {
@@ -419,7 +360,6 @@ fn progress(screen: ScreenId) -> ProgressView {
         ProgressGroup::PermissionsNetwork,
         ProgressGroup::Connect,
         ProgressGroup::Arrange,
-        ProgressGroup::Practice,
         ProgressGroup::Ready,
     ];
     let current = match screen {
@@ -434,7 +374,6 @@ fn progress(screen: ScreenId) -> ProgressView {
         | ScreenId::HidingChoice => ProgressGroup::PermissionsNetwork,
         ScreenId::Connect | ScreenId::MatchNumbers => ProgressGroup::Connect,
         ScreenId::Grants | ScreenId::Layout => ProgressGroup::Arrange,
-        ScreenId::Practice => ProgressGroup::Practice,
         ScreenId::Summary => ProgressGroup::Ready,
     };
     let at = order.iter().position(|g| *g == current).unwrap_or(0);
@@ -664,7 +603,7 @@ pub fn fixture(screen: ScreenId) -> WizardView {
         }
         ScreenId::Connect => {
             view.title = "Pair with the other computer".into();
-            view.message = "Both computers will show a number to compare.\n\nSkipping Connect also skips Arrange and Practice.".into();
+            view.message = "Both computers will show a number to compare.\n\nSkipping Connect also skips Arrange.".into();
             view.rows = vec![row(
                 951,
                 "Found mac-studio on your network",
@@ -769,45 +708,6 @@ pub fn fixture(screen: ScreenId) -> WizardView {
                 ButtonKind::Primary,
             ));
         }
-        ScreenId::Practice => {
-            view.title = "Try each feature once".into();
-            view.message = "Choose the Crosspane speakers for mac-studio as the output, play the \
-                            test sound, then confirm what you heard."
-                .into();
-            view.illustration.practice = Some(PracticeIllustration::Tone);
-            view.rows = vec![row(
-                76,
-                "Play sound from this computer on the other one",
-                "Waiting for the test sound to reach the other computer.",
-                RowState::Working,
-            )];
-            view.buttons = vec![
-                button(
-                    3104,
-                    ButtonRole::Confirm,
-                    "I heard the test sound on the other computer",
-                    ButtonKind::Choice,
-                ),
-                button(
-                    3107,
-                    ButtonRole::Confirm,
-                    "Nothing else was playing sound during the test",
-                    ButtonKind::Choice,
-                ),
-                button(
-                    5,
-                    ButtonRole::Stop,
-                    "Stop this practice",
-                    ButtonKind::Secondary,
-                ),
-                button(
-                    6,
-                    ButtonRole::Ordinary,
-                    "Play the test sound",
-                    ButtonKind::Primary,
-                ),
-            ];
-        }
         ScreenId::Summary => {
             view.escape = EscapeMapping::Close;
             view.title = "Your workspace is ready".into();
@@ -819,14 +719,11 @@ pub fn fixture(screen: ScreenId) -> WizardView {
                 "Start Crosspane when you sign in",
                 "Pair with the other computer",
                 "Arrange the screens",
-                "Control the other computer from this keyboard and mouse",
-                "Send a window from this computer",
-                "Play sound from this computer on the other one",
             ]
             .iter()
             .enumerate()
             .map(|(index, label)| RowView {
-                human_confirmed: index >= 5,
+                human_confirmed: false,
                 ..row(index as u16 + 1, label, "", RowState::Verified)
             })
             .collect();
@@ -880,10 +777,7 @@ pub fn fixture(screen: ScreenId) -> WizardView {
             ];
         }
     }
-    if matches!(
-        screen,
-        ScreenId::Connect | ScreenId::Layout | ScreenId::Practice
-    ) {
+    if matches!(screen, ScreenId::Connect | ScreenId::Layout) {
         view.buttons.push(button(
             crate::live::ids::SKIP,
             ButtonRole::Ordinary,
@@ -1008,23 +902,15 @@ impl DisconnectedController {
                 };
                 if self.demo_mode
                     && id == crate::live::ids::SKIP
-                    && matches!(
-                        self.view.screen,
-                        ScreenId::Connect | ScreenId::Layout | ScreenId::Practice
-                    )
+                    && matches!(self.view.screen, ScreenId::Connect | ScreenId::Layout)
                 {
                     let revision = self.view.revision + 1;
                     if let Some(mut view) = fixture_named("summary-skipped") {
                         if self.view.screen != ScreenId::Connect {
-                            let (row_id, button_id) = if self.view.screen == ScreenId::Layout {
-                                (941, crate::live::ids::REOPEN_ARRANGE)
-                            } else {
-                                (942, crate::live::ids::REOPEN_PRACTICE)
-                            };
+                            let (row_id, button_id) = (941, crate::live::ids::REOPEN_ARRANGE);
                             let skipped = view.rows.iter().find(|r| r.id == row_id).cloned();
                             view = fixture(ScreenId::Summary);
-                            view.rows
-                                .retain(|r| if row_id == 941 { r.id != 5 } else { r.id < 6 });
+                            view.rows.retain(|r| r.id != 5);
                             view.rows.extend(skipped);
                             view.message =
                                 "Crosspane is ready. The step you skipped is listed below.".into();
@@ -1043,15 +929,12 @@ impl DisconnectedController {
                 if self.demo_mode
                     && matches!(
                         id,
-                        crate::live::ids::REOPEN_CONNECT
-                            | crate::live::ids::REOPEN_ARRANGE
-                            | crate::live::ids::REOPEN_PRACTICE
+                        crate::live::ids::REOPEN_CONNECT | crate::live::ids::REOPEN_ARRANGE
                     )
                 {
                     let revision = self.view.revision + 1;
                     let screen = match id {
                         crate::live::ids::REOPEN_ARRANGE => ScreenId::Layout,
-                        crate::live::ids::REOPEN_PRACTICE => ScreenId::Practice,
                         _ => ScreenId::Connect,
                     };
                     self.view = skipped_fixture(screen);
@@ -1060,10 +943,7 @@ impl DisconnectedController {
                 }
                 if self.demo_mode
                     && id == crate::live::ids::SET_UP_NOW
-                    && matches!(
-                        self.view.screen,
-                        ScreenId::Connect | ScreenId::Layout | ScreenId::Practice
-                    )
+                    && matches!(self.view.screen, ScreenId::Connect | ScreenId::Layout)
                 {
                     let revision = self.view.revision + 1;
                     self.view = fixture(self.view.screen);

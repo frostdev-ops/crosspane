@@ -37,7 +37,7 @@ target=$(cargo metadata --no-deps --format-version 1 --locked |
 tmp=$(mktemp -d "$(dirname "$out")/.prepare-linux-input.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 mkdir -m 700 "$tmp/bin" "$tmp/resources" "$tmp/libraries"
-for b in crosspane-agent crosspanectl crosspane-ui crosspane-installer crosspane-tutorial; do
+for b in crosspane-agent crosspanectl crosspane-ui crosspane-installer; do
     install -m 0755 "$target/release/$b" "$tmp/bin/$b"
     strip --strip-debug "$tmp/bin/$b"
 done
@@ -62,7 +62,7 @@ python3 -I - "$tmp" "$rev" "$version" "$arch" <<'PY'
 import hashlib, json, pathlib, sys
 src, rev, version, arch = pathlib.Path(sys.argv[1]), *sys.argv[2:]
 files = ["bin/crosspane-agent", "bin/crosspanectl", "bin/crosspane-ui", "bin/crosspane-installer",
-         "bin/crosspane-tutorial", "resources/crosspane-agent.service",
+         "resources/crosspane-agent.service",
          "resources/crosspane-settings.desktop", "resources/crosspane-installer.desktop",
          "resources/crosspane-icon.svg", "resources/LICENSE"]
 def sha(path):

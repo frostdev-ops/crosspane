@@ -24,7 +24,6 @@ pub struct SigningRule {
 pub enum PayloadRole {
     Agent,
     Settings,
-    Tutorial,
     Ctl,
     Installer,
     EmbeddedCode,
@@ -35,7 +34,6 @@ impl SigningRule {
             role: match self.role {
                 PayloadRole::Agent => ArtifactRole::Agent,
                 PayloadRole::Settings => ArtifactRole::Settings,
-                PayloadRole::Tutorial => ArtifactRole::Tutorial,
                 PayloadRole::Ctl => ArtifactRole::Ctl,
                 PayloadRole::Installer => ArtifactRole::Installer,
                 PayloadRole::EmbeddedCode => ArtifactRole::EmbeddedCode,
@@ -123,7 +121,6 @@ impl ApprovedInventory {
                     let expected = match rule.role {
                         PayloadRole::Agent => AGENT,
                         PayloadRole::Settings => "Crosspane.app/Contents/MacOS/crosspane-ui",
-                        PayloadRole::Tutorial => "Crosspane.app/Contents/MacOS/crosspane-tutorial",
                         PayloadRole::Ctl => CTL,
                         PayloadRole::Installer => INSTALLER,
                         PayloadRole::EmbeddedCode => {
@@ -157,7 +154,6 @@ impl ApprovedInventory {
             != BTreeSet::from([
                 PayloadRole::Agent,
                 PayloadRole::Settings,
-                PayloadRole::Tutorial,
                 PayloadRole::Ctl,
                 PayloadRole::Installer,
             ])
@@ -469,14 +465,19 @@ impl MacPayload {
     pub(super) fn installed(&self, deadline: &Deadline) -> NativeResult<(Tree, Tree, bool)> {
         let app = tree(&self.io, &self.io.target().app_path(), deadline)?;
         let ctl = tree(&self.io, &self.ctl(), deadline)?;
-        let mut matching = true;
+        let legacy = self.legacy_receipt(deadline)?.is_some();
+        let mut matching = !legacy;
         if app.root.is_some() {
-            let expected: BTreeSet<_> = self
+            let mut expected: BTreeSet<_> = self
                 .approved
                 .files
                 .iter()
                 .filter_map(|f| f.path.strip_prefix("Crosspane.app/").map(str::to_owned))
                 .collect();
+            // An obsolete leaf may already be absent; it is never a required current role.
+            if legacy && app.hashes.contains_key("Contents/MacOS/crosspane-tutorial") {
+                expected.insert("Contents/MacOS/crosspane-tutorial".into());
+            }
             let dirs = directories(expected.iter().cloned());
             if app.hashes.keys().cloned().collect::<BTreeSet<_>>() != expected
                 || app

@@ -12,7 +12,7 @@ use crosspane_installer_core::{ObservationSource, OperationId};
 
 use std::path::Path;
 
-use super::super::native_io::{AdmittedTutorialChild, Deadline, NativeError, SupportObservation};
+use super::super::native_io::{Deadline, NativeError, SupportObservation};
 use super::super::transport::{SelectedAgent, SelectedLink};
 use crate::agent_contract::AgentReply;
 use crate::live::{
@@ -376,8 +376,7 @@ pub trait Repairer: Send {
     ) -> Result<RepairFinish, String>;
 }
 
-/// Where the shared sound driver stands. Advisory: nothing here proves working audio, which only
-/// the practice steps (a real tone, heard) can show.
+/// Where the shared sound driver stands. Advisory: nothing here proves working audio.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioState {
     /// The driver is in place and the installer's own outcome says so (or it was already there).
@@ -436,35 +435,9 @@ pub struct Domains {
     pub agents: Box<dyn Agents>,
     pub uninstaller: Box<dyn Uninstaller>,
     pub repairer: Box<dyn Repairer>,
-    /// The tutorial executable's admitted launcher, when the build can launch one.
-    pub fixtures: Option<Box<dyn FixtureLauncher>>,
 }
 
 pub type DomainFactory = Box<dyn FnOnce() -> Domains + Send>;
-
-/// A launched practice fixture: opaque, handed from the worker to the GUI-thread fixture port.
-pub struct FixtureChild {
-    pub(super) inner: FixtureChildInner,
-}
-
-pub(super) enum FixtureChildInner {
-    Native(Box<AdmittedTutorialChild>),
-}
-
-impl std::fmt::Debug for FixtureChild {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("FixtureChild")
-    }
-}
-
-pub trait FixtureLauncher: Send {
-    /// Launch the installed tutorial executable against a fresh support proof.
-    fn launch(
-        &mut self,
-        font: &std::path::Path,
-        deadline: &Deadline,
-    ) -> Result<FixtureChild, String>;
-}
 
 // ---- builds that can change nothing -----------------------------------------------------------
 
@@ -634,7 +607,6 @@ impl Blocked {
             agents: Box::new(blocked.clone()),
             uninstaller: Box::new(blocked.clone()),
             repairer: Box::new(blocked),
-            fixtures: None,
         }
     }
 }

@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
 use crate::agent_contract::*;
+use crate::platform::linux::payload::FILES;
 use crate::platform::linux::removal::TrackedAgent;
 use crate::platform::linux::{native_io::*, payload::*, service::*};
 use serde_json::{Value, json};
@@ -255,25 +256,25 @@ fn package_with_icon(architecture: Architecture, icon: &[u8]) -> Package {
     );
     elf[20] = 1;
     elf[52] = 64;
-    let data: Vec<Vec<u8>> = (0..10)
+    let data: Vec<Vec<u8>> = (0..FILES.len())
         .map(|i| match i {
-            0..=4 => elf.clone(),
-            5 => include_bytes!(concat!(
+            0..=3 => elf.clone(),
+            4 => include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../packaging/linux/crosspane-agent.service"
             ))
             .to_vec(),
-            6 => include_bytes!(concat!(
+            5 => include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../packaging/linux/crosspane-settings.desktop"
             ))
             .to_vec(),
-            7 => include_bytes!(concat!(
+            6 => include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../packaging/linux/crosspane-installer.desktop"
             ))
             .to_vec(),
-            8 => icon.to_vec(),
+            7 => icon.to_vec(),
             _ => b"inert resource".to_vec(),
         })
         .collect();

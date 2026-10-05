@@ -267,7 +267,7 @@ fn footer(view: &WizardView) -> Vec<&ButtonView> {
 }
 
 #[test]
-fn all_fifteen_screens_render_with_demo_label_and_supplied_state_at_both_sizes() {
+fn all_fourteen_screens_render_with_demo_label_and_supplied_state_at_both_sizes() {
     for size in [egui::vec2(1100.0, 760.0), egui::vec2(800.0, 600.0)] {
         let mut harness = Harness::new(size);
         for (screen, _) in demo::SCREENS {
@@ -628,11 +628,11 @@ fn disabled_controls_are_skipped_and_choices_are_keyboard_reachable() {
 #[test]
 fn keyboard_scrolls_long_content_while_release_and_stop_remain_visible() {
     let mut harness = Harness::new(egui::vec2(800.0, 600.0));
-    let mut view = demo::fixture(ScreenId::Practice);
+    let mut view = demo::fixture(ScreenId::Grants);
     view.rows = (0..40)
         .map(|id| RowView {
             id,
-            label: format!("Practice result {id}"),
+            label: format!("Permission result {id}"),
             detail: "Waiting for evidence. ".repeat(12),
             state: RowState::Waiting,
             human_confirmed: false,
@@ -646,13 +646,13 @@ fn keyboard_scrolls_long_content_while_release_and_stop_remain_visible() {
     harness.settle(&view);
     let after = harness.texts();
     assert_ne!(before, after);
-    assert!(harness.rect("Play the test sound").max.y <= 600.0);
-    assert!(harness.rect("Stop this practice").max.y <= 600.0);
+    assert!(harness.rect("Apply permissions").max.y <= 600.0);
+    assert!(harness.rect("Back").max.y <= 600.0);
     assert_eq!(
-        harness.click(&view, "Play the test sound"),
+        harness.click(&view, "Apply permissions"),
         vec![WizardAction {
             revision: 1,
-            intent: WizardIntent::Button(6)
+            intent: WizardIntent::Button(crosspane_installer::live::ids::GRANTS_APPLY)
         }]
     );
 }
@@ -812,12 +812,11 @@ fn overflowing_consent_scrolls_into_view_and_cannot_activate_while_hidden() {
 #[test]
 fn repeated_vertical_arrows_scroll_without_moving_focus() {
     let mut harness = Harness::new(egui::vec2(800.0, 600.0));
-    let mut view = demo::fixture(ScreenId::Practice);
-    view.illustration.practice = None;
+    let mut view = demo::fixture(ScreenId::Grants);
     view.rows = (0..40)
         .map(|id| RowView {
             id,
-            label: format!("Practice detail {id}"),
+            label: format!("Permission detail {id}"),
             detail: "Waiting for evidence. ".repeat(12),
             state: RowState::Waiting,
             human_confirmed: false,
@@ -907,19 +906,12 @@ fn progress_uses_supplied_groups_and_the_actual_viewport_breakpoint() {
         };
         harness.settle(&view);
         let texts = harness.texts();
-        let labels = [
-            "Install",
-            "Permissions",
-            "Connect",
-            "Arrange",
-            "Practice",
-            "Ready",
-        ];
+        let labels = ["Install", "Permissions", "Connect", "Arrange", "Ready"];
         // Progress reads by marks, not by "Current"/"Completed" words.
         for word in ["Current", "Completed", "Current: Arrange"] {
             assert!(!texts.iter().any(|(text, _)| text == word));
         }
-        // The narrow strip: six slim segments, the completed one Frost, the current Glacier.
+        // The narrow strip: five slim segments, the completed one Frost, the current Glacier.
         let segments: Vec<egui::Color32> = harness
             .shapes()
             .into_iter()
@@ -944,7 +936,7 @@ fn progress_uses_supplied_groups_and_the_actual_viewport_breakpoint() {
                     "the narrow layout has no rail: {label}"
                 );
             }
-            assert_eq!(segments.len(), 6);
+            assert_eq!(segments.len(), 5);
             assert_eq!(segments.iter().filter(|c| **c == theme::FROST).count(), 1);
             assert_eq!(segments.iter().filter(|c| **c == theme::GLACIER).count(), 1);
         }
@@ -1019,7 +1011,7 @@ fn solid_scrollbar(harness: &Harness) -> Option<(Rect, Rect)> {
 fn overflow_has_a_dormant_solid_track_and_handle_and_keeps_fixed_actions_visible() {
     for size in [egui::vec2(800.0, 600.0), egui::vec2(1100.0, 760.0)] {
         let mut harness = Harness::review(size);
-        let mut view = demo::fixture(ScreenId::Practice);
+        let mut view = demo::fixture(ScreenId::Grants);
         view.rows = (0..40)
             .map(|id| RowView {
                 id,
@@ -1047,7 +1039,7 @@ fn overflow_has_a_dormant_solid_track_and_handle_and_keeps_fixed_actions_visible
             (message.top() - body_clip.top()).abs() <= 4.0,
             "Overflow must stay top-aligned: content {message:?}, body {body_clip:?}"
         );
-        for label in ["Play the test sound", "Stop this practice"] {
+        for label in ["Apply permissions", "Back"] {
             let (raw, clip, _) = harness.raw_text(label);
             assert!(clip.contains_rect(raw) && raw.bottom() <= size.y);
         }

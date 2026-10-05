@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crosspane_installer_core::{FlowEvent, StepId, StepState};
 
 use super::controller::{LiveController, OwnCall};
-use super::graph::{StepKind, steps};
+use super::graph::steps;
 use crate::gui::ShellEffect;
 use crate::view::ScreenId;
 use crate::view::{RowState, RowView};
@@ -20,7 +20,7 @@ use crate::view::{RowState, RowView};
 pub(super) const LATER: &str = "Do this later from the Crosspane menu > Settings";
 
 pub(super) fn optional(id: StepId) -> bool {
-    matches!(id.0, 60..=62 | 70..=78)
+    matches!(id.0, 60..=62)
 }
 
 /// A bounded preference file at a selected installer's own path. Tests pass only private roots.
@@ -44,10 +44,11 @@ impl SkippedStore {
                 return None;
             }
             let ids: Vec<StepId> = serde_json::from_slice(&bytes).ok()?;
-            if ids.len() > 12 || ids.iter().any(|id| !optional(*id)) {
+            if ids.len() > 12 || ids.iter().any(|id| !matches!(id.0, 60..=62 | 70..=78)) {
                 return None;
             }
-            Some(ids.into_iter().collect())
+            // Old Practice preferences are accepted as data, then ignored.
+            Some(ids.into_iter().filter(|id| optional(*id)).collect())
         };
         read().unwrap_or_default()
     }
@@ -107,11 +108,6 @@ impl LiveController {
         for (id, screen, label) in [
             (940, ScreenId::Connect, "Connect another computer"),
             (941, ScreenId::Layout, "Arrange your screens"),
-            (
-                942,
-                ScreenId::Practice,
-                "Practise sharing input, windows and sound",
-            ),
         ] {
             if self.skipped_on(screen)
                 || (screen == ScreenId::Layout && self.skipped_on(ScreenId::Grants))
@@ -119,14 +115,7 @@ impl LiveController {
                 rows.push(RowView {
                     id,
                     label: label.into(),
-                    detail: if screen == ScreenId::Practice
-                        && self.practice.tutorial.detail().remote_restoration
-                            == crate::tutorial_flow::RemoteRestoration::Unknown
-                    {
-                        format!("{LATER}. Check that the practice window returned on the other computer.")
-                    } else {
-                        LATER.into()
-                    },
+                    detail: LATER.into(),
                     state: RowState::Skipped,
                     human_confirmed: false,
                 });
@@ -149,14 +138,8 @@ impl LiveController {
 
     pub(super) fn skip_current(&mut self) {
         let screens: &[ScreenId] = match self.screen {
-            ScreenId::Connect => &[
-                ScreenId::Connect,
-                ScreenId::Grants,
-                ScreenId::Layout,
-                ScreenId::Practice,
-            ],
+            ScreenId::Connect => &[ScreenId::Connect, ScreenId::Grants, ScreenId::Layout],
             ScreenId::Layout => &[ScreenId::Layout],
-            ScreenId::Practice => &[ScreenId::Practice],
             _ => return,
         };
         let ids: Vec<_> = self
@@ -194,20 +177,12 @@ impl LiveController {
             self.connect.place = None;
             self.connect.placed = None;
         }
-        self.practice.deferred = None;
-        self.practice.requested = None;
-        self.cancel_practice();
         self.pending_skip = Some(ids);
         self.finish_skip();
     }
 
     pub(super) fn finish_skip(&mut self) {
         if self.pending_skip.is_none() {
-            return;
-        }
-        // Deferral can advance after owned-local cleanup; it never confirms remote restoration.
-        if self.practice.run.is_some() && !self.practice.tutorial.detail().local_cleanup_settled {
-            self.notice = Some("Stopping practice and cleaning up its window and sound…".into());
             return;
         }
         let Some(ids) = self.pending_skip.take() else {
@@ -235,12 +210,7 @@ impl LiveController {
         if !self.reopened.contains(&screen) {
             self.reopened.push(screen);
         }
-        let ids: Vec<_> = self
-            .graph
-            .on_screen(screen)
-            .filter(|m| !matches!(m.kind, StepKind::Practice(_)))
-            .map(|m| m.id)
-            .collect();
+        let ids: Vec<_> = self.graph.on_screen(screen).map(|m| m.id).collect();
         for id in ids {
             if self.step_state(id) == StepState::Skipped {
                 self.begin(id);
@@ -252,6 +222,34 @@ impl LiveController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_practice_skips_load_without_erasing_connect_and_arrange() {
+        struct Root(PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "crosspane-wp436-skips-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let root = Root(path);
+        let store = SkippedStore(root.0.join("skipped.json"));
+        std::fs::write(&store.0, b"[60,61,62,70,71,72,73,74,75,76,77,78]").unwrap();
+        assert_eq!(
+            store.load(),
+            BTreeSet::from([StepId(60), StepId(61), StepId(62)])
+        );
+        std::fs::write(&store.0, b"[70,78]").unwrap();
+        assert!(store.load().is_empty());
+    }
 
     #[test]
     fn skipped_preferences_are_bounded_and_preserve_remaining_members() {

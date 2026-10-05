@@ -1,32 +1,27 @@
 //! The GUI-thread ports: the agent port, which asks the worker for a fresh admission of the
-//! running agent before it sends, and the practice-fixture launcher. Neither blocks a frame.
+//! running agent before it sends. It never blocks a frame.
 //!
 //! An agent admission (the signature, the support proof and the instance) lives five seconds, so
 //! nothing here caches one for long. The worker thread mints admissions on request; the port
 //! reuses one only for a moment, and a peer-bound call is bound to the link the last Status
 //! showed for that peer.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
-use crosspane_installer_core::{AttemptId, ObservationSource};
+use crosspane_installer_core::ObservationSource;
 use crosspane_types::id::NodeId;
 
 use super::super::native_io::NativeError;
 use super::super::transport::{CallerClock, MacAgentPort, SelectedLink};
-use super::super::tutorial::fixture_port;
-use super::domains::{Admitted, AdmittedInner, FixtureChild, FixtureChildInner};
+use super::domains::{Admitted, AdmittedInner};
 use crate::agent_contract::{
     AgentCall, AgentPort, AgentReply, CallFailure, ContractError, DecodedReply, InstallerRequest,
     StatusAdmission,
 };
-use crate::fixture::{
-    FixtureCall, FixtureError, FixtureId, FixturePort, FixtureReceipt, PipeFixturePort,
-};
-use crate::live::{Clock, FixtureReadiness, NativeJob, PracticeFixtures};
+use crate::live::{Clock, NativeJob};
 
 /// What the GUI thread can send the worker.
 #[derive(Debug)]
@@ -37,24 +32,15 @@ pub enum Command {
         ticket: u64,
         link: Option<SelectedLink>,
     },
-    /// Launch the practice fixture now.
-    Fixture {
-        ticket: u64,
-        font: PathBuf,
-    },
 }
 
 type Admission = Result<Admitted, String>;
-type Launch = Result<FixtureChild, String>;
 
-/// Hands out admissions and fixture launches that the worker thread performs, one request at a
+/// Hands out admissions that the worker thread performs, one request at a
 /// time, by ticket.
 pub struct Broker {
     sender: Mutex<Option<SyncSender<Command>>>,
     admissions: Mutex<BTreeMap<u64, Admission>>,
-    launches: Mutex<BTreeMap<u64, Launch>>,
-    /// Launch tickets nobody will collect: a window launched for one is retired at once.
-    abandoned: Mutex<BTreeSet<u64>>,
     next: AtomicU64,
 }
 
@@ -63,8 +49,6 @@ impl Broker {
         Arc::new(Self {
             sender: Mutex::new(Some(sender)),
             admissions: Mutex::new(BTreeMap::new()),
-            launches: Mutex::new(BTreeMap::new()),
-            abandoned: Mutex::new(BTreeSet::new()),
             next: AtomicU64::new(1),
         })
     }
@@ -87,67 +71,14 @@ impl Broker {
         self.send(Command::Admit { ticket, link }).then_some(ticket)
     }
 
-    pub fn request_launch(&self, font: PathBuf) -> Option<u64> {
-        let ticket = self.ticket();
-        self.send(Command::Fixture { ticket, font })
-            .then_some(ticket)
-    }
-
     pub fn take_admission(&self, ticket: u64) -> Option<Admission> {
         self.admissions.lock().ok()?.remove(&ticket)
-    }
-
-    pub fn take_launch(&self, ticket: u64) -> Option<Launch> {
-        self.launches.lock().ok()?.remove(&ticket)
     }
 
     /// Worker side: record a result. Requests that were never collected can't pile up.
     pub fn put_admission(&self, ticket: u64, result: Admission) {
         if let Ok(mut map) = self.admissions.lock() {
             while map.len() >= 16 {
-                let Some(oldest) = map.keys().next().copied() else {
-                    break;
-                };
-                map.remove(&oldest);
-            }
-            map.insert(ticket, result);
-        }
-    }
-
-    /// The GUI no longer wants this launch. A window already launched for it is dropped now
-    /// (which retires its process); one still being launched is dropped when it arrives.
-    pub fn abandon_launch(&self, ticket: u64) {
-        let launched = self
-            .launches
-            .lock()
-            .ok()
-            .and_then(|mut m| m.remove(&ticket));
-        if launched.is_none()
-            && let Ok(mut abandoned) = self.abandoned.lock()
-        {
-            while abandoned.len() >= 16 {
-                let Some(oldest) = abandoned.iter().next().copied() else {
-                    break;
-                };
-                abandoned.remove(&oldest);
-            }
-            abandoned.insert(ticket);
-        }
-        drop(launched);
-    }
-
-    pub fn put_launch(&self, ticket: u64, result: Launch) {
-        if self
-            .abandoned
-            .lock()
-            .is_ok_and(|mut abandoned| abandoned.remove(&ticket))
-        {
-            // Nobody will collect it: dropping the child retires the window and its process.
-            drop(result);
-            return;
-        }
-        if let Ok(mut map) = self.launches.lock() {
-            while map.len() >= 4 {
                 let Some(oldest) = map.keys().next().copied() else {
                     break;
                 };
@@ -471,108 +402,6 @@ impl AgentPort for AgentSlot {
     }
 }
 
-/// Launches the installed practice fixture once the worker has admitted it. `launch` never
-/// blocks, and a window the worker refuses never appears.
-pub struct MacPractice {
-    broker: Arc<Broker>,
-    clock: Clock,
-    font: PathBuf,
-    ticket: Option<u64>,
-    port: Option<PipeFixturePort>,
-    failed: Option<FixtureError>,
-}
-
-impl MacPractice {
-    pub fn new(broker: Arc<Broker>, clock: Clock, font: PathBuf) -> Self {
-        Self {
-            broker,
-            clock,
-            font,
-            ticket: None,
-            port: None,
-            failed: None,
-        }
-    }
-}
-
-impl PracticeFixtures for MacPractice {
-    fn launch(&mut self, _attempt: AttemptId) -> Result<(), FixtureError> {
-        self.retire();
-        self.ticket = Some(
-            self.broker
-                .request_launch(self.font.clone())
-                .ok_or(FixtureError::Unavailable)?,
-        );
-        Ok(())
-    }
-
-    fn readiness(&mut self) -> FixtureReadiness {
-        if let Some(error) = self.failed {
-            return FixtureReadiness::Failed(error);
-        }
-        if self.port.is_some() {
-            return FixtureReadiness::Ready;
-        }
-        let Some(ticket) = self.ticket else {
-            return FixtureReadiness::Idle;
-        };
-        match self.broker.take_launch(ticket) {
-            None => FixtureReadiness::Launching,
-            Some(Err(_)) => {
-                self.ticket = None;
-                self.failed = Some(FixtureError::Unavailable);
-                FixtureReadiness::Failed(FixtureError::Unavailable)
-            }
-            Some(Ok(child)) => {
-                self.ticket = None;
-                let FixtureChildInner::Native(child) = child.inner;
-                match fixture_port(*child, self.clock.clone()) {
-                    Ok(port) => {
-                        self.port = Some(port);
-                        FixtureReadiness::Ready
-                    }
-                    Err(error) => {
-                        self.failed = Some(error);
-                        FixtureReadiness::Failed(error)
-                    }
-                }
-            }
-        }
-    }
-
-    fn submit(&mut self, call: FixtureCall) -> Result<(), FixtureError> {
-        FixturePort::submit(self.port.as_mut().ok_or(FixtureError::Unavailable)?, call)
-    }
-
-    fn poll(&mut self) -> Vec<FixtureReceipt> {
-        self.port
-            .as_mut()
-            .map(PipeFixturePort::poll_receipts)
-            .unwrap_or_default()
-    }
-
-    fn complete_closed(
-        &mut self,
-        attempt: AttemptId,
-        fixture: FixtureId,
-    ) -> Result<(), FixtureError> {
-        self.port
-            .as_mut()
-            .ok_or(FixtureError::Unavailable)?
-            .complete_closed(attempt, fixture)
-    }
-
-    fn retire(&mut self) {
-        if let Some(ticket) = self.ticket.take() {
-            self.broker.abandon_launch(ticket);
-        }
-        self.failed = None;
-        if let Some(mut port) = self.port.take() {
-            port.cancel();
-        }
-    }
-}
-
 macro_rules! opaque_debug {
     ($($ty:ty),+ $(,)?) => {$(
         impl std::fmt::Debug for $ty {
@@ -583,42 +412,4 @@ macro_rules! opaque_debug {
     )+};
 }
 
-opaque_debug!(Broker, AgentSlot, MacPractice, NativeBackend);
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-    use super::*;
-
-    #[test]
-    fn a_launch_nobody_will_collect_is_dropped_whether_it_arrives_before_or_after() {
-        let (sender, _receiver) = std::sync::mpsc::sync_channel(8);
-        let broker = Broker::new(sender);
-        // Abandoned while the worker is still launching: the late result is dropped on arrival.
-        let early = broker.request_launch(PathBuf::from("/font")).unwrap();
-        broker.abandon_launch(early);
-        broker.put_launch(early, Err("late".into()));
-        assert!(broker.take_launch(early).is_none());
-        // Abandoned after it arrived: it is taken and dropped at once.
-        let late = broker.request_launch(PathBuf::from("/font")).unwrap();
-        broker.put_launch(late, Err("arrived".into()));
-        broker.abandon_launch(late);
-        assert!(broker.take_launch(late).is_none());
-        // A launch that is still wanted is kept for its ticket.
-        let kept = broker.request_launch(PathBuf::from("/font")).unwrap();
-        broker.put_launch(kept, Err("wanted".into()));
-        assert!(broker.take_launch(kept).is_some());
-    }
-
-    #[test]
-    fn retiring_a_practice_mid_launch_abandons_its_ticket() {
-        let (sender, _receiver) = std::sync::mpsc::sync_channel(8);
-        let broker = Broker::new(sender);
-        let mut practice = MacPractice::new(broker.clone(), Arc::new(|| 0), PathBuf::from("/f"));
-        practice.launch(AttemptId(1)).unwrap();
-        let ticket = practice.ticket.unwrap();
-        practice.retire();
-        broker.put_launch(ticket, Err("late".into()));
-        assert!(broker.take_launch(ticket).is_none());
-    }
-}
+opaque_debug!(Broker, AgentSlot, NativeBackend);

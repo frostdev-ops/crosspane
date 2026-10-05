@@ -2,6 +2,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Private scratch, injected process/support/signature answers. No command is ever spawned.
 use crosspane_installer::platform::macos::native_io::*;
+#[path = "../src/legacy_payload.rs"]
+mod legacy_payload;
 use rustix::{fd::OwnedFd, fs as rfs};
 use serde_json::json;
 use std::{
@@ -1327,17 +1329,19 @@ mod a2_tests {
     }
     struct Signatures {
         bad: AtomicBool,
+        installed_bad: Mutex<Option<PathBuf>>,
     }
     impl SignatureProbe for Signatures {
         fn observe(
             &self,
-            _: &Path,
+            path: &Path,
             r: &SigningRequirement,
             d: &Deadline,
         ) -> NativeResult<SignatureObservation> {
             d.check()?;
             Ok(SignatureObservation {
-                strict_verified: !self.bad.load(Ordering::Acquire),
+                strict_verified: !self.bad.load(Ordering::Acquire)
+                    && self.installed_bad.lock().unwrap().as_deref() != Some(path),
                 team_identifier: "ABCDE12345".into(),
                 identifier: r.identifier.clone(),
                 designated_requirement: r.designated_requirement.clone(),
@@ -1434,10 +1438,6 @@ mod a2_tests {
                 "Crosspane.app/Contents/MacOS/crosspane-ui",
                 Some(PayloadRole::Settings),
             ),
-            (
-                "Crosspane.app/Contents/MacOS/crosspane-tutorial",
-                Some(PayloadRole::Tutorial),
-            ),
             ("crosspanectl", Some(PayloadRole::Ctl)),
             ("crosspane-installer", Some(PayloadRole::Installer)),
             ("Crosspane.app/Contents/Info.plist", None),
@@ -1506,7 +1506,7 @@ mod a2_tests {
         signatures: Arc<Signatures>,
         runner: Arc<Runner>,
         hook: Arc<Mutex<Option<Hook>>>,
-        _listener: std::os::unix::net::UnixListener,
+        _listener: Mutex<Option<std::os::unix::net::UnixListener>>,
     }
     impl Rig {
         fn new() -> Self {
@@ -1572,6 +1572,7 @@ mod a2_tests {
             });
             let signatures = Arc::new(Signatures {
                 bad: AtomicBool::new(false),
+                installed_bad: Mutex::new(None),
             });
             let plist = home.join("Library/LaunchAgents/io.frostdev.crosspane.agent.plist");
             let print = format!(
@@ -1632,7 +1633,7 @@ mod a2_tests {
                 signatures,
                 runner,
                 hook,
-                _listener: listener,
+                _listener: Mutex::new(Some(listener)),
             };
             r.put(&r.io.target().runtime_dir().join("bootstrap.json"),&serde_json::to_vec(&json!({"schema_version":1,"instance_id":1,"pid":4242,"started_unix_ms":0,"phase":"ready","phase_seq":1,"keystore":"os_store","reason":null,"runtime_dir":r.io.target().runtime_dir()})).unwrap(),0o600);
             r.put(&plist, &render_plist(r.io.target()).unwrap(), 0o644);
@@ -1768,6 +1769,50 @@ mod a2_tests {
                     .unwrap();
             f(&mut v);
             self.put(&p, &serde_json::to_vec(&v).unwrap(), 0o600);
+        }
+        fn legacy_tutorial(&self) {
+            let mut old = serde_json::to_value(producer_inventory()).unwrap();
+            old["product_version"] = json!("legacy-v1");
+            let bytes = macho();
+            old["files"].as_array_mut().unwrap().push(json!({
+                "path":crate::legacy_payload::TUTORIAL,"size":bytes.len(),"sha256":sha(&bytes),
+                "mode":493,"signing":{"role":"Tutorial","identifier":"fake-unverifiable",
+                "designated_requirement":"fake fixture, never approved","entitlements":{}}}));
+            let companion = json!({"inventory":old});
+            let legacy = crate::legacy_payload::classify(
+                &serde_json::to_vec(&companion).unwrap(),
+                &serde_json::to_vec(&producer_inventory()).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            let digest: String = legacy.manifest.iter().map(|b| format!("{b:02x}")).collect();
+            self.put(
+                &self
+                    .io
+                    .target()
+                    .installer_dir()
+                    .join(format!("payload-inventory-{digest}.json")),
+                &serde_json::to_vec(&companion).unwrap(),
+                0o600,
+            );
+            self.put(
+                &self
+                    .io
+                    .target()
+                    .app_path()
+                    .join("Contents/MacOS/crosspane-tutorial"),
+                &bytes,
+                0o755,
+            );
+            self.edit_payload(|v| {
+                v["receipt"]["product_version"] = json!(legacy.product_version);
+                v["receipt"]["manifest_sha256"] = json!(legacy.manifest);
+                v["receipt"]["payload_sha256"] = json!(legacy.payload);
+            });
+            self.edit_launch(|v| {
+                v["receipt"]["product_version"] = json!(legacy.product_version);
+                v["receipt"]["manifest_sha256"] = json!(legacy.manifest);
+            });
         }
         fn edit_payload(&self, f: impl FnOnce(&mut Value)) {
             let p = self.io.target().installer_dir().join("payload.json");
@@ -6396,6 +6441,251 @@ mod a2_tests {
             );
             assert!(f.journal()["in_flight"].is_null());
             assert!(result.retained_recovery);
+        }
+        #[test]
+        fn legacy_clean_removal_backs_up_unknown_app_after_optional_erase() {
+            for erase in [false, true] {
+                let r = Rig::new();
+                r.legacy_tutorial();
+                let f = Flow::from_rig(r);
+                let trust = f.rig.io.target().state_dir().join("trust.json");
+                f.rig.put(&trust, b"inert retained identity", 0o600);
+                let app = f.rig.io.target().app_path();
+                let checked = Arc::new(AtomicBool::default());
+                let moved = checked.clone();
+                let effects = f.effects.clone();
+                let expected = app.clone();
+                *f.rig.hook.lock().unwrap() = Some(Arc::new(move |stage, path| {
+                    if stage == "move-aside" && path == expected {
+                        assert_eq!(
+                            *effects.mutations.lock().unwrap(),
+                            if erase {
+                                vec!["disable", "bootout", "erase"]
+                            } else {
+                                vec!["disable", "bootout"]
+                            }
+                        );
+                        moved.store(true, Ordering::Release);
+                    }
+                    Ok(())
+                }));
+                let result = f.apply(RemovalChoices {
+                    delete_identity: erase,
+                    remove_driver: false,
+                });
+                assert!(result.complete, "{result:?}");
+                assert!(checked.load(Ordering::Acquire));
+                assert!(!app.exists());
+                assert_eq!(trust.exists(), !erase);
+                let backup = std::fs::read_dir(f.rig.io.target().backups_dir())
+                    .unwrap()
+                    .map(|e| e.unwrap().path().join("Crosspane.app"))
+                    .find(|p| p.exists())
+                    .unwrap();
+                assert!(backup.join("Contents/MacOS/crosspane-tutorial").exists());
+                assert!(result.rows.iter().any(|r| r.delta.effect
+                    == RemovalEffect::BackupLegacyAppAfterCleanExit
+                    && r.outcome == RemovalOutcome::Completed));
+                assert!(
+                    !f.rig
+                        .io
+                        .target()
+                        .paths()
+                        .home
+                        .join("Library/LaunchAgents/io.frostdev.crosspane.agent.plist")
+                        .exists()
+                );
+            }
+        }
+        #[test]
+        fn legacy_absent_tutorial_is_obsolete_not_missing_and_remains_unowned() {
+            let r = Rig::new();
+            r.legacy_tutorial();
+            r.scratch.remove(
+                &r.io
+                    .target()
+                    .app_path()
+                    .join("Contents/MacOS/crosspane-tutorial"),
+            );
+            let payload = MacPayload::admit(r.io.clone(), inventory(), &r.d()).unwrap();
+            let plan = payload.plan(2, 2, None, &r.d()).unwrap();
+            assert_eq!(plan.state(), PayloadState::AdoptionRequired);
+            let f = Flow::from_rig(r);
+            let result = f.apply(RemovalChoices {
+                delete_identity: false,
+                remove_driver: false,
+            });
+            assert!(result.complete, "{result:?}");
+            assert!(!f.rig.io.target().app_path().exists());
+            let backup = std::fs::read_dir(f.rig.io.target().backups_dir())
+                .unwrap()
+                .map(|e| e.unwrap().path().join("Crosspane.app"))
+                .find(|p| p.exists())
+                .unwrap();
+            assert!(backup.join("Contents/MacOS/crosspane-agent").exists());
+            assert!(!backup.join("Contents/MacOS/crosspane-tutorial").exists());
+        }
+        #[test]
+        fn legacy_upgrade_backs_up_whole_app_and_replaces_without_tutorial() {
+            let r = Rig::new();
+            r.legacy_tutorial();
+            let f = Flow::from_rig(r);
+            f.effects.journal_required.store(false, Ordering::Release);
+            let source = MacLaunchAgent::admit(
+                f.rig.io.clone(),
+                inventory(),
+                Arc::new(UnobservableApproval),
+                &f.rig.d(),
+            )
+            .unwrap();
+            let saved = source.reclaim(&f.rig.d()).unwrap().unwrap();
+            assert!(
+                saved
+                    .folder
+                    .join("Crosspane.app/Contents/MacOS/crosspane-tutorial")
+                    .exists()
+            );
+            assert!(!f.rig.io.target().app_path().exists());
+            // The fake original process has exited; close its test-owned endpoint as well.
+            f.rig._listener.lock().unwrap().take();
+            let payload = MacPayload::admit(f.rig.io.clone(), inventory(), &f.rig.d()).unwrap();
+            let plan = payload.plan(2, 2, None, &f.rig.d()).unwrap();
+            assert_eq!(plan.state(), PayloadState::Absent);
+            let consent = plan.consent(2, 2, true).unwrap();
+            let pending = payload
+                .install(plan, consent, None, &f.rig.d())
+                .unwrap()
+                .unwrap();
+            assert!(f.rig.io.target().agent_path().exists());
+            assert!(
+                !f.rig
+                    .io
+                    .target()
+                    .app_path()
+                    .join("Contents/MacOS/crosspane-tutorial")
+                    .exists()
+            );
+            assert!(
+                saved
+                    .folder
+                    .join("Crosspane.app/Contents/MacOS/crosspane-tutorial")
+                    .exists()
+            );
+            assert_eq!(pending.phase(), PayloadPhase::Published);
+        }
+        #[test]
+        fn legacy_unclean_stop_never_moves_app_or_erases_identity() {
+            let r = Rig::new();
+            r.legacy_tutorial();
+            let f = Flow::from_rig(r);
+            *f.effects.response.lock().unwrap() =
+                Some(("bootout".into(), Err(NativeError::OutcomeUnknown)));
+            let result = f.apply(RemovalChoices {
+                delete_identity: true,
+                remove_driver: false,
+            });
+            assert!(!result.complete);
+            assert!(
+                f.rig
+                    .io
+                    .target()
+                    .app_path()
+                    .join("Contents/MacOS/crosspane-tutorial")
+                    .exists()
+            );
+            assert_eq!(*f.effects.mutations.lock().unwrap(), ["disable", "bootout"]);
+            assert!(!f.rig.io.target().backups_dir().exists());
+        }
+        #[test]
+        fn legacy_late_agent_signature_refusal_keeps_identity_then_backs_up() {
+            let r = Rig::new();
+            r.legacy_tutorial();
+            let f = Flow::from_rig(r);
+            let trust = f.rig.io.target().state_dir().join("trust.json");
+            f.rig.put(&trust, b"inert retained identity", 0o600);
+            let signatures = f.rig.signatures.clone();
+            let installed = f.rig.io.target().agent_path();
+            *f.effects.hook.lock().unwrap() = Some(Arc::new(move |verb, _| {
+                if verb == "bootout" {
+                    *signatures.installed_bad.lock().unwrap() = Some(installed.clone());
+                }
+                Ok(())
+            }));
+            let result = f.apply(RemovalChoices {
+                delete_identity: true,
+                remove_driver: false,
+            });
+            assert!(result.complete, "{result:?}");
+            assert!(trust.exists());
+            assert!(!f.rig.io.target().app_path().exists());
+            assert_eq!(*f.effects.mutations.lock().unwrap(), ["disable", "bootout"]);
+            assert_eq!(
+                result
+                    .rows
+                    .iter()
+                    .find(|r| r.delta.effect == RemovalEffect::EraseOnlyAfterCleanExit)
+                    .unwrap()
+                    .outcome,
+                RemovalOutcome::Kept
+            );
+            assert!(
+                std::fs::read_dir(f.rig.io.target().backups_dir())
+                    .unwrap()
+                    .any(|e| e
+                        .unwrap()
+                        .path()
+                        .join("Crosspane.app/Contents/MacOS/crosspane-tutorial")
+                        .exists())
+            );
+        }
+        #[test]
+        fn legacy_wrong_plist_envelope_never_tracks_or_moves_agent() {
+            for mutation in 0..3 {
+                let r = Rig::new();
+                r.legacy_tutorial();
+                match mutation {
+                    0 => r.put(
+                        &r.io
+                            .target()
+                            .paths()
+                            .home
+                            .join("Library/LaunchAgents/io.frostdev.crosspane.agent.plist"),
+                        b"wrong fixture plist label",
+                        0o644,
+                    ),
+                    1 => r.edit_launch(|v| {
+                        v["receipt"]["resources"][0]["resolved_path"] = json!("/wrong.plist")
+                    }),
+                    _ => {
+                        let mut p = render_plist(r.io.target()).unwrap();
+                        p.push(b' ');
+                        r.put(
+                            &r.io
+                                .target()
+                                .paths()
+                                .home
+                                .join("Library/LaunchAgents/io.frostdev.crosspane.agent.plist"),
+                            &p,
+                            0o644,
+                        );
+                    }
+                }
+                let f = Flow::from_rig(r);
+                let mut removal = MacRemoval::new(f.rig.observer());
+                assert!(
+                    removal
+                        .plan(
+                            1,
+                            OperationId(1),
+                            choices(),
+                            Some(f.rig.current()),
+                            &f.rig.d()
+                        )
+                        .is_err()
+                );
+                assert!(f.effects.mutations.lock().unwrap().is_empty());
+                assert!(f.rig.io.target().app_path().exists());
+            }
         }
         #[test]
         fn b2b_scaffold_explicit_erase_precedes_executable_removal() {

@@ -13,16 +13,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crosspane_installer::agent_contract::*;
-use crosspane_installer::fixture::{FixtureCall, FixtureError, FixtureId, FixtureReceipt};
 use crosspane_installer::live::{
-    Availability, FixtureReadiness, MaintenanceId, MaintenanceOutcome, MaintenanceReport,
-    MaintenanceRequest, NativeJob, NativeOutcome, NativeReport, Platform, PracticeFixtures,
-    StepReport,
+    Availability, MaintenanceId, MaintenanceOutcome, MaintenanceReport, MaintenanceRequest,
+    NativeJob, NativeOutcome, NativeReport, Platform, StepReport,
 };
 use crosspane_installer::platform::linux::integration::{
-    AgentSource, DomainFactory, Domains, FirewallReading, Firewalls, FixtureSource, LinuxPlatform,
-    NativePayloads, NativeRepairer, NativeUninstaller, Parts, RuleApply, RulePresence, Services,
-    Support, SupportOutcome, SupportedAgentPort,
+    AgentSource, DomainFactory, Domains, FirewallReading, Firewalls, LinuxPlatform, NativePayloads,
+    NativeRepairer, NativeUninstaller, Parts, RuleApply, RulePresence, Services, Support,
+    SupportOutcome, SupportedAgentPort,
 };
 use crosspane_installer::platform::linux::{
     firewall::FirewallError,
@@ -30,9 +28,7 @@ use crosspane_installer::platform::linux::{
     payload::*,
     service::{AgentEvidence, ServiceAction, ServiceError, ServiceFacts, ServiceResult},
 };
-use crosspane_installer_core::{
-    AttemptId, JobIntent, JobStage, ObservationSource, OperationId, StepId,
-};
+use crosspane_installer_core::{JobIntent, JobStage, ObservationSource, OperationId, StepId};
 use serde_json::{Value, json};
 
 const PAYLOAD: StepId = StepId(20);
@@ -80,23 +76,23 @@ fn elf(version: u8) -> Vec<u8> {
 }
 
 fn contents(version: u8) -> Vec<Vec<u8>> {
-    (0..10)
+    (0..FILES.len())
         .map(|i| {
-            if i < 5 {
+            if i < 4 {
                 elf(version)
-            } else if i == 5 {
+            } else if i == 4 {
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/../../packaging/linux/crosspane-agent.service"
                 ))
                 .to_vec()
-            } else if i == 6 {
+            } else if i == 5 {
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/../../packaging/linux/crosspane-settings.desktop"
                 ))
                 .to_vec()
-            } else if i == 7 {
+            } else if i == 6 {
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/../../packaging/linux/crosspane-installer.desktop"
@@ -440,27 +436,6 @@ impl SupportedAgentPort for IdleAgent {
     }
 }
 
-struct IdleFixtures;
-impl PracticeFixtures for IdleFixtures {
-    fn launch(&mut self, _: AttemptId) -> Result<(), FixtureError> {
-        Err(FixtureError::Unavailable)
-    }
-    fn readiness(&mut self) -> FixtureReadiness {
-        FixtureReadiness::Idle
-    }
-    fn submit(&mut self, _: FixtureCall) -> Result<(), FixtureError> {
-        Err(FixtureError::Unavailable)
-    }
-    fn poll(&mut self) -> Vec<FixtureReceipt> {
-        Vec::new()
-    }
-    fn complete_closed(&mut self, _: AttemptId, _: FixtureId) -> Result<(), FixtureError> {
-        Ok(())
-    }
-    fn retire(&mut self) {}
-}
-
-/// The real payload installer and removal coordinator on a scratch target, behind the real worker.
 struct Rig {
     platform: LinuxPlatform,
     scratch: Arc<Scratch>,
@@ -503,7 +478,6 @@ impl Rig {
             support,
             domains,
             agent: AgentSource::Injected(Box::new(IdleAgent)),
-            fixtures: FixtureSource::Injected(Box::new(IdleFixtures)),
             package: pkg,
         })
         .unwrap();

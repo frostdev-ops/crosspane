@@ -45,10 +45,9 @@ use super::super::repair::{
 use super::super::transport::{CallerClock, MacAgentPort, SelectedAgent, SelectedLink};
 use super::domains::{
     Admitted, AdmittedInner, Agents, AudioError, AudioPackages, AudioPreview, AudioState,
-    DomainFactory, Domains, FixtureChild, FixtureChildInner, FixtureLauncher, InstallApplied,
-    InstallError, InstallPreview, InstallState, Installs, MAC_CHECKS, RepairFinish, RepairOffer,
-    RepairStep, Repairer, Support, SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
-    mac_support_checks, unconfirmed,
+    DomainFactory, Domains, InstallApplied, InstallError, InstallPreview, InstallState, Installs,
+    MAC_CHECKS, RepairFinish, RepairOffer, RepairStep, Repairer, Support, SupportOutcome,
+    UninstallOffer, UninstallResult, Uninstaller, mac_support_checks, unconfirmed,
 };
 use crate::agent_contract::{
     AgentCall, AgentPort, AgentReply, DecodedReply, InstallerRequest, StatusAdmission,
@@ -66,6 +65,11 @@ pub struct MacProbes {
     pub signatures: Arc<dyn SignatureProbe>,
     pub approval: Arc<dyn ApprovalProbe>,
     pub runner: Arc<dyn CommandRunner>,
+}
+impl std::fmt::Debug for MacProbes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MacProbes")
+    }
 }
 
 impl MacProbes {
@@ -149,7 +153,6 @@ fn requirement(rule: &SigningRule) -> SigningRequirement {
         role: match rule.role {
             PayloadRole::Agent => ArtifactRole::Agent,
             PayloadRole::Settings => ArtifactRole::Settings,
-            PayloadRole::Tutorial => ArtifactRole::Tutorial,
             PayloadRole::Ctl => ArtifactRole::Ctl,
             PayloadRole::Installer => ArtifactRole::Installer,
             PayloadRole::EmbeddedCode => ArtifactRole::EmbeddedCode,
@@ -174,7 +177,6 @@ pub fn domains(env: NativeEnv, checks: SupportChecksSlot) -> DomainFactory {
         agents: Box::new(NativeAgents { env: env.clone() }),
         uninstaller: Box::new(NativeUninstaller::new(env.clone())),
         repairer: Box::new(NativeRepairer::new(env.clone())),
-        fixtures: Some(Box::new(NativeFixtures { env })),
     })
 }
 
@@ -1074,6 +1076,7 @@ fn effect_phrase(effect: RemovalEffect) -> Option<&'static str> {
             "erase this Mac's Crosspane identity and pairings, only after the agent has exited \
              cleanly"
         }
+        RemovalEffect::BackupLegacyAppAfterCleanExit => "back up the previous Crosspane app",
         RemovalEffect::RemoveSharedDriverAfterPackageVerification => {
             "remove the shared Crosspane audio driver"
         }
@@ -1468,6 +1471,17 @@ impl NativeRepairer {
 
     fn admit(&self, deadline: &Deadline) -> Result<MacRepair, String> {
         let io = self.env.io().map_err(admission_text)?;
+        let payload = MacPayload::admit(io.clone(), self.env.inventory.clone(), deadline)
+            .map_err(admission_text)?;
+        if payload
+            .legacy_installed_receipt(deadline)
+            .map_err(admission_text)?
+            .is_some()
+        {
+            return Err(
+                "This older install needs replacement. Its previous app will be backed up.".into(),
+            );
+        }
         if let Some(record) = MacRepair::saved_record(&io, &self.env.inventory, deadline)
             .map_err(|_| unreadable_record_text())?
         {
@@ -2031,56 +2045,6 @@ impl Repairer for NativeRepairer {
                 true,
             ),
         })
-    }
-}
-
-// ---- practice fixture -------------------------------------------------------------------------
-
-pub struct NativeFixtures {
-    env: Arc<NativeEnv>,
-}
-
-impl FixtureLauncher for NativeFixtures {
-    fn launch(
-        &mut self,
-        font: &std::path::Path,
-        deadline: &Deadline,
-    ) -> Result<FixtureChild, String> {
-        let attempt = (|| {
-            let io = self.env.io()?;
-            let agent = self.env.agent_requirement()?;
-            let main = io.admit_main_signature(&io.target().agent_path(), &agent, deadline)?;
-            let support = io.admit_support(&main, deadline)?;
-            let tutorial = self
-                .env
-                .rule("Crosspane.app/Contents/MacOS/crosspane-tutorial")?;
-            let signature = io.admit_artifact_signature(
-                &io.target()
-                    .app_path()
-                    .join("Contents/MacOS/crosspane-tutorial"),
-                &tutorial,
-                &main,
-                deadline,
-            )?;
-            io.launch_tutorial(&support, &signature, font, deadline)
-        })();
-        attempt
-            .map(|child| FixtureChild {
-                inner: FixtureChildInner::Native(Box::new(child)),
-            })
-            .map_err(|_| "The practice window couldn't be started.".to_owned())
-    }
-}
-
-impl std::fmt::Debug for MacProbes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MacProbes")
-    }
-}
-
-impl std::fmt::Debug for NativeEnv {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("NativeEnv")
     }
 }
 

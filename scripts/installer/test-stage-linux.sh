@@ -6,12 +6,12 @@ import hashlib, io, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfil
 
 stage = pathlib.Path(sys.argv[1]).resolve()
 FILES = ["bin/crosspane-agent", "bin/crosspanectl", "bin/crosspane-ui",
-         "bin/crosspane-installer", "bin/crosspane-tutorial",
+         "bin/crosspane-installer",
          "resources/crosspane-agent.service", "resources/crosspane-settings.desktop",
          "resources/crosspane-installer.desktop", "resources/crosspane-icon.svg", "resources/LICENSE"]
-TEMPLATES = {FILES[5]: b"[Service]\nExecStart={{agent_executable}} run\nEnvironment={{xdg_config_environment}}\nEnvironment={{xdg_state_environment}}\nEnvironment={{xdg_runtime_environment}}\nEnvironment={{crosspane_runtime_environment}}\n",
-             FILES[6]: b"[Desktop Entry]\nExec={{settings_executable}}\n",
-             FILES[7]: b"[Desktop Entry]\nExec={{installer_executable}}\n"}
+TEMPLATES = {FILES[4]: b"[Service]\nExecStart={{agent_executable}} run\nEnvironment={{xdg_config_environment}}\nEnvironment={{xdg_state_environment}}\nEnvironment={{xdg_runtime_environment}}\nEnvironment={{crosspane_runtime_environment}}\n",
+             FILES[5]: b"[Desktop Entry]\nExec={{settings_executable}}\n",
+             FILES[6]: b"[Desktop Entry]\nExec={{installer_executable}}\n"}
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 def elf(machine=62):
@@ -31,7 +31,7 @@ def fixture(root, machine=62):
     metadata = {"schema_version": 1, "product_version": "0.0.0", "architecture": "x86_64" if machine == 62 else "aarch64",
                 "source_revision": "1" * 40, "profile": "dev", "libraries": [], "members": []}
     for index, name in enumerate(FILES):
-        data = elf(machine) if index < 5 else TEMPLATES.get(name, b"inert-resource\n")
+        data = elf(machine) if index < 4 else TEMPLATES.get(name, b"inert-resource\n")
         write(root / name, data)
         metadata["members"].append({"name": name, "size": len(data), "sha256": sha(data),
                                     "features": ["video"] if index == 0 else []})
@@ -101,7 +101,7 @@ with tempfile.TemporaryDirectory(prefix="cp47b-stage-", dir="/tmp") as directory
         elif case == 11:
             write(broken / "provenance.json", b'{"schema_version":1,"schema_version":1}')
         else:
-            content = TEMPLATES[FILES[5]]
+            content = TEMPLATES[FILES[4]]
             if case == 12:
                 content = content.replace(b"{{agent_executable}}", b"{{unknown}}")
             elif case == 13:
@@ -123,14 +123,14 @@ with tempfile.TemporaryDirectory(prefix="cp47b-stage-", dir="/tmp") as directory
             elif case == 21:
                 content = content.replace(b"[Service]", b"[Wrong]")
             elif case < 25:
-                content = TEMPLATES[FILES[6]]
+                content = TEMPLATES[FILES[5]]
                 content = (content + b"Exec=/bin/false\n" if case == 22 else
                            content.replace(b"{{settings_executable}}", b'"{{settings_executable}}"') if case == 23 else
                            content + b"Name=raw %f\n")
-                write(broken / FILES[6], content)
+                write(broken / FILES[5], content)
                 record = m["members"][6]
                 record["size"], record["sha256"] = len(content), sha(content)
-                content = TEMPLATES[FILES[5]]
+                content = TEMPLATES[FILES[4]]
             else:
                 # Native-parser normalization cases; our ASCII physical grammar refuses them.
                 index = 5 if case < 29 else 6
@@ -149,9 +149,9 @@ with tempfile.TemporaryDirectory(prefix="cp47b-stage-", dir="/tmp") as directory
                     write(broken / FILES[index], content)
                     record = m["members"][index]
                     record["size"], record["sha256"] = len(content), sha(content)
-                    content = TEMPLATES[FILES[5]]
-            write(broken / FILES[5], content)
-            record = next(row for row in m["members"] if row["name"] == FILES[5])
+                    content = TEMPLATES[FILES[4]]
+            write(broken / FILES[4], content)
+            record = next(row for row in m["members"] if row["name"] == FILES[4])
             record["size"], record["sha256"] = len(content), sha(content)
         if case != 11:
             write(broken / "provenance.json", json.dumps(m).encode())

@@ -7,13 +7,13 @@ exec python3 - "$@" <<'PY'
 import hashlib, json, os, pathlib, re, stat, sys
 
 FILES = ["bin/crosspane-agent", "bin/crosspanectl", "bin/crosspane-ui",
-         "bin/crosspane-installer", "bin/crosspane-tutorial",
+         "bin/crosspane-installer",
          "resources/crosspane-agent.service", "resources/crosspane-settings.desktop",
          "resources/crosspane-installer.desktop", "resources/crosspane-icon.svg", "resources/LICENSE"]
 # Each placeholder is a whole quoted Exec argument or unit Environment assignment, never a fragment.
-FIELDS = {FILES[5]: ["{{agent_executable}}", "{{xdg_config_environment}}", "{{xdg_state_environment}}",
+FIELDS = {FILES[4]: ["{{agent_executable}}", "{{xdg_config_environment}}", "{{xdg_state_environment}}",
                      "{{xdg_runtime_environment}}", "{{crosspane_runtime_environment}}"],
-          FILES[6]: ["{{settings_executable}}"], FILES[7]: ["{{installer_executable}}"]}
+          FILES[5]: ["{{settings_executable}}"], FILES[6]: ["{{installer_executable}}"]}
 LIMIT, RECORD, ARCHIVE = 64 * 1024 * 1024, 65536, 256 * 1024 * 1024
 def require(condition):
     if not condition:
@@ -87,7 +87,7 @@ try:
             and re.fullmatch(r"[0-9a-f]{40}", metadata["source_revision"])
             and metadata["profile"] in ("dev", "release"))
     machine = 62 if metadata["architecture"] == "x86_64" else 183
-    require(isinstance(metadata["members"], list) and len(metadata["members"]) == 10
+    require(isinstance(metadata["members"], list) and len(metadata["members"]) == 9
             and isinstance(metadata["libraries"], list) and 0 < len(metadata["libraries"]) <= 32)
     data, expected = {}, {"provenance.json"}
     for artifact in metadata["members"]:
@@ -114,7 +114,7 @@ try:
                 if line.startswith("["):
                     section = line
                 directive = line.split("=", 1)[0].strip() if "=" in line else ""
-                unit = name == FILES[5]
+                unit = name == FILES[4]
                 expected_section = "[Service]" if unit else "[Desktop Entry]"
                 values = {field: ("ExecStart=" + field + " run" if unit and i == 0 else
                                   "Environment=" + field if unit else "Exec=" + field)

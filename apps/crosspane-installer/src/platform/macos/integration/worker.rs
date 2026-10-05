@@ -22,9 +22,8 @@ use super::super::permissions::{
     ASK_EXPLANATION, MICROPHONE_DETAIL, MICROPHONE_REASON, SettingsPane,
 };
 use super::domains::{
-    Agents, AudioError, AudioPackages, AudioState, DomainFactory, FixtureLauncher, InstallError,
-    InstallState, Installs, RepairFinish, RepairStep, Repairer, Support, SupportOutcome,
-    Uninstaller,
+    Agents, AudioError, AudioPackages, AudioState, DomainFactory, InstallError, InstallState,
+    Installs, RepairFinish, RepairStep, Repairer, Support, SupportOutcome, Uninstaller,
 };
 use super::ports::{Broker, Command};
 use super::{AGENT, AUDIO, INSTALL, PERMISSIONS, SUPPORT};
@@ -68,7 +67,6 @@ pub struct Worker {
     agents: Box<dyn Agents>,
     uninstaller: Box<dyn Uninstaller>,
     repairer: Box<dyn Repairer>,
-    fixtures: Option<Box<dyn FixtureLauncher>>,
     reports: SyncSender<NativeReport>,
     broker: Arc<Broker>,
     stop: Arc<Cancellation>,
@@ -209,7 +207,6 @@ impl Worker {
             agents: domains.agents,
             uninstaller: domains.uninstaller,
             repairer: domains.repairer,
-            fixtures: domains.fixtures,
             reports: parts.reports,
             broker: parts.broker,
             stop: parts.stop,
@@ -230,14 +227,6 @@ impl Worker {
                     let deadline = self.deadline(READ_MS);
                     let result = self.agents.admit(link, &deadline);
                     self.broker.put_admission(ticket, result);
-                }
-                Ok(Command::Fixture { ticket, font }) => {
-                    let deadline = self.deadline(READ_MS);
-                    let result = match self.fixtures.as_mut() {
-                        Some(launcher) => launcher.launch(&font, &deadline),
-                        None => Err("This build can't start the practice window.".into()),
-                    };
-                    self.broker.put_launch(ticket, result);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,

@@ -3,7 +3,7 @@
 //! Only explicit temporary resources and injected process/signature/GUI facts. No ctl
 //! connection, native command, Settings URL, prompt, audio or owner resource is accessed.
 use crosspane_installer::platform::macos::{native_io, transport};
-use crosspane_installer::{agent_contract, tutorial_flow, view};
+use crosspane_installer::{agent_contract, settings_transition, view};
 #[path = "../src/platform/macos/permissions.rs"]
 mod permissions;
 use agent_contract::*;
@@ -331,7 +331,7 @@ impl Fixture {
         );
         assert_eq!(
             g.settings_state(),
-            &tutorial_flow::SettingsTransitionState::NeedsRestartConsent
+            &settings_transition::SettingsTransitionState::NeedsRestartConsent
         );
         g
     }
@@ -1429,14 +1429,14 @@ fn demo_pending_after_settings_restart_settles_frozen_transition_without_live_ev
     assert!(!g.view(f.now()).audio_prerequisite);
     assert_eq!(
         g.settings_state(),
-        &tutorial_flow::SettingsTransitionState::WaitingNewInstance
+        &settings_transition::SettingsTransitionState::WaitingNewInstance
     );
     let mut raw = f.raw();
     raw["result"]["installer"]["config_revision"] = json!(NEW);
     f.poll(&mut g, raw);
     assert_eq!(
         g.settings_state(),
-        &tutorial_flow::SettingsTransitionState::Complete
+        &settings_transition::SettingsTransitionState::Complete
     );
 }
 
@@ -1689,7 +1689,7 @@ fn completed_d7_ordinary_restart_requires_consent_new_instance_and_recovered_hea
     assert_eq!(g.view(f.now()).hiding_choice, None);
     assert_eq!(
         g.settings_state(),
-        &tutorial_flow::SettingsTransitionState::NeedsDetection
+        &settings_transition::SettingsTransitionState::NeedsDetection
     );
 }
 
@@ -1811,7 +1811,7 @@ fn new_admitted_instance_clears_poison_and_retains_returned_settings_verificatio
     f.poll(&mut g, raw.clone());
     assert_eq!(
         g.settings_state(),
-        &tutorial_flow::SettingsTransitionState::Complete
+        &settings_transition::SettingsTransitionState::Complete
     );
     let token = g.view(f.now()).token;
     g.begin_projection_check(&token, PEER.parse().unwrap(), f.now())

@@ -10,7 +10,7 @@ use crate::agent_contract::EraseIdentityV1;
 use crate::platform::linux::{
     firewall::{FirewallError, RuleKind},
     native_io::{ChildEnvironment, LinuxNativeIo, ManagerMutation, NativeError, PendingOperation},
-    payload::{FILES, PayloadInstaller},
+    payload::{CLEANUP_FILES as FILES, PayloadInstaller},
     service::LinuxService,
 };
 
@@ -137,12 +137,14 @@ impl UninstallPlanner {
         {
             return Err(RemovalError::NotClean.into());
         }
-        let paths = PayloadInstaller::new(target.clone()).map_err(RemovalError::from)?;
+        let paths = PayloadInstaller::new(target.clone())
+            .map_err(RemovalError::from)?
+            .cleanup_targets();
         if cleanup.resources().len() != FILES.len()
             || cleanup
                 .resources()
                 .iter()
-                .zip(paths.targets())
+                .zip(&paths)
                 .zip(FILES)
                 .any(|((row, path), name)| {
                     row.receipt.resource_id != name || row.receipt.resolved_path != *path

@@ -8,4 +8,3 @@ pub mod removal;
 pub mod repair;
 pub mod service;
 pub mod transport;
-pub mod tutorial;

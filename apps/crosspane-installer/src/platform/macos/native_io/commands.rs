@@ -186,10 +186,7 @@ impl CommandSpec {
             }
             NativeOperation::ControlledChild { signature, args } => {
                 if signature.nonce != target.nonce
-                    || !matches!(
-                        signature.requirement.role,
-                        ArtifactRole::Settings | ArtifactRole::Tutorial
-                    )
+                    || !matches!(signature.requirement.role, ArtifactRole::Settings)
                     || args.len() > 32
                     || args
                         .iter()

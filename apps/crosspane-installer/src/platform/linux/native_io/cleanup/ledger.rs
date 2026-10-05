@@ -47,8 +47,7 @@ impl LinuxNativeIo {
             io.validate_target()?;
             let paths = PayloadInstaller::new(io.clone())
                 .map_err(|_| NativeError::Foreign)?
-                .targets()
-                .to_vec();
+                .cleanup_targets();
             let path = io
                 .target
                 .paths
@@ -94,8 +93,9 @@ impl LinuxNativeIo {
             if !value["source"].is_string() {
                 return Err(NativeError::Foreign);
             }
-            let ledger: Ledger =
+            let mut ledger: Ledger =
                 serde_json::from_slice(&bytes).map_err(|_| NativeError::Foreign)?;
+            let current = ledger.items.len() == FILES.len() - 1;
             let _ = (ledger.previous_instance, ledger.base_generation);
             if ledger.phase != "Verified"
                 || ledger.source != io.target.source()
@@ -103,20 +103,43 @@ impl LinuxNativeIo {
                 || ledger.receipt.operation_id.0 == 0
                 || ledger.receipt.product_version.is_empty()
                 || ledger.receipt.product_version.len() > 128
-                || ledger.items.len() != FILES.len()
-                || ledger.receipt.resources.len() != FILES.len()
+                || !matches!(ledger.items.len(), 9 | 10)
+                || ledger.receipt.resources.len() != ledger.items.len()
                 || !ledger.receipt.unfinished.is_empty()
             {
                 return Err(NativeError::Foreign);
             }
             let mut entries = Vec::new();
-            for (index, (item, row)) in ledger
-                .items
-                .iter()
-                .zip(&ledger.receipt.resources)
-                .enumerate()
-            {
+            for index in 0..FILES.len() {
                 let mode = if index < 5 { 0o755 } else { 0o644 };
+                if current && index == 4 {
+                    let (snapshot, _) =
+                        Snapshot::open(&io, &paths[index], mode, MAX_MEMBER_BYTES, &d)?;
+                    let observation = if snapshot.hash().is_none() {
+                        ResourceObservation::Absent
+                    } else {
+                        ResourceObservation::Different
+                    };
+                    ledger.receipt.resources.insert(
+                        index,
+                        crosspane_installer_core::ResourceReceipt {
+                            resource_id: FILES[index].into(),
+                            resolved_path: paths[index].to_string_lossy().into_owned(),
+                            ownership: ResourceOwnership::Foreign,
+                            before: observation,
+                            after: observation,
+                            outcome: MutationOutcome::Unknown,
+                        },
+                    );
+                    entries.push(Resource {
+                        snapshot,
+                        hash: [0; 32],
+                        owned: false,
+                    });
+                    continue;
+                }
+                let item = &ledger.items[index - usize::from(current && index > 4)];
+                let row = &ledger.receipt.resources[index];
                 if row.resource_id != FILES[index]
                     || Path::new(&row.resolved_path) != paths[index]
                     || item.ownership != row.ownership

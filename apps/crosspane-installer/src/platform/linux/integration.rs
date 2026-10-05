@@ -1,5 +1,5 @@
 //! The Linux production binding: native adapters on one worker thread, the agent port and the
-//! practice fixture on the GUI thread, composed behind the shared `live::Platform` port.
+//! agent port on the GUI thread, composed behind the shared `live::Platform` port.
 //!
 //! Nothing here decides what a result means. `worker.rs` holds that policy; `domains.rs` wraps
 //! each merged native module; `ports.rs` carries the GUI-thread ports, which ask the worker for a
@@ -30,8 +30,8 @@ mod worker;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -49,9 +49,8 @@ use crate::agent_contract::{AgentPlatform, AgentPort};
 use crate::gui::InstallerController;
 use crate::live::{
     Clock, LiveController, LiveError, NativeJob, NativeRefusal, NativeReport, NativeStep, Platform,
-    PlatformDescription, PracticeFixtures, SupportChecklist, SupportChecksSlot,
+    PlatformDescription, SupportChecklist, SupportChecksSlot,
 };
-use crate::tutorial_flow::TutorialSourcePolicy;
 use crate::view::{ProgressGroup, ScreenId};
 
 pub use domains::{
@@ -60,7 +59,7 @@ pub use domains::{
     RepairFinish, RepairOffer, RepairStep, Repairer, RuleApply, RulePresence, Services, Support,
     SupportOutcome, UninstallOffer, UninstallProgress, Uninstaller,
 };
-pub use ports::{AgentSlot, Command, LinuxPractice, ProofBroker, SupportedAgentPort};
+pub use ports::{AgentSlot, Command, ProofBroker, SupportedAgentPort};
 pub use repair::NativeRepairer;
 pub use uninstall::NativeUninstaller;
 
@@ -82,7 +81,7 @@ pub fn open(
     let deadline = Deadline::new(8_000, Cancellation::default()).map_err(native)?;
     let font =
         detect::fonts::discover(&io, &env, &deadline).context("Cannot read a system font")?;
-    let platform = LinuxPlatform::production(io, env, payload, font.path.clone(), clock.clone())?;
+    let platform = LinuxPlatform::production(io, env, payload, clock.clone())?;
     let controller = LiveController::new(Box::new(platform), clock).map_err(live_err)?;
     Ok((font.definitions, Box::new(controller)))
 }
@@ -306,10 +305,8 @@ pub fn description(resume_note: Option<String>) -> PlatformDescription {
             ),
         ],
         connect_after: vec![AGENT],
-        practice_after: vec![AGENT, NETWORK],
+        ready_after: vec![AGENT, NETWORK],
         hiding_choice: false,
-        source_policy: TutorialSourcePolicy::Native,
-        speakers_device: Some("crosspane.{peer}.speaker".into()),
         resume_note,
     }
 }
@@ -326,7 +323,6 @@ pub struct Parts {
     /// Builds the worker's native domains on the worker thread.
     pub domains: DomainFactory,
     pub agent: AgentSource,
-    pub fixtures: FixtureSource,
     /// An already-validated package, for tests that don't stage one on disk.
     #[doc(hidden)]
     pub package: Option<Package>,
@@ -339,13 +335,6 @@ pub enum AgentSource {
     Injected(Box<dyn SupportedAgentPort>),
 }
 
-pub enum FixtureSource {
-    /// The owned practice window, started once a fresh support proof arrives.
-    Native { font: PathBuf },
-    #[doc(hidden)]
-    Injected(Box<dyn PracticeFixtures>),
-}
-
 pub struct LinuxPlatform {
     skipped: crate::live::SkippedStore,
     desc: PlatformDescription,
@@ -353,20 +342,18 @@ pub struct LinuxPlatform {
     reports: Receiver<NativeReport>,
     broker: Arc<ProofBroker>,
     agent: AgentSlot,
-    fixtures: Box<dyn PracticeFixtures>,
     stop: Arc<Cancellation>,
     /// The support detection's checklist slot, when the support domain reports one.
     checks: Option<SupportChecksSlot>,
 }
 
-opaque_debug!(LinuxPlatform, Parts, AgentSource, FixtureSource);
+opaque_debug!(LinuxPlatform, Parts, AgentSource);
 
 impl LinuxPlatform {
     fn production(
         io: Arc<LinuxNativeIo>,
         env: ChildEnvironment,
         payload: Option<PathBuf>,
-        font: PathBuf,
         clock: Clock,
     ) -> Result<Self> {
         let support = Arc::new(NativeSupport {
@@ -408,7 +395,6 @@ impl LinuxPlatform {
             support,
             domains,
             agent: AgentSource::Native,
-            fixtures: FixtureSource::Native { font },
             package: None,
         })
     }
@@ -416,7 +402,7 @@ impl LinuxPlatform {
     /// Compose from injected parts: the test seam. It exists only in this crate's own tests and
     /// when the non-default `test-hooks` feature is on (the installer's integration tests turn it
     /// on through a dev-dependency on this crate); a production build has no way to inject
-    /// domains, an agent port or fixtures.
+    /// domains or an agent port.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn compose(parts: Parts) -> Result<Self> {
         Self::start(parts)
@@ -437,24 +423,12 @@ impl LinuxPlatform {
         let (commands, receiver) = mpsc::sync_channel::<Command>(8);
         let (reports_tx, reports_rx) = mpsc::sync_channel::<NativeReport>(64);
         let (broker, results) = ProofBroker::new(commands.clone());
-        let tutorial_hash = Arc::new(Mutex::new(None));
         let stop = Arc::new(Cancellation::default());
         let inner: Box<dyn SupportedAgentPort> = match parts.agent {
             AgentSource::Native => Box::new(
                 LinuxAgentPort::new(parts.io.clone(), None, parts.clock.clone()).map_err(native)?,
             ),
             AgentSource::Injected(port) => port,
-        };
-        let fixtures: Box<dyn PracticeFixtures> = match parts.fixtures {
-            FixtureSource::Native { font } => Box::new(LinuxPractice::new(
-                parts.io.clone(),
-                parts.env.clone(),
-                parts.clock.clone(),
-                font,
-                broker.clone(),
-                tutorial_hash.clone(),
-            )),
-            FixtureSource::Injected(fixtures) => fixtures,
         };
         let worker = worker::WorkerParts {
             io: parts.io,
@@ -464,7 +438,6 @@ impl LinuxPlatform {
             domains: parts.domains,
             reports: reports_tx,
             results,
-            tutorial_hash,
             stop: stop.clone(),
             package: parts.package,
         };
@@ -483,7 +456,6 @@ impl LinuxPlatform {
             reports: reports_rx,
             agent: AgentSlot::new(inner, broker.clone(), parts.clock),
             broker,
-            fixtures,
             stop,
             checks,
         })
@@ -523,15 +495,10 @@ impl Platform for LinuxPlatform {
         &mut self.agent
     }
 
-    fn fixtures(&mut self) -> &mut dyn PracticeFixtures {
-        self.fixtures.as_mut()
-    }
-
     fn shutdown(&mut self) {
         self.stop.cancel();
         self.broker.close();
         self.commands = None;
-        self.fixtures.retire();
     }
 
     fn support_checks(&mut self) -> Option<SupportChecklist> {

@@ -14,7 +14,6 @@ pub enum ScreenId {
     MatchNumbers,
     Grants,
     Layout,
-    Practice,
     Summary,
     RepairRemove,
 }
@@ -45,7 +44,6 @@ pub enum ProgressGroup {
     PermissionsNetwork,
     Connect,
     Arrange,
-    Practice,
     Ready,
 }
 
@@ -55,19 +53,11 @@ pub struct ProgressView {
     pub completed: Vec<ProgressGroup>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PracticeIllustration {
-    Pointer,
-    Window,
-    Tone,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IllustrationView {
     pub permission_row: Option<u16>,
     pub traffic_observed: bool,
     pub sas: Option<String>,
-    pub practice: Option<PracticeIllustration>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -176,7 +176,6 @@ fn inline_button_row(id: u16) -> Option<u16> {
     permission_button_row(id).or(match id {
         ids::REOPEN_CONNECT => Some(940),
         ids::REOPEN_ARRANGE => Some(941),
-        ids::REOPEN_PRACTICE => Some(942),
         _ => None,
     })
 }
@@ -260,9 +259,8 @@ fn order(screen: ScreenId) -> u8 {
         ScreenId::MatchNumbers => 9,
         ScreenId::Grants => 10,
         ScreenId::Layout => 11,
-        ScreenId::Practice => 12,
-        ScreenId::Summary => 13,
-        ScreenId::RepairRemove => 14,
+        ScreenId::Summary => 12,
+        ScreenId::RepairRemove => 13,
     }
 }
 
@@ -2405,12 +2403,11 @@ pub(crate) fn check_wording(check: &RowView) -> String {
     }
 }
 
-const PROGRESS_GROUPS: [ProgressGroup; 6] = [
+const PROGRESS_GROUPS: [ProgressGroup; 5] = [
     ProgressGroup::Install,
     ProgressGroup::PermissionsNetwork,
     ProgressGroup::Connect,
     ProgressGroup::Arrange,
-    ProgressGroup::Practice,
     ProgressGroup::Ready,
 ];
 
@@ -2420,7 +2417,6 @@ fn progress_label(group: ProgressGroup) -> &'static str {
         ProgressGroup::PermissionsNetwork => "Permissions",
         ProgressGroup::Connect => "Connect",
         ProgressGroup::Arrange => "Arrange",
-        ProgressGroup::Practice => "Practice",
         ProgressGroup::Ready => "Ready",
     }
 }
@@ -2431,9 +2427,7 @@ fn progress_label(group: ProgressGroup) -> &'static str {
 fn gives_way(screen: ScreenId, room: f32) -> bool {
     match screen {
         ScreenId::Welcome => room < 240.0,
-        ScreenId::Grants | ScreenId::HidingChoice | ScreenId::Practice | ScreenId::Summary => {
-            room < 400.0
-        }
+        ScreenId::Grants | ScreenId::HidingChoice | ScreenId::Summary => room < 400.0,
         _ => false,
     }
 }
@@ -2448,7 +2442,6 @@ fn illustrated(view: &WizardView) -> bool {
             && !view.rows.iter().any(|row| row.state == RowState::NeedsAction))
         || (view.screen == ScreenId::Summary && view.summary == SummaryView::WorkspaceReady)
         || (view.screen == ScreenId::Permissions && view.illustration.permission_row.is_some())
-        || (view.screen == ScreenId::Practice && view.illustration.practice.is_some())
 }
 
 /// Illustrations explain; they never crowd the question. Each has a fixed, modest height.
@@ -2457,7 +2450,7 @@ fn illustration_height(view: &WizardView, body_height: f32) -> f32 {
     let height: f32 = match view.screen {
         ScreenId::Welcome => 132.0,
         ScreenId::MatchNumbers => 104.0,
-        ScreenId::HidingChoice | ScreenId::Practice => 96.0,
+        ScreenId::HidingChoice => 96.0,
         ScreenId::Summary => 64.0,
         _ => 96.0,
     };
@@ -2793,47 +2786,6 @@ fn illustration(ui: &mut egui::Ui, view: &WizardView, height: f32, fraction: f32
                 46.0,
                 theme::ICE,
             );
-        }
-        ScreenId::Practice => {
-            display_glyph(&painter, left, theme::FROST);
-            display_glyph(&painter, right, theme::PEER_ICE);
-            match view.illustration.practice {
-                Some(PracticeIllustration::Pointer) => {
-                    let point = left.center().lerp(right.center(), fraction);
-                    painter.add(egui::Shape::convex_polygon(
-                        vec![
-                            point,
-                            point + egui::vec2(0.0, 22.0),
-                            point + egui::vec2(16.0, 15.0),
-                        ],
-                        theme::ICE,
-                        egui::Stroke::new(1.0, theme::MIDNIGHT),
-                    ));
-                }
-                Some(PracticeIllustration::Window) => window_glyph(
-                    &painter,
-                    egui::Rect::from_center_size(
-                        left.center().lerp(right.center(), fraction),
-                        size * 0.6,
-                    ),
-                ),
-                Some(PracticeIllustration::Tone) => {
-                    for index in 0..5 {
-                        let x = centre.x - 24.0 + index as f32 * 12.0;
-                        let amplitude = 8.0
-                            + (fraction * std::f32::consts::PI).sin().abs()
-                                * (8.0 + index as f32 * 3.0);
-                        painter.line_segment(
-                            [
-                                egui::pos2(x, centre.y - amplitude),
-                                egui::pos2(x, centre.y + amplitude),
-                            ],
-                            (3.0, theme::FROST),
-                        );
-                    }
-                }
-                None => {}
-            }
         }
         ScreenId::Summary => {
             let verified = view

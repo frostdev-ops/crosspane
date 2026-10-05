@@ -367,13 +367,13 @@ fn package_with_icon(architecture: Architecture, icon: &[u8]) -> Package {
     );
     elf[20] = 1;
     elf[52] = 64;
-    let data: Vec<Vec<u8>> = (0..10)
+    let data: Vec<Vec<u8>> = (0..FILES.len())
         .map(|i| match i {
-            0..=4 => elf.clone(),
-            5 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
-            6 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
-            7 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
-            8 => icon.to_vec(),
+            0..=3 => elf.clone(),
+            4 => include_bytes!("../../../packaging/linux/crosspane-agent.service").to_vec(),
+            5 => include_bytes!("../../../packaging/linux/crosspane-settings.desktop").to_vec(),
+            6 => include_bytes!("../../../packaging/linux/crosspane-installer.desktop").to_vec(),
+            7 => icon.to_vec(),
             _ => b"inert resource".to_vec(),
         })
         .collect();
@@ -1183,7 +1183,7 @@ mod uninstall_tests {
         let digest = sha256(&serde_json::to_vec(proof.receipt()).unwrap());
         let lease = proof.lease(&deadline()).unwrap();
         assert!(lease.delete(8, &deadline()).unwrap());
-        let mut resources = [CleanupResult::Pending; FILES.len()];
+        let mut resources = [CleanupResult::Pending; CLEANUP_FILES.len()];
         resources[8] = CleanupResult::Removed;
         CleanupStore::new(lease)
             .write(
@@ -1214,7 +1214,7 @@ mod uninstall_tests {
         let (plan, consent) = planned(&f, RemovalSelection::default(), None, 3, 300);
         assert!(plan.resume(consent, service, &deadline()).is_ok());
         assert!(
-            f.io.metadata(&PayloadInstaller::new(f.io.clone()).unwrap().targets()[8])
+            f.io.metadata(&PayloadInstaller::new(f.io.clone()).unwrap().targets()[7])
                 .unwrap()
                 .is_none()
         );
@@ -1617,7 +1617,13 @@ mod uninstall_tests {
         assert!(
             run.report().progress.resources[..6]
                 .iter()
-                .all(|r| *r == CleanupResult::Kept)
+                .enumerate()
+                .all(|(i, r)| *r
+                    == if i == 4 {
+                        CleanupResult::AlreadyAbsent
+                    } else {
+                        CleanupResult::Kept
+                    })
         );
         assert!(!f.probe.0.lock().unwrap().as_ref().unwrap().is_some());
         assert_eq!(
@@ -1725,7 +1731,13 @@ mod uninstall_tests {
             assert!(
                 run.report().progress.resources[..6]
                     .iter()
-                    .all(|r| *r == CleanupResult::Kept)
+                    .enumerate()
+                    .all(|(i, r)| *r
+                        == if i == 4 {
+                            CleanupResult::AlreadyAbsent
+                        } else {
+                            CleanupResult::Kept
+                        })
             );
         }
     }
@@ -1757,7 +1769,13 @@ mod uninstall_tests {
             assert!(
                 run.report().progress.resources[..6]
                     .iter()
-                    .all(|r| *r == CleanupResult::Kept)
+                    .enumerate()
+                    .all(|(i, r)| *r
+                        == if i == 4 {
+                            CleanupResult::AlreadyAbsent
+                        } else {
+                            CleanupResult::Kept
+                        })
             );
         }
     }
@@ -2206,6 +2224,31 @@ mod uninstall_tests {
         run.observe_exit(&deadline()).unwrap();
         finish_files(f, run);
     }
+    #[test]
+    fn legacy_cleanup_old_ten_removes_tutorial_only_after_genuine_clean_exit() {
+        for clean in [false, true] {
+            let f = Fixture::new(false);
+            let p = package();
+            installed(&f, &p);
+            let leaf = legacy_cleanup_ledger(&f);
+            let service = known_manager(&f, &p, clean);
+            let (plan, consent) =
+                planned(&f, RemovalSelection::default(), Some(f.tracked()), 1, 100);
+            let mut run = plan.begin(consent, service, &deadline()).unwrap();
+            run.disable(&deadline()).unwrap();
+            finish(&f, &mut run);
+            assert_eq!(run.report().progress.resources.len(), 10);
+            assert_eq!(leaf.exists(), !clean);
+            assert_eq!(
+                run.report().progress.resources[4],
+                if clean {
+                    CleanupResult::Removed
+                } else {
+                    CleanupResult::Kept
+                }
+            );
+        }
+    }
     fn finish_clean(f: &Fixture, run: &mut UninstallRun) {
         run.stop(&deadline()).unwrap();
         run.observe_exit(&deadline()).unwrap();
@@ -2473,7 +2516,13 @@ mod uninstall_tests {
         assert!(
             run.report().progress.resources[..6]
                 .iter()
-                .all(|r| *r == CleanupResult::Kept)
+                .enumerate()
+                .all(|(i, r)| *r
+                    == if i == 4 {
+                        CleanupResult::AlreadyAbsent
+                    } else {
+                        CleanupResult::Kept
+                    })
         );
         assert!(
             run.report().progress.resources[6..]
@@ -2540,7 +2589,13 @@ mod uninstall_tests {
         assert!(
             run.report().progress.resources[..6]
                 .iter()
-                .all(|r| *r == CleanupResult::Kept)
+                .enumerate()
+                .all(|(i, r)| *r
+                    == if i == 4 {
+                        CleanupResult::AlreadyAbsent
+                    } else {
+                        CleanupResult::Kept
+                    })
         );
     }
     #[test]
@@ -2655,7 +2710,13 @@ mod uninstall_tests {
         assert!(
             run.report().progress.resources[..6]
                 .iter()
-                .all(|r| *r == CleanupResult::Kept)
+                .enumerate()
+                .all(|(i, r)| *r
+                    == if i == 4 {
+                        CleanupResult::AlreadyAbsent
+                    } else {
+                        CleanupResult::Kept
+                    })
         );
         assert!(
             run.report().progress.resources[6..]
@@ -2715,9 +2776,11 @@ fn cleanup_admits_completed_literal_ledger_with_read_only_exact_snapshots() {
     installed(&f, &package());
     let commands = f.runner.calls.lock().unwrap().len();
     let proof = f.io.admit_cleanup(&deadline()).unwrap();
-    assert_eq!(proof.receipt().resources.len(), 10);
+    assert_eq!(proof.receipt().resources.len(), CLEANUP_FILES.len());
     assert_eq!(proof.observation(0).unwrap(), ResourceObservation::Matching);
     assert!(proof.owned(0).unwrap());
+    assert_eq!(proof.observation(4).unwrap(), ResourceObservation::Absent);
+    assert!(!proof.owned(4).unwrap());
     assert_eq!(proof.observation(10), Err(NativeError::Invalid));
     assert_eq!(proof.owned(10), Err(NativeError::Invalid));
     assert_eq!(format!("{proof:?}"), "CleanupProof(..)");
@@ -2725,6 +2788,7 @@ fn cleanup_admits_completed_literal_ledger_with_read_only_exact_snapshots() {
         .receipt()
         .resources
         .iter()
+        .filter(|r| r.resource_id != "bin/crosspane-tutorial")
         .map(|r| fs::read(&r.resolved_path).unwrap())
         .collect();
     assert!(
@@ -2737,6 +2801,7 @@ fn cleanup_admits_completed_literal_ledger_with_read_only_exact_snapshots() {
         .receipt()
         .resources
         .iter()
+        .filter(|r| r.resource_id != "bin/crosspane-tutorial")
         .map(|r| fs::read(&r.resolved_path).unwrap())
         .collect();
     assert_eq!(before, after);
@@ -2832,6 +2897,115 @@ fn cleanup_ledger(f: &Fixture) -> (PathBuf, Value) {
     (path, value)
 }
 
+fn legacy_cleanup_ledger(f: &Fixture) -> PathBuf {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let leaf = f.io.target().paths().prefix.join("bin/crosspane-tutorial");
+    let bytes = b"owned inert V1 tutorial fixture";
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&leaf)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+    let file = fs::metadata(&leaf).unwrap();
+    let parent = fs::metadata(leaf.parent().unwrap()).unwrap();
+    let hash = sha256(bytes);
+    let (path, mut ledger) = cleanup_ledger(f);
+    ledger["items"].as_array_mut().unwrap().insert(
+        4,
+        json!({
+        "old":null,"new":hash,"template":hash,"ownership":"Created",
+        "replacement":{"file":[file.dev(),file.ino()],"parent":[parent.dev(),parent.ino()],
+        "hash":hash,"mode":493}}),
+    );
+    ledger["receipt"]["resources"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            4,
+            json!({
+        "resource_id":"bin/crosspane-tutorial","resolved_path":leaf,
+        "ownership":"Created","before":"Absent","after":"Matching","outcome":"Verified"}),
+        );
+    f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&ledger).unwrap())
+        .unwrap();
+    leaf
+}
+
+#[test]
+fn legacy_cleanup_current_nine_preserves_ten_slots_without_obsolete_authority() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    assert_eq!(proof.receipt().resources.len(), 10);
+    assert_eq!(
+        proof.receipt().resources[4].resource_id,
+        "bin/crosspane-tutorial"
+    );
+    assert_eq!(proof.observation(4).unwrap(), ResourceObservation::Absent);
+    assert!(!proof.owned(4).unwrap());
+    assert_eq!(
+        proof.receipt().resources[5].resource_id,
+        "resources/crosspane-agent.service"
+    );
+    assert!(proof.owned(5).unwrap());
+}
+
+#[test]
+fn legacy_cleanup_current_nine_never_deletes_an_unrecorded_obsolete_leaf() {
+    let f = Fixture::new(false);
+    installed(&f, &package());
+    let leaf = f.io.target().paths().prefix.join("bin/crosspane-tutorial");
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&leaf)
+        .unwrap()
+        .write_all(b"unrecorded own scratch leaf")
+        .unwrap();
+    let proof = f.io.admit_cleanup(&deadline()).unwrap();
+    assert_eq!(proof.receipt().resources.len(), 10);
+    assert!(!proof.owned(4).unwrap());
+    assert!(
+        !proof
+            .lease(&deadline())
+            .unwrap()
+            .delete(4, &deadline())
+            .unwrap()
+    );
+    assert!(leaf.exists());
+}
+
+#[test]
+fn legacy_cleanup_old_ten_refuses_wrong_slot_path_and_other_counts() {
+    for mutation in 0..3 {
+        let f = Fixture::new(false);
+        installed(&f, &package());
+        legacy_cleanup_ledger(&f);
+        let (path, mut ledger) = cleanup_ledger(&f);
+        match mutation {
+            0 => ledger["receipt"]["resources"]
+                .as_array_mut()
+                .unwrap()
+                .swap(3, 4),
+            1 => ledger["receipt"]["resources"][4]["resolved_path"] = json!("/wrong/tutorial"),
+            _ => {
+                ledger["items"].as_array_mut().unwrap().pop();
+            }
+        }
+        f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&ledger).unwrap())
+            .unwrap();
+        assert!(matches!(
+            f.io.admit_cleanup(&deadline()),
+            Err(NativeError::Foreign)
+        ));
+    }
+}
+
 mod cleanup_consent_tests {
     use super::*;
     use crosspane_installer::platform::linux::removal::executor::*;
@@ -2867,7 +3041,7 @@ mod cleanup_consent_tests {
     fn progress() -> CleanupProgress {
         CleanupProgress {
             stage: CleanupStage::Prepared,
-            resources: [CleanupResult::Pending; FILES.len()],
+            resources: [CleanupResult::Pending; CLEANUP_FILES.len()],
             autostart: CleanupResult::Pending,
             stop: CleanupResult::Pending,
             identity: CleanupResult::Kept,
@@ -2886,9 +3060,15 @@ mod cleanup_consent_tests {
         let f = Fixture::new(false);
         installed(&f, &package());
         let first = inventory(&f);
-        assert_eq!(first.resources().len(), FILES.len());
-        for (row, name) in first.resources().iter().zip(FILES) {
+        assert_eq!(first.resources().len(), CLEANUP_FILES.len());
+        for (row, name) in first.resources().iter().zip(CLEANUP_FILES) {
             assert_eq!(row.receipt.resource_id, name);
+            if name == "bin/crosspane-tutorial" {
+                assert_eq!(row.observation, ResourceObservation::Absent);
+                assert!(!row.owned);
+                assert_eq!(row.action, ResourceAction::AlreadyAbsent);
+                continue;
+            }
             assert_eq!(row.observation, ResourceObservation::Matching);
             assert!(row.owned);
             assert_eq!(
@@ -2910,6 +3090,13 @@ mod cleanup_consent_tests {
             .verify(&f.proof, &p, 19, 100, &f.reply(), &deadline())
             .unwrap();
         for row in inventory(&f).resources() {
+            if row.receipt.resource_id == "bin/crosspane-tutorial" {
+                assert_eq!(row.receipt.ownership, ResourceOwnership::Foreign);
+                assert_eq!(row.observation, ResourceObservation::Absent);
+                assert!(!row.owned);
+                assert_eq!(row.action, ResourceAction::AlreadyAbsent);
+                continue;
+            }
             assert_eq!(row.receipt.ownership, ResourceOwnership::Created);
             assert_eq!(row.observation, ResourceObservation::Matching);
             assert!(!row.owned);
@@ -2933,7 +3120,7 @@ mod cleanup_consent_tests {
         let f = Fixture::new(false);
         installed(&f, &package());
         let targets = PayloadInstaller::new(f.io.clone()).unwrap();
-        let path = &targets.targets()[8];
+        let path = &targets.targets()[7];
         edit_owned(&f, path, b"owned test edit");
         let changed = inventory(&f);
         assert_eq!(
@@ -3105,7 +3292,7 @@ mod cleanup_consent_tests {
                 RemovalSelection::default(),
             )
             .unwrap();
-        let target = PayloadInstaller::new(f.io.clone()).unwrap().targets()[8].clone();
+        let target = PayloadInstaller::new(f.io.clone()).unwrap().targets()[7].clone();
         let original = f.io.read(&target, MAX_MEMBER_BYTES, false).unwrap();
         edit_owned(&f, &target, b"changed test state");
         assert!(matches!(
@@ -3387,7 +3574,7 @@ mod cleanup_intent_tests {
         assert!(!intent.mdns_rule);
         assert_eq!(intent.progress.stage, CleanupStage::Prepared);
         assert_eq!(
-            intent.progress.resources,
+            intent.progress.resources.as_slice(),
             [
                 CleanupResult::Pending,
                 CleanupResult::Removed,
@@ -3400,6 +3587,7 @@ mod cleanup_intent_tests {
                 CleanupResult::Pending,
                 CleanupResult::Pending
             ]
+            .as_slice()
         );
         assert_eq!(intent.progress.autostart, CleanupResult::Removed);
         assert_eq!(intent.progress.stop, CleanupResult::Unknown);
@@ -3909,14 +4097,14 @@ fn cleanup_retains_adopted_foreign_modified_and_same_hash_replaced_resources() {
         installed(&f, &package());
         let (path, mut value) = cleanup_ledger(&f);
         let resource = PathBuf::from(
-            value["receipt"]["resources"][8]["resolved_path"]
+            value["receipt"]["resources"][7]["resolved_path"]
                 .as_str()
                 .unwrap(),
         );
         if change < 2 {
             let ownership = if change == 0 { "Adopted" } else { "Foreign" };
-            value["items"][8]["ownership"] = json!(ownership);
-            value["receipt"]["resources"][8]["ownership"] = json!(ownership);
+            value["items"][7]["ownership"] = json!(ownership);
+            value["receipt"]["resources"][7]["ownership"] = json!(ownership);
             f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&value).unwrap())
                 .unwrap();
         } else if change == 2 {
@@ -3947,7 +4135,7 @@ fn cleanup_absence_is_fresh_noent_and_parent_replacement_cannot_transfer_authori
     installed(&f, &package());
     let (_, value) = cleanup_ledger(&f);
     let path = PathBuf::from(
-        value["receipt"]["resources"][8]["resolved_path"]
+        value["receipt"]["resources"][7]["resolved_path"]
             .as_str()
             .unwrap(),
     );
@@ -4045,7 +4233,7 @@ fn completed_cleanup_repair(minimal: bool) {
     installed(&f, &p);
     let installer = PayloadInstaller::new(f.io.clone()).unwrap();
     if minimal {
-        fs::remove_file(&installer.targets()[8]).unwrap();
+        fs::remove_file(&installer.targets()[7]).unwrap();
     }
     let plan = installer
         .plan(&f.proof, &p, OperationId(48), MatchingFiles::Preserve)
@@ -4059,10 +4247,14 @@ fn completed_cleanup_repair(minimal: bool) {
     assert_eq!(ledger["items"][0]["ownership"], "Created");
     assert!(ledger["items"][0]["replacement"].is_null());
     let proof = f.io.admit_cleanup(&deadline()).unwrap();
-    for index in 0..10 {
+    for index in 0..CLEANUP_FILES.len() {
         assert_eq!(
             proof.observation(index).unwrap(),
-            ResourceObservation::Matching
+            if index == 4 {
+                ResourceObservation::Absent
+            } else {
+                ResourceObservation::Matching
+            }
         );
         assert_eq!(proof.owned(index).unwrap(), minimal && index == 8);
     }
@@ -4107,7 +4299,7 @@ fn cleanup_accepts_genuine_completed_minimal_repair_with_only_one_owned_replacem
 #[test]
 fn cleanup_member_mode_boundary_is_pinned_to_frozen_payload_inventory() {
     assert_eq!(
-        FILES,
+        CLEANUP_FILES,
         [
             "bin/crosspane-agent",
             "bin/crosspanectl",
@@ -4124,11 +4316,16 @@ fn cleanup_member_mode_boundary_is_pinned_to_frozen_payload_inventory() {
     let f = Fixture::new(false);
     installed(&f, &package());
     let proof = f.io.admit_cleanup(&deadline()).unwrap();
-    assert!(FILES.iter().enumerate().all(|(index, name)| if index < 5 {
-        name.starts_with("bin/")
-    } else {
-        name.starts_with("resources/")
-    }));
+    assert!(
+        CLEANUP_FILES
+            .iter()
+            .enumerate()
+            .all(|(index, name)| if index < 5 {
+                name.starts_with("bin/")
+            } else {
+                name.starts_with("resources/")
+            })
+    );
     proof.revalidate(&deadline()).unwrap();
 }
 
@@ -4319,7 +4516,7 @@ fn missing_agent_has_not_clean_form_and_interruption_or_identity_reset_is_never_
         plan.cleanup_form(),
         CleanupForm::NotCleanRetainIdentityAndRecovery
     );
-    assert_eq!(plan.repair_delta().len(), 10);
+    assert_eq!(plan.repair_delta().len(), FILES.len());
     assert!(plan.consent(1, OperationId(1), false).is_err());
     assert!(
         planner
@@ -4426,14 +4623,14 @@ fn adopted_matching_resource_is_retained_and_wrong_architecture_never_proposes_d
             .join("crosspane/installer/payload-outcome.json");
     let mut receipt: Value =
         serde_json::from_slice(&f.io.read(&path, MAX_RECORD_BYTES, true).unwrap()).unwrap();
-    receipt["items"][8]["ownership"] = json!("Adopted");
-    receipt["receipt"]["resources"][8]["ownership"] = json!("Adopted");
+    receipt["items"][7]["ownership"] = json!("Adopted");
+    receipt["receipt"]["resources"][7]["ownership"] = json!("Adopted");
     f.io.atomic_write(&f.proof, &path, &serde_json::to_vec(&receipt).unwrap())
         .unwrap();
     let mut planner = f.planner();
     let facts = f.inventory(&planner, &p);
     assert_eq!(
-        facts.facts().resources.as_ref().unwrap()[8].ownership,
+        facts.facts().resources.as_ref().unwrap()[7].ownership,
         ResourceOwnership::Adopted
     );
     let plan = planner
@@ -4483,7 +4680,7 @@ fn changed_detection_retires_cached_matching_inventory_and_consent() {
         .unwrap();
     let consent = plan.consent(1, OperationId(1), true).unwrap();
     let cached = f.inventory(&planner, &p);
-    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[8].clone();
+    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[7].clone();
     fs::write(icon, b"own injected administrator edit").unwrap();
     let _changed = f.inventory(&planner, &p);
     let before = f.runner.calls.lock().unwrap().len();
@@ -4506,7 +4703,7 @@ fn approved_package_and_exact_repair_delta_cannot_be_substituted() {
     let f = Fixture::new(false);
     let p = package();
     installed(&f, &p);
-    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[8].clone();
+    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[7].clone();
     fs::remove_file(icon).unwrap();
     let mut planner = f.planner();
     let plan = planner
@@ -4604,7 +4801,7 @@ fn validation_itself_redetects_resource_drift_without_a_caller_refresh() {
         .unwrap();
     let consent = plan.consent(1, OperationId(1), true).unwrap();
     let cached = f.inventory(&planner, &p);
-    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[8].clone();
+    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[7].clone();
     fs::write(&icon, b"own injected edit after cached detection").unwrap();
     assert_eq!(
         planner
@@ -4629,7 +4826,7 @@ fn validation_binds_package_even_when_the_supplied_snapshot_is_unchanged() {
     let f = Fixture::new(false);
     let p = package();
     installed(&f, &p);
-    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[8].clone();
+    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[7].clone();
     fs::remove_file(&icon).unwrap();
     let mut planner = f.planner();
     let plan = planner
@@ -4679,7 +4876,7 @@ fn restored_detection_cannot_revive_permanently_retired_consent() {
         )
         .unwrap();
     let consent = plan.consent(1, OperationId(1), true).unwrap();
-    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[8].clone();
+    let icon = PayloadInstaller::new(f.io.clone()).unwrap().targets()[7].clone();
     let original = fs::read(&icon).unwrap();
     fs::write(&icon, b"own injected temporary administrator edit").unwrap();
     let changed = f.inventory(&planner, &p);

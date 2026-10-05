@@ -1,6 +1,6 @@
 use super::super::{CleanupForm, RemovalError, Result};
 use crate::platform::linux::native_io::{CleanupLease, Deadline};
-use crate::platform::linux::payload::{FILES, MAX_RECORD_BYTES};
+use crate::platform::linux::payload::{CLEANUP_FILES as FILES, MAX_RECORD_BYTES};
 use crosspane_installer_core::OperationId;
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +57,7 @@ impl CleanupStage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CleanupProgress {
     pub stage: CleanupStage,
-    /// Fixed order is the frozen payload::FILES inventory, not caller-supplied paths.
+    /// Fixed V1 cleanup order includes the obsolete slot; never caller-supplied paths.
     pub resources: [CleanupResult; FILES.len()],
     pub autostart: CleanupResult,
     pub stop: CleanupResult,

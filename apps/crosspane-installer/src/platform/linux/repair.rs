@@ -158,7 +158,7 @@ impl RepairPlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairOutcome {
-    /// No mutation and no claim that health or tutorial readiness is verified.
+    /// No mutation and no claim that health or readiness is verified.
     NoDelta,
     AwaitingCleanExit,
     AwaitingAgent,

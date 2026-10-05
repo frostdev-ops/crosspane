@@ -5,6 +5,8 @@ use crosspane_installer::agent_contract;
 #[path = "../src/platform/macos/launchd_observation.rs"]
 #[allow(dead_code)]
 mod launchd_observation;
+#[path = "../src/legacy_payload.rs"]
+mod legacy_payload;
 #[path = "../src/platform/macos/native_io.rs"]
 #[allow(dead_code, unused_imports)]
 mod native_io;
@@ -438,10 +440,6 @@ fn inventory() -> ApprovedInventory {
         (
             "Crosspane.app/Contents/MacOS/crosspane-ui",
             Some(PayloadRole::Settings),
-        ),
-        (
-            "Crosspane.app/Contents/MacOS/crosspane-tutorial",
-            Some(PayloadRole::Tutorial),
         ),
         (
             "Crosspane.app/Contents/Frameworks/libfixture.dylib",

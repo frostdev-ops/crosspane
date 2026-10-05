@@ -196,7 +196,7 @@ fn setup(major: u16) -> Setup {
             mono.now_ms()
         })
     };
-    let platform = MacPlatform::native(clock, env, PathBuf::from("/nonexistent/font")).unwrap();
+    let platform = MacPlatform::native(clock, env).unwrap();
     Setup {
         scratch,
         facts,

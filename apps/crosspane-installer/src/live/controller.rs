@@ -10,7 +10,6 @@ use crosspane_types::id::NodeId;
 
 use super::graph::{self, Graph, StepKind};
 use super::ledger::Ledger;
-use super::practice::PracticeState;
 use super::present::MaintenanceState;
 use super::present::permissions::PermissionAsks;
 use super::shared::ConnectState;
@@ -36,7 +35,7 @@ const STATUS_WAIT_MS: u64 = 12_000;
 /// worker can never make the window unclosable.
 const CLOSE_GUARD_MS: u64 = 150_000;
 
-pub(super) const ORDER: [ScreenId; 13] = [
+pub(super) const ORDER: [ScreenId; 12] = [
     ScreenId::Welcome,
     ScreenId::Compatibility,
     ScreenId::InstallPlan,
@@ -48,7 +47,6 @@ pub(super) const ORDER: [ScreenId; 13] = [
     ScreenId::Connect,
     ScreenId::Grants,
     ScreenId::Layout,
-    ScreenId::Practice,
     ScreenId::Summary,
 ];
 
@@ -110,7 +108,6 @@ pub struct LiveController {
     pub(super) health: Option<Health>,
     pub(super) peer: Option<NodeId>,
     pub(super) connect: ConnectState,
-    pub(super) practice: PracticeState,
     pub(super) maintenance: MaintenanceState,
     pub(super) screen: ScreenId,
     pub(super) view: WizardView,
@@ -260,7 +257,6 @@ impl LiveController {
             health: None,
             peer: None,
             connect: ConnectState::default(),
-            practice: PracticeState::default(),
             maintenance: MaintenanceState::default(),
             screen: ScreenId::Welcome,
             view: crate::demo::disconnected_view(),
@@ -404,7 +400,6 @@ impl LiveController {
             }
             match self.graph.kind(job.step) {
                 Some(StepKind::Native) => self.dispatch_native(job),
-                Some(StepKind::Practice(role)) => self.dispatch_practice(job, role),
                 Some(StepKind::Final) => self.dispatch_final(job),
                 Some(StepKind::Pair) => self.dispatch_pair(job),
                 Some(StepKind::Grants) => self.dispatch_grants(job),
@@ -509,8 +504,7 @@ impl LiveController {
     /// Issue a Status call now unless one is already outstanding.
     pub(super) fn request_status_now(&mut self) {
         // While the sequencer polls, its own Status replies release held jobs.
-        if self.practice.engaged(self.now) || self.own_calls.values().any(|k| *k == OwnCall::Status)
-        {
+        if self.own_calls.values().any(|k| *k == OwnCall::Status) {
             return;
         }
         self.status_sent_at = Some(self.now);
@@ -671,11 +665,9 @@ impl LiveController {
         let _ = self.reduce(event);
     }
 
-    /// Own calls, settings and the tutorial share one increasing id namespace.
+    /// Own calls and settings share one increasing id namespace.
     pub(super) fn alloc_call_id(&mut self) -> u64 {
-        let id = self
-            .next_call
-            .max(self.practice.tutorial.last_call_id().saturating_add(1));
+        let id = self.next_call;
         self.next_call = id.saturating_add(1);
         id
     }
@@ -713,9 +705,8 @@ impl LiveController {
         self.stamp();
         for reply in replies {
             self.now = self.now.max(reply.observed_at_ms);
-            match self.own_calls.remove(&reply.id) {
-                Some(kind) => self.own_reply(kind, reply),
-                None => self.practice_reply(reply),
+            if let Some(kind) = self.own_calls.remove(&reply.id) {
+                self.own_reply(kind, reply);
             }
             self.dispatch_intents();
         }
@@ -797,8 +788,7 @@ impl LiveController {
     }
 
     fn poll_status(&mut self) {
-        if self.practice.engaged(self.now)
-            || self.summary.milestone == crosspane_installer_core::Milestone::NotInstalled
+        if self.summary.milestone == crosspane_installer_core::Milestone::NotInstalled
             || self.own_calls.values().any(|k| *k == OwnCall::Status)
         {
             return;
@@ -829,20 +819,14 @@ impl LiveController {
                 | ScreenId::MatchNumbers
                 | ScreenId::Grants
                 | ScreenId::Layout
-                | ScreenId::Practice
                 | ScreenId::HidingChoice
                 | ScreenId::Summary
         )
     }
 
-    /// Detection only: Begin never mutates. Practice steps wait for the person.
+    /// Detection only: Begin never mutates.
     fn auto_begin(&mut self) {
-        let candidates: Vec<StepId> = self
-            .graph
-            .on_screen(self.screen)
-            .filter(|m| !matches!(m.kind, StepKind::Practice(_)))
-            .map(|m| m.id)
-            .collect();
+        let candidates: Vec<StepId> = self.graph.on_screen(self.screen).map(|m| m.id).collect();
         for step in candidates {
             // A step that reads the agent (it may still be starting, or waiting for the person to
             // unlock the key store) is looked at again on its own screen, quietly and rarely.
@@ -926,13 +910,6 @@ impl LiveController {
         if self.skipped_on(self.screen) && !self.reopened.contains(&self.screen) {
             return false;
         }
-        if self.screen == ScreenId::Practice {
-            return self
-                .graph
-                .practice_steps()
-                .iter()
-                .all(|step| self.settled(*step));
-        }
         self.screen_complete(self.screen)
             && !self
                 .graph
@@ -980,10 +957,8 @@ impl LiveController {
     }
 
     pub(super) fn screen_present(&self, screen: ScreenId) -> bool {
-        matches!(
-            screen,
-            ScreenId::Welcome | ScreenId::Practice | ScreenId::Summary
-        ) || self.graph.on_screen(screen).next().is_some()
+        matches!(screen, ScreenId::Welcome | ScreenId::Summary)
+            || self.graph.on_screen(screen).next().is_some()
     }
 
     pub(super) fn screen_complete(&self, screen: ScreenId) -> bool {
@@ -1078,7 +1053,6 @@ impl LiveController {
         self.jobs.values().any(|j| j.stage == JobStage::Apply)
             || self.maintenance.running()
             || self.maintenance.repair_waiting()
-            || self.practice.engaged(self.now)
     }
 
     /// A native change (a platform Apply or a removal) that closing the window would cut short.
@@ -1174,8 +1148,6 @@ impl InstallerController for LiveController {
             None
         };
         self.drain_agent();
-        self.drain_fixtures();
-        self.practice_tick();
         self.finish_skip();
         self.poll_status();
         self.status_wait_tick();
@@ -1224,9 +1196,6 @@ impl InstallerController for LiveController {
         if self.closed {
             return;
         }
-        self.practice.deferred = None;
-        self.cancel_practice();
-        self.platform.fixtures().retire();
         self.platform.shutdown();
         self.closed = true;
     }

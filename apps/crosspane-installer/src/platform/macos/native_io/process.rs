@@ -55,7 +55,7 @@ impl AdmittedInstance {
     pub fn admit_status(&self, status: &InstanceStatus) -> NativeResult<()> {
         if status.id != self.bootstrap.instance_id
             || status.pid != self.process.pid
-            || status.uid != self.process.uid
+            || status.uid != Some(self.process.uid)
             || admitted_spelling(Path::new(&status.exe))? != self.process.executable
             || admitted_spelling(Path::new(&status.runtime_dir))?
                 != admitted_spelling(Path::new(&self.bootstrap.runtime_dir))?

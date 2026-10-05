@@ -9,21 +9,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crosspane_installer::agent_contract::*;
-use crosspane_installer::fixture::{
-    FixtureCall, FixtureCommand, FixtureError, FixtureEvent, FixtureId, FixtureMessage,
-    FixtureReceipt, FixtureSnapshot, OwnToneState, OwnWindowFacts, PhaseId, ToneId,
-};
 use crosspane_installer::gui::{InstallerController, ShellEffect};
 use crosspane_installer::live::{
-    self, Clock, FixtureReadiness, LiveController, MaintenanceId, MaintenanceReport,
-    MaintenanceRequest, NativeJob, NativeOutcome, NativeRefusal, NativeReport, NativeStep,
-    Platform, PlatformDescription, PracticeFixtures, RepairOutcome, StepReport, ids,
+    self, Clock, LiveController, MaintenanceId, MaintenanceReport, MaintenanceRequest, NativeJob,
+    NativeOutcome, NativeRefusal, NativeReport, NativeStep, Platform, PlatformDescription,
+    RepairOutcome, StepReport, ids,
 };
 use crosspane_installer::live::{CheckState, SupportCheck, SupportChecklist, SupportChecksSlot};
-use crosspane_installer::tutorial_flow::{HumanConfirmation, TutorialRole, TutorialSourcePolicy};
 use crosspane_installer::view::*;
 use crosspane_installer_core::*;
-use crosspane_types::id::{NodeId, WindowId};
+use crosspane_types::id::NodeId;
 use crosspane_ui_kit::layout::{LayoutAction, PlacementIntent};
 use serde_json::{Value, json};
 
@@ -88,10 +83,8 @@ fn description() -> PlatformDescription {
             native(AGENT, &[PAYLOAD], ScreenId::Installing, true),
         ],
         connect_after: vec![AGENT],
-        practice_after: vec![AGENT],
+        ready_after: vec![AGENT],
         hiding_choice: false,
-        source_policy: TutorialSourcePolicy::Native,
-        speakers_device: Some("validated virtual output".into()),
         resume_note: None,
     }
 }
@@ -117,53 +110,10 @@ impl AgentPort for SharedAgent {
     }
 }
 
-#[derive(Default)]
-struct FixtureState {
-    launches: Vec<AttemptId>,
-    readiness: Option<FixtureReadiness>,
-    calls: Vec<FixtureCall>,
-    receipts: Vec<FixtureReceipt>,
-    closed: Vec<(AttemptId, FixtureId)>,
-    retired: u32,
-}
-struct SharedFixtures(Rc<RefCell<FixtureState>>);
-impl PracticeFixtures for SharedFixtures {
-    fn launch(&mut self, attempt: AttemptId) -> Result<(), FixtureError> {
-        let mut s = self.0.borrow_mut();
-        s.launches.push(attempt);
-        s.readiness = Some(FixtureReadiness::Launching);
-        Ok(())
-    }
-    fn readiness(&mut self) -> FixtureReadiness {
-        self.0.borrow().readiness.unwrap_or(FixtureReadiness::Idle)
-    }
-    fn submit(&mut self, call: FixtureCall) -> Result<(), FixtureError> {
-        self.0.borrow_mut().calls.push(call);
-        Ok(())
-    }
-    fn poll(&mut self) -> Vec<FixtureReceipt> {
-        std::mem::take(&mut self.0.borrow_mut().receipts)
-    }
-    fn complete_closed(
-        &mut self,
-        attempt: AttemptId,
-        fixture: FixtureId,
-    ) -> Result<(), FixtureError> {
-        self.0.borrow_mut().closed.push((attempt, fixture));
-        Ok(())
-    }
-    fn retire(&mut self) {
-        let mut s = self.0.borrow_mut();
-        s.retired += 1;
-        s.readiness = None;
-    }
-}
-
 struct Fake {
     description: PlatformDescription,
     native: Rc<RefCell<Native>>,
     agent: SharedAgent,
-    fixtures: SharedFixtures,
     checks: Option<SupportChecksSlot>,
 }
 impl Platform for Fake {
@@ -183,9 +133,6 @@ impl Platform for Fake {
     }
     fn agent(&mut self) -> &mut dyn AgentPort {
         &mut self.agent
-    }
-    fn fixtures(&mut self) -> &mut dyn PracticeFixtures {
-        &mut self.fixtures
     }
     fn shutdown(&mut self) {
         self.native.borrow_mut().shutdown = true;
@@ -208,12 +155,10 @@ struct H {
     c: LiveController,
     native: Rc<RefCell<Native>>,
     agent: Rc<RefCell<AgentQueue>>,
-    fixtures: Rc<RefCell<FixtureState>>,
     clock: Arc<AtomicU64>,
     status: Value,
     calls: Vec<AgentCall>,
     effects: Vec<ShellEffect>,
-    fixture_sequence: u64,
     /// Where the last `next` (or `install`) left the flow.
     last: ScreenId,
     /// The platform the fake agent's replies are decoded for.
@@ -230,7 +175,6 @@ impl H {
     fn with_checks(description: PlatformDescription, checks: Option<SupportChecksSlot>) -> Self {
         let native = Rc::new(RefCell::new(Native::default()));
         let agent = Rc::new(RefCell::new(AgentQueue::default()));
-        let fixtures = Rc::new(RefCell::new(FixtureState::default()));
         let clock = Arc::new(AtomicU64::new(1_000));
         let time = clock.clone();
         let clock_fn: Clock = Arc::new(move || time.load(Ordering::SeqCst));
@@ -240,7 +184,6 @@ impl H {
                 description,
                 native: native.clone(),
                 agent: SharedAgent(agent.clone()),
-                fixtures: SharedFixtures(fixtures.clone()),
                 checks,
             }),
             clock_fn,
@@ -250,18 +193,23 @@ impl H {
             c,
             native,
             agent,
-            fixtures,
             clock,
             status: serde_json::from_str(STATUS).unwrap(),
             calls: Vec::new(),
             effects: Vec::new(),
-            fixture_sequence: 0,
             last: ScreenId::Welcome,
             platform,
         }
     }
     fn advance(&mut self, ms: u64) {
         self.clock.fetch_add(ms, Ordering::SeqCst);
+    }
+    fn set(&mut self, path: &[&str], value: Value) {
+        let mut at = &mut self.status["result"];
+        for key in path {
+            at = &mut at[*key];
+        }
+        *at = value;
     }
     fn now(&self) -> u64 {
         self.clock.load(Ordering::SeqCst)
@@ -486,7 +434,6 @@ fn graph_rejects_platform_steps_outside_the_reserved_range_or_shared_anchors() {
             description: bad,
             native: Rc::default(),
             agent: SharedAgent(Rc::default()),
-            fixtures: SharedFixtures(Rc::default()),
             checks: None,
         }),
         Arc::new(|| 1),
@@ -500,7 +447,6 @@ fn graph_rejects_platform_steps_outside_the_reserved_range_or_shared_anchors() {
                 description: unknown,
                 native: Rc::default(),
                 agent: SharedAgent(Rc::default()),
-                fixtures: SharedFixtures(Rc::default()),
                 checks: None,
             }),
             Arc::new(|| 1),
@@ -1076,7 +1022,7 @@ fn connect_skip_retires_pairing_and_reopens_only_after_an_explicit_action() {
     h.click(ids::SKIP);
     assert_eq!(h.view().screen, ScreenId::Summary);
     let saved = h.native.borrow().skipped.clone();
-    assert_eq!(saved.len(), 12);
+    assert_eq!(saved.len(), 3);
     assert!(saved.contains(&live::steps::PAIR));
     assert!(saved.contains(&live::steps::GRANTS));
     h.pair_status(&listen, r#"{"ok":true,"result":{"phase":"confirm","sas":"123 456","candidates":[],"peer":"fixture","error":null}}"#);
@@ -1090,7 +1036,7 @@ fn connect_skip_retires_pairing_and_reopens_only_after_an_explicit_action() {
             .iter()
             .filter(|r| r.state == RowState::Skipped)
             .count()
-            == 3
+            == 2
     );
     h.set(&["installer", "startup_recovery"], json!("failed"));
     h.status_reply();
@@ -1119,7 +1065,6 @@ fn connect_skip_retires_pairing_and_reopens_only_after_an_explicit_action() {
             description: description(),
             native: h.native.clone(),
             agent: SharedAgent(h.agent.clone()),
-            fixtures: SharedFixtures(h.fixtures.clone()),
             checks: None,
         }),
         Arc::new(move || time.load(Ordering::SeqCst)),
@@ -1145,50 +1090,6 @@ fn connect_skip_retires_pairing_and_reopens_only_after_an_explicit_action() {
     assert_eq!(h.row(live::steps::PAIR).state, RowState::Verified);
     assert!(!h.native.borrow().skipped.contains(&live::steps::PAIR));
     assert!(h.native.borrow().skipped.contains(&live::steps::LAYOUT));
-    assert!(
-        h.native
-            .borrow()
-            .skipped
-            .contains(&live::steps::practice(TutorialRole::E1Controller))
-    );
-    let mut practice = H::new();
-    to_practice(&mut practice);
-    practice.begin_practice(TutorialRole::E1Target);
-    practice.fixture_open();
-    let arm = practice
-        .fixture_command(|c| matches!(c, FixtureCommand::ArmTarget { .. }))
-        .unwrap();
-    let FixtureCommand::ArmTarget { phase, .. } = arm.command else {
-        unreachable!()
-    };
-    practice.click(ids::SKIP);
-    assert_eq!(
-        practice.view().screen,
-        ScreenId::Practice,
-        "owned cleanup precedes advancement"
-    );
-    assert!(
-        !practice
-            .native
-            .borrow()
-            .skipped
-            .contains(&live::steps::practice(TutorialRole::E1Target))
-    );
-    practice.fixture_reply(
-        &arm,
-        Ok(FixtureEvent::TargetArmed {
-            fixture: FixtureId(10),
-            phase,
-        }),
-    );
-    practice.fixture_close();
-    practice.status_reply();
-    assert_eq!(practice.view().screen, ScreenId::Summary);
-    assert_eq!(practice.native.borrow().skipped.len(), 9);
-    assert_eq!(
-        practice.practice_row(TutorialRole::E1Target).state,
-        RowState::Skipped
-    );
 }
 
 #[test]
@@ -1571,7 +1472,6 @@ fn while_waiting_to_be_found_the_person_can_still_type_an_address_or_go_back() {
 fn hiding_description() -> PlatformDescription {
     let mut d = description();
     d.hiding_choice = true;
-    d.source_policy = TutorialSourcePolicy::MacMirror;
     d
 }
 
@@ -2035,7 +1935,7 @@ fn a_layout_the_agent_already_holds_is_done_on_reopen() {
         h.advance(100);
         h.tick();
     }
-    assert_eq!(h.view().screen, ScreenId::Practice);
+    assert_eq!(h.view().screen, ScreenId::Summary);
 }
 
 #[test]
@@ -2140,485 +2040,12 @@ fn close_shuts_the_platform_down() {
     assert!(h.native.borrow().shutdown);
 }
 
-// ---- practice -------------------------------------------------------------------------------
-
-impl H {
-    fn counter(&mut self, name: &str, value: u64) {
-        self.status["result"]["installer"]["peers"][0]["counters"][name] = json!(value);
-    }
-    fn bump(&mut self, name: &str, by: u64) {
-        let now = self.status["result"]["installer"]["peers"][0]["counters"][name]
-            .as_u64()
-            .unwrap_or(0);
-        self.counter(name, now + by);
-    }
-    fn practice_row(&self, role: TutorialRole) -> RowView {
-        self.row(live::steps::practice(role))
-    }
-    fn confirm(&mut self, c: HumanConfirmation) {
-        self.click(ids::confirm(c));
-    }
-    fn begin_practice(&mut self, role: TutorialRole) {
-        self.click(ids::practice_start(role));
-        // The first answer may belong to a poll that was already in flight; the second is the
-        // sequencer's own baseline.
-        self.status_reply();
-        self.status_reply();
-    }
-    /// The fixture command the controller submitted, if any.
-    fn fixture_command(
-        &mut self,
-        matches: impl Fn(&FixtureCommand) -> bool,
-    ) -> Option<FixtureCall> {
-        let mut state = self.fixtures.borrow_mut();
-        let i = state.calls.iter().position(|c| matches(&c.command))?;
-        Some(state.calls.remove(i))
-    }
-    /// Let the fixture child "start" and deliver its receipt for `call`.
-    fn fixture_reply(&mut self, call: &FixtureCall, result: Result<FixtureEvent, FixtureError>) {
-        self.fixture_sequence += 1;
-        let receipt = FixtureReceipt {
-            received_at_ms: self.now() + 1,
-            message: FixtureMessage {
-                call_id: Some(call.id),
-                attempt: call.attempt,
-                sequence: self.fixture_sequence,
-                result,
-            },
-        };
-        self.fixtures.borrow_mut().receipts.push(receipt);
-        self.advance(2);
-        self.tick();
-    }
-    fn fixture_event(&mut self, attempt: AttemptId, event: FixtureEvent) {
-        self.fixture_sequence += 1;
-        let receipt = FixtureReceipt {
-            received_at_ms: self.now() + 1,
-            message: FixtureMessage {
-                call_id: None,
-                attempt,
-                sequence: self.fixture_sequence,
-                result: Ok(event),
-            },
-        };
-        self.fixtures.borrow_mut().receipts.push(receipt);
-        self.advance(2);
-        self.tick();
-    }
-    /// Make the fixture ready and run until the sequencer submits the Open command.
-    fn fixture_open(&mut self) -> FixtureCall {
-        self.fixtures.borrow_mut().readiness = Some(FixtureReadiness::Ready);
-        for _ in 0..8 {
-            self.advance(100);
-            self.tick();
-            if let Some(call) = self.fixture_command(|c| matches!(c, FixtureCommand::Open { .. })) {
-                self.fixture_reply(
-                    &call,
-                    Ok(FixtureEvent::Opened {
-                        fixture: FixtureId(10),
-                        pid: 123,
-                        window: WindowId(100),
-                        label: "own fixture A".into(),
-                    }),
-                );
-                return call;
-            }
-        }
-        panic!("the sequencer never asked the fixture to open");
-    }
-}
-
-fn to_practice(h: &mut H) {
-    to_grants(h);
-    h.paired_peer(&ALL_GRANTS);
-    h.status_reply();
-    h.status_reply();
-    assert_eq!(h.row(live::steps::GRANTS).state, RowState::Verified);
-    h.next();
-    assert_eq!(h.view().screen, ScreenId::Layout);
-    h.placements();
-    h.status_reply();
-    h.click(ids::LAYOUT_ACCEPT);
-    h.status_reply();
-    h.status_reply();
-    assert_eq!(h.row(live::steps::LAYOUT).state, RowState::Verified);
-    h.next();
-    assert_eq!(h.view().screen, ScreenId::Practice);
-}
-
-#[test]
-fn practice_starts_only_on_an_explicit_click_and_never_before_prerequisites() {
-    let mut h = H::new();
-    to_grants(&mut h);
-    h.paired_peer(&ALL_GRANTS);
-    h.status_reply();
-    h.status_reply();
-    h.next();
-    h.placements();
-    h.status_reply();
-    // Layout is not committed yet, so the screen stays and no practice can start.
-    for _ in 0..5 {
-        h.advance(500);
-        h.tick();
-    }
-    assert_eq!(h.view().screen, ScreenId::Layout);
-    assert!(h.button(ids::NEXT).is_none());
-    let mut h = H::new();
-    to_practice(&mut h);
-    for _ in 0..6 {
-        h.advance(600);
-        h.tick();
-    }
-    assert!(h.fixtures.borrow().launches.is_empty());
-    assert!(
-        !h.has_call(|r| matches!(
-            r,
-            InstallerRequest::Project { .. }
-                | InstallerRequest::Pull { .. }
-                | InstallerRequest::Release
-        )),
-        "nothing is projected or released until the person starts a practice"
-    );
-    assert_eq!(h.summary(), SummaryView::InstalledWaiting);
-}
-
-#[test]
-fn menu_practice_needs_the_spawn_counter_the_tray_and_the_human() {
-    let mut h = H::new();
-    to_practice(&mut h);
-    h.begin_practice(TutorialRole::Menu);
-    h.confirm(HumanConfirmation::TrayAndSettingsVisible);
-    assert_ne!(h.practice_row(TutorialRole::Menu).state, RowState::Verified);
-    h.status["result"]["installer"]["settings_opened"] = json!(1);
-    h.status_reply();
-    h.status_reply();
-    assert_eq!(h.practice_row(TutorialRole::Menu).state, RowState::Verified);
-    assert!(h.practice_row(TutorialRole::Menu).human_confirmed);
-}
-
-#[test]
-fn e1_controller_passes_with_the_chord_release_and_not_with_a_command_release() {
-    let mut command = H::new();
-    to_practice(&mut command);
-    command.begin_practice(TutorialRole::E1Controller);
-    command.bump("e1_controller_started", 1);
-    command.bump("e1_controller_ended", 1);
-    command.bump("e1_command_releases", 1);
-    command.status_reply();
-    let _ = command
-        .view()
-        .buttons
-        .iter()
-        .find(|b| b.id == ids::confirm(HumanConfirmation::RemotePracticeAndHud));
-    if command
-        .button(ids::confirm(HumanConfirmation::RemotePracticeAndHud))
-        .is_some_and(|b| b.enabled)
-    {
-        command.confirm(HumanConfirmation::RemotePracticeAndHud);
-    }
-    assert_ne!(
-        command.practice_row(TutorialRole::E1Controller).state,
-        RowState::Verified,
-        "a command release is not the chord"
-    );
-
-    let mut h = H::new();
-    to_practice(&mut h);
-    h.begin_practice(TutorialRole::E1Controller);
-    h.bump("e1_controller_started", 1);
-    h.bump("e1_controller_ended", 1);
-    h.bump("e1_chord_releases", 1);
-    h.status_reply();
-    h.confirm(HumanConfirmation::RemotePracticeAndHud);
-    assert_eq!(
-        h.practice_row(TutorialRole::E1Controller).state,
-        RowState::Verified
-    );
-}
-
-fn snapshot(phase: Option<u64>, clicks: u64, facts: OwnWindowFacts) -> FixtureEvent {
-    FixtureEvent::Snapshot {
-        snapshot: FixtureSnapshot {
-            fixture: FixtureId(10),
-            window: WindowId(100),
-            phase: phase.map(PhaseId),
-            pattern_ticks: 10,
-            target_clicks: clicks,
-            window_facts: facts,
-            tone: OwnToneState::Stopped,
-        },
-    }
-}
-
-fn home() -> OwnWindowFacts {
-    OwnWindowFacts::Present {
-        visible_on_user_workspace: Some(true),
-        on_initial_display: Some(true),
-    }
-}
-
-impl H {
-    fn attempt(&self) -> AttemptId {
-        *self
-            .fixtures
-            .borrow()
-            .launches
-            .last()
-            .expect("a launched attempt")
-    }
-    fn windows_reply(&mut self, request: InstallerRequest, body: &str) {
-        let call = self.call(|r| *r == request);
-        let decoded = decode_reply(&request, body.as_bytes(), AgentPlatform::Linux).unwrap();
-        self.reply(&call, Ok(decoded));
-    }
-    fn projection(&mut self, source: NodeId, on: bool) {
-        self.status["result"]["projections"] = if on {
-            json!([{"source": source.short(), "projection": 55, "text": "sensitive title",
-                "received": {"frames": 999999, "bytes": 999999}}])
-        } else {
-            json!([])
-        };
-    }
-    fn set(&mut self, path: &[&str], value: Value) {
-        let mut at = &mut self.status["result"];
-        for key in path {
-            at = &mut at[*key];
-        }
-        *at = value;
-    }
-    fn fixture_close(&mut self) {
-        let call = self
-            .fixture_command(|c| matches!(c, FixtureCommand::Close { .. }))
-            .expect("the owned fixture is closed");
-        self.fixture_reply(
-            &call,
-            Ok(FixtureEvent::Closed {
-                fixture: FixtureId(10),
-            }),
-        );
-    }
-    fn fixture_home(&mut self) {
-        let call = self
-            .fixture_command(|c| matches!(c, FixtureCommand::ObserveWindow { .. }))
-            .expect("the controller observes the fixture's home window");
-        self.fixture_reply(&call, Ok(snapshot(None, 0, home())));
-    }
-}
-
-fn run_e1_target(h: &mut H) {
-    h.begin_practice(TutorialRole::E1Target);
-    h.fixture_open();
-    let arm = h
-        .fixture_command(|c| matches!(c, FixtureCommand::ArmTarget { .. }))
-        .expect("the target is armed");
-    let FixtureCommand::ArmTarget { phase, .. } = arm.command.clone() else {
-        unreachable!()
-    };
-    h.fixture_reply(
-        &arm,
-        Ok(FixtureEvent::TargetArmed {
-            fixture: FixtureId(10),
-            phase,
-        }),
-    );
-    let attempt = h.attempt();
-    h.fixture_event(attempt, snapshot(Some(phase.0), 1, OwnWindowFacts::Unknown));
-    for name in [
-        "e1_target_started",
-        "e1_target_ended",
-        "e1_injections_ok",
-        "e1_hud_shows",
-    ] {
-        h.bump(name, 1);
-    }
-    h.status_reply();
-    h.confirm(HumanConfirmation::ControllerCrossingAndRelease);
-    h.fixture_close();
-}
-
-fn e2_start(h: &mut H, role: TutorialRole) {
-    let source = matches!(
-        role,
-        TutorialRole::E2SourcePush | TutorialRole::E2SourcePull
-    );
-    h.begin_practice(role);
-    match role {
-        TutorialRole::E2SourcePush => {
-            h.fixture_open();
-            h.windows_reply(
-                InstallerRequest::Windows,
-                r#"{"ok":true,"result":[{"id":100,"app":"fixture","title":"sensitive","display":null,"size":[20.5,30.5]}]}"#,
-            );
-            let project = h.call(|r| matches!(r, InstallerRequest::Project { .. }));
-            assert_eq!(
-                project.request,
-                InstallerRequest::Project {
-                    window: WindowId(100),
-                    peer: peer()
-                },
-                "only the owned fixture window is ever projected"
-            );
-            h.ack(&project);
-        }
-        TutorialRole::E2SourcePull => {
-            h.fixture_open();
-            h.confirm(HumanConfirmation::SourceMachineAndAttempt);
-        }
-        TutorialRole::E2DestinationPull => {
-            h.windows_reply(
-                InstallerRequest::WindowsFrom { peer: peer() },
-                r#"{"ok":true,"result":[{"id":100,"app":"fixture","title":"advisory","size":[20,30]}]}"#,
-            );
-            h.click(ids::remote_window(0));
-            h.confirm(HumanConfirmation::SourceMachineAndAttempt);
-            let pull = h.call(|r| matches!(r, InstallerRequest::Pull { .. }));
-            h.ack(&pull);
-        }
-        TutorialRole::E2DestinationPush => h.confirm(HumanConfirmation::SourceMachineAndAttempt),
-        _ => unreachable!(),
-    }
-    h.projection(if source { local() } else { peer() }, true);
-    let metric = if source {
-        "e2_source_started"
-    } else {
-        "e2_dest_started"
-    };
-    h.bump(metric, 1);
-    if source {
-        h.set(&["installer", "recovery_pending"], json!(1));
-        h.set(&["installer", "peers"], {
-            let mut peers = h.status["result"]["installer"]["peers"].clone();
-            peers[0]["last_source_parking"] = json!("twin");
-            peers
-        });
-    }
-    h.status_reply();
-}
-
-fn e2_end(h: &mut H, role: TutorialRole) {
-    let source = matches!(
-        role,
-        TutorialRole::E2SourcePush | TutorialRole::E2SourcePull
-    );
-    h.confirm(HumanConfirmation::DestinationPatternInteractionAndClose);
-    let ret = h.call(|r| matches!(r, InstallerRequest::Return { .. }));
-    assert_eq!(
-        ret.request,
-        InstallerRequest::Return {
-            projection: 55,
-            source: (!source).then_some(peer()),
-        }
-    );
-    h.ack(&ret);
-    assert_ne!(
-        h.practice_row(role).state,
-        RowState::Verified,
-        "the return acknowledgement is not completion"
-    );
-    h.projection(local(), false);
-    h.bump(
-        if source {
-            "e2_source_returned"
-        } else {
-            "e2_dest_returned"
-        },
-        1,
-    );
-    h.set(&["installer", "recovery_pending"], json!(0));
-    if !source {
-        h.bump("e2_frames_presented", 10);
-    }
-    h.status_reply();
-    if source {
-        h.fixture_home();
-        if h.fixtures
-            .borrow()
-            .calls
-            .iter()
-            .any(|c| matches!(c.command, FixtureCommand::Close { .. }))
-        {
-            h.fixture_close();
-        }
-    } else {
-        h.confirm(HumanConfirmation::SourceRestored);
-    }
-}
-
-fn run_e2(h: &mut H, role: TutorialRole) {
-    e2_start(h, role);
-    e2_end(h, role);
-}
-
-fn run_audio_sender(h: &mut H) {
-    h.begin_practice(TutorialRole::AudioSender);
-    h.fixture_open();
-    h.click(ids::PLAY_TONE);
-    let play = h
-        .fixture_command(|c| matches!(c, FixtureCommand::PlayTone { .. }))
-        .expect("the owned fixture plays its own tone");
-    let FixtureCommand::PlayTone { output, .. } = &play.command else {
-        unreachable!()
-    };
-    assert_eq!(output.peer, peer());
-    h.fixture_reply(
-        &play,
-        Ok(FixtureEvent::ToneStarted {
-            fixture: FixtureId(10),
-            tone: ToneId(33),
-        }),
-    );
-    h.set(&["installer", "audio", "active_peers"], json!([peer()]));
-    h.status_reply();
-    h.set(&["installer", "audio", "frames_sent"], json!(10));
-    h.status_reply();
-    let stop = h
-        .fixture_command(|c| matches!(c, FixtureCommand::StopTone { .. }))
-        .expect("the tone is stopped");
-    h.fixture_reply(
-        &stop,
-        Ok(FixtureEvent::ToneStopped {
-            fixture: FixtureId(10),
-            tone: ToneId(33),
-        }),
-    );
-    h.confirm(HumanConfirmation::FarSpeakerHeard);
-    h.confirm(HumanConfirmation::ExclusiveAudioInterval);
-    h.fixture_close();
-}
-
-fn run_audio_receiver(h: &mut H) {
-    h.begin_practice(TutorialRole::AudioReceiver);
-    h.confirm(HumanConfirmation::SelectedSourceToneStarted);
-    h.set(&["installer", "audio", "active_peers"], json!([peer()]));
-    h.status_reply();
-    h.set(&["installer", "audio", "frames_played"], json!(10));
-    h.status_reply();
-    h.confirm(HumanConfirmation::LocalSpeakerHeard);
-    h.confirm(HumanConfirmation::ExclusiveAudioInterval);
-}
-
-fn run_menu(h: &mut H) {
-    h.begin_practice(TutorialRole::Menu);
-    h.set(&["installer", "settings_opened"], json!(1));
-    h.status_reply();
-    h.confirm(HumanConfirmation::TrayAndSettingsVisible);
-}
-
-fn run_e1_controller(h: &mut H) {
-    h.begin_practice(TutorialRole::E1Controller);
-    h.bump("e1_controller_started", 1);
-    h.bump("e1_controller_ended", 1);
-    h.bump("e1_chord_releases", 1);
-    h.status_reply();
-    h.confirm(HumanConfirmation::RemotePracticeAndHud);
-}
-
 fn with_extra_step(mut extra: NativeStep) -> H {
     let mut d = description();
     extra.prerequisites = vec![AGENT];
     d.steps.push(extra);
     d.connect_after.push(StepId(30));
-    d.practice_after.push(StepId(30));
+    d.ready_after.push(StepId(30));
     H::with(d)
 }
 
@@ -2770,113 +2197,6 @@ fn loop_for_job(
         }
     }
     panic!("no {stage:?} job for step {}", step.0);
-}
-
-#[test]
-fn e1_target_needs_its_armed_click_counters_and_human_confirmation() {
-    let mut h = H::new();
-    to_practice(&mut h);
-    run_e1_target(&mut h);
-    h.status_reply();
-    assert_eq!(
-        h.practice_row(TutorialRole::E1Target).state,
-        RowState::Verified
-    );
-    assert!(
-        h.fixtures.borrow().retired >= 1,
-        "the owned fixture is retired"
-    );
-}
-
-#[test]
-fn all_four_e2_roles_pass_with_distinct_owned_attempts_and_verified_returns() {
-    for role in [
-        TutorialRole::E2SourcePush,
-        TutorialRole::E2DestinationPush,
-        TutorialRole::E2SourcePull,
-        TutorialRole::E2DestinationPull,
-    ] {
-        let mut h = H::new();
-        to_practice(&mut h);
-        run_e2(&mut h, role);
-        h.status_reply();
-        assert_eq!(
-            h.practice_row(role).state,
-            RowState::Verified,
-            "{role:?}: {}",
-            h.practice_row(role).detail
-        );
-    }
-}
-
-#[test]
-fn audio_sender_and_receiver_pass_with_hearing_and_the_global_counter_limit_is_shown() {
-    let mut h = H::new();
-    to_practice(&mut h);
-    run_audio_sender(&mut h);
-    h.status_reply();
-    assert_eq!(
-        h.practice_row(TutorialRole::AudioSender).state,
-        RowState::Verified,
-        "{}",
-        h.practice_row(TutorialRole::AudioSender).detail
-    );
-    let mut h = H::new();
-    to_practice(&mut h);
-    run_audio_receiver(&mut h);
-    h.status_reply();
-    assert_eq!(
-        h.practice_row(TutorialRole::AudioReceiver).state,
-        RowState::Verified
-    );
-    // Audio counters are global and sampled; both audio rows say so even before practice.
-    for role in [TutorialRole::AudioSender, TutorialRole::AudioReceiver] {
-        let detail = h.practice_row(role).detail;
-        assert!(
-            detail.contains("computer-wide") && detail.contains("hear"),
-            "audio rows carry the attribution limit: {detail}"
-        );
-    }
-}
-
-#[test]
-fn all_nine_roles_then_fresh_final_health_reach_ready_and_readiness_lapses_after_five_seconds() {
-    let mut h = H::new();
-    to_practice(&mut h);
-    run_e1_controller(&mut h);
-    run_e1_target(&mut h);
-    run_e2(&mut h, TutorialRole::E2SourcePush);
-    run_e2(&mut h, TutorialRole::E2DestinationPush);
-    run_e2(&mut h, TutorialRole::E2SourcePull);
-    run_e2(&mut h, TutorialRole::E2DestinationPull);
-    run_audio_sender(&mut h);
-    // Each role is verified before the next starts; the summary is still waiting until the last.
-    assert_eq!(h.summary(), SummaryView::InstalledWaiting);
-    run_audio_receiver(&mut h);
-    assert_eq!(h.summary(), SummaryView::InstalledWaiting);
-    run_menu(&mut h);
-    for role in live::PRACTICE_ROLES {
-        assert_eq!(h.practice_row(role).state, RowState::Verified, "{role:?}");
-    }
-    h.next();
-    assert_eq!(h.view().screen, ScreenId::Summary);
-    // The final fresh-health step is checked only by a status issued after every role passed.
-    h.status_reply();
-    h.status_reply();
-    assert_eq!(h.summary(), SummaryView::WorkspaceReady);
-    assert_eq!(h.row(live::steps::FINAL).state, RowState::Verified);
-    // Without a fresh observation, readiness lapses honestly after five seconds.
-    h.advance(5_500);
-    h.c.tick();
-    assert_ne!(
-        h.summary(),
-        SummaryView::WorkspaceReady,
-        "stale health is never green"
-    );
-    // Renewing it needs a new status, not a button.
-    h.status_reply();
-    h.status_reply();
-    assert_eq!(h.summary(), SummaryView::WorkspaceReady);
 }
 
 // ---- review (Opus) regressions ---------------------------------------------------------------
@@ -4113,7 +3433,7 @@ fn mac_at_permissions() -> H {
     step.agent_apply = Some(live::AgentApply::AskPermissions);
     d.steps.push(step);
     d.connect_after.push(PERMS);
-    d.practice_after.push(PERMS);
+    d.ready_after.push(PERMS);
     let mut h = H::with(d);
     set_mac_permissions(&mut h, &[]);
     h.install();
@@ -4293,4 +3613,42 @@ fn a_mac_without_audio_has_no_microphone_row() {
     h.status_reply();
     assert!(h.view().rows.iter().all(|r| r.id != MIC_ROW));
     assert!(h.button(allow(MIC_ROW)).is_none());
+}
+
+fn to_ready(h: &mut H) {
+    to_grants(h);
+    h.paired_peer(&ALL_GRANTS);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::GRANTS).state, RowState::Verified);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Layout);
+    h.placements();
+    h.status_reply();
+    h.click(ids::LAYOUT_ACCEPT);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::LAYOUT).state, RowState::Verified);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Summary);
+}
+
+#[test]
+fn arrange_then_fresh_final_health_reaches_ready_and_expires_without_new_health() {
+    let mut h = H::new();
+    to_ready(&mut h);
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.summary(), SummaryView::WorkspaceReady);
+    assert_eq!(h.row(live::steps::FINAL).state, RowState::Verified);
+    h.advance(5_500);
+    h.c.tick();
+    assert_ne!(
+        h.summary(),
+        SummaryView::WorkspaceReady,
+        "stale health is never green"
+    );
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.summary(), SummaryView::WorkspaceReady);
 }

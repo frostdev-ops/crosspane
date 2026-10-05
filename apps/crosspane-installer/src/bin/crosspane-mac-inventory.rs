@@ -254,7 +254,6 @@ mod mac {
         Ok(match path {
             "Crosspane.app/Contents/MacOS/Crosspane" => Some(PayloadRole::Agent),
             "Crosspane.app/Contents/MacOS/crosspane-ui" => Some(PayloadRole::Settings),
-            "Crosspane.app/Contents/MacOS/crosspane-tutorial" => Some(PayloadRole::Tutorial),
             "crosspanectl" => Some(PayloadRole::Ctl),
             "crosspane-installer" => Some(PayloadRole::Installer),
             other

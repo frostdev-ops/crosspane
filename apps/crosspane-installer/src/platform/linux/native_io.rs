@@ -5,10 +5,9 @@ pub use cleanup::CleanupProof;
 pub(crate) use cleanup::RepairJournalSnapshot;
 mod removal;
 mod runtime;
-pub(crate) use runtime::DeadRuntime;
-pub mod tutorial;
 use crate::agent_contract::{BootstrapV1, InstanceStatus, ObservationSource, parse_bootstrap};
 pub use removal::{ExitReader, ProcessExit, ProcessWatch};
+pub(crate) use runtime::DeadRuntime;
 use rustix::fs::{self as rfs, AtFlags, FlockOperation, Mode, OFlags, ResolveFlags};
 use rustix::net::{self as rnet, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use std::{

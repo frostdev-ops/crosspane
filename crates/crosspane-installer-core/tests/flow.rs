@@ -130,17 +130,12 @@ fn graphs_reject_invalid_shapes_and_requirements() {
 #[test]
 fn optional_skip_never_satisfies_evidence_and_still_requires_fresh_health() {
     let mut specs = graph();
-    specs[1].prerequisites = vec![StepId(70)];
+    specs[1].prerequisites = vec![StepId(62)];
     let pair = step(60);
     let mut layout = step(62);
     layout.prerequisites = vec![StepId(60)];
-    let mut practice = step(70);
-    practice.prerequisites = vec![StepId(62)];
-    practice.requires_activity = true;
-    practice.requires_human = true;
-    practice.requires_fixture = true;
-    specs.extend([pair, layout, practice]);
-    let optional = [StepId(60), StepId(62), StepId(70)];
+    specs.extend([pair, layout]);
+    let optional = [StepId(60), StepId(62)];
     assert_eq!(
         Flow::new_with_optional_steps(specs.clone(), &[StepId(1)]).unwrap_err(),
         GraphError::InvalidOptionalStep
@@ -197,7 +192,7 @@ fn optional_skip_never_satisfies_evidence_and_still_requires_fresh_health() {
     );
     // An explicit reopen retires readiness, but does not reopen the other deferrals.
     begin(&mut flow, 60, 1);
-    assert_eq!(flow.summary(1, &[]).skipped, vec![StepId(62), StepId(70)]);
+    assert_eq!(flow.summary(1, &[]).skipped, vec![StepId(62)]);
 }
 #[test]
 fn detection_is_not_verification_and_install_is_not_ready() {

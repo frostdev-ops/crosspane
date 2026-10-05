@@ -10,7 +10,7 @@ mod mutation;
 mod snapshot;
 use super::*;
 use crate::platform::linux::payload::{
-    FILES, MAX_MEMBER_BYTES, MAX_RECORD_BYTES, PayloadInstaller, sha256,
+    CLEANUP_FILES as FILES, MAX_MEMBER_BYTES, MAX_RECORD_BYTES, PayloadInstaller, sha256,
 };
 use crosspane_installer_core::{
     InstallReceipt, MutationOutcome, ResourceObservation, ResourceOwnership,
@@ -47,6 +47,8 @@ impl CleanupProof {
         self.0.io.target_binding()
     }
     pub fn receipt(&self) -> &InstallReceipt {
+        // Current-nine journals have one unowned obsolete slot in this fixed V1 view.
+        // The original journal bytes remain independently bound by the ledger snapshot.
         &self.0.receipt
     }
     /// Captured compatibility/absence, never a refreshed native observation.

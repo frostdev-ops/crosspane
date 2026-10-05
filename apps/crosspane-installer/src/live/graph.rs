@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 use crosspane_installer_core::{StepId, StepSpec};
 
 use super::{LiveError, PlatformDescription};
-use crate::tutorial_flow::TutorialRole;
 use crate::view::{ProgressGroup, ScreenId};
 
 pub mod steps {
@@ -17,58 +16,6 @@ pub mod steps {
     pub const LAYOUT: StepId = StepId(62);
     pub const HIDING: StepId = StepId(63);
     pub const FINAL: StepId = StepId(90);
-
-    /// The practice step for one of the nine roles.
-    pub fn practice(role: crate::tutorial_flow::TutorialRole) -> StepId {
-        StepId(70 + super::role_index(role) as u16)
-    }
-}
-
-pub const ROLES: [TutorialRole; 9] = [
-    TutorialRole::E1Controller,
-    TutorialRole::E1Target,
-    TutorialRole::E2SourcePush,
-    TutorialRole::E2DestinationPush,
-    TutorialRole::E2SourcePull,
-    TutorialRole::E2DestinationPull,
-    TutorialRole::AudioSender,
-    TutorialRole::AudioReceiver,
-    TutorialRole::Menu,
-];
-
-pub fn role_index(role: TutorialRole) -> usize {
-    ROLES.iter().position(|r| *r == role).unwrap_or(0)
-}
-
-pub fn role_of(step: StepId) -> Option<TutorialRole> {
-    step.0
-        .checked_sub(70)
-        .and_then(|i| ROLES.get(usize::from(i)).copied())
-}
-
-/// The sequencer's fixture-owning roles; their proofs carry the fixture attempt.
-pub fn uses_fixture(role: TutorialRole) -> bool {
-    matches!(
-        role,
-        TutorialRole::E1Target
-            | TutorialRole::E2SourcePush
-            | TutorialRole::E2SourcePull
-            | TutorialRole::AudioSender
-    )
-}
-
-pub fn role_label(role: TutorialRole) -> &'static str {
-    match role {
-        TutorialRole::E1Controller => "Control the other computer from this keyboard and mouse",
-        TutorialRole::E1Target => "Let the other computer control this one",
-        TutorialRole::E2SourcePush => "Send a window from this computer",
-        TutorialRole::E2DestinationPush => "Receive a window sent from the other computer",
-        TutorialRole::E2SourcePull => "Let the other computer take a window from here",
-        TutorialRole::E2DestinationPull => "Take a window from the other computer",
-        TutorialRole::AudioSender => "Play sound from this computer on the other one",
-        TutorialRole::AudioReceiver => "Hear the other computer's sound here",
-        TutorialRole::Menu => "Find the Crosspane menu and settings",
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +25,6 @@ pub enum StepKind {
     Grants,
     Layout,
     Hiding,
-    Practice(TutorialRole),
     Final,
 }
 
@@ -112,9 +58,6 @@ impl Graph {
     pub fn on_screen(&self, screen: ScreenId) -> impl Iterator<Item = &StepMeta> {
         self.metas.iter().filter(move |m| m.screen == screen)
     }
-    pub fn practice_steps(&self) -> Vec<StepId> {
-        ROLES.iter().map(|r| steps::practice(*r)).collect()
-    }
 }
 
 pub fn build(desc: &PlatformDescription) -> Result<Graph, LiveError> {
@@ -127,7 +70,7 @@ pub fn build(desc: &PlatformDescription) -> Result<Graph, LiveError> {
     let known = |ids: &[StepId]| ids.iter().all(|id| native.contains(id));
     if !desc.steps.iter().all(|s| known(&s.prerequisites))
         || !known(&desc.connect_after)
-        || !known(&desc.practice_after)
+        || !known(&desc.ready_after)
     {
         return Err(LiveError::UnknownAnchor);
     }
@@ -167,19 +110,15 @@ pub fn build(desc: &PlatformDescription) -> Result<Graph, LiveError> {
                       group: ProgressGroup,
                       label: &str,
                       prerequisites: Vec<StepId>| {
-        let role = match kind {
-            StepKind::Practice(role) => Some(role),
-            _ => None,
-        };
         specs.push(StepSpec {
             id,
             prerequisites: prerequisites.clone(),
             required_for_installed: false,
             required_for_ready: true,
             requires_fresh_observation: kind == StepKind::Final,
-            requires_activity: role.is_some(),
-            requires_human: role.is_some(),
-            requires_fixture: role.is_some_and(uses_fixture),
+            requires_activity: false,
+            requires_human: false,
+            requires_fixture: false,
         });
         metas.push(StepMeta {
             id,
@@ -194,7 +133,7 @@ pub fn build(desc: &PlatformDescription) -> Result<Graph, LiveError> {
             agent_apply: None,
         });
     };
-    let mut practice_after = desc.practice_after.clone();
+    let mut ready_after = desc.ready_after.clone();
     if desc.hiding_choice {
         shared(
             steps::HIDING,
@@ -204,7 +143,7 @@ pub fn build(desc: &PlatformDescription) -> Result<Graph, LiveError> {
             "How windows you send are hidden here",
             desc.connect_after.clone(),
         );
-        practice_after.push(steps::HIDING);
+        ready_after.push(steps::HIDING);
     }
     shared(
         steps::PAIR,
@@ -230,27 +169,17 @@ pub fn build(desc: &PlatformDescription) -> Result<Graph, LiveError> {
         "Where the other computer's screens sit",
         vec![steps::PAIR],
     );
-    let mut before_practice = vec![steps::GRANTS, steps::LAYOUT];
-    before_practice.extend(practice_after);
-    before_practice.sort();
-    before_practice.dedup();
-    for role in ROLES {
-        shared(
-            steps::practice(role),
-            StepKind::Practice(role),
-            ScreenId::Practice,
-            ProgressGroup::Practice,
-            role_label(role),
-            before_practice.clone(),
-        );
-    }
+    let mut before_ready = vec![steps::GRANTS, steps::LAYOUT];
+    before_ready.extend(ready_after);
+    before_ready.sort();
+    before_ready.dedup();
     shared(
         steps::FINAL,
         StepKind::Final,
         ScreenId::Summary,
         ProgressGroup::Ready,
         "Everything is working right now",
-        ROLES.iter().map(|r| steps::practice(*r)).collect(),
+        before_ready,
     );
     Ok(Graph { metas, specs })
 }

@@ -65,7 +65,6 @@ pub struct WorkerParts {
     pub domains: DomainFactory,
     pub reports: SyncSender<NativeReport>,
     pub results: ProofResults,
-    pub tutorial_hash: Arc<Mutex<Option<[u8; 32]>>>,
     pub stop: Arc<Cancellation>,
     /// Package source for tests; production reads the staged directory.
     pub package: Option<Package>,
@@ -86,7 +85,6 @@ pub struct Worker {
     repairer: Box<dyn Repairer>,
     reports: SyncSender<NativeReport>,
     results: ProofResults,
-    tutorial_hash: Arc<Mutex<Option<[u8; 32]>>>,
     stop: Arc<Cancellation>,
     /// Firewall and cleanup intents persist across runs, so their ids never restart at 1.
     op_base: u64,
@@ -171,7 +169,6 @@ impl Worker {
             repairer: domains.repairer,
             reports: parts.reports,
             results: parts.results,
-            tutorial_hash: parts.tutorial_hash,
             stop: parts.stop,
             op_base: unix_ms().saturating_mul(1000),
             held: Held::default(),
@@ -240,7 +237,6 @@ impl Worker {
 
     fn load_package(&mut self) {
         if self.package.is_some() {
-            self.note_tutorial_hash();
             return;
         }
         match &self.payload_dir {
@@ -254,24 +250,9 @@ impl Worker {
             Some(dir) => match super::read_package(dir) {
                 Ok(package) => {
                     self.package = Some(package);
-                    self.note_tutorial_hash();
                 }
                 Err(text) => self.package_error = Some(text),
             },
-        }
-    }
-
-    fn note_tutorial_hash(&mut self) {
-        let hash = self.package.as_ref().and_then(|package| {
-            package
-                .manifest()
-                .members
-                .iter()
-                .find(|m| m.name == "bin/crosspane-tutorial")
-                .and_then(|m| super::hex_hash(&m.sha256).ok())
-        });
-        if let (Some(hash), Ok(mut slot)) = (hash, self.tutorial_hash.lock()) {
-            *slot = Some(hash);
         }
     }
 
@@ -828,7 +809,7 @@ impl Worker {
                     NativeOutcome::Planned {
                         preview: "Restart crosspane-agent.service once in your user service \
                                   manager. Crosspane disconnects for a moment while a new \
-                                  instance starts; practice then runs against that instance."
+                                  instance starts."
                             .into(),
                     },
                     "Review this restart.",

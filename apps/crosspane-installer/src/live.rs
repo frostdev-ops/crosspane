@@ -1,14 +1,13 @@
 //! The shared live installer controller: one OS-free binding of core `Flow`, the agent client, the
-//! nine-role tutorial sequencer and the fixture boundary to the presentation shell.
+//! presentation shell.
 //!
 //! Platforms supply only the [`Platform`] port: their native steps, one non-blocking job channel,
-//! the selected agent port and the owned fixture launcher. Core alone decides validity and
+//! the selected agent port. Core alone decides validity and
 //! milestones; every native result is correlated to the outstanding core job before it is reduced.
 
 mod controller;
 mod graph;
 mod ledger;
-mod practice;
 mod present;
 mod shared;
 mod skipped;
@@ -19,19 +18,17 @@ pub(crate) use skipped::SkippedStore;
 use std::sync::{Arc, Mutex};
 
 use crosspane_installer_core::{
-    ApplyOutcome, AttemptId, JobIntent, ObservationSource, OperationId, StepId, WaitKind,
+    ApplyOutcome, JobIntent, ObservationSource, OperationId, StepId, WaitKind,
 };
 
 use crate::agent_contract::{AgentPlatform, AgentPort, AgentReply};
-use crate::fixture::{FixtureCall, FixtureError, FixtureId, FixtureReceipt};
-use crate::tutorial_flow::TutorialSourcePolicy;
 use crate::view::{HidingChoice, ProgressGroup, ScreenId, ToggleRole};
 
 pub use controller::LiveController;
-pub use graph::{ROLES as PRACTICE_ROLES, steps};
+pub use graph::steps;
 
 /// One monotonic millisecond clock shared by the controller, platform workers, the agent
-/// transport and the fixture port.
+/// transport.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// One platform-owned step in the readiness graph. Ids 10–59 are reserved for platforms.
@@ -72,20 +69,15 @@ pub enum AgentApply {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlatformDescription {
     pub platform: AgentPlatform,
-    /// This machine's name, shown to the person and on the practice fixture.
+    /// This machine's name, shown to the person.
     pub machine_label: String,
     pub steps: Vec<NativeStep>,
     /// Native steps the shared pairing step depends on.
     pub connect_after: Vec<StepId>,
-    /// Native steps every practice step depends on.
-    pub practice_after: Vec<StepId>,
+    /// Native steps the final readiness check depends on.
+    pub ready_after: Vec<StepId>,
     /// Whether the shared hiding-choice step applies (macOS, D7).
     pub hiding_choice: bool,
-    /// The source policy used when no hiding choice applies or none is verified.
-    pub source_policy: TutorialSourcePolicy,
-    /// The output the practice fixture plays its tone into, named per selected peer: every
-    /// `{peer}` is replaced with that peer's id (for example `crosspane.{peer}.speaker`).
-    pub speakers_device: Option<String>,
     /// A hint that an earlier setup stopped partway. It is shown on the welcome screen only: it
     /// is never evidence, and every step is detected again from the real system.
     pub resume_note: Option<String>,
@@ -347,29 +339,6 @@ pub enum NativeRefusal {
     Unavailable(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FixtureReadiness {
-    Idle,
-    Launching,
-    Ready,
-    Failed(FixtureError),
-}
-
-/// One owned practice fixture child at a time, launched for one attempt.
-pub trait PracticeFixtures {
-    fn launch(&mut self, attempt: AttemptId) -> Result<(), FixtureError>;
-    fn readiness(&mut self) -> FixtureReadiness;
-    fn submit(&mut self, call: FixtureCall) -> Result<(), FixtureError>;
-    /// Receipts keep the complete-line receipt time the sequencer requires.
-    fn poll(&mut self) -> Vec<FixtureReceipt>;
-    fn complete_closed(
-        &mut self,
-        attempt: AttemptId,
-        fixture: FixtureId,
-    ) -> Result<(), FixtureError>;
-    fn retire(&mut self);
-}
-
 /// What one support check found, in the person's terms. Text is plain and observed: a failed
 /// check names the reason; a check that couldn't be confirmed names what couldn't be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -471,7 +440,6 @@ pub trait Platform {
     fn submit(&mut self, job: NativeJob) -> Result<(), NativeRefusal>;
     fn poll(&mut self) -> Vec<NativeReport>;
     fn agent(&mut self) -> &mut dyn AgentPort;
-    fn fixtures(&mut self) -> &mut dyn PracticeFixtures;
     fn shutdown(&mut self);
     /// The checks of the latest finished support detection pass, if the platform reports them.
     fn support_checks(&mut self) -> Option<SupportChecklist> {
@@ -525,7 +493,6 @@ pub enum LiveError {
 
 /// Button and field ids. Stable so tests and the shell agree on meaning.
 pub mod ids {
-    use crate::tutorial_flow::{HumanConfirmation, TutorialRole};
     use crosspane_installer_core::StepId;
 
     pub const NEXT: u16 = 1;
@@ -541,7 +508,6 @@ pub mod ids {
     pub const SET_UP_NOW: u16 = 8;
     pub const REOPEN_CONNECT: u16 = 9;
     pub const REOPEN_ARRANGE: u16 = 91;
-    pub const REOPEN_PRACTICE: u16 = 92;
     pub const PEER_ADDRESS: u16 = 1;
     pub const PAIR_LISTEN: u16 = 2001;
     pub const PAIR_JOIN: u16 = 2002;
@@ -560,8 +526,6 @@ pub mod ids {
     pub const HIDING_RESTART: u16 = 2402;
     /// Revisit a hiding choice the agent's settings already hold.
     pub const HIDING_CHANGE: u16 = 2403;
-    pub const PLAY_TONE: u16 = 3200;
-    pub const PRACTICE_CANCEL: u16 = 3201;
     pub const FINAL_CHECK: u16 = 4001;
     pub const REMOVE_REVIEW: u16 = 5001;
     pub const REMOVE_CONFIRM: u16 = 5002;
@@ -590,15 +554,6 @@ pub mod ids {
     }
     pub fn removal_field(choice: u16) -> u16 {
         50 + choice.min(40)
-    }
-    pub fn practice_start(role: TutorialRole) -> u16 {
-        3000 + super::graph::role_index(role) as u16
-    }
-    pub fn confirm(c: HumanConfirmation) -> u16 {
-        3100 + super::practice::confirmation_index(c) as u16
-    }
-    pub fn remote_window(index: usize) -> u16 {
-        3300 + index.min(15) as u16
     }
     pub fn follow_up_confirm(id: u16) -> u16 {
         5100 + id.min(90)

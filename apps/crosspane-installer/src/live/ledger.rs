@@ -1,6 +1,6 @@
 //! The single observation ledger in front of core `Observe`.
 //!
-//! `Tutorial::begin` and every later `reduce` replay the sequencer's last admitted batch. When the
+//! Settings transitions can replay their last admitted observation batch. When the
 //! controller has polled in between, that replay is older than what core already holds, and core
 //! would reject it and retire every bound proof. The one substitution rule: a non-empty batch with
 //! any sample older than the newest admitted sample of its scope is replaced by the newest

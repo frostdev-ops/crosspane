@@ -6,19 +6,17 @@ use crosspane_installer_core::{JobStage, Milestone, StepId, StepState};
 pub(super) mod permissions;
 
 use super::controller::{LiveController, automatic_screen, bounded, bounded_lines};
-use super::graph::{self, StepKind, steps};
-use super::practice::{CONFIRMATIONS, confirmation_label, confirmations};
+use super::graph::{StepKind, steps};
 use super::shared::{CAPABILITIES, PairMode, capability_label};
 use super::{
     Availability, CheckState, Consent, MaintenanceId, MaintenanceOutcome, MaintenanceReport,
     MaintenanceRequest, NativeJob, RemovalChoice, RepairOutcome, StatusEvidence, ids,
 };
 use crate::agent_contract::{InstallerRequest, PairPhase};
-use crate::tutorial_flow::{TutorialRole, TutorialState, TutorialUserAction};
 use crate::view::{
     ButtonKind, ButtonRole, ButtonView, EscapeMapping, FieldView, IllustrationView, LayoutPreview,
-    PracticeIllustration, ProgressGroup, ProgressView, RowState, RowView, ScreenId, SummaryView,
-    ToggleRole, WizardView, check_row_id,
+    ProgressGroup, ProgressView, RowState, RowView, ScreenId, SummaryView, ToggleRole, WizardView,
+    check_row_id,
 };
 
 const MAX_PROGRESS_LINES: usize = 24;
@@ -40,11 +38,6 @@ const REPAIR_STATUS_FRESH_MS: u64 = 3_000;
 /// isn't answering yet), the platform is still asked this often, without one. Its own bounded
 /// wait then ends the repair with its typed result instead of the backstop's.
 const REPAIR_BLIND_LOOK_MS: u64 = 2_000;
-
-/// The R9.4 attribution limit, shown with both audio rows.
-const AUDIO_LIMIT: &str = "Audio counters are computer-wide, not per computer, and are only \
-sampled: other sound between checks might not be noticed. Crosspane relies on you hearing the \
-test sound.";
 
 #[derive(Default)]
 pub(super) struct MaintenanceState {
@@ -258,7 +251,6 @@ fn group_of(screen: ScreenId) -> Option<ProgressGroup> {
         | ScreenId::HidingChoice => ProgressGroup::PermissionsNetwork,
         ScreenId::Connect | ScreenId::MatchNumbers => ProgressGroup::Connect,
         ScreenId::Grants | ScreenId::Layout => ProgressGroup::Arrange,
-        ScreenId::Practice => ProgressGroup::Practice,
         ScreenId::Summary => ProgressGroup::Ready,
         ScreenId::RepairRemove => return None,
     })
@@ -345,14 +337,6 @@ impl LiveController {
                 StepState::Skipped => super::skipped::LATER.into(),
                 _ => String::new(),
             });
-        let detail = if matches!(
-            graph::role_of(step),
-            Some(TutorialRole::AudioSender | TutorialRole::AudioReceiver)
-        ) {
-            bounded(format!("{detail} {AUDIO_LIMIT}").trim().to_owned())
-        } else {
-            detail
-        };
         let detail = match self.support_timing(step) {
             Some(timing) if detail.is_empty() => timing,
             Some(timing) => bounded(format!("{detail} {timing}")),
@@ -363,7 +347,7 @@ impl LiveController {
             label: meta.map_or_else(String::new, |m| step_title(&m.label).to_owned()),
             detail,
             state: row_state(state),
-            human_confirmed: graph::role_of(step).is_some() && state == StepState::Satisfied,
+            human_confirmed: false,
         }
     }
 
@@ -458,7 +442,6 @@ impl LiveController {
                     }
                 })
                 .collect(),
-            ScreenId::Practice => self.practice_rows(),
             // These screens ask their question in their content; the step itself is shown only
             // while it isn't asking (checking, saving, or stopped with a reason).
             ScreenId::Grants | ScreenId::Layout | ScreenId::HidingChoice => self
@@ -587,29 +570,6 @@ impl LiveController {
         }
     }
 
-    /// The practice screen lists what is done; what is left is offered as choices.
-    fn practice_rows(&self) -> Vec<RowView> {
-        if let Some(run) = self
-            .practice
-            .run
-            .as_ref()
-            .filter(|_| self.practice.active())
-        {
-            return vec![self.row(run.step)];
-        }
-        graph::ROLES
-            .iter()
-            .map(|role| steps::practice(*role))
-            .filter(|step| {
-                !matches!(
-                    self.step_state(*step),
-                    StepState::NotChecked | StepState::Stale
-                )
-            })
-            .map(|step| self.row(step))
-            .collect()
-    }
-
     fn progress(&self, screen: ScreenId) -> ProgressView {
         let mut completed = Vec::new();
         for group in [
@@ -617,7 +577,6 @@ impl LiveController {
             ProgressGroup::PermissionsNetwork,
             ProgressGroup::Connect,
             ProgressGroup::Arrange,
-            ProgressGroup::Practice,
             ProgressGroup::Ready,
         ] {
             let mut members = self
@@ -807,7 +766,6 @@ impl LiveController {
                 "Arrange your screens".into(),
                 "Drag the screens to match your desk.".into(),
             ),
-            ScreenId::Practice => ("Try each feature once".into(), self.practice_message()),
             ScreenId::Summary => (
                 match self.summary.milestone {
                     Milestone::WorkspaceReady => "Your workspace is ready",
@@ -833,7 +791,7 @@ impl LiveController {
         };
         let mut message = message;
         if screen == ScreenId::Connect {
-            message.push_str("\n\nSkipping Connect also skips Arrange and Practice.");
+            message.push_str("\n\nSkipping Connect also skips Arrange.");
         }
         if self.skipped_on(screen)
             && !self.reopened.contains(&screen)
@@ -845,28 +803,6 @@ impl LiveController {
             message = format!("{notice}\n\n{message}");
         }
         (bounded(title), bounded_lines(message.trim().to_owned()))
-    }
-
-    fn practice_message(&self) -> String {
-        let Some(run) = self
-            .practice
-            .run
-            .as_ref()
-            .filter(|_| self.practice.active())
-        else {
-            return "Start the same practice on both computers. A small window checks that it \
-                    worked."
-                .into();
-        };
-        let mut text = format!("Practising: {}.", graph::role_label(run.role));
-        if let Some(note) = &run.note {
-            text.push(' ');
-            text.push_str(note);
-        }
-        if self.practice.tutorial.state() == TutorialState::WaitingUser {
-            text.push_str(" Follow the practice window, then confirm what you saw.");
-        }
-        text
     }
 
     fn maintenance_message(&self) -> String {
@@ -993,7 +929,7 @@ impl LiveController {
                         ids::SET_UP_NOW,
                         ButtonRole::Ordinary,
                         "Set up now",
-                        !self.practice.engaged(self.now),
+                        true,
                         ButtonKind::Primary,
                     ),
                 ],
@@ -1200,7 +1136,6 @@ impl LiveController {
                     ));
                 }
             }
-            ScreenId::Practice => self.practice_controls(&mut buttons),
             ScreenId::Permissions if self.permission_rows_active() => {
                 self.permission_buttons(&mut buttons);
             }
@@ -1227,7 +1162,9 @@ impl LiveController {
                     ids::FINAL_CHECK,
                     ButtonRole::Retry,
                     "Check again",
-                    self.graph.practice_steps().iter().all(|s| self.settled(*s)),
+                    self.graph
+                        .on_screen(ScreenId::Summary)
+                        .all(|m| m.prerequisites.iter().all(|s| self.settled(*s))),
                     ButtonKind::Link,
                 ));
                 buttons.push(button(
@@ -1249,7 +1186,6 @@ impl LiveController {
                 for (screen, id) in [
                     (ScreenId::Connect, ids::REOPEN_CONNECT),
                     (ScreenId::Layout, ids::REOPEN_ARRANGE),
-                    (ScreenId::Practice, ids::REOPEN_PRACTICE),
                 ] {
                     if self.skipped_on(screen)
                         || (screen == ScreenId::Layout && self.skipped_on(ScreenId::Grants))
@@ -1267,10 +1203,7 @@ impl LiveController {
             ScreenId::RepairRemove => self.maintenance_controls(&mut buttons, &mut fields),
             _ => {}
         }
-        if matches!(
-            screen,
-            ScreenId::Connect | ScreenId::Layout | ScreenId::Practice
-        ) {
+        if matches!(screen, ScreenId::Connect | ScreenId::Layout) {
             buttons.push(button(
                 ids::SKIP,
                 ButtonRole::Ordinary,
@@ -1295,7 +1228,6 @@ impl LiveController {
             // A finished screen moves on by itself. Continue is offered only where it doesn't:
             // after the person came back to it.
             if !self.auto_advance
-                && screen != ScreenId::Practice
                 && self.screen_complete(screen)
                 && !buttons.iter().any(|b| b.id == ids::NEXT)
                 && self.next_screen().is_some()
@@ -1438,94 +1370,6 @@ impl LiveController {
         }
     }
 
-    fn practice_controls(&self, buttons: &mut Vec<ButtonView>) {
-        if let Some(run) = self
-            .practice
-            .run
-            .as_ref()
-            .filter(|_| self.practice.active())
-        {
-            let waiting = self.practice.tutorial.state() == TutorialState::WaitingUser
-                || self.practice.tutorial.state() == TutorialState::Running;
-            let private = self.source_policy()
-                == crate::tutorial_flow::TutorialSourcePolicy::MacPrivateDisplay;
-            // What the person saw or heard: each statement is confirmed on its own.
-            for c in confirmations(run.role, private) {
-                if run.confirmed.contains(&c) {
-                    continue;
-                }
-                buttons.push(button(
-                    ids::confirm(c),
-                    ButtonRole::Confirm,
-                    confirmation_label(c),
-                    waiting,
-                    ButtonKind::Choice,
-                ));
-            }
-            if run.role == TutorialRole::E2DestinationPull {
-                for (i, w) in run.remote_windows.iter().enumerate() {
-                    buttons.push(button(
-                        ids::remote_window(i),
-                        ButtonRole::Ordinary,
-                        &bounded(format!("Take “{}” ({})", w.title, w.app)),
-                        waiting,
-                        ButtonKind::Choice,
-                    ));
-                }
-            }
-            buttons.push(button(
-                ids::PRACTICE_CANCEL,
-                ButtonRole::Stop,
-                "Stop this practice",
-                true,
-                ButtonKind::Secondary,
-            ));
-            if run.role == TutorialRole::AudioSender {
-                buttons.push(button(
-                    ids::PLAY_TONE,
-                    ButtonRole::Ordinary,
-                    "Play the test sound",
-                    waiting,
-                    ButtonKind::Primary,
-                ));
-            }
-            return;
-        }
-        // What is left to try, each offered as a choice: the person starts the one whose partner
-        // runs on the other computer.
-        for role in graph::ROLES {
-            let step = steps::practice(role);
-            if self.satisfied(step) {
-                continue;
-            }
-            buttons.push(button(
-                ids::practice_start(role),
-                ButtonRole::Ordinary,
-                graph::role_label(role),
-                self.prerequisites_valid(step) && !self.practice.engaged(self.now),
-                ButtonKind::Choice,
-            ));
-        }
-        if self.next_screen().is_some() && !self.practice.engaged(self.now) {
-            let all_done = self
-                .graph
-                .practice_steps()
-                .iter()
-                .all(|step| self.satisfied(*step));
-            buttons.push(button(
-                ids::NEXT,
-                ButtonRole::Next,
-                if all_done { "Continue" } else { "Finish later" },
-                true,
-                if all_done {
-                    ButtonKind::Primary
-                } else {
-                    ButtonKind::Link
-                },
-            ));
-        }
-    }
-
     fn maintenance_controls(&self, buttons: &mut Vec<ButtonView>, fields: &mut Vec<FieldView>) {
         let m = &self.maintenance;
         let repair = &m.repair_state;
@@ -1662,20 +1506,6 @@ impl LiveController {
                 busy: self.connect.layout_busy,
             }
         });
-        let practice = self
-            .practice
-            .run
-            .as_ref()
-            .filter(|_| self.practice.active())
-            .map(|run| match run.role {
-                TutorialRole::E1Controller | TutorialRole::E1Target => {
-                    PracticeIllustration::Pointer
-                }
-                TutorialRole::AudioSender | TutorialRole::AudioReceiver => {
-                    PracticeIllustration::Tone
-                }
-                _ => PracticeIllustration::Window,
-            });
         let sas = (screen == ScreenId::MatchNumbers)
             .then(|| self.connect.pairing.as_ref().and_then(|p| p.sas.clone()))
             .flatten()
@@ -1716,7 +1546,6 @@ impl LiveController {
                 permission_row: None,
                 traffic_observed: false,
                 sas,
-                practice,
             },
             demo: false,
             link_caption: (screen == ScreenId::Connect
@@ -1791,7 +1620,6 @@ impl LiveController {
             ids::SET_UP_NOW => self.reopen(self.screen),
             ids::REOPEN_CONNECT => self.reopen(ScreenId::Connect),
             ids::REOPEN_ARRANGE => self.reopen(ScreenId::Layout),
-            ids::REOPEN_PRACTICE => self.reopen(ScreenId::Practice),
             ids::NEXT => {
                 if self.screen == ScreenId::Welcome {
                     // The go-ahead for the install steps that stay inside this account.
@@ -1848,8 +1676,6 @@ impl LiveController {
             ids::HIDING_APPLY => self.request_apply(steps::HIDING),
             ids::HIDING_RESTART => self.hiding_restart(),
             ids::HIDING_CHANGE => self.change_hiding(),
-            ids::PLAY_TONE => self.practice_user(TutorialUserAction::PlayTestSound),
-            ids::PRACTICE_CANCEL => self.practice_user(TutorialUserAction::Cancel),
             ids::FINAL_CHECK => self.begin(steps::FINAL),
             ids::REMOVE_REVIEW => self.plan_uninstall(),
             ids::REMOVE_CONFIRM => self.confirm_uninstall(),
@@ -1871,7 +1697,7 @@ impl LiveController {
     fn retryable_on(&self, screen: ScreenId) -> Vec<StepId> {
         self.graph
             .on_screen(screen)
-            .filter(|m| !matches!(m.kind, StepKind::Practice(_) | StepKind::Final))
+            .filter(|m| m.kind != StepKind::Final)
             .filter(|m| retryable(self.step_state(m.id)))
             .map(|m| m.id)
             .collect()
@@ -1896,27 +1722,6 @@ impl LiveController {
             2110..=2125 => self.pair_answer(InstallerRequest::PairPick {
                 index: usize::from(id - 2110),
             }),
-            3000..=3008 => {
-                if let Some(role) = graph::ROLES.get(usize::from(id - 3000)) {
-                    self.start_practice(*role);
-                }
-            }
-            3100..=3110 => {
-                if let Some(c) = CONFIRMATIONS.get(usize::from(id - 3100)) {
-                    self.practice_user(TutorialUserAction::Confirm(*c));
-                }
-            }
-            3300..=3315 => {
-                let window = self
-                    .practice
-                    .run
-                    .as_ref()
-                    .and_then(|r| r.remote_windows.get(usize::from(id - 3300)))
-                    .map(|w| w.id);
-                if let Some(window) = window {
-                    self.practice_user(TutorialUserAction::SelectRemoteWindow { window });
-                }
-            }
             2600..=2639 => self.permission_button(id),
             5100..=5190 => self.follow_up(id - 5100, true),
             5200..=5290 => self.follow_up(id - 5200, false),

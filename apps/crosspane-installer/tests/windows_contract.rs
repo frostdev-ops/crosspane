@@ -285,19 +285,3 @@ fn windows_status_keeps_existing_json_bounds_and_envelope() {
     let value = json!({"ok":false,"error":"fixture refusal"});
     assert_eq!(parse(&value, windows()), Err(ContractError::WrongEnvelope));
 }
-
-#[cfg(not(unix))]
-#[test]
-fn non_unix_tutorial_is_unavailable_without_opening_font_or_pipes() {
-    use crosspane_installer::{
-        fixture::FixtureError,
-        tutorial_window::{TutorialOptions, run},
-    };
-    assert_eq!(
-        run(TutorialOptions {
-            controlled: true,
-            font: Some(std::path::PathBuf::from(r"C:\fixture\never-opened.ttf")),
-        }),
-        Err(FixtureError::Unavailable)
-    );
-}
