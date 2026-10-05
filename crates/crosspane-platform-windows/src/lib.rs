@@ -19,6 +19,8 @@ pub mod hotkey;
 #[cfg(windows)]
 pub mod inject;
 pub mod keystore;
+#[cfg(windows)]
+pub mod link;
 pub mod model;
 #[cfg(windows)]
 pub mod overlay;
