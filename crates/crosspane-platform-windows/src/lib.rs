@@ -12,6 +12,8 @@ pub mod model;
 pub mod session;
 #[cfg(windows)]
 pub mod stubs;
+#[cfg(windows)]
+pub mod tray;
 
 #[cfg(windows)]
 pub use stubs::UnsupportedWindows;
