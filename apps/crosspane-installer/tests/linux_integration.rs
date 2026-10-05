@@ -17,6 +17,7 @@ use crosspane_installer::live::{
     MaintenanceOutcome, MaintenanceReport, MaintenanceRequest, NativeJob, NativeOutcome,
     NativeReport, Platform, PracticeFixtures, RepairOutcome, StatusEvidence, StepReport,
 };
+use crosspane_installer::live::{CheckState, SupportCheck, SupportChecksSlot};
 use crosspane_installer::platform::linux::integration::{
     AgentSource, DomainFactory, Domains, FirewallReading, Firewalls, FixtureSource, LinuxPlatform,
     Parts, PayloadPreview, Payloads, RepairFinish, RepairOffer, RepairStep, Repairer, RuleApply,
@@ -366,6 +367,7 @@ fn calls(w: &Shared) -> Vec<String> {
 struct FakeSupport {
     w: Shared,
     scratch: Arc<LinuxNativeIo>,
+    checks: SupportChecksSlot,
 }
 
 impl Support for FakeSupport {
@@ -380,6 +382,15 @@ impl Support for FakeSupport {
             w.calls.push("support.detect".into());
             w.sup.clone()
         };
+        // Like the native detection, each finished pass writes its checklist.
+        self.checks.publish(vec![SupportCheck::new(
+            "Fake check",
+            match &sup {
+                Sup::Supported => CheckState::Passed(None),
+                Sup::NotSupported(t) => CheckState::Failed((*t).into()),
+                Sup::Pending(t) => CheckState::Unconfirmed((*t).into()),
+            },
+        )]);
         match sup {
             Sup::Supported => SupportOutcome::Supported(
                 self.scratch
@@ -406,6 +417,9 @@ impl Support for FakeSupport {
     }
     fn source(&self) -> ObservationSource {
         ObservationSource::Live
+    }
+    fn checks(&self) -> Option<SupportChecksSlot> {
+        Some(self.checks.clone())
     }
 }
 
@@ -847,6 +861,7 @@ impl Rig {
         let support = Arc::new(FakeSupport {
             w: w.clone(),
             scratch: scratch.io.clone(),
+            checks: SupportChecksSlot::new(SUPPORT),
         });
         let shared = w.clone();
         let domains: DomainFactory = Box::new(move || Domains {
@@ -1055,6 +1070,39 @@ fn detect_needs_action(outcome: &NativeOutcome) -> Option<bool> {
 }
 
 // ---- support ----------------------------------------------------------------------------------
+
+#[test]
+fn the_platform_hands_each_finished_support_pass_to_the_window() {
+    let mut rig = Rig::new();
+    // Before any pass: the empty placeholder, which already names the support step.
+    let first = rig.platform.support_checks().unwrap();
+    assert_eq!((first.step, first.pass), (SUPPORT, 0));
+    assert!(first.checks.is_empty());
+    rig.set(|w| w.sup = Sup::Pending("couldn't read the session environment"));
+    let (_, report) = rig.run(SUPPORT, JobStage::Detect, None, None);
+    assert!(
+        matches!(report.outcome, NativeOutcome::Waiting(_)),
+        "{report:?}"
+    );
+    let pending = rig.platform.support_checks().unwrap();
+    assert!(pending.pass >= 1);
+    assert_eq!(
+        pending.checks,
+        vec![SupportCheck::new(
+            "Fake check",
+            CheckState::Unconfirmed("couldn't read the session environment".into())
+        )]
+    );
+    rig.set(|w| w.sup = Sup::Supported);
+    let (_, report) = rig.run(SUPPORT, JobStage::Detect, None, None);
+    assert!(
+        matches!(report.outcome, NativeOutcome::Detected { .. }),
+        "{report:?}"
+    );
+    let passed = rig.platform.support_checks().unwrap();
+    assert!(passed.pass > pending.pass);
+    assert_eq!(passed.checks[0].state, CheckState::Passed(None));
+}
 
 #[test]
 fn an_unsupported_session_is_refused_with_zero_mutation_calls() {
@@ -2448,6 +2496,7 @@ impl Rig {
         let support = Arc::new(FakeSupport {
             w: w.clone(),
             scratch: scratch.io.clone(),
+            checks: SupportChecksSlot::new(SUPPORT),
         });
         let shared = w.clone();
         let domains: DomainFactory = Box::new(move || Domains {
@@ -2587,6 +2636,7 @@ mod flow {
             let support = Arc::new(FakeSupport {
                 w: w.clone(),
                 scratch: scratch.io.clone(),
+                checks: SupportChecksSlot::new(SUPPORT),
             });
             let shared = w.clone();
             let domains: DomainFactory = Box::new(move || Domains {
@@ -3934,4 +3984,51 @@ fn r2_gui_a_refused_discard_leaves_nothing_working_and_removal_reachable() {
             .count(),
         1
     );
+}
+
+#[test]
+fn the_compatibility_card_lists_each_check_from_the_real_worker_and_check_again_reruns_it() {
+    use crosspane_installer::view::{RowState, RowView, ScreenId};
+    let mut f = flow::Flow::new();
+    f.world().lock().unwrap().sup = Sup::Pending("couldn't read the session environment");
+    f.until("the welcome screen", |f| {
+        f.view().screen == ScreenId::Welcome
+    });
+    f.go_next();
+    assert_eq!(f.view().screen, ScreenId::Compatibility);
+    let checks = |f: &flow::Flow| -> Vec<RowView> {
+        f.view()
+            .rows
+            .iter()
+            .filter(|r| r.is_check())
+            .cloned()
+            .collect()
+    };
+    f.until("the pending pass's checklist", |f| {
+        checks(f)
+            .first()
+            .is_some_and(|r| r.state == RowState::Waiting)
+    });
+    let rows = checks(&f);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "Fake check");
+    assert_eq!(rows[0].detail, "couldn't read the session environment");
+    let card = f.view().rows[0].clone();
+    assert_eq!(card.id, 10);
+    assert!(card.detail.contains("Last checked"), "{card:?}");
+    // Check again: the rows read as checking until the new pass ends, then show what it found.
+    f.world().lock().unwrap().sup = Sup::Supported;
+    f.world().lock().unwrap().hold_support = true;
+    f.click(live::ids::retry(StepId(10)));
+    f.until("the rerun to start", |f| {
+        checks(f)
+            .first()
+            .is_some_and(|r| r.state == RowState::Working)
+    });
+    assert!(f.view().rows[0].detail.ends_with("Checking now…"));
+    f.world().lock().unwrap().hold_support = false;
+    f.until("support verified", |f| f.verified(10));
+    let rows = checks(&f);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, RowState::Verified);
 }

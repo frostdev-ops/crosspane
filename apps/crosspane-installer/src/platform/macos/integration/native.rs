@@ -46,13 +46,17 @@ use super::super::transport::{CallerClock, MacAgentPort, SelectedAgent, Selected
 use super::domains::{
     Admitted, AdmittedInner, Agents, AudioError, AudioPackages, AudioPreview, AudioState,
     DomainFactory, Domains, FixtureChild, FixtureChildInner, FixtureLauncher, InstallApplied,
-    InstallError, InstallPreview, InstallState, Installs, RepairFinish, RepairOffer, RepairStep,
-    Repairer, Support, SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
+    InstallError, InstallPreview, InstallState, Installs, MAC_CHECKS, RepairFinish, RepairOffer,
+    RepairStep, Repairer, Support, SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
+    mac_support_checks, unconfirmed,
 };
 use crate::agent_contract::{
     AgentCall, AgentPort, AgentReply, DecodedReply, InstallerRequest, StatusAdmission,
 };
-use crate::live::{Availability, MaintenanceOutcome, RemovalChoice, RepairOutcome as Shown};
+use crate::live::{
+    Availability, CheckState, MaintenanceOutcome, RemovalChoice, RepairOutcome as Shown,
+    SupportCheck, SupportChecksSlot,
+};
 use crate::view::ToggleRole;
 
 /// The probes a production build must bring: the foundation provides none of the first two.
@@ -156,11 +160,15 @@ fn requirement(rule: &SigningRule) -> SigningRequirement {
     }
 }
 
-/// The native domains over `env`, built on the worker thread.
-pub fn domains(env: NativeEnv) -> DomainFactory {
+/// The native domains over `env`, built on the worker thread. Each support pass writes its
+/// checklist to `checks`.
+pub fn domains(env: NativeEnv, checks: SupportChecksSlot) -> DomainFactory {
     let env = Arc::new(env);
     Box::new(move || Domains {
-        support: Box::new(NativeSupport { env: env.clone() }),
+        support: Box::new(NativeSupport {
+            env: env.clone(),
+            checks: checks.clone(),
+        }),
         installs: Box::new(NativeInstalls::new(env.clone())),
         audio: Box::new(NativeAudio::new(env.clone())),
         agents: Box::new(NativeAgents { env: env.clone() }),
@@ -193,22 +201,102 @@ fn admit_selected(
 
 pub struct NativeSupport {
     env: Arc<NativeEnv>,
+    checks: SupportChecksSlot,
 }
 
-impl Support for NativeSupport {
-    fn observe(&mut self, deadline: &Deadline) -> SupportOutcome {
+impl NativeSupport {
+    /// The admission itself, unchanged: the signed incoming app, then support. Along the way it
+    /// notes what the build row should say.
+    fn admit(
+        &self,
+        deadline: &Deadline,
+        build: &mut CheckState,
+    ) -> (Option<Arc<MacNativeIo>>, NativeResult<ObservationSource>) {
+        let io = match self.env.io() {
+            Ok(io) => io,
+            Err(error) => return (None, Err(error)),
+        };
         let attempt = (|| {
-            let io = self.env.io()?;
-            let requirement = self.env.agent_requirement()?;
+            let requirement = self.env.agent_requirement().inspect_err(|_| {
+                *build = CheckState::Failed(
+                    "this build's approved inventory doesn't name the Crosspane app".into(),
+                );
+            })?;
             let incoming = io
                 .target()
                 .paths()
                 .payload_root
                 .join("Crosspane.app/Contents/MacOS/Crosspane");
-            let main = io.admit_main_signature(&incoming, &requirement, deadline)?;
+            let main = io
+                .admit_main_signature(&incoming, &requirement, deadline)
+                .inspect_err(|error| {
+                    *build = match error {
+                        NativeError::Unsupported | NativeError::Foreign | NativeError::Invalid => {
+                            CheckState::Failed(
+                                "the bundled Crosspane app isn't the signed release this build \
+                                 expects"
+                                    .into(),
+                            )
+                        }
+                        other => unconfirmed("the bundled Crosspane app's signature", *other),
+                    };
+                })?;
+            *build = CheckState::Passed(Some(format!(
+                "Crosspane {}",
+                self.env.inventory.product_version
+            )));
             io.admit_support(&main, deadline)?;
             Ok::<_, NativeError>(io.target().source())
         })();
+        (Some(io), attempt)
+    }
+}
+
+impl Support for NativeSupport {
+    fn observe(&mut self, deadline: &Deadline) -> SupportOutcome {
+        let mut build = CheckState::Unconfirmed(
+            "not checked, because this Mac's install target couldn't be opened".into(),
+        );
+        let (io, attempt) = self.admit(deadline, &mut build);
+        // The checklist only: admitted support proves every fact; otherwise one more read-only
+        // observation says which fact stood in the way. It never changes the outcome below.
+        let checks = match (&io, &attempt) {
+            (Some(io), result) => {
+                let paths = io.target().paths();
+                let location = CheckState::Passed(Some("inside your home folder".into()));
+                if result.is_ok() {
+                    MAC_CHECKS
+                        .iter()
+                        .zip([
+                            CheckState::Passed(None),
+                            CheckState::Passed(None),
+                            CheckState::Passed(None),
+                            build,
+                            location,
+                        ])
+                        .map(|(label, state)| SupportCheck::new(*label, state))
+                        .collect()
+                } else {
+                    let facts = io.support_observation(deadline);
+                    mac_support_checks(
+                        facts.as_ref().map_err(|error| *error),
+                        paths.uid,
+                        &paths.gui_tmpdir,
+                        build,
+                        location,
+                    )
+                }
+            }
+            (None, Err(error)) => mac_support_checks(
+                Err(*error),
+                0,
+                std::path::Path::new(""),
+                build,
+                unconfirmed("where the installer was opened from", *error),
+            ),
+            (None, Ok(_)) => Vec::new(),
+        };
+        self.checks.publish(checks);
         match attempt {
             Ok(source) => SupportOutcome::Supported(source),
             Err(NativeError::Unsupported) => SupportOutcome::Unsupported(
@@ -1864,5 +1952,300 @@ mod repair_wording_tests {
             assert!(text.contains("stopped, then started again"));
             assert!(text.contains("pairings and permissions are kept"));
         }
+    }
+}
+
+#[cfg(test)]
+mod support_checklist_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+
+    use super::super::super::native_io::{
+        Cancellation, CommandOutput, CommandSpec, GuiObservation, MonotonicClock,
+        SignatureObservation, SupportObservation, TargetPaths,
+    };
+    use super::super::super::payload::PayloadFile;
+    use super::*;
+    use crate::live::SupportChecklist;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Facts(Mutex<NativeResult<SupportObservation>>);
+    impl SupportProbe for Facts {
+        fn observe(&self, _: &Deadline) -> NativeResult<SupportObservation> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct Signatures(Mutex<bool>);
+    impl SignatureProbe for Signatures {
+        fn observe(
+            &self,
+            _: &Path,
+            approved: &SigningRequirement,
+            _: &Deadline,
+        ) -> NativeResult<SignatureObservation> {
+            Ok(SignatureObservation {
+                strict_verified: *self.0.lock().unwrap(),
+                team_identifier: "ABCDE12345".into(),
+                identifier: approved.identifier.clone(),
+                designated_requirement: approved.designated_requirement.clone(),
+                entitlements: approved.entitlements.clone(),
+                apple_development: true,
+                hardened_runtime: true,
+                ad_hoc: false,
+            })
+        }
+    }
+
+    struct NoCommands;
+    impl CommandRunner for NoCommands {
+        fn run(&self, _: &CommandSpec, _: &Deadline) -> NativeResult<CommandOutput> {
+            Err(NativeError::Unavailable)
+        }
+    }
+
+    struct Rig {
+        root: PathBuf,
+        tmp: PathBuf,
+        uid: u32,
+        facts: Arc<Facts>,
+        signatures: Arc<Signatures>,
+        support: NativeSupport,
+        slot: SupportChecksSlot,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn make(path: &Path) {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn rig() -> Rig {
+        let root = PathBuf::from(format!(
+            "/private/tmp/crosspane-wp428-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let (home, tmp) = (root.join("home"), root.join("tmp"));
+        let payload = home.join("payload");
+        let bin = payload.join("Crosspane.app/Contents/MacOS");
+        for dir in [
+            &root,
+            &home,
+            &tmp,
+            &payload,
+            &payload.join("Crosspane.app"),
+            &payload.join("Crosspane.app/Contents"),
+            &bin,
+        ] {
+            make(dir);
+        }
+        std::fs::write(bin.join("Crosspane"), b"not a real agent").unwrap();
+        std::fs::set_permissions(
+            bin.join("Crosspane"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let facts = Arc::new(Facts(Mutex::new(Ok(SupportObservation {
+            macos_major: 26,
+            apple_silicon: true,
+            gui: GuiObservation {
+                console_uid: Some(uid),
+                interactive_uid: Some(uid),
+                console_session: "100".into(),
+                interactive_session: "100".into(),
+                active: true,
+            },
+            gui_tmpdir: tmp.clone(),
+        }))));
+        let signatures = Arc::new(Signatures(Mutex::new(true)));
+        let target = MacTarget::scratch(TargetPaths {
+            uid,
+            home,
+            gui_tmpdir: tmp.clone(),
+            runtime_override: None,
+            payload_root: payload,
+        })
+        .unwrap();
+        let inventory = ApprovedInventory {
+            product_version: "0.0.1".into(),
+            features: Vec::new(),
+            files: vec![PayloadFile {
+                path: "Crosspane.app/Contents/MacOS/Crosspane".into(),
+                size: 16,
+                sha256: [7; 32],
+                mode: 0o755,
+                signing: Some(SigningRule {
+                    role: PayloadRole::Agent,
+                    identifier: "io.frostdev.crosspane.agent".into(),
+                    designated_requirement: "identifier \"io.frostdev.crosspane.agent\"".into(),
+                    entitlements: BTreeMap::new(),
+                }),
+            }],
+        };
+        let probes = MacProbes {
+            support: facts.clone(),
+            signatures: signatures.clone(),
+            approval: Arc::new(UnobservableApproval),
+            runner: Arc::new(NoCommands),
+        };
+        let env = NativeEnv::new(
+            target,
+            inventory,
+            probes,
+            Arc::new(MonotonicClock::default()),
+        );
+        let slot = SupportChecksSlot::new(crosspane_installer_core::StepId(10));
+        Rig {
+            root,
+            tmp,
+            uid,
+            facts,
+            signatures,
+            support: NativeSupport {
+                env: Arc::new(env),
+                checks: slot.clone(),
+            },
+            slot,
+        }
+    }
+
+    fn observe(rig: &mut Rig) -> (SupportOutcome, SupportChecklist) {
+        let deadline = Deadline::new(
+            10_000,
+            Arc::new(MonotonicClock::default()),
+            Cancellation::default(),
+        )
+        .unwrap();
+        let outcome = rig.support.observe(&deadline);
+        (outcome, rig.slot.latest().unwrap())
+    }
+
+    fn states(list: &SupportChecklist) -> Vec<(&str, &CheckState)> {
+        list.checks
+            .iter()
+            .map(|c| (c.label.as_str(), &c.state))
+            .collect()
+    }
+
+    #[test]
+    fn admitted_support_passes_every_row_and_names_the_build() {
+        let mut rig = rig();
+        let (outcome, list) = observe(&mut rig);
+        assert!(
+            matches!(outcome, SupportOutcome::Supported(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(list.pass, 1);
+        assert_eq!(list.checks.len(), MAC_CHECKS.len());
+        for (label, state) in states(&list) {
+            assert!(matches!(state, CheckState::Passed(_)), "{label}: {state:?}");
+        }
+        assert_eq!(
+            list.checks[3].state,
+            CheckState::Passed(Some("Crosspane 0.0.1".into()))
+        );
+    }
+
+    #[test]
+    fn an_old_macos_fails_only_its_row_and_the_outcome_is_unchanged() {
+        let mut rig = rig();
+        if let Ok(facts) = rig.facts.0.lock().unwrap().as_mut() {
+            facts.macos_major = 25;
+        }
+        let (outcome, list) = observe(&mut rig);
+        assert!(
+            matches!(outcome, SupportOutcome::Unsupported(_)),
+            "{outcome:?}"
+        );
+        let failed: Vec<_> = states(&list)
+            .into_iter()
+            .filter(|(_, s)| !matches!(s, CheckState::Passed(_)))
+            .collect();
+        assert_eq!(
+            failed,
+            vec![(
+                "macOS version",
+                &CheckState::Failed(
+                    "macOS 25 is older than macOS 26, which Crosspane needs".into()
+                )
+            )]
+        );
+        assert_eq!(list.pass, 1);
+    }
+
+    #[test]
+    fn a_bad_signature_fails_the_build_row_and_the_facts_are_still_shown() {
+        let mut rig = rig();
+        *rig.signatures.0.lock().unwrap() = false;
+        let (outcome, list) = observe(&mut rig);
+        assert!(
+            matches!(outcome, SupportOutcome::Unsupported(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            matches!(list.checks[3].state, CheckState::Failed(_)),
+            "{list:?}"
+        );
+        assert_eq!(
+            list.checks[0].state,
+            CheckState::Passed(Some("macOS 26".into()))
+        );
+    }
+
+    #[test]
+    fn another_account_at_the_screen_fails_the_session_row() {
+        let mut rig = rig();
+        let uid = rig.uid;
+        if let Ok(facts) = rig.facts.0.lock().unwrap().as_mut() {
+            facts.gui.console_uid = Some(uid.wrapping_add(1));
+        }
+        let (outcome, list) = observe(&mut rig);
+        assert!(
+            matches!(outcome, SupportOutcome::Unsupported(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            list.checks[2].state,
+            CheckState::Failed("another account is signed in at this Mac's screen".into())
+        );
+        let _ = &rig.tmp;
+    }
+
+    #[test]
+    fn an_unreadable_session_is_unconfirmed_and_only_pending() {
+        let mut rig = rig();
+        *rig.facts.0.lock().unwrap() = Err(NativeError::Unavailable);
+        let (outcome, list) = observe(&mut rig);
+        assert!(
+            matches!(outcome, SupportOutcome::Unavailable(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            list.checks[2].state,
+            CheckState::Unconfirmed("couldn't read the signed-in session".into())
+        );
+        assert_eq!(
+            list.checks[0].state,
+            CheckState::Unconfirmed("couldn't read this Mac's version".into())
+        );
+        // A second pass is a new pass.
+        let (_, again) = observe(&mut rig);
+        assert_eq!(again.pass, 2);
     }
 }

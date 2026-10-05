@@ -19,6 +19,7 @@ use crosspane_installer::live::{
     MaintenanceRequest, NativeJob, NativeOutcome, NativeRefusal, NativeReport, NativeStep,
     Platform, PlatformDescription, PracticeFixtures, RepairOutcome, StepReport, ids,
 };
+use crosspane_installer::live::{CheckState, SupportCheck, SupportChecklist, SupportChecksSlot};
 use crosspane_installer::tutorial_flow::{HumanConfirmation, TutorialRole, TutorialSourcePolicy};
 use crosspane_installer::view::*;
 use crosspane_installer_core::*;
@@ -160,6 +161,7 @@ struct Fake {
     native: Rc<RefCell<Native>>,
     agent: SharedAgent,
     fixtures: SharedFixtures,
+    checks: Option<SupportChecksSlot>,
 }
 impl Platform for Fake {
     fn describe(&self) -> PlatformDescription {
@@ -185,6 +187,9 @@ impl Platform for Fake {
     fn shutdown(&mut self) {
         self.native.borrow_mut().shutdown = true;
     }
+    fn support_checks(&mut self) -> Option<SupportChecklist> {
+        self.checks.as_ref().and_then(SupportChecksSlot::latest)
+    }
 }
 
 struct H {
@@ -204,6 +209,9 @@ impl H {
         Self::with(description())
     }
     fn with(description: PlatformDescription) -> Self {
+        Self::with_checks(description, None)
+    }
+    fn with_checks(description: PlatformDescription, checks: Option<SupportChecksSlot>) -> Self {
         let native = Rc::new(RefCell::new(Native::default()));
         let agent = Rc::new(RefCell::new(AgentQueue::default()));
         let fixtures = Rc::new(RefCell::new(FixtureState::default()));
@@ -216,6 +224,7 @@ impl H {
                 native: native.clone(),
                 agent: SharedAgent(agent.clone()),
                 fixtures: SharedFixtures(fixtures.clone()),
+                checks,
             }),
             clock_fn,
         )
@@ -443,6 +452,7 @@ fn graph_rejects_platform_steps_outside_the_reserved_range_or_shared_anchors() {
             native: Rc::default(),
             agent: SharedAgent(Rc::default()),
             fixtures: SharedFixtures(Rc::default()),
+            checks: None,
         }),
         Arc::new(|| 1),
     );
@@ -456,6 +466,7 @@ fn graph_rejects_platform_steps_outside_the_reserved_range_or_shared_anchors() {
                 native: Rc::default(),
                 agent: SharedAgent(Rc::default()),
                 fixtures: SharedFixtures(Rc::default()),
+                checks: None,
             }),
             Arc::new(|| 1),
         )
@@ -2686,4 +2697,242 @@ fn an_unknown_outcome_with_no_resume_doesnt_ask_for_one() {
     assert!(message.contains("Outcome unknown"), "{message}");
     assert!(!message.contains("resume required"), "{message}");
     assert!(h.button(ids::REPAIR_RESUME).is_none());
+}
+
+// ---- the support checklist (WP-4.28) ----------------------------------------------------------
+
+fn sample_checks() -> Vec<SupportCheck> {
+    vec![
+        SupportCheck::new(
+            "Operating system",
+            CheckState::Passed(Some("Arch-based".into())),
+        ),
+        SupportCheck::new("Hyprland version", CheckState::Failed("too old".into())),
+        SupportCheck::new(
+            "This session is the signed-in one",
+            CheckState::Unconfirmed("couldn't read the session environment".into()),
+        ),
+        SupportCheck::new("Processor", CheckState::Passed(None)),
+    ]
+}
+
+/// The checklist rows of the current view, in order.
+fn check_rows(h: &H) -> Vec<RowView> {
+    h.view()
+        .rows
+        .iter()
+        .filter(|r| r.is_check())
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn the_checklist_follows_the_support_pass_and_check_again_resets_it() {
+    let slot = SupportChecksSlot::new(SUPPORT);
+    let mut h = H::with_checks(description(), Some(slot.clone()));
+    h.tick();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Compatibility);
+    // The first pass is running and nothing has finished yet: no rows, a running indicator.
+    let (detect, _) = h.job(SUPPORT, JobStage::Detect);
+    assert!(check_rows(&h).is_empty());
+    assert!(
+        h.row(SUPPORT).detail.ends_with("Checking now…"),
+        "{:?}",
+        h.row(SUPPORT)
+    );
+    // The pass finishes: its checklist is published before the report that ends the job.
+    slot.publish(sample_checks());
+    h.report(&detect, NativeOutcome::Waiting(WaitKind::User));
+    assert_eq!(h.row(SUPPORT).state, RowState::Waiting);
+    let rows = check_rows(&h);
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.id, r.label.as_str(), r.state, r.detail.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (900, "Operating system", RowState::Verified, "Arch-based"),
+            (901, "Hyprland version", RowState::Failed, "too old"),
+            (
+                902,
+                "This session is the signed-in one",
+                RowState::Waiting,
+                "couldn't read the session environment"
+            ),
+            (903, "Processor", RowState::Verified, ""),
+        ]
+    );
+    // The rows sit right under their card, and the summary sentence is kept.
+    let ids: Vec<u16> = h.view().rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![SUPPORT.0, 900, 901, 902, 903]);
+    let card = h.row(SUPPORT);
+    assert!(card.detail.starts_with("fake detail"), "{card:?}");
+    assert!(card.detail.ends_with("Last checked just now."), "{card:?}");
+    let revision = h.view().revision;
+    h.advance(3_000);
+    h.tick();
+    assert!(h.row(SUPPORT).detail.ends_with("Last checked 3 s ago."));
+    h.advance(120_000);
+    h.tick();
+    assert!(h.row(SUPPORT).detail.ends_with("Last checked 2 min ago."));
+    // Time passing is not a change of meaning.
+    assert_eq!(h.view().revision, revision);
+    // Check again re-runs the pass and shows every row as checking until it finishes.
+    h.click(ids::retry(SUPPORT));
+    let (again, _) = h.job(SUPPORT, JobStage::Detect);
+    let rows = check_rows(&h);
+    assert_eq!(rows.len(), 4);
+    assert!(
+        rows.iter()
+            .all(|r| r.state == RowState::Working && r.detail.is_empty())
+    );
+    assert!(h.row(SUPPORT).detail.ends_with("Checking now…"));
+    slot.publish(vec![
+        SupportCheck::new("Operating system", CheckState::Passed(None)),
+        SupportCheck::new("Hyprland version", CheckState::Passed(None)),
+    ]);
+    h.report(
+        &again,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    let (verify, _) = h.job(SUPPORT, JobStage::Verify);
+    // Verification is another pass: the rows read as checking again until it ends.
+    assert!(check_rows(&h).iter().all(|r| r.state == RowState::Working));
+    slot.publish(vec![
+        SupportCheck::new("Operating system", CheckState::Passed(None)),
+        SupportCheck::new("Hyprland version", CheckState::Passed(None)),
+    ]);
+    let live = h.live();
+    h.report(&verify, live);
+    assert_eq!(h.row(SUPPORT).state, RowState::Verified);
+    let rows = check_rows(&h);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.state == RowState::Verified));
+    assert!(h.row(SUPPORT).detail.ends_with("Last checked just now."));
+}
+
+#[test]
+fn the_checklist_stays_on_its_own_screen_and_platforms_without_one_are_unchanged() {
+    // No slot: the card reads exactly as before and no checklist rows appear.
+    let mut h = H::new();
+    h.tick();
+    h.next();
+    let (detect, _) = h.job(SUPPORT, JobStage::Detect);
+    assert!(check_rows(&h).is_empty());
+    h.report(&detect, NativeOutcome::Waiting(WaitKind::User));
+    assert_eq!(h.row(SUPPORT).detail, "fake detail");
+    assert!(check_rows(&h).is_empty());
+
+    // With a slot, the rows belong to the support card only, never to the next screen.
+    let slot = SupportChecksSlot::new(SUPPORT);
+    let mut h = H::with_checks(description(), Some(slot.clone()));
+    h.tick();
+    h.next();
+    let (detect, _) = h.job(SUPPORT, JobStage::Detect);
+    slot.publish(sample_checks());
+    h.report(
+        &detect,
+        NativeOutcome::Detected {
+            needs_action: false,
+        },
+    );
+    let (verify, _) = h.job(SUPPORT, JobStage::Verify);
+    slot.publish(vec![SupportCheck::new(
+        "Processor",
+        CheckState::Passed(None),
+    )]);
+    let live = h.live();
+    h.report(&verify, live);
+    assert_eq!(check_rows(&h).len(), 1);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::InstallPlan);
+    assert!(check_rows(&h).is_empty());
+    // A checklist naming a step that isn't a native step is ignored.
+    let mut h = H::with_checks(description(), Some(SupportChecksSlot::new(StepId(59))));
+    h.tick();
+    h.next();
+    assert!(check_rows(&h).is_empty());
+    assert!(!h.row(SUPPORT).detail.contains("Checking now"));
+}
+
+#[test]
+fn a_screen_with_several_waiting_steps_shows_one_check_again_that_rechecks_each() {
+    let mut desc = description();
+    for id in [24, 25] {
+        desc.steps
+            .push(native(StepId(id), &[PAYLOAD], ScreenId::Installing, true));
+    }
+    let mut h = H::with(desc);
+    h.tick();
+    h.next();
+    h.pass(SUPPORT);
+    h.next();
+    h.pass(PAYLOAD);
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::Installing);
+    let installing = [AGENT, StepId(24), StepId(25)];
+    let jobs = h.take_jobs();
+    for step in installing {
+        let job = jobs
+            .iter()
+            .find_map(|j| match j {
+                NativeJob::Step { job, .. } if job.step == step => Some(job.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no detect for {}", step.0));
+        h.report(&job, NativeOutcome::Waiting(WaitKind::User));
+        assert_eq!(h.row(step).state, RowState::Waiting);
+    }
+    let retries = |h: &H| -> Vec<ButtonView> {
+        h.view()
+            .buttons
+            .iter()
+            .filter(|b| b.role == ButtonRole::Retry)
+            .cloned()
+            .collect()
+    };
+    let shown = retries(&h);
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(shown[0].id, ids::RETRY_ALL);
+    assert_eq!(shown[0].label, "Check again");
+    assert!(shown[0].enabled);
+    // One click re-checks every waiting step on the screen.
+    h.click(ids::RETRY_ALL);
+    let jobs = h.take_jobs();
+    for step in installing {
+        assert!(
+            jobs.iter().any(|j| matches!(j, NativeJob::Step { job, .. }
+                if job.step == step && job.stage == JobStage::Detect)),
+            "{} not re-checked: {jobs:?}",
+            step.0
+        );
+        assert_eq!(h.row(step).state, RowState::Working);
+    }
+    assert!(
+        retries(&h).is_empty(),
+        "nothing waits while all are checking"
+    );
+    // Two settle; the last one still waiting gets its own single "Check again".
+    for j in &jobs {
+        if let NativeJob::Step { job, .. } = j {
+            if job.step == StepId(25) {
+                h.report(job, NativeOutcome::Waiting(WaitKind::User));
+            } else {
+                h.report(
+                    job,
+                    NativeOutcome::Detected {
+                        needs_action: false,
+                    },
+                );
+                let (verify, _) = h.job(job.step, JobStage::Verify);
+                let live = h.live();
+                h.report(&verify, live);
+            }
+        }
+    }
+    let shown = retries(&h);
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(shown[0].id, ids::retry(StepId(25)));
 }

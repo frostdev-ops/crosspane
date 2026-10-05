@@ -15,7 +15,7 @@ use super::present::MaintenanceState;
 use super::shared::ConnectState;
 use super::{
     Clock, Consent, LiveError, NativeJob, NativeOutcome, NativeReport, Platform,
-    PlatformDescription, StatusEvidence, StepReport,
+    PlatformDescription, StatusEvidence, StepReport, SupportChecklist,
 };
 use crate::agent_contract::{
     AgentCall, AgentReply, CallFailure, DecodedReply, HealthSnapshot, InstallerRequest,
@@ -120,6 +120,9 @@ pub struct LiveController {
     pub(super) change_since: Option<u64>,
     /// Agent-applied step requests in flight, by call id, with the Apply job each one serves.
     pub(super) step_apply_calls: BTreeMap<u64, JobIntent>,
+    /// The latest finished support checklist the platform reported, and when this controller
+    /// first saw that pass (its own clock, so "checked N s ago" never mixes clocks).
+    pub(super) support_checks: Option<(SupportChecklist, u64)>,
 }
 
 impl std::fmt::Debug for LiveController {
@@ -184,6 +187,7 @@ impl LiveController {
             closed: false,
             change_since: None,
             step_apply_calls: BTreeMap::new(),
+            support_checks: None,
         };
         controller.view.demo = false;
         controller.rebuild_view();
@@ -447,9 +451,25 @@ impl LiveController {
         }
     }
 
+    /// Take a newly finished support pass, if there is one. Display only: it never changes state.
+    fn poll_support_checks(&mut self) {
+        let Some(latest) = self.platform.support_checks() else {
+            return;
+        };
+        let known = self
+            .support_checks
+            .as_ref()
+            .is_some_and(|(seen, _)| seen.pass == latest.pass && seen.step == latest.step);
+        if !known && self.graph.kind(latest.step) == Some(StepKind::Native) {
+            self.support_checks = Some((latest, self.now));
+        }
+    }
+
     fn drain_platform(&mut self) {
         let reports = self.platform.poll();
         self.stamp();
+        // Checks before reports: a pass is published before the report that ends its job.
+        self.poll_support_checks();
         if !reports.is_empty() && self.change_since.is_some() {
             self.change_since = Some(self.now);
         }

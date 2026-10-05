@@ -38,16 +38,16 @@ use crate::agent_contract::{AgentPlatform, AgentPort};
 use crate::gui::InstallerController;
 use crate::live::{
     Clock, LiveController, LiveError, NativeJob, NativeRefusal, NativeReport, NativeStep, Platform,
-    PlatformDescription, PracticeFixtures,
+    PlatformDescription, PracticeFixtures, SupportChecklist, SupportChecksSlot,
 };
 use crate::tutorial_flow::TutorialSourcePolicy;
 use crate::view::{ProgressGroup, ScreenId};
 
 pub use domains::{
-    Admitted, Agents, AudioError, AudioPackages, AudioPreview, AudioState, Blocked, DomainFactory,
-    Domains, FixtureChild, FixtureLauncher, InstallApplied, InstallError, InstallPreview,
-    InstallState, Installs, RepairFinish, RepairOffer, RepairStep, Repairer, Support,
-    SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
+    Admitted, Agents, AudioError, AudioPackages, AudioPreview, AudioState, Blocked, BlockedBy,
+    DomainFactory, Domains, FixtureChild, FixtureLauncher, InstallApplied, InstallError,
+    InstallPreview, InstallState, Installs, RepairFinish, RepairOffer, RepairStep, Repairer,
+    Support, SupportOutcome, UninstallOffer, UninstallResult, Uninstaller,
 };
 pub use native::MacProbes;
 use native::NativeEnv;
@@ -80,9 +80,16 @@ pub fn open() -> Result<(egui::FontDefinitions, Box<dyn InstallerController>)> {
     let platform = match embedded_inventory() {
         InventoryAdmission::Present(inventory) => match production_env(*inventory, &clock) {
             Ok(env) => MacPlatform::native(clock.clone(), env, font_path)?,
-            Err(reason) => MacPlatform::blocked(clock.clone(), reason, font_path)?,
+            Err(reason) => {
+                MacPlatform::blocked(clock.clone(), reason, BlockedBy::Location, font_path)?
+            }
         },
-        other => MacPlatform::blocked(clock.clone(), blocked_reason(&other), font_path)?,
+        other => MacPlatform::blocked(
+            clock.clone(),
+            blocked_reason(&other),
+            BlockedBy::Inventory,
+            font_path,
+        )?,
     };
     let controller = LiveController::new(Box::new(platform), clock).map_err(live_err)?;
     Ok((font.definitions, Box::new(controller)))
@@ -329,6 +336,8 @@ pub struct MacPlatform {
     agent: AgentSlot,
     fixtures: Box<dyn PracticeFixtures>,
     stop: Arc<Cancellation>,
+    /// Where the support domain writes each pass's checklist (production builds only).
+    checks: Option<SupportChecksSlot>,
 }
 
 macro_rules! opaque_debug {
@@ -353,27 +362,37 @@ impl NativeClock for FnClock {
 
 impl MacPlatform {
     /// A launch that can't admit anything: every domain is [`Blocked`] with the typed reason.
-    fn blocked(clock: Clock, reason: &'static str, font: PathBuf) -> Result<Self> {
-        let domains: DomainFactory = Box::new(move || Blocked::domains(reason));
-        Self::start(Parts {
-            clock,
-            domains,
-            agent: AgentSource::Native,
-            fixtures: FixtureSource::Native { font },
-        })
+    fn blocked(clock: Clock, reason: &'static str, by: BlockedBy, font: PathBuf) -> Result<Self> {
+        let checks = SupportChecksSlot::new(SUPPORT);
+        let slot = checks.clone();
+        let domains: DomainFactory =
+            Box::new(move || Blocked::domains_reporting(reason, Some((slot, by))));
+        Self::start(
+            Parts {
+                clock,
+                domains,
+                agent: AgentSource::Native,
+                fixtures: FixtureSource::Native { font },
+            },
+            Some(checks),
+        )
     }
 
     /// The production composition: the merged native adapters over `env`, built from this Mac's
     /// selected target, the production probes and the build's embedded inventory. Crate-private:
     /// an inventory is never handed in from outside the build.
     pub(crate) fn native(clock: Clock, env: NativeEnv, font: PathBuf) -> Result<Self> {
-        let domains = native::domains(env);
-        Self::start(Parts {
-            clock,
-            domains,
-            agent: AgentSource::Native,
-            fixtures: FixtureSource::Native { font },
-        })
+        let checks = SupportChecksSlot::new(SUPPORT);
+        let domains = native::domains(env, checks.clone());
+        Self::start(
+            Parts {
+                clock,
+                domains,
+                agent: AgentSource::Native,
+                fixtures: FixtureSource::Native { font },
+            },
+            Some(checks),
+        )
     }
 
     /// Compose from injected parts: the test seam. It exists only in this crate's own tests and
@@ -382,11 +401,11 @@ impl MacPlatform {
     /// domains, an agent port or fixtures.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn compose(parts: Parts) -> Result<Self> {
-        Self::start(parts)
+        Self::start(parts, None)
     }
 
     /// Start the worker and wire the GUI-thread ports to it.
-    fn start(parts: Parts) -> Result<Self> {
+    fn start(parts: Parts, checks: Option<SupportChecksSlot>) -> Result<Self> {
         let (commands, receiver) = mpsc::sync_channel::<Command>(8);
         let (reports_tx, reports_rx) = mpsc::sync_channel::<NativeReport>(64);
         let broker = Broker::new(commands.clone());
@@ -425,6 +444,7 @@ impl MacPlatform {
             broker,
             fixtures,
             stop,
+            checks,
         })
     }
 }
@@ -464,6 +484,10 @@ impl Platform for MacPlatform {
         self.broker.close();
         self.commands = None;
         self.fixtures.retire();
+    }
+
+    fn support_checks(&mut self) -> Option<SupportChecklist> {
+        self.checks.as_ref().and_then(SupportChecksSlot::latest)
     }
 }
 

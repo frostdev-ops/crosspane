@@ -47,7 +47,7 @@ use crate::agent_contract::{AgentPlatform, AgentPort};
 use crate::gui::InstallerController;
 use crate::live::{
     Clock, LiveController, LiveError, NativeJob, NativeRefusal, NativeReport, NativeStep, Platform,
-    PlatformDescription, PracticeFixtures,
+    PlatformDescription, PracticeFixtures, SupportChecklist, SupportChecksSlot,
 };
 use crate::tutorial_flow::TutorialSourcePolicy;
 use crate::view::{ProgressGroup, ScreenId};
@@ -326,6 +326,8 @@ pub struct LinuxPlatform {
     agent: AgentSlot,
     fixtures: Box<dyn PracticeFixtures>,
     stop: Arc<Cancellation>,
+    /// The support detection's checklist slot, when the support domain reports one.
+    checks: Option<SupportChecksSlot>,
 }
 
 opaque_debug!(LinuxPlatform, Parts, AgentSource, FixtureSource);
@@ -342,6 +344,7 @@ impl LinuxPlatform {
             io: io.clone(),
             env: env.clone(),
             clock: clock.clone(),
+            checks: SupportChecksSlot::new(SUPPORT),
         });
         // Validate the install paths here, so a bad target is a startup error, not a dead worker.
         NativePayloads::new(io.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -393,6 +396,7 @@ impl LinuxPlatform {
     /// Start the worker and wire the GUI-thread ports to it.
     fn start(parts: Parts) -> Result<Self> {
         let resume_note = resume::read(&parts.io).as_ref().and_then(resume::note);
+        let checks = parts.support.checks();
         let (commands, receiver) = mpsc::sync_channel::<Command>(8);
         let (reports_tx, reports_rx) = mpsc::sync_channel::<NativeReport>(64);
         let (broker, results) = ProofBroker::new(commands.clone());
@@ -443,6 +447,7 @@ impl LinuxPlatform {
             broker,
             fixtures,
             stop,
+            checks,
         })
     }
 }
@@ -482,6 +487,10 @@ impl Platform for LinuxPlatform {
         self.broker.close();
         self.commands = None;
         self.fixtures.retire();
+    }
+
+    fn support_checks(&mut self) -> Option<SupportChecklist> {
+        self.checks.as_ref().and_then(SupportChecksSlot::latest)
     }
 }
 

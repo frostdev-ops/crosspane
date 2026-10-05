@@ -139,6 +139,25 @@ pub struct RowView {
     pub human_confirmed: bool,
 }
 
+/// Rows with ids in this range are checklist entries: the shell draws them as a compact list
+/// inside the card of the ordinary row before them, never as cards of their own. Their states
+/// read as `Working` "Checking…", `Verified` "Passed", `Failed` "Failed: `detail`" and `Waiting`
+/// "Couldn't confirm: `detail`". Step ids never reach this range.
+pub const CHECK_ROW_IDS: std::ops::Range<u16> = 900..932;
+
+/// The row id of checklist entry `index`, saturating at the last id of the range.
+pub fn check_row_id(index: usize) -> u16 {
+    let span = usize::from(CHECK_ROW_IDS.end - CHECK_ROW_IDS.start - 1);
+    CHECK_ROW_IDS.start + index.min(span) as u16
+}
+
+impl RowView {
+    /// Whether this row is a checklist entry under the card before it.
+    pub fn is_check(&self) -> bool {
+        CHECK_ROW_IDS.contains(&self.id)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ButtonView {
     pub id: u16,

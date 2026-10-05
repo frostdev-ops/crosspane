@@ -629,24 +629,95 @@ fn reveal_focus(response: &egui::Response) {
 }
 
 fn rows(ui: &mut egui::Ui, rows: &[RowView]) {
-    for row in rows {
-        let (label, color, icon) = row_style(row.state);
+    let mut at = 0;
+    while at < rows.len() {
+        // Checklist entries belong inside the card of the ordinary row before them.
+        let (card, checks_from) = if rows[at].is_check() {
+            (None, at)
+        } else {
+            (Some(&rows[at]), at + 1)
+        };
+        let checks_to = rows[checks_from..]
+            .iter()
+            .position(|row| !row.is_check())
+            .map_or(rows.len(), |n| checks_from + n);
+        let checks = &rows[checks_from..checks_to];
         theme::glass().show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-                theme::icon(ui.painter(), rect, icon, color);
-                ui.vertical(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new(&row.label).strong());
-                    ui.label(RichText::new(label).color(color));
-                    ui.label(&row.detail);
-                    if row.human_confirmed {
-                        ui.small("Confirmed by you");
-                    }
+            if let Some(row) = card {
+                let (label, color, icon) = row_style(row.state);
+                ui.horizontal_top(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                    theme::icon(ui.painter(), rect, icon, color);
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(&row.label).strong());
+                        ui.label(RichText::new(label).color(color));
+                        ui.label(&row.detail);
+                        if row.human_confirmed {
+                            ui.small("Confirmed by you");
+                        }
+                        checklist(ui, checks);
+                    });
                 });
-            });
+            } else {
+                ui.set_width(ui.available_width());
+                checklist(ui, checks);
+            }
         });
         ui.add_space(6.0);
+        at = checks_to;
+    }
+}
+
+/// The compact checklist: one line per check, with a small state icon and its own wording.
+/// Nothing here animates, so it reads the same in every Motion setting.
+fn checklist(ui: &mut egui::Ui, checks: &[RowView]) {
+    if checks.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    for check in checks {
+        let (_, color, icon) = row_style(check.state);
+        ui.horizontal_top(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+            theme::icon(ui.painter(), rect, icon, color);
+            let style = ui.style().clone();
+            let mut line = egui::text::LayoutJob::default();
+            RichText::new(format!("{}  ", check.label)).append_to(
+                &mut line,
+                &style,
+                egui::FontSelection::Default,
+                egui::Align::Center,
+            );
+            RichText::new(check_wording(check)).color(color).append_to(
+                &mut line,
+                &style,
+                egui::FontSelection::Default,
+                egui::Align::Center,
+            );
+            ui.add(egui::Label::new(line).wrap());
+        });
+    }
+}
+
+/// How a checklist entry reads: "Checking…", "Passed", "Failed: `reason`" or
+/// "Couldn't confirm: `issue`".
+pub(crate) fn check_wording(check: &RowView) -> String {
+    let detail = check.detail.trim();
+    let with = |head: &str| {
+        if detail.is_empty() {
+            head.to_owned()
+        } else {
+            format!("{head}: {detail}")
+        }
+    };
+    match check.state {
+        RowState::Working => "Checking…".to_owned(),
+        RowState::Verified if detail.is_empty() => "Passed".to_owned(),
+        RowState::Verified => format!("Passed ({detail})"),
+        RowState::Failed | RowState::Unsupported => with("Failed"),
+        RowState::Waiting | RowState::NeedsAction => with("Couldn't confirm"),
+        RowState::Unchecked => "Not checked yet".to_owned(),
     }
 }
 

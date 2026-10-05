@@ -10,10 +10,14 @@
 
 use crosspane_installer_core::{ObservationSource, OperationId};
 
-use super::super::native_io::{AdmittedTutorialChild, Deadline};
+use std::path::Path;
+
+use super::super::native_io::{AdmittedTutorialChild, Deadline, NativeError, SupportObservation};
 use super::super::transport::{SelectedAgent, SelectedLink};
 use crate::agent_contract::AgentReply;
-use crate::live::{Availability, MaintenanceOutcome, RemovalChoice};
+use crate::live::{
+    Availability, CheckState, MaintenanceOutcome, RemovalChoice, SupportCheck, SupportChecksSlot,
+};
 
 /// Support detection. Each call is a fresh read: the proofs it takes live five seconds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +33,125 @@ pub enum SupportOutcome {
 
 pub trait Support: Send {
     fn observe(&mut self, deadline: &Deadline) -> SupportOutcome;
+}
+
+// ---- the support checklist ----------------------------------------------------------------------
+//
+// Presentation only: each row restates what one part of support admission observed. The step's
+// outcome still comes from `SupportOutcome` alone; nothing here decides support.
+
+/// The checklist rows, in the order they are shown.
+pub const MAC_CHECKS: [&str; 5] = [
+    "macOS version",
+    "Apple silicon",
+    "Signed-in console session",
+    "Approved installer build",
+    "Installer location",
+];
+
+/// What a native error means for a fact that couldn't be confirmed, in plain words.
+pub fn unconfirmed(what: &str, error: NativeError) -> CheckState {
+    CheckState::Unconfirmed(match error {
+        NativeError::Timeout => format!("reading {what} took too long"),
+        NativeError::Cancelled => format!("the check of {what} was stopped"),
+        NativeError::Busy => format!("{what} couldn't be read while another check was running"),
+        _ => format!("couldn't read {what}"),
+    })
+}
+
+fn console_session(observation: &SupportObservation, uid: u32, gui_tmpdir: &Path) -> CheckState {
+    let gui = &observation.gui;
+    let named = |session: &str| {
+        !session.is_empty() && session.len() <= 64 && !session.chars().any(char::is_control)
+    };
+    if gui.console_uid.is_none() {
+        CheckState::Failed("no one is signed in at this Mac's screen".into())
+    } else if gui.console_uid != Some(uid) {
+        CheckState::Failed("another account is signed in at this Mac's screen".into())
+    } else if gui.interactive_uid != Some(uid) {
+        CheckState::Failed("this isn't your signed-in session".into())
+    } else if !gui.active {
+        CheckState::Failed("your session isn't the active one".into())
+    } else if !named(&gui.console_session) {
+        CheckState::Failed("the screen's session couldn't be identified".into())
+    } else if gui.console_session != gui.interactive_session {
+        CheckState::Failed("the screen's session and this session differ".into())
+    } else if observation.gui_tmpdir != gui_tmpdir {
+        CheckState::Failed(
+            "this session's temporary folder isn't the one setup started with".into(),
+        )
+    } else {
+        CheckState::Passed(None)
+    }
+}
+
+/// The checklist from one support pass: the observed facts (or why they couldn't be read), and
+/// the build and location rows the caller already knows.
+pub fn mac_support_checks(
+    facts: Result<&SupportObservation, NativeError>,
+    uid: u32,
+    gui_tmpdir: &Path,
+    build: CheckState,
+    location: CheckState,
+) -> Vec<SupportCheck> {
+    let (version, silicon, session) = match facts {
+        Ok(observation) => (
+            if observation.macos_major >= 26 {
+                CheckState::Passed(Some(format!("macOS {}", observation.macos_major)))
+            } else {
+                CheckState::Failed(format!(
+                    "macOS {} is older than macOS 26, which Crosspane needs",
+                    observation.macos_major
+                ))
+            },
+            if observation.apple_silicon {
+                CheckState::Passed(None)
+            } else {
+                CheckState::Failed("Crosspane needs a Mac with Apple silicon".into())
+            },
+            console_session(observation, uid, gui_tmpdir),
+        ),
+        Err(error) => (
+            unconfirmed("this Mac's version", error),
+            unconfirmed("this Mac's processor", error),
+            unconfirmed("the signed-in session", error),
+        ),
+    };
+    MAC_CHECKS
+        .iter()
+        .zip([version, silicon, session, build, location])
+        .map(|(label, state)| SupportCheck::new(*label, state))
+        .collect()
+}
+
+/// Why this build can't be used here, as checklist rows: which of the build and its location
+/// failed, and every Mac fact unconfirmed because nothing is read while blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockedBy {
+    /// No approved inventory is embedded, or it is invalid.
+    Inventory,
+    /// The inventory is present, but the installer isn't running from a usable home folder.
+    Location,
+}
+
+pub fn blocked_checks(by: BlockedBy) -> Vec<SupportCheck> {
+    let skipped =
+        || CheckState::Unconfirmed("not checked, because this installer can't be used here".into());
+    let (build, location) = match by {
+        BlockedBy::Inventory => (
+            CheckState::Failed("this build has no valid approved inventory".into()),
+            skipped(),
+        ),
+        BlockedBy::Location => (
+            CheckState::Passed(None),
+            CheckState::Failed("the installer isn't open from a folder in your home folder".into()),
+        ),
+    };
+    MAC_CHECKS
+        .iter()
+        .zip([skipped(), skipped(), skipped(), build, location])
+        .map(|(label, state)| SupportCheck::new(*label, state))
+        .collect()
 }
 
 /// Where the payload and the sign-in item stand.
@@ -342,10 +465,15 @@ pub trait FixtureLauncher: Send {
 #[derive(Clone, Debug)]
 pub struct Blocked {
     pub reason: String,
+    /// Where each support pass's checklist goes, and what it says, when the window shows one.
+    pub checks: Option<(SupportChecksSlot, BlockedBy)>,
 }
 
 impl Support for Blocked {
     fn observe(&mut self, _deadline: &Deadline) -> SupportOutcome {
+        if let Some((slot, by)) = &self.checks {
+            slot.publish(blocked_checks(*by));
+        }
         SupportOutcome::Unavailable(self.reason.clone())
     }
 }
@@ -479,8 +607,17 @@ impl AudioPackages for Blocked {
 
 impl Blocked {
     pub fn domains(reason: impl Into<String>) -> Domains {
+        Self::domains_reporting(reason, None)
+    }
+
+    /// The blocked domains, with each support pass writing its checklist to `checks`.
+    pub fn domains_reporting(
+        reason: impl Into<String>,
+        checks: Option<(SupportChecksSlot, BlockedBy)>,
+    ) -> Domains {
         let blocked = Self {
             reason: reason.into(),
+            checks,
         };
         Domains {
             support: Box::new(blocked.clone()),
@@ -497,5 +634,138 @@ impl Blocked {
 impl std::fmt::Debug for Domains {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Domains")
+    }
+}
+
+#[cfg(test)]
+mod checklist_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use std::path::PathBuf;
+
+    use super::super::super::native_io::GuiObservation;
+    use super::*;
+
+    fn facts() -> SupportObservation {
+        SupportObservation {
+            macos_major: 27,
+            apple_silicon: true,
+            gui: GuiObservation {
+                console_uid: Some(501),
+                interactive_uid: Some(501),
+                console_session: "100".into(),
+                interactive_session: "100".into(),
+                active: true,
+            },
+            gui_tmpdir: PathBuf::from("/private/var/folders/x/T"),
+        }
+    }
+
+    fn rows(observation: &SupportObservation) -> Vec<SupportCheck> {
+        mac_support_checks(
+            Ok(observation),
+            501,
+            Path::new("/private/var/folders/x/T"),
+            CheckState::Passed(None),
+            CheckState::Passed(None),
+        )
+    }
+
+    #[test]
+    fn observed_facts_map_to_their_rows_with_plain_reasons() {
+        let good = rows(&facts());
+        assert_eq!(
+            good.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+            MAC_CHECKS.to_vec()
+        );
+        assert_eq!(good[0].state, CheckState::Passed(Some("macOS 27".into())));
+        assert!(
+            good.iter()
+                .all(|c| matches!(c.state, CheckState::Passed(_)))
+        );
+        type Edit = fn(&mut SupportObservation);
+        let cases: [(Edit, usize, &str); 7] = [
+            (|f| f.macos_major = 15, 0, "macOS 15 is older than macOS 26"),
+            (|f| f.apple_silicon = false, 1, "Apple silicon"),
+            (|f| f.gui.console_uid = None, 2, "no one is signed in"),
+            (|f| f.gui.console_uid = Some(502), 2, "another account"),
+            (|f| f.gui.active = false, 2, "isn't the active one"),
+            (|f| f.gui.interactive_session = "101".into(), 2, "differ"),
+            (
+                |f| f.gui_tmpdir = PathBuf::from("/tmp/other"),
+                2,
+                "temporary folder",
+            ),
+        ];
+        for (edit, row, reason) in cases {
+            let mut observation = facts();
+            edit(&mut observation);
+            let checks = rows(&observation);
+            for (index, check) in checks.iter().enumerate() {
+                if index == row {
+                    match &check.state {
+                        CheckState::Failed(text) => assert!(text.contains(reason), "{text}"),
+                        other => panic!("{reason}: {other:?}"),
+                    }
+                } else {
+                    assert!(
+                        matches!(check.state, CheckState::Passed(_)),
+                        "{reason}: {check:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_facts_are_unconfirmed_with_the_issue() {
+        let checks = mac_support_checks(
+            Err(NativeError::Timeout),
+            501,
+            Path::new("/"),
+            CheckState::Passed(None),
+            CheckState::Passed(None),
+        );
+        assert_eq!(
+            checks[2].state,
+            CheckState::Unconfirmed("reading the signed-in session took too long".into())
+        );
+        assert!(matches!(checks[0].state, CheckState::Unconfirmed(_)));
+        assert!(matches!(checks[3].state, CheckState::Passed(_)));
+    }
+
+    #[test]
+    fn a_blocked_build_names_what_blocked_it_and_reads_nothing_else() {
+        let inventory = blocked_checks(BlockedBy::Inventory);
+        assert!(matches!(inventory[3].state, CheckState::Failed(_)));
+        let location = blocked_checks(BlockedBy::Location);
+        assert_eq!(location[3].state, CheckState::Passed(None));
+        assert!(matches!(location[4].state, CheckState::Failed(_)));
+        for checks in [&inventory, &location] {
+            assert!(
+                checks[..3]
+                    .iter()
+                    .all(|c| matches!(c.state, CheckState::Unconfirmed(_)))
+            );
+        }
+        // Every support pass of a blocked build republishes, so "Check again" ends a new pass.
+        let slot = SupportChecksSlot::new(crosspane_installer_core::StepId(10));
+        let mut blocked = Blocked {
+            reason: "blocked".into(),
+            checks: Some((slot.clone(), BlockedBy::Location)),
+        };
+        let deadline = Deadline::new(
+            1_000,
+            std::sync::Arc::new(super::super::super::native_io::MonotonicClock::default()),
+            super::super::super::native_io::Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            blocked.observe(&deadline),
+            SupportOutcome::Unavailable("blocked".into())
+        );
+        blocked.observe(&deadline);
+        let latest = slot.latest().unwrap();
+        assert_eq!(latest.pass, 2);
+        assert_eq!(latest.checks, location);
     }
 }

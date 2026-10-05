@@ -8,7 +8,7 @@ use super::graph::{self, StepKind, steps};
 use super::practice::{CONFIRMATIONS, confirmation_label, confirmations};
 use super::shared::{CAPABILITIES, PairMode, capability_label};
 use super::{
-    Availability, Consent, MaintenanceId, MaintenanceOutcome, MaintenanceReport,
+    Availability, CheckState, Consent, MaintenanceId, MaintenanceOutcome, MaintenanceReport,
     MaintenanceRequest, NativeJob, RemovalChoice, RepairOutcome, StatusEvidence, ids,
 };
 use crate::agent_contract::{InstallerRequest, PairPhase};
@@ -16,7 +16,7 @@ use crate::tutorial_flow::{TutorialRole, TutorialState, TutorialUserAction};
 use crate::view::{
     ButtonKind, ButtonRole, ButtonView, EscapeMapping, FieldView, IllustrationView, LayoutPreview,
     PracticeIllustration, ProgressGroup, ProgressView, RowState, RowView, ScreenId, SummaryView,
-    ToggleRole, WizardView,
+    ToggleRole, WizardView, check_row_id,
 };
 
 const MAX_PROGRESS_LINES: usize = 24;
@@ -253,6 +253,11 @@ impl LiveController {
         } else {
             detail
         };
+        let detail = match self.support_timing(step) {
+            Some(timing) if detail.is_empty() => timing,
+            Some(timing) => bounded(format!("{detail} {timing}")),
+            None => detail,
+        };
         RowView {
             id: step.0,
             label: meta.map_or_else(String::new, |m| m.label.clone()),
@@ -260,6 +265,76 @@ impl LiveController {
             state: row_state(state),
             human_confirmed: graph::role_of(step).is_some() && state == StepState::Satisfied,
         }
+    }
+
+    /// The support checklist belongs to `step`, and its pass is running now.
+    fn support_pass_running(&self, step: StepId) -> bool {
+        self.support_checks
+            .as_ref()
+            .is_some_and(|(checks, _)| checks.step == step)
+            && matches!(
+                self.step_state(step),
+                StepState::Checking
+                    | StepState::Planning
+                    | StepState::Running
+                    | StepState::Verifying
+            )
+    }
+
+    /// "Checking now…" while the support pass runs, then when it last finished.
+    fn support_timing(&self, step: StepId) -> Option<String> {
+        let (checks, seen_at) = self
+            .support_checks
+            .as_ref()
+            .filter(|(c, _)| c.step == step)?;
+        if self.support_pass_running(step) {
+            return Some("Checking now…".into());
+        }
+        if checks.pass == 0 {
+            return None;
+        }
+        let age_s = self.now.saturating_sub(*seen_at) / 1_000;
+        Some(match age_s {
+            0 => "Last checked just now.".into(),
+            1..=59 => format!("Last checked {age_s} s ago."),
+            60..=3_599 => format!("Last checked {} min ago.", age_s / 60),
+            _ => format!("Last checked {} h ago.", age_s / 3_600),
+        })
+    }
+
+    /// The checklist rows under `step`'s card: each check of the last finished pass, or every
+    /// one of them as "checking" while a new pass runs. Empty before the first pass.
+    pub(super) fn support_check_rows(&self, step: StepId) -> Vec<RowView> {
+        let Some((checks, _)) = self.support_checks.as_ref().filter(|(c, _)| c.step == step) else {
+            return Vec::new();
+        };
+        let running = self.support_pass_running(step);
+        checks
+            .checks
+            .iter()
+            .enumerate()
+            .map(|(index, check)| {
+                let (state, detail) = if running {
+                    (RowState::Working, String::new())
+                } else {
+                    match &check.state {
+                        CheckState::Checking => (RowState::Working, String::new()),
+                        CheckState::Passed(value) => {
+                            (RowState::Verified, value.clone().unwrap_or_default())
+                        }
+                        CheckState::Failed(reason) => (RowState::Failed, reason.clone()),
+                        CheckState::Unconfirmed(issue) => (RowState::Waiting, issue.clone()),
+                    }
+                };
+                RowView {
+                    id: check_row_id(index),
+                    label: bounded(check.label.clone()),
+                    detail: bounded(detail),
+                    state,
+                    human_confirmed: false,
+                }
+            })
+            .collect()
     }
 
     fn screen_rows(&self, screen: ScreenId) -> Vec<RowView> {
@@ -274,7 +349,11 @@ impl LiveController {
             other => self
                 .graph
                 .on_screen(other)
-                .map(|m| self.row(m.id))
+                .flat_map(|m| {
+                    let mut rows = vec![self.row(m.id)];
+                    rows.extend(self.support_check_rows(m.id));
+                    rows
+                })
                 .collect(),
         }
     }
@@ -513,15 +592,21 @@ impl LiveController {
                     ButtonKind::Primary,
                 ));
             }
-            if retryable(state) && !matches!(meta.kind, StepKind::Practice(_) | StepKind::Final) {
-                buttons.push(button(
-                    ids::retry(meta.id),
-                    ButtonRole::Retry,
-                    "Check again",
-                    true,
-                    secondary,
-                ));
-            }
+        }
+        // One "Check again" for the whole screen, however many of its steps are waiting.
+        let waiting = self.retryable_on(screen);
+        if !waiting.is_empty() {
+            let id = match waiting.as_slice() {
+                [only] => ids::retry(*only),
+                _ => ids::RETRY_ALL,
+            };
+            buttons.push(button(
+                id,
+                ButtonRole::Retry,
+                "Check again",
+                true,
+                secondary,
+            ));
         }
         match screen {
             ScreenId::Welcome => {
@@ -1117,9 +1202,24 @@ impl LiveController {
             ids::REPAIR_CONFIRM => self.confirm_repair(),
             ids::REPAIR_RESUME => self.resume_repair(),
             ids::REPAIR_DISCARD => self.discard_repair(),
+            ids::RETRY_ALL => {
+                for step in self.retryable_on(self.display_screen()) {
+                    self.begin(step);
+                }
+            }
             other => self.ranged_button(other),
         }
         false
+    }
+
+    /// The steps on `screen` that "Check again" re-checks, in screen order.
+    fn retryable_on(&self, screen: ScreenId) -> Vec<StepId> {
+        self.graph
+            .on_screen(screen)
+            .filter(|m| !matches!(m.kind, StepKind::Practice(_) | StepKind::Final))
+            .filter(|m| retryable(self.step_state(m.id)))
+            .map(|m| m.id)
+            .collect()
     }
 
     fn ranged_button(&mut self, id: u16) {

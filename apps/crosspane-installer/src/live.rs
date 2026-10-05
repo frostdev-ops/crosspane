@@ -12,7 +12,7 @@ mod practice;
 mod present;
 mod shared;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crosspane_installer_core::{
     ApplyOutcome, AttemptId, JobIntent, ObservationSource, OperationId, StepId, WaitKind,
@@ -364,6 +364,99 @@ pub trait PracticeFixtures {
     fn retire(&mut self);
 }
 
+/// What one support check found, in the person's terms. Text is plain and observed: a failed
+/// check names the reason; a check that couldn't be confirmed names what couldn't be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckState {
+    /// The check is part of a pass that is running now.
+    Checking,
+    /// The check passed. The value seen, when it helps (for example "Hyprland 0.56.2").
+    Passed(Option<String>),
+    /// An established negative, with the one-line reason.
+    Failed(String),
+    /// The fact couldn't be read or proved, with the issue in plain words.
+    Unconfirmed(String),
+}
+
+/// One row of the support checklist shown under the "can run Crosspane" card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupportCheck {
+    pub label: String,
+    pub state: CheckState,
+}
+
+impl SupportCheck {
+    pub fn new(label: impl Into<String>, state: CheckState) -> Self {
+        Self {
+            label: label.into(),
+            state,
+        }
+    }
+}
+
+/// The checks of the most recent finished support detection pass. Presentation only: it is
+/// never evidence, and the step's state still comes from its own report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupportChecklist {
+    /// The native step whose card the checklist belongs under.
+    pub step: StepId,
+    /// Increases with every published pass, so a reader can tell a new pass from an old one.
+    /// Pass 0 is the empty placeholder before any pass has finished.
+    pub pass: u64,
+    pub checks: Vec<SupportCheck>,
+}
+
+/// A shared slot the support detection writes each finished pass into and the platform port
+/// reads from. One slot per platform instance; clones share it.
+#[derive(Clone, Debug)]
+pub struct SupportChecksSlot {
+    step: StepId,
+    latest: Arc<Mutex<Option<SupportChecklist>>>,
+}
+
+impl SupportChecksSlot {
+    /// The most checks one pass may carry; extra rows are dropped.
+    pub const MAX_CHECKS: usize = 16;
+
+    /// A slot for `step`'s checks. Until the first pass finishes it holds pass 0 with no
+    /// checks, so the reader knows which card the checklist belongs under from the start.
+    pub fn new(step: StepId) -> Self {
+        Self {
+            step,
+            latest: Arc::new(Mutex::new(Some(SupportChecklist {
+                step,
+                pass: 0,
+                checks: Vec::new(),
+            }))),
+        }
+    }
+
+    /// Record one finished pass. A poisoned slot is recovered: the checklist is display-only.
+    pub fn publish(&self, mut checks: Vec<SupportCheck>) {
+        checks.truncate(Self::MAX_CHECKS);
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pass = latest
+            .as_ref()
+            .map_or(1, |l| l.pass.saturating_add(1))
+            .max(1);
+        *latest = Some(SupportChecklist {
+            step: self.step,
+            pass,
+            checks,
+        });
+    }
+
+    pub fn latest(&self) -> Option<SupportChecklist> {
+        self.latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// The only platform port. Every method is non-blocking.
 pub trait Platform {
     fn describe(&self) -> PlatformDescription;
@@ -372,6 +465,10 @@ pub trait Platform {
     fn agent(&mut self) -> &mut dyn AgentPort;
     fn fixtures(&mut self) -> &mut dyn PracticeFixtures;
     fn shutdown(&mut self);
+    /// The checks of the latest finished support detection pass, if the platform reports them.
+    fn support_checks(&mut self) -> Option<SupportChecklist> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -393,6 +490,9 @@ pub mod ids {
     pub const BACK: u16 = 2;
     pub const CLOSE: u16 = 3;
     pub const REMOVE_OR_REPAIR: u16 = 4;
+    /// One "Check again" for a screen where more than one step is waiting: it re-checks each.
+    /// A screen with a single waiting step uses that step's own [`retry`] id.
+    pub const RETRY_ALL: u16 = 5;
     pub const PEER_ADDRESS: u16 = 1;
     pub const PAIR_LISTEN: u16 = 2001;
     pub const PAIR_JOIN: u16 = 2002;

@@ -9,11 +9,11 @@ use std::sync::Arc;
 use crosspane_installer_core::{ObservationSource, OperationId, ResourceReceipt};
 
 use crate::agent_contract::AgentReply;
-use crate::live::Availability;
+use crate::live::{Availability, CheckState, SupportCheck, SupportChecksSlot};
 
 use super::super::detect::{
-    self, Eligibility, NativeSessionProbes, ProbeIssue, RuntimeFacts, UnsupportedReason,
-    runtime::RuntimeInput,
+    self, Eligibility, Fact, NativeSessionProbes, OsFamily, ProbeIssue, RuntimeFacts,
+    SupportReport, UnsupportedReason, runtime::RuntimeInput,
 };
 use super::super::firewall::{
     Activity, FirewallError, FirewallPlan, LinuxFirewall, ManagerSelection, PlanRequest, Presence,
@@ -47,6 +47,10 @@ pub trait Support: Send + Sync {
     /// Whether this target's observations are live. A scratch target is never live, so core
     /// refuses everything it observes.
     fn source(&self) -> ObservationSource;
+    /// Where each finished pass's checklist is written, when this detection reports one.
+    fn checks(&self) -> Option<SupportChecksSlot> {
+        None
+    }
 }
 
 /// The user files of the install: detect, plan once, apply that plan, verify against the agent.
@@ -361,11 +365,257 @@ pub fn pending_text(issue: ProbeIssue) -> String {
     }
 }
 
+// ---- the support checklist ----------------------------------------------------------------------
+//
+// Presentation only: each row restates one part of the detection report in plain words. The
+// step's outcome still comes from `Eligibility` alone; nothing here decides support.
+
+/// The checklist rows, in the order they are shown.
+pub const LINUX_CHECKS: [&str; 9] = [
+    "Operating system",
+    "Processor",
+    "Hyprland version",
+    "Wayland protocols",
+    "uwsm session",
+    "Graphical session active",
+    "This session is the signed-in one",
+    "Required libraries",
+    "Video support in the payload",
+];
+
+/// What couldn't be confirmed about `what`, in plain words.
+fn unconfirmed(what: &str, issue: ProbeIssue) -> CheckState {
+    CheckState::Unconfirmed(match issue {
+        ProbeIssue::Missing => format!("{what} wasn't found"),
+        ProbeIssue::WrongVersion => format!("{what} reported an unexpected version"),
+        ProbeIssue::Timeout => format!("reading {what} took too long"),
+        ProbeIssue::Cancelled => format!("the check of {what} was stopped"),
+        ProbeIssue::Oversize | ProbeIssue::Malformed => {
+            format!("{what} couldn't be understood")
+        }
+        ProbeIssue::Foreign => format!("{what} belongs to a different session"),
+        ProbeIssue::Ambiguous => "more than one graphical session could be this one".into(),
+        ProbeIssue::Unverified => format!("{what} hasn't been verified yet"),
+        _ => format!("couldn't read {what}"),
+    })
+}
+
+/// A yes/no fact: true passes, false fails with `reason`, an issue is unconfirmed.
+fn yes_no(fact: &Fact<bool>, what: &str, reason: UnsupportedReason) -> CheckState {
+    match fact.value {
+        Ok(true) => CheckState::Passed(None),
+        Ok(false) => CheckState::Failed(unsupported_text(reason)),
+        Err(issue) => unconfirmed(what, issue),
+    }
+}
+
+/// The first failure wins, then the first unconfirmed part, else passed with `value`.
+fn worst(parts: Vec<CheckState>, value: Option<String>) -> CheckState {
+    if let Some(failed) = parts
+        .iter()
+        .find(|part| matches!(part, CheckState::Failed(_)))
+    {
+        return failed.clone();
+    }
+    parts
+        .into_iter()
+        .find(|part| matches!(part, CheckState::Unconfirmed(_) | CheckState::Checking))
+        .unwrap_or(CheckState::Passed(value))
+}
+
+fn graphical_session_active(report: &SupportReport) -> CheckState {
+    let session = &report.session;
+    let mut parts = vec![match session.graphical_target_active.value {
+        Ok(true) => CheckState::Passed(None),
+        Ok(false) => CheckState::Unconfirmed("the graphical session isn't active yet".into()),
+        Err(issue) => unconfirmed("the graphical session state", issue),
+    }];
+    if let Ok(Some(chosen)) = &session.selected_session.value
+        && (chosen.session.seat.as_deref().is_none_or(str::is_empty)
+            || chosen.session.active != Some(true))
+    {
+        parts.push(CheckState::Unconfirmed(
+            "this session isn't shown as the active one on its seat".into(),
+        ));
+    }
+    worst(parts, None)
+}
+
+fn signed_in_session(report: &SupportReport) -> CheckState {
+    let session = &report.session;
+    let chosen = match &session.selected_session.value {
+        Ok(Some(chosen)) => &chosen.session,
+        Ok(None) => {
+            return CheckState::Unconfirmed(
+                "more than one graphical session could be this one".into(),
+            );
+        }
+        Err(issue) => return unconfirmed("this session", *issue),
+    };
+    let mut parts = Vec::new();
+    match chosen.kind.as_deref() {
+        None => parts.push(CheckState::Unconfirmed(
+            "couldn't read the session type".into(),
+        )),
+        Some("wayland") => {}
+        Some(_) => parts.push(CheckState::Failed(unsupported_text(
+            UnsupportedReason::SessionType,
+        ))),
+    }
+    if chosen.uid != Some(session.uid) {
+        parts.push(CheckState::Unconfirmed(
+            "this session belongs to another account".into(),
+        ));
+    }
+    match session.graphical_sessions.value {
+        Ok(1) => {}
+        Ok(0) => parts.push(CheckState::Unconfirmed(
+            "no graphical session was found".into(),
+        )),
+        Ok(count) => parts.push(CheckState::Unconfirmed(format!(
+            "{count} graphical sessions are open, so this one isn't unique"
+        ))),
+        Err(issue) => parts.push(unconfirmed("the list of graphical sessions", issue)),
+    }
+    match &session.manager_environment.value {
+        Ok(effective)
+            if effective.runtime_dir == session.selected_environment.runtime_dir
+                && effective.wayland_display == session.selected_environment.wayland_display
+                && effective.hyprland_instance_signature
+                    == session.selected_environment.hyprland_instance_signature => {}
+        Ok(_) => parts.push(CheckState::Unconfirmed(
+            "the session manager's environment doesn't match this session".into(),
+        )),
+        Err(issue) => parts.push(unconfirmed("the session environment", *issue)),
+    }
+    worst(parts, None)
+}
+
+fn required_libraries(runtime: &RuntimeFacts) -> CheckState {
+    let mut parts = Vec::new();
+    // A named library that is missing or the wrong version is the clearest reason: it comes first.
+    for library in runtime.libraries.iter().filter(|l| l.required) {
+        let name = bounded_name(&library.name);
+        match library.resolved.value {
+            Ok(_) => {}
+            Err(ProbeIssue::Missing) => {
+                parts.push(CheckState::Failed(format!("{name} isn't installed")));
+            }
+            Err(ProbeIssue::WrongVersion) => parts.push(CheckState::Failed(format!(
+                "{name} isn't the version Crosspane needs"
+            ))),
+            Err(ProbeIssue::Foreign) => parts.push(CheckState::Unconfirmed(format!(
+                "{name} was found outside the system library folder"
+            ))),
+            Err(issue) => parts.push(unconfirmed(&name, issue)),
+        }
+    }
+    for (fact, name) in [
+        (&runtime.ffmpeg, "FFmpeg"),
+        (&runtime.opus, "Opus"),
+        (&runtime.pipewire_library, "PipeWire"),
+        (&runtime.xkb, "xkbcommon"),
+        (&runtime.wayland_library, "the Wayland client library"),
+        (&runtime.software_video, "software video decoding"),
+    ] {
+        parts.push(match fact.value {
+            Ok(true) => CheckState::Passed(None),
+            Ok(false) => CheckState::Failed(format!("{name} isn't installed")),
+            Err(issue) => unconfirmed(name, issue),
+        });
+    }
+    if !runtime.libraries.iter().any(|l| l.required) {
+        parts.push(CheckState::Unconfirmed(
+            "the libraries can't be checked until a staged payload is read".into(),
+        ));
+    }
+    if runtime.libei_required {
+        parts.push(CheckState::Unconfirmed(
+            "libei support hasn't been verified yet".into(),
+        ));
+    }
+    let found = runtime.libraries.iter().filter(|l| l.required).count();
+    worst(parts, Some(format!("{found} found")))
+}
+
+/// A library name as shown: bounded and printable.
+fn bounded_name(name: &str) -> String {
+    name.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
+/// One row per check, mapped from a finished detection report.
+pub fn support_checks(report: &SupportReport) -> Vec<SupportCheck> {
+    let session = &report.session;
+    let os = match &session.os.value {
+        Ok(OsFamily::Arch) => CheckState::Passed(Some("Arch-based".into())),
+        Ok(OsFamily::Other(_)) => {
+            CheckState::Failed(unsupported_text(UnsupportedReason::OperatingSystem))
+        }
+        Err(issue) => unconfirmed("the operating system", *issue),
+    };
+    let processor = match &session.architecture.value {
+        Ok(detect::Architecture::X86_64) => CheckState::Passed(Some("x86-64".into())),
+        Ok(detect::Architecture::Aarch64) => CheckState::Passed(Some("ARM64".into())),
+        Ok(detect::Architecture::Other(_)) => {
+            CheckState::Failed(unsupported_text(UnsupportedReason::Architecture))
+        }
+        Err(issue) => unconfirmed("the processor type", *issue),
+    };
+    let hyprland = match session.hyprland_version.value {
+        Ok(v) if v >= [0, 56, 0] => {
+            CheckState::Passed(Some(format!("Hyprland {}.{}.{}", v[0], v[1], v[2])))
+        }
+        Ok(v) => CheckState::Failed(format!(
+            "Hyprland {}.{}.{} is older than 0.56, which Crosspane needs",
+            v[0], v[1], v[2]
+        )),
+        Err(issue) => unconfirmed("the Hyprland version", issue),
+    };
+    let states = [
+        os,
+        processor,
+        hyprland,
+        yes_no(
+            &session.protocols,
+            "Hyprland's Wayland protocols",
+            UnsupportedReason::RequiredProtocols,
+        ),
+        yes_no(
+            &session.uwsm_managed,
+            "how this session is managed",
+            UnsupportedReason::Uwsm,
+        ),
+        graphical_session_active(report),
+        signed_in_session(report),
+        required_libraries(&report.runtime),
+        yes_no(
+            &report.runtime.video_feature,
+            "the staged payload's features",
+            UnsupportedReason::VideoFeature,
+        ),
+    ];
+    LINUX_CHECKS
+        .iter()
+        .zip(states)
+        .map(|(label, state)| SupportCheck::new(*label, state))
+        .collect()
+}
+
+/// Every row unconfirmed for one reason, when the pass couldn't run at all.
+pub fn unchecked_support(issue: &str) -> Vec<SupportCheck> {
+    LINUX_CHECKS
+        .iter()
+        .map(|label| SupportCheck::new(*label, CheckState::Unconfirmed(issue.to_owned())))
+        .collect()
+}
+
 /// The real read-only session and runtime detection.
 pub struct NativeSupport {
     pub io: Arc<LinuxNativeIo>,
     pub env: ChildEnvironment,
     pub clock: CallerClock,
+    /// Each finished pass's checklist is written here for the installer window.
+    pub checks: SupportChecksSlot,
 }
 
 impl NativeSupport {
@@ -427,6 +677,8 @@ impl Support for NativeSupport {
             match NativeSessionProbes::new(self.io.clone(), self.env.clone(), self.clock.clone()) {
                 Ok(probes) => probes,
                 Err(_) => {
+                    self.checks
+                        .publish(unchecked_support("this session's checks couldn't start"));
                     return SupportOutcome::Pending(
                         "This session couldn't be checked. Nothing will be changed.".into(),
                     );
@@ -434,6 +686,7 @@ impl Support for NativeSupport {
             };
         let runtime = self.runtime_facts(package, deadline);
         let result = probes.detect(runtime, deadline);
+        self.checks.publish(support_checks(&result.report));
         match result.report.eligibility {
             Eligibility::Supported => match result.proof {
                 Some(proof) => SupportOutcome::Supported(proof),
@@ -452,6 +705,10 @@ impl Support for NativeSupport {
 
     fn source(&self) -> ObservationSource {
         self.io.target().source()
+    }
+
+    fn checks(&self) -> Option<SupportChecksSlot> {
+        Some(self.checks.clone())
     }
 }
 
@@ -901,3 +1158,309 @@ opaque_debug!(
     NoRepairer,
     BrokenPayloads,
 );
+
+#[cfg(test)]
+mod checklist_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use std::path::PathBuf;
+
+    use super::super::super::detect::{
+        Architecture, EffectiveEnvironment, LibraryFact, SelectedSession, SessionCandidate,
+        SessionFacts, SessionSelection, classify,
+    };
+    use super::*;
+
+    const LIVE: ObservationSource = ObservationSource::Live;
+
+    fn ok<T>(value: T) -> Fact<T> {
+        Fact::known(value, LIVE, 1)
+    }
+
+    fn env() -> EffectiveEnvironment {
+        EffectiveEnvironment {
+            runtime_dir: PathBuf::from("/run/user/1000"),
+            wayland_display: "wayland-1".into(),
+            hyprland_instance_signature: "sig".into(),
+            session_id: Some("2".into()),
+        }
+    }
+
+    fn library(name: &str) -> LibraryFact {
+        LibraryFact {
+            name: name.into(),
+            required: true,
+            resolved: ok(PathBuf::from(format!("/usr/lib/{name}"))),
+        }
+    }
+
+    /// A report every check passes.
+    fn supported() -> SupportReport {
+        let session = SessionFacts {
+            uid: 1000,
+            os: ok(OsFamily::Arch),
+            architecture: ok(Architecture::X86_64),
+            hyprland_version: ok([0, 56, 2]),
+            protocols: ok(true),
+            uwsm_managed: ok(true),
+            graphical_target_active: ok(true),
+            graphical_sessions: ok(1),
+            selected_session: ok(Some(SelectedSession {
+                selection: SessionSelection::Environment,
+                session: SessionCandidate {
+                    id: "2".into(),
+                    path: "/org/freedesktop/login1/session/_32".into(),
+                    kind: Some("wayland".into()),
+                    uid: Some(1000),
+                    seat: Some("seat0".into()),
+                    active: Some(true),
+                    locked_hint: Some(false),
+                },
+            })),
+            selected_environment: env(),
+            manager_environment: ok(env()),
+        };
+        let unverified = || Fact::issue(ProbeIssue::Unverified, LIVE, 1);
+        let runtime = RuntimeFacts {
+            libraries: vec![library("libopus.so.0"), library("libxkbcommon.so.0")],
+            video_feature: ok(true),
+            ffmpeg: ok(true),
+            opus: ok(true),
+            pipewire_library: ok(true),
+            xkb: ok(true),
+            wayland_library: ok(true),
+            software_video: ok(true),
+            gpu: unverified(),
+            libei_required: false,
+            pipewire: unverified(),
+            session_manager: unverified(),
+            secret_service: unverified(),
+            keystore: Fact::issue(ProbeIssue::Unverified, LIVE, 1),
+        };
+        SupportReport {
+            eligibility: classify(&session, &runtime),
+            session,
+            runtime,
+            installed_agent: Fact::issue(ProbeIssue::Unverified, LIVE, 1),
+            reduced_motion: Fact::issue(ProbeIssue::Unverified, LIVE, 1),
+        }
+    }
+
+    fn reclassify(mut report: SupportReport) -> SupportReport {
+        report.eligibility = classify(&report.session, &report.runtime);
+        report
+    }
+
+    /// The labels of every row that didn't pass, with their states.
+    fn not_passed(report: &SupportReport) -> Vec<(String, CheckState)> {
+        support_checks(report)
+            .into_iter()
+            .filter(|c| !matches!(c.state, CheckState::Passed(_)))
+            .map(|c| (c.label, c.state))
+            .collect()
+    }
+
+    #[test]
+    fn a_supported_report_passes_every_row_in_order() {
+        let report = supported();
+        assert_eq!(report.eligibility, Eligibility::Supported);
+        let checks = support_checks(&report);
+        assert_eq!(
+            checks.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+            LINUX_CHECKS.to_vec()
+        );
+        assert!(not_passed(&report).is_empty(), "{checks:?}");
+        assert_eq!(
+            checks[2].state,
+            CheckState::Passed(Some("Hyprland 0.56.2".into()))
+        );
+        assert_eq!(checks[7].state, CheckState::Passed(Some("2 found".into())));
+    }
+
+    #[test]
+    fn each_established_negative_fails_exactly_its_row_with_a_reason() {
+        type Edit = fn(&mut SupportReport);
+        let cases: [(Edit, &str, &str); 9] = [
+            (
+                |r| r.session.os = ok(OsFamily::Other("fedora".into())),
+                "Operating system",
+                "Arch-based Linux",
+            ),
+            (
+                |r| r.session.architecture = ok(Architecture::Other("riscv64".into())),
+                "Processor",
+                "processor isn't supported",
+            ),
+            (
+                |r| r.session.hyprland_version = ok([0, 55, 1]),
+                "Hyprland version",
+                "Hyprland 0.55.1 is older than 0.56",
+            ),
+            (
+                |r| r.session.protocols = ok(false),
+                "Wayland protocols",
+                "Wayland features",
+            ),
+            (
+                |r| r.session.uwsm_managed = ok(false),
+                "uwsm session",
+                "managed by uwsm",
+            ),
+            (
+                |r| {
+                    if let Ok(Some(s)) = r.session.selected_session.value.as_mut() {
+                        s.session.kind = Some("x11".into());
+                    }
+                },
+                "This session is the signed-in one",
+                "Wayland session",
+            ),
+            (
+                |r| r.runtime.libraries[0].resolved = Fact::issue(ProbeIssue::Missing, LIVE, 1),
+                "Required libraries",
+                "libopus.so.0 isn't installed",
+            ),
+            (
+                |r| r.runtime.xkb = ok(false),
+                "Required libraries",
+                "xkbcommon isn't installed",
+            ),
+            (
+                |r| r.runtime.video_feature = ok(false),
+                "Video support in the payload",
+                "doesn't include video support",
+            ),
+        ];
+        for (edit, label, reason) in cases {
+            let mut report = supported();
+            edit(&mut report);
+            let report = reclassify(report);
+            assert!(
+                matches!(report.eligibility, Eligibility::NotSupported(_)),
+                "{label}: {:?}",
+                report.eligibility
+            );
+            let rows = not_passed(&report);
+            assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+            assert_eq!(rows[0].0, label);
+            match &rows[0].1 {
+                CheckState::Failed(text) => assert!(text.contains(reason), "{label}: {text}"),
+                other => panic!("{label}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_report_shows_exactly_the_blocking_rows() {
+        type Edit = fn(&mut SupportReport);
+        let cases: [(Edit, &str, &str); 9] = [
+            (
+                |r| r.session.manager_environment = Fact::issue(ProbeIssue::Unavailable, LIVE, 1),
+                "This session is the signed-in one",
+                "couldn't read the session environment",
+            ),
+            (
+                |r| {
+                    let mut other = env();
+                    other.wayland_display = "wayland-9".into();
+                    r.session.manager_environment = ok(other);
+                },
+                "This session is the signed-in one",
+                "doesn't match this session",
+            ),
+            (
+                |r| r.session.selected_session = ok(None),
+                "This session is the signed-in one",
+                "more than one graphical session",
+            ),
+            (
+                |r| r.session.graphical_sessions = ok(2),
+                "This session is the signed-in one",
+                "2 graphical sessions are open",
+            ),
+            (
+                |r| r.session.graphical_target_active = ok(false),
+                "Graphical session active",
+                "isn't active yet",
+            ),
+            (
+                |r| {
+                    if let Ok(Some(s)) = r.session.selected_session.value.as_mut() {
+                        s.session.active = Some(false);
+                    }
+                },
+                "Graphical session active",
+                "isn't shown as the active one",
+            ),
+            (
+                |r| r.session.hyprland_version = Fact::issue(ProbeIssue::Timeout, LIVE, 1),
+                "Hyprland version",
+                "reading the Hyprland version took too long",
+            ),
+            (
+                |r| r.runtime.libraries.clear(),
+                "Required libraries",
+                "staged payload",
+            ),
+            (
+                |r| r.session.uwsm_managed = Fact::issue(ProbeIssue::Malformed, LIVE, 1),
+                "uwsm session",
+                "couldn't be understood",
+            ),
+        ];
+        for (edit, label, issue) in cases {
+            let mut report = supported();
+            edit(&mut report);
+            let report = reclassify(report);
+            assert!(
+                matches!(report.eligibility, Eligibility::Pending(_)),
+                "{label}: {:?}",
+                report.eligibility
+            );
+            let rows = not_passed(&report);
+            assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+            assert_eq!(rows[0].0, label);
+            match &rows[0].1 {
+                CheckState::Unconfirmed(text) => assert!(text.contains(issue), "{label}: {text}"),
+                other => panic!("{label}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn without_a_payload_only_the_runtime_rows_are_unconfirmed() {
+        let mut report = supported();
+        let unverified = || Fact::issue(ProbeIssue::Unverified, LIVE, 1);
+        report.runtime = RuntimeFacts {
+            libraries: Vec::new(),
+            video_feature: unverified(),
+            ffmpeg: unverified(),
+            opus: unverified(),
+            pipewire_library: unverified(),
+            xkb: unverified(),
+            wayland_library: unverified(),
+            software_video: unverified(),
+            gpu: unverified(),
+            libei_required: false,
+            pipewire: unverified(),
+            session_manager: unverified(),
+            secret_service: unverified(),
+            keystore: Fact::issue(ProbeIssue::Unverified, LIVE, 1),
+        };
+        let report = reclassify(report);
+        let labels: Vec<String> = not_passed(&report).into_iter().map(|r| r.0).collect();
+        assert_eq!(
+            labels,
+            vec!["Required libraries", "Video support in the payload"]
+        );
+    }
+
+    #[test]
+    fn a_pass_that_cannot_start_leaves_every_row_unconfirmed() {
+        let rows = unchecked_support("this session's checks couldn't start");
+        assert_eq!(rows.len(), LINUX_CHECKS.len());
+        assert!(
+            rows.iter().all(|r| r.state
+                == CheckState::Unconfirmed("this session's checks couldn't start".into()))
+        );
+    }
+}

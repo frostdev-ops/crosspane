@@ -1212,3 +1212,107 @@ fn completed_current_ready_rail_group_shows_one_status_label() {
         .collect::<Vec<_>>();
     assert_eq!(labels, vec!["Completed"]);
 }
+
+fn check(index: usize, label: &str, state: RowState, detail: &str) -> RowView {
+    RowView {
+        id: check_row_id(index),
+        label: label.into(),
+        detail: detail.into(),
+        state,
+        human_confirmed: false,
+    }
+}
+
+#[test]
+fn the_support_checklist_is_drawn_inside_its_card_with_its_own_wording_in_every_motion() {
+    for motion in [
+        MotionPreference::Reduced,
+        MotionPreference::Full,
+        MotionPreference::Auto,
+    ] {
+        // The review size; the compact size scrolls the body, which other tests cover.
+        for size in [egui::vec2(1100.0, 760.0)] {
+            let mut harness = Harness::review(size);
+            let mut view = demo::fixture(ScreenId::Compatibility);
+            view.motion = motion;
+            view.rows = vec![
+                RowView {
+                    id: 10,
+                    label: "This computer can run Crosspane".into(),
+                    detail: "Some facts couldn't be confirmed yet. Last checked 3 s ago.".into(),
+                    state: RowState::Waiting,
+                    human_confirmed: false,
+                },
+                check(0, "Operating system", RowState::Verified, "Arch-based"),
+                check(1, "Processor", RowState::Verified, ""),
+                check(2, "Hyprland version", RowState::Failed, "too old"),
+                check(
+                    3,
+                    "This session is the signed-in one",
+                    RowState::Waiting,
+                    "couldn't read the session environment",
+                ),
+                check(4, "Required libraries", RowState::Working, ""),
+            ];
+            harness.settle(&view);
+            let (card, _) = harness.card("This computer can run Crosspane");
+            for line in [
+                "Operating system  Passed (Arch-based)",
+                "Processor  Passed",
+                "Hyprland version  Failed: too old",
+                "This session is the signed-in one  Couldn't confirm: couldn't read the session \
+                 environment",
+                "Required libraries  Checking…",
+            ] {
+                let (rect, _, _) = harness.raw_text(line);
+                assert!(
+                    card.contains_rect(rect),
+                    "{motion:?} {size:?}: {line:?} {rect:?} outside the card {card:?}"
+                );
+            }
+            // Checks are lines in the card, not cards of their own: the card count is the same
+            // as with the card alone.
+            let glass = |harness: &Harness| {
+                harness
+                    .shapes()
+                    .into_iter()
+                    .filter(|(shape, _)| {
+                        matches!(shape, egui::epaint::Shape::Rect(rect)
+                            if rect.fill == theme::alpha(theme::MIDNIGHT, 205)
+                                && rect.stroke.color == theme::alpha(theme::GLACIER, 42))
+                    })
+                    .count()
+            };
+            let with_checks = glass(&harness);
+            let mut alone = Harness::review(size);
+            let mut card_only = view.clone();
+            card_only.rows.truncate(1);
+            alone.settle(&card_only);
+            assert_eq!(with_checks, glass(&alone), "{motion:?} {size:?}");
+            // Nothing in the checklist animates: a settled frame asks for no repaint.
+            if motion == MotionPreference::Reduced {
+                let output = harness.output.as_ref().unwrap();
+                assert!(
+                    output
+                        .viewport_output
+                        .values()
+                        .all(|v| v.repaint_delay > std::time::Duration::from_millis(100)),
+                    "{size:?}: a reduced, settled checklist keeps repainting"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn checklist_rows_without_a_card_get_one_and_ids_stay_in_their_range() {
+    assert!(CHECK_ROW_IDS.contains(&check_row_id(0)));
+    assert!(CHECK_ROW_IDS.contains(&check_row_id(10_000)));
+    assert!(!CHECK_ROW_IDS.contains(&59) && !CHECK_ROW_IDS.contains(&90));
+    let mut harness = Harness::review(egui::vec2(800.0, 600.0));
+    let mut view = demo::fixture(ScreenId::Compatibility);
+    view.rows = vec![check(0, "Operating system", RowState::Unchecked, "")];
+    harness.settle(&view);
+    let (card, _) = harness.card("Operating system  Not checked yet");
+    assert!(card.is_positive());
+}
