@@ -28,6 +28,8 @@ pub mod session;
 pub mod stubs;
 #[cfg(windows)]
 pub mod tray;
+#[cfg(all(windows, feature = "video"))]
+pub mod video;
 #[cfg(windows)]
 pub mod window;
 

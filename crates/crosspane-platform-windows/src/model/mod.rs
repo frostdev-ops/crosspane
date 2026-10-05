@@ -14,5 +14,7 @@ pub mod keystore;
 pub mod overlay;
 pub mod session;
 pub mod tray;
+#[cfg(feature = "video")]
+pub mod video;
 pub mod window;
 pub mod winevent;
