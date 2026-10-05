@@ -28,6 +28,8 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, Input::*, WindowsAndMessaging::*},
 };
 
+#[path = "../src/cursor.rs"]
+mod cursor;
 #[path = "../src/displays.rs"]
 mod displays;
 #[path = "../src/frame_capture.rs"]

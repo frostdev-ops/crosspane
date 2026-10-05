@@ -534,6 +534,7 @@ struct Stream {
     latest: Latest<Held>,
     crop: Option<PixelRect>,
     slots: Vec<Arc<Image>>,
+    cursor: crate::cursor::StreamCursor,
 }
 impl Drop for Stream {
     fn drop(&mut self) {
@@ -617,6 +618,7 @@ impl Stream {
             latest: Latest::new(fps)?,
             crop,
             slots: Vec::new(),
+            cursor: crate::cursor::StreamCursor::default(),
         };
         stream
             .session
@@ -916,6 +918,32 @@ fn worker(
             if stream.abandoned.load(Ordering::Acquire) {
                 end(shared, &mut streams, id, StreamEndReason::Requested);
                 continue;
+            }
+            if let Ok(content) = size(stream.pool_size)
+                && let Some(shape) =
+                    stream
+                        .cursor
+                        .sample(stream.binding, content, stream.crop, || {
+                            shared.permitted(stream.epoch)
+                        })
+                && shared.permitted(stream.epoch)
+                && shared.resolver.resolve(stream.target) == Some(stream.binding)
+            {
+                let event = match shape {
+                    crate::model::cursor::Shape::Image(image) => FrameEvent::Cursor {
+                        stream: id,
+                        cursor: Some(image),
+                    },
+                    crate::model::cursor::Shape::Hidden => FrameEvent::Cursor {
+                        stream: id,
+                        cursor: None,
+                    },
+                    crate::model::cursor::Shape::Default => {
+                        FrameEvent::CursorDefault { stream: id }
+                    }
+                };
+                // Cursor observation/consumer failure never ends the pixel stream.
+                emit(&stream.sink, event);
             }
             match stream.poll(shared, &graphics, start) {
                 Ok(Some(mut frame)) => {

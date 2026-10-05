@@ -34,6 +34,8 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, WindowsAndMessaging::*},
 };
 
+#[path = "../src/cursor.rs"]
+mod cursor;
 #[path = "../src/frame_capture.rs"]
 mod frame_capture;
 #[path = "../src/window.rs"]
