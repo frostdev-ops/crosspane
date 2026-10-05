@@ -7,8 +7,8 @@
 //! machine can offer it in a list. Paired peers are recognised by their keys in the TLS handshake
 //! after dialling a candidate, never by anything in the advertisement.
 
-use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -52,6 +52,95 @@ pub enum DiscoveryError {
     Mdns(String),
 }
 
+/// An exact interface name/address admission key. Native family indices and IPv6 scopes remain
+/// the discovery daemon's facts; this key carries no OS identity or classification policy.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DiscoveryInterface {
+    pub name: String,
+    pub addr: IpAddr,
+}
+impl std::fmt::Debug for DiscoveryInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DiscoveryInterface { .. }")
+    }
+}
+
+/// Full-snapshot admission, shared by daemon membership and future service-address insertion.
+#[derive(Default)]
+struct InterfaceFilter {
+    desired: Mutex<Option<BTreeSet<DiscoveryInterface>>>,
+    installation: Mutex<FilterInstallation>,
+}
+#[derive(Default)]
+enum FilterInstallation {
+    #[default]
+    Uninstalled,
+    Installed,
+    Failed,
+}
+impl InterfaceFilter {
+    fn normalized(
+        interfaces: Vec<DiscoveryInterface>,
+    ) -> Result<BTreeSet<DiscoveryInterface>, DiscoveryError> {
+        if interfaces.len() > 4096
+            || interfaces
+                .iter()
+                .any(|key| key.name.is_empty() || key.name.len() > 1024 || key.name.contains('\0'))
+        {
+            return Err(DiscoveryError::Mdns(
+                "invalid or oversized interface selection".into(),
+            ));
+        }
+        Ok(interfaces.into_iter().collect())
+    }
+    fn allows(&self, name: &str, addr: IpAddr) -> bool {
+        let Ok(desired) = self.desired.lock() else {
+            return false;
+        };
+        desired.as_ref().is_none_or(|keys| {
+            keys.contains(&DiscoveryInterface {
+                name: name.to_owned(),
+                addr,
+            })
+        })
+    }
+    fn install(self: &Arc<Self>, daemon: &ServiceDaemon) -> Result<(), DiscoveryError> {
+        let mut installation = self
+            .installation
+            .lock()
+            .map_err(|_| DiscoveryError::Mdns("interface filter lock failed".into()))?;
+        match *installation {
+            FilterInstallation::Installed => return Ok(()),
+            FilterInstallation::Failed => {
+                return Err(DiscoveryError::Mdns(
+                    "interface filter installation failed".into(),
+                ));
+            }
+            FilterInstallation::Uninstalled => {}
+        }
+        // Mark failure before enqueueing so a partial/failed install cannot grow mdns-sd's
+        // permanent selection history when callers retry.
+        *installation = FilterInstallation::Failed;
+        let filter = Arc::clone(self);
+        daemon
+            .disable_interface(IfKind::Predicate(IfPredicate::new(move |interface| {
+                !filter.allows(&interface.name, interface.ip())
+            })))
+            .map_err(mdns_error)?;
+        daemon.set_ip_check_interval(1).map_err(mdns_error)?;
+        *installation = FilterInstallation::Installed;
+        Ok(())
+    }
+    fn replace(&self, interfaces: Vec<DiscoveryInterface>) -> Result<(), DiscoveryError> {
+        let keys = Self::normalized(interfaces)?;
+        *self
+            .desired
+            .lock()
+            .map_err(|_| DiscoveryError::Mdns("interface filter lock failed".into()))? = Some(keys);
+        Ok(())
+    }
+}
+
 /// The protocol major version advertised in the `v` TXT key.
 const PROTOCOL_VERSION: u32 = 1;
 /// TXT key: protocol major version.
@@ -88,6 +177,7 @@ struct Shared {
     seen: Mutex<Seen>,
     /// The pairing name this node advertises, and when it last changed.
     advert: Mutex<Advert>,
+    interfaces: Arc<InterfaceFilter>,
 }
 
 /// The device name in this node's advertisement (pairing mode), wanted and sent.
@@ -116,8 +206,14 @@ impl Advert {
         daemon: &ServiceDaemon,
         instance: &str,
         port: u16,
+        interfaces: &Arc<InterfaceFilter>,
     ) -> Result<(), DiscoveryError> {
-        let info = advertisement(instance, port, self.wanted.as_deref())?;
+        let info = advertisement_with_filter(
+            instance,
+            port,
+            self.wanted.as_deref(),
+            Some(Arc::clone(interfaces)),
+        )?;
         daemon.register(info).map_err(mdns_error)?;
         self.sent = self.wanted.clone();
         self.last_change = Some(Instant::now());
@@ -154,27 +250,76 @@ impl Discovery {
         port: u16,
         events: Box<dyn Fn(DiscoveryEvent) + Send + Sync>,
     ) -> Result<Discovery, DiscoveryError> {
+        Self::start_filtered(port, None, events)
+    }
+
+    /// Browse and advertise only on exact native interface name/address keys. At most 4096
+    /// keys with nonempty names of at most 1024 bytes. An empty selection admits no interface.
+    ///
+    /// The existing daemon briefly initializes memberships before consuming its filter command.
+    /// This method does not acknowledge kernel membership changes. Native indices/scopes remain
+    /// daemon facts, and no interface is guessed when a key is missing.
+    pub fn start_with_interfaces(
+        port: u16,
+        interfaces: Vec<DiscoveryInterface>,
+        events: Box<dyn Fn(DiscoveryEvent) + Send + Sync>,
+    ) -> Result<Discovery, DiscoveryError> {
+        Self::start_filtered(port, Some(interfaces), events)
+    }
+
+    /// Replace the full desired admission snapshot atomically; never union old keys.
+    ///
+    /// A single shared predicate is installed once. Native memberships and cached advertisement
+    /// addresses reconcile nominally within the daemon's first 5-second timer, then about once
+    /// per second, plus scheduling and OS enumeration delays. These are not hard wall-clock
+    /// bounds or per-send revocation. Queued/cached candidate events carry no interface generation.
+    /// Discovery finds candidates only; the pinned QUIC handshake is still required for trust.
+    /// An error is not an admission acknowledgement; callers should stop discovery rather than
+    /// fall back to all interfaces.
+    pub fn set_interfaces(
+        &self,
+        interfaces: Vec<DiscoveryInterface>,
+    ) -> Result<(), DiscoveryError> {
+        self.shared.interfaces.replace(interfaces)?;
+        self.shared.interfaces.install(&self.daemon)
+    }
+
+    fn start_filtered(
+        port: u16,
+        interfaces: Option<Vec<DiscoveryInterface>>,
+        events: Box<dyn Fn(DiscoveryEvent) + Send + Sync>,
+    ) -> Result<Discovery, DiscoveryError> {
+        let filter = Arc::new(InterfaceFilter::default());
+        let filtered = interfaces.is_some();
+        if let Some(keys) = interfaces {
+            filter.replace(keys)?;
+        }
         let instance = new_instance_id();
-        let info = advertisement(&instance, port, None)?;
+        let info = advertisement_with_filter(&instance, port, None, Some(Arc::clone(&filter)))?;
         let fullname = info.get_fullname().to_string();
 
         let daemon = ServiceDaemon::new().map_err(mdns_error)?;
-        match Self::start_on(&daemon, instance, fullname, port, info, events) {
-            Ok(discovery) => Ok(discovery),
-            Err(error) => {
-                // Don't leak the daemon's thread; this also withdraws what was registered.
-                let _ = daemon.shutdown();
-                Err(error)
+        let result = (|| {
+            if filtered {
+                // Queue exclusion immediately, ahead of browsing and registering.
+                filter.install(&daemon)?;
             }
+            Self::start_on(&daemon, instance, fullname, port, info, filter, events)
+        })();
+        if result.is_err() {
+            let _ = daemon.shutdown();
         }
+        result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_on(
         daemon: &ServiceDaemon,
         instance: String,
         fullname: String,
         port: u16,
         info: ServiceInfo,
+        interfaces: Arc<InterfaceFilter>,
         events: Box<dyn Fn(DiscoveryEvent) + Send + Sync>,
     ) -> Result<Discovery, DiscoveryError> {
         let monitor = daemon.monitor().map_err(mdns_error)?;
@@ -182,6 +327,7 @@ impl Discovery {
         daemon.register(info).map_err(mdns_error)?;
 
         let shared = Arc::new(Shared {
+            interfaces,
             seen: Mutex::default(),
             // The registration just made counts as a change.
             advert: Mutex::new(Advert {
@@ -238,7 +384,12 @@ impl Discovery {
         if !advert.due() {
             return Ok(());
         }
-        let result = advert.send(&self.daemon, &self.instance, self.port);
+        let result = advert.send(
+            &self.daemon,
+            &self.instance,
+            self.port,
+            &self.shared.interfaces,
+        );
         if result.is_err() {
             advert.wanted = advert.sent.clone();
         }
@@ -329,7 +480,8 @@ impl Browser {
     fn send_due_change(&self) {
         let mut advert = lock(&self.shared.advert);
         if advert.due()
-            && let Err(error) = advert.send(&self.daemon, &self.own, self.port)
+            && let Err(error) =
+                advert.send(&self.daemon, &self.own, self.port, &self.shared.interfaces)
         {
             tracing::warn!(%error, "could not update the mDNS advertisement");
             // Try again after the spacing, not on every tick.
@@ -537,10 +689,20 @@ fn is_unicast_link_local(addr: &Ipv6Addr) -> bool {
 /// the service to `<id> (2)`, `<id> (3)`, ... A change of the TXT record (the pairing name) is
 /// such an announcement, and macOS, whose probes on `en0` and `lo0` finish at different times,
 /// ran into it every time.
+#[cfg(test)]
 fn advertisement(
     instance: &str,
     port: u16,
     pairing_name: Option<&str>,
+) -> Result<ServiceInfo, DiscoveryError> {
+    advertisement_with_filter(instance, port, pairing_name, None)
+}
+
+fn advertisement_with_filter(
+    instance: &str,
+    port: u16,
+    pairing_name: Option<&str>,
+    filter: Option<Arc<InterfaceFilter>>,
 ) -> Result<ServiceInfo, DiscoveryError> {
     let mut properties = vec![(TXT_VERSION.to_string(), PROTOCOL_VERSION.to_string())];
     if let Some(name) = pairing_name {
@@ -553,9 +715,16 @@ fn advertisement(
     // This node is for other machines: its loopback addresses, including macOS's `fe80::1` on
     // `lo0`, are useless to them. (The daemon still listens on loopback: the host delivers the
     // copies of our own multicasts there, which is how two nodes on one host see each other.)
-    info.set_interfaces(vec![IfKind::Predicate(IfPredicate::new(|interface| {
-        !interface.is_loopback() && interface.name != "lo" && interface.name != "lo0"
-    }))]);
+    info.set_interfaces(vec![IfKind::Predicate(IfPredicate::new(
+        move |interface| {
+            !interface.is_loopback()
+                && interface.name != "lo"
+                && interface.name != "lo0"
+                && filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.allows(&interface.name, interface.ip()))
+        },
+    ))]);
     Ok(info.enable_addr_auto())
 }
 
@@ -856,5 +1025,50 @@ mod tests {
         assert!(advert.due());
         advert.wanted = advert.sent.clone();
         assert!(!advert.due(), "changed back before it was sent");
+    }
+}
+
+#[cfg(test)]
+mod interface_filter_tests {
+    use super::*;
+    fn key(name: &str, ip: &str) -> DiscoveryInterface {
+        DiscoveryInterface {
+            name: name.into(),
+            addr: ip.parse().unwrap(),
+        }
+    }
+    #[test]
+    fn full_snapshot_replacement_revokes_unchanged_native_addresses() {
+        let filter = InterfaceFilter::default();
+        let v4 = key("owned", "192.0.2.1");
+        let v6 = key("owned", "fe80::1");
+        assert!(filter.allows(&v4.name, v4.addr));
+        filter
+            .replace(vec![v4.clone(), v6.clone(), v4.clone()])
+            .unwrap();
+        assert!(filter.allows(&v4.name, v4.addr));
+        assert!(filter.allows(&v6.name, v6.addr));
+        filter.replace(vec![v6.clone()]).unwrap();
+        assert!(!filter.allows(&v4.name, v4.addr));
+        assert!(filter.allows(&v6.name, v6.addr));
+        filter.replace(Vec::new()).unwrap();
+        assert!(!filter.allows(&v6.name, v6.addr));
+    }
+    #[test]
+    fn name_and_address_must_both_match_without_index_guessing() {
+        let filter = InterfaceFilter::default();
+        let k = key("owned", "fe80::1");
+        filter.replace(vec![k.clone()]).unwrap();
+        assert!(!filter.allows("other", k.addr));
+        assert!(!filter.allows("owned", "fe80::2".parse().unwrap()));
+    }
+    #[test]
+    fn malformed_or_oversized_selection_preserves_previous_snapshot() {
+        let filter = InterfaceFilter::default();
+        let k = key("owned", "192.0.2.1");
+        filter.replace(vec![k.clone()]).unwrap();
+        assert!(filter.replace(vec![key("", "192.0.2.2")]).is_err());
+        assert!(filter.replace(vec![k.clone(); 4097]).is_err());
+        assert!(filter.allows(&k.name, k.addr));
     }
 }

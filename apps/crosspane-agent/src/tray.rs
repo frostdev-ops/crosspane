@@ -54,6 +54,8 @@ pub struct PairingView {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrayView {
     pub name: String,
+    /// Factual network access status on platforms that can query it.
+    pub network_line: Option<String>,
     pub peers: Vec<PeerView>,
     /// This node's windows that can be sent: id and label.
     pub local_windows: Vec<(WindowId, String)>,
@@ -192,6 +194,9 @@ pub fn build(view: &TrayView) -> (TrayMenu, BTreeMap<TrayItemId, TrayAction>) {
 
     // Status.
     items.push(label(format!("Crosspane — {}", view.name)));
+    if let Some(line) = &view.network_line {
+        items.push(label(line.clone()));
+    }
     if let Some(peer) = &view.controlling {
         items.push(label(format!("Keyboard and mouse → {peer}")));
         items.push(b.action("Take input back", TrayAction::Release));

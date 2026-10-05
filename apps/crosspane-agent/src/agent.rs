@@ -617,6 +617,14 @@ pub struct Agent {
     tray: TrayState,
     quit_requested: bool,
     discovery: Option<crosspane_transport::discovery::Discovery>,
+    #[cfg(windows)]
+    discovery_requested: bool,
+    #[cfg(windows)]
+    interfaces_observed: bool,
+    #[cfg(windows)]
+    discovery_selection: crate::reachability::DiscoverySelection,
+    #[cfg(windows)]
+    firewall: crate::windows::firewall::Watch,
     /// Other Crosspane nodes on the network, by instance id.
     candidates: BTreeMap<String, crosspane_transport::discovery::Candidate>,
     last_candidate_dial: Option<Instant>,
@@ -874,6 +882,8 @@ impl Agent {
         features: Vec<String>,
         audio: Option<Box<dyn AudioPlane>>,
     ) -> Agent {
+        #[cfg(windows)]
+        let discovery_selection = crate::reachability::select(platform.links.is_some(), false, &[]);
         let mut agent = Agent {
             node,
             name,
@@ -908,6 +918,14 @@ impl Agent {
             tray: TrayState::new(),
             quit_requested: false,
             discovery: None,
+            #[cfg(windows)]
+            discovery_requested: false,
+            #[cfg(windows)]
+            interfaces_observed: false,
+            #[cfg(windows)]
+            discovery_selection,
+            #[cfg(windows)]
+            firewall: crate::windows::firewall::Watch::new(),
             candidates: BTreeMap::new(),
             last_candidate_dial: None,
             advertising_name: false,
@@ -1640,6 +1658,11 @@ impl Agent {
             Event::Discovery(event) => self.on_discovery(event),
             Event::Links(interfaces) => {
                 self.interfaces = interfaces;
+                #[cfg(windows)]
+                {
+                    self.interfaces_observed = true;
+                    self.refresh_discovery_interfaces();
+                }
                 self.update_paths();
             }
             Event::Tray(crosspane_platform::TrayEvent::Chosen(id)) => {
@@ -3150,6 +3173,10 @@ impl Agent {
         };
         TrayView {
             name: self.name.clone(),
+            #[cfg(windows)]
+            network_line: Some(self.network_line()),
+            #[cfg(not(windows))]
+            network_line: None,
             peers,
             local_windows: self.tray.local_windows.clone(),
             // While input is home in a projected window, its line says so (WP-2.43).
@@ -3272,6 +3299,18 @@ impl Agent {
     /// address, so the agent only connects to configured or explicitly dialled addresses (test
     /// harnesses use this to stay away from other agents on the network).
     pub fn start_discovery(&mut self) {
+        #[cfg(windows)]
+        {
+            self.discovery_requested = true;
+            self.refresh_discovery_interfaces();
+            self.start_windows_discovery();
+        }
+        #[cfg(not(windows))]
+        self.start_unfiltered_discovery();
+    }
+
+    #[cfg(not(windows))]
+    fn start_unfiltered_discovery(&mut self) {
         use crosspane_transport::discovery::Discovery;
         if discovery_switched_off(std::env::var("CROSSPANE_DISCOVERY").ok().as_deref()) {
             tracing::info!(
@@ -3296,8 +3335,113 @@ impl Agent {
         }
     }
 
+    #[cfg(windows)]
+    fn start_windows_discovery(&mut self) {
+        use crate::reachability::DiscoverySelection;
+        use crosspane_transport::discovery::Discovery;
+        if self.discovery.is_some()
+            || discovery_switched_off(std::env::var("CROSSPANE_DISCOVERY").ok().as_deref())
+        {
+            return;
+        }
+        let events = self.events.clone();
+        let callback = Box::new(move |event| {
+            let _ = events.send(Event::Discovery(event));
+        });
+        let result = match &self.discovery_selection {
+            DiscoverySelection::UnavailableAll => Discovery::start(self.port, callback),
+            DiscoverySelection::Selected(keys) => {
+                Discovery::start_with_interfaces(self.port, keys.clone(), callback)
+            }
+            // Do not create a daemon while waiting for the initial snapshot or with no keys.
+            DiscoverySelection::Pending | DiscoverySelection::NoEligible => return,
+        };
+        match result {
+            Ok(discovery) => {
+                self.discovery = Some(discovery);
+                self.tracker.discovery_error = None;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "no discovery: using configured addresses only");
+                self.tracker.discovery_error = Some("daemon_failed");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn refresh_discovery_interfaces(&mut self) {
+        use crate::reachability::DiscoverySelection;
+        let next = crate::reachability::select(
+            self.platform.links.is_some(),
+            self.interfaces_observed,
+            &self.interfaces,
+        );
+        if next == self.discovery_selection {
+            return;
+        }
+        self.discovery_selection = next;
+        self.candidates.clear();
+        self.last_candidate_dial = None;
+        if !self.discovery_requested {
+            return;
+        }
+        if let Some(discovery) = &self.discovery {
+            let keys = match &self.discovery_selection {
+                DiscoverySelection::Selected(keys) => keys.clone(),
+                DiscoverySelection::Pending | DiscoverySelection::NoEligible => Vec::new(),
+                // The optional LinkInfo box is fixed after subscription. This transition is
+                // not produced at runtime; never reopen all interfaces after filtered mode.
+                DiscoverySelection::UnavailableAll => return,
+            };
+            if let Err(error) = discovery.set_interfaces(keys) {
+                tracing::warn!(%error, "discovery interface selection failed: using manual addresses");
+                self.discovery = None;
+                self.advertising_name = false;
+                self.tracker.discovery_error = Some("daemon_failed");
+            }
+        } else {
+            self.start_windows_discovery();
+        }
+    }
+
+    #[cfg(windows)]
+    fn network_status(&self) -> Value {
+        let snapshot = self.firewall.snapshot();
+        json!({
+            "listener_bound": true,
+            "discovery_policy": self.discovery_selection.token(),
+            "selected_interface_addresses": self.discovery_selection.count(),
+            "firewall_rule": snapshot.rule.token(),
+            "firewall_checked": snapshot.checked.is_some(),
+            "firewall_checked_ms_ago": snapshot.checked.map(|at| at.elapsed().as_millis() as u64),
+            "inbound": "InboundUnverified",
+        })
+    }
+
+    #[cfg(windows)]
+    fn network_line(&self) -> String {
+        let rule = self.firewall.snapshot().rule.label();
+        let discovery = match &self.discovery_selection {
+            crate::reachability::DiscoverySelection::UnavailableAll => "; interfaces unavailable",
+            crate::reachability::DiscoverySelection::Pending => "; waiting for interfaces",
+            crate::reachability::DiscoverySelection::NoEligible => "; discovery manual only",
+            crate::reachability::DiscoverySelection::Selected(_) => "",
+        };
+        format!("Inbound access unverified — private UDP rule {rule}{discovery}")
+    }
+
     fn on_discovery(&mut self, event: crosspane_transport::discovery::DiscoveryEvent) {
         use crosspane_transport::discovery::DiscoveryEvent;
+        #[cfg(windows)]
+        if self.discovery.is_none()
+            || matches!(
+                self.discovery_selection,
+                crate::reachability::DiscoverySelection::Pending
+                    | crate::reachability::DiscoverySelection::NoEligible
+            )
+        {
+            return;
+        }
         match event {
             DiscoveryEvent::Found(candidate) => {
                 let fresh = !self.candidates.contains_key(&candidate.instance);
@@ -3326,6 +3470,14 @@ impl Agent {
     /// Housekeeping for discovery: re-try candidates while a paired peer is offline, and put the
     /// device name in the advertisement only while a pairing window is open (04 §3).
     fn discovery_housekeeping(&mut self) {
+        #[cfg(windows)]
+        if matches!(
+            self.discovery_selection,
+            crate::reachability::DiscoverySelection::Pending
+                | crate::reachability::DiscoverySelection::NoEligible
+        ) {
+            return;
+        }
         let Some(discovery) = &self.discovery else {
             return;
         };
@@ -4686,7 +4838,11 @@ impl Agent {
 
     fn on_ctl(&mut self, request: Request) -> Response {
         match request {
-            Request::Status => Response::ok(self.status()),
+            Request::Status => {
+                #[cfg(windows)]
+                self.firewall.demand();
+                Response::ok(self.status())
+            }
             Request::Release => {
                 self.feed(Input::Command(Command::ReleaseControl));
                 Response::ok(json!("released"))
@@ -5029,7 +5185,8 @@ impl Agent {
 
     fn status(&self) -> Value {
         let now = platform::now();
-        json!({
+        #[allow(unused_mut)]
+        let mut status = json!({
             "node": self.node.to_string(),
             "name": self.name,
             "listening": self.net.local_addr().to_string(),
@@ -5092,7 +5249,12 @@ impl Agent {
             "uptime_s": now.as_nanos() / 1_000_000_000,
             // The typed local facts the installer reads (WP-4.5).
             "installer": self.installer_status(),
-        })
+        });
+        #[cfg(windows)]
+        {
+            status["network"] = self.network_status();
+        }
+        status
     }
 }
 
@@ -6743,12 +6905,28 @@ mod installer {
             } else {
                 built("audio", self.audio.is_some(), &[Permission::Microphone])
             };
-            let discovery = match (self.discovery.is_some(), t.discovery_off, t.discovery_error) {
-                (true, _, _) => up("discovery"),
-                (false, true, _) => down("discovery", "missing", "disabled"),
-                (false, false, Some(_)) => down("discovery", "failed", "construction_failed"),
-                // Not started yet.
-                (false, false, None) => down("discovery", "failed", "unknown"),
+            #[cfg(windows)]
+            let manual_discovery = matches!(
+                self.discovery_selection,
+                crate::reachability::DiscoverySelection::Pending
+                    | crate::reachability::DiscoverySelection::NoEligible
+            );
+            #[cfg(not(windows))]
+            let manual_discovery = false;
+            let discovery = if manual_discovery && !t.discovery_off {
+                down("discovery", "missing", "unknown")
+            } else {
+                match (
+                    self.discovery.is_some() && !manual_discovery,
+                    t.discovery_off,
+                    t.discovery_error,
+                ) {
+                    (true, _, _) => up("discovery"),
+                    (false, true, _) => down("discovery", "missing", "disabled"),
+                    (false, false, Some(_)) => down("discovery", "failed", "construction_failed"),
+                    // Not started yet.
+                    (false, false, None) => down("discovery", "failed", "unknown"),
+                }
             };
             use Permission::{Accessibility, InputMonitoring, ScreenRecording};
             vec![
@@ -6865,7 +7043,8 @@ mod installer {
                 LockState::Locked => "locked",
                 LockState::Unknown => "unknown",
             };
-            json!({
+            #[allow(unused_mut)]
+            let mut status = json!({
                 "schema_version": SCHEMA_VERSION,
                 "build": { "version": env!("CARGO_PKG_VERSION"), "features": features },
                 "instance": {
@@ -6914,7 +7093,12 @@ mod installer {
                 },
                 "settings_opened": t.settings_opened,
                 "peers": peers,
-            })
+            });
+            #[cfg(windows)]
+            {
+                status["network"] = self.network_status();
+            }
+            status
         }
     }
 

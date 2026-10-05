@@ -16,6 +16,8 @@ mod pairing;
 mod parking_worker;
 mod paths;
 mod platform;
+#[cfg(any(windows, test))]
+mod reachability;
 mod revocations;
 mod tray;
 mod trust;
