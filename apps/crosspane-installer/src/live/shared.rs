@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use crosspane_installer_core::{
-    ApplyOutcome, FlowEvent, JobIntent, JobStage, StepId, StepState, Verification, WaitKind,
+    ApplyOutcome, FlowEvent, JobIntent, JobStage, ObservationSource, StepId, StepState,
+    Verification, WaitKind,
 };
 use crosspane_types::id::NodeId;
 use crosspane_ui_kit::layout::{DisplayRect, LayoutAction};
@@ -16,7 +17,7 @@ use super::graph::steps;
 use crate::agent_contract::{
     AgentReply, BackendName, BackendState, CallFailure, Capability, DecodedReply,
     GrantableCapability, HealthSnapshot, InstallerRequest, KeyStoreProvenance, PairCandidate,
-    PairPhase, PairingStatus, Placement, SessionState, StartupRecovery,
+    PairPhase, PairingStatus, Placement, SessionState, StartupRecovery, StatusAdmission,
 };
 use crate::gui::ShellEffect;
 use crate::view::HidingChoice;
@@ -96,6 +97,11 @@ pub(super) struct ConnectState {
     pub settings: Option<crate::tutorial_flow::SettingsTransition>,
     /// The hiding choice was applied with its restart consent in the same click.
     pub hiding_restart_agreed: bool,
+    /// The agent's settings already held the hiding choice when the step was detected, so it is
+    /// done without asking again.
+    pub hiding_saved: bool,
+    /// The person asked to change a saved hiding choice: detection asks again.
+    pub hiding_change: bool,
     // ---- automatic pairing ----
     /// The person chose to type an address instead of searching.
     pub manual: bool,
@@ -403,6 +409,9 @@ impl LiveController {
                 }
                 self.granted() != [true; 5]
             }
+            // A layout the agent already holds for this peer is done; it isn't asked again,
+            // unless the person just arranged a new one.
+            steps::LAYOUT => self.connect.place.is_some() || !self.layout_committed(),
             _ => true,
         };
         let _ = self.reduce(FlowEvent::Detected {
@@ -884,13 +893,7 @@ impl LiveController {
 
     pub(super) fn dispatch_layout(&mut self, job: JobIntent) {
         match job.stage {
-            JobStage::Detect => {
-                let _ = self.reduce(FlowEvent::Detected {
-                    step: job.step,
-                    operation: job.operation,
-                    needs_action: true,
-                });
-            }
+            JobStage::Detect => self.resolve_detect(&job),
             JobStage::Plan => {
                 self.planned(
                     &job,
@@ -1082,7 +1085,7 @@ impl LiveController {
                 step: steps::LAYOUT,
             });
         }
-        for step in [steps::PAIR, steps::GRANTS] {
+        for step in [steps::PAIR, steps::GRANTS, steps::LAYOUT] {
             if let Some(job) = self.job(step, JobStage::Detect) {
                 self.resolve_detect(&job);
             }
@@ -1102,6 +1105,11 @@ impl LiveController {
             self.begin(steps::GRANTS);
         }
         self.dispatch_intents();
+        // The hiding step's Verify runs once, when the change completes. Its own Status may have
+        // failed around the restart then, so it is checked again with each Status that reports.
+        if let Some(job) = self.job(steps::HIDING, JobStage::Verify) {
+            self.dispatch_hiding(job);
+        }
         for step in [steps::PAIR, steps::GRANTS, steps::LAYOUT] {
             let Some(job) = self.job(step, JobStage::Verify) else {
                 continue;
@@ -1222,9 +1230,23 @@ impl LiveController {
     }
 
     pub(super) fn choose_hiding(&mut self, choice: HidingChoice) {
-        if self.desc.hiding_choice {
+        // A finished choice changes only through "Change", never by a stray click on it.
+        if self.desc.hiding_choice && !self.satisfied(steps::HIDING) {
             self.connect.hiding = Some(choice);
         }
+    }
+
+    /// Revisit a hiding choice that is done: the step asks again, the current choice selected.
+    pub(super) fn change_hiding(&mut self) {
+        if !self.desc.hiding_choice || !self.satisfied(steps::HIDING) {
+            return;
+        }
+        self.connect.hiding_change = true;
+        self.connect.hiding_saved = false;
+        let _ = self.reduce(FlowEvent::Invalidate {
+            step: steps::HIDING,
+        });
+        self.begin(steps::HIDING);
     }
 
     /// The macOS hiding choice through the frozen settings transition: an explicit update consent,
@@ -1232,10 +1254,21 @@ impl LiveController {
     pub(super) fn dispatch_hiding(&mut self, job: JobIntent) {
         match job.stage {
             JobStage::Detect => {
+                // A choice the agent's settings already hold is done: a reopened installer
+                // doesn't ask for it again. Nothing is preselected only when none was made.
+                let saved = if self.connect.hiding_change {
+                    None
+                } else {
+                    self.platform.saved_hiding()
+                };
+                self.connect.hiding_saved = saved.is_some();
+                if saved.is_some() {
+                    self.connect.hiding = saved;
+                }
                 let _ = self.reduce(FlowEvent::Detected {
                     step: job.step,
                     operation: job.operation,
-                    needs_action: true,
+                    needs_action: saved.is_none(),
                 });
             }
             JobStage::Plan => {
@@ -1249,9 +1282,10 @@ impl LiveController {
             }
             JobStage::Apply => self.start_settings(),
             JobStage::Verify => {
-                let complete = self.connect.settings.as_ref().is_some_and(|t| {
-                    *t.state() == crate::tutorial_flow::SettingsTransitionState::Complete
-                });
+                let complete = self.connect.hiding_saved
+                    || self.connect.settings.as_ref().is_some_and(|t| {
+                        *t.state() == crate::tutorial_flow::SettingsTransitionState::Complete
+                    });
                 if let (true, Some((at, source))) = (
                     complete,
                     self.health.as_ref().map(|h| (h.observed_at_ms, h.source)),
@@ -1347,6 +1381,28 @@ impl LiveController {
         let Some(transition) = self.connect.settings.as_mut() else {
             return;
         };
+        // A reply that never reached an admitted agent (the port says Demo) is still this call's
+        // answer. The transition admits only Live replies, so handed over as is it would be
+        // refused and stay pending, and no Status poll could ever be sent again: the step waited
+        // forever after an in-place restart (same PID, new instance), whose first poll fails
+        // against the old instance's admission. Settle it as an unknown outcome instead, like the
+        // permission guide does; a Demo receipt never becomes positive Live evidence.
+        let negative = matches!(
+            reply.result,
+            Err(_)
+                | Ok(DecodedReply::Status(
+                    StatusAdmission::PendingHealthContract(_)
+                ))
+        );
+        let reply = if reply.source != ObservationSource::Live && negative {
+            AgentReply {
+                source: ObservationSource::Live,
+                result: Err(CallFailure::TimeoutOutcomeUnknown),
+                ..reply
+            }
+        } else {
+            reply
+        };
         let Ok(outcome_) = transition.reply(reply, self.now) else {
             return;
         };
@@ -1356,7 +1412,10 @@ impl LiveController {
             let _ = self.reduce(event);
         }
         match state {
-            S::Complete => self.apply_outcome(steps::HIDING, ApplyOutcome::Applied),
+            S::Complete => {
+                self.connect.hiding_change = false;
+                self.apply_outcome(steps::HIDING, ApplyOutcome::Applied)
+            }
             S::Failed(failure) => {
                 self.details
                     .insert(steps::HIDING, failure_text(&failure).into());

@@ -684,6 +684,10 @@ impl LiveController {
                 "Windows you send from this Mac".into(),
                 if asking {
                     preview
+                } else if self.satisfied(steps::HIDING) && self.connect.hiding_saved {
+                    "Windows you send from this Mac are already hidden on a private virtual \
+                     display while they are shown on the other computer."
+                        .into()
                 } else if self.hiding_restart_pending() {
                     "Your choice is saved. Crosspane restarts to use it, which ends what is \
                      shared right now (input, windows or sound). Restart when you're ready."
@@ -1063,6 +1067,15 @@ impl LiveController {
                         "Restart Crosspane now",
                         true,
                         ButtonKind::Primary,
+                    ));
+                }
+                if self.satisfied(steps::HIDING) {
+                    buttons.push(button(
+                        ids::HIDING_CHANGE,
+                        ButtonRole::Ordinary,
+                        "Change",
+                        true,
+                        ButtonKind::Link,
                     ));
                 }
             }
@@ -1695,6 +1708,7 @@ impl LiveController {
             ids::LAYOUT_ACCEPT => self.accept_layout(),
             ids::HIDING_APPLY => self.request_apply(steps::HIDING),
             ids::HIDING_RESTART => self.hiding_restart(),
+            ids::HIDING_CHANGE => self.change_hiding(),
             ids::PLAY_TONE => self.practice_user(TutorialUserAction::PlayTestSound),
             ids::PRACTICE_CANCEL => self.practice_user(TutorialUserAction::Cancel),
             ids::FINAL_CHECK => self.begin(steps::FINAL),

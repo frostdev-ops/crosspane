@@ -1108,6 +1108,54 @@ fn transport_restart_or_link_change_requires_idle_explicit_re_detection_and_new_
     }
 }
 
+/// WP-4.33b: an in-place exec restart keeps the PID (4242) and the process start, and changes
+/// only the instance id. A Status on the old admission is refused before any byte reaches the
+/// agent, and the reply says it was never admitted (not Live): the caller has to settle that call,
+/// not wait on it. A fresh admission then admits the new instance under the same PID.
+#[test]
+fn transport_in_place_restart_refuses_the_old_admission_unadmitted_and_admits_the_new_instance() {
+    let f = Fixture::new();
+    let current = Arc::new(Mutex::new(wire_status(&f)));
+    let replies = current.clone();
+    let _server = Server::new(
+        &f,
+        Arc::new(move |bytes, socket| {
+            if command(bytes) == "status" {
+                send_owned(socket, &line(&replies.lock().unwrap()));
+            }
+        }),
+    );
+    let mut port = MacAgentPort::new(selected(&f), Arc::new(|| 83)).unwrap();
+    port.emulate_live();
+    port.submit(call(1, InstallerRequest::Status, 1000))
+        .unwrap();
+    let first = drain(&mut port, 1).remove(0);
+    assert!(matches!(
+        first.result,
+        Ok(DecodedReply::Status(StatusAdmission::Supported(_)))
+    ));
+    assert_eq!(first.source, ObservationSource::Live);
+    // The same process execs itself: same PID and start, a new instance id.
+    f.bootstrap(7, 0, "ready", 1);
+    current.lock().unwrap()["result"]["installer"]["instance"]["id"] = 7.into();
+    port.submit(call(2, InstallerRequest::Status, 1000))
+        .unwrap();
+    let stale = drain(&mut port, 1).remove(0);
+    assert_eq!(stale.result, Err(CallFailure::Unavailable));
+    assert_ne!(stale.source, ObservationSource::Live);
+    port.redetect(selected(&f)).unwrap();
+    port.emulate_live();
+    port.submit(call(3, InstallerRequest::Status, 1000))
+        .unwrap();
+    let fresh = drain(&mut port, 1).remove(0);
+    let Ok(DecodedReply::Status(StatusAdmission::Supported(health))) = &fresh.result else {
+        panic!("the new instance is admitted");
+    };
+    assert_eq!(health.installer().instance.id, 7);
+    assert_eq!(health.installer().instance.pid, 4242);
+    assert_eq!(fresh.source, ObservationSource::Live);
+}
+
 #[test]
 fn transport_wrong_status_identity_and_wrong_requested_peer_never_transmit_mutation() {
     for field in [

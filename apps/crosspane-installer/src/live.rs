@@ -21,7 +21,7 @@ use crosspane_installer_core::{
 use crate::agent_contract::{AgentPlatform, AgentPort, AgentReply};
 use crate::fixture::{FixtureCall, FixtureError, FixtureId, FixtureReceipt};
 use crate::tutorial_flow::TutorialSourcePolicy;
-use crate::view::{ProgressGroup, ScreenId, ToggleRole};
+use crate::view::{HidingChoice, ProgressGroup, ScreenId, ToggleRole};
 
 pub use controller::LiveController;
 pub use graph::{ROLES as PRACTICE_ROLES, steps};
@@ -471,6 +471,35 @@ pub trait Platform {
     fn support_checks(&mut self) -> Option<SupportChecklist> {
         None
     }
+    /// The hiding choice (D7) this machine's agent settings already hold, if they hold one: a
+    /// reopened installer shows that step as done instead of asking again. Only a choice the
+    /// settings prove is reported; a bounded read of one small local file at most.
+    fn saved_hiding(&mut self) -> Option<HidingChoice> {
+        None
+    }
+}
+
+/// The hiding choice (D7) an agent config file proves was made: `mac_virtual_display = true` at
+/// its top level. The default is `false`, which the agent writes on its first start, so `false`
+/// can't tell a Mirror choice from no choice and proves nothing.
+pub fn saved_hiding_choice(config: &[u8]) -> Option<HidingChoice> {
+    let text = std::str::from_utf8(config).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            // Top-level keys come before the first table.
+            break;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"');
+        if key == "mac_virtual_display" {
+            let value = value.split('#').next().unwrap_or_default().trim();
+            return (value == "true").then_some(HidingChoice::Hide);
+        }
+    }
+    None
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -513,6 +542,8 @@ pub mod ids {
     pub const LAYOUT_ACCEPT: u16 = 2301;
     pub const HIDING_APPLY: u16 = 2401;
     pub const HIDING_RESTART: u16 = 2402;
+    /// Revisit a hiding choice the agent's settings already hold.
+    pub const HIDING_CHANGE: u16 = 2403;
     pub const PLAY_TONE: u16 = 3200;
     pub const PRACTICE_CANCEL: u16 = 3201;
     pub const FINAL_CHECK: u16 = 4001;

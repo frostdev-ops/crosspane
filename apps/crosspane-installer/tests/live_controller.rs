@@ -102,6 +102,8 @@ struct Native {
     reports: Vec<NativeReport>,
     refuse: bool,
     shutdown: bool,
+    /// The hiding choice the agent's settings already hold, as the platform reports it.
+    saved_hiding: Option<HidingChoice>,
 }
 
 struct SharedAgent(Rc<RefCell<AgentQueue>>);
@@ -189,6 +191,9 @@ impl Platform for Fake {
     }
     fn support_checks(&mut self) -> Option<SupportChecklist> {
         self.checks.as_ref().and_then(SupportChecksSlot::latest)
+    }
+    fn saved_hiding(&mut self) -> Option<HidingChoice> {
+        self.native.borrow().saved_hiding
     }
 }
 
@@ -1397,6 +1402,232 @@ fn the_hiding_choice_is_never_preselected_and_apply_restarts_unless_something_is
     }
 }
 
+impl H {
+    /// Answer every outstanding Status call with `result` from `source`, ticking until at least
+    /// one was issued.
+    fn answer_statuses(
+        &mut self,
+        result: impl Fn(&Self) -> Result<DecodedReply, CallFailure>,
+        source: ObservationSource,
+    ) {
+        for _ in 0..40 {
+            if self.has_call(|r| *r == InstallerRequest::Status) {
+                break;
+            }
+            self.advance(100);
+            self.tick();
+        }
+        while self.has_call(|r| *r == InstallerRequest::Status) {
+            let call = self.call(|r| *r == InstallerRequest::Status);
+            let result = result(self);
+            self.reply_from(&call, result, source);
+        }
+    }
+    /// Choose Hide on the hiding screen, apply it, let the agent save it, and return the restart
+    /// call that the Apply click consented to.
+    fn hide_and_apply(&mut self) -> AgentCall {
+        self.install();
+        self.status_reply();
+        self.next();
+        assert_eq!(self.view().screen, ScreenId::HidingChoice);
+        self.status_reply();
+        let revision = self.view().revision;
+        self.act(revision, WizardIntent::ChooseHiding(HidingChoice::Hide));
+        self.click(ids::HIDING_APPLY);
+        let update = self.call(|r| matches!(r, InstallerRequest::SettingsUpdate { .. }));
+        let saved = decode_reply(
+            &update.request,
+            br#"{"ok":true,"result":{"revision":"aaaaaaaaaaaaaaaa","restart_required":true}}"#,
+            AgentPlatform::Linux,
+        )
+        .unwrap();
+        self.reply(&update, Ok(saved));
+        self.call(|r| *r == InstallerRequest::Restart)
+    }
+}
+
+/// WP-4.33b: the agent restarts in place through exec, so the PID and the process start time stay
+/// the same and only the instance id changes. Right after it, a poll can fail against the old
+/// instance's admission before anything reaches the agent (the port reports that as Demo), and the
+/// installer's own Status fails the same way. The step must still complete on the first Status of
+/// the new instance with the saved setting loaded, whatever the restart call itself answered.
+#[test]
+fn an_in_place_restart_with_the_same_pid_completes_the_hiding_step() {
+    for acknowledged in [true, false] {
+        let mut h = H::with(hiding_description());
+        let restart = h.hide_and_apply();
+        if acknowledged {
+            h.ack(&restart);
+        } else {
+            h.reply(&restart, Err(CallFailure::TimeoutOutcomeUnknown));
+        }
+        assert_ne!(h.row(live::steps::HIDING).state, RowState::Verified);
+        // The first polls fail before reaching any agent.
+        h.answer_statuses(|_| Err(CallFailure::Unavailable), ObservationSource::Demo);
+        // The same process now runs a new instance with the saved setting loaded.
+        let pid = h.status["result"]["installer"]["instance"]["pid"].clone();
+        let started = h.status["result"]["installer"]["instance"]["started_unix_ms"].clone();
+        h.status["result"]["installer"]["instance"]["id"] = json!(100);
+        h.status["result"]["installer"]["config_revision"] = json!("aaaaaaaaaaaaaaaa");
+        // One Status of the new instance gets through while the other still fails, in either
+        // order: the step completes even when the installer's own Status is the one that fails.
+        for flip in [false, true] {
+            for _ in 0..40 {
+                if h.has_call(|r| *r == InstallerRequest::Status) {
+                    break;
+                }
+                h.advance(100);
+                h.tick();
+            }
+            let mut index = 0;
+            while h.has_call(|r| *r == InstallerRequest::Status) {
+                let call = h.call(|r| *r == InstallerRequest::Status);
+                if (index % 2 == 0) == flip {
+                    h.reply_from(
+                        &call,
+                        Err(CallFailure::Unavailable),
+                        ObservationSource::Demo,
+                    );
+                } else {
+                    let health = h.health();
+                    h.reply(
+                        &call,
+                        Ok(DecodedReply::Status(StatusAdmission::Supported(health))),
+                    );
+                }
+                index += 1;
+            }
+        }
+        for _ in 0..20 {
+            if h.row(live::steps::HIDING).state == RowState::Verified {
+                break;
+            }
+            h.answer_statuses(
+                |h| Ok(DecodedReply::Status(StatusAdmission::Supported(h.health()))),
+                ObservationSource::Live,
+            );
+        }
+        assert_eq!(h.status["result"]["installer"]["instance"]["pid"], pid);
+        assert_eq!(
+            h.status["result"]["installer"]["instance"]["started_unix_ms"],
+            started
+        );
+        assert_eq!(
+            h.row(live::steps::HIDING).state,
+            RowState::Verified,
+            "acknowledged restart: {acknowledged}"
+        );
+        assert!(
+            !h.has_call(|r| *r == InstallerRequest::Restart),
+            "no second restart"
+        );
+    }
+}
+
+/// The same restart, but the new instance still reports the old setting: a restart alone never
+/// completes the step; the saved revision must be the loaded one.
+#[test]
+fn a_new_instance_without_the_saved_setting_never_completes_the_hiding_step() {
+    let mut h = H::with(hiding_description());
+    let restart = h.hide_and_apply();
+    h.ack(&restart);
+    h.status["result"]["installer"]["instance"]["id"] = json!(100);
+    for _ in 0..5 {
+        h.answer_statuses(
+            |h| Ok(DecodedReply::Status(StatusAdmission::Supported(h.health()))),
+            ObservationSource::Live,
+        );
+    }
+    assert_ne!(h.row(live::steps::HIDING).state, RowState::Verified);
+}
+
+/// WP-4.33b: a reopened installer whose agent settings already hold the hiding choice shows the
+/// step as done and moves on, without asking, saving or restarting again. A quiet "Change" link
+/// revisits it with the saved choice selected.
+#[test]
+fn a_saved_hiding_choice_is_done_on_reopen_and_change_revisits_it() {
+    let mut h = H::with(hiding_description());
+    h.native.borrow_mut().saved_hiding = Some(HidingChoice::Hide);
+    h.install();
+    h.status_reply();
+    h.next();
+    for _ in 0..20 {
+        if h.view().screen != ScreenId::HidingChoice {
+            break;
+        }
+        h.status_reply();
+    }
+    assert_eq!(h.row(live::steps::HIDING).state, RowState::Verified);
+    assert_eq!(
+        h.view().screen,
+        ScreenId::Connect,
+        "a finished screen moves on"
+    );
+    assert!(!h.has_call(|r| matches!(r, InstallerRequest::SettingsUpdate { .. })));
+    assert!(!h.has_call(|r| *r == InstallerRequest::Restart));
+    h.click(ids::BACK);
+    assert_eq!(h.view().screen, ScreenId::HidingChoice);
+    assert_eq!(h.view().hiding_choice, Some(HidingChoice::Hide));
+    assert!(h.view().message.contains("already hidden"));
+    assert!(h.button(ids::HIDING_APPLY).is_none());
+    // A stray click on the other answer changes nothing while the step is done.
+    let revision = h.view().revision;
+    h.act(revision, WizardIntent::ChooseHiding(HidingChoice::Mirror));
+    assert_eq!(h.view().hiding_choice, Some(HidingChoice::Hide));
+    let change = h.button(ids::HIDING_CHANGE).cloned().expect("change link");
+    assert_eq!(change.kind, ButtonKind::Link);
+    h.click(ids::HIDING_CHANGE);
+    for _ in 0..10 {
+        if h.row(live::steps::HIDING).state == RowState::NeedsAction {
+            break;
+        }
+        h.status_reply();
+    }
+    assert_eq!(h.row(live::steps::HIDING).state, RowState::NeedsAction);
+    assert_eq!(h.view().hiding_choice, Some(HidingChoice::Hide));
+    assert!(h.button(ids::HIDING_CHANGE).is_none());
+    let revision = h.view().revision;
+    h.act(revision, WizardIntent::ChooseHiding(HidingChoice::Mirror));
+    h.click(ids::HIDING_APPLY);
+    let update = h.call(|r| matches!(r, InstallerRequest::SettingsUpdate { .. }));
+    assert!(matches!(
+        update.request,
+        InstallerRequest::SettingsUpdate {
+            mac_virtual_display: false,
+            ..
+        }
+    ));
+}
+
+/// Settings that don't prove a choice (the default `false`, or none at all) still ask, with
+/// nothing preselected.
+#[test]
+fn an_unproven_hiding_choice_is_still_asked_with_nothing_preselected() {
+    for saved in [
+        b"mac_virtual_display = false\n".as_slice(),
+        b"[remap]\nmac_virtual_display = true\n",
+        b"",
+        b"\xff",
+    ] {
+        assert_eq!(live::saved_hiding_choice(saved), None);
+    }
+    for saved in [
+        b"mac_virtual_display = true\n".as_slice(),
+        b"crossing = true\nmac_virtual_display=true # D7\n\n[remap]\nx = \"none\"\n",
+    ] {
+        assert_eq!(live::saved_hiding_choice(saved), Some(HidingChoice::Hide));
+    }
+    let mut h = H::with(hiding_description());
+    h.install();
+    h.status_reply();
+    h.next();
+    assert_eq!(h.view().screen, ScreenId::HidingChoice);
+    h.status_reply();
+    assert_eq!(h.row(live::steps::HIDING).state, RowState::NeedsAction);
+    assert_eq!(h.view().hiding_choice, None);
+    assert!(h.button(ids::HIDING_CHANGE).is_none());
+}
+
 #[test]
 fn typing_an_address_stops_the_automatic_window() {
     let mut h = H::new();
@@ -1498,6 +1729,9 @@ fn layout_apply_is_busy_until_committed_status_and_failure_reverts() {
     assert_eq!(h.row(live::steps::GRANTS).state, RowState::Verified);
     h.next();
     assert_eq!(h.view().screen, ScreenId::Layout);
+    // No layout is held yet when the step is detected; it is asked for.
+    h.status_reply();
+    assert_eq!(h.row(live::steps::LAYOUT).state, RowState::NeedsAction);
     h.placements();
     h.status_reply();
     let layout = h.view().layout.clone().expect("layout preview");
@@ -1548,6 +1782,36 @@ fn layout_apply_is_busy_until_committed_status_and_failure_reverts() {
     assert_eq!(h.row(live::steps::LAYOUT).state, RowState::Verified);
     assert!(!h.view().layout.as_ref().unwrap().busy);
     assert!(h.effects.contains(&ShellEffect::FollowLayout));
+}
+
+/// WP-4.33b: a layout the agent already holds for the paired computer is done when the installer
+/// is reopened: the screen moves on without asking or placing anything again.
+#[test]
+fn a_layout_the_agent_already_holds_is_done_on_reopen() {
+    let mut h = H::new();
+    to_grants(&mut h);
+    h.paired_peer(&ALL_GRANTS);
+    h.placements();
+    h.status_reply();
+    h.status_reply();
+    assert_eq!(h.row(live::steps::GRANTS).state, RowState::Verified);
+    h.next();
+    for _ in 0..20 {
+        if h.row(live::steps::LAYOUT).state == RowState::Verified {
+            break;
+        }
+        h.status_reply();
+    }
+    assert_eq!(h.row(live::steps::LAYOUT).state, RowState::Verified);
+    assert!(!h.has_call(|r| matches!(r, InstallerRequest::Place { .. })));
+    for _ in 0..20 {
+        if h.view().screen != ScreenId::Layout {
+            break;
+        }
+        h.advance(100);
+        h.tick();
+    }
+    assert_eq!(h.view().screen, ScreenId::Practice);
 }
 
 #[test]

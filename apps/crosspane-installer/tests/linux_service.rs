@@ -1446,6 +1446,45 @@ fn disabled_enable_reload_stop_and_start_command_success_are_distinct_facts() {
     assert_eq!(f.mutations(), 5);
 }
 
+/// WP-4.33b: the agent can restart in place through exec, so systemd's MainPID and the process
+/// start time stay the same and only the instance id changes. That is a new instance: the wait
+/// after a restart completes on it, and never on the instance that was running before.
+#[test]
+fn an_in_place_exec_restart_with_the_same_main_pid_is_a_new_instance() {
+    let f = Fixture::new("");
+    let service = f.service();
+    f.active();
+    f.bootstrap(9, "ready");
+    let result = service
+        .apply(
+            &f.proof(),
+            service
+                .plan(&f.proof(), ServiceAction::Restart, &deadline())
+                .unwrap(),
+            &deadline(),
+        )
+        .unwrap();
+    let facts = result.after.as_ref().unwrap();
+    assert_eq!(result.previous_instance, Some(9));
+    let agent = |id| {
+        service.agent(
+            facts,
+            Some(&f.reply(id)),
+            19,
+            100,
+            result.previous_instance,
+            &deadline(),
+        )
+    };
+    assert!(
+        agent(9).is_err(),
+        "the old instance never completes the wait"
+    );
+    // Same MainPID (4242) and start time, new instance id.
+    f.bootstrap(10, "ready");
+    assert!(matches!(agent(10).unwrap(), AgentEvidence::Matched(_)));
+}
+
 #[test]
 fn locked_starting_failed_ready_and_restart_require_actual_new_matched_status() {
     let f = Fixture::new("");

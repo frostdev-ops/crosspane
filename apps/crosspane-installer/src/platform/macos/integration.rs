@@ -43,7 +43,7 @@ use crate::live::{
     PlatformDescription, PracticeFixtures, SupportChecklist, SupportChecksSlot,
 };
 use crate::tutorial_flow::TutorialSourcePolicy;
-use crate::view::{ProgressGroup, ScreenId};
+use crate::view::{HidingChoice, ProgressGroup, ScreenId};
 
 pub use domains::{
     Admitted, Agents, AudioError, AudioPackages, AudioPreview, AudioState, Blocked, BlockedBy,
@@ -340,6 +340,8 @@ pub struct MacPlatform {
     stop: Arc<Cancellation>,
     /// Where the support domain writes each pass's checklist (production builds only).
     checks: Option<SupportChecksSlot>,
+    /// The agent's config file, read for a hiding choice it already holds (production only).
+    config: Option<PathBuf>,
 }
 
 macro_rules! opaque_debug {
@@ -385,8 +387,9 @@ impl MacPlatform {
     /// an inventory is never handed in from outside the build.
     pub(crate) fn native(clock: Clock, env: NativeEnv, font: PathBuf) -> Result<Self> {
         let checks = SupportChecksSlot::new(SUPPORT);
+        let config = env.target.state_dir().join("config.toml");
         let domains = native::domains(env, checks.clone());
-        Self::start(
+        let mut platform = Self::start(
             Parts {
                 clock,
                 domains,
@@ -394,7 +397,9 @@ impl MacPlatform {
                 fixtures: FixtureSource::Native { font },
             },
             Some(checks),
-        )
+        )?;
+        platform.config = Some(config);
+        Ok(platform)
     }
 
     /// Compose from injected parts: the test seam. It exists only in this crate's own tests and
@@ -447,6 +452,7 @@ impl MacPlatform {
             fixtures,
             stop,
             checks,
+            config: None,
         })
     }
 }
@@ -490,6 +496,18 @@ impl Platform for MacPlatform {
 
     fn support_checks(&mut self) -> Option<SupportChecklist> {
         self.checks.as_ref().and_then(SupportChecksSlot::latest)
+    }
+
+    fn saved_hiding(&mut self) -> Option<HidingChoice> {
+        use std::io::Read;
+        // A config is a few hundred bytes; anything past this bound isn't read.
+        let mut bytes = Vec::new();
+        std::fs::File::open(self.config.as_ref()?)
+            .ok()?
+            .take(64 * 1024)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        crate::live::saved_hiding_choice(&bytes)
     }
 }
 
