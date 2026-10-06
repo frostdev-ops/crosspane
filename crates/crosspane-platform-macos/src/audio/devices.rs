@@ -6,8 +6,8 @@
 use crosspane_media::audio::Resampler;
 
 use super::hal::{
-    CLASS_AUDIO_DEVICE, DeviceInfo, FLAG_NON_INTERLEAVED, FLAGS_FLOAT_PACKED, FORMAT_LINEAR_PCM,
-    RATE, StreamFormat, StreamInfo, TRANSPORT_VIRTUAL,
+    CLASS_AUDIO_DEVICE, DeviceId, DeviceInfo, FLAG_NON_INTERLEAVED, FLAGS_FLOAT_PACKED,
+    FORMAT_LINEAR_PCM, RATE, StreamFormat, StreamInfo, TRANSPORT_BUILTIN, TRANSPORT_VIRTUAL,
 };
 
 /// Visible output the apps play into ("Crosspane speakers").
@@ -96,6 +96,72 @@ pub(super) enum OutputLayout {
     Interleaved,
     /// Two buffers of one channel each.
     Planar,
+}
+
+/// The priority rule that selected a playback target; only the rule and UID are logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackRule {
+    DefaultOutput,
+    DefaultSystemOutput,
+    BuiltIn,
+}
+
+impl PlaybackRule {
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::DefaultOutput => "default_output",
+            Self::DefaultSystemOutput => "default_system_output",
+            Self::BuiltIn => "built_in",
+        }
+    }
+}
+
+/// A selection borrows the exact snapshot that qualified, so callers can track the whole snapshot.
+pub(super) struct PlaybackSelection<'a> {
+    pub device: DeviceId,
+    pub info: &'a DeviceInfo,
+    pub layout: OutputLayout,
+    pub rate: u32,
+    pub rule: PlaybackRule,
+}
+
+/// Pure selection over read-only snapshots. Only a Crosspane rejection opens the fallback path;
+/// every other default rejection is preserved. Inventory order is the HAL's order, not a new
+/// preference policy. No Crosspane UID or bound Crosspane id can qualify under any rule.
+pub(super) fn select_playback<'a>(
+    default: (DeviceId, &'a DeviceInfo),
+    system: Option<(DeviceId, &'a DeviceInfo)>,
+    inventory: impl IntoIterator<Item = (DeviceId, &'a DeviceInfo)>,
+    bound_crosspane: &[DeviceId],
+) -> Result<PlaybackSelection<'a>, Reject> {
+    let accept = |(device, info): (DeviceId, &'a DeviceInfo), rule| {
+        let (layout, rate) = playback_layout(info)?;
+        if bound_crosspane.contains(&device) {
+            return Err(Reject::CrosspaneDevice);
+        }
+        Ok(PlaybackSelection {
+            device,
+            info,
+            layout,
+            rate,
+            rule,
+        })
+    };
+    match accept(default, PlaybackRule::DefaultOutput) {
+        Ok(selected) => return Ok(selected),
+        Err(Reject::CrosspaneDevice) => {}
+        Err(reject) => return Err(reject),
+    }
+    if let Some(selected) =
+        system.and_then(|candidate| accept(candidate, PlaybackRule::DefaultSystemOutput).ok())
+    {
+        return Ok(selected);
+    }
+    inventory
+        .into_iter()
+        .filter(|(_, info)| info.transport == TRANSPORT_BUILTIN)
+        .find_map(|candidate| accept(candidate, PlaybackRule::BuiltIn).ok())
+        .ok_or(Reject::CrosspaneDevice)
 }
 
 /// Why a default output cannot be played on.
@@ -208,6 +274,193 @@ mod tests {
                     ..StreamFormat::float32(2, interleaved)
                 },
             }],
+        }
+    }
+
+    #[test]
+    fn selection_default_physical_uses_default() {
+        let default = physical(44_100.0, false);
+        let system = physical(48_000.0, true);
+        let builtin = physical(96_000.0, true);
+        let selected = select_playback(
+            (DeviceId(1), &default),
+            Some((DeviceId(2), &system)),
+            [(DeviceId(3), &builtin)],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(selected.device, DeviceId(1));
+        assert_eq!(selected.rule, PlaybackRule::DefaultOutput);
+        assert_eq!(selected.info, &default);
+        assert_eq!(
+            (selected.layout, selected.rate),
+            (OutputLayout::Planar, 44_100)
+        );
+    }
+
+    #[test]
+    fn selection_crosspane_default_uses_system_physical() {
+        let mut default = physical(48_000.0, true);
+        default.uid = SPEAKERS_APP_UID.into();
+        let mut system = physical(96_000.0, true);
+        system.uid = "SystemPhysicalOutput".into();
+        system.transport = 0; // The system rule does not require built-in transport.
+        let builtin = physical(48_000.0, true);
+        let selected = select_playback(
+            (DeviceId(1), &default),
+            Some((DeviceId(2), &system)),
+            [(DeviceId(3), &builtin)],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(selected.device, DeviceId(2));
+        assert_eq!(selected.rule, PlaybackRule::DefaultSystemOutput);
+        assert_eq!(selected.info, &system);
+        assert_eq!(selected.rate, 96_000);
+    }
+
+    #[test]
+    fn selection_crosspane_system_uses_first_accepted_builtin() {
+        let mut default = physical(48_000.0, true);
+        default.uid = SPEAKERS_APP_UID.into();
+        let mut system = physical(48_000.0, true);
+        system.uid = "io.frostdev.crosspane.audio.v1.future".into();
+        let mut dead = physical(48_000.0, true);
+        dead.alive = false;
+        let bound = physical(48_000.0, true);
+        let mut other_transport = physical(48_000.0, true);
+        other_transport.transport = 0;
+        let mut no_output = physical(48_000.0, true);
+        no_output.output_streams.clear();
+        let first = physical(44_100.0, false);
+        let second = physical(48_000.0, true);
+        let selected = select_playback(
+            (DeviceId(1), &default),
+            Some((DeviceId(2), &system)),
+            [
+                (DeviceId(3), &dead),
+                (DeviceId(4), &bound),
+                (DeviceId(5), &other_transport),
+                (DeviceId(6), &no_output),
+                (DeviceId(7), &first),
+                (DeviceId(8), &second),
+            ],
+            &[DeviceId(4)],
+        )
+        .unwrap();
+        assert_eq!(selected.device, DeviceId(7));
+        assert_eq!(selected.rule, PlaybackRule::BuiltIn);
+        assert_eq!(selected.info, &first);
+
+        // A default-system identity change can leave the built-in selection unchanged while
+        // requiring new watchers. The admitted selection snapshot must notice that change.
+        let mut old_targets = Vec::new();
+        let mut new_targets = Vec::new();
+        crate::audio::playback_device_targets(&mut old_targets, DeviceId(20), &dead);
+        crate::audio::playback_device_targets(&mut new_targets, DeviceId(21), &dead);
+        assert!(!crate::audio::same_playback_targets(
+            &old_targets,
+            &new_targets
+        ));
+        old_targets.reverse();
+        assert!(crate::audio::same_playback_targets(
+            &old_targets,
+            &old_targets.iter().copied().rev().collect::<Vec<_>>()
+        ));
+
+        // Re-running the same priority rule notices a newly acceptable earlier candidate.
+        dead.alive = true;
+        assert_eq!(
+            select_playback(
+                (DeviceId(1), &default),
+                Some((DeviceId(2), &system)),
+                [
+                    (DeviceId(3), &dead),
+                    (DeviceId(4), &bound),
+                    (DeviceId(5), &other_transport),
+                    (DeviceId(6), &no_output),
+                    (DeviceId(7), &first),
+                    (DeviceId(8), &second),
+                ],
+                &[DeviceId(4)],
+            )
+            .unwrap()
+            .device,
+            DeviceId(3)
+        );
+        let physical_system = physical(48_000.0, true);
+        assert_eq!(
+            select_playback(
+                (DeviceId(1), &default),
+                Some((DeviceId(9), &physical_system)),
+                [
+                    (DeviceId(3), &dead),
+                    (DeviceId(4), &bound),
+                    (DeviceId(5), &other_transport),
+                    (DeviceId(6), &no_output),
+                    (DeviceId(7), &first),
+                    (DeviceId(8), &second),
+                ],
+                &[DeviceId(4)],
+            )
+            .unwrap()
+            .rule,
+            PlaybackRule::DefaultSystemOutput
+        );
+    }
+
+    #[test]
+    fn selection_nothing_qualifies_keeps_crosspane_refusal() {
+        let mut default = physical(48_000.0, true);
+        default.uid = SPEAKERS_APP_UID.into();
+        let mut future_crosspane = physical(48_000.0, true);
+        future_crosspane.uid = "io.frostdev.crosspane.audio.v9.future".into();
+        let mut dead = physical(48_000.0, true);
+        dead.alive = false;
+        let bound = physical(48_000.0, true);
+        assert_eq!(
+            select_playback(
+                (DeviceId(1), &default),
+                Some((DeviceId(2), &future_crosspane)),
+                [
+                    (DeviceId(3), &future_crosspane),
+                    (DeviceId(4), &dead),
+                    (DeviceId(5), &bound)
+                ],
+                &[DeviceId(5)],
+            )
+            .err(),
+            Some(Reject::CrosspaneDevice)
+        );
+    }
+
+    #[test]
+    fn selection_other_rejects_never_fall_back() {
+        let valid_system = physical(48_000.0, true);
+        for reject in [
+            Reject::NotAlive,
+            Reject::NoOutput,
+            Reject::Rate,
+            Reject::Format,
+        ] {
+            let mut default = physical(48_000.0, true);
+            match reject {
+                Reject::NotAlive => default.alive = false,
+                Reject::NoOutput => default.output_streams.clear(),
+                Reject::Rate => default.nominal_rate = 44_100.0,
+                Reject::Format => default.output_streams[0].format.channels_per_frame = 1,
+                Reject::CrosspaneDevice => unreachable!(),
+            }
+            assert_eq!(
+                select_playback(
+                    (DeviceId(1), &default),
+                    Some((DeviceId(2), &valid_system)),
+                    [(DeviceId(3), &valid_system)],
+                    &[],
+                )
+                .err(),
+                Some(reject)
+            );
         }
     }
 

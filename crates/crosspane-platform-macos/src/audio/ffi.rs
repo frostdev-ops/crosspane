@@ -97,6 +97,7 @@ pub const kAudioObjectPropertyElementMain: u32 = 0;
 
 pub const kAudioHardwarePropertyTranslateUIDToDevice: u32 = fourcc(b"uidd");
 pub const kAudioHardwarePropertyDefaultOutputDevice: u32 = fourcc(b"dOut");
+pub const kAudioHardwarePropertyDefaultSystemOutputDevice: u32 = fourcc(b"sOut");
 pub const kAudioHardwarePropertyDevices: u32 = fourcc(b"dev#");
 pub const kAudioHardwarePropertyServiceRestarted: u32 = fourcc(b"srst");
 
@@ -105,6 +106,7 @@ pub const kAudioDeviceClassID: u32 = fourcc(b"adev");
 pub const kAudioDevicePropertyDeviceUID: u32 = fourcc(b"uid ");
 pub const kAudioDevicePropertyTransportType: u32 = fourcc(b"tran");
 pub const kAudioDeviceTransportTypeVirtual: u32 = fourcc(b"virt");
+pub const kAudioDeviceTransportTypeBuiltIn: u32 = fourcc(b"bltn");
 pub const kAudioDevicePropertyDeviceIsAlive: u32 = fourcc(b"livn");
 pub const kAudioDevicePropertyDeviceIsRunningSomewhere: u32 = fourcc(b"gone");
 pub const kAudioDevicePropertyIsHidden: u32 = fourcc(b"hidn");
@@ -324,6 +326,10 @@ pub fn abi_report() -> Vec<(&'static str, u64)> {
             kAudioHardwarePropertyDefaultOutputDevice
         ),
         entry!(
+            "kAudioHardwarePropertyDefaultSystemOutputDevice",
+            kAudioHardwarePropertyDefaultSystemOutputDevice
+        ),
+        entry!(
             "kAudioHardwarePropertyDevices",
             kAudioHardwarePropertyDevices
         ),
@@ -344,6 +350,10 @@ pub fn abi_report() -> Vec<(&'static str, u64)> {
         entry!(
             "kAudioDeviceTransportTypeVirtual",
             kAudioDeviceTransportTypeVirtual
+        ),
+        entry!(
+            "kAudioDeviceTransportTypeBuiltIn",
+            kAudioDeviceTransportTypeBuiltIn
         ),
         entry!(
             "kAudioDevicePropertyDeviceIsAlive",

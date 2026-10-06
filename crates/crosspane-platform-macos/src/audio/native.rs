@@ -209,6 +209,10 @@ fn listener_address(target: ListenTarget) -> (AudioObjectID, AudioObjectProperty
             ffi::kAudioObjectSystemObject,
             address(ffi::kAudioHardwarePropertyDefaultOutputDevice, global),
         ),
+        ListenTarget::DefaultSystemOutput => (
+            ffi::kAudioObjectSystemObject,
+            address(ffi::kAudioHardwarePropertyDefaultSystemOutputDevice, global),
+        ),
         ListenTarget::DeviceList => (
             ffi::kAudioObjectSystemObject,
             address(ffi::kAudioHardwarePropertyDevices, global),
@@ -355,6 +359,26 @@ impl Hal for NativeHal {
         );
         let device: AudioObjectID = get_scalar(ffi::kAudioObjectSystemObject, addr)?;
         Ok((device != ffi::kAudioObjectUnknown).then_some(DeviceId(device)))
+    }
+
+    fn default_system_output_device(&self) -> Result<Option<DeviceId>, HalError> {
+        let addr = address(
+            ffi::kAudioHardwarePropertyDefaultSystemOutputDevice,
+            ffi::kAudioObjectPropertyScopeGlobal,
+        );
+        let device: AudioObjectID = get_scalar(ffi::kAudioObjectSystemObject, addr)?;
+        Ok((device != ffi::kAudioObjectUnknown).then_some(DeviceId(device)))
+    }
+
+    fn device_ids(&self) -> Result<Vec<DeviceId>, HalError> {
+        let addr = address(
+            ffi::kAudioHardwarePropertyDevices,
+            ffi::kAudioObjectPropertyScopeGlobal,
+        );
+        Ok(get_u32_list(ffi::kAudioObjectSystemObject, addr)?
+            .into_iter()
+            .map(DeviceId)
+            .collect())
     }
 
     fn add_listener(

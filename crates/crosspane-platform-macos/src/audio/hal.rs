@@ -30,6 +30,8 @@ pub const RATE: f64 = 48_000.0;
 pub const CLASS_AUDIO_DEVICE: u32 = super::ffi::kAudioDeviceClassID;
 /// `kAudioDeviceTransportTypeVirtual` ('virt').
 pub const TRANSPORT_VIRTUAL: u32 = super::ffi::kAudioDeviceTransportTypeVirtual;
+/// `kAudioDeviceTransportTypeBuiltIn` ('bltn').
+pub const TRANSPORT_BUILTIN: u32 = super::ffi::kAudioDeviceTransportTypeBuiltIn;
 /// `kAudioFormatLinearPCM` ('lpcm').
 pub const FORMAT_LINEAR_PCM: u32 = super::ffi::kAudioFormatLinearPCM;
 /// `kAudioFormatFlagsNativeFloatPacked`: float, native endian, packed, interleaved.
@@ -143,6 +145,8 @@ pub enum ListenTarget {
     StreamFormat(StreamId),
     /// `kAudioHardwarePropertyDefaultOutputDevice` of the system object.
     DefaultOutput,
+    /// `kAudioHardwarePropertyDefaultSystemOutputDevice` of the system object.
+    DefaultSystemOutput,
     /// `kAudioHardwarePropertyDevices` of the system object.
     DeviceList,
     /// `kAudioHardwarePropertyServiceRestarted` of the system object.
@@ -365,6 +369,18 @@ pub trait Hal: Send + Sync + 'static {
 
     /// The system default output device, `Ok(None)` when there is none.
     fn default_output_device(&self) -> Result<Option<DeviceId>, HalError>;
+
+    /// The default system output, distinct from the default output. A stub without that device
+    /// supplies no candidate; the native implementation reads the public system property.
+    fn default_system_output_device(&self) -> Result<Option<DeviceId>, HalError> {
+        Ok(None)
+    }
+
+    /// Device ids in the order returned by `kAudioHardwarePropertyDevices`, without changing any
+    /// device. Existing stubs have no inventory beyond their explicit default.
+    fn device_ids(&self) -> Result<Vec<DeviceId>, HalError> {
+        Ok(Vec::new())
+    }
 
     /// Register a change listener. Notifications call [`Notifier::notify`] on an OS thread.
     fn add_listener(

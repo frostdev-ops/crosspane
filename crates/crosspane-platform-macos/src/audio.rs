@@ -80,7 +80,10 @@
 //!
 //! # Physical playback
 //!
-//! `open_playback` supports only the default output, and only when it is not a Crosspane device
+//! `open_playback` first tries the default output. Only a Crosspane-device rejection permits a
+//! fallback: the accepted default system output, then the first alive accepted built-in output
+//! in HAL inventory order. Other rejections never fall back; all Crosspane UIDs and bound
+//! Crosspane device ids are excluded. The chosen output must not be a Crosspane device
 //! and its client-facing format is float32 stereo, one stream, interleaved or planar, at a rate
 //! `crosspane_media::audio::Resampler` can reach from 48 kHz: the device's nominal rate and its
 //! stream's rate must be the same whole number of hertz (44.1, 88.2, 96, 176.4 and 192 kHz among
@@ -95,8 +98,8 @@
 //! the IOProc renders in chunks of its 8192-frame scratch; a larger buffer is a bad cycle, zeroed
 //! (up to a bounded size, never past the reported one) before the handle fails. The resampler and
 //! its scratch are allocated at open, so the IOProc allocates nothing. The output can exceed full
-//! scale by the filter's overshoot; it is not clipped, as the 48 kHz path never was. Default-device
-//! changes, device loss, nominal-rate or stream-format changes close the handle with
+//! scale by the filter's overshoot; it is not clipped, as the 48 kHz path never was. Selection is
+//! re-evaluated after change notifications; a different device or full snapshot closes the handle with
 //! `DeviceError::Unavailable`; the caller reopens deliberately and the reopen picks up the new
 //! rate (there is no live rate switching). Physical `open_capture` is always `Unsupported`: it
 //! never reads a device, a default input, a permission state, and no microphone is ever opened by
@@ -488,6 +491,8 @@ struct Binding {
 struct Playback {
     device: DeviceId,
     snapshot: hal::DeviceInfo,
+    /// The selection's watch set; a new candidate or stream needs a deliberate reopen.
+    selection_targets: Vec<ListenTarget>,
     render: Arc<PlaybackRender>,
     io: Box<dyn IoSession>,
     notifier: Arc<Notifier>,
@@ -1133,6 +1138,78 @@ impl Worker {
 
     // -- physical playback ----------------------------------------------------------------
 
+    /// Read only the facts needed by the priority rule. An accepted default (or any rejection
+    /// other than Crosspane) never queries fallback devices. HAL failures remain fail-closed.
+    fn playback_selection(&self) -> Result<PlaybackChoice, PlatformError> {
+        let device = self
+            .hal
+            .default_output_device()
+            .map_err(hal_error)?
+            .ok_or(PlatformError::NotFound)?;
+        let info = self.hal.device_info(device).map_err(hal_error)?;
+        let bound = self
+            .binding
+            .as_ref()
+            .map(|binding| binding.devices.all().to_vec())
+            .unwrap_or_default();
+        match devices::select_playback((device, &info), None, [], &bound) {
+            Ok(selected) => {
+                let mut targets = vec![ListenTarget::DefaultOutput];
+                playback_device_targets(&mut targets, selected.device, selected.info);
+                return Ok(PlaybackChoice::new(selected, targets));
+            }
+            Err(devices::Reject::CrosspaneDevice) => {}
+            Err(reject) => return Err(PlatformError::Unsupported(reject.reason())),
+        }
+
+        let system = self
+            .hal
+            .default_system_output_device()
+            .map_err(hal_error)?
+            .map(|id| self.hal.device_info(id).map(|snapshot| (id, snapshot)))
+            .transpose()
+            .map_err(hal_error)?;
+        let system_ref = system.as_ref().map(|(id, snapshot)| (*id, snapshot));
+        let mut targets = vec![
+            ListenTarget::DefaultOutput,
+            ListenTarget::DefaultSystemOutput,
+            ListenTarget::DeviceList,
+        ];
+        // A system candidate can become acceptable without its default-system id changing.
+        if let Some((id, snapshot)) = system_ref {
+            playback_device_targets(&mut targets, id, snapshot);
+        }
+        if let Ok(selected) = devices::select_playback((device, &info), system_ref, [], &bound) {
+            return Ok(PlaybackChoice::new(selected, targets));
+        }
+
+        let mut inventory = Vec::new();
+        for id in self.hal.device_ids().map_err(hal_error)? {
+            let snapshot = self.hal.device_info(id).map_err(hal_error)?;
+            let builtin = snapshot.transport == hal::TRANSPORT_BUILTIN;
+            inventory.push((id, snapshot));
+            if builtin {
+                let selected = devices::select_playback(
+                    (device, &info),
+                    system_ref,
+                    inventory.iter().map(|(id, snapshot)| (*id, snapshot)),
+                    &bound,
+                );
+                // Watch every earlier built-in candidate as well as the chosen one: alive,
+                // rate, configuration or format changes can promote it in the same rule.
+                if let Some((id, snapshot)) = inventory.last() {
+                    playback_device_targets(&mut targets, *id, snapshot);
+                }
+                if let Ok(selected) = selected {
+                    return Ok(PlaybackChoice::new(selected, targets));
+                }
+            }
+        }
+        Err(PlatformError::Unsupported(
+            devices::Reject::CrosspaneDevice.reason(),
+        ))
+    }
+
     fn open_playback(&mut self, cancelled: &AtomicBool) -> Result<AudioPlayback, PlatformError> {
         if !self.gate.is_open() {
             return Err(PlatformError::Locked);
@@ -1140,36 +1217,16 @@ impl Worker {
         if self.playbacks.len() >= MAX_PLAYBACKS {
             return Err(PlatformError::Unsupported("audio stream limit"));
         }
-        let device = self
-            .hal
-            .default_output_device()
-            .map_err(hal_error)?
-            .ok_or(PlatformError::NotFound)?;
-        let info = self.hal.device_info(device).map_err(hal_error)?;
-        let (layout, rate) = devices::playback_layout(&info)
-            .map_err(|reject| PlatformError::Unsupported(reject.reason()))?;
-        if self
-            .binding
-            .as_ref()
-            .is_some_and(|b| b.devices.all().contains(&device))
-        {
-            return Err(PlatformError::Unsupported(
-                devices::Reject::CrosspaneDevice.reason(),
-            ));
-        }
-
+        let PlaybackChoice {
+            device,
+            info,
+            layout,
+            rate,
+            rule,
+            targets,
+        } = self.playback_selection()?;
         let notifier = Notifier::new(self.me.clone());
-        let mut targets = vec![
-            ListenTarget::DefaultOutput,
-            ListenTarget::DeviceAlive(device),
-            ListenTarget::DeviceNominalRate(device),
-            ListenTarget::DeviceOutputConfig(device),
-        ];
-        targets.extend(
-            info.output_streams
-                .iter()
-                .map(|stream| ListenTarget::StreamFormat(stream.id)),
-        );
+        let selection_targets = targets.clone();
         let mut listeners = Vec::with_capacity(targets.len());
         for target in targets {
             match self.hal.add_listener(target, notifier.clone()) {
@@ -1182,8 +1239,11 @@ impl Worker {
         }
         // Listeners are in place: re-read, so a change between validation and registration is
         // never missed.
-        let unchanged = matches!(self.hal.default_output_device(), Ok(Some(d)) if d == device)
-            && self.hal.device_info(device).as_ref() == Ok(&info);
+        let unchanged = self.playback_selection().is_ok_and(|selected| {
+            selected.device == device
+                && selected.info == info
+                && same_playback_targets(&selected.targets, &selection_targets)
+        });
         let permitted = self.gate.is_open();
         if !unchanged || !permitted || cancelled.load(Ordering::SeqCst) {
             self.release_listeners(&notifier, listeners);
@@ -1227,9 +1287,11 @@ impl Worker {
             wake: self.me.clone(),
             stopped: false,
         };
+        tracing::info!(rule = rule.name(), uid = %info.uid, "audio playback target selected");
         self.playbacks.push(Playback {
             device,
             snapshot: info,
+            selection_targets,
             render,
             io,
             notifier,
@@ -1262,12 +1324,13 @@ impl Worker {
         None
     }
 
-    /// Did the default output, the device, or its format change since the handle opened?
+    /// Did re-running the full priority rule choose another device or a different snapshot?
     fn playback_changed(&self, playback: &Playback) -> bool {
-        if !matches!(self.hal.default_output_device(), Ok(Some(d)) if d == playback.device) {
-            return true;
-        }
-        self.hal.device_info(playback.device).as_ref() != Ok(&playback.snapshot)
+        !self.playback_selection().is_ok_and(|selected| {
+            selected.device == playback.device
+                && selected.info == playback.snapshot
+                && same_playback_targets(&selected.targets, &playback.selection_targets)
+        })
     }
 
     fn service_playbacks(&mut self) {
@@ -1300,6 +1363,57 @@ impl Worker {
             self.emit_error(None, AudioKind::Speaker, error);
         }
     }
+}
+
+/// An owned result of the read-only playback rule, including its change listeners.
+struct PlaybackChoice {
+    device: DeviceId,
+    info: hal::DeviceInfo,
+    layout: devices::OutputLayout,
+    rate: u32,
+    rule: devices::PlaybackRule,
+    targets: Vec<ListenTarget>,
+}
+
+impl PlaybackChoice {
+    fn new(selected: devices::PlaybackSelection<'_>, targets: Vec<ListenTarget>) -> Self {
+        Self {
+            device: selected.device,
+            info: selected.info.clone(),
+            layout: selected.layout,
+            rate: selected.rate,
+            rule: selected.rule,
+            targets,
+        }
+    }
+}
+
+fn playback_device_targets(
+    targets: &mut Vec<ListenTarget>,
+    device: DeviceId,
+    snapshot: &hal::DeviceInfo,
+) {
+    for target in [
+        ListenTarget::DeviceAlive(device),
+        ListenTarget::DeviceNominalRate(device),
+        ListenTarget::DeviceOutputConfig(device),
+    ]
+    .into_iter()
+    .chain(
+        snapshot
+            .output_streams
+            .iter()
+            .map(|s| ListenTarget::StreamFormat(s.id)),
+    ) {
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+}
+
+/// Each generated watch set is deduplicated. Ordering alone is not a selection change.
+fn same_playback_targets(left: &[ListenTarget], right: &[ListenTarget]) -> bool {
+    left.len() == right.len() && left.iter().all(|target| right.contains(target))
 }
 
 /// The handle's stop: silence immediately, retirement on the owner thread.
