@@ -427,7 +427,7 @@ mod native {
             LogonArchiveResult, MonotonicClock, OwnedArchiveResult, SupportProof, WindowsNativeIo,
             activation::EntrySelection,
             jobs::{ChildStartPermit, CreatedChild, SupervisorOwner},
-            supervisor_owner::OwnerServer,
+            supervisor_owner::{OuterOwnerServer, OwnerServer},
         },
         transport::WindowsAgentPort,
     };
@@ -901,6 +901,13 @@ mod native {
             &proof(&images.io, &initial)?,
             &initial,
         )?;
+        // A4d companion shares this original owner's current-agent/terminal/export state.
+        // It reserves no new job or source namespace; warm updates use that SAME state Arc.
+        let mut outer = Some(OuterOwnerServer::reserve(
+            &server,
+            &proof(owner.io(), &initial)?,
+            &initial,
+        )?);
         let permit = match candidate {
             EntryCandidate::Installer(permit) => EntryPermit::Installer(permit),
             EntryCandidate::Logon(candidate) => {
@@ -1072,10 +1079,18 @@ mod native {
                         owner
                             .settled_for_stop(&proof(owner.io(), &deadline)?, &original, &deadline)?
                             .ok_or(NativeError::Busy)?;
+                        outer
+                            .take()
+                            .ok_or(NativeError::Foreign)?
+                            .finish_and_settle(&proof(owner.io(), &deadline)?, &deadline)?;
                         server.finish(&proof(owner.io(), &deadline)?, &deadline)?;
                         return Ok(SupervisorExit::InstallerStopped);
                     }
                     transition(&owner, &mut record, Phase::Finished, &model, generation)?;
+                    outer
+                        .take()
+                        .ok_or(NativeError::Foreign)?
+                        .finish_and_settle(&proof(owner.io(), &deadline)?, &deadline)?;
                     server.finish(&proof(owner.io(), &deadline)?, &deadline)?;
                     return Ok(SupervisorExit::NormalQuit);
                 }

@@ -1173,3 +1173,800 @@ fn start_readiness_stale_predecessor_waits_without_status_until_exact_new_candid
     assert_eq!(status_attempts, 1);
     assert!(service::new_ready_candidate(&BootstrapPhase::Ready, 0, None).is_err());
 }
+
+/// These ports own authored fixture effects, not native handles or permits. The real keeper
+/// controller, payload apply/recovery and admission predicate are exercised without OS calls.
+mod a4d_outer {
+    use super::*;
+    use native_io::activation::{
+        KeeperApplyAttempt, KeeperControl, KeeperPort, KeeperProgress, KeeperStage,
+    };
+    use payload::recovery::{
+        FixedObservation, RecoveryPort, ReopenedRole, RollbackOutcome, StageObservation,
+    };
+    use payload::staging::PayloadPort;
+    use std::{cell::Cell, rc::Rc, sync::Arc};
+
+    struct FixtureLock(Rc<Cell<bool>>);
+    impl Drop for FixtureLock {
+        fn drop(&mut self) {
+            self.0.set(false);
+        }
+    }
+    struct OwnedUpgrade {
+        inner: FakeUpgrade,
+        retained_stop: Option<Arc<service::UpgradeStopProof>>,
+        lock_held: Rc<Cell<bool>>,
+        lock_boundary: payload::LockHandoff<'static, FixtureLock>,
+        start_permit: Option<u8>,
+    }
+    impl OwnedUpgrade {
+        fn new() -> Self {
+            let held = Rc::new(Cell::new(true));
+            Self {
+                inner: FakeUpgrade::new(),
+                retained_stop: None,
+                lock_held: held.clone(),
+                lock_boundary: payload::LockHandoff::Owned(Some(FixtureLock(held))),
+                start_permit: Some(1),
+            }
+        }
+    }
+    impl PayloadPort for OwnedUpgrade {
+        type Stop = Arc<service::UpgradeStopProof>;
+        type Verified = payload::health::VerifiedPayload;
+        type Started = service::NewInstanceEvidence;
+        fn journal(&mut self, r: &OperationRecord) -> NativeResult<()> {
+            self.inner.journal(r)
+        }
+        fn stop(&mut self, op: [u8; 16]) -> NativeResult<Self::Stop> {
+            // Store this fake's completed effect before its result can be lost. No journal
+            // observation can populate this retained slot, and cold recovery has no slot.
+            self.inner.expect_intent(Phase::StopIntent, None);
+            self.inner.before(Effect::Stop)?;
+            self.inner.stops += 1;
+            self.inner.loaded_old_image = false;
+            let value = Arc::new(service::UpgradeStopProof::fixture(op, Some(OLD_INSTANCE))?);
+            self.retained_stop = Some(value.clone());
+            self.inner.after()?;
+            Ok(value)
+        }
+        fn original_instance(&self, s: &Self::Stop) -> Option<u64> {
+            s.original_instance()
+        }
+        fn released(&mut self, s: &Self::Stop) -> NativeResult<()> {
+            self.inner.released(s)
+        }
+        fn stage(&mut self, op: [u8; 16], r: PayloadRole) -> NativeResult<ImageObservation> {
+            self.inner.stage(op, r)
+        }
+        fn observe_original(
+            &mut self,
+            r: PayloadRole,
+        ) -> NativeResult<payload::recovery::OriginalLeaf> {
+            self.inner.observe_original(r)
+        }
+        fn backup(&mut self, op: [u8; 16], r: PayloadRole) -> NativeResult<Option<FileStamp>> {
+            self.inner.backup(op, r)
+        }
+        fn publish(&mut self, op: [u8; 16], r: PayloadRole) -> NativeResult<ImageObservation> {
+            self.inner.publish(op, r)
+        }
+        fn verify(&mut self, op: [u8; 16]) -> NativeResult<Self::Verified> {
+            self.inner.verify(op)
+        }
+        fn start(&mut self, op: [u8; 16], v: &Self::Verified) -> NativeResult<Self::Started> {
+            let held = self.lock_held.clone();
+            let fresh = held.clone();
+            let inner = &mut self.inner;
+            self.lock_boundary.run_once(
+                &mut self.start_permit,
+                true,
+                || {
+                    assert!(!held.get());
+                    inner.start(op, v)
+                },
+                || {
+                    assert!(!fresh.get());
+                    fresh.set(true);
+                    Ok((FixtureLock(fresh), 2))
+                },
+            )
+        }
+        fn health(
+            &mut self,
+            op: [u8; 16],
+            s: &Self::Started,
+            v: &Self::Verified,
+        ) -> NativeResult<String> {
+            assert!(self.lock_held.get());
+            self.inner.health(op, s, v)
+        }
+        fn prune(&mut self, op: [u8; 16]) -> NativeResult<bool> {
+            self.inner.prune(op)
+        }
+    }
+    impl RecoveryPort for OwnedUpgrade {
+        fn recover_stop(&mut self, r: &OperationRecord) -> NativeResult<Self::Stop> {
+            let value = self
+                .retained_stop
+                .as_ref()
+                .ok_or(NativeError::Unsupported)?;
+            if value.operation() != r.operation() {
+                return Err(NativeError::Foreign);
+            }
+            Ok(value.clone())
+        }
+        fn observe_role(
+            &mut self,
+            _: &OperationRecord,
+            role: PayloadRole,
+        ) -> NativeResult<ReopenedRole> {
+            let events = &self.inner.events;
+            let published = events.contains(&Effect::Publish(role));
+            let staged = events.contains(&Effect::Stage(role));
+            let backed = events.contains(&Effect::Backup(role));
+            let old = FileStamp {
+                volume: 7,
+                file: [role as u8 + 11; 16],
+            };
+            Ok(ReopenedRole {
+                staged: if staged && !published {
+                    StageObservation::Ready(FakeUpgrade::observation(role))
+                } else {
+                    StageObservation::Missing
+                },
+                fixed: if published {
+                    FixedObservation::Published(FakeUpgrade::observation(role))
+                } else if backed {
+                    FixedObservation::Missing
+                } else {
+                    FixedObservation::Original(old)
+                },
+                backup: backed.then_some(old),
+                unknown_backup: false,
+            })
+        }
+        fn recover_started(
+            &mut self,
+            r: &OperationRecord,
+            v: &Self::Verified,
+        ) -> NativeResult<Option<Self::Started>> {
+            if self.inner.starts != 1 {
+                return Ok(None);
+            }
+            Ok(Some(service::NewInstanceEvidence::fixture(
+                r.operation(),
+                self.inner.new_instance,
+                v.agent_identity()?,
+            )?))
+        }
+        fn settle_stage(
+            &mut self,
+            _: &OperationRecord,
+            role: PayloadRole,
+        ) -> NativeResult<ImageObservation> {
+            if !self.inner.events.contains(&Effect::Stage(role)) {
+                return Err(NativeError::Missing);
+            }
+            Ok(FakeUpgrade::observation(role))
+        }
+        fn rollback_stage(&mut self, _: &OperationRecord) -> NativeResult<RollbackOutcome> {
+            if self.inner.stops == 0 {
+                Ok(RollbackOutcome::RolledBack)
+            } else {
+                Ok(RollbackOutcome::Retained)
+            }
+        }
+    }
+    struct Child(Rc<Cell<bool>>);
+    struct FakeKeeper {
+        exclusive: Rc<Cell<bool>>,
+        upgrade: OwnedUpgrade,
+        operation: OperationRecord,
+        lose_apply_reply: bool,
+        lose_commit_intent_reply: bool,
+        commit_published: bool,
+        attempt: KeeperApplyAttempt,
+        launches: usize,
+        settles: usize,
+        cancellations: usize,
+    }
+    impl FakeKeeper {
+        fn new(exclusive: Rc<Cell<bool>>) -> Self {
+            Self {
+                exclusive,
+                upgrade: OwnedUpgrade::new(),
+                operation: OperationRecord::new([7; 16]).unwrap(),
+                lose_apply_reply: false,
+                lose_commit_intent_reply: false,
+                commit_published: false,
+                attempt: KeeperApplyAttempt::default(),
+                launches: 0,
+                settles: 0,
+                cancellations: 0,
+            }
+        }
+    }
+    impl KeeperPort for FakeKeeper {
+        type Child = Child;
+        fn prepare(&mut self) -> NativeResult<Child> {
+            // Authored fake of kernel first-instance acquisition. Sharing this primitive tests
+            // a second independent caller; the control's own preparing bit alone cannot do so.
+            if self.exclusive.replace(true) {
+                return Err(NativeError::Busy);
+            }
+            self.launches += 1;
+            Ok(Child(self.exclusive.clone()))
+        }
+        fn mark_ready(&mut self, _: &Child) -> NativeResult<()> {
+            Ok(())
+        }
+        fn commit_intent(&mut self, child: &Child) -> NativeResult<()> {
+            assert!(Rc::ptr_eq(&child.0, &self.exclusive));
+            assert!(child.0.get());
+            self.commit_published = true;
+            if self.lose_commit_intent_reply {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        }
+        fn apply_once(&mut self, _: &Child) -> NativeResult<KeeperProgress> {
+            self.attempt.reserve()?;
+            payload::staging::apply(&mut self.upgrade, &mut self.operation)?;
+            if self.lose_apply_reply {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(KeeperProgress::Complete)
+        }
+        fn recover_same_owner(&mut self, child: &Child) -> NativeResult<KeeperProgress> {
+            if !self.attempt.started() {
+                // Authored fixture of the ORIGINAL live committed owner, not a cold journal
+                // constructor. Production additionally renews actual lock/source/native-idle seals.
+                if !self.commit_published
+                    || !Rc::ptr_eq(&child.0, &self.exclusive)
+                    || !child.0.get()
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                return self.apply_once(child);
+            }
+            self.upgrade.inner.fail_at = None;
+            let mut durable = self
+                .upgrade
+                .inner
+                .durable
+                .clone()
+                .ok_or(NativeError::Missing)?;
+            let result = payload::recovery::resume(&mut self.upgrade, &mut durable)?;
+            self.operation = durable;
+            Ok(if result == RecoveryDecision::Complete {
+                KeeperProgress::Complete
+            } else {
+                KeeperProgress::Pending
+            })
+        }
+        fn settle(&mut self, child: &Child) -> NativeResult<()> {
+            self.settles += 1;
+            child.0.set(false);
+            Ok(())
+        }
+        fn cancel_before_stop(&mut self, child: &Child) -> NativeResult<()> {
+            assert_eq!(
+                (self.upgrade.inner.stops, self.upgrade.inner.starts),
+                (0, 0)
+            );
+            self.cancellations += 1;
+            child.0.set(false);
+            Ok(())
+        }
+    }
+    fn sid(sub: &[u32]) -> native_io::identity::Sid {
+        let mut bytes = vec![1, sub.len() as u8, 0, 0, 0, 0, 0, 5];
+        for value in sub {
+            bytes.extend(value.to_le_bytes());
+        }
+        native_io::identity::Sid::from_bytes(bytes).unwrap()
+    }
+    fn token() -> native_io::identity::TokenFacts {
+        native_io::identity::TokenFacts {
+            user: sid(&[21, 7]),
+            logon: sid(&[5, 9, 11]),
+            session: 2,
+            elevated: false,
+            integrity: 0x2000,
+            authentication_id: 17,
+            impersonating: false,
+        }
+    }
+    fn peer(
+        actual: &native_io::identity::TokenFacts,
+        process: (u32, u64),
+        identity: FileIdentity,
+        path: &str,
+    ) -> NativeResult<()> {
+        native_io::supervisor_owner::outer_peer_observations_match(
+            &token(),
+            actual,
+            (101, 200),
+            process,
+            (
+                FileIdentity {
+                    volume: 7,
+                    file: [17; 16],
+                },
+                r"C:\fixture\keeper-copy.exe",
+            ),
+            (identity, path),
+        )
+    }
+
+    #[derive(Default)]
+    struct SelectionFake {
+        selected: Option<payload::recovery::OuterUpgradeRecord>,
+        created: Option<[u8; 16]>,
+        lose_selection_reply: bool,
+    }
+    impl payload::recovery::OuterSelectionPort for SelectionFake {
+        fn publish_selection(
+            &mut self,
+            r: &payload::recovery::OuterUpgradeRecord,
+        ) -> NativeResult<()> {
+            if self.selected.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            self.selected = Some(r.clone());
+            if self.lose_selection_reply {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        }
+        fn create_operation(&mut self, r: &OperationRecord) -> NativeResult<()> {
+            assert_eq!(self.selected.as_ref().unwrap().operation(), r.operation());
+            assert!(self.created.is_none());
+            self.created = Some(r.operation());
+            Ok(())
+        }
+    }
+    fn selection() -> payload::recovery::OuterUpgradeRecord {
+        use payload::recovery::{
+            OuterContextCorrelation, OuterProcessCorrelation, OuterUpgradeRecord,
+        };
+        OuterUpgradeRecord::new(
+            [7; 16],
+            OuterProcessCorrelation::new(
+                101,
+                200,
+                FileStamp {
+                    volume: 7,
+                    file: [17; 16],
+                },
+                image(),
+            )
+            .unwrap(),
+            OuterContextCorrelation::new(&token()).unwrap(),
+            std::array::from_fn(|_| image()),
+        )
+        .unwrap()
+    }
+    fn source_bytes(role: PayloadRole) -> Vec<u8> {
+        let mut bytes = vec![role as u8; 512];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[60..64].copy_from_slice(&64u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        bytes[68..70].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[84..86].copy_from_slice(&240u16.to_le_bytes());
+        bytes[88..90].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[156..158].copy_from_slice(&3u16.to_le_bytes());
+        bytes
+    }
+    fn source_facts(role: PayloadRole) -> PeFacts {
+        let bytes = source_bytes(role);
+        let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &bytes);
+        let mut sha256 = [0; 32];
+        sha256.copy_from_slice(hash.as_ref());
+        PeFacts {
+            size: bytes.len() as u64,
+            sha256,
+            machine: 0x8664,
+            subsystem: 3,
+            version: "1".into(),
+        }
+    }
+    fn source_inputs() -> Vec<payload::PayloadInput> {
+        [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+            .into_iter()
+            .map(|role| payload::PayloadInput {
+                role,
+                content: Box::new(std::io::Cursor::new(source_bytes(role))),
+            })
+            .collect()
+    }
+    fn verify_sources_before_stop() {
+        use payload::inventory::ApprovedInventory;
+        let inventory = ApprovedInventory::fixture(
+            PayloadRole::ALL
+                .into_iter()
+                .map(|role| ApprovedPe::fixture(role, source_facts(role)))
+                .collect(),
+        )
+        .unwrap();
+        let installer =
+            ApprovedPe::fixture(PayloadRole::Installer, source_facts(PayloadRole::Installer));
+        let deadline = native_io::Deadline::new(
+            5000,
+            Arc::new(native_io::process::MonotonicClock::default()),
+            native_io::process::Cancellation::default(),
+        )
+        .unwrap();
+        let sources =
+            payload::buffer_outer_sources(source_inputs(), &inventory, &installer, &deadline)
+                .unwrap();
+        for role in [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl] {
+            assert_eq!(sources.bytes(role).unwrap(), source_bytes(role));
+        }
+        let received = payload::ApprovedOuterSources::receive(
+            [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl].map(source_bytes),
+            &inventory,
+            &installer,
+            &deadline,
+        )
+        .unwrap();
+        assert_eq!(sources.facts(), received.facts());
+        let mut missing = source_inputs();
+        missing.pop();
+        assert!(payload::buffer_outer_sources(missing, &inventory, &installer, &deadline).is_err());
+        for kind in 0..4 {
+            let mut bytes = source_bytes(PayloadRole::Agent);
+            match kind {
+                0 => {
+                    bytes.pop();
+                }
+                1 => bytes.push(7),
+                2 => bytes[400] ^= 1,
+                _ => bytes[0] = 0,
+            }
+            let mut inputs = source_inputs();
+            inputs[0].content = Box::new(std::io::Cursor::new(bytes.clone()));
+            assert!(
+                payload::buffer_outer_sources(inputs, &inventory, &installer, &deadline).is_err()
+            );
+            let mut receiver =
+                [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl].map(source_bytes);
+            receiver[0] = bytes;
+            assert!(
+                payload::ApprovedOuterSources::receive(receiver, &inventory, &installer, &deadline)
+                    .is_err()
+            );
+        }
+        let mut wrong_pins: Vec<_> = PayloadRole::ALL
+            .into_iter()
+            .map(|role| ApprovedPe::fixture(role, source_facts(role)))
+            .collect();
+        let mut wrong = source_facts(PayloadRole::Agent);
+        wrong.sha256[0] ^= 1;
+        let at = wrong_pins
+            .iter()
+            .position(|pin| pin.role() == PayloadRole::Agent)
+            .unwrap();
+        wrong_pins[at] = ApprovedPe::fixture(PayloadRole::Agent, wrong);
+        let own_inventory = ApprovedInventory::fixture(wrong_pins).unwrap();
+        assert!(
+            payload::ApprovedOuterSources::receive(
+                [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl].map(source_bytes),
+                &own_inventory,
+                &installer,
+                &deadline
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn outer_upgrade_end_to_end_ready_is_not_stop_and_lost_reply_never_replays() {
+        let mut selection_port = SelectionFake::default();
+        payload::recovery::publish_outer_selection(&mut selection_port, &selection()).unwrap();
+        assert_eq!(selection_port.created, Some([7; 16]));
+        for lose_intent in [false, true] {
+            let exclusive = Rc::new(Cell::new(false));
+            let mut port = FakeKeeper::new(exclusive.clone());
+            let mut owner = KeeperControl::default();
+            owner.prepare(&mut port).unwrap();
+            assert_eq!(owner.stage(), KeeperStage::Ready);
+            assert_eq!(
+                (port.upgrade.inner.stops, port.upgrade.inner.starts),
+                (0, 0)
+            );
+            port.lose_apply_reply = !lose_intent;
+            port.lose_commit_intent_reply = lose_intent;
+            assert_eq!(owner.commit(&mut port), Err(NativeError::OutcomeUnknown));
+            assert!(owner.committed());
+            assert!(exclusive.get());
+            assert_eq!(
+                (port.upgrade.inner.stops, port.upgrade.inner.starts),
+                if lose_intent { (0, 0) } else { (1, 1) }
+            );
+            assert_eq!(port.attempt.started(), !lose_intent);
+            let effects = port.upgrade.inner.events.len();
+            assert_eq!(owner.commit(&mut port), Err(NativeError::OutcomeUnknown));
+            assert_eq!(port.upgrade.inner.events.len(), effects);
+            assert_eq!(owner.recover(&mut port), Ok(KeeperProgress::Complete));
+            assert_eq!(
+                (port.upgrade.inner.stops, port.upgrade.inner.starts),
+                (1, 1)
+            );
+            assert_eq!(port.operation.phase(), Phase::Complete);
+            assert!(!exclusive.get());
+            assert!(port.attempt.started());
+            assert_eq!(port.attempt.reserve(), Err(NativeError::OutcomeUnknown));
+            let settled = port.settles;
+            assert_eq!(owner.recover(&mut port), Ok(KeeperProgress::Complete));
+            assert_eq!(port.settles, settled);
+        }
+    }
+
+    #[test]
+    fn outer_crash_after_stop_new_caller_uses_same_owner_and_cold_port_refuses() {
+        // Find a boundary before the first stage effect, after genuine completed Stop/release.
+        let mut baseline = FakeUpgrade::new();
+        let mut record = OperationRecord::new([7; 16]).unwrap();
+        payload::staging::apply(&mut baseline, &mut record).unwrap();
+        let stage_index = baseline
+            .events
+            .iter()
+            .position(|e| *e == Effect::Stage(PayloadRole::Installer))
+            .unwrap();
+        let stop_index = baseline
+            .events
+            .iter()
+            .position(|e| *e == Effect::Stop)
+            .unwrap();
+        // Both actual completed Stop with a lost reply and the later preStage interruption
+        // retain the same authored owner; neither may manufacture proof from its journal.
+        for interruption in [stop_index * 2 + 1, stage_index * 2] {
+            let exclusive = Rc::new(Cell::new(false));
+            let mut port = FakeKeeper::new(exclusive.clone());
+            port.upgrade.inner.fail_at = Some(interruption);
+            let mut keeper_owner = KeeperControl::default();
+            keeper_owner.prepare(&mut port).unwrap();
+            let outer_client = Rc::new(());
+            let outer_weak = Rc::downgrade(&outer_client);
+            assert_eq!(
+                keeper_owner.commit(&mut port),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert_eq!(
+                (port.upgrade.inner.stops, port.upgrade.inner.starts),
+                (1, 0)
+            );
+            assert!(port.upgrade.retained_stop.is_some());
+            assert!(exclusive.get());
+            drop(outer_client);
+            assert!(outer_weak.upgrade().is_none());
+            let mut cold = service::NativeUpgradePort::new();
+            assert!(matches!(
+                payload::health::ServicePort::recover_stop(
+                    &mut cold,
+                    &port.upgrade.inner.durable.clone().unwrap()
+                ),
+                Err(NativeError::Unsupported)
+            ));
+            // A new client reaches the still resident owner/port; it does not recreate either.
+            let next_outer_client = Rc::new(());
+            assert_eq!(
+                keeper_owner.recover(&mut port),
+                Ok(KeeperProgress::Complete)
+            );
+            drop(next_outer_client);
+            assert_eq!(
+                (port.upgrade.inner.stops, port.upgrade.inner.starts),
+                (1, 1)
+            );
+            assert_eq!(port.operation.phase(), Phase::Complete);
+        }
+    }
+
+    #[test]
+    fn outer_cancel_before_stop_and_source_or_selection_failure_leave_old_tree_running() {
+        verify_sources_before_stop();
+        // Terminal metadata is not deletion authority. Even policy retirement requires positive
+        // absence plus an exact no-Stop/no-mutation cancelled operation and matching catalog.
+        use payload::recovery::{
+            OriginalLeaf, OuterPhase, StageCatalog, validate_outer_terminal_retirement,
+        };
+        let mut terminal = selection();
+        terminal.advance(OuterPhase::Cancelled).unwrap();
+        let operation = OperationRecord::new(terminal.operation()).unwrap();
+        let mut catalog = StageCatalog::default();
+        catalog.active = Some(terminal.operation());
+        assert!(validate_outer_terminal_retirement(&terminal, &operation, &catalog).is_err());
+        terminal.begin_cleanup().unwrap();
+        assert!(validate_outer_terminal_retirement(&terminal, &operation, &catalog).is_err());
+        terminal.copy_absent().unwrap();
+        assert_eq!(
+            validate_outer_terminal_retirement(&terminal, &operation, &catalog),
+            Ok(())
+        );
+        let mut stopped = operation.clone();
+        stopped.advance(Phase::StopIntent, None);
+        assert!(validate_outer_terminal_retirement(&terminal, &stopped, &catalog).is_err());
+        let mut observed = operation.clone();
+        observed.set_original_instance(format!("{:032x}", 11));
+        assert!(validate_outer_terminal_retirement(&terminal, &observed, &catalog).is_err());
+        let mut changed = operation.clone();
+        changed.role_mut(PayloadRole::Agent).unwrap().original = OriginalLeaf::Present(FileStamp {
+            volume: 7,
+            file: [18; 16],
+        });
+        assert!(validate_outer_terminal_retirement(&terminal, &changed, &catalog).is_err());
+        let mut pending = operation.clone();
+        pending.set_retention_incomplete(true);
+        assert!(validate_outer_terminal_retirement(&terminal, &pending, &catalog).is_err());
+        catalog.active = Some([8; 16]);
+        assert!(validate_outer_terminal_retirement(&terminal, &operation, &catalog).is_err());
+        let mut interrupted = SelectionFake {
+            lose_selection_reply: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            payload::recovery::publish_outer_selection(&mut interrupted, &selection()),
+            Err(NativeError::OutcomeUnknown)
+        );
+        assert!(interrupted.selected.is_some());
+        assert!(interrupted.created.is_none());
+        interrupted.lose_selection_reply = false;
+        assert_eq!(
+            payload::recovery::publish_outer_selection(&mut interrupted, &selection()),
+            Err(NativeError::OutcomeUnknown)
+        );
+        assert!(interrupted.created.is_none());
+        let mut port = FakeKeeper::new(Rc::new(Cell::new(false)));
+        let mut owner = KeeperControl::default();
+        owner.prepare(&mut port).unwrap();
+        owner.cancel(&mut port).unwrap();
+        assert_eq!(owner.stage(), KeeperStage::Cancelled);
+        assert!(port.upgrade.inner.loaded_old_image);
+        assert_eq!(
+            (port.upgrade.inner.stops, port.upgrade.inner.starts),
+            (0, 0)
+        );
+        assert_eq!(port.cancellations, 1);
+        assert_eq!(port.launches, 1);
+        assert_eq!(owner.commit(&mut port), Err(NativeError::OutcomeUnknown));
+        assert_eq!(owner.cancel(&mut port), Err(NativeError::OutcomeUnknown));
+        assert_eq!(owner.prepare(&mut port), Err(NativeError::OutcomeUnknown));
+        assert_eq!(port.cancellations, 1);
+    }
+
+    #[test]
+    fn wrong_user_logon_session_or_nonlimited_peer_is_refused() {
+        let expected = token();
+        let identity = FileIdentity {
+            volume: 7,
+            file: [17; 16],
+        };
+        assert_eq!(
+            peer(
+                &expected,
+                (101, 200),
+                identity,
+                r"C:\fixture\keeper-copy.exe"
+            ),
+            Ok(())
+        );
+        let history = payload::recovery::OuterContextCorrelation::new(&expected).unwrap();
+        let mut later = expected.clone();
+        later.logon = sid(&[5, 19, 21]);
+        later.authentication_id += 9;
+        later.session += 1;
+        // Terminal correlation history may survive logon; it does not admit a live peer.
+        assert_eq!(history.same_user(&later), Ok(()));
+        assert!(history.matches(&later).is_err());
+        assert!(peer(&later, (101, 200), identity, r"C:\fixture\keeper-copy.exe").is_err());
+        later.user = sid(&[21, 8]);
+        assert!(history.same_user(&later).is_err());
+        for index in 0..7 {
+            let mut actual = expected.clone();
+            match index {
+                0 => actual.user = sid(&[21, 8]),
+                1 => actual.logon = sid(&[5, 9, 12]),
+                2 => actual.session += 1,
+                3 => actual.elevated = true,
+                4 => actual.integrity = 0x3000,
+                5 => actual.authentication_id += 1,
+                _ => actual.impersonating = true,
+            }
+            assert!(peer(&actual, (101, 200), identity, r"C:\fixture\keeper-copy.exe").is_err());
+        }
+    }
+
+    #[test]
+    fn forged_path_pid_creation_or_fileid_correlation_never_matches_actual_peer() {
+        // No argv path, process number or operation can select the private native keeper.
+        let flag = std::ffi::OsString::from("--windows-upgrade-keeper");
+        assert_eq!(
+            service::upgrade_keeper_mode(std::slice::from_ref(&flag)),
+            Ok(true)
+        );
+        assert_eq!(service::upgrade_keeper_mode(&[]), Ok(false));
+        assert_eq!(
+            service::upgrade_keeper_mode(&["--diagnose".into()]),
+            Ok(false)
+        );
+        for arguments in [
+            vec![flag.clone(), "C:\\fixture\\foreign.exe".into()],
+            vec!["--diagnose".into(), flag.clone()],
+            vec![flag.clone(), flag],
+            vec!["--windows-upgrade-keeper=101".into()],
+        ] {
+            assert_eq!(
+                service::upgrade_keeper_mode(&arguments),
+                Err(NativeError::Invalid)
+            );
+        }
+        let actual = token();
+        let identity = FileIdentity {
+            volume: 7,
+            file: [17; 16],
+        };
+        for process in [(0, 200), (102, 200), (101, 0), (101, 201)] {
+            assert!(peer(&actual, process, identity, r"C:\fixture\keeper-copy.exe").is_err());
+        }
+        for path in [
+            r"C:\other\keeper-copy.exe",
+            r"C:\fixture\agent.exe",
+            r"..\keeper-copy.exe",
+        ] {
+            assert!(peer(&actual, (101, 200), identity, path).is_err());
+        }
+        for changed in [
+            FileIdentity {
+                volume: 8,
+                file: [17; 16],
+            },
+            FileIdentity {
+                volume: 7,
+                file: [18; 16],
+            },
+        ] {
+            assert!(peer(&actual, (101, 200), changed, r"C:\fixture\keeper-copy.exe").is_err());
+        }
+    }
+
+    #[test]
+    fn concurrent_second_outer_never_gets_another_keeper_or_stop() {
+        let exclusive = Rc::new(Cell::new(false));
+        let mut first_port = FakeKeeper::new(exclusive.clone());
+        let mut first = KeeperControl::default();
+        first.prepare(&mut first_port).unwrap();
+        let mut second_port = FakeKeeper::new(exclusive.clone());
+        let mut second = KeeperControl::default();
+        assert_eq!(second.prepare(&mut second_port), Err(NativeError::Busy));
+        assert_eq!(second_port.launches, 0);
+        assert!(second.child().is_err());
+        assert_eq!(
+            second.commit(&mut second_port),
+            Err(NativeError::OutcomeUnknown)
+        );
+        assert_eq!(
+            (
+                second_port.upgrade.inner.stops,
+                second_port.upgrade.inner.starts
+            ),
+            (0, 0)
+        );
+        assert_eq!(first.commit(&mut first_port), Ok(KeeperProgress::Complete));
+        assert_eq!(
+            (
+                first_port.upgrade.inner.stops,
+                first_port.upgrade.inner.starts
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            second.prepare(&mut second_port),
+            Err(NativeError::OutcomeUnknown)
+        );
+        assert_eq!(second_port.launches, 0);
+    }
+}

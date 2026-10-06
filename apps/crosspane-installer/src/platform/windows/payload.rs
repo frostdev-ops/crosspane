@@ -10,6 +10,190 @@ pub(crate) mod recovery;
 #[path = "payload/staging.rs"]
 pub(crate) mod staging;
 
+/// Untrusted source content; approval still comes only from the executing build.
+#[cfg(any(windows, test))]
+pub(crate) struct PayloadInput {
+    pub role: inventory::PayloadRole,
+    pub content: Box<dyn std::io::Read + Send>,
+}
+/// Immutable bounded bytes survive the outer's process without granting path/native authority.
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct ApprovedOuterSources {
+    roles: Vec<(inventory::PayloadRole, std::sync::Arc<[u8]>)>,
+    facts: [inventory::PeFacts; 3],
+}
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+impl ApprovedOuterSources {
+    pub(crate) fn facts(&self) -> &[inventory::PeFacts; 3] {
+        &self.facts
+    }
+    pub(crate) fn roles(&self) -> &[(inventory::PayloadRole, std::sync::Arc<[u8]>)] {
+        &self.roles
+    }
+    pub(crate) fn bytes(
+        &self,
+        role: inventory::PayloadRole,
+    ) -> super::native_io::NativeResult<&[u8]> {
+        self.roles
+            .iter()
+            .find(|(r, _)| *r == role)
+            .map(|(_, b)| b.as_ref())
+            .ok_or(super::native_io::NativeError::Invalid)
+    }
+    pub(crate) fn inputs(&self) -> Vec<PayloadInput> {
+        self.roles
+            .iter()
+            .map(|(role, bytes)| PayloadInput {
+                role: *role,
+                content: Box::new(std::io::Cursor::new(bytes.clone())),
+            })
+            .collect()
+    }
+    /// Receiver verifies AGAIN using its own embedded inventory, not sender-supplied approvals.
+    pub(crate) fn receive(
+        bytes: [Vec<u8>; 3],
+        inventory: &inventory::ApprovedInventory,
+        installer: &inventory::ApprovedPe,
+        deadline: &super::native_io::Deadline,
+    ) -> super::native_io::NativeResult<Self> {
+        use inventory::PayloadRole;
+        Self::receive_roles(
+            [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+                .into_iter()
+                .zip(bytes)
+                .collect(),
+            inventory,
+            installer,
+            deadline,
+        )
+    }
+    fn receive_roles(
+        roles: Vec<(inventory::PayloadRole, Vec<u8>)>,
+        inventory: &inventory::ApprovedInventory,
+        installer: &inventory::ApprovedPe,
+        deadline: &super::native_io::Deadline,
+    ) -> super::native_io::NativeResult<Self> {
+        use super::native_io::NativeError;
+        use inventory::PayloadRole;
+        deadline.check()?;
+        inventory.check_staging_budget(installer, true)?;
+        if roles.len() != 3 {
+            return Err(NativeError::Invalid);
+        }
+        let mut result = Vec::with_capacity(3);
+        let ordered = [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl];
+        let mut facts = Vec::with_capacity(3);
+        for role in ordered {
+            let mut matches = roles.iter().filter(|(r, _)| *r == role);
+            let (_, bytes) = matches.next().ok_or(NativeError::Invalid)?;
+            if matches.next().is_some() {
+                return Err(NativeError::Invalid);
+            }
+            verify_outer_source(bytes, inventory.role(role)?, deadline)?;
+            facts.push(inventory.role(role)?.facts().clone());
+        }
+        for role in ordered {
+            let (_, bytes) = roles
+                .iter()
+                .find(|(r, _)| *r == role)
+                .ok_or(NativeError::Invalid)?;
+            // Move each validated allocation below; no caller can mutate the sealed bundle.
+            if bytes.len() as u64 != inventory.role(role)?.size() {
+                return Err(NativeError::Foreign);
+            }
+        }
+        for (role, bytes) in roles {
+            result.push((role, std::sync::Arc::from(bytes)));
+        }
+        Ok(Self {
+            roles: result,
+            facts: facts.try_into().map_err(|_| NativeError::Invalid)?,
+        })
+    }
+}
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn verify_outer_source(
+    bytes: &[u8],
+    approved: &inventory::ApprovedPe,
+    deadline: &super::native_io::Deadline,
+) -> super::native_io::NativeResult<()> {
+    use super::native_io::NativeError;
+    use aws_lc_rs::digest::{SHA256, digest};
+    deadline.check()?;
+    if bytes.len() as u64 != approved.size() {
+        return Err(NativeError::Foreign);
+    }
+    let (machine, subsystem) =
+        inventory::pe_header(&bytes[..bytes.len().min(1024 * 1024)], approved.size())?;
+    if machine != approved.machine()
+        || subsystem != approved.subsystem()
+        || digest(&SHA256, bytes).as_ref() != approved.sha256()
+    {
+        return Err(NativeError::Foreign);
+    }
+    deadline.check()
+}
+/// The only pre-Stop source read: exact expected length plus one overflow-detection byte.
+/// A blocking supplied Read is never allowed to make Stop eligible; every completion is rechecked.
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn buffer_outer_sources(
+    mut inputs: Vec<PayloadInput>,
+    inventory: &inventory::ApprovedInventory,
+    installer: &inventory::ApprovedPe,
+    deadline: &super::native_io::Deadline,
+) -> super::native_io::NativeResult<ApprovedOuterSources> {
+    use super::native_io::NativeError;
+    use inventory::PayloadRole;
+    deadline.check()?;
+    inventory.check_staging_budget(installer, true)?;
+    if inputs.len() != 3 {
+        return Err(NativeError::Invalid);
+    }
+    let mut roles = Vec::with_capacity(3);
+    for role in [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl] {
+        if inputs.iter().filter(|input| input.role == role).count() != 1 {
+            return Err(NativeError::Invalid);
+        }
+        let index = inputs
+            .iter()
+            .position(|input| input.role == role)
+            .ok_or(NativeError::Invalid)?;
+        let mut input = inputs.remove(index);
+        let cap = usize::try_from(inventory.role(role)?.size())
+            .map_err(|_| NativeError::Oversize)?
+            .checked_add(1)
+            .ok_or(NativeError::Oversize)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(cap)
+            .map_err(|_| NativeError::Oversize)?;
+        let mut chunk = [0u8; 64 * 1024];
+        while bytes.len() < cap {
+            deadline.check()?;
+            let room = (cap - bytes.len()).min(chunk.len());
+            let n = input
+                .content
+                .read(&mut chunk[..room])
+                .map_err(|_| NativeError::Unavailable)?;
+            deadline.check()?;
+            if n == 0 {
+                break;
+            }
+            if n > room {
+                return Err(NativeError::Invalid);
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        verify_outer_source(&bytes, inventory.role(role)?, deadline)?;
+        roles.push((role, bytes));
+    }
+    ApprovedOuterSources::receive_roles(roles, inventory, installer, deadline)
+}
+
 /// Actual owned-lock boundary, shared with focused fakes. It has no native authority factory.
 #[cfg(any(windows, test))]
 #[allow(dead_code)] // Older source-included test roots compile but do not execute this new boundary.
@@ -64,7 +248,7 @@ mod native {
         Deadline, InstallerLock, NativeError, NativeResult, OpenedPe, PayloadRoot, PruneOutcome,
         SelfImagePin, StagedPe, SupportProof, WindowsNativeIo,
     };
-    use super::LockHandoff;
+    use super::{LockHandoff, PayloadInput};
     use super::{
         health::{ServicePort, VerifiedPayload},
         inventory::{ApprovedInventory, ApprovedPe, PayloadRole},
@@ -76,10 +260,6 @@ mod native {
     use std::sync::Arc;
     /// Content is untrusted and grants no path or approval capability. The embedded inventory
     /// pins and the opened stage's whole size/SHA/PE decide whether it may be published.
-    pub(crate) struct PayloadInput {
-        pub role: PayloadRole,
-        pub content: Box<dyn std::io::Read + Send>,
-    }
     pub(crate) struct WindowsPayload {
         io: Arc<WindowsNativeIo>,
         inventory: ApprovedInventory,
@@ -711,10 +891,6 @@ mod native {
         }
     }
 }
-#[cfg(windows)]
-#[allow(unused_imports)]
-// A5 supplies bounded untrusted content through the retained approved staging facade.
-pub(crate) use native::PayloadInput;
 #[cfg(windows)]
 pub(crate) use native::WindowsPayload;
 #[cfg(windows)]

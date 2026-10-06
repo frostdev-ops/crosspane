@@ -796,3 +796,185 @@ impl SupervisorLogonRecord {
         Ok(())
     }
 }
+
+// WP-W4.1a4d keeper lifecycle. These states are observations, never native authority.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeeperStage {
+    Preparing,
+    Ready,
+    Committed,
+    Retained,
+    Complete,
+    Cancelled,
+}
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeeperProgress {
+    Pending,
+    Complete,
+}
+
+/// The native port retains actual process/image/namespace/copy authority before delivery. Fakes
+/// exercise this same sequence but cannot manufacture any of its native capability types.
+#[cfg(any(windows, test))]
+pub(crate) trait KeeperPort {
+    type Child;
+    fn prepare(&mut self) -> NativeResult<Self::Child>;
+    fn mark_ready(&mut self, child: &Self::Child) -> NativeResult<()>;
+    fn commit_intent(&mut self, child: &Self::Child) -> NativeResult<()>;
+    fn apply_once(&mut self, child: &Self::Child) -> NativeResult<KeeperProgress>;
+    fn recover_same_owner(&mut self, child: &Self::Child) -> NativeResult<KeeperProgress>;
+    fn settle(&mut self, child: &Self::Child) -> NativeResult<()>;
+    fn cancel_before_stop(&mut self, child: &Self::Child) -> NativeResult<()>;
+}
+
+#[cfg(any(windows, test))]
+pub(crate) struct KeeperControl<C> {
+    stage: KeeperStage,
+    child: Option<C>,
+    preparing: bool,
+    committed: bool,
+    cancelled: bool,
+}
+#[cfg(any(windows, test))]
+impl<C> Default for KeeperControl<C> {
+    fn default() -> Self {
+        Self {
+            stage: KeeperStage::Preparing,
+            child: None,
+            preparing: false,
+            committed: false,
+            cancelled: false,
+        }
+    }
+}
+#[cfg(any(windows, test))]
+impl<C> KeeperControl<C> {
+    pub(crate) fn stage(&self) -> KeeperStage {
+        self.stage
+    }
+    pub(crate) fn committed(&self) -> bool {
+        self.committed
+    }
+    pub(crate) fn child(&self) -> NativeResult<&C> {
+        self.child.as_ref().ok_or(NativeError::OutcomeUnknown)
+    }
+    pub(crate) fn prepare<P: KeeperPort<Child = C>>(&mut self, port: &mut P) -> NativeResult<()> {
+        if self.preparing || self.cancelled || self.committed {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        self.preparing = true;
+        // No error/late delivery makes another launch or source allocation eligible.
+        let result = keeper_call(|| port.prepare());
+        match result {
+            Ok(child) => self.child = Some(child),
+            Err(error) => {
+                self.stage = KeeperStage::Retained;
+                return Err(error);
+            }
+        }
+        if let Err(error) = keeper_call(|| port.mark_ready(self.child()?)) {
+            self.stage = KeeperStage::Retained;
+            return Err(error);
+        }
+        self.stage = KeeperStage::Ready;
+        Ok(())
+    }
+    pub(crate) fn commit<P: KeeperPort<Child = C>>(
+        &mut self,
+        port: &mut P,
+    ) -> NativeResult<KeeperProgress> {
+        if self.stage != KeeperStage::Ready || self.committed || self.cancelled {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        // The actual resident owner consumes commit BEFORE intent/effect. A lost acknowledgement
+        // or outer exit can only observe/recover this owner; neither may repeat Stop or apply.
+        self.committed = true;
+        self.stage = KeeperStage::Committed;
+        let result = keeper_call(|| {
+            port.commit_intent(self.child()?)?;
+            port.apply_once(self.child()?)
+        });
+        self.finish_progress(port, result)
+    }
+    pub(crate) fn recover<P: KeeperPort<Child = C>>(
+        &mut self,
+        port: &mut P,
+    ) -> NativeResult<KeeperProgress> {
+        if !self.committed || self.stage == KeeperStage::Cancelled {
+            return Err(NativeError::Foreign);
+        }
+        if self.stage == KeeperStage::Complete {
+            return Ok(KeeperProgress::Complete);
+        }
+        // Fresh per-call deadline is valid only for observations and the SAME retained recovery
+        // owner. The native port never resets its one-Stop/one-Run or unknown mutation fences.
+        let result = keeper_call(|| port.recover_same_owner(self.child()?));
+        self.finish_progress(port, result)
+    }
+    fn finish_progress<P: KeeperPort<Child = C>>(
+        &mut self,
+        port: &mut P,
+        result: NativeResult<KeeperProgress>,
+    ) -> NativeResult<KeeperProgress> {
+        match result {
+            Ok(KeeperProgress::Complete) => {
+                if let Err(error) = keeper_call(|| port.settle(self.child()?)) {
+                    self.stage = KeeperStage::Retained;
+                    return Err(error);
+                }
+                self.stage = KeeperStage::Complete;
+                Ok(KeeperProgress::Complete)
+            }
+            Ok(KeeperProgress::Pending) => {
+                self.stage = KeeperStage::Retained;
+                Ok(KeeperProgress::Pending)
+            }
+            Err(error) => {
+                self.stage = KeeperStage::Retained;
+                Err(error)
+            }
+        }
+    }
+    pub(crate) fn cancel<P: KeeperPort<Child = C>>(&mut self, port: &mut P) -> NativeResult<()> {
+        if self.committed || self.cancelled {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        self.cancelled = true;
+        if let Some(child) = self.child.as_ref()
+            && let Err(error) = keeper_call(|| port.cancel_before_stop(child))
+        {
+            self.stage = KeeperStage::Retained;
+            return Err(error);
+        }
+        self.stage = KeeperStage::Cancelled;
+        Ok(())
+    }
+}
+#[cfg(any(windows, test))]
+fn keeper_call<T>(work: impl FnOnce() -> NativeResult<T>) -> NativeResult<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or(Err(NativeError::OutcomeUnknown))
+}
+
+/// In-memory cardinality only, never native/image/commit authority. The resident owner validates
+/// its live commit, prepared sources and actual selected native capability before reserving it.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub(crate) struct KeeperApplyAttempt {
+    started: bool,
+}
+#[cfg(any(windows, test))]
+impl KeeperApplyAttempt {
+    pub(crate) fn started(&self) -> bool {
+        self.started
+    }
+    pub(crate) fn reserve(&mut self) -> NativeResult<()> {
+        if self.started {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        self.started = true;
+        Ok(())
+    }
+}

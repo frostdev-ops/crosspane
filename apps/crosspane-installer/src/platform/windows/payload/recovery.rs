@@ -320,6 +320,546 @@ pub(crate) fn retire_completed(
         .retain(|generation| generation.operation != operation);
     catalog.validate()
 }
+/// The one fixed outer selection is correlation only; it cannot construct a native owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) enum OuterPhase {
+    Selecting,
+    Preparing,
+    Prepared,
+    Ready,
+    Committed,
+    Complete,
+    Cancelled,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) enum OuterLaunchPhase {
+    None,
+    CreateIntent,
+    Created,
+    ResumeIntent,
+    Resumed,
+}
+/// Fixed-copy cleanup observations never establish process/job completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) enum OuterCopyCleanup {
+    None,
+    DeleteIntent,
+    Absent,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct OuterContextCorrelation {
+    user: Vec<u8>,
+    logon: Vec<u8>,
+    authentication_id: u64,
+    session: u32,
+}
+#[cfg_attr(test, allow(dead_code))]
+impl OuterContextCorrelation {
+    pub(crate) fn new(facts: &super::super::native_io::identity::TokenFacts) -> NativeResult<Self> {
+        super::super::native_io::identity::LimitedIdentity::admit(facts.clone())?;
+        Ok(Self {
+            user: facts.user.bytes().to_vec(),
+            logon: facts.logon.bytes().to_vec(),
+            authentication_id: facts.authentication_id,
+            session: facts.session,
+        })
+    }
+    fn validate(&self) -> NativeResult<()> {
+        use super::super::native_io::identity::{LimitedIdentity, Sid, TokenFacts};
+        LimitedIdentity::admit(TokenFacts {
+            user: Sid::from_bytes(self.user.clone())?,
+            logon: Sid::from_bytes(self.logon.clone())?,
+            authentication_id: self.authentication_id,
+            session: self.session,
+            elevated: false,
+            integrity: 0x2000,
+            impersonating: false,
+        })?;
+        Ok(())
+    }
+    pub(crate) fn matches(
+        &self,
+        facts: &super::super::native_io::identity::TokenFacts,
+    ) -> NativeResult<()> {
+        self.validate()?;
+        if *self != Self::new(facts)? {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+    /// Terminal history may belong to an earlier logon. This compares only the same user and
+    /// admits no old process/job or session-disposition capability; current native guards remain.
+    pub(crate) fn same_user(
+        &self,
+        facts: &super::super::native_io::identity::TokenFacts,
+    ) -> NativeResult<()> {
+        self.validate()?;
+        let current = Self::new(facts)?;
+        if self.user != current.user {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct OuterProcessCorrelation {
+    pid: u32,
+    creation: u64,
+    module: FileStamp,
+    image: super::inventory::PeFacts,
+}
+#[cfg_attr(test, allow(dead_code))]
+impl OuterProcessCorrelation {
+    pub(crate) fn new(
+        pid: u32,
+        creation: u64,
+        module: FileStamp,
+        image: super::inventory::PeFacts,
+    ) -> NativeResult<Self> {
+        let value = Self {
+            pid,
+            creation,
+            module,
+            image,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    fn validate(&self) -> NativeResult<()> {
+        if self.pid == 0
+            || self.creation == 0
+            || self.module.volume == 0
+            || self.module.file == [0; 16]
+            || !self.image.valid()
+        {
+            return Err(NativeError::Invalid);
+        }
+        Ok(())
+    }
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+    pub(crate) fn creation(&self) -> u64 {
+        self.creation
+    }
+    pub(crate) fn image(&self) -> &super::inventory::PeFacts {
+        &self.image
+    }
+    pub(crate) fn matches(
+        &self,
+        pid: u32,
+        creation: u64,
+        module: FileStamp,
+        image: &super::inventory::PeFacts,
+    ) -> NativeResult<()> {
+        self.validate()?;
+        if self.pid != pid
+            || self.creation != creation
+            || self.module != module
+            || self.image != *image
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct OuterUpgradeRecord {
+    schema_version: u32,
+    operation: [u8; 16],
+    phase: OuterPhase,
+    outer: OuterProcessCorrelation,
+    context: OuterContextCorrelation,
+    sources: [super::inventory::PeFacts; 3],
+    keeper_image: Option<FileStamp>,
+    keeper: Option<OuterProcessCorrelation>,
+    inherited_parent_handle: Option<u64>,
+    launch_stage: OuterLaunchPhase,
+    copy_cleanup: OuterCopyCleanup,
+}
+#[cfg_attr(test, allow(dead_code))]
+impl OuterUpgradeRecord {
+    pub(crate) fn new(
+        operation: [u8; 16],
+        outer: OuterProcessCorrelation,
+        context: OuterContextCorrelation,
+        sources: [super::inventory::PeFacts; 3],
+    ) -> NativeResult<Self> {
+        let record = Self {
+            schema_version: 1,
+            operation,
+            phase: OuterPhase::Selecting,
+            outer,
+            context,
+            sources,
+            keeper_image: None,
+            keeper: None,
+            inherited_parent_handle: None,
+            launch_stage: OuterLaunchPhase::None,
+            copy_cleanup: OuterCopyCleanup::None,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+    pub(crate) fn validate(&self) -> NativeResult<()> {
+        if self.schema_version != 1 || self.operation == [0; 16] {
+            return Err(NativeError::Invalid);
+        }
+        self.outer.validate()?;
+        self.context.validate()?;
+        if self.copy_cleanup != OuterCopyCleanup::None
+            && !matches!(self.phase, OuterPhase::Complete | OuterPhase::Cancelled)
+        {
+            return Err(NativeError::Invalid);
+        }
+        if self.sources.iter().any(|facts| !facts.valid()) {
+            return Err(NativeError::Invalid);
+        }
+        let source_bytes = self
+            .sources
+            .iter()
+            .try_fold(0u64, |sum, p| sum.checked_add(p.size))
+            .ok_or(NativeError::Oversize)?;
+        let total = self
+            .outer
+            .image
+            .size
+            .checked_mul(2)
+            .and_then(|own| own.checked_add(source_bytes))
+            .ok_or(NativeError::Oversize)?;
+        if total > super::inventory::MAX_STAGING_BYTES {
+            return Err(NativeError::Oversize);
+        }
+        if let Some(image) = self.keeper_image
+            && (image.volume == 0 || image.file == [0; 16])
+        {
+            return Err(NativeError::Invalid);
+        }
+        if matches!(
+            self.launch_stage,
+            OuterLaunchPhase::Created | OuterLaunchPhase::ResumeIntent | OuterLaunchPhase::Resumed
+        ) != self.keeper.is_some()
+        {
+            return Err(NativeError::Invalid);
+        }
+        if self.launch_stage != OuterLaunchPhase::None && self.keeper_image.is_none() {
+            return Err(NativeError::Invalid);
+        }
+        if self.keeper.is_some() != self.inherited_parent_handle.is_some() {
+            return Err(NativeError::Invalid);
+        }
+        if let Some(keeper) = &self.keeper {
+            keeper.validate()?;
+            let handle = self.inherited_parent_handle.ok_or(NativeError::Invalid)?;
+            if handle < 4
+                || handle > usize::MAX as u64
+                || handle >= u64::MAX - 15
+                || !handle.is_multiple_of(4)
+                || keeper.pid == self.outer.pid
+                || keeper.module != self.keeper_image.ok_or(NativeError::Invalid)?
+                || keeper.image != self.outer.image
+            {
+                return Err(NativeError::Invalid);
+            }
+        }
+        if matches!(
+            self.phase,
+            OuterPhase::Prepared | OuterPhase::Ready | OuterPhase::Committed | OuterPhase::Complete
+        ) && self.keeper_image.is_none()
+        {
+            return Err(NativeError::Invalid);
+        }
+        if matches!(
+            self.phase,
+            OuterPhase::Ready | OuterPhase::Committed | OuterPhase::Complete
+        ) && (self.keeper.is_none() || self.launch_stage != OuterLaunchPhase::Resumed)
+        {
+            return Err(NativeError::Invalid);
+        }
+        Ok(())
+    }
+    pub(crate) fn operation(&self) -> [u8; 16] {
+        self.operation
+    }
+    pub(crate) fn phase(&self) -> OuterPhase {
+        self.phase
+    }
+    pub(crate) fn outer(&self) -> &OuterProcessCorrelation {
+        &self.outer
+    }
+    pub(crate) fn context(&self) -> &OuterContextCorrelation {
+        &self.context
+    }
+    pub(crate) fn sources(&self) -> &[super::inventory::PeFacts; 3] {
+        &self.sources
+    }
+    pub(crate) fn keeper_image(&self) -> Option<FileStamp> {
+        self.keeper_image
+    }
+    pub(crate) fn keeper(&self) -> Option<&OuterProcessCorrelation> {
+        self.keeper.as_ref()
+    }
+    pub(crate) fn inherited_parent_handle(&self) -> Option<u64> {
+        self.inherited_parent_handle
+    }
+    pub(crate) fn launch_stage(&self) -> OuterLaunchPhase {
+        self.launch_stage
+    }
+    pub(crate) fn launch_phase(&self) -> OuterLaunchPhase {
+        self.launch_stage
+    }
+    pub(crate) fn copy_cleanup(&self) -> OuterCopyCleanup {
+        self.copy_cleanup
+    }
+    pub(crate) fn begin_cleanup(&mut self) -> NativeResult<()> {
+        self.validate()?;
+        if !matches!(self.phase, OuterPhase::Complete | OuterPhase::Cancelled)
+            || self.copy_cleanup != OuterCopyCleanup::None
+        {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        self.copy_cleanup = OuterCopyCleanup::DeleteIntent;
+        self.validate()
+    }
+    pub(crate) fn copy_absent(&mut self) -> NativeResult<()> {
+        self.validate()?;
+        if !matches!(self.phase, OuterPhase::Complete | OuterPhase::Cancelled)
+            || self.copy_cleanup != OuterCopyCleanup::DeleteIntent
+        {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        self.copy_cleanup = OuterCopyCleanup::Absent;
+        self.validate()
+    }
+    pub(crate) fn selection_matches(&self, old: &Self) -> bool {
+        self.operation == old.operation
+            && self.outer == old.outer
+            && self.context == old.context
+            && self.sources == old.sources
+    }
+    pub(crate) fn encode(&self) -> NativeResult<Vec<u8>> {
+        use super::super::native_io::records;
+        self.validate()?;
+        records::encode_record(
+            &records::RecordName::OuterUpgrade,
+            serde_json::to_value(self).map_err(|_| NativeError::Invalid)?,
+        )
+    }
+    pub(crate) fn decode(bytes: &[u8]) -> NativeResult<Self> {
+        use super::super::native_io::records;
+        let value: Self = records::record_data(&records::RecordName::OuterUpgrade, bytes)?;
+        value.validate()?;
+        Ok(value)
+    }
+    pub(crate) fn same_selection(&self, old: &Self) -> NativeResult<()> {
+        self.validate()?;
+        old.validate()?;
+        if self.operation != old.operation
+            || self.outer != old.outer
+            || self.context != old.context
+            || self.sources != old.sources
+        {
+            return Err(NativeError::Foreign);
+        }
+        if old.keeper_image.is_some() && old.keeper_image != self.keeper_image
+            || old.keeper.is_some() && old.keeper != self.keeper
+            || old.inherited_parent_handle.is_some()
+                && old.inherited_parent_handle != self.inherited_parent_handle
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+    pub(crate) fn advance(&mut self, next: OuterPhase) -> NativeResult<()> {
+        let allowed = self.phase == next
+            || matches!(
+                (self.phase, next),
+                (OuterPhase::Selecting, OuterPhase::Preparing)
+                    | (OuterPhase::Preparing, OuterPhase::Prepared)
+                    | (OuterPhase::Prepared, OuterPhase::Ready)
+                    | (OuterPhase::Ready, OuterPhase::Committed)
+                    | (OuterPhase::Committed, OuterPhase::Complete)
+            );
+        let cancel = next == OuterPhase::Cancelled
+            && matches!(
+                self.phase,
+                OuterPhase::Selecting
+                    | OuterPhase::Preparing
+                    | OuterPhase::Prepared
+                    | OuterPhase::Ready
+            );
+        if !allowed && !cancel && next != OuterPhase::Unknown {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let mut value = self.clone();
+        value.phase = next;
+        value.validate()?;
+        *self = value;
+        Ok(())
+    }
+    pub(crate) fn set_keeper_image(&mut self, image: FileStamp) -> NativeResult<()> {
+        if self.phase != OuterPhase::Preparing || self.keeper_image.is_some() {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let mut value = self.clone();
+        value.keeper_image = Some(image);
+        value.advance(OuterPhase::Prepared)?;
+        *self = value;
+        Ok(())
+    }
+    pub(crate) fn record_created_keeper(
+        &mut self,
+        handle: u64,
+        keeper: OuterProcessCorrelation,
+    ) -> NativeResult<()> {
+        if self.phase != OuterPhase::Prepared
+            || self.launch_stage != OuterLaunchPhase::CreateIntent
+            || self.keeper.is_some()
+        {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let mut value = self.clone();
+        value.keeper = Some(keeper);
+        value.inherited_parent_handle = Some(handle);
+        value.launch_stage = OuterLaunchPhase::Created;
+        value.validate()?;
+        *self = value;
+        Ok(())
+    }
+    pub(crate) fn advance_launch(&mut self, next: OuterLaunchPhase) -> NativeResult<()> {
+        if self.phase != OuterPhase::Prepared
+            || !matches!(
+                (self.launch_stage, next),
+                (OuterLaunchPhase::None, OuterLaunchPhase::CreateIntent)
+                    | (OuterLaunchPhase::Created, OuterLaunchPhase::ResumeIntent)
+                    | (OuterLaunchPhase::ResumeIntent, OuterLaunchPhase::Resumed)
+            )
+        {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let mut value = self.clone();
+        value.launch_stage = next;
+        value.validate()?;
+        *self = value;
+        Ok(())
+    }
+    pub(crate) fn peer_matches(
+        &self,
+        pid: u32,
+        creation: u64,
+        module: FileStamp,
+        image: &super::inventory::PeFacts,
+        facts: &super::super::native_io::identity::TokenFacts,
+    ) -> NativeResult<()> {
+        self.validate()?;
+        self.context.matches(facts)?;
+        self.keeper
+            .as_ref()
+            .ok_or(NativeError::Foreign)?
+            .matches(pid, creation, module, image)
+    }
+    /// Read only the fixed rooted leaf; values are observations, not an owner/lock factory.
+    #[cfg(windows)]
+    pub(crate) fn read(
+        io: &super::super::native_io::WindowsNativeIo,
+        proof: &super::super::native_io::SupportProof,
+        deadline: &super::super::native_io::Deadline,
+    ) -> NativeResult<Option<Self>> {
+        use super::super::native_io::{files::MAX_RECORD_BYTES, records};
+        let observed = io.read_record(
+            proof,
+            records::RecordName::OuterUpgrade,
+            MAX_RECORD_BYTES,
+            deadline,
+        )?;
+        observed
+            .map(|record| {
+                let value: Self =
+                    records::record_data(&records::RecordName::OuterUpgrade, record.bytes())?;
+                value.validate()?;
+                Ok(value)
+            })
+            .transpose()
+    }
+}
+
+/// Observation-only terminal policy shared by native retirement and focused pure fakes.
+/// Native publication additionally requires the real exclusive-namespace/absence capability.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn validate_outer_terminal_retirement(
+    outer: &OuterUpgradeRecord,
+    operation: &OperationRecord,
+    catalog: &StageCatalog,
+) -> NativeResult<()> {
+    outer.validate()?;
+    operation.validate()?;
+    catalog.validate()?;
+    if operation.operation() != outer.operation()
+        || outer.copy_cleanup() != OuterCopyCleanup::Absent
+    {
+        return Err(NativeError::Foreign);
+    }
+    match outer.phase() {
+        OuterPhase::Complete
+            if operation.phase() == Phase::Complete && catalog.active.is_none() =>
+        {
+            Ok(())
+        }
+        OuterPhase::Cancelled => {
+            if !matches!(operation.phase(), Phase::Intent | Phase::RolledBack)
+                || catalog.active.is_some_and(|id| id != outer.operation())
+                || operation.current_role().is_some()
+                || operation.original_instance().is_some()
+                || operation.new_instance().is_some()
+                || operation.handoff().is_some()
+                || operation.retention_incomplete()
+                || operation.roles().iter().any(|role| {
+                    role.original != OriginalLeaf::Unobserved
+                        || role.staged.is_some()
+                        || role.backup.is_some()
+                        || role.published.is_some()
+                })
+            {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        _ => Err(NativeError::OutcomeUnknown),
+    }
+}
+
+/// The actual two-publication entry order, shared with the six focused interruption fakes.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) trait OuterSelectionPort {
+    fn publish_selection(&mut self, record: &OuterUpgradeRecord) -> NativeResult<()>;
+    fn create_operation(&mut self, record: &OperationRecord) -> NativeResult<()>;
+}
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn publish_outer_selection<P: OuterSelectionPort>(
+    port: &mut P,
+    record: &OuterUpgradeRecord,
+) -> NativeResult<()> {
+    record.validate()?;
+    if record.phase() != OuterPhase::Selecting || record.launch_phase() != OuterLaunchPhase::None {
+        return Err(NativeError::OutcomeUnknown);
+    }
+    port.publish_selection(record)?;
+    port.create_operation(&OperationRecord::new(record.operation())?)
+}
+
 #[cfg(windows)]
 mod native {
     use super::super::super::native_io::{
@@ -424,6 +964,65 @@ mod native {
             return Err(NativeError::Unsupported);
         }
         Ok(Some(record))
+    }
+    /// Terminal correlation is retired only AFTER the real native cleanup capability settles
+    /// the fixed keeper copy. This cannot reconstruct an old process/tree or authorize Stop/Run.
+    #[cfg(not(test))]
+    pub(crate) fn retire_outer_terminal(
+        io: &Arc<WindowsNativeIo>,
+        proof: &SupportProof,
+        lock: &InstallerLock,
+        absence: &super::super::super::native_io::keeper::KeeperCopyAbsent,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        absence.reverify(io, proof, lock, deadline)?;
+        let outer = OuterUpgradeRecord::read(io, proof, deadline)?.ok_or(NativeError::Foreign)?;
+        outer.context().same_user(io.target().identity())?;
+        if outer.operation() != absence.operation()
+            || outer.copy_cleanup() != OuterCopyCleanup::Absent
+        {
+            return Err(NativeError::Foreign);
+        }
+        let name = RecordName::Operation(outer.operation());
+        let observed = io
+            .read_record(
+                proof,
+                name.clone(),
+                super::super::super::native_io::files::MAX_RECORD_BYTES,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+        let mut operation: OperationRecord = records::record_data(&name, observed.bytes())?;
+        let mut current = catalog(io, proof, deadline)?;
+        validate_outer_terminal_retirement(&outer, &operation, &current)?;
+        if outer.phase() == OuterPhase::Complete {
+            return absence.reverify(io, proof, lock, deadline);
+        }
+        // Intent has never admitted Stop or payload mutation. Commit its rollback observation
+        // before clearing the selected catalog; an interrupted result remains safe to reobserve.
+        if operation.phase() == Phase::Intent {
+            operation.set_phase(Phase::RolledBack);
+            let bytes = records::encode_record(
+                &name,
+                serde_json::to_value(&operation).map_err(|_| NativeError::Invalid)?,
+            )?;
+            absence.reverify(io, proof, lock, deadline)?;
+            publish(io, proof, lock, name, &bytes, deadline)?;
+        }
+        if current.active == Some(outer.operation()) {
+            current.active = None;
+            current
+                .generations
+                .retain(|row| row.operation != outer.operation());
+            current.validate()?;
+            let bytes = records::encode_record(
+                &RecordName::StageCatalog,
+                serde_json::to_value(&current).map_err(|_| NativeError::Invalid)?,
+            )?;
+            absence.reverify(io, proof, lock, deadline)?;
+            publish(io, proof, lock, RecordName::StageCatalog, &bytes, deadline)?;
+        }
+        absence.reverify(io, proof, lock, deadline)
     }
     pub(crate) fn save_operation(
         io: Arc<WindowsNativeIo>,
@@ -538,6 +1137,8 @@ mod native {
         })
     }
 }
+#[cfg(all(windows, not(test)))]
+pub(crate) use native::retire_outer_terminal;
 #[cfg(windows)]
 pub(crate) use native::{
     MutationPermit, active_helper_operation, catalog, save_operation, selected_operation,

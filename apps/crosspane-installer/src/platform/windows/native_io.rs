@@ -60,6 +60,8 @@ pub(crate) use adapter::AgentObservation;
 #[allow(unused_imports)]
 // A4 consumes completion fields; terminal ACK presently only rechecks origin.
 pub(crate) use adapter::ExitObservation;
+#[cfg(all(windows, not(test)))]
+pub(crate) use adapter::SelectedOuterOperation;
 #[cfg(all(windows, test))]
 #[allow(unused_imports)]
 // Source-included probe exports; library unit tests do not invoke them.
@@ -79,6 +81,12 @@ pub(crate) use adapter::{OpenedPe, PayloadRoot, PruneOutcome, SelfImagePin, Stag
 pub(crate) use adapter::{
     LogonArchiveResult, LogonReservation, OwnedArchiveResult, PriorLogonDisposition,
 };
+
+#[cfg(all(windows, not(test)))]
+pub(crate) use adapter::{OuterCompletionAdmission, OuterPeerImage};
+
+#[cfg(all(windows, not(test)))]
+pub(crate) use adapter::keeper;
 
 #[cfg(windows)]
 mod adapter {
@@ -410,6 +418,200 @@ mod adapter {
             })
         }
     }
+    /// A current original-IO own-process/image selection, never reconstructed from journal facts.
+    #[cfg(not(test))]
+    pub(crate) struct SelectedOuterOperation {
+        io: Arc<WindowsNativeIo>,
+        module: SelfImagePin,
+        process: super::process::own::OwnProcessIdentity,
+        record: super::super::payload::recovery::OuterUpgradeRecord,
+    }
+    #[cfg(not(test))]
+    impl SelectedOuterOperation {
+        pub(crate) fn io(&self) -> &Arc<WindowsNativeIo> {
+            &self.io
+        }
+        pub(crate) fn module(&self) -> &SelfImagePin {
+            &self.module
+        }
+        pub(crate) fn owner_identity(&self) -> &super::process::own::OwnProcessIdentity {
+            &self.process
+        }
+        pub(crate) fn record(&self) -> &super::super::payload::recovery::OuterUpgradeRecord {
+            &self.record
+        }
+        pub(crate) fn operation(&self) -> [u8; 16] {
+            self.record.operation()
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !std::ptr::eq(io, self.io.as_ref()) {
+                return Err(NativeError::Foreign);
+            }
+            io.verify_stop_lock(proof, lock, deadline)?;
+            self.process.reverify(deadline)?;
+            self.module.reverify(io, proof, deadline)?;
+            let current = io.observe_outer_operation(proof, lock, deadline)?;
+            current.same_selection(&self.record)?;
+            current.context().matches(&io.context.target.identity)?;
+            deadline.check()
+        }
+        fn change(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+            edit: impl FnOnce(
+                &mut super::super::payload::recovery::OuterUpgradeRecord,
+            ) -> NativeResult<()>,
+        ) -> NativeResult<()> {
+            self.reverify(io, proof, lock, deadline)?;
+            let mut record = io.observe_outer_operation(proof, lock, deadline)?;
+            edit(&mut record)?;
+            record.same_selection(&self.record)?;
+            io.publish_outer_operation(proof, lock, &record, deadline)
+        }
+        pub(crate) fn mark_preparing(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.record.outer().matches(
+                self.process.pid(),
+                self.process.creation(),
+                outer_stamp(self.module.identity()),
+                self.module.facts(),
+            )?;
+            self.change(&self.io, proof, lock, deadline, |r| {
+                r.advance(super::super::payload::recovery::OuterPhase::Preparing)
+            })
+        }
+        pub(crate) fn record_keeper_image(
+            &self,
+            image: &OpenedPe,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            image.reverify(&self.io, proof, deadline)?;
+            if image.approved().facts() != self.module.facts() {
+                return Err(NativeError::Foreign);
+            }
+            // The caller's new fixed-copy adapter supplied this actual opened object. It is only
+            // recorded here; native keeper admission separately reopens the exact rooted leaf.
+            self.change(&self.io, proof, lock, deadline, |r| {
+                r.set_keeper_image(outer_stamp(image.identity()))
+            })
+        }
+        pub(crate) fn mark_launch_intent(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.record.outer().matches(
+                self.process.pid(),
+                self.process.creation(),
+                outer_stamp(self.module.identity()),
+                self.module.facts(),
+            )?;
+            self.change(&self.io, proof, lock, deadline, |r| {
+                r.advance_launch(super::super::payload::recovery::OuterLaunchPhase::CreateIntent)
+            })
+        }
+        pub(crate) fn record_created_keeper(
+            &mut self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            parent_handle: u64,
+            keeper: super::super::payload::recovery::OuterProcessCorrelation,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.change(io, proof, lock, deadline, |r| {
+                r.record_created_keeper(parent_handle, keeper)
+            })?;
+            self.record = io.observe_outer_operation(proof, lock, deadline)?;
+            Ok(())
+        }
+        pub(crate) fn mark_resume_intent(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.change(&self.io, proof, lock, deadline, |r| {
+                r.advance_launch(super::super::payload::recovery::OuterLaunchPhase::ResumeIntent)
+            })
+        }
+        pub(crate) fn mark_ready(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.change(&self.io, proof, lock, deadline, |r| {
+                r.peer_matches(
+                    self.process.pid(),
+                    self.process.creation(),
+                    outer_stamp(self.module.identity()),
+                    self.module.facts(),
+                    &self.io.context.target.identity,
+                )?;
+                if r.launch_stage()
+                    == super::super::payload::recovery::OuterLaunchPhase::ResumeIntent
+                {
+                    r.advance_launch(super::super::payload::recovery::OuterLaunchPhase::Resumed)?;
+                }
+                r.advance(super::super::payload::recovery::OuterPhase::Ready)
+            })
+        }
+        pub(crate) fn mark_committed(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.change(&self.io, proof, lock, deadline, |r| {
+                r.advance(super::super::payload::recovery::OuterPhase::Committed)
+            })
+        }
+        pub(crate) fn mark_complete(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.change(&self.io, proof, lock, deadline, |r| {
+                r.advance(super::super::payload::recovery::OuterPhase::Complete)
+            })
+        }
+        pub(crate) fn mark_cancelled(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.change(&self.io, proof, lock, deadline, |r| {
+                r.advance(super::super::payload::recovery::OuterPhase::Cancelled)
+            })
+        }
+    }
+    #[cfg(not(test))]
+    fn outer_stamp(identity: FileIdentity) -> super::super::payload::recovery::FileStamp {
+        super::super::payload::recovery::FileStamp {
+            volume: identity.volume,
+            file: identity.file,
+        }
+    }
+
     pub(crate) struct OpenedPe(Arc<ApprovedImage>);
     struct ApprovedImage {
         target: [u8; 16],
@@ -1644,6 +1846,103 @@ mod adapter {
                 .map_err(|_| NativeError::Unavailable)?
                 .take();
             Ok(())
+        }
+    }
+
+    /// Completion-only own-module admission. No approval or facts constructor exists.
+    #[cfg(not(test))]
+    pub(crate) struct OuterCompletionAdmission {
+        io: Arc<WindowsNativeIo>,
+        module: SelfImagePin,
+        own: process::own::OwnProcessIdentity,
+        keeper: OuterPeerImage,
+        operation: [u8; 16],
+    }
+    #[cfg(not(test))]
+    impl OuterCompletionAdmission {
+        pub(crate) fn operation(&self) -> [u8; 16] {
+            self.operation
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !std::ptr::eq(io, self.io.as_ref()) {
+                return Err(NativeError::Foreign);
+            }
+            self.module.reverify(io, proof, deadline)?;
+            self.own.reverify(deadline)?;
+            self.keeper.reverify(io, proof, deadline)?;
+            let record = io.outer_stop_selection(proof, self.operation, deadline)?;
+            record.peer_matches(
+                self.own.pid(),
+                self.own.creation(),
+                epoch_stamp(self.module.identity()),
+                self.module.facts(),
+                io.target().identity(),
+            )?;
+            if self.module.identity() != self.keeper.identity()
+                || self.module.facts() != self.keeper.facts()
+                || process::literal_path(self.module.canonical_dos_path())?
+                    != process::literal_path(self.keeper.canonical_dos_path())?
+            {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()
+        }
+    }
+    /// Measured read pin, deliberately not SelfImagePin/OpenedPe or launch approval.
+    #[cfg(not(test))]
+    pub(crate) struct OuterPeerImage {
+        io: Arc<WindowsNativeIo>,
+        parent: Arc<Anchor>,
+        leaf: String,
+        image: native::ImageData,
+        private: bool,
+    }
+    #[cfg(not(test))]
+    impl OuterPeerImage {
+        pub(crate) fn identity(&self) -> FileIdentity {
+            self.image.identity
+        }
+        pub(crate) fn facts(&self) -> &PeFacts {
+            &self.image.facts
+        }
+        pub(crate) fn canonical_dos_path(&self) -> &str {
+            &self.image.canonical
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !std::ptr::eq(io, self.io.as_ref()) {
+                return Err(NativeError::Foreign);
+            }
+            let context = io.context.clone();
+            let parent = self.parent.clone();
+            let leaf = self.leaf.clone();
+            let private = self.private;
+            let expected = self.image.identity;
+            let facts = self.image.facts.clone();
+            let budget = proof.budget(io, deadline)?;
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                let fresh = parent.open_image(
+                    &leaf,
+                    private,
+                    &facts.version,
+                    &context.security,
+                    &budget,
+                )?;
+                if fresh.identity != expected || fresh.facts != facts {
+                    return Err(NativeError::Foreign);
+                }
+                budget.check()
+            })
         }
     }
 
@@ -3598,6 +3897,175 @@ mod adapter {
         }
         // Exact new bridge: native production callers are excluded from lib-test roots.
         #[cfg_attr(test, allow(dead_code))]
+        /// Read-only precommit support selection, never a terminal or payload-start capability.
+        #[cfg(not(test))]
+        pub(crate) fn outer_support_selection(
+            &self,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<super::super::payload::recovery::OuterUpgradeRecord> {
+            use super::super::payload::recovery::{OuterPhase, OuterUpgradeRecord};
+            proof.budget(self, deadline)?.check()?;
+            let record =
+                OuterUpgradeRecord::read(self, proof, deadline)?.ok_or(NativeError::Missing)?;
+            record.context().matches(self.target().identity())?;
+            if operation == [0; 16]
+                || record.operation() != operation
+                || !matches!(record.phase(), OuterPhase::Prepared | OuterPhase::Ready)
+            {
+                return Err(NativeError::Foreign);
+            }
+            let selected =
+                super::super::payload::recovery::selected_operation(self, proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+            if selected.operation() != operation || selected.phase() != Phase::Intent {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()?;
+            Ok(record)
+        }
+        #[cfg(not(test))]
+        pub(crate) fn outer_stop_selection(
+            &self,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<super::super::payload::recovery::OuterUpgradeRecord> {
+            use super::super::payload::recovery::{OuterPhase, OuterUpgradeRecord};
+            proof.budget(self, deadline)?.check()?;
+            let record =
+                OuterUpgradeRecord::read(self, proof, deadline)?.ok_or(NativeError::Missing)?;
+            record.context().matches(self.target().identity())?;
+            if operation == [0; 16]
+                || record.operation() != operation
+                || record.phase() != OuterPhase::Committed
+            {
+                return Err(NativeError::Foreign);
+            }
+            let selected =
+                super::super::payload::recovery::selected_operation(self, proof, deadline)?
+                    .ok_or(NativeError::Missing)?;
+            if selected.operation() != operation || selected.phase() != Phase::StopIntent {
+                return Err(NativeError::Foreign);
+            }
+            Ok(record)
+        }
+        #[cfg(not(test))]
+        pub(crate) fn pin_outer_keeper(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<OuterPeerImage> {
+            use super::super::payload::recovery::{OuterPhase, OuterUpgradeRecord};
+            let record =
+                OuterUpgradeRecord::read(self, proof, deadline)?.ok_or(NativeError::Missing)?;
+            record.context().matches(self.target().identity())?;
+            if record.operation() != operation
+                || !matches!(
+                    record.phase(),
+                    OuterPhase::Prepared
+                        | OuterPhase::Ready
+                        | OuterPhase::Committed
+                        | OuterPhase::Complete
+                )
+            {
+                return Err(NativeError::Foreign);
+            }
+            let expected = record.keeper_image().ok_or(NativeError::Foreign)?;
+            let version = record.outer().image().version.clone();
+            let context = self.context.clone();
+            let io = self.clone();
+            let budget = proof.budget(self, deadline)?;
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                let op: String = operation.iter().map(|byte| format!("{byte:02x}")).collect();
+                let fixed = format!("{}\\payload-stage\\{op}", context.target.paths.install());
+                let parent = Arc::new(
+                    Anchor::open(&fixed, &context.security, true, &budget)?
+                        .ok_or(NativeError::Missing)?,
+                );
+                let image = parent.open_image(
+                    "keeper-copy.exe",
+                    true,
+                    &version,
+                    &context.security,
+                    &budget,
+                )?;
+                if epoch_stamp(image.identity) != expected || image.facts != *record.outer().image()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                budget.check()?;
+                Ok(OuterPeerImage {
+                    io,
+                    parent,
+                    leaf: "keeper-copy.exe".into(),
+                    image,
+                    private: true,
+                })
+            })
+        }
+        /// The input can only be produced by the connected pipe's kernel peer factory.
+        #[cfg(not(test))]
+        pub(crate) fn pin_outer_kernel_image(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            peer: &super::supervisor_owner::KernelOuterPeer,
+            version: &str,
+            deadline: &Deadline,
+        ) -> NativeResult<OuterPeerImage> {
+            peer.reverify(self, proof, deadline)?;
+            let actual = peer.image().to_owned();
+            let version = version.to_owned();
+            let context = self.context.clone();
+            let io = self.clone();
+            let budget = proof.budget(self, deadline)?;
+            let image = self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                let (parent, leaf) = actual.rsplit_once('\\').ok_or(NativeError::Unsupported)?;
+                let parent = Arc::new(
+                    Anchor::open(parent, &context.security, false, &budget)?
+                        .ok_or(NativeError::Missing)?,
+                );
+                let image = parent.open_image(leaf, false, &version, &context.security, &budget)?;
+                budget.check()?;
+                Ok(OuterPeerImage {
+                    io,
+                    parent,
+                    leaf: leaf.into(),
+                    image,
+                    private: false,
+                })
+            })?;
+            peer.reverify(self, proof, deadline)?;
+            Ok(image)
+        }
+        #[cfg(not(test))]
+        pub(crate) fn prepare_outer_completion(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<OuterCompletionAdmission> {
+            self.verify_stop_lock(proof, lock, deadline)?;
+            self.outer_stop_selection(proof, operation, deadline)?;
+            let module = self.self_image(proof, deadline)?;
+            let own = self.own_process_identity(proof, deadline)?;
+            let keeper = self.pin_outer_keeper(proof, operation, deadline)?;
+            let admission = OuterCompletionAdmission {
+                io: self.clone(),
+                module,
+                own,
+                keeper,
+                operation,
+            };
+            admission.reverify(self, proof, deadline)?;
+            self.verify_stop_lock(proof, lock, deadline)?;
+            Ok(admission)
+        }
         pub(crate) fn broker_admission(
             self: &Arc<Self>,
             proof: &SupportProof,
@@ -4108,6 +4576,235 @@ mod adapter {
                 bytes: source.bytes().to_vec(),
             })
         }
+        /// Publishes the fixed correlation BEFORE any random operation record is created.
+        #[cfg(not(test))]
+        pub(crate) fn begin_outer_operation(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            operation: [u8; 16],
+            sources: &super::super::payload::ApprovedOuterSources,
+            deadline: &Deadline,
+        ) -> NativeResult<SelectedOuterOperation> {
+            use super::super::payload::{
+                inventory::{ApprovedInventory, ApprovedPe},
+                recovery::{
+                    self, OperationRecord, OuterContextCorrelation, OuterPhase,
+                    OuterProcessCorrelation, OuterUpgradeRecord,
+                },
+            };
+            self.verify_stop_lock(proof, lock, deadline)?;
+            let module = self.self_image(proof, deadline)?;
+            let own = self.own_process_identity(proof, deadline)?;
+            let inventory = ApprovedInventory::embedded()?;
+            let installer = ApprovedPe::own_image(&module)?;
+            inventory.check_staging_budget(&installer, true)?;
+            for (role, bytes) in sources.roles() {
+                super::super::payload::verify_outer_source(
+                    bytes,
+                    inventory.role(*role)?,
+                    deadline,
+                )?;
+            }
+            if recovery::catalog(self, proof, deadline)?.active.is_some() {
+                return Err(NativeError::Busy);
+            }
+            if let Some(prior) = OuterUpgradeRecord::read(self, proof, deadline)? {
+                if !matches!(prior.phase(), OuterPhase::Complete | OuterPhase::Cancelled) {
+                    return Err(NativeError::Busy);
+                }
+                // Only the admitted native cleanup can publish positive copy absence. Terminal
+                // phase or an uncreated-image observation alone never settles an old fixed leaf.
+                if prior.copy_cleanup() != super::super::payload::recovery::OuterCopyCleanup::Absent
+                {
+                    return Err(NativeError::Busy);
+                }
+                // Only terminal metadata is replaced; a changed logon is not old-owner proof.
+                // Fresh current self/manifest/lock and later kernel reservation remain mandatory.
+                prior.context().same_user(&self.context.target.identity)?;
+            }
+            let record = OuterUpgradeRecord::new(
+                operation,
+                OuterProcessCorrelation::new(
+                    own.pid(),
+                    own.creation(),
+                    outer_stamp(module.identity()),
+                    module.facts().clone(),
+                )?,
+                OuterContextCorrelation::new(&self.context.target.identity)?,
+                sources.facts().clone(),
+            )?;
+            struct Publisher<'a> {
+                io: &'a Arc<WindowsNativeIo>,
+                proof: &'a SupportProof,
+                lock: &'a InstallerLock,
+                deadline: &'a Deadline,
+            }
+            impl recovery::OuterSelectionPort for Publisher<'_> {
+                fn publish_selection(&mut self, record: &OuterUpgradeRecord) -> NativeResult<()> {
+                    self.io
+                        .publish_outer_operation(self.proof, self.lock, record, self.deadline)
+                }
+                fn create_operation(&mut self, record: &OperationRecord) -> NativeResult<()> {
+                    recovery::save_operation(
+                        self.io.clone(),
+                        self.proof,
+                        self.lock,
+                        record,
+                        self.deadline,
+                    )?;
+                    Ok(())
+                }
+            }
+            recovery::publish_outer_selection(
+                &mut Publisher {
+                    io: self,
+                    proof,
+                    lock,
+                    deadline,
+                },
+                &record,
+            )?;
+            let selection = SelectedOuterOperation {
+                io: self.clone(),
+                module,
+                process: own,
+                record,
+            };
+            selection.reverify(self, proof, lock, deadline)?;
+            Ok(selection)
+        }
+        /// A new caller may observe the live selected keeper; this creates only its OWN context
+        /// selection and cannot reconstruct an earlier process/job completion or launch permit.
+        #[cfg(not(test))]
+        pub(crate) fn select_outer_operation(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<SelectedOuterOperation> {
+            let record = self.observe_outer_operation(proof, lock, deadline)?;
+            let module = self.self_image(proof, deadline)?;
+            let process = self.own_process_identity(proof, deadline)?;
+            let selected = SelectedOuterOperation {
+                io: self.clone(),
+                module,
+                process,
+                record,
+            };
+            selected.reverify(self, proof, lock, deadline)?;
+            Ok(selected)
+        }
+        /// The fixed record selects metadata; the caller still owns actual original context/lock.
+        #[cfg(not(test))]
+        pub(crate) fn observe_outer_operation(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<super::super::payload::recovery::OuterUpgradeRecord> {
+            use super::super::payload::recovery::{self, OuterUpgradeRecord, Phase};
+            self.verify_stop_lock(proof, lock, deadline)?;
+            let record =
+                OuterUpgradeRecord::read(self, proof, deadline)?.ok_or(NativeError::Missing)?;
+            record.context().matches(&self.context.target.identity)?;
+            let catalog = recovery::catalog(self, proof, deadline)?;
+            if catalog.active == Some(record.operation()) {
+                let selected = recovery::selected_operation(self, proof, deadline)?
+                    .ok_or(NativeError::Foreign)?;
+                if selected.operation() != record.operation() {
+                    return Err(NativeError::Foreign);
+                }
+            } else if catalog.active.is_none() {
+                // Only exact completed/cancelled payload observations permit post-action recording.
+                let observed = self
+                    .read_record(
+                        proof,
+                        records::RecordName::Operation(record.operation()),
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                let operation: recovery::OperationRecord = records::record_data(
+                    &records::RecordName::Operation(record.operation()),
+                    observed.bytes(),
+                )?;
+                operation.validate()?;
+                if operation.operation() != record.operation()
+                    || !matches!(operation.phase(), Phase::Complete | Phase::RolledBack)
+                {
+                    return Err(NativeError::Foreign);
+                }
+            } else {
+                return Err(NativeError::Busy);
+            }
+            Ok(record)
+        }
+        #[cfg(not(test))]
+        pub(super) fn publish_outer_operation(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            record: &super::super::payload::recovery::OuterUpgradeRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.verify_stop_lock(proof, lock, deadline)?;
+            record.validate()?;
+            record.context().matches(&self.context.target.identity)?;
+            let bytes = records::encode_record(
+                &records::RecordName::OuterUpgrade,
+                serde_json::to_value(record).map_err(|_| NativeError::Invalid)?,
+            )?;
+            let outcome = self.publish_record(
+                proof,
+                lock,
+                records::RecordName::OuterUpgrade,
+                &bytes,
+                deadline,
+            )?;
+            if outcome.state != records::PublicationRecovery::NewPublished
+                || outcome.native_failure.is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        }
+        /// Actual copied module and own inherited-process correlation, never a journal PID open.
+        #[cfg(not(test))]
+        pub(crate) fn keeper_selection(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<SelectedOuterOperation> {
+            let record = self.observe_outer_operation(proof, lock, deadline)?;
+            let module = self.self_image(proof, deadline)?;
+            let process = self.own_process_identity(proof, deadline)?;
+            let fixed =
+                self.open_keeper_image(proof, lock, record.operation(), &module, deadline)?;
+            if fixed.identity() != module.identity()
+                || Some(outer_stamp(fixed.identity())) != record.keeper_image()
+            {
+                return Err(NativeError::Foreign);
+            }
+            record.peer_matches(
+                process.pid(),
+                process.creation(),
+                outer_stamp(module.identity()),
+                module.facts(),
+                &self.context.target.identity,
+            )?;
+            drop(fixed);
+            let selected = SelectedOuterOperation {
+                io: self.clone(),
+                module,
+                process,
+                record,
+            };
+            selected.reverify(self, proof, lock, deadline)?;
+            Ok(selected)
+        }
+
         pub fn native_idle(&self) -> bool {
             self.owner.idle()
         }
@@ -4120,6 +4817,1798 @@ mod adapter {
                     std::io::stderr().lock(),
                     "Windows installer native cleanup unverified: call still in flight; retained owner keeps handles and lease"
                 );
+            }
+        }
+    }
+
+    // A4d fixed keeper source/launch. Every capability retains ORIGINAL IO and actual objects;
+    // record values only correlate the returned process/module and cannot select a process/path.
+    #[cfg(not(test))]
+    pub(crate) mod keeper {
+        use super::super::super::payload::{
+            ApprovedOuterSources,
+            inventory::ApprovedInventory,
+            recovery::{OuterPhase, OuterProcessCorrelation, OuterUpgradeRecord},
+        };
+        use super::super::activation::KeeperStage;
+        use super::*;
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use std::sync::{
+            OnceLock,
+            atomic::{AtomicBool, Ordering},
+        };
+        use windows_sys::Win32::{
+            Foundation::*,
+            Security::Authorization::*,
+            Security::*,
+            System::{JobObjects::*, Pipes::*, Threading::*},
+        };
+        pub(crate) const KEEPER_ARGUMENT: &str = "--windows-upgrade-keeper";
+        const CHUNK: usize = 64 * 1024;
+
+        fn locked_record(
+            context: &Context,
+            lease: &LockState,
+            deadline: &Deadline,
+        ) -> NativeResult<OuterUpgradeRecord> {
+            validate_payload_lock(context, lease, deadline)?;
+            let (_, bytes) = lease
+                .parent
+                .read_private(
+                    &records::RecordName::OuterUpgrade.file_name()?,
+                    &context.security,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .ok_or(NativeError::Missing)?;
+            let record = OuterUpgradeRecord::decode(&bytes)?;
+            record.context().matches(&context.target.identity)?;
+            Ok(record)
+        }
+        impl WindowsNativeIo {
+            pub(crate) fn prepare_keeper_image(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                selected: &SelectedOuterOperation,
+                deadline: &Deadline,
+            ) -> NativeResult<OpenedPe> {
+                selected.reverify(self, proof, lock, deadline)?;
+                selected.mark_preparing(proof, lock, deadline)?;
+                let proof = self.admit_support(deadline)?;
+                let root = self.payload_root(&proof, lock, deadline)?;
+                let expected = ApprovedPe::own_image(selected.module())?;
+                let input = self.self_image_reader(selected.module(), &proof, deadline)?;
+                let original = selected.record().clone();
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let root = root.0.clone();
+                let budget = proof.budget(self, deadline)?;
+                let image = self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    change.finish((|| {
+                        let actual = locked_record(&context, &lease, &budget)?;
+                        if !actual.selection_matches(&original)
+                            || actual.phase() != OuterPhase::Preparing
+                            || actual.keeper_image().is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        let root = PayloadRoot(root).ensure(&context, &budget, &change)?;
+                        let stage = ensure_payload_child(
+                            &root,
+                            "payload-stage",
+                            &context,
+                            &budget,
+                            &change,
+                        )?;
+                        let parent = Arc::new(ensure_payload_child(
+                            &stage,
+                            &records::hex(&actual.operation()),
+                            &context,
+                            &budget,
+                            &change,
+                        )?);
+                        change.reached();
+                        let image = parent.stage_image(
+                            "keeper-copy.exe",
+                            input,
+                            &expected,
+                            &context.security,
+                            &budget,
+                        )?;
+                        Ok(OpenedPe(Arc::new(ApprovedImage {
+                            target: context.target.nonce,
+                            parent,
+                            leaf: "keeper-copy.exe".into(),
+                            image,
+                            expected,
+                        })))
+                    })())
+                })?;
+                let proof = self.admit_support(deadline)?;
+                selected.record_keeper_image(&image, &proof, lock, deadline)?;
+                Ok(image)
+            }
+            pub(crate) fn open_keeper_image(
+                &self,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                operation: [u8; 16],
+                own: &SelfImagePin,
+                deadline: &Deadline,
+            ) -> NativeResult<OpenedPe> {
+                self.lock_binding(proof, lock, deadline)?;
+                own.reverify(self, proof, deadline)?;
+                if operation == [0; 16] {
+                    return Err(NativeError::Invalid);
+                }
+                let root = self.payload_root(proof, lock, deadline)?;
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let root = root.0.clone();
+                let expected = ApprovedPe::own_image(own)?;
+                let budget = proof.budget(self, deadline)?;
+                self.owner.run(Dispatch::Observation, deadline, move || {
+                    let actual = locked_record(&context, &lease, &budget)?;
+                    if actual.operation() != operation {
+                        return Err(NativeError::Foreign);
+                    }
+                    let root = PayloadRoot(root)
+                        .check(&context, &budget)?
+                        .ok_or(NativeError::Missing)?;
+                    let parent = root
+                        .child("payload-stage", &context.security, &budget)?
+                        .ok_or(NativeError::Missing)?;
+                    let parent = Arc::new(
+                        parent
+                            .child(&records::hex(&operation), &context.security, &budget)?
+                            .ok_or(NativeError::Missing)?,
+                    );
+                    let image = parent.open_image(
+                        "keeper-copy.exe",
+                        true,
+                        expected.version(),
+                        &context.security,
+                        &budget,
+                    )?;
+                    if image.facts != *expected.facts()
+                        || Some(outer_stamp(image.identity)) != actual.keeper_image()
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(OpenedPe(Arc::new(ApprovedImage {
+                        target: context.target.nonce,
+                        parent,
+                        leaf: "keeper-copy.exe".into(),
+                        image,
+                        expected,
+                    })))
+                })
+            }
+        }
+        fn process_creation(process: &OwnedHandle) -> NativeResult<u64> {
+            let (mut a, mut b, mut c, mut d) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            // SAFETY: actual retained process query object and complete distinct FILETIME outputs.
+            if unsafe { GetProcessTimes(process.as_raw_handle(), &mut a, &mut b, &mut c, &mut d) }
+                == 0
+            {
+                return Err(NativeError::Unavailable);
+            }
+            let result = (u64::from(a.dwHighDateTime) << 32) | u64::from(a.dwLowDateTime);
+            if result == 0 {
+                Err(NativeError::Foreign)
+            } else {
+                Ok(result)
+            }
+        }
+        pub(crate) struct KeeperParent {
+            handle: Arc<OwnedHandle>,
+            pid: u32,
+            created: u64,
+            token: identity::TokenFacts,
+        }
+        impl KeeperParent {
+            pub(crate) fn admit(
+                io: &WindowsNativeIo,
+                selected: &SelectedOuterOperation,
+                deadline: &Deadline,
+            ) -> NativeResult<Self> {
+                deadline.check()?;
+                let value = selected
+                    .record()
+                    .inherited_parent_handle()
+                    .ok_or(NativeError::Foreign)?;
+                let raw = value as usize as std::os::windows::io::RawHandle;
+                let mut flags = 0;
+                // SAFETY: this value is ONLY an alleged inherited handle; query it before adoption.
+                // No PID lookup/path reopen or use of an unchecked value for a mutation occurs.
+                if unsafe { GetHandleInformation(raw, &mut flags) } == 0
+                    || flags & HANDLE_FLAG_INHERIT == 0
+                {
+                    return Err(NativeError::Foreign);
+                }
+                // SAFETY: the checked live inherited object must be a real process; zero refuses.
+                let pid = unsafe { GetProcessId(raw) };
+                if pid == 0 || pid != selected.record().outer().pid() {
+                    return Err(NativeError::Foreign);
+                }
+                // SAFETY: only the actual validated inherited real process handle is now owned.
+                let handle = Arc::new(unsafe { OwnedHandle::from_raw_handle(raw) });
+                let created = process_creation(&handle)?;
+                let token = identity::native::observe_process(&handle)?;
+                identity::LimitedIdentity::admit(token.clone())?;
+                if token != io.context.target.identity
+                    || created != selected.record().outer().creation()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let parent = Self {
+                    handle,
+                    pid,
+                    created,
+                    token,
+                };
+                parent.reverify(deadline)?;
+                Ok(parent)
+            }
+            pub(crate) fn handle(&self) -> &Arc<OwnedHandle> {
+                &self.handle
+            }
+            pub(crate) fn reverify(&self, deadline: &Deadline) -> NativeResult<()> {
+                deadline.check()?;
+                // SAFETY: retained original inherited process object, nonblocking observation.
+                if unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } != WAIT_TIMEOUT
+                    // SAFETY: query the SAME already retained inherited process object.
+                    || unsafe { GetProcessId(self.handle.as_raw_handle()) } != self.pid
+                    || process_creation(&self.handle)? != self.created
+                    || identity::native::observe_process(&self.handle)? != self.token
+                {
+                    return Err(NativeError::Foreign);
+                }
+                deadline.check()
+            }
+        }
+        struct Attributes {
+            storage: Vec<usize>,
+            handles: Box<[HANDLE; 1]>,
+            initialized: bool,
+        }
+        impl Attributes {
+            fn new(parent: HANDLE) -> NativeResult<Self> {
+                let mut bytes = 0;
+                // SAFETY: documented size query only; no native list exists yet.
+                unsafe {
+                    InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes)
+                };
+                if bytes == 0 || bytes > CHUNK {
+                    return Err(NativeError::Unavailable);
+                }
+                let mut a = Self {
+                    storage: vec![0; bytes.div_ceil(std::mem::size_of::<usize>())],
+                    handles: Box::new([parent]),
+                    initialized: false,
+                };
+                // SAFETY: aligned size-query allocation retained through CreateProcess.
+                if unsafe { InitializeProcThreadAttributeList(a.pointer(), 1, 0, &mut bytes) } == 0
+                {
+                    return Err(NativeError::Unavailable);
+                }
+                a.initialized = true;
+                // SAFETY: exactly one actual inheritable own-parent process handle, boxed so its
+                // address remains stable for the full native list lifetime; no other inheritance.
+                if unsafe {
+                    UpdateProcThreadAttribute(
+                        a.pointer(),
+                        0,
+                        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                        a.handles.as_ptr().cast(),
+                        std::mem::size_of::<[HANDLE; 1]>(),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                    )
+                } == 0
+                {
+                    return Err(NativeError::Unavailable);
+                }
+                Ok(a)
+            }
+            fn pointer(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+                self.storage.as_mut_ptr().cast()
+            }
+        }
+        impl Drop for Attributes {
+            fn drop(&mut self) {
+                if self.initialized {
+                    // SAFETY: balances the successful initialization of this exact retained list.
+                    unsafe { DeleteProcThreadAttributeList(self.pointer()) };
+                }
+            }
+        }
+        struct ChildState {
+            process: Option<Arc<OwnedHandle>>,
+            thread: Option<Arc<OwnedHandle>>,
+            dispatched: bool,
+            create_returned: bool,
+            known_created: bool,
+            resuming: bool,
+            resumed: bool,
+            cleanup_started: bool,
+            retired: bool,
+        }
+        struct LaunchOwner {
+            io: Arc<WindowsNativeIo>,
+            selected: Mutex<SelectedOuterOperation>,
+            lock: Mutex<Option<InstallerLock>>,
+            image: Mutex<Option<OpenedPe>>,
+            parent: Arc<OwnedHandle>,
+            sources: ApprovedOuterSources,
+            calls: Arc<CallOwner>,
+            cleanup: Arc<CallOwner>,
+            state: Mutex<ChildState>,
+            monitor_started: AtomicBool,
+            cancel_requested: AtomicBool,
+        }
+        static LAUNCH: OnceLock<Mutex<Option<Arc<LaunchOwner>>>> = OnceLock::new();
+        pub(crate) struct PreparedKeeper(Arc<LaunchOwner>);
+        pub(crate) struct KeeperChild(Arc<LaunchOwner>);
+        impl PreparedKeeper {
+            pub(crate) fn prepare(
+                io: Arc<WindowsNativeIo>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                selected: &SelectedOuterOperation,
+                sources: ApprovedOuterSources,
+                deadline: &Deadline,
+            ) -> NativeResult<Self> {
+                selected.reverify(&io, proof, lock, deadline)?;
+                if sources.facts() != selected.record().sources() {
+                    return Err(NativeError::Foreign);
+                }
+                let image = io.prepare_keeper_image(proof, lock, selected, deadline)?;
+                let proof = io.admit_support(deadline)?;
+                let process = io.own_process_identity(&proof, deadline)?;
+                let source = process.handle();
+                let mut raw = std::ptr::null_mut();
+                // SAFETY: duplicate ONLY own actual process into this process, query/sync and
+                // explicit inheritance for HANDLE_LIST; no process is selected by a record PID.
+                if unsafe {
+                    DuplicateHandle(
+                        GetCurrentProcess(),
+                        source.as_raw_handle(),
+                        GetCurrentProcess(),
+                        &mut raw,
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                        1,
+                        0,
+                    )
+                } == 0
+                    || raw.is_null()
+                {
+                    return Err(NativeError::Unavailable);
+                }
+                // SAFETY: successful duplication transferred this one real own process handle.
+                let parent = Arc::new(unsafe { OwnedHandle::from_raw_handle(raw) });
+                let selection = SelectedOuterOperation {
+                    io: io.clone(),
+                    module: SelfImagePin(selected.module().0.clone()),
+                    process,
+                    record: selected.record().clone(),
+                };
+                let owner = Arc::new(LaunchOwner {
+                    io,
+                    selected: Mutex::new(selection),
+                    lock: Mutex::new(Some(InstallerLock(lock.0.clone()))),
+                    image: Mutex::new(Some(image)),
+                    parent,
+                    sources,
+                    calls: Arc::new(CallOwner::default()),
+                    cleanup: Arc::new(CallOwner::default()),
+                    state: Mutex::new(ChildState {
+                        process: None,
+                        thread: None,
+                        dispatched: false,
+                        create_returned: false,
+                        known_created: false,
+                        resuming: false,
+                        resumed: false,
+                        cleanup_started: false,
+                        retired: false,
+                    }),
+                    monitor_started: AtomicBool::new(false),
+                    cancel_requested: AtomicBool::new(false),
+                });
+                let mut slot = LAUNCH
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if slot.is_some() {
+                    return Err(NativeError::Busy);
+                }
+                *slot = Some(owner.clone());
+                Ok(Self(owner))
+            }
+            pub(crate) fn launch(self, deadline: &Deadline) -> NativeResult<KeeperChild> {
+                let owner = self.0;
+                let held = owner.clone();
+                let bound = deadline.clone();
+                let result=owner.calls.run(Dispatch::Mutation,deadline,move || {
+                    let mut selected=held.selected.lock().map_err(|_|NativeError::OutcomeUnknown)?;
+                    let lock=held.lock.lock().map_err(|_|NativeError::OutcomeUnknown)?;
+                    let lock=lock.as_ref().ok_or(NativeError::Foreign)?;
+                    let proof=held.io.admit_support(&bound)?;
+                    selected.mark_launch_intent(&proof,lock,&bound)?;
+                    let proof=held.io.admit_support(&bound)?; let image=held.image()?;image.reverify(&held.io,&proof,&bound)?;
+                    let path=image.canonical_dos_path();
+                    if path.contains(['\0','"']){return Err(NativeError::Foreign);}
+                    let app=files::native::wide(path)?;
+                    let mut command=files::native::wide(&format!("\"{path}\" {KEEPER_ARGUMENT}"))?;
+                    let mut attrs=Attributes::new(held.parent.as_raw_handle())?;
+                    let start=STARTUPINFOEXW{StartupInfo:STARTUPINFOW{cb:std::mem::size_of::<STARTUPINFOEXW>() as u32,
+                        ..Default::default()},lpAttributeList:attrs.pointer()};
+                    let mut output=PROCESS_INFORMATION::default(); bound.check()?;
+                    let mut state=held.state.lock().map_err(|_|NativeError::OutcomeUnknown)?;
+                    state.dispatched=true;
+                    // SAFETY: actual opened fixed copy + sole constant flag, SUSPENDED before any
+                    // instruction, explicit sole parent HANDLE_LIST. BREAKAWAY is requested but
+                    // never assumed; actual returned child membership is checked before Resume.
+                    let ok=unsafe{CreateProcessW(app.as_ptr(),command.as_mut_ptr(),std::ptr::null(),std::ptr::null(),1,
+                        CREATE_SUSPENDED|CREATE_NO_WINDOW|CREATE_BREAKAWAY_FROM_JOB|EXTENDED_STARTUPINFO_PRESENT,
+                        std::ptr::null(),std::ptr::null(),&start.StartupInfo,&mut output)};
+                    state.create_returned=true;state.known_created=ok!=0 && !output.hProcess.is_null() && !output.hThread.is_null()
+                        && output.hProcess!=output.hThread;
+                    {
+                        // SAFETY: each distinct non-null CreateProcess result is reserved in the
+                        // owner BEFORE any validation or delivery, including anomalous partial output.
+                        state.process=(!output.hProcess.is_null()).then(||Arc::new(unsafe{OwnedHandle::from_raw_handle(output.hProcess)}));
+                        // SAFETY: separately transferred returned primary thread, not a claimed id.
+                        state.thread=(!output.hThread.is_null() && output.hThread!=output.hProcess)
+                            .then(||Arc::new(unsafe{OwnedHandle::from_raw_handle(output.hThread)}));
+                    }
+                    drop(state);
+                    if ok==0 && output.hProcess.is_null() && output.hThread.is_null(){
+                        eprintln!("Crosspane upgrade keeper cannot start inside the current containing job; run the installer outside it, for example from Explorer.");
+                        return Err(NativeError::Unsupported);
+                    }
+                    if ok==0 || output.hProcess.is_null() || output.hThread.is_null() || output.hProcess==output.hThread {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    held.monitor_exit()?;
+                    let process=held.state.lock().map_err(|_|NativeError::OutcomeUnknown)?.process.clone().ok_or(NativeError::OutcomeUnknown)?;
+                    let mut in_job=0;
+                    // SAFETY: exact returned suspended child and NULL means any job, not a name or
+                    // guessed job handle. Do not alter job policies to make this succeed.
+                    if unsafe{IsProcessInJob(process.as_raw_handle(),std::ptr::null_mut(),&mut in_job)}==0 || in_job!=0 {
+                        eprintln!("Crosspane upgrade keeper must run outside the current containing job; start the installer from Explorer.");
+                        return Err(NativeError::Unsupported);
+                    }
+                    // SAFETY: retained actual child; this observation does not grant adoption/launch.
+                    let pid=unsafe{GetProcessId(process.as_raw_handle())}; let created=process_creation(&process)?;
+                    let proof=held.io.admit_support(&bound)?;
+                    selected.record_created_keeper(&held.io,&proof,lock,held.parent.as_raw_handle() as usize as u64,
+                        OuterProcessCorrelation::new(pid,created,outer_stamp(image.identity()),image.approved().facts().clone())?,&bound)?;
+                    let proof=held.io.admit_support(&bound)?; selected.mark_resume_intent(&proof,lock,&bound)?;
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    let _ = owner.cancel_suspended();
+                    return Err(error);
+                }
+                // Every caller-supplied lock alias must also be dropped by the outer before this
+                // point. We release our private alias; the child takes a fresh lock for admission.
+                owner
+                    .lock
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .take();
+                let held = owner.clone();
+                let bound = deadline.clone();
+                let result = owner.calls.run(Dispatch::Mutation, deadline, move || {
+                    bound.check()?;
+                    let thread = {
+                        let mut s = held.state.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+                        if s.resuming || s.resumed {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        s.resuming = true;
+                        s.thread.clone().ok_or(NativeError::OutcomeUnknown)?
+                    };
+                    // SAFETY: only our retained actual never-resumed child primary thread. Marked
+                    // resuming BEFORE call: failure/late delivery never permits forced cleanup.
+                    let previous = unsafe { ResumeThread(thread.as_raw_handle()) };
+                    let mut state = held.state.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+                    if previous != 1 {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    state.resumed = true;
+                    bound.check()
+                });
+                if let Err(error) = result {
+                    let _ = owner.cancel_suspended();
+                    return Err(error);
+                }
+                Ok(KeeperChild(owner))
+            }
+        }
+        impl LaunchOwner {
+            fn image(&self) -> NativeResult<OpenedPe> {
+                let image = self.image.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+                let image = image.as_ref().ok_or(NativeError::OutcomeUnknown)?;
+                Ok(OpenedPe(image.0.clone()))
+            }
+            fn release_if_settled(self: &Arc<Self>) -> NativeResult<bool> {
+                if !self.calls.idle() || !self.cleanup.idle() {
+                    return Ok(false);
+                }
+                let mut state = self.state.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+                if state.retired {
+                    return Ok(true);
+                }
+                let no_child = (!state.dispatched || state.create_returned)
+                    && state.process.is_none()
+                    && state.thread.is_none();
+                let exited = state.known_created
+                    && state.process.as_ref().is_some_and(|process| {
+                        // SAFETY: exactly our successful CreateProcess output, observation only.
+                        (unsafe { WaitForSingleObject(process.as_raw_handle(), 0) })
+                            == WAIT_OBJECT_0
+                    });
+                if !no_child && !exited {
+                    return Ok(false);
+                }
+                state.retired = true;
+                drop(state);
+                self.lock
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .take();
+                self.image
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .take();
+                // Only this positively settled original launcher can cancel a pre-commit ledger.
+                // A concurrent real Commit remains strict and cannot be overwritten as cancelled.
+                let _ = self.cancel_settled_precommit();
+                let mut slot = LAUNCH
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if slot.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, self)) {
+                    slot.take();
+                }
+                Ok(true)
+            }
+            fn cancel_settled_precommit(&self) -> NativeResult<()> {
+                use super::super::super::payload::recovery::{self, Phase};
+                let deadline =
+                    Deadline::new(30_000, self.io.bound_clock(), Cancellation::default())?;
+                let proof = self.io.admit_support(&deadline)?;
+                let lock = self.io.acquire_installer_lock(&proof, &deadline)?;
+                let proof = self.io.admit_support(&deadline)?;
+                let selected = self
+                    .selected
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                selected.reverify(&self.io, &proof, &lock, &deadline)?;
+                let record = self.io.observe_outer_operation(&proof, &lock, &deadline)?;
+                if !matches!(
+                    record.phase(),
+                    OuterPhase::Selecting
+                        | OuterPhase::Preparing
+                        | OuterPhase::Prepared
+                        | OuterPhase::Ready
+                ) {
+                    return Ok(());
+                }
+                let operation = recovery::selected_operation(&self.io, &proof, &deadline)?
+                    .ok_or(NativeError::Foreign)?;
+                if operation.operation() != record.operation() || operation.phase() != Phase::Intent
+                {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                selected.mark_cancelled(&proof, &lock, &deadline)
+            }
+            fn monitor_exit(self: &Arc<Self>) -> NativeResult<()> {
+                if self.monitor_started.swap(true, Ordering::AcqRel) {
+                    return Ok(());
+                }
+                let held = self.clone();
+                let started = std::thread::Builder::new()
+                    .name("crosspane-keeper-child-settlement".into())
+                    .spawn(move || {
+                        // One retained child and no queue. Neither caller death nor a timeout drops
+                        // the copy/source pins before the ACTUAL original child has exited.
+                        loop {
+                            if matches!(held.release_if_settled(), Ok(true)) {
+                                return;
+                            }
+                            if held.cancel_requested.load(Ordering::Acquire) && held.calls.idle() {
+                                // An abandoned caller's intent survives late native output. Eligibility
+                                // still requires actual successful complete creation and NEVER Resume.
+                                let _ = held.cancel_suspended();
+                            }
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                    });
+                if started.is_err() {
+                    // Definite failure dispatched no observer. A caller/actual late worker may
+                    // renew this reservation; it never permits another child Create or Resume.
+                    self.monitor_started.store(false, Ordering::Release);
+                    return Err(NativeError::Unavailable);
+                }
+                Ok(())
+            }
+            fn cancel_suspended(self: &Arc<Self>) -> NativeResult<()> {
+                // Independent intent publication never waits behind the CreateProcess state gate.
+                // It is NOT authority: the settled original output gates below decide cleanup.
+                self.cancel_requested.store(true, Ordering::Release);
+                let observer = self.monitor_exit();
+                if !self.calls.idle() {
+                    return Err(observer.err().unwrap_or(NativeError::Busy));
+                }
+                // Observer failure cannot hide positively eligible actual output/no-child state.
+                // Busy/partial/Resume-attempted states keep the observer error and retained owner.
+                if self.release_if_settled()? {
+                    return Ok(());
+                }
+                let process = {
+                    let mut state = self.state.lock().map_err(|_| NativeError::OutcomeUnknown)?;
+                    // FALSE/partial native output, a running/late worker or any Resume attempt
+                    // is uncertain. No such case is eligible for termination.
+                    if !state.known_created
+                        || !state.create_returned
+                        || state.resuming
+                        || state.resumed
+                        || state.cleanup_started
+                    {
+                        return Err(observer.err().unwrap_or(NativeError::OutcomeUnknown));
+                    }
+                    state.cleanup_started = true;
+                    state.process.clone().ok_or(NativeError::OutcomeUnknown)?
+                };
+                let held = self.clone();
+                // The caller's original thirty-second launch window is never renewed. This one
+                // separately bounded cleanup remains owned after the caller returns its error.
+                std::thread::Builder::new()
+                    .name("crosspane-keeper-suspended-cleanup".into())
+                    .spawn(move || {
+                        let result = (|| {
+                            let budget = Deadline::new(
+                                30_000,
+                                held.io.bound_clock(),
+                                Cancellation::default(),
+                            )?;
+                            let captured = held.clone();
+                            let bound = budget.clone();
+                            held.cleanup.run(Dispatch::Mutation, &budget, move || {
+                                bound.check()?;
+                                // SAFETY: actual successful SUSPENDED creation, retained process,
+                                // NEVER resumed. No unknown/failed-output/Resume attempt is eligible.
+                                if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
+                                    return Err(NativeError::OutcomeUnknown);
+                                }
+                                loop {
+                                    bound.check()?;
+                                    // SAFETY: exact same original object, bounded zero-time exit poll.
+                                    if unsafe { WaitForSingleObject(process.as_raw_handle(), 0) }
+                                        == WAIT_OBJECT_0
+                                    {
+                                        break;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                                drop(captured);
+                                Ok(())
+                            })
+                        })();
+                        if result.is_ok() {
+                            let _ = held.release_if_settled();
+                        }
+                    })
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                Ok(())
+            }
+        }
+
+        use super::super::supervisor_owner::{
+            OuterPeerPin, admit_keeper_observer_server, admit_keeper_peer,
+            admit_outer_observer_peer, admit_outer_source_peer,
+        };
+        use tokio::{
+            io::{AsyncRead, AsyncWrite, ReadBuf},
+            net::windows::named_pipe::{
+                ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+            },
+        };
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Message {
+            schema: u32,
+            operation: [u8; 16],
+            method: Method,
+            state: Option<WireState>,
+        }
+        #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        enum Method {
+            Sources,
+            Ready,
+            Commit,
+            Cancel,
+            Observe,
+            Ack,
+            Refused,
+        }
+        #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        enum WireState {
+            Ready,
+            Committed,
+            Retained,
+            Complete,
+            Cancelled,
+            ReinstallRequired,
+        }
+        fn wire_stage(stage: KeeperStage) -> WireState {
+            match stage {
+                KeeperStage::Ready => WireState::Ready,
+                KeeperStage::Committed => WireState::Committed,
+                KeeperStage::Complete => WireState::Complete,
+                KeeperStage::Cancelled => WireState::Cancelled,
+                KeeperStage::Preparing | KeeperStage::Retained => WireState::Retained,
+            }
+        }
+        pub(crate) struct KeeperObservation {
+            stage: KeeperStage,
+        }
+        fn endpoint(io: &WindowsNativeIo) -> String {
+            format!(
+                r"\\.\pipe\Crosspane.{}.{}.upgrade-keeper",
+                io.target().identity().user.sddl(),
+                io.target().identity().session
+            )
+        }
+        fn runtime() -> NativeResult<tokio::runtime::Runtime> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(|_| NativeError::Unavailable)
+        }
+        async fn read_exact<R: AsyncRead + Unpin>(
+            pipe: &mut R,
+            bytes: &mut [u8],
+        ) -> std::io::Result<()> {
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let end = (offset + CHUNK).min(bytes.len());
+                let mut target = ReadBuf::new(&mut bytes[offset..end]);
+                std::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut *pipe).poll_read(cx, &mut target)
+                })
+                .await?;
+                if target.filled().is_empty() {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                offset += target.filled().len();
+            }
+            Ok(())
+        }
+        async fn write_all<W: AsyncWrite + Unpin>(
+            pipe: &mut W,
+            bytes: &[u8],
+        ) -> std::io::Result<()> {
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let end = (offset + CHUNK).min(bytes.len());
+                let n = std::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut *pipe).poll_write(cx, &bytes[offset..end])
+                })
+                .await?;
+                if n == 0 || n > end - offset {
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+                offset += n;
+            }
+            Ok(())
+        }
+        async fn write_message<W: AsyncWrite + Unpin>(
+            pipe: &mut W,
+            op: [u8; 16],
+            method: Method,
+            state: Option<WireState>,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let bytes = serde_json::to_vec(&Message {
+                schema: 1,
+                operation: op,
+                method,
+                state,
+            })
+            .map_err(|_| NativeError::Invalid)?;
+            if bytes.len() > 2048 {
+                return Err(NativeError::Oversize);
+            }
+            tokio::time::timeout(Duration::from_millis(deadline.remaining_ms()?), async {
+                write_all(pipe, &(bytes.len() as u32).to_le_bytes()).await?;
+                write_all(pipe, &bytes).await
+            })
+            .await
+            .map_err(|_| NativeError::OutcomeUnknown)?
+            .map_err(|_| NativeError::OutcomeUnknown)
+        }
+        async fn read_message<R: AsyncRead + Unpin>(
+            pipe: &mut R,
+            op: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<Message> {
+            let value =
+                tokio::time::timeout(Duration::from_millis(deadline.remaining_ms()?), async {
+                    let mut length = [0; 4];
+                    read_exact(pipe, &mut length)
+                        .await
+                        .map_err(|_| NativeError::Unavailable)?;
+                    let length = u32::from_le_bytes(length) as usize;
+                    if length == 0 || length > 2048 {
+                        return Err(NativeError::Oversize);
+                    }
+                    let mut bytes = vec![0; length];
+                    read_exact(pipe, &mut bytes)
+                        .await
+                        .map_err(|_| NativeError::Unavailable)?;
+                    serde_json::from_slice::<Message>(&bytes).map_err(|_| NativeError::Invalid)
+                })
+                .await
+                .map_err(|_| NativeError::Timeout)??;
+            if value.schema != 1 || value.operation != op {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()?;
+            Ok(value)
+        }
+        struct Descriptor(PSECURITY_DESCRIPTOR);
+        impl Drop for Descriptor {
+            fn drop(&mut self) {
+                // SAFETY: exactly the LocalAlloc allocation transferred by SDDL conversion.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        fn create_server(io: &WindowsNativeIo) -> NativeResult<NamedPipeServer> {
+            let token = io.target().identity();
+            let user = token.user.sddl();
+            let logon = token.logon.sddl();
+            let text = files::native::wide(&format!(
+                "O:{user}G:{user}D:P(A;;GA;;;{user})(A;;GRGW;;;{logon})"
+            ))?;
+            let mut pointer = std::ptr::null_mut();
+            // SAFETY: exact validated current user/logon SIDs, protected local descriptor output.
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut pointer,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(NativeError::Unavailable);
+            }
+            let descriptor = Descriptor(pointer);
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0,
+                bInheritHandle: 0,
+            };
+            // SAFETY: sole first instance, one local connection with no inheritance; validated
+            // descriptor lives until the call returns and Tokio then owns the actual server object.
+            unsafe {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .reject_remote_clients(true)
+                    .max_instances(1)
+                    .in_buffer_size(CHUNK as u32)
+                    .out_buffer_size(CHUNK as u32)
+                    .create_with_security_attributes_raw(
+                        endpoint(io),
+                        (&attributes as *const SECURITY_ATTRIBUTES)
+                            .cast_mut()
+                            .cast(),
+                    )
+            }
+            .map_err(|_| NativeError::Busy)
+        }
+        pub(crate) struct KeeperServer {
+            io: Arc<WindowsNativeIo>,
+            selected: SelectedOuterOperation,
+            parent: KeeperParent,
+            rt: tokio::runtime::Runtime,
+            pipe: NamedPipeServer,
+            peer: Option<OuterPeerPin>,
+            connected: bool,
+        }
+        impl KeeperServer {
+            pub(crate) fn reserve(
+                io: Arc<WindowsNativeIo>,
+                selected: SelectedOuterOperation,
+                deadline: &Deadline,
+            ) -> NativeResult<Self> {
+                let proof = io.admit_support(deadline)?;
+                proof.check(&io, deadline)?;
+                let parent = KeeperParent::admit(&io, &selected, deadline)?;
+                let rt = runtime()?;
+                let pipe = {
+                    let _entered = rt.enter();
+                    create_server(&io)?
+                };
+                Ok(Self {
+                    io,
+                    selected,
+                    parent,
+                    rt,
+                    pipe,
+                    peer: None,
+                    connected: false,
+                })
+            }
+            pub(crate) fn selected(&self) -> &SelectedOuterOperation {
+                &self.selected
+            }
+            pub(crate) fn receive_sources(
+                &mut self,
+                deadline: &Deadline,
+            ) -> NativeResult<ApprovedOuterSources> {
+                self.rt.block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_millis(deadline.remaining_ms()?),
+                        self.pipe.connect(),
+                    )
+                    .await
+                    .map_err(|_| NativeError::Timeout)?
+                    .map_err(|_| NativeError::Unavailable)
+                })?;
+                self.connected = true;
+                let proof = self.io.admit_support(deadline)?;
+                self.peer = Some(admit_outer_source_peer(
+                    self.pipe.as_raw_handle(),
+                    self.io.clone(),
+                    &proof,
+                    &self.parent,
+                    self.selected.module(),
+                    self.selected.operation(),
+                    deadline,
+                )?);
+                let message = self.rt.block_on(read_message(
+                    &mut self.pipe,
+                    self.selected.operation(),
+                    deadline,
+                ))?;
+                if message.method != Method::Sources || message.state.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+                let inventory = ApprovedInventory::embedded()?;
+                let own = ApprovedPe::own_image(self.selected.module())?;
+                inventory.check_staging_budget(&own, true)?;
+                let mut received: [Vec<u8>; 3] = std::array::from_fn(|_| Vec::new());
+                for (index, role) in [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let expected = inventory.role(role)?.size();
+                    self.rt.block_on(async {
+                        let mut length = [0; 8];
+                        tokio::time::timeout(
+                            Duration::from_millis(deadline.remaining_ms()?),
+                            read_exact(&mut self.pipe, &mut length),
+                        )
+                        .await
+                        .map_err(|_| NativeError::Timeout)?
+                        .map_err(|_| NativeError::Unavailable)?;
+                        if u64::from_le_bytes(length) != expected {
+                            return Err(NativeError::Foreign);
+                        }
+                        let length =
+                            usize::try_from(expected).map_err(|_| NativeError::Oversize)?;
+                        received[index]
+                            .try_reserve_exact(length)
+                            .map_err(|_| NativeError::Oversize)?;
+                        received[index].resize(length, 0);
+                        tokio::time::timeout(
+                            Duration::from_millis(deadline.remaining_ms()?),
+                            read_exact(&mut self.pipe, &mut received[index]),
+                        )
+                        .await
+                        .map_err(|_| NativeError::Timeout)?
+                        .map_err(|_| NativeError::Unavailable)
+                    })?;
+                }
+                let proof = self.io.admit_support(deadline)?;
+                self.peer
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .reverify(&self.io, &proof, deadline)?;
+                let result = ApprovedOuterSources::receive(received, &inventory, &own, deadline)?;
+                if result.facts() != self.selected.record().sources() {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(result)
+            }
+            pub(crate) fn refuse_reinstall_required(
+                &mut self,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                let proof = self.io.admit_support(deadline)?;
+                self.peer
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .reverify(&self.io, &proof, deadline)?;
+                self.rt.block_on(write_message(
+                    &mut self.pipe,
+                    self.selected.operation(),
+                    Method::Refused,
+                    Some(WireState::ReinstallRequired),
+                    deadline,
+                ))
+            }
+            pub(crate) fn announce_ready(&mut self, deadline: &Deadline) -> NativeResult<()> {
+                let proof = self.io.admit_support(deadline)?;
+                self.peer
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .reverify(&self.io, &proof, deadline)?;
+                self.rt.block_on(write_message(
+                    &mut self.pipe,
+                    self.selected.operation(),
+                    Method::Ready,
+                    Some(WireState::Ready),
+                    deadline,
+                ))
+            }
+            pub(crate) fn wait_commit(&mut self, deadline: &Deadline) -> NativeResult<bool> {
+                let proof = self.io.admit_support(deadline)?;
+                self.peer
+                    .as_ref()
+                    .ok_or(NativeError::Foreign)?
+                    .reverify(&self.io, &proof, deadline)?;
+                let request = self.rt.block_on(read_message(
+                    &mut self.pipe,
+                    self.selected.operation(),
+                    deadline,
+                ))?;
+                if request.state.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+                match request.method {
+                    Method::Commit => Ok(true),
+                    Method::Cancel => Ok(false),
+                    _ => Err(NativeError::Foreign),
+                }
+            }
+            pub(crate) fn acknowledge_commit(&mut self, deadline: &Deadline) {
+                // Lost ACK never cancels/repeats committed work. Close actual aliases so later
+                // same-operation observers can connect; no read/source queue survives this handoff.
+                let _ = self.rt.block_on(write_message(
+                    &mut self.pipe,
+                    self.selected.operation(),
+                    Method::Ack,
+                    Some(WireState::Committed),
+                    deadline,
+                ));
+                self.disconnect();
+            }
+            fn disconnect(&mut self) {
+                self.peer.take();
+                if self.connected {
+                    let _ = self.pipe.disconnect();
+                    self.connected = false;
+                }
+            }
+            pub(crate) fn poll_observer(
+                &mut self,
+                stage: KeeperStage,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if self.connected {
+                    return Err(NativeError::Busy);
+                }
+                let remaining = deadline.remaining_ms()?;
+                let connected = self.rt.block_on(async {
+                    tokio::time::timeout(Duration::from_millis(remaining), self.pipe.connect())
+                        .await
+                });
+                match connected {
+                    Err(_) => return Ok(()),
+                    Ok(Err(_)) => return Err(NativeError::Unavailable),
+                    Ok(Ok(())) => {}
+                }
+                self.connected = true;
+                let result = (|| {
+                    let proof = self.io.admit_support(deadline)?;
+                    let peer = admit_outer_observer_peer(
+                        self.pipe.as_raw_handle(),
+                        self.io.clone(),
+                        &proof,
+                        self.selected.operation(),
+                        deadline,
+                    )?;
+                    let message = self.rt.block_on(read_message(
+                        &mut self.pipe,
+                        self.selected.operation(),
+                        deadline,
+                    ))?;
+                    if message.method != Method::Observe || message.state.is_some() {
+                        return Err(NativeError::Foreign);
+                    }
+                    peer.reverify(&self.io, &self.io.admit_support(deadline)?, deadline)?;
+                    self.rt.block_on(write_message(
+                        &mut self.pipe,
+                        self.selected.operation(),
+                        Method::Ack,
+                        Some(wire_stage(stage)),
+                        deadline,
+                    ))
+                })();
+                self.disconnect();
+                result
+            }
+        }
+
+        struct ExclusiveKeeperNamespace {
+            io: Arc<WindowsNativeIo>,
+            pipe: NamedPipeServer,
+            own: process::own::OwnProcessIdentity,
+            _rt: tokio::runtime::Runtime,
+        }
+        impl ExclusiveKeeperNamespace {
+            fn reserve(
+                io: Arc<WindowsNativeIo>,
+                proof: &SupportProof,
+                deadline: &Deadline,
+            ) -> NativeResult<Arc<Self>> {
+                proof.check(&io, deadline)?;
+                let own = io.own_process_identity(proof, deadline)?;
+                let rt = runtime()?;
+                let pipe = {
+                    let _entered = rt.enter();
+                    create_server(&io)?
+                };
+                let value = Arc::new(Self {
+                    io,
+                    pipe,
+                    own,
+                    _rt: rt,
+                });
+                value.reverify(proof, deadline)?;
+                Ok(value)
+            }
+            fn reverify(&self, proof: &SupportProof, deadline: &Deadline) -> NativeResult<()> {
+                proof.check(&self.io, deadline)?;
+                self.own.reverify(deadline)?;
+                let mut flags = 0;
+                // SAFETY: exact originally created sole FIRST_INSTANCE server object, not a name
+                // reconstructed from metadata. Same original process/context retain the lease.
+                if unsafe {
+                    GetNamedPipeInfo(
+                        self.pipe.as_raw_handle(),
+                        &mut flags,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                    || flags & PIPE_SERVER_END == 0
+                {
+                    return Err(NativeError::Foreign);
+                }
+                deadline.check()
+            }
+        }
+        /// Actual original process EXIT, cleanup only. Never a tree/start/Stop capability.
+        pub(crate) struct SettledKeeperCopy {
+            io: Arc<WindowsNativeIo>,
+            process: Arc<OwnedHandle>,
+            pid: u32,
+            created: u64,
+            operation: [u8; 16],
+            identity: FileIdentity,
+        }
+        impl SettledKeeperCopy {
+            fn from_peer(
+                io: Arc<WindowsNativeIo>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                peer: OuterPeerPin,
+                deadline: &Deadline,
+            ) -> NativeResult<Self> {
+                let record = io.observe_outer_operation(proof, lock, deadline)?;
+                peer.reverify_exited_keeper(&io, proof, record.operation(), deadline)?;
+                let identity = peer.image_identity();
+                let value = Self {
+                    io,
+                    process: peer.retained_process(),
+                    pid: peer.pid(),
+                    created: peer.creation(),
+                    operation: record.operation(),
+                    identity,
+                };
+                // Settle the peer's actual measured read pins before any exclusive DELETE open.
+                drop(peer);
+                value.reverify(proof, deadline)?;
+                Ok(value)
+            }
+            fn reverify(&self, proof: &SupportProof, deadline: &Deadline) -> NativeResult<()> {
+                proof.check(&self.io, deadline)?;
+                // SAFETY: SAME retained kernel-derived original process; never OpenProcess PID.
+                if unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } != WAIT_OBJECT_0
+                    // SAFETY: query the SAME original kernel-admitted retained process object.
+                    || unsafe { GetProcessId(self.process.as_raw_handle()) } != self.pid
+                    || process_creation(&self.process)? != self.created
+                {
+                    return Err(NativeError::Foreign);
+                }
+                deadline.check()
+            }
+        }
+        /// Positive fixed-name absence plus ACTUAL exclusive namespace. FS-only retirement;
+        /// metadata/this type never reconstructs a process/job or permits Stop/start/Run.
+        pub(crate) struct KeeperCopyAbsent {
+            io: Arc<WindowsNativeIo>,
+            namespace: Arc<ExclusiveKeeperNamespace>,
+            operation: [u8; 16],
+            identity: Option<FileIdentity>,
+        }
+        impl KeeperCopyAbsent {
+            pub(crate) fn operation(&self) -> [u8; 16] {
+                self.operation
+            }
+            pub(crate) fn reverify(
+                &self,
+                io: &WindowsNativeIo,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<()> {
+                if !std::ptr::eq(io, self.io.as_ref()) {
+                    return Err(NativeError::Foreign);
+                }
+                io.lock_binding(proof, lock, deadline)?;
+                self.namespace.reverify(proof, deadline)?;
+                let record = cleanup_ledger(io, proof, lock, deadline)?;
+                if record.operation() != self.operation
+                    || record.keeper_image() != self.identity.map(outer_stamp)
+                    || record.copy_cleanup()
+                        != super::super::super::payload::recovery::OuterCopyCleanup::Absent
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let context = io.context.clone();
+                let lease = lock.0.clone();
+                let operation = self.operation;
+                let budget = proof.budget(io, deadline)?;
+                io.owner.run(Dispatch::Observation, deadline, move || {
+                    validate_payload_lock(&context, &lease, &budget)?;
+                    // Missing admitted ancestors prove absence without creating any path.
+                    let Some(root) = Anchor::open(
+                        context.target.paths.install(),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?
+                    else {
+                        return Ok(());
+                    };
+                    let Some(stage) = root.child("payload-stage", &context.security, &budget)?
+                    else {
+                        return Ok(());
+                    };
+                    let Some(parent) =
+                        stage.child(&records::hex(&operation), &context.security, &budget)?
+                    else {
+                        return Ok(());
+                    };
+                    if parent
+                        .opaque("keeper-copy.exe", false, &context.security, &budget)?
+                        .is_some()
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(())
+                })
+            }
+        }
+        fn cleanup_ledger(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<OuterUpgradeRecord> {
+            use super::super::super::payload::recovery::{
+                self, OperationRecord, OriginalLeaf, Phase,
+            };
+            io.lock_binding(proof, lock, deadline)?;
+            let record =
+                OuterUpgradeRecord::read(io, proof, deadline)?.ok_or(NativeError::Foreign)?;
+            record.context().same_user(io.target().identity())?;
+            if !matches!(record.phase(), OuterPhase::Complete | OuterPhase::Cancelled) {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let observed = io
+                .read_record(
+                    proof,
+                    records::RecordName::Operation(record.operation()),
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .ok_or(NativeError::Foreign)?;
+            let operation: OperationRecord = records::record_data(
+                &records::RecordName::Operation(record.operation()),
+                observed.bytes(),
+            )?;
+            operation.validate()?;
+            let catalog = recovery::catalog(io, proof, deadline)?;
+            if record.phase() == OuterPhase::Complete {
+                if operation.phase() != Phase::Complete || catalog.active.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+            } else {
+                if !matches!(operation.phase(), Phase::Intent | Phase::RolledBack)
+                    || catalog.active.is_some_and(|op| op != record.operation())
+                    || operation.current_role().is_some()
+                    || operation.original_instance().is_some()
+                    || operation.new_instance().is_some()
+                    || operation.handoff().is_some()
+                    || operation.retention_incomplete()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                for role in PayloadRole::ALL {
+                    let role = operation.role(role)?;
+                    if role.original != OriginalLeaf::Unobserved
+                        || role.staged.is_some()
+                        || role.backup.is_some()
+                        || role.published.is_some()
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                }
+            }
+            Ok(record)
+        }
+        fn publish_cleanup(
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            record: &OuterUpgradeRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            io.lock_binding(proof, lock, deadline)?;
+            record.validate()?;
+            record.context().same_user(io.target().identity())?;
+            if !matches!(record.phase(), OuterPhase::Complete | OuterPhase::Cancelled) {
+                return Err(NativeError::Foreign);
+            }
+            let publication = io.publish_record(
+                proof,
+                lock,
+                records::RecordName::OuterUpgrade,
+                &record.encode()?,
+                deadline,
+            )?;
+            if publication.state != records::PublicationRecovery::NewPublished
+                || publication.native_failure.is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        }
+        impl WindowsNativeIo {
+            /// Explicit lead2bbef658 FS-only cold retirement. It proves current namespace vacancy
+            /// by actually reserving first instance, NOT old process exit or tree completion.
+            pub(crate) fn cleanup_cold_keeper(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                deadline: &Deadline,
+            ) -> NativeResult<KeeperCopyAbsent> {
+                self.lock_binding(proof, lock, deadline)?;
+                let record = cleanup_ledger(self, proof, lock, deadline)?;
+                let namespace = ExclusiveKeeperNamespace::reserve(self.clone(), proof, deadline)?;
+                self.cleanup_copy_with_namespace(proof, lock, record, namespace, deadline)
+            }
+            pub(crate) fn cleanup_exited_keeper(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                peer: OuterPeerPin,
+                deadline: &Deadline,
+            ) -> NativeResult<KeeperCopyAbsent> {
+                let exit = SettledKeeperCopy::from_peer(self.clone(), proof, lock, peer, deadline)?;
+                exit.reverify(proof, deadline)?;
+                let record = cleanup_ledger(self, proof, lock, deadline)?;
+                if record.operation() != exit.operation
+                    || record.keeper_image() != Some(outer_stamp(exit.identity))
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let namespace = ExclusiveKeeperNamespace::reserve(self.clone(), proof, deadline)?;
+                self.cleanup_copy_with_namespace(proof, lock, record, namespace, deadline)
+            }
+            fn cleanup_copy_with_namespace(
+                self: &Arc<Self>,
+                proof: &SupportProof,
+                lock: &InstallerLock,
+                mut record: OuterUpgradeRecord,
+                namespace: Arc<ExclusiveKeeperNamespace>,
+                deadline: &Deadline,
+            ) -> NativeResult<KeeperCopyAbsent> {
+                use super::super::super::payload::recovery::OuterCopyCleanup;
+                namespace.reverify(proof, deadline)?;
+                let identity = record.keeper_image().map(|stamp| FileIdentity {
+                    volume: stamp.volume,
+                    file: stamp.file,
+                });
+                // Fresh fixed-name observation precedes a NEW DeleteIntent. A missing copy with
+                // a recorded FileId cannot be explained by an intent we are just about to create.
+                let observed = {
+                    let context = self.context.clone();
+                    let lease = lock.0.clone();
+                    let operation = record.operation();
+                    let expected = record.encode()?;
+                    let budget = proof.budget(self, deadline)?;
+                    self.owner.run(Dispatch::Observation, deadline, move || {
+                        validate_payload_lock(&context, &lease, &budget)?;
+                        let (_, bytes) = lease
+                            .parent
+                            .read_private(
+                                &records::RecordName::OuterUpgrade.file_name()?,
+                                &context.security,
+                                files::MAX_RECORD_BYTES,
+                                &budget,
+                            )?
+                            .ok_or(NativeError::Foreign)?;
+                        if bytes != expected {
+                            return Err(NativeError::Foreign);
+                        }
+                        let Some(root) = Anchor::open(
+                            context.target.paths.install(),
+                            &context.security,
+                            true,
+                            &budget,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(stage) =
+                            root.child("payload-stage", &context.security, &budget)?
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(parent) =
+                            stage.child(&records::hex(&operation), &context.security, &budget)?
+                        else {
+                            return Ok(None);
+                        };
+                        Ok(parent
+                            .opaque("keeper-copy.exe", false, &context.security, &budget)?
+                            .map(|leaf| leaf.identity))
+                    })?
+                };
+                match (record.copy_cleanup(), identity, observed) {
+                    (OuterCopyCleanup::None, None, None) => {}
+                    (OuterCopyCleanup::None, Some(expected), Some(actual))
+                        if expected == actual => {}
+                    (OuterCopyCleanup::DeleteIntent, Some(expected), Some(actual))
+                        if expected == actual => {}
+                    (OuterCopyCleanup::DeleteIntent, _, None)
+                    | (OuterCopyCleanup::Absent, _, None) => {}
+                    _ => return Err(NativeError::OutcomeUnknown),
+                }
+                if record.copy_cleanup() == OuterCopyCleanup::None {
+                    record.begin_cleanup()?;
+                    publish_cleanup(self, proof, lock, &record, deadline)?;
+                }
+                let operation = record.operation();
+                let expected = record.encode()?;
+                let context = self.context.clone();
+                let lease = lock.0.clone();
+                let namespace_held = namespace.clone();
+                let io = self.clone();
+                let fresh = self.admit_support(deadline)?;
+                let budget = fresh.budget(self, deadline)?;
+                self.owner.run(Dispatch::Mutation, deadline, move || {
+                    let change = Change::new();
+                    let result = change.finish((|| {
+                        namespace_held.own.reverify(&budget)?;
+                        context.validate(&budget)?;
+                        validate_payload_lock(&context, &lease, &budget)?;
+                        let (_, bytes) = lease
+                            .parent
+                            .read_private(
+                                &records::RecordName::OuterUpgrade.file_name()?,
+                                &context.security,
+                                files::MAX_RECORD_BYTES,
+                                &budget,
+                            )?
+                            .ok_or(NativeError::Foreign)?;
+                        let current = OuterUpgradeRecord::decode(&bytes)?;
+                        current.context().same_user(&context.target.identity)?;
+                        if current.encode()? != expected {
+                            return Err(NativeError::Foreign);
+                        }
+                        let Some(root) = Anchor::open(
+                            context.target.paths.install(),
+                            &context.security,
+                            true,
+                            &budget,
+                        )?
+                        else {
+                            return Ok(());
+                        };
+                        let Some(stage) =
+                            root.child("payload-stage", &context.security, &budget)?
+                        else {
+                            return Ok(());
+                        };
+                        let Some(parent) =
+                            stage.child(&records::hex(&operation), &context.security, &budget)?
+                        else {
+                            return Ok(());
+                        };
+                        if let Some(actual) =
+                            parent.opaque("keeper-copy.exe", false, &context.security, &budget)?
+                        {
+                            if Some(actual.identity) != identity {
+                                return Err(NativeError::Foreign);
+                            }
+                            drop(actual);
+                            change.reached();
+                            parent.delete_keeper_copy(
+                                identity.ok_or(NativeError::Foreign)?,
+                                &context.security,
+                                &budget,
+                            )?;
+                        }
+                        if parent
+                            .opaque("keeper-copy.exe", false, &context.security, &budget)?
+                            .is_some()
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        Ok(())
+                    })());
+                    if matches!(result, Err(NativeError::OutcomeUnknown)) {
+                        io.owner.retire_mutations();
+                    }
+                    result
+                })?;
+                if record.copy_cleanup() != OuterCopyCleanup::Absent {
+                    record.copy_absent()?;
+                    let proof = self.admit_support(deadline)?;
+                    publish_cleanup(self, &proof, lock, &record, deadline)?;
+                }
+                let absence = KeeperCopyAbsent {
+                    io: self.clone(),
+                    namespace,
+                    operation,
+                    identity,
+                };
+                absence.reverify(self, &self.admit_support(deadline)?, lock, deadline)?;
+                Ok(absence)
+            }
+        }
+
+        pub(crate) struct KeeperReady {
+            child: KeeperChild,
+            rt: tokio::runtime::Runtime,
+            pipe: NamedPipeClient,
+            peer: OuterPeerPin,
+        }
+        #[doc(hidden)]
+        pub struct KeeperContinuation {
+            io: Arc<WindowsNativeIo>,
+            operation: [u8; 16],
+        }
+        impl std::fmt::Debug for KeeperContinuation {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("KeeperContinuation")
+            }
+        }
+        impl KeeperChild {
+            pub(crate) fn await_ready(&self, deadline: &Deadline) -> NativeResult<KeeperReady> {
+                let rt = runtime()?;
+                let mut pipe = loop {
+                    deadline.check()?;
+                    let result = {
+                        let _enter = rt.enter();
+                        ClientOptions::new().open(endpoint(&self.0.io))
+                    };
+                    match result {
+                        Ok(pipe) => break pipe,
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                };
+                let proof = self.0.io.admit_support(deadline)?;
+                let image = self.0.image()?;
+                let peer = admit_keeper_peer(
+                    pipe.as_raw_handle(),
+                    true,
+                    self.0.io.clone(),
+                    &proof,
+                    &self.process()?,
+                    &image,
+                    deadline,
+                )?;
+                let op = self
+                    .0
+                    .selected
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .operation();
+                let transfer = rt.block_on(async {
+                    write_message(&mut pipe, op, Method::Sources, None, deadline).await?;
+                    for role in [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl] {
+                        let bytes = self.0.sources.bytes(role)?;
+                        tokio::time::timeout(
+                            Duration::from_millis(deadline.remaining_ms()?),
+                            async {
+                                write_all(&mut pipe, &(bytes.len() as u64).to_le_bytes()).await?;
+                                write_all(&mut pipe, bytes).await
+                            },
+                        )
+                        .await
+                        .map_err(|_| NativeError::OutcomeUnknown)?
+                        .map_err(|_| NativeError::OutcomeUnknown)?;
+                    }
+                    let reply = read_message(&mut pipe, op, deadline).await?;
+                    if reply.method == Method::Refused
+                        && reply.state == Some(WireState::ReinstallRequired)
+                    {
+                        eprintln!("Windows outer completion unavailable; reinstall required");
+                        return Err(NativeError::Unsupported);
+                    }
+                    if reply.method != Method::Ready || reply.state != Some(WireState::Ready) {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(())
+                });
+                drop(image);
+                if let Err(error) = transfer {
+                    // Only this previously kernel-admitted ORIGINAL keeper peer can supply exit
+                    // cleanup. A still-live/unknown child refuses; no cancellation/kill/Stop occurs.
+                    if let Ok(cleanup) =
+                        Deadline::new(30_000, self.0.io.bound_clock(), Cancellation::default())
+                        && let Ok(proof) = self.0.io.admit_support(&cleanup)
+                        && let Ok(lock) = self.0.io.acquire_installer_lock(&proof, &cleanup)
+                        && let Ok(proof) = self.0.io.admit_support(&cleanup)
+                    {
+                        let _ = self
+                            .0
+                            .io
+                            .cleanup_exited_keeper(&proof, &lock, peer, &cleanup);
+                    }
+                    return Err(error);
+                }
+                peer.reverify(&self.0.io, &self.0.io.admit_support(deadline)?, deadline)?;
+                Ok(KeeperReady {
+                    child: KeeperChild(self.0.clone()),
+                    rt,
+                    pipe,
+                    peer,
+                })
+            }
+        }
+        impl KeeperReady {
+            pub(crate) fn commit(
+                mut self,
+                deadline: &Deadline,
+            ) -> NativeResult<KeeperContinuation> {
+                self.peer.reverify(
+                    &self.child.0.io,
+                    &self.child.0.io.admit_support(deadline)?,
+                    deadline,
+                )?;
+                let op = self
+                    .child
+                    .0
+                    .selected
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .operation();
+                self.rt.block_on(async {
+                    write_message(&mut self.pipe, op, Method::Commit, None, deadline).await?;
+                    let reply = read_message(&mut self.pipe, op, deadline).await?;
+                    if reply.method != Method::Ack || reply.state != Some(WireState::Committed) {
+                        return Err(NativeError::Foreign);
+                    }
+                    Ok(())
+                })?;
+                Ok(KeeperContinuation {
+                    io: self.child.0.io.clone(),
+                    operation: op,
+                })
+            }
+        }
+        impl KeeperContinuation {
+            /// Read-only authenticated observation of the retained keeper. No replay or native
+            /// authority is returned; caller loss never cancels a committed operation.
+            pub fn status(&self) -> NativeResult<&'static str> {
+                let deadline =
+                    Deadline::new(30_000, self.io.bound_clock(), Cancellation::default())?;
+                Ok(match self.observe(&deadline)?.stage {
+                    KeeperStage::Preparing => "preparing",
+                    KeeperStage::Ready => "ready",
+                    KeeperStage::Committed => "committed",
+                    KeeperStage::Retained => "retained",
+                    KeeperStage::Complete => "complete",
+                    KeeperStage::Cancelled => "cancelled",
+                })
+            }
+            pub(crate) fn admit(
+                io: Arc<WindowsNativeIo>,
+                proof: &SupportProof,
+                selected: &SelectedOuterOperation,
+                deadline: &Deadline,
+            ) -> NativeResult<Self> {
+                if !Arc::ptr_eq(&io, selected.io()) {
+                    return Err(NativeError::Foreign);
+                }
+                proof.check(&io, deadline)?;
+                // Connection authority is checked from the actual server kernel peer below;
+                // selected record fields only identify this one operation, never its process.
+                let value = Self {
+                    io,
+                    operation: selected.operation(),
+                };
+                value.observe(deadline)?;
+                Ok(value)
+            }
+            pub(crate) fn observe(&self, deadline: &Deadline) -> NativeResult<KeeperObservation> {
+                let rt = runtime()?;
+                let mut pipe = {
+                    let _entered = rt.enter();
+                    ClientOptions::new().open(endpoint(&self.io))
+                }
+                .map_err(|_| NativeError::Unavailable)?;
+                let proof = self.io.admit_support(deadline)?;
+                let peer = admit_keeper_observer_server(
+                    pipe.as_raw_handle(),
+                    self.io.clone(),
+                    &proof,
+                    self.operation,
+                    deadline,
+                )?;
+                let reply = rt.block_on(async {
+                    write_message(&mut pipe, self.operation, Method::Observe, None, deadline)
+                        .await?;
+                    read_message(&mut pipe, self.operation, deadline).await
+                })?;
+                if reply.method != Method::Ack {
+                    return Err(NativeError::Foreign);
+                }
+                peer.reverify(&self.io, &self.io.admit_support(deadline)?, deadline)?;
+                let stage = match reply.state.ok_or(NativeError::Foreign)? {
+                    WireState::Ready => KeeperStage::Ready,
+                    WireState::Committed => KeeperStage::Committed,
+                    WireState::Retained => KeeperStage::Retained,
+                    WireState::Complete => KeeperStage::Complete,
+                    WireState::Cancelled => KeeperStage::Cancelled,
+                    WireState::ReinstallRequired => return Err(NativeError::Foreign),
+                };
+                Ok(KeeperObservation { stage })
+            }
+        }
+
+        impl KeeperChild {
+            pub(crate) fn process(&self) -> NativeResult<Arc<OwnedHandle>> {
+                self.0
+                    .state
+                    .lock()
+                    .map_err(|_| NativeError::OutcomeUnknown)?
+                    .process
+                    .clone()
+                    .ok_or(NativeError::OutcomeUnknown)
             }
         }
     }

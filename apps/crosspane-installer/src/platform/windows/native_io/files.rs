@@ -1477,6 +1477,55 @@ pub(crate) mod native {
                 Some(_) => Err(NativeError::OutcomeUnknown),
             }
         }
+        /// A4d exact-identity fixed lifecycle copy under the actual installer lock and admitted
+        /// durable cleanup intent. Caller renews its live exclusive namespace plus strict terminal
+        /// selection, optionally also its positive retained-peer exit; FS-only cleanup grants no
+        /// old tree/process completion or start authority.
+        #[cfg(not(test))]
+        pub(crate) fn delete_keeper_copy(
+            &self,
+            expected: FileIdentity,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            const LEAF: &str = "keeper-copy.exe";
+            self.revalidate(security, true, deadline)?;
+            let source = open_component(
+                self.file()?,
+                &ComponentName::new(LEAF)?,
+                ObjectKind::File,
+                super::DELETE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+            let facts = observe(&source, LEAF, security)?;
+            super::admit_component(&facts, super::Admission::PrivateFile)?;
+            if facts.identity != expected {
+                return Err(NativeError::Foreign);
+            }
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            deadline.check()?;
+            // SAFETY: strict private/no-follow fixed leaf; exact FileId checked on THIS exclusive
+            // DELETE handle. No POSIX flags, overwrite, path reopen or loaded-image bypass.
+            if unsafe {
+                SetFileInformationByHandle(
+                    source.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            drop(source);
+            deadline.check()?;
+            match self.opaque(LEAF, false, security, deadline)? {
+                None => Ok(()),
+                Some(_) => Err(NativeError::OutcomeUnknown),
+            }
+        }
         /// Bounded no-follow deletion, only below a completed fixed backup-generation handle.
         pub(crate) fn prune_tree(
             &self,

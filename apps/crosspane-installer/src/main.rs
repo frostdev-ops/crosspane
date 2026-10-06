@@ -17,6 +17,23 @@ fn main() {
     #[cfg(windows)]
     {
         let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+        // A4d keeper has one exact flag and no path/PID/operation argv authority.
+        match crosspane_installer::platform::windows::service::upgrade_keeper_mode(&arguments) {
+            Ok(true) => {
+                if let Err(error) =
+                    crosspane_installer::platform::windows::service::upgrade_keeper_entry()
+                {
+                    eprintln!("Crosspane Installer upgrade keeper: {error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Err(_) => {
+                eprintln!("Crosspane Installer upgrade keeper: invalid arguments");
+                std::process::exit(2);
+            }
+            Ok(false) => {}
+        }
         // The fixed helper entry is admitted before any supervisor, diagnose or GUI work.
         match crosspane_installer::platform::windows::replace_helper_mode(&arguments) {
             Ok(true) => {

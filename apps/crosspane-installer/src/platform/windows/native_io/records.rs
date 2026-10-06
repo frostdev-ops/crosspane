@@ -73,6 +73,7 @@ pub fn recover(
 pub enum RecordKind {
     Receipt,
     StageCatalog,
+    OuterUpgrade,
     Operation,
     Supervisor,
     TaskActivation,
@@ -83,6 +84,7 @@ pub enum RecordKind {
 pub enum RecordName {
     Receipt,
     StageCatalog,
+    OuterUpgrade,
     Operation([u8; 16]),
     Supervisor,
     TaskActivation,
@@ -95,6 +97,7 @@ impl RecordName {
         match self {
             Self::Receipt => super::files::PrivateName::new("receipt.json"),
             Self::StageCatalog => super::files::PrivateName::new("stage-catalog.json"),
+            Self::OuterUpgrade => super::files::PrivateName::new("outer-upgrade.json"),
             Self::Supervisor => super::files::PrivateName::new("supervisor.json"),
             Self::TaskActivation => super::files::PrivateName::new("task-activation.json"),
             Self::SupervisorLogon => super::files::PrivateName::new("supervisor-logon.json"),
@@ -114,6 +117,7 @@ impl RecordName {
         match self {
             Self::Receipt => RecordKind::Receipt,
             Self::StageCatalog => RecordKind::StageCatalog,
+            Self::OuterUpgrade => RecordKind::OuterUpgrade,
             Self::Operation(_) => RecordKind::Operation,
             Self::Supervisor => RecordKind::Supervisor,
             Self::TaskActivation => RecordKind::TaskActivation,

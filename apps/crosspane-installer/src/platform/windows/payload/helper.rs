@@ -388,6 +388,34 @@ pub(crate) fn replace_helper_entry() -> NativeResult<HelperExit> {
     native::entry()
 }
 
+/// New pre-Stop keeper wrappers; the old replacement helper/handoff remains unchanged.
+#[cfg(all(windows, not(test)))]
+pub(crate) fn prepare_keeper(
+    io: std::sync::Arc<super::super::native_io::WindowsNativeIo>,
+    proof: &super::super::native_io::SupportProof,
+    lock: &super::super::native_io::InstallerLock,
+    selected: &super::super::native_io::SelectedOuterOperation,
+    own: &super::super::native_io::SelfImagePin,
+    sources: super::ApprovedOuterSources,
+    deadline: &super::super::native_io::Deadline,
+) -> NativeResult<super::super::native_io::keeper::PreparedKeeper> {
+    selected.reverify(&io, proof, lock, deadline)?;
+    own.reverify(&io, proof, deadline)?;
+    if own.identity() != selected.module().identity() || own.facts() != selected.module().facts() {
+        return Err(NativeError::Foreign);
+    }
+    super::super::native_io::keeper::PreparedKeeper::prepare(
+        io, proof, lock, selected, sources, deadline,
+    )
+}
+#[cfg(all(windows, not(test)))]
+pub(crate) fn launch_keeper(
+    prepared: super::super::native_io::keeper::PreparedKeeper,
+    deadline: &super::super::native_io::Deadline,
+) -> NativeResult<super::super::native_io::keeper::KeeperChild> {
+    prepared.launch(deadline)
+}
+
 // A4b will connect the retained lifecycle executor to this admitted fixed helper launcher.
 #[cfg(windows)]
 #[allow(unused_imports)] // A4b/A5 connect the fixed native launcher; a4 keeps it uninvoked.
