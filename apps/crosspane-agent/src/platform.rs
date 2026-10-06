@@ -459,6 +459,7 @@ pub fn clipboard_host(gate: Arc<IoGate>) -> Option<Box<dyn crosspane_platform::C
 
 /// The video codecs for E2's motion path (WP-2.14), if this build and machine have them. With the
 /// source GPU, NVENC takes NV12 straight from GPU memory (WP-2.29).
+#[cfg(any(not(all(windows, feature = "video")), test))]
 pub fn video_codecs(
     gpu: Option<&GpuDevice>,
 ) -> Option<std::sync::Arc<dyn crosspane_media::codec::VideoCodecs>> {
@@ -490,6 +491,30 @@ pub fn video_codecs(
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// The receive device belongs to the proxy host, independently of the source GPU. The
+/// bridge is metadata-only until the host reports its real device; the codecs retain it.
+#[cfg(all(windows, feature = "video"))]
+pub(crate) fn windows_receive_codecs(
+    host: Option<crosspane_render::proxy::HostHandle>,
+) -> (
+    Arc<dyn crosspane_media::codec::VideoCodecs>,
+    Option<Arc<crosspane_platform_windows::video::MfDecodeGpu>>,
+) {
+    use crosspane_platform_windows::video::{MfCodecs, MfDecodeGpu};
+    let gpu = host.map(|host| {
+        Arc::new(MfDecodeGpu::new(Arc::new(move || {
+            // This is the initial wake for a copy with no pending redraw. Queue callbacks
+            // cannot make progress until the host polls its device.
+            let _ = host.send(crosspane_render::proxy::HostCommand::Run(Box::new(|| {})));
+        })))
+    });
+    let codecs = match &gpu {
+        Some(gpu) => MfCodecs::new().with_decode_gpu(gpu.clone()),
+        None => MfCodecs::new(),
+    };
+    (Arc::new(codecs), gpu)
 }
 
 /// The OS key store alone, for commands that need the identity but must not start the backends

@@ -1001,6 +1001,7 @@ dependencies = [
  "rtrb",
  "serde",
  "serde_json",
+ "wgpu",
  "windows",
  "windows-sys 0.61.2",
  "zeroize",

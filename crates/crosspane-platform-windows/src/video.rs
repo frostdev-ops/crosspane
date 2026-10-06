@@ -4,15 +4,18 @@
 //! incompatible hardware falls back to the inbox Microsoft software codec. Native
 //! jobs and event waits have a two-second deadline. A native call already running
 //! cannot be preempted; a timed-out facade is retired and never accepts another frame.
-//! GPU input/output and D3D zero-copy are deliberately left to WP-W2.3b.
+//! Windows receive GPU output uses one copy-only NV12 import and fresh immutable Y/UV
+//! textures. The original CPU output remains the fallback; encoder behavior is unchanged.
 #![allow(unsafe_code)]
 
 use crate::model::video::{self as model, Clock, Events, Headers, Params, References};
 use crosspane_media::{
     codec::{CodecError, EncodedVideo, VideoCodecs, VideoDecoder, VideoEncoder},
-    picture::{Nv12, YuvColour, YuvMatrix, nv12_to_bgra},
+    picture::{Decoded, Nv12, YuvColour, YuvMatrix, nv12_to_bgra},
 };
 use crosspane_types::geom::PixelSize;
+pub use decode_gpu::{MfDecodeGpu, MfGpuPicture, MfPathObserver};
+pub use model::{MfDecodePath, MfGpuFallback};
 use std::{
     mem::ManuallyDrop,
     ptr,
@@ -50,10 +53,17 @@ fn failure(reason: &str) -> CodecError {
 
 /// Per-session hardware-first factory. Construction does not touch native resources.
 #[derive(Debug, Default)]
-pub struct MfCodecs;
+pub struct MfCodecs {
+    decode_gpu: Option<Arc<MfDecodeGpu>>,
+}
 impl MfCodecs {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+    /// Receive-only GPU handshake; encoding and explicit CPU decoding are unchanged.
+    pub fn with_decode_gpu(mut self, gpu: Arc<MfDecodeGpu>) -> Self {
+        self.decode_gpu = Some(gpu);
+        self
     }
     pub fn encoder_cpu(
         &self,
@@ -90,7 +100,12 @@ impl VideoCodecs for MfCodecs {
         Ok(Box::new(self.encoder_cpu(size, bits_per_second, fps)?))
     }
     fn decoder(&self) -> Result<Box<dyn VideoDecoder>, CodecError> {
-        Ok(Box::new(self.decoder_cpu()?))
+        let (worker, name) = Worker::new_with_gpu(Mode::Decoder, self.decode_gpu.clone())?;
+        Ok(Box::new(MfDecoder {
+            worker,
+            name,
+            clock: Clock::default(),
+        }))
     }
 }
 
@@ -203,6 +218,33 @@ impl VideoDecoder for MfDecoder {
         reuse_picture(out, self.picture(data)?);
         Ok(())
     }
+    fn decode_native(&mut self, data: &[u8], reuse: &mut Arc<Nv12>) -> Result<Decoded, CodecError> {
+        let (at, duration) = self.clock.next(30)?;
+        match self.worker.request(Job::DecodeNative {
+            bytes: if data.len() <= MAX_PACKET {
+                data.to_vec()
+            } else {
+                Vec::new()
+            },
+            at,
+            duration,
+        })? {
+            Reply::NativePicture { picture, name } => {
+                self.name = name;
+                Ok(Decoded::Native(picture))
+            }
+            Reply::Picture { picture, name } => {
+                self.name = name;
+                if Arc::get_mut(reuse).is_none() {
+                    *reuse = Arc::default();
+                }
+                let out = Arc::get_mut(reuse).ok_or_else(|| failure("CPU picture is in use"))?;
+                reuse_picture(out, picture);
+                Ok(Decoded::Nv12(reuse.clone()))
+            }
+            _ => Err(failure("unexpected native decoder reply")),
+        }
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -228,6 +270,11 @@ enum Mode {
     Decoder,
 }
 enum Job {
+    DecodeNative {
+        bytes: Vec<u8>,
+        at: i64,
+        duration: i64,
+    },
     Encode {
         params: Params,
         bytes: Vec<u8>,
@@ -242,6 +289,10 @@ enum Job {
     },
 }
 enum Reply {
+    NativePicture {
+        picture: Arc<MfGpuPicture>,
+        name: String,
+    },
     Encoded {
         bytes: Vec<u8>,
         key: bool,
@@ -262,19 +313,28 @@ struct Worker {
     stop: Arc<AtomicBool>,
     done: mpsc::Receiver<()>,
     join: Option<thread::JoinHandle<()>>,
+    control: Option<mpsc::SyncSender<()>>,
 }
 impl Worker {
     fn new(mode: Mode) -> Result<(Self, String), CodecError> {
+        Self::new_with_gpu(mode, None)
+    }
+    fn new_with_gpu(
+        mode: Mode,
+        gpu: Option<Arc<MfDecodeGpu>>,
+    ) -> Result<(Self, String), CodecError> {
         let (send, receive) = mpsc::sync_channel::<Envelope>(1);
         let (started, start) = mpsc::sync_channel(1);
         let (finished, done) = mpsc::sync_channel(1);
+        let (control_send, control_receive) = mpsc::sync_channel(1);
+        let control = gpu.as_ref().map(|_| control_send.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let deadline = Instant::now() + BOUND;
         let join = thread::Builder::new()
             .name("crosspane-mf".into())
             .spawn(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let run = || {
                     let runtime = match Runtime::new() {
                         Ok(runtime) => runtime,
                         Err(error) => {
@@ -282,7 +342,7 @@ impl Worker {
                             return;
                         }
                     };
-                    let mut codec = match Native::new(mode, deadline, &flag) {
+                    let mut codec = match Native::new(mode, gpu, control_send, deadline, &flag) {
                         Ok(codec) => codec,
                         Err(error) => {
                             let _ = started.try_send(Err(error));
@@ -294,17 +354,76 @@ impl Worker {
                     {
                         return;
                     }
-                    while let Ok(envelope) = receive.recv() {
-                        if check(envelope.deadline, &flag).is_err() {
-                            break;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        loop {
+                            // Control flags are drained BEFORE the next MFT input, including shutdown.
+                            let blocked = codec.poll_leases();
+                            if flag.load(Ordering::Acquire) && codec.leases.is_empty() {
+                                break;
+                            }
+                            if flag.load(Ordering::Acquire) || blocked {
+                                if codec
+                                    .leases
+                                    .iter()
+                                    .all(decode_gpu::SourceLease::quarantined)
+                                {
+                                    // Unknown retired work stays owned without an active polling loop.
+                                    let _ = control_receive.recv();
+                                } else {
+                                    let _ = control_receive.recv_timeout(model::GPU_POLL);
+                                }
+                                continue;
+                            }
+                            let received = if codec.gpu.is_some() {
+                                match receive.try_recv() {
+                                    Ok(envelope) => Some(envelope),
+                                    Err(mpsc::TryRecvError::Empty) => {
+                                        let _ = control_receive.recv();
+                                        continue;
+                                    }
+                                    Err(mpsc::TryRecvError::Disconnected) => None,
+                                }
+                            } else {
+                                receive.recv().ok()
+                            };
+                            let Some(envelope) = received else {
+                                flag.store(true, Ordering::Release);
+                                continue;
+                            };
+                            if check(envelope.deadline, &flag).is_err() {
+                                flag.store(true, Ordering::Release);
+                                continue;
+                            }
+                            let result = codec.job(envelope.job, envelope.deadline, &flag);
+                            let result = check(envelope.deadline, &flag).and(result);
+                            let _ = envelope.reply.try_send(result);
                         }
-                        let result = codec.job(envelope.job, envelope.deadline, &flag);
-                        let result = check(envelope.deadline, &flag).and(result);
-                        let _ = envelope.reply.try_send(result);
+                    }));
+                    if result.is_err() {
+                        flag.store(true, Ordering::Release);
+                        for lease in &codec.leases {
+                            lease.quarantine();
+                        }
+                        // Quarantine retains MTA/sample/runtime owners until proven safe settlement.
+                        while !codec.leases.is_empty() {
+                            let polled =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    codec.poll_leases()
+                                }));
+                            if polled.is_err() {
+                                for lease in &codec.leases {
+                                    lease.quarantine();
+                                }
+                            }
+                            if !codec.leases.is_empty() {
+                                let _ = control_receive.recv();
+                            }
+                        }
                     }
                     drop(codec);
                     drop(runtime);
-                }));
+                };
+                run();
                 let _ = finished.try_send(());
             })
             .map_err(|error| CodecError::Unavailable(error.to_string()))?;
@@ -313,6 +432,7 @@ impl Worker {
             stop,
             done,
             join: Some(join),
+            control,
         };
         match start.recv_timeout(BOUND) {
             Ok(Ok(name)) => Ok((worker, name)),
@@ -342,6 +462,9 @@ impl Worker {
                 reply: send,
             })
             .map_err(|_| failure("MFT worker unavailable or busy"))?;
+        if let Some(control) = &self.control {
+            let _ = control.try_send(());
+        }
         match receive.recv_timeout(BOUND) {
             Ok(result) => {
                 let result = deliver_reply(result, deadline, &self.stop);
@@ -362,6 +485,9 @@ impl Worker {
     fn close(&mut self) -> Result<(), CodecError> {
         self.stop.store(true, Ordering::Release);
         self.send.take();
+        if let Some(control) = &self.control {
+            let _ = control.try_send(());
+        }
         if let Some(join) = self.join.take() {
             if self.done.recv_timeout(BOUND).is_err() {
                 return Err(failure("MFT native shutdown still running"));
@@ -429,9 +555,19 @@ struct Native {
     headers: Headers,
     references: References,
     aperture: Option<model::Aperture>,
+    gpu: Option<Arc<MfDecodeGpu>>,
+    gpu_mta: Option<decode_gpu::GpuMta>,
+    control: mpsc::SyncSender<()>,
+    leases: Vec<decode_gpu::SourceLease>,
 }
 impl Native {
-    fn new(mode: Mode, deadline: Instant, stop: &AtomicBool) -> Result<Self, CodecError> {
+    fn new(
+        mode: Mode,
+        gpu: Option<Arc<MfDecodeGpu>>,
+        control: mpsc::SyncSender<()>,
+        deadline: Instant,
+        stop: &AtomicBool,
+    ) -> Result<Self, CodecError> {
         Ok(Self {
             session: Session::select(mode, false, deadline, stop)?,
             mode,
@@ -439,10 +575,112 @@ impl Native {
             headers: Headers::default(),
             references: References::default(),
             aperture: None,
+            gpu,
+            gpu_mta: None,
+            control,
+            leases: Vec::new(),
         })
+    }
+    fn poll_leases(&mut self) -> bool {
+        model::gpu_drain_control(
+            &mut self.leases,
+            decode_gpu::SourceLease::poll,
+            decode_gpu::SourceLease::blocks_input,
+        )
+    }
+    fn blocks_input(&self) -> bool {
+        self.leases
+            .iter()
+            .any(decode_gpu::SourceLease::blocks_input)
+    }
+    fn decode_admission(&mut self, bytes: &[u8]) -> Result<(bool, model::Aperture), CodecError> {
+        self.references.check(bytes)?;
+        let idr = model::has_nal(bytes, 5);
+        if self.first && !idr {
+            return Err(failure("decoder requires IDR"));
+        }
+        if idr {
+            self.aperture = Some(model::h264_aperture(bytes)?);
+        } else if model::has_nal(bytes, 7) && self.aperture != Some(model::h264_aperture(bytes)?) {
+            return Err(failure("geometry change requires IDR"));
+        }
+        let aperture = self
+            .aperture
+            .ok_or_else(|| failure("missing coded geometry"))?;
+        Ok((idr, aperture))
+    }
+    fn decode_native(
+        &mut self,
+        bytes: &[u8],
+        at: i64,
+        duration: i64,
+        deadline: Instant,
+        stop: &AtomicBool,
+    ) -> Result<Reply, CodecError> {
+        let Some(bridge) = self.gpu.clone() else {
+            return self.decode(bytes, at, duration, deadline, stop);
+        };
+        let (idr, expected) = self.decode_admission(bytes)?;
+        if idr {
+            // Only an independent IDR may change the device binding/decoder implementation.
+            self.gpu_mta = None;
+            if let Some(host) = bridge.host()
+                && model::gpu_idr_binding(idr, Some(host.generation)).is_some()
+                && let Ok(gpu) = decode_gpu::GpuMta::new(host)
+                && let Ok(session) = Session::select_gpu(&gpu.manager, deadline, stop)
+            {
+                self.session = session;
+                self.gpu_mta = Some(gpu);
+            }
+        }
+        let Some(gpu) = self.gpu_mta.as_ref() else {
+            return self.decode_admitted(bytes, at, duration, deadline, stop, idr, expected);
+        };
+        if bridge
+            .host()
+            .is_none_or(|host| host.generation != gpu.host.generation)
+        {
+            return Err(failure("MF GPU generation retired; requires a CPU IDR"));
+        }
+        let output = (|| {
+            check(deadline, stop)?;
+            let input = sample(bytes, at, duration)?;
+            let output = self.session.exchange(&input, at, deadline, stop)?;
+            let (area, colour) = self.session.gpu_description(expected)?;
+            check(deadline, stop)?;
+            let picture = gpu.prepare(
+                &bridge,
+                output,
+                area,
+                expected,
+                colour,
+                self.control.clone(),
+                deadline,
+                &mut self.leases,
+            )?;
+            self.first = false;
+            Ok(Reply::NativePicture {
+                picture,
+                name: self.session.name.clone(),
+            })
+        })();
+        if output.is_err() && idr && !self.blocks_input() {
+            // An unavailable GPU path before checkout can retry the independent IDR on CPU.
+            // Unknown checkout state instead propagates failure and stays quarantined.
+            self.gpu_mta = None;
+            self.session.invalid = true;
+            self.decode_admitted(bytes, at, duration, deadline, stop, idr, expected)
+        } else {
+            output
+        }
     }
     fn job(&mut self, job: Job, deadline: Instant, stop: &AtomicBool) -> Result<Reply, CodecError> {
         let result = match job {
+            Job::DecodeNative {
+                bytes,
+                at,
+                duration,
+            } => self.decode_native(&bytes, at, duration, deadline, stop),
             Job::Encode {
                 params,
                 bytes,
@@ -536,21 +774,20 @@ impl Native {
         deadline: Instant,
         stop: &AtomicBool,
     ) -> Result<Reply, CodecError> {
-        self.references.check(bytes)?;
-        let idr = model::nals(bytes).any(|n| n[0] & 0x1f == 5);
-        if self.first && !idr {
-            return Err(failure("decoder requires IDR"));
-        }
-        if idr {
-            self.aperture = Some(model::h264_aperture(bytes)?);
-        } else if model::nals(bytes).any(|nal| nal[0] & 31 == 7)
-            && self.aperture != Some(model::h264_aperture(bytes)?)
-        {
-            return Err(failure("geometry change requires IDR"));
-        }
-        let aperture = self
-            .aperture
-            .ok_or_else(|| failure("missing coded geometry"))?;
+        let (idr, aperture) = self.decode_admission(bytes)?;
+        self.decode_admitted(bytes, at, duration, deadline, stop, idr, aperture)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn decode_admitted(
+        &mut self,
+        bytes: &[u8],
+        at: i64,
+        duration: i64,
+        deadline: Instant,
+        stop: &AtomicBool,
+        idr: bool,
+        aperture: model::Aperture,
+    ) -> Result<Reply, CodecError> {
         // An IDR is independent of all prior samples, including after damage or resize.
         if idr || self.session.invalid {
             self.session = Session::select(Mode::Decoder, false, deadline, stop)?;
@@ -644,11 +881,74 @@ impl Session {
             Self::configure(transform, false, name.into(), mode)
         })
     }
+    fn select_gpu(
+        manager: &IMFDXGIDeviceManager,
+        deadline: Instant,
+        stop: &AtomicBool,
+    ) -> Result<Self, CodecError> {
+        let attempts = enumerate(Mode::Decoder)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|activate| {
+                check(deadline, stop)?;
+                // SAFETY: owned enumeration activation, used solely on the decoder MTA.
+                let result = api(
+                    unsafe { activate.ActivateObject::<IMFTransform>() },
+                    "GPU ActivateObject",
+                )
+                .and_then(|transform| {
+                    Self::configure_with_manager(
+                        transform,
+                        true,
+                        friendly_name(&activate),
+                        Mode::Decoder,
+                        Some(manager),
+                    )
+                });
+                if result.is_err() {
+                    // SAFETY: failed candidate has no published output and its cache is no longer used.
+                    unsafe {
+                        let _ = activate.ShutdownObject();
+                    }
+                }
+                result
+            });
+        model::prefer_hardware(attempts, || {
+            check(deadline, stop)?;
+            // SAFETY: documented inbox decoder, initialized MTA, no aggregation.
+            let transform = api(
+                unsafe {
+                    CoCreateInstance::<_, IMFTransform>(
+                        &CMSH264DecoderMFT,
+                        None,
+                        CLSCTX_INPROC_SERVER,
+                    )
+                },
+                "GPU inbox decoder",
+            )?;
+            Self::configure_with_manager(
+                transform,
+                false,
+                "Microsoft H.264 DXGI decoder".into(),
+                Mode::Decoder,
+                Some(manager),
+            )
+        })
+    }
     fn configure(
         transform: IMFTransform,
         hardware: bool,
         name: String,
         mode: Mode,
+    ) -> Result<Self, CodecError> {
+        Self::configure_with_manager(transform, hardware, name, mode, None)
+    }
+    fn configure_with_manager(
+        transform: IMFTransform,
+        hardware: bool,
+        name: String,
+        mode: Mode,
+        manager: Option<&IMFDXGIDeviceManager>,
     ) -> Result<Self, CodecError> {
         let mut session = Self {
             transform,
@@ -692,6 +992,25 @@ impl Session {
                     "async unlock",
                 )?;
                 session.events = Some(api(session.transform.cast(), "IMFMediaEventGenerator")?);
+            }
+        }
+        if let Some(manager) = manager {
+            // SAFETY: owned attributes and exact manager, configured BEFORE media types/streaming.
+            unsafe {
+                let attributes = api(session.transform.GetAttributes(), "GPU MFT attributes")?;
+                if api(
+                    attributes.GetUINT32(&MF_SA_D3D11_AWARE),
+                    "MF D3D11 awareness",
+                )? != 1
+                {
+                    return Err(failure("MFT is not D3D11 aware"));
+                }
+                api(
+                    session
+                        .transform
+                        .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize),
+                    "MFT DXGI manager",
+                )?;
             }
         }
         // The inbox H.264 decoder uniquely requires VT_UI4; other codecs use VT_BOOL.
@@ -925,6 +1244,49 @@ impl Session {
         sample.ok_or_else(|| {
             windows::core::Error::from_hresult(windows::Win32::Foundation::E_POINTER)
         })
+    }
+    fn gpu_description(
+        &self,
+        expected: model::Aperture,
+    ) -> Result<(model::Aperture, YuvColour), CodecError> {
+        // SAFETY: owned negotiated output type; metadata only, never a CPU pixel read.
+        let ty = api(
+            unsafe { self.transform.GetOutputCurrentType(self.output) },
+            "GPU output type",
+        )?;
+        // SAFETY: public attributes with their documented integer/GUID representations.
+        let (size, subtype, matrix, range) = unsafe {
+            (
+                api(ty.GetUINT64(&MF_MT_FRAME_SIZE), "GPU output size")?,
+                api(ty.GetGUID(&MF_MT_SUBTYPE), "GPU output subtype")?,
+                optional_u32(&ty, &MF_MT_YUV_MATRIX)?.unwrap_or(0),
+                optional_u32(&ty, &MF_MT_VIDEO_NOMINAL_RANGE)?.unwrap_or(0),
+            )
+        };
+        if subtype != MFVideoFormat_NV12 {
+            return Err(failure("GPU output is not NV12"));
+        }
+        let storage = PixelSize::new((size >> 32) as u32, size as u32);
+        let area = output_aperture(&ty)?.unwrap_or(model::Aperture {
+            x: 0,
+            y: 0,
+            size: storage,
+        });
+        model::Nv12CopyPlan::new(storage, 1, 0, area, expected)
+            .map_err(|reason| failure(reason.as_str()))?;
+        let colour = YuvColour {
+            matrix: match matrix {
+                0 | 1 => YuvMatrix::Bt709,
+                2 => YuvMatrix::Bt601,
+                _ => return Err(failure("unsupported YUV matrix")),
+            },
+            full_range: match range {
+                0 | 2 => false,
+                1 => true,
+                _ => return Err(failure("unsupported nominal range")),
+            },
+        };
+        Ok((area, colour))
     }
     fn picture(&self, sample: &IMFSample, expected: model::Aperture) -> Result<Nv12, CodecError> {
         // SAFETY: owned output type, reading only its public format attributes.
@@ -1277,5 +1639,830 @@ mod tests {
             name: "fake".into(),
         });
         assert!(deliver_reply(result, Instant::now() + BOUND, &AtomicBool::new(true)).is_err());
+    }
+}
+
+/// Receiving-device interop; MF objects and check-in stay on their originating MTA.
+mod decode_gpu {
+    use super::*;
+    use crosspane_media::picture::NativePicture;
+    use std::{
+        any::Any,
+        collections::BTreeSet,
+        fmt,
+        sync::{Mutex, Weak},
+    };
+    use wgpu::hal::api::Dx12;
+    use windows::Win32::Graphics::{
+        Direct3D10::ID3D10Multithread,
+        Direct3D11::{
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, ID3D11Device,
+            ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext,
+            ID3D11VideoDevice,
+        },
+        Direct3D11on12::{D3D11On12CreateDevice, ID3D11On12Device2},
+        Direct3D12::{
+            D3D12_FENCE_FLAG_NONE, D3D12_RESOURCE_DIMENSION_TEXTURE2D, ID3D12CommandQueue,
+            ID3D12Device, ID3D12Fence, ID3D12Resource,
+        },
+        Dxgi::Common::DXGI_FORMAT_NV12,
+    };
+
+    pub type MfPathObserver = Arc<dyn Fn(MfDecodePath, Option<MfGpuFallback>) + Send + Sync>;
+
+    #[derive(Clone)]
+    pub(super) struct Host {
+        pub generation: u64,
+        pub device: wgpu::Device,
+        pub queue: wgpu::Queue,
+    }
+    struct Bridge {
+        host: Option<Host>,
+        latest: Option<u64>,
+        retired: BTreeSet<u64>,
+        leases: Vec<Weak<Signal>>,
+    }
+    /// A metadata-only handshake with the actual receiving host device.
+    pub struct MfDecodeGpu {
+        state: Mutex<Bridge>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    }
+    impl fmt::Debug for MfDecodeGpu {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MfDecodeGpu").finish_non_exhaustive()
+        }
+    }
+    impl MfDecodeGpu {
+        pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+            Self {
+                state: Mutex::new(Bridge {
+                    host: None,
+                    latest: None,
+                    retired: BTreeSet::new(),
+                    leases: Vec::new(),
+                }),
+                wake,
+            }
+        }
+        pub fn set_host(&self, generation: u64, host: Option<(wgpu::Device, wgpu::Queue)>) {
+            let leases = match self.state.lock() {
+                Ok(mut state) => {
+                    let update = model::gpu_host_update(
+                        state.latest,
+                        state.host.as_ref().map(|host| host.generation),
+                        generation,
+                        host.is_some(),
+                        state.retired.contains(&generation),
+                    );
+                    match update {
+                        model::GpuHostUpdate::Ignore => return,
+                        model::GpuHostUpdate::Ready => {
+                            if let Some(previous) = state.host.take() {
+                                state.retired.insert(previous.generation);
+                            }
+                            state.host = host.map(|(device, queue)| Host {
+                                generation,
+                                device,
+                                queue,
+                            });
+                        }
+                        model::GpuHostUpdate::RetireCurrent => {
+                            state.host = None;
+                            state.retired.insert(generation);
+                        }
+                        model::GpuHostUpdate::RetireOther => {
+                            state.retired.insert(generation);
+                        }
+                    }
+                    state.latest = Some(state.latest.map_or(generation, |at| at.max(generation)));
+                    state
+                        .leases
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .filter(|signal| state.retired.contains(&signal.generation))
+                        .collect::<Vec<_>>()
+                }
+                Err(_) => return,
+            };
+            for signal in leases {
+                signal.quarantine_local(MfGpuFallback::DeviceLost);
+            }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.wake)()));
+        }
+        pub(super) fn host(&self) -> Option<Host> {
+            let state = self.state.lock().ok()?;
+            let host = state.host.as_ref()?;
+            (!state.retired.contains(&host.generation)).then(|| host.clone())
+        }
+        pub(super) fn retire(&self, generation: u64, reason: MfGpuFallback) {
+            let leases = match self.state.lock() {
+                Ok(mut state) => {
+                    if !state.retired.insert(generation) {
+                        return;
+                    }
+                    state
+                        .leases
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .filter(|signal| signal.generation == generation)
+                        .collect::<Vec<_>>()
+                }
+                Err(_) => return,
+            };
+            for signal in leases {
+                signal.quarantine_local(reason);
+            }
+        }
+        fn reserve(&self, signal: &Arc<Signal>) -> Result<(), MfGpuFallback> {
+            let mut state = self.state.lock().map_err(|_| MfGpuFallback::CopyFailed)?;
+            state.leases.retain(|lease| lease.strong_count() != 0);
+            if state.retired.contains(&signal.generation) {
+                return Err(MfGpuFallback::DeviceLost);
+            }
+            if state
+                .leases
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|lease| lease.state().is_none_or(|state| !state.returned))
+                .count()
+                >= model::GPU_COPY_JOBS
+            {
+                return Err(MfGpuFallback::PoolBusy);
+            }
+            state.leases.push(Arc::downgrade(signal));
+            drop(state);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.wake)()));
+            Ok(())
+        }
+        /// Memory-only progress: the host itself performs the nonblocking Device::poll.
+        pub fn poll_deadline(&self, now: Instant) -> Option<Instant> {
+            let leases = self
+                .state
+                .lock()
+                .ok()?
+                .leases
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            let mut deadlines = Vec::new();
+            for signal in leases {
+                let Some(state) = signal.state() else {
+                    continue;
+                };
+                if state.returned || state.quarantined {
+                    continue;
+                }
+                if now >= signal.deadline {
+                    self.retire(signal.generation, MfGpuFallback::Deadline);
+                    signal.quarantine(MfGpuFallback::Deadline);
+                } else {
+                    deadlines.push(signal.deadline);
+                }
+            }
+            model::gpu_poll_deadline(now, deadlines)
+        }
+        pub fn import_picture(
+            &self,
+            device: &wgpu::Device,
+            picture: &dyn NativePicture,
+        ) -> Result<[wgpu::Texture; 2], String> {
+            let picture = picture
+                .as_any()
+                .downcast_ref::<MfGpuPicture>()
+                .ok_or_else(|| "picture is not MF GPU output".to_owned())?;
+            picture.signal.attempted.store(true, Ordering::Release);
+            let result = self.import(device, picture);
+            match result {
+                Ok(planes) => {
+                    picture.signal.notify(MfDecodePath::DxgiGpuCopy, None);
+                    Ok(planes)
+                }
+                Err(reason) => {
+                    self.retire(picture.signal.generation, reason);
+                    picture.signal.cancel();
+                    picture
+                        .signal
+                        .notify(MfDecodePath::AwaitingCpuIdr, Some(reason));
+                    Err(reason.as_str().to_owned())
+                }
+            }
+        }
+        fn import(
+            &self,
+            device: &wgpu::Device,
+            picture: &MfGpuPicture,
+        ) -> Result<[wgpu::Texture; 2], MfGpuFallback> {
+            let host = self.host().ok_or(MfGpuFallback::HostNotReady)?;
+            model::gpu_decode_admission(
+                Some(host.generation),
+                picture.signal.generation,
+                device == &host.device,
+                device
+                    .features()
+                    .contains(wgpu::Features::TEXTURE_FORMAT_NV12),
+            )?;
+            let mut cached = picture
+                .planes
+                .lock()
+                .map_err(|_| MfGpuFallback::CopyFailed)?;
+            if let Some(planes) = &*cached {
+                return Ok(planes.clone());
+            }
+            if Instant::now() >= picture.signal.deadline {
+                return Err(MfGpuFallback::Deadline);
+            }
+            // SAFETY: guards only create/import resources on this exact retained host device.
+            let hal = unsafe { device.as_hal::<Dx12>() }.ok_or(MfGpuFallback::UnsupportedDevice)?;
+            // SAFETY: prepared NV12 storage is initialized, exclusive to this checkout,
+            // and belongs to this exact device. One COPY_SRC wrapper tracks BOTH planes.
+            let source = unsafe {
+                let raw = wgpu::hal::dx12::Device::texture_from_raw(
+                    picture.resource.clone(),
+                    wgpu::TextureFormat::NV12,
+                    wgpu::TextureDimension::D2,
+                    wgpu::Extent3d {
+                        width: picture.plan.storage.width,
+                        height: picture.plan.storage.height,
+                        depth_or_array_layers: picture.plan.layers,
+                    },
+                    1,
+                    1,
+                );
+                device.create_texture_from_hal::<Dx12>(
+                    raw,
+                    &wgpu::TextureDescriptor {
+                        label: Some("MF NV12 copy source"),
+                        size: wgpu::Extent3d {
+                            width: picture.plan.storage.width,
+                            height: picture.plan.storage.height,
+                            depth_or_array_layers: picture.plan.layers,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::NV12,
+                        usage: wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    },
+                    wgpu::TextureUses::PRESENT,
+                )
+            };
+            drop(hal);
+            let make = |format, size: PixelSize| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("MF immutable decoded plane"),
+                    size: wgpu::Extent3d {
+                        width: size.width,
+                        height: size.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            };
+            let size = picture.plan.area.size;
+            let planes = model::allocate_gpu_planes(size, |uv, size| {
+                make(
+                    if uv {
+                        wgpu::TextureFormat::Rg8Unorm
+                    } else {
+                        wgpu::TextureFormat::R8Unorm
+                    },
+                    size,
+                )
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("MF split NV12 planes"),
+            });
+            for (plane, destination) in planes.iter().enumerate() {
+                let ((x, y), size) = picture
+                    .plan
+                    .plane(plane as u32)
+                    .ok_or(MfGpuFallback::InvalidSurface)?;
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &source,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x,
+                            y,
+                            z: picture.plan.slice,
+                        },
+                        aspect: if plane == 0 {
+                            wgpu::TextureAspect::Plane0
+                        } else {
+                            wgpu::TextureAspect::Plane1
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: destination,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: size.width,
+                        height: size.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            encoder.transition_resources(
+                std::iter::empty(),
+                std::iter::once(wgpu::TextureTransition {
+                    texture: &source,
+                    selector: None,
+                    state: wgpu::TextureUses::PRESENT,
+                }),
+            );
+            picture.signal.modify(|state| state.submit())??;
+            // SAFETY: this is the exact retained host queue; only foreign fences are staged.
+            let queue =
+                unsafe { host.queue.as_hal::<Dx12>() }.ok_or(MfGpuFallback::UnsupportedDevice)?;
+            queue.add_wait_fence(picture.fence.clone(), 1);
+            queue.add_signal_fence(picture.fence.clone(), 2);
+            drop(queue);
+            host.queue.submit([encoder.finish()]);
+            let signal = picture.signal.clone();
+            host.queue.on_submitted_work_done(move || {
+                // This is a wake, NOT proof of COMMON: the MTA also checks the native fence.
+                signal.wake_control();
+            });
+            *cached = Some(planes.clone());
+            picture.signal.wake_control();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.wake)()));
+            Ok(planes)
+        }
+    }
+
+    #[derive(Default)]
+    struct ObserverState {
+        callback: Option<MfPathObserver>,
+        outcome: Option<(MfDecodePath, Option<MfGpuFallback>)>,
+        revision: u64,
+        delivered: u64,
+        draining: bool,
+    }
+    struct Signal {
+        generation: u64,
+        deadline: Instant,
+        bridge: Weak<MfDecodeGpu>,
+        lease: Mutex<model::GpuLeaseState>,
+        attempted: AtomicBool,
+        observer: Mutex<ObserverState>,
+        control: mpsc::SyncSender<()>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    }
+    impl Signal {
+        fn state(&self) -> Option<model::GpuLeaseState> {
+            self.lease.lock().ok().map(|s| *s)
+        }
+        fn modify<T>(
+            &self,
+            f: impl FnOnce(&mut model::GpuLeaseState) -> T,
+        ) -> Result<T, MfGpuFallback> {
+            self.lease
+                .lock()
+                .map(|mut state| f(&mut state))
+                .map_err(|_| MfGpuFallback::CopyFailed)
+        }
+        fn wake_control(&self) {
+            let _ = self.control.try_send(());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.wake)()));
+        }
+        fn cancel(&self) {
+            let _ = self.modify(|state| state.cancelled = true);
+            self.wake_control();
+        }
+        fn quarantine(&self, reason: MfGpuFallback) {
+            self.quarantine_local(reason);
+            if let Some(bridge) = self.bridge.upgrade() {
+                bridge.retire(self.generation, reason);
+            }
+        }
+        fn quarantine_local(&self, reason: MfGpuFallback) {
+            let _ = self.modify(model::GpuLeaseState::quarantine);
+            self.notify(MfDecodePath::AwaitingCpuIdr, Some(reason));
+            self.wake_control();
+        }
+        fn notify(&self, path: MfDecodePath, reason: Option<MfGpuFallback>) {
+            if let Ok(mut state) = self.observer.lock() {
+                let outcome = model::gpu_path_update(state.outcome, (path, reason));
+                if state.outcome == outcome {
+                    return;
+                }
+                state.outcome = outcome;
+                state.revision = state.revision.saturating_add(1);
+            }
+            self.dispatch();
+        }
+        fn dispatch(&self) {
+            if let Ok(mut state) = self.observer.lock() {
+                if state.draining {
+                    return;
+                }
+                state.draining = true;
+            } else {
+                return;
+            }
+            loop {
+                let next = match self.observer.lock() {
+                    Ok(mut state) => {
+                        if let Some(callback) = state.callback.clone()
+                            && let Some(outcome) = state.outcome
+                            && state.delivered != state.revision
+                        {
+                            state.delivered = state.revision;
+                            Some((callback, outcome))
+                        } else {
+                            state.draining = false;
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                };
+                let Some((callback, (path, reason))) = next else {
+                    return;
+                };
+                // One drainer orders replay/retirement; callbacks run outside every mutex.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    callback(path, reason)
+                }));
+            }
+        }
+    }
+    /// COM sample ownership is an MTA token. Reads cannot block or change rendering status.
+    pub struct MfGpuPicture {
+        plan: model::Nv12CopyPlan,
+        colour: YuvColour,
+        resource: ID3D12Resource,
+        fence: ID3D12Fence,
+        signal: Arc<Signal>,
+        planes: Mutex<Option<[wgpu::Texture; 2]>>,
+    }
+    impl fmt::Debug for MfGpuPicture {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MfGpuPicture")
+                .field("size", &self.plan.area.size)
+                .finish_non_exhaustive()
+        }
+    }
+    impl MfGpuPicture {
+        pub fn set_path_observer(&self, observer: MfPathObserver) {
+            if let Ok(mut state) = self.signal.observer.lock() {
+                state.callback = Some(observer);
+                state.revision = state.revision.saturating_add(1);
+            }
+            self.signal.dispatch();
+        }
+    }
+    impl NativePicture for MfGpuPicture {
+        fn size(&self) -> PixelSize {
+            self.plan.area.size
+        }
+        fn colour(&self) -> YuvColour {
+            self.colour
+        }
+        fn to_nv12(&self, _out: &mut Nv12) -> Result<(), CodecError> {
+            // No initial CPU cache: neither host fallback nor explicit snapshot can block/read back.
+            model::native_cpu_cache(None, _out)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+    impl Drop for MfGpuPicture {
+        fn drop(&mut self) {
+            let _ = self.signal.modify(|state| {
+                state.picture_dropped = true;
+                if !state.submitted {
+                    state.cancelled = true;
+                }
+            });
+            self.signal.wake_control();
+        }
+    }
+
+    /// Constructed and used only on the existing COM MTA.
+    pub(super) struct GpuMta {
+        pub host: Host,
+        device12: ID3D12Device,
+        queue12: ID3D12CommandQueue,
+        device11: ID3D11Device,
+        context11: ID3D11DeviceContext,
+        on12: ID3D11On12Device2,
+        pub manager: IMFDXGIDeviceManager,
+    }
+    impl GpuMta {
+        pub fn new(host: Host) -> Result<Self, CodecError> {
+            if !host
+                .device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_NV12)
+            {
+                return Err(failure("receiving device has no NV12 feature"));
+            }
+            // SAFETY: only cloned native handles are kept; guards never cross a thread.
+            let guard = unsafe { host.device.as_hal::<Dx12>() }
+                .ok_or_else(|| failure("receiving device is not DX12"))?;
+            let device12 = guard.raw_device().clone();
+            let queue12 = guard.raw_queue().clone();
+            drop(guard);
+            let mut device11 = None;
+            let mut context11 = None;
+            let queues = [Some(api(queue12.cast(), "receiving queue IUnknown")?)];
+            // SAFETY: exact retained DX12 device/DIRECT queue, one node; outputs are owned.
+            api(
+                // SAFETY: exact retained DX12 device/DIRECT queue; owned output slots.
+                unsafe {
+                    D3D11On12CreateDevice(
+                        &device12,
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT.0 | D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0,
+                        None,
+                        Some(&queues),
+                        0,
+                        Some(&mut device11),
+                        Some(&mut context11),
+                        None,
+                    )
+                },
+                "D3D11On12CreateDevice",
+            )?;
+            let device11 = device11.ok_or_else(|| failure("missing D3D11-on-12 device"))?;
+            let context11 = context11.ok_or_else(|| failure("missing D3D11-on-12 context"))?;
+            let on12 = api(device11.cast::<ID3D11On12Device2>(), "ID3D11On12Device2")?;
+            let video = api(device11.cast::<ID3D11VideoDevice>(), "ID3D11VideoDevice")?;
+            let _: ID3D11VideoContext = api(context11.cast(), "ID3D11VideoContext")?;
+            // SAFETY: driver-owned profile capability query; no decoder/resource is guessed.
+            let supports = unsafe {
+                video.CheckVideoDecoderFormat(
+                    &windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
+                    DXGI_FORMAT_NV12,
+                )
+            };
+            if !api(supports, "H.264 NV12 decode capability")?.as_bool() {
+                return Err(failure("device cannot decode H.264 NV12"));
+            }
+            let multithread = api(device11.cast::<ID3D10Multithread>(), "ID3D10Multithread")?;
+            // SAFETY: context-wide synchronization is enabled before any MFT sees this device.
+            unsafe {
+                let _ = multithread.SetMultithreadProtected(true);
+            }
+            let mut token = 0;
+            let mut manager = None;
+            // SAFETY: output owners remain on this MTA and ResetDevice uses the exact device.
+            unsafe {
+                api(
+                    MFCreateDXGIDeviceManager(&mut token, &mut manager),
+                    "MFCreateDXGIDeviceManager",
+                )?;
+            }
+            let manager = manager.ok_or_else(|| failure("missing MF DXGI manager"))?;
+            // SAFETY: token belongs to this newly created manager; device lives with it.
+            api(
+                // SAFETY: this manager's creation token and retained matching device.
+                unsafe { manager.ResetDevice(&device11, token) },
+                "DXGI ResetDevice",
+            )?;
+            Ok(Self {
+                host,
+                device12,
+                queue12,
+                device11,
+                context11,
+                on12,
+                manager,
+            })
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub fn prepare(
+            &self,
+            bridge: &Arc<MfDecodeGpu>,
+            sample: IMFSample,
+            area: model::Aperture,
+            expected: model::Aperture,
+            colour: YuvColour,
+            control: mpsc::SyncSender<()>,
+            deadline: Instant,
+            leases: &mut Vec<SourceLease>,
+        ) -> Result<Arc<MfGpuPicture>, CodecError> {
+            model::gpu_capacity(leases.len(), model::GPU_SOURCE_LEASES)
+                .map_err(|reason| failure(reason.as_str()))?;
+            // SAFETY: one owned output sample; never read CPU pixels or expose COM sample pointers.
+            let count = api(
+                unsafe { sample.GetBufferCount() },
+                "GPU output buffer count",
+            )?;
+            if count != 1 {
+                return Err(failure("GPU output must have one DXGI buffer"));
+            }
+            // SAFETY: verified existing buffer index; each returned interface is an owned reference.
+            let buffer = api(unsafe { sample.GetBufferByIndex(0) }, "GPU output buffer")?;
+            let dxgi = api(buffer.cast::<IMFDXGIBuffer>(), "IMFDXGIBuffer")?;
+            let mut texture: Option<ID3D11Texture2D> = None;
+            // SAFETY: typed out-interface storage, matching IID; retain it on this MTA.
+            api(
+                // SAFETY: matching IID and typed out-interface storage retained on the MTA.
+                unsafe {
+                    dxgi.GetResource(
+                        &ID3D11Texture2D::IID,
+                        &mut texture as *mut _ as *mut *mut std::ffi::c_void,
+                    )
+                },
+                "DXGI texture",
+            )?;
+            let texture = texture.ok_or_else(|| failure("missing DXGI texture"))?;
+            // SAFETY: owned decoder texture/metadata; no foreign resources are queried.
+            let (device, slice) = unsafe {
+                (
+                    api(texture.GetDevice(), "DXGI texture device")?,
+                    api(dxgi.GetSubresourceIndex(), "DXGI texture surface index")?,
+                )
+            };
+            if device != self.device11 {
+                return Err(failure("DXGI device mismatch"));
+            }
+            let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: writable initialized descriptor borrowed for the live texture query.
+            unsafe {
+                texture.GetDesc(&mut desc);
+            }
+            if desc.Format != DXGI_FORMAT_NV12 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1
+            {
+                return Err(failure("DXGI NV12 descriptor mismatch"));
+            }
+            let plan = model::Nv12CopyPlan::new(
+                PixelSize::new(desc.Width, desc.Height),
+                desc.ArraySize,
+                slice,
+                area,
+                expected,
+            )
+            .map_err(|reason| failure(reason.as_str()))?;
+            let resource11 = api(texture.cast::<ID3D11Resource>(), "D3D11 resource")?;
+            // SAFETY: a new private fence on the exact host device; no shared handle escapes.
+            let fence: ID3D12Fence = api(
+                unsafe { self.device12.CreateFence(0, D3D12_FENCE_FLAG_NONE) },
+                "GPU copy fence",
+            )?;
+            let signal = Arc::new(Signal {
+                generation: self.host.generation,
+                deadline,
+                bridge: Arc::downgrade(bridge),
+                lease: Mutex::new(model::GpuLeaseState {
+                    picture_dropped: true,
+                    ..model::GpuLeaseState::reserved()
+                }),
+                attempted: AtomicBool::new(false),
+                observer: Mutex::new(ObserverState::default()),
+                control,
+                wake: bridge.wake.clone(),
+            });
+            bridge
+                .reserve(&signal)
+                .map_err(|reason| failure(reason.as_str()))?;
+            // Reservation is visible BEFORE checkout/publication/another ProcessInput.
+            leases.push(SourceLease {
+                _sample: sample,
+                resource11,
+                on12: self.on12.clone(),
+                device12: self.device12.clone(),
+                fence: fence.clone(),
+                signal: signal.clone(),
+                checked_out: true,
+            });
+            let index = leases.len() - 1;
+            let prepared = (|| {
+                // SAFETY: the MTA execution gate owns the decoder resource exclusively; pending
+                // work is waited on by the exact host queue. No further MFT input runs until return.
+                let raw = unsafe {
+                    self.on12.UnwrapUnderlyingResource::<_, _, ID3D12Resource>(
+                        &leases[index].resource11,
+                        &self.queue12,
+                    )
+                };
+                let raw = match api(raw, "UnwrapUnderlyingResource") {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        signal.quarantine(MfGpuFallback::CopyFailed);
+                        return Err(error);
+                    }
+                };
+                // SAFETY: flush/signal the unwrap prefix before publishing its prepared token.
+                unsafe {
+                    self.context11.Flush();
+                    api(self.queue12.Signal(&fence, 1), "GPU checkout ready fence")?;
+                }
+                // SAFETY: the unwrapped owned resource is inspected before constructing any wrapper.
+                let desc = unsafe { raw.GetDesc() };
+                let mut raw_device = None::<ID3D12Device>;
+                // SAFETY: matching device interface storage; retain and compare COM identity.
+                api(
+                    // SAFETY: typed device output slot for the retained unwrapped resource.
+                    unsafe { raw.GetDevice(&mut raw_device) },
+                    "unwrapped device",
+                )?;
+                if raw_device.as_ref() != Some(&self.device12)
+                    || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    || desc.Format != DXGI_FORMAT_NV12
+                    || desc.MipLevels != 1
+                    || desc.SampleDesc.Count != 1
+                    || desc.Width != u64::from(plan.storage.width)
+                    || desc.Height != plan.storage.height
+                    || u32::from(desc.DepthOrArraySize) != plan.layers
+                {
+                    signal.cancel();
+                    return Err(failure("unwrapped resource does not match MF surface"));
+                }
+                signal
+                    .modify(|state| state.picture_dropped = false)
+                    .map_err(|reason| failure(reason.as_str()))?;
+                Ok(Arc::new(MfGpuPicture {
+                    plan,
+                    colour,
+                    resource: raw,
+                    fence,
+                    signal: signal.clone(),
+                    planes: Mutex::new(None),
+                }))
+            })();
+            if prepared.is_err() {
+                // Cancellation does not claim ready completion: poll still requires the native
+                // ready fence and successful return; failed/unknown unwrap remains quarantined.
+                signal.cancel();
+                signal.quarantine(MfGpuFallback::CopyFailed);
+            }
+            prepared
+        }
+    }
+    /// Samples, device-manager objects and return calls never cross the originating MTA.
+    pub(super) struct SourceLease {
+        _sample: IMFSample,
+        resource11: ID3D11Resource,
+        on12: ID3D11On12Device2,
+        device12: ID3D12Device,
+        fence: ID3D12Fence,
+        signal: Arc<Signal>,
+        checked_out: bool,
+    }
+    impl SourceLease {
+        pub fn poll(&mut self) -> bool {
+            let Some(mut state) = self.signal.state() else {
+                return false;
+            };
+            if self.checked_out {
+                // SAFETY: private owned fence, nonblocking query; UINT64_MAX means removed device.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                if completed == u64::MAX {
+                    self.signal.quarantine(MfGpuFallback::DeviceLost);
+                    return false;
+                }
+                if state.submitted && completed >= 2 {
+                    let _ = self.signal.modify(|state| state.completion = true);
+                    state.completion = true;
+                }
+                if state.check_in_ready(completed >= 1) {
+                    // SAFETY: the exact retained native device must still be usable; failure
+                    // preserves sample/resource ownership rather than fabricating completion.
+                    if unsafe { self.device12.GetDeviceRemovedReason() }.is_err() {
+                        self.signal.quarantine(MfGpuFallback::DeviceLost);
+                        return false;
+                    }
+                    // SAFETY: completed ready/copy fence proves COMMON and no pending use;
+                    // zero sync fences suffice because completion was observed, not assumed.
+                    let result = unsafe {
+                        self.on12.ReturnUnderlyingResource(
+                            &self.resource11,
+                            0,
+                            ptr::null(),
+                            ptr::null(),
+                        )
+                    };
+                    if result.is_err() {
+                        self.signal.quarantine(MfGpuFallback::CopyFailed);
+                        return false;
+                    }
+                    self.checked_out = false;
+                    let _ = self.signal.modify(model::GpuLeaseState::return_completed);
+                    self.signal.wake_control();
+                }
+            }
+            self.signal
+                .state()
+                .is_some_and(model::GpuLeaseState::release_sample)
+        }
+        pub fn quarantine(&self) {
+            self.signal.quarantine(MfGpuFallback::CopyFailed);
+        }
+        pub fn blocks_input(&self) -> bool {
+            self.checked_out
+        }
+        pub fn quarantined(&self) -> bool {
+            !self.checked_out || self.signal.state().is_none_or(|state| state.quarantined)
+        }
     }
 }

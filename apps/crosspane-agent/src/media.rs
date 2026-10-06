@@ -68,6 +68,10 @@ struct ProxyMap {
     by_key: HashMap<ProjectionKey, u64>,
     by_id: HashMap<u64, ProjectionKey>,
     stats: HashMap<ProjectionKey, FrameStats>,
+    #[cfg(any(all(windows, feature = "video"), test))]
+    video_paths: HashMap<ProjectionKey, WindowsVideoState>,
+    #[cfg(any(all(windows, feature = "video"), test))]
+    receive_generation: u64,
     /// Each peer's clock minus this node's (ns), from the agent's ping exchange.
     offsets: HashMap<NodeId, i64>,
     /// Frames the renderer reported presented, per source peer, for projections that have since
@@ -89,6 +93,34 @@ pub struct FrameStats {
     pub latency_ms: Option<f64>,
     /// Frames the renderer submitted for presentation (WP-4.5; the call site is WP-4.5a's).
     pub presented: u64,
+    /// The last actual Windows receive outcome, not the codec's advertised capability.
+    #[cfg(any(windows, test))]
+    pub decode_path: Option<&'static str>,
+    #[cfg(any(windows, test))]
+    pub decode_fallback: Option<&'static str>,
+}
+
+/// App-local correlation and independent-frame requests. No native calls run under this lock.
+#[cfg(any(all(windows, feature = "video"), test))]
+#[derive(Debug, Default)]
+struct WindowsVideoState {
+    id: u64,
+    seq: Option<u64>,
+    video_seen: bool,
+    awaiting_cpu: bool,
+    promote: bool,
+    ready_generation: u64,
+    request_pending: bool,
+    last_request: Option<Instant>,
+}
+
+#[cfg(any(all(windows, feature = "video"), test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsVideoRestart {
+    Continue,
+    WaitForIdr,
+    Cpu(u64),
+    Gpu(u64),
 }
 
 impl ProxyIds {
@@ -103,6 +135,18 @@ impl ProxyIds {
         let id = map.next;
         map.by_key.insert(key, id);
         map.by_id.insert(id, key);
+        #[cfg(any(all(windows, feature = "video"), test))]
+        {
+            let ready_generation = map.receive_generation;
+            map.video_paths.insert(
+                key,
+                WindowsVideoState {
+                    id,
+                    ready_generation,
+                    ..WindowsVideoState::default()
+                },
+            );
+        }
         id
     }
 
@@ -110,6 +154,8 @@ impl ProxyIds {
         let mut map = self.inner.lock().ok()?;
         let id = map.by_key.remove(&key)?;
         map.by_id.remove(&id);
+        #[cfg(any(all(windows, feature = "video"), test))]
+        map.video_paths.remove(&key);
         // What this projection presented stays in its peer's total.
         if let Some(stats) = map.stats.remove(&key)
             && stats.presented > 0
@@ -175,6 +221,221 @@ impl ProxyIds {
             if let Some(age) = age_ms {
                 stats.latency_ms = Some(stats.latency_ms.map_or(age, |l| l * 0.9 + age * 0.1));
             }
+        }
+    }
+
+    /// Mark the actual in-flight video attempt before codec construction. A host becoming
+    /// ready during that first CPU decode must still request an independent promotion frame.
+    #[cfg(any(all(windows, feature = "video"), test))]
+    fn begin_windows_video_attempt(&self, key: ProjectionKey, id: u64) {
+        if let Ok(mut map) = self.inner.lock()
+            && map.by_key.get(&key) == Some(&id)
+            && let Some(state) = map.video_paths.get_mut(&key)
+            && state.id == id
+        {
+            state.video_seen = true;
+        }
+    }
+
+    /// A real decode failure before publication has no per-picture observer. Unknown native
+    /// ownership stays in the adapter; this app only switches at a later independent frame.
+    #[cfg(any(all(windows, feature = "video"), test))]
+    fn windows_native_decode_failed(
+        &self,
+        key: ProjectionKey,
+        id: u64,
+        seq: u64,
+        error: &crosspane_media::codec::CodecError,
+    ) {
+        if matches!(
+            error,
+            crosspane_media::codec::CodecError::Failed(_)
+                | crosspane_media::codec::CodecError::Unavailable(_)
+        ) {
+            self.begin_windows_picture(key, id, seq, true);
+            self.record_windows_video_path(key, id, seq, "awaiting_cpu_idr", None);
+        }
+    }
+
+    #[cfg(any(all(windows, feature = "video"), test))]
+    fn begin_windows_picture(&self, key: ProjectionKey, id: u64, seq: u64, video: bool) {
+        if let Ok(mut map) = self.inner.lock()
+            && map.by_key.get(&key) == Some(&id)
+            && let Some(state) = map.video_paths.get_mut(&key)
+            && state.id == id
+            && state.seq.is_none_or(|old| seq > old)
+        {
+            state.seq = Some(seq);
+            state.video_seen |= video;
+        }
+    }
+
+    /// Only the callback installed on this exact live picture can change its path. Old
+    /// pictures, closed proxies and reopened projections cannot request a new key frame.
+    #[cfg(any(all(windows, feature = "video"), test))]
+    fn record_windows_video_path(
+        &self,
+        key: ProjectionKey,
+        id: u64,
+        seq: u64,
+        path: &'static str,
+        reason: Option<&'static str>,
+    ) {
+        let changed = {
+            let Ok(mut map) = self.inner.lock() else {
+                return;
+            };
+            if map.by_key.get(&key) != Some(&id) {
+                return;
+            }
+            let Some(state) = map.video_paths.get_mut(&key) else {
+                return;
+            };
+            if state.id != id || state.seq != Some(seq) {
+                return;
+            }
+            if path == "awaiting_cpu_idr" && !state.awaiting_cpu {
+                state.awaiting_cpu = true;
+                state.request_pending = true;
+            }
+            let stats = map.stats.entry(key).or_default();
+            let reason = if path == "cpu_nv12" {
+                // A cause belongs to this session only when its importer observed it.
+                reason.or(stats.decode_fallback)
+            } else {
+                reason
+            };
+            let changed = stats.decode_path != Some(path) || stats.decode_fallback != reason;
+            stats.decode_path = Some(path);
+            stats.decode_fallback = reason;
+            changed.then_some(reason)
+        };
+        if let Some(reason) = changed {
+            // Static labels only, outside the map lock. No user/window/resource text.
+            tracing::info!(
+                decode_path = path,
+                decode_fallback = reason,
+                "Windows video receive path"
+            );
+        }
+    }
+
+    #[cfg(all(windows, feature = "video"))]
+    fn video_path(
+        &self,
+        key: ProjectionKey,
+        id: u64,
+        seq: u64,
+        path: crosspane_platform_windows::video::MfDecodePath,
+        reason: Option<crosspane_platform_windows::video::MfGpuFallback>,
+    ) {
+        self.record_windows_video_path(key, id, seq, path.as_str(), reason.map(|r| r.as_str()));
+    }
+
+    #[cfg(any(all(windows, feature = "video"), test))]
+    pub(crate) fn windows_gpu_ready(&self, generation: u64) {
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
+        if generation == 0 || generation <= map.receive_generation {
+            return;
+        }
+        map.receive_generation = generation;
+        for state in map.video_paths.values_mut() {
+            if state.ready_generation == generation {
+                continue;
+            }
+            state.ready_generation = generation;
+            if state.video_seen {
+                state.promote = true;
+                state.request_pending = true;
+            }
+        }
+    }
+
+    /// Drain durable requests at the existing bounded key-frame cadence. A callback only
+    /// sets a flag; it never fills an unbounded queue with one request per failed picture.
+    #[cfg(any(all(windows, feature = "video"), test))]
+    fn windows_video_requests(
+        &self,
+        now: Instant,
+        last_error: impl Fn(ProjectionKey) -> Option<Instant>,
+    ) -> Vec<ProjectionKey> {
+        let Ok(mut map) = self.inner.lock() else {
+            return Vec::new();
+        };
+        map.video_paths
+            .iter_mut()
+            .filter_map(|(key, state)| {
+                let last = state.last_request.into_iter().chain(last_error(*key)).max();
+                if state.request_pending
+                    && last.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= Duration::from_millis(200)
+                    })
+                {
+                    state.request_pending = false;
+                    state.last_request = Some(now);
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(any(all(windows, feature = "video"), test))]
+    fn windows_video_restart(&self, key: ProjectionKey, id: u64, idr: bool) -> WindowsVideoRestart {
+        let Ok(map) = self.inner.lock() else {
+            return WindowsVideoRestart::WaitForIdr;
+        };
+        if map.by_key.get(&key) != Some(&id) {
+            return WindowsVideoRestart::WaitForIdr;
+        }
+        let Some(state) = map.video_paths.get(&key) else {
+            return WindowsVideoRestart::WaitForIdr;
+        };
+        if state.awaiting_cpu {
+            if !idr {
+                return WindowsVideoRestart::WaitForIdr;
+            }
+            WindowsVideoRestart::Cpu(state.ready_generation)
+        } else if state.promote && idr {
+            WindowsVideoRestart::Gpu(state.ready_generation)
+        } else {
+            WindowsVideoRestart::Continue
+        }
+    }
+
+    /// Commit the restart only after codec construction and the independent picture both
+    /// succeed. A failed CPU initializer cannot clear the latch or reuse the retired GPU MTA.
+    #[cfg(any(all(windows, feature = "video"), test))]
+    fn windows_video_restarted(&self, key: ProjectionKey, id: u64, action: WindowsVideoRestart) {
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
+        if map.by_key.get(&key) != Some(&id) {
+            return;
+        }
+        let Some(state) = map.video_paths.get_mut(&key) else {
+            return;
+        };
+        match action {
+            WindowsVideoRestart::Cpu(generation) => {
+                state.awaiting_cpu = false;
+                if state.ready_generation == generation {
+                    state.promote = false;
+                    state.request_pending = false;
+                }
+            }
+            WindowsVideoRestart::Gpu(generation) => {
+                if state.ready_generation == generation {
+                    state.promote = false;
+                    if !state.awaiting_cpu {
+                        state.request_pending = false;
+                    }
+                }
+            }
+            WindowsVideoRestart::Continue | WindowsVideoRestart::WaitForIdr => {}
         }
     }
 
@@ -1650,6 +1911,13 @@ impl Decoding {
     }
 }
 
+/// Annex-B splitting may yield empty NALs at adjacent/trailing start codes. Validate the
+/// header byte without indexing them; the codec still validates the complete access unit.
+#[cfg(any(all(windows, feature = "video"), test))]
+fn windows_independent_frame<'a>(key: bool, mut nals: impl Iterator<Item = &'a [u8]>) -> bool {
+    key && nals.any(|nal| nal.first().is_some_and(|header| header & 0x1f == 5))
+}
+
 const GAP_TIMEOUT: Duration = Duration::from_millis(300);
 const MAX_PENDING: usize = 8;
 
@@ -1737,6 +2005,15 @@ fn decode_loop(
             }
             None => {}
         }
+        #[cfg(all(windows, feature = "video"))]
+        for key in ids.windows_video_requests(Instant::now(), |key| {
+            decoders.get(&key).and_then(|d| d.last_error)
+        }) {
+            if let Some(d) = decoders.get_mut(&key) {
+                d.last_error = Some(Instant::now());
+            }
+            let _ = engine.send(Event::Input(Input::MediaError { key }));
+        }
         // Gaps that didn't fill: ask for a key frame (at most every 200 ms per projection).
         for (key, d) in &mut decoders {
             if d.gap_since.is_some_and(|t| t.elapsed() > GAP_TIMEOUT)
@@ -1765,7 +2042,7 @@ fn apply(
     video: &VideoSetup,
 ) {
     let result = match read_codec(data) {
-        Ok(Codec::H264) => apply_video(d, data, video)
+        Ok(Codec::H264) => apply_video(d, data, video, key, id, ids)
             .map(|(header, size, rect)| (header, Some((size, rect)), None)),
         Ok(Codec::Tiles) => d
             .decoder
@@ -1779,8 +2056,24 @@ fn apply(
         Ok((header, video_size, dirty)) => {
             d.last = seq.max(header.seq);
             ids.shown(key, data.len(), header.captured_ns);
+            #[cfg(all(windows, feature = "video"))]
+            ids.begin_windows_picture(key, id, seq, video_size.is_some());
             let command = if let Some((size, rect)) = video_size {
                 d.showing = Showing::Video { size, rect };
+                #[cfg(all(windows, feature = "video"))]
+                {
+                    use crosspane_platform_windows::video::{MfDecodePath, MfGpuPicture};
+                    if let Some(picture) = &d.native {
+                        if let Some(picture) = picture.as_any().downcast_ref::<MfGpuPicture>() {
+                            let ids = ids.clone();
+                            picture.set_path_observer(Arc::new(move |path, reason| {
+                                ids.video_path(key, id, seq, path, reason);
+                            }));
+                        }
+                    } else {
+                        ids.video_path(key, id, seq, MfDecodePath::CpuNv12, None);
+                    }
+                }
                 match &d.native {
                     Some(picture) => HostCommand::VideoNative {
                         id,
@@ -1857,9 +2150,40 @@ fn apply_video(
     d: &mut Decoding,
     data: &[u8],
     video: &VideoSetup,
+    key: ProjectionKey,
+    id: u64,
+    ids: &ProxyIds,
 ) -> Result<(FrameHeader, PixelSize, PixelRect), String> {
     let (header, region, access_unit) =
         read_video_region(data).map_err(|e: MediaError| e.to_string())?;
+    #[cfg(not(all(windows, feature = "video")))]
+    let _ = (key, id, ids);
+    #[cfg(all(windows, feature = "video"))]
+    let windows_restart = {
+        use crosspane_platform_windows::model::video::nals;
+        ids.begin_windows_video_attempt(key, id);
+        // The wire key bit alone cannot permit a dependent picture on a fresh decoder.
+        // The native decoder still validates the full SPS/PPS/reference and aperture rules.
+        let idr = windows_independent_frame(header.key, nals(access_unit));
+        let action = ids.windows_video_restart(key, id, idr);
+        match action {
+            WindowsVideoRestart::WaitForIdr => {
+                return Err("Windows video awaits an independent CPU frame".into());
+            }
+            WindowsVideoRestart::Cpu(_) => {
+                // Drop the retired facade before initialization; failure leaves the latch set.
+                d.video = None;
+                d.video = Some(Box::new(
+                    crosspane_platform_windows::video::MfCodecs::new()
+                        .decoder_cpu()
+                        .map_err(|e| e.to_string())?,
+                ));
+            }
+            WindowsVideoRestart::Gpu(_) => d.video = None,
+            WindowsVideoRestart::Continue => {}
+        }
+        action
+    };
     if d.video.is_none() {
         let codecs = video
             .codecs
@@ -1872,10 +2196,12 @@ fn apply_video(
     let decoder = d.video.as_mut().ok_or("no decoder")?;
     // A CPU picture reuses the last one's buffers unless the proxy hasn't uploaded it yet; a
     // native one stays where the decoder put it.
-    let coded = match decoder
-        .decode_native(access_unit, &mut d.picture)
-        .map_err(|e| e.to_string())?
-    {
+    let decoded = decoder.decode_native(access_unit, &mut d.picture);
+    #[cfg(all(windows, feature = "video"))]
+    if let Err(error) = &decoded {
+        ids.windows_native_decode_failed(key, id, header.seq, error);
+    }
+    let coded = match decoded.map_err(|e| e.to_string())? {
         Decoded::Nv12(picture) => {
             d.native = None;
             picture.size
@@ -1901,6 +2227,8 @@ fn apply_video(
         point2(area.x as i32, area.y as i32),
         point2((area.x + area.width) as i32, (area.y + area.height) as i32),
     );
+    #[cfg(all(windows, feature = "video"))]
+    ids.windows_video_restarted(key, id, windows_restart);
     Ok((header, size, rect))
 }
 
@@ -2997,5 +3325,318 @@ pub(crate) mod recorded {
                 d.cursor_seq != before
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod windows_receive_path_tests {
+    use super::*;
+
+    fn key() -> ProjectionKey {
+        ProjectionKey {
+            source: NodeId([7; 32]),
+            projection: ProjectionId(1),
+        }
+    }
+
+    #[test]
+    fn windows_video_path_status_ignores_late_and_closed_session() {
+        let ids = ProxyIds::default();
+        let key = key();
+        let first = ids.open(key);
+        ids.begin_windows_picture(key, first, 1, true);
+        ids.record_windows_video_path(key, first, 1, "cpu_nv12", None);
+        ids.begin_windows_picture(key, first, 2, false);
+        ids.record_windows_video_path(key, first, 1, "awaiting_cpu_idr", Some("copy_failed"));
+        assert_eq!(ids.stats(key).unwrap().decode_path, Some("cpu_nv12"));
+        assert!(
+            ids.windows_video_requests(Instant::now(), |_| None)
+                .is_empty()
+        );
+        ids.close(key);
+        ids.record_windows_video_path(key, first, 2, "awaiting_cpu_idr", Some("deadline"));
+        assert!(ids.stats(key).is_none());
+        let second = ids.open(key);
+        ids.begin_windows_picture(key, second, 2, true);
+        ids.record_windows_video_path(key, first, 2, "mf_dxgi_gpu_copy", None);
+        assert!(ids.stats(key).is_none());
+        assert!(
+            ids.windows_video_requests(Instant::now(), |_| None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn windows_video_fallback_log_and_status_match_actual_import_outcome() {
+        let ids = ProxyIds::default();
+        let key = key();
+        let id = ids.open(key);
+        ids.begin_windows_picture(key, id, 1, true);
+        // Native publication alone is no evidence that the renderer imported it.
+        assert!(ids.stats(key).is_none());
+        ids.record_windows_video_path(key, id, 1, "mf_dxgi_gpu_copy", None);
+        let stats = ids.stats(key).unwrap();
+        assert_eq!(stats.decode_path, Some("mf_dxgi_gpu_copy"));
+        assert_eq!(stats.decode_fallback, None);
+        assert!(
+            ids.windows_video_requests(Instant::now(), |_| None)
+                .is_empty()
+        );
+        ids.begin_windows_picture(key, id, 2, true);
+        ids.record_windows_video_path(key, id, 2, "awaiting_cpu_idr", Some("copy_failed"));
+        let now = Instant::now();
+        assert!(ids.windows_video_requests(now, |_| Some(now)).is_empty());
+        let now = now + Duration::from_millis(200);
+        assert_eq!(ids.windows_video_requests(now, |_| None), vec![key]);
+        assert!(ids.windows_video_requests(now, |_| None).is_empty());
+        assert_eq!(
+            ids.windows_video_restart(key, id, false),
+            WindowsVideoRestart::WaitForIdr
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Cpu(0)
+        );
+        ids.windows_video_restarted(key, id, WindowsVideoRestart::Cpu(0));
+        ids.begin_windows_picture(key, id, 3, true);
+        ids.record_windows_video_path(key, id, 3, "cpu_nv12", None);
+        let stats = ids.stats(key).unwrap();
+        assert_eq!(stats.decode_path, Some("cpu_nv12"));
+        assert_eq!(stats.decode_fallback, Some("copy_failed"));
+        assert_eq!(
+            ids.windows_video_restart(key, id, false),
+            WindowsVideoRestart::Continue
+        );
+    }
+
+    #[test]
+    fn windows_gpu_ready_requests_one_idr_per_live_session_generation() {
+        let ids = ProxyIds::default();
+        let key = key();
+        let id = ids.open(key);
+        ids.begin_windows_picture(key, id, 1, true);
+        ids.record_windows_video_path(key, id, 1, "cpu_nv12", None);
+        ids.windows_gpu_ready(3);
+        let now = Instant::now();
+        assert_eq!(ids.windows_video_requests(now, |_| None), vec![key]);
+        ids.windows_gpu_ready(3);
+        ids.windows_gpu_ready(0);
+        ids.windows_gpu_ready(2);
+        assert!(
+            ids.windows_video_requests(now + Duration::from_secs(1), |_| None)
+                .is_empty()
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, false),
+            WindowsVideoRestart::Continue
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Gpu(3)
+        );
+        ids.windows_video_restarted(key, id, WindowsVideoRestart::Gpu(3));
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Continue
+        );
+        ids.close(key);
+        ids.windows_gpu_ready(4);
+        assert!(
+            ids.windows_video_requests(now + Duration::from_secs(2), |_| None)
+                .is_empty()
+        );
+        let id = ids.open(key);
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Continue
+        );
+    }
+
+    #[test]
+    fn windows_gpu_ready_during_first_decode_requests_promotion() {
+        let ids = ProxyIds::default();
+        let key = key();
+        let id = ids.open(key);
+        ids.begin_windows_video_attempt(key, id);
+        ids.windows_gpu_ready(1);
+        assert!(ids.stats(key).is_none());
+        ids.begin_windows_picture(key, id, 1, true);
+        ids.record_windows_video_path(key, id, 1, "cpu_nv12", None);
+        assert_eq!(
+            ids.windows_video_requests(Instant::now(), |_| None),
+            vec![key]
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Gpu(1)
+        );
+    }
+
+    #[test]
+    fn windows_cpu_idr_latch_survives_failed_cpu_initialization() {
+        let ids = ProxyIds::default();
+        let key = key();
+        let id = ids.open(key);
+        ids.windows_native_decode_failed(
+            key,
+            id,
+            1,
+            &crosspane_media::codec::CodecError::Failed("authored native failure".into()),
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Cpu(0)
+        );
+        // Initialization failed: no successful transaction is committed, so dependent input
+        // remains refused and the next independent frame retries CPU instead of the old MTA.
+        assert_eq!(
+            ids.windows_video_restart(key, id, false),
+            WindowsVideoRestart::WaitForIdr
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Cpu(0)
+        );
+        ids.windows_video_restarted(key, id, WindowsVideoRestart::Cpu(0));
+        assert_eq!(
+            ids.windows_video_restart(key, id, false),
+            WindowsVideoRestart::Continue
+        );
+    }
+
+    #[test]
+    fn windows_failure_before_publication_latches_cpu_at_next_idr() {
+        let ids = ProxyIds::default();
+        let key = key();
+        let id = ids.open(key);
+        ids.begin_windows_video_attempt(key, id);
+        ids.windows_native_decode_failed(
+            key,
+            id,
+            1,
+            &crosspane_media::codec::CodecError::Unavailable("authored interop refusal".into()),
+        );
+        let stats = ids.stats(key).unwrap();
+        assert_eq!(stats.decode_path, Some("awaiting_cpu_idr"));
+        assert_eq!(stats.decode_fallback, None);
+        assert_eq!(
+            ids.windows_video_restart(key, id, false),
+            WindowsVideoRestart::WaitForIdr
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Cpu(0)
+        );
+    }
+
+    #[test]
+    fn windows_bad_input_does_not_arm_cpu_idr_latch() {
+        let ids = ProxyIds::default();
+        let key = key();
+        let id = ids.open(key);
+        ids.windows_native_decode_failed(
+            key,
+            id,
+            1,
+            &crosspane_media::codec::CodecError::BadInput("authored invalid input"),
+        );
+        assert!(ids.stats(key).is_none());
+        assert!(
+            ids.windows_video_requests(Instant::now(), |_| None)
+                .is_empty()
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, false),
+            WindowsVideoRestart::Continue
+        );
+    }
+
+    #[test]
+    fn windows_repeated_native_failure_does_not_rearm_existing_latch() {
+        let ids = ProxyIds::default();
+        let key = key();
+        let id = ids.open(key);
+        let error = crosspane_media::codec::CodecError::Failed("authored native failure".into());
+        let now = Instant::now();
+        ids.windows_native_decode_failed(key, id, 1, &error);
+        assert_eq!(ids.windows_video_requests(now, |_| None), vec![key]);
+        ids.windows_native_decode_failed(key, id, 2, &error);
+        assert!(
+            ids.windows_video_requests(now + Duration::from_secs(1), |_| None)
+                .is_empty()
+        );
+        assert_eq!(
+            ids.windows_video_restart(key, id, true),
+            WindowsVideoRestart::Cpu(0)
+        );
+    }
+
+    #[test]
+    fn windows_empty_annex_b_nals_cannot_panic_idr_gate() {
+        let empty = &[][..];
+        let idr = &[0x65_u8][..];
+        let dependent = &[0x41_u8][..];
+        assert!(!windows_independent_frame(true, std::iter::empty()));
+        assert!(!windows_independent_frame(true, [empty, empty].into_iter()));
+        assert!(!windows_independent_frame(
+            true,
+            [empty, dependent, empty].into_iter()
+        ));
+        assert!(windows_independent_frame(
+            true,
+            [empty, idr, empty].into_iter()
+        ));
+        assert!(!windows_independent_frame(
+            false,
+            [empty, idr, empty].into_iter()
+        ));
+    }
+
+    #[test]
+    fn windows_ready_during_restart_preserves_new_generation_request() {
+        for cpu in [true, false] {
+            let ids = ProxyIds::default();
+            let key = key();
+            let id = ids.open(key);
+            ids.begin_windows_video_attempt(key, id);
+            ids.begin_windows_picture(key, id, 1, true);
+            if cpu {
+                ids.windows_native_decode_failed(
+                    key,
+                    id,
+                    1,
+                    &crosspane_media::codec::CodecError::Failed("authored native failure".into()),
+                );
+            } else {
+                ids.windows_gpu_ready(1);
+            }
+            let now = Instant::now();
+            assert_eq!(ids.windows_video_requests(now, |_| None), vec![key]);
+            let selected = ids.windows_video_restart(key, id, true);
+            assert_eq!(
+                selected,
+                if cpu {
+                    WindowsVideoRestart::Cpu(0)
+                } else {
+                    WindowsVideoRestart::Gpu(1)
+                }
+            );
+            // A newer real device appears while construction/decode is outside the map lock.
+            ids.windows_gpu_ready(2);
+            ids.windows_video_restarted(key, id, selected);
+            assert_eq!(
+                ids.windows_video_requests(now + Duration::from_millis(200), |_| None),
+                vec![key]
+            );
+            assert_eq!(
+                ids.windows_video_restart(key, id, true),
+                WindowsVideoRestart::Gpu(2)
+            );
+            ids.windows_video_restarted(key, id, WindowsVideoRestart::Gpu(2));
+            assert_eq!(
+                ids.windows_video_restart(key, id, true),
+                WindowsVideoRestart::Continue
+            );
+        }
     }
 }

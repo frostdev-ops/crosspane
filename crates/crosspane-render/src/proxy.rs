@@ -291,6 +291,34 @@ pub enum HostEvent {
     },
 }
 
+/// The exact Windows host device/queue lifetime, observed on the host thread.
+/// Ready is sent after lazy device creation and before Opened or native import; Retired is
+/// sent once on loss or shutdown, before the host drops that generation's device.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+pub enum WindowsDecodeDevice {
+    Ready {
+        generation: u64,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    },
+    Retired {
+        generation: u64,
+    },
+}
+
+/// Bounded metadata-only callback: no COM/MF calls, waits or locks held by a waiting decoder.
+#[cfg(target_os = "windows")]
+pub type WindowsDecodeDeviceObserver = Arc<dyn Fn(WindowsDecodeDevice) + Send + Sync>;
+
+/// Memory-only progress after nonblocking device polling. Return the earliest active absolute
+/// operation deadline, capped to a 5 ms tick, or None when work has settled/retired. Retire work
+/// at its 2 s operation deadline before returning; an expired Some retires host decode admission.
+/// Never perform native work or wait here. First work must separately wake HostHandle::Run.
+#[cfg(target_os = "windows")]
+pub type WindowsDecodeProgress =
+    Arc<dyn Fn(std::time::Instant) -> Option<std::time::Instant> + Send + Sync>;
+
 /// Imports a native picture's planes into the host's GPU `device` without copying them (WP-2.24):
 /// `[luma, chroma]` as an `R8Unorm` texture of the picture's coded size and an `Rg8Unorm` texture
 /// of half that, both with `TEXTURE_BINDING`. The textures must keep the picture's memory alive
@@ -326,6 +354,10 @@ pub struct ProxyHost {
     importer: Option<PictureImporter>,
     #[cfg(target_os = "windows")]
     placement_mapping: Option<HostPlacementMapping>,
+    #[cfg(target_os = "windows")]
+    decode_device_observer: Option<WindowsDecodeDeviceObserver>,
+    #[cfg(target_os = "windows")]
+    decode_progress: Option<WindowsDecodeProgress>,
 }
 
 impl ProxyHost {
@@ -374,6 +406,10 @@ impl ProxyHost {
                 importer: None,
                 #[cfg(target_os = "windows")]
                 placement_mapping: None,
+                #[cfg(target_os = "windows")]
+                decode_device_observer: None,
+                #[cfg(target_os = "windows")]
+                decode_progress: None,
             },
             handle,
         ))
@@ -394,6 +430,19 @@ impl ProxyHost {
         let _ = mapping;
     }
 
+    /// Observe the real Windows receive device before run. This opts into requesting NV12
+    /// when supported; optional device creation failure retries ordinary CPU-render creation.
+    #[cfg(target_os = "windows")]
+    pub fn set_windows_decode_device_observer(&mut self, observer: WindowsDecodeDeviceObserver) {
+        self.decode_device_observer = Some(observer);
+    }
+
+    /// Install bounded receive-copy progress before run; no hook or idle polling by default.
+    #[cfg(target_os = "windows")]
+    pub fn set_windows_decode_progress(&mut self, progress: WindowsDecodeProgress) {
+        self.decode_progress = Some(progress);
+    }
+
     /// Run until `Shutdown`. The event callback runs on the main thread and must not block.
     pub fn run(self, events: Box<dyn FnMut(HostEvent)>) -> Result<(), HostError> {
         let mut app = app::App::new(
@@ -402,6 +451,10 @@ impl ProxyHost {
             self.importer,
             #[cfg(target_os = "windows")]
             self.placement_mapping,
+            #[cfg(target_os = "windows")]
+            self.decode_device_observer,
+            #[cfg(target_os = "windows")]
+            self.decode_progress,
         );
         self.event_loop.run_app(&mut app)?;
         Ok(())

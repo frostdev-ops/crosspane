@@ -470,8 +470,20 @@ fn start_agent(
     }
     agent::subscribe_platform(&mut platform, &tx);
 
+    #[cfg(all(windows, feature = "video"))]
+    let (windows_codecs, decode_gpu) = if config.video_mbps != Some(0) {
+        let (codecs, bridge) =
+            platform::windows_receive_codecs(host.as_ref().map(|(_, handle)| handle.clone()));
+        (Some(codecs), bridge)
+    } else {
+        (None, None)
+    };
+
     // E2 video (WP-2.14): this node's encoder/decoder, if it has one and video isn't turned off.
     let video = media::VideoSetup {
+        #[cfg(all(windows, feature = "video"))]
+        codecs: windows_codecs,
+        #[cfg(not(all(windows, feature = "video")))]
         codecs: if config.video_mbps != Some(0) {
             platform::video_codecs(platform.gpu.as_ref())
         } else {
@@ -574,6 +586,40 @@ fn start_agent(
         host.set_placement_mapping(mapping);
     }
     let proxy_ids = media::ProxyIds::default();
+    #[cfg(all(windows, feature = "video"))]
+    if let Some((host, _)) = &mut host
+        && let Some(gpu) = &decode_gpu
+    {
+        use crosspane_render::proxy::WindowsDecodeDevice;
+        let weak = Arc::downgrade(gpu);
+        let ids = proxy_ids.clone();
+        host.set_windows_decode_device_observer(Arc::new(move |event| {
+            let Some(gpu) = weak.upgrade() else { return };
+            match event {
+                WindowsDecodeDevice::Ready {
+                    generation,
+                    device,
+                    queue,
+                } => {
+                    gpu.set_host(generation, Some((device, queue)));
+                    // Each live receive session requests at most one independent frame
+                    // per real device generation. Decoder construction stays off the host.
+                    ids.windows_gpu_ready(generation);
+                }
+                WindowsDecodeDevice::Retired { generation } => gpu.set_host(generation, None),
+            }
+        }));
+        let weak = Arc::downgrade(gpu);
+        host.set_windows_decode_progress(Arc::new(move |now| {
+            weak.upgrade().and_then(|gpu| gpu.poll_deadline(now))
+        }));
+        let weak = Arc::downgrade(gpu);
+        host.set_importer(Arc::new(move |device, picture| {
+            weak.upgrade()
+                .ok_or_else(|| "Windows receive device retired".to_owned())?
+                .import_picture(device, picture)
+        }));
+    }
     let (source_media, source_worker) = media::start_source(net.transport(), video.clone());
     let (dest_media, dest_worker) = media::start_destination(
         host.as_ref().map(|(_, handle)| handle.clone()),

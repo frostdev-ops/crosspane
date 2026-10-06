@@ -6,6 +6,280 @@ use crosspane_media::{
 };
 use crosspane_types::geom::PixelSize;
 
+/// The truthful receiving path; the GPU path copies pixels only on the GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MfDecodePath {
+    CpuNv12,
+    DxgiGpuCopy,
+    AwaitingCpuIdr,
+}
+impl MfDecodePath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CpuNv12 => "cpu_nv12",
+            Self::DxgiGpuCopy => "mf_dxgi_gpu_copy",
+            Self::AwaitingCpuIdr => "awaiting_cpu_idr",
+        }
+    }
+}
+/// Classified adapter failures only; never driver/window/resource text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MfGpuFallback {
+    HostNotReady,
+    UnsupportedDevice,
+    DeviceMismatch,
+    UnsupportedMft,
+    InvalidSurface,
+    PoolBusy,
+    CopyFailed,
+    DeviceLost,
+    Deadline,
+}
+impl MfGpuFallback {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostNotReady => "host_not_ready",
+            Self::UnsupportedDevice => "unsupported_device",
+            Self::DeviceMismatch => "device_mismatch",
+            Self::UnsupportedMft => "unsupported_mft",
+            Self::InvalidSurface => "invalid_surface",
+            Self::PoolBusy => "pool_busy",
+            Self::CopyFailed => "copy_failed",
+            Self::DeviceLost => "device_lost",
+            Self::Deadline => "deadline",
+        }
+    }
+}
+pub const GPU_SOURCE_LEASES: usize = 8;
+pub const GPU_COPY_JOBS: usize = 8;
+pub const GPU_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+pub const GPU_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Native metadata, including the MF surface-array slice, not a guessed plane index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nv12CopyPlan {
+    pub storage: PixelSize,
+    pub slice: u32,
+    pub layers: u32,
+    pub area: Aperture,
+}
+impl Nv12CopyPlan {
+    pub fn new(
+        storage: PixelSize,
+        layers: u32,
+        slice: u32,
+        area: Aperture,
+        expected: Aperture,
+    ) -> Result<Self, MfGpuFallback> {
+        if layers == 0
+            || layers > 64
+            || slice >= layers
+            || area != expected
+            || area.validate().is_err()
+            || Params::new(storage, 1, 1).and_then(Params::coded).ok() != Some(storage)
+            || area
+                .x
+                .checked_add(area.size.width)
+                .is_none_or(|n| n > storage.width)
+            || area
+                .y
+                .checked_add(area.size.height)
+                .is_none_or(|n| n > storage.height)
+        {
+            return Err(MfGpuFallback::InvalidSurface);
+        }
+        Ok(Self {
+            storage,
+            slice,
+            layers,
+            area,
+        })
+    }
+    /// Plane origins/extents are in texels, including chroma subsampling.
+    pub fn plane(self, plane: u32) -> Option<((u32, u32), PixelSize)> {
+        match plane {
+            0 => Some(((self.area.x, self.area.y), self.area.size)),
+            1 => Some((
+                (self.area.x / 2, self.area.y / 2),
+                PixelSize::new(self.area.size.width / 2, self.area.size.height / 2),
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Host observer updates are correlated by generation, including late retirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuHostUpdate {
+    Ready,
+    RetireCurrent,
+    RetireOther,
+    Ignore,
+}
+pub fn gpu_host_update(
+    latest: Option<u64>,
+    current: Option<u64>,
+    generation: u64,
+    ready: bool,
+    retired: bool,
+) -> GpuHostUpdate {
+    if ready {
+        if retired
+            || latest.is_some_and(|latest| generation < latest)
+            || current == Some(generation)
+        {
+            GpuHostUpdate::Ignore
+        } else {
+            GpuHostUpdate::Ready
+        }
+    } else if current == Some(generation) {
+        GpuHostUpdate::RetireCurrent
+    } else {
+        GpuHostUpdate::RetireOther
+    }
+}
+
+/// Retirement is terminal for one picture; a late successful import cannot overwrite it.
+pub fn gpu_path_update(
+    current: Option<(MfDecodePath, Option<MfGpuFallback>)>,
+    next: (MfDecodePath, Option<MfGpuFallback>),
+) -> Option<(MfDecodePath, Option<MfGpuFallback>)> {
+    if current.is_some_and(|(path, _)| path == MfDecodePath::AwaitingCpuIdr) {
+        current
+    } else {
+        Some(next)
+    }
+}
+
+/// One output is reserved BEFORE publication or the next MFT input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuLeaseState {
+    pub submitted: bool,
+    pub cancelled: bool,
+    pub completion: bool,
+    pub returned: bool,
+    pub picture_dropped: bool,
+    pub quarantined: bool,
+}
+impl Default for GpuLeaseState {
+    fn default() -> Self {
+        Self::reserved()
+    }
+}
+impl GpuLeaseState {
+    pub const fn reserved() -> Self {
+        Self {
+            submitted: false,
+            cancelled: false,
+            completion: false,
+            returned: false,
+            picture_dropped: false,
+            quarantined: false,
+        }
+    }
+    pub fn next_input_allowed(self) -> bool {
+        self.returned && !self.quarantined
+    }
+    pub fn release_sample(self) -> bool {
+        self.returned && self.picture_dropped && !self.quarantined
+    }
+    pub fn check_in_ready(self, ready_completed: bool) -> bool {
+        !self.returned
+            && if self.submitted {
+                self.completion
+            } else {
+                self.cancelled && ready_completed
+            }
+    }
+    pub fn submit(&mut self) -> Result<(), MfGpuFallback> {
+        if self.submitted || self.cancelled || self.returned || self.quarantined {
+            return Err(MfGpuFallback::CopyFailed);
+        }
+        self.submitted = true;
+        Ok(())
+    }
+    /// Retirement cannot undo successful native COMMON/check-in proof.
+    pub fn quarantine(&mut self) {
+        if !self.returned {
+            self.quarantined = true;
+        }
+    }
+    pub fn return_completed(&mut self) {
+        self.returned = true;
+        self.quarantined = false;
+    }
+}
+
+/// A timeout stops active progress without falsely settling or recycling native storage.
+pub fn gpu_poll_deadline(
+    now: std::time::Instant,
+    deadlines: impl IntoIterator<Item = std::time::Instant>,
+) -> Option<std::time::Instant> {
+    deadlines
+        .into_iter()
+        .filter(|at| *at > now)
+        .min()
+        .map(|at| at.min(now + GPU_POLL))
+}
+
+/// Capability admission uses exact device identity, not adapter identity alone.
+pub fn gpu_decode_admission(
+    current: Option<u64>,
+    generation: u64,
+    same_device: bool,
+    nv12: bool,
+) -> Result<(), MfGpuFallback> {
+    match current {
+        None => Err(MfGpuFallback::HostNotReady),
+        Some(current) if current != generation || !same_device => {
+            Err(MfGpuFallback::DeviceMismatch)
+        }
+        Some(_) if !nv12 => Err(MfGpuFallback::UnsupportedDevice),
+        Some(_) => Ok(()),
+    }
+}
+pub fn gpu_capacity(occupied: usize, limit: usize) -> Result<(), MfGpuFallback> {
+    if occupied >= limit {
+        Err(MfGpuFallback::PoolBusy)
+    } else {
+        Ok(())
+    }
+}
+/// Each frame receives independently owned outputs; there is no mutating reuse operation.
+pub fn allocate_gpu_planes<T>(
+    size: PixelSize,
+    mut allocate: impl FnMut(bool, PixelSize) -> T,
+) -> [T; 2] {
+    [
+        allocate(false, size),
+        allocate(true, PixelSize::new(size.width / 2, size.height / 2)),
+    ]
+}
+/// Reading an uncached native picture is unavailable, not a request to the GPU/MFT.
+pub fn native_cpu_cache(cache: Option<&Nv12>, out: &mut Nv12) -> Result<(), CodecError> {
+    let cache = cache
+        .ok_or_else(|| CodecError::Unavailable("native MF picture has no CPU cache".into()))?;
+    cache
+        .validate()
+        .map_err(|_| failed("invalid native CPU cache"))?;
+    *out = cache.clone();
+    Ok(())
+}
+
+/// Settle all return/drop controls before deciding whether any next native input can run.
+pub fn gpu_drain_control<T>(
+    leases: &mut Vec<T>,
+    mut settled: impl FnMut(&mut T) -> bool,
+    blocks: impl Fn(&T) -> bool,
+) -> bool {
+    leases.retain_mut(|lease| !settled(lease));
+    leases.iter().any(blocks)
+}
+/// Promotion/rebinding is never performed on a dependent P access unit.
+pub fn gpu_idr_binding(idr: bool, generation: Option<u64>) -> Option<u64> {
+    generation.filter(|_| idr)
+}
+
 pub const GOP: u32 = 100_000;
 pub const MAX_DIMENSION: u32 = 8192;
 
@@ -329,6 +603,10 @@ pub fn nals(data: &[u8]) -> impl Iterator<Item = &[u8]> {
         Some(&nal[..length])
     })
 }
+/// Classification is safe before validation; malformed empty NALs never match.
+pub fn has_nal(data: &[u8], kind: u8) -> bool {
+    nals(data).any(|nal| nal.first().is_some_and(|header| header & 31 == kind))
+}
 pub fn annex_b(data: &[u8]) -> bool {
     data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
 }
@@ -605,5 +883,360 @@ impl<'a> Rbsp<'a> {
             }
         }
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod gpu_decode_tests {
+    use super::*;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    fn area() -> Aperture {
+        Aperture {
+            x: 2,
+            y: 4,
+            size: PixelSize::new(640, 480),
+        }
+    }
+    #[test]
+    fn gpu_decode_requires_exact_host_generation_and_capabilities() {
+        assert_eq!(
+            gpu_decode_admission(None, 1, true, true),
+            Err(MfGpuFallback::HostNotReady)
+        );
+        assert_eq!(
+            gpu_decode_admission(Some(2), 1, true, true),
+            Err(MfGpuFallback::DeviceMismatch)
+        );
+        assert_eq!(
+            gpu_decode_admission(Some(1), 1, false, true),
+            Err(MfGpuFallback::DeviceMismatch)
+        );
+        assert_eq!(
+            gpu_decode_admission(Some(1), 1, true, false),
+            Err(MfGpuFallback::UnsupportedDevice)
+        );
+        assert_eq!(gpu_decode_admission(Some(1), 1, true, true), Ok(()));
+    }
+    #[test]
+    fn native_nv12_plane_copy_uses_exact_slice_and_plane_extent() {
+        let plan = Nv12CopyPlan::new(PixelSize::new(672, 512), 8, 7, area(), area()).unwrap();
+        assert_eq!(plan.slice, 7);
+        assert_eq!(plan.plane(0), Some(((2, 4), PixelSize::new(640, 480))));
+        assert_eq!(plan.plane(1), Some(((1, 2), PixelSize::new(320, 240))));
+        assert_eq!(plan.plane(2), None);
+        assert!(Nv12CopyPlan::new(plan.storage, 8, 8, area(), area()).is_err());
+        assert!(Nv12CopyPlan::new(PixelSize::new(640, 480), 8, 7, area(), area()).is_err());
+        assert!(Nv12CopyPlan::new(PixelSize::new(673, 512), 8, 7, area(), area()).is_err());
+    }
+    #[test]
+    fn copy_lease_returns_sample_only_after_common_and_completion() {
+        let mut lease = GpuLeaseState::reserved();
+        lease.submit().unwrap();
+        lease.picture_dropped = true;
+        assert!(!lease.check_in_ready(true));
+        assert!(!lease.release_sample());
+        lease.completion = true;
+        assert!(lease.check_in_ready(true));
+        assert!(!lease.release_sample());
+        lease.return_completed();
+        assert!(lease.release_sample());
+    }
+    #[test]
+    fn unsubmitted_superseded_picture_releases_without_gpu_access() {
+        let mut lease = GpuLeaseState::reserved();
+        lease.cancelled = true;
+        lease.picture_dropped = true;
+        assert!(!lease.check_in_ready(false));
+        assert!(lease.check_in_ready(true));
+        lease.return_completed();
+        assert!(lease.release_sample());
+        assert!(lease.submit().is_err());
+    }
+    #[test]
+    fn copy_capacity_and_deadline_retire_without_recycling_uncertain_work() {
+        assert_eq!(gpu_capacity(7, GPU_COPY_JOBS), Ok(()));
+        assert_eq!(gpu_capacity(8, GPU_COPY_JOBS), Err(MfGpuFallback::PoolBusy));
+        assert_eq!(
+            gpu_capacity(8, GPU_SOURCE_LEASES),
+            Err(MfGpuFallback::PoolBusy)
+        );
+        let mut lease = GpuLeaseState::reserved();
+        lease.submit().unwrap();
+        lease.quarantined = true;
+        lease.picture_dropped = true;
+        assert!(!lease.next_input_allowed());
+        assert!(!lease.release_sample());
+        assert!(!lease.check_in_ready(true));
+        let now = Instant::now();
+        assert_eq!(gpu_poll_deadline(now, [now]), None);
+    }
+    #[test]
+    fn gpu_loss_refuses_old_generation_and_preserves_cpu_idr_fallback() {
+        assert_eq!(
+            gpu_decode_admission(None, 3, true, true),
+            Err(MfGpuFallback::HostNotReady)
+        );
+        assert_eq!(
+            gpu_decode_admission(Some(4), 3, true, true),
+            Err(MfGpuFallback::DeviceMismatch)
+        );
+        let mut lease = GpuLeaseState::reserved();
+        lease.quarantined = true;
+        lease.picture_dropped = true;
+        assert!(!lease.release_sample());
+        assert!(!lease.next_input_allowed());
+        assert_eq!(MfDecodePath::AwaitingCpuIdr.as_str(), "awaiting_cpu_idr");
+        assert_eq!(MfDecodePath::CpuNv12.as_str(), "cpu_nv12");
+    }
+    #[test]
+    fn gpu_ready_promotes_only_at_idr_once_per_generation() {
+        assert_eq!(gpu_idr_binding(false, Some(2)), None);
+        assert_eq!(gpu_idr_binding(true, None), None);
+        assert_eq!(gpu_idr_binding(true, Some(2)), Some(2));
+        assert_eq!(
+            gpu_decode_admission(Some(1), 2, true, true),
+            Err(MfGpuFallback::DeviceMismatch)
+        );
+        assert_eq!(gpu_decode_admission(Some(2), 2, true, true), Ok(()));
+    }
+    #[test]
+    fn fresh_output_pairs_are_not_overwritten_after_source_release() {
+        let mut serial = 0;
+        let mut allocate = |_uv, size| {
+            serial += 1;
+            Arc::new((serial, size))
+        };
+        let first = allocate_gpu_planes(PixelSize::new(640, 480), &mut allocate);
+        let held = first.clone();
+        let second = allocate_gpu_planes(PixelSize::new(640, 480), &mut allocate);
+        assert_ne!(first[0].0, second[0].0);
+        assert_ne!(first[1].0, second[1].0);
+        drop(first);
+        assert_eq!(held[0].0, 1);
+        assert_eq!(held[1].0, 2);
+        assert_eq!(second[1].1, PixelSize::new(320, 240));
+    }
+    #[test]
+    fn native_snapshot_unavailable_is_immediate_and_side_effect_free() {
+        let mut out = Nv12 {
+            y: vec![17, 18],
+            ..Default::default()
+        };
+        let before = out.clone();
+        assert!(matches!(
+            native_cpu_cache(None, &mut out),
+            Err(CodecError::Unavailable(_))
+        ));
+        assert_eq!(out.y, before.y);
+        assert_eq!(out.size, before.size);
+        // This helper receives no worker, callback, native resource or status sink.
+    }
+    #[test]
+    fn output_reservation_prevents_next_input_before_publication() {
+        let mut lease = GpuLeaseState::reserved();
+        assert!(!lease.next_input_allowed());
+        assert!(!lease.check_in_ready(false));
+        lease.cancelled = true;
+        assert!(!lease.next_input_allowed());
+        lease.return_completed();
+        assert!(lease.next_input_allowed());
+        assert!(!lease.release_sample());
+    }
+    #[test]
+    fn return_control_is_processed_before_waiting_decode() {
+        let trace = std::cell::RefCell::new(Vec::new());
+        let mut leases = vec![GpuLeaseState::reserved()];
+        let blocked = gpu_drain_control(
+            &mut leases,
+            |lease| {
+                trace.borrow_mut().push("return");
+                lease.return_completed();
+                false
+            },
+            |lease| {
+                trace.borrow_mut().push("input");
+                !lease.next_input_allowed()
+            },
+        );
+        assert!(!blocked);
+        assert_eq!(*trace.borrow(), vec!["return", "input"]);
+    }
+    #[test]
+    fn sample_release_requires_last_picture_drop_and_safe_checkin() {
+        let mut lease = GpuLeaseState::reserved();
+        lease.submit().unwrap();
+        lease.completion = true;
+        lease.return_completed();
+        assert!(lease.next_input_allowed());
+        assert!(!lease.release_sample());
+        lease.picture_dropped = true;
+        assert!(lease.release_sample());
+        let mut opposite = GpuLeaseState::reserved();
+        opposite.picture_dropped = true;
+        assert!(!opposite.release_sample());
+        opposite.return_completed();
+        assert!(opposite.release_sample());
+    }
+    #[test]
+    fn copy_progress_wakes_without_redraw_and_stops_at_deadline() {
+        let now = Instant::now();
+        let end = now + GPU_BOUND;
+        assert_eq!(gpu_poll_deadline(now, [end]), Some(now + GPU_POLL));
+        assert_eq!(
+            gpu_poll_deadline(end - Duration::from_millis(1), [end]),
+            Some(end)
+        );
+        assert_eq!(gpu_poll_deadline(end, [end]), None);
+        assert_eq!(
+            gpu_poll_deadline(end + Duration::from_millis(1), [end]),
+            None
+        );
+        assert_eq!(gpu_poll_deadline(now, []), None);
+    }
+    #[test]
+    fn late_host_events_cannot_retire_or_revive_a_newer_generation() {
+        assert_eq!(
+            gpu_host_update(None, None, 1, true, false),
+            GpuHostUpdate::Ready
+        );
+        assert_eq!(
+            gpu_host_update(Some(2), Some(2), 1, false, false),
+            GpuHostUpdate::RetireOther
+        );
+        assert_eq!(
+            gpu_host_update(Some(2), Some(2), 1, true, false),
+            GpuHostUpdate::Ignore
+        );
+        assert_eq!(
+            gpu_host_update(Some(2), Some(2), 2, true, false),
+            GpuHostUpdate::Ignore
+        );
+        assert_eq!(
+            gpu_host_update(Some(2), Some(2), 2, false, false),
+            GpuHostUpdate::RetireCurrent
+        );
+        assert_eq!(
+            gpu_host_update(Some(2), None, 2, true, true),
+            GpuHostUpdate::Ignore
+        );
+        assert_eq!(
+            gpu_host_update(Some(2), None, 3, true, false),
+            GpuHostUpdate::Ready
+        );
+    }
+    #[test]
+    fn retirement_preserves_return_proof_and_releases_once_after_final_drop() {
+        let mut returned = GpuLeaseState::reserved();
+        returned.submit().unwrap();
+        returned.completion = true;
+        returned.return_completed();
+        returned.quarantine();
+        assert!(returned.returned);
+        assert!(!returned.quarantined);
+        assert!(!returned.release_sample());
+        let mut leases = vec![returned];
+        let mut released = 0;
+        leases[0].picture_dropped = true;
+        for _ in 0..2 {
+            assert!(!gpu_drain_control(
+                &mut leases,
+                |lease| {
+                    if lease.release_sample() {
+                        released += 1;
+                        true
+                    } else {
+                        false
+                    }
+                },
+                |lease| !lease.next_input_allowed()
+            ));
+        }
+        assert_eq!(released, 1);
+        assert!(leases.is_empty());
+    }
+    #[test]
+    fn retired_lease_releases_after_late_return_then_final_drop() {
+        let mut lease = GpuLeaseState::reserved();
+        lease.submit().unwrap();
+        lease.quarantine();
+        lease.completion = true;
+        assert!(lease.check_in_ready(true));
+        lease.return_completed();
+        assert!(!lease.release_sample());
+        lease.picture_dropped = true;
+        assert!(lease.release_sample());
+        assert!(!lease.quarantined);
+    }
+    #[test]
+    fn retired_unreturned_lease_stays_counted_until_proven_return_and_drop() {
+        let mut lease = GpuLeaseState::reserved();
+        lease.submit().unwrap();
+        lease.quarantine();
+        lease.picture_dropped = true;
+        let mut leases = vec![lease];
+        assert!(gpu_drain_control(
+            &mut leases,
+            |lease| lease.release_sample(),
+            |lease| !lease.next_input_allowed()
+        ));
+        assert_eq!(leases.len(), 1);
+        assert!(gpu_capacity(leases.len(), 1).is_err());
+        assert!(!leases[0].check_in_ready(true));
+        // Only observed completion plus successful native return can settle quarantine.
+        leases[0].completion = true;
+        assert!(leases[0].check_in_ready(true));
+        leases[0].return_completed();
+        assert!(!gpu_drain_control(
+            &mut leases,
+            |lease| lease.release_sample(),
+            |lease| !lease.next_input_allowed()
+        ));
+        assert!(leases.is_empty());
+    }
+    #[test]
+    fn picture_retirement_cannot_be_overwritten_by_late_import_success() {
+        let outcome = (
+            MfDecodePath::AwaitingCpuIdr,
+            Some(MfGpuFallback::DeviceLost),
+        );
+        let failure = Some(outcome);
+        assert_eq!(
+            gpu_path_update(failure, (MfDecodePath::DxgiGpuCopy, None)),
+            failure
+        );
+        assert_eq!(
+            gpu_path_update(None, (MfDecodePath::DxgiGpuCopy, None)),
+            Some((MfDecodePath::DxgiGpuCopy, None))
+        );
+        assert_eq!(
+            gpu_path_update(Some((MfDecodePath::DxgiGpuCopy, None)), outcome),
+            failure
+        );
+    }
+    #[test]
+    fn malformed_empty_nals_never_classify_as_idr() {
+        for bytes in [&[][..], &[0, 0, 1][..], &[0, 0, 1, 0, 0, 1][..]] {
+            assert!(!has_nal(bytes, 5));
+            assert!(!has_nal(bytes, 7));
+        }
+        assert!(has_nal(&[0, 0, 1, 0x65, 0, 0, 1], 5));
+        // The decoder's existing admission refuses malformed units, without a panic.
+        for bytes in [&[0, 0, 1][..], &[0, 0, 1, 0, 0, 1][..]] {
+            assert!(References::default().check(bytes).is_err());
+        }
+    }
+    #[test]
+    fn unsubmitted_checkout_waits_for_ready_before_checkin() {
+        let mut lease = GpuLeaseState::reserved();
+        lease.picture_dropped = true;
+        lease.cancelled = true;
+        assert!(!lease.check_in_ready(false));
+        assert!(!lease.release_sample());
+        assert!(lease.check_in_ready(true));
+        lease.return_completed();
+        assert!(lease.release_sample());
     }
 }

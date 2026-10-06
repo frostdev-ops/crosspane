@@ -20,14 +20,18 @@ use winit::{
 
 #[cfg(any(target_os = "windows", test))]
 use super::HostMonitorMapping;
-#[cfg(target_os = "windows")]
-use super::HostPlacementMapping;
 use super::{
     HostCommand, HostEvent, HostPlace, PictureImporter, cursor,
     gpu::{Presenter, surface_format},
     input::{InputState, install_arm, mouse_button, scroll},
 };
+#[cfg(target_os = "windows")]
+use super::{
+    HostPlacementMapping, WindowsDecodeDevice, WindowsDecodeDeviceObserver, WindowsDecodeProgress,
+};
 use crate::keymap::keycode_to_hid;
+#[cfg(any(target_os = "windows", test))]
+use std::sync::atomic::AtomicU64;
 
 pub(super) struct App {
     proxy: EventLoopProxy<HostCommand>,
@@ -41,6 +45,14 @@ pub(super) struct App {
     importer: Option<PictureImporter>,
     #[cfg(target_os = "windows")]
     placement_mapping: Option<HostPlacementMapping>,
+    #[cfg(target_os = "windows")]
+    decode_device_observer: Option<WindowsDecodeDeviceObserver>,
+    #[cfg(target_os = "windows")]
+    decode_progress: Option<WindowsDecodeProgress>,
+    #[cfg(target_os = "windows")]
+    decode_lifetime: DecodeDeviceLifetime,
+    #[cfg(target_os = "windows")]
+    decode_poll_at: Option<Instant>,
 }
 
 struct Gpu {
@@ -80,11 +92,21 @@ impl App {
         events: Box<dyn FnMut(HostEvent)>,
         importer: Option<PictureImporter>,
         #[cfg(target_os = "windows")] placement_mapping: Option<HostPlacementMapping>,
+        #[cfg(target_os = "windows")] decode_device_observer: Option<WindowsDecodeDeviceObserver>,
+        #[cfg(target_os = "windows")] decode_progress: Option<WindowsDecodeProgress>,
     ) -> Self {
         Self {
             importer,
             #[cfg(target_os = "windows")]
             placement_mapping,
+            #[cfg(target_os = "windows")]
+            decode_device_observer,
+            #[cfg(target_os = "windows")]
+            decode_progress,
+            #[cfg(target_os = "windows")]
+            decode_lifetime: DecodeDeviceLifetime::default(),
+            #[cfg(target_os = "windows")]
+            decode_poll_at: None,
             proxy,
             events,
             instance: None,
@@ -230,7 +252,15 @@ impl App {
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
         if self.gpu.is_none() {
-            self.gpu = Some(Gpu::new(instance, &surface, self.proxy.clone())?);
+            self.gpu = Some(Gpu::new(
+                instance,
+                &surface,
+                self.proxy.clone(),
+                #[cfg(target_os = "windows")]
+                self.decode_device_observer.is_some(),
+            )?);
+            #[cfg(target_os = "windows")]
+            self.publish_decode_device();
         }
         let gpu = self.gpu.as_ref().ok_or("GPU initialization failed")?;
         if gpu.failed.load(Ordering::Acquire) {
@@ -380,6 +410,41 @@ impl App {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn publish_decode_device(&mut self) {
+        if self.decode_lifetime.generation.is_some() {
+            return;
+        }
+        let (Some(observer), Some(gpu)) = (&self.decode_device_observer, &self.gpu) else {
+            return;
+        };
+        if gpu.failed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(generation) = self.decode_lifetime.ready(&NEXT_DECODE_GENERATION) else {
+            // Tokens never wrap/reuse. A new host with an exhausted counter stays CPU-only.
+            tracing::warn!("Windows decode generation unavailable; using ordinary rendering");
+            self.decode_device_observer = None;
+            self.decode_progress = None;
+            return;
+        };
+        observer(WindowsDecodeDevice::Ready {
+            generation,
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn retire_decode_device(&mut self) {
+        self.decode_poll_at = None;
+        if let Some(generation) = self.decode_lifetime.retire()
+            && let Some(observer) = &self.decode_device_observer
+        {
+            observer(WindowsDecodeDevice::Retired { generation });
+        }
+    }
+
     fn check_gpu(&mut self) {
         if let Some(gpu) = &self.gpu
             && gpu.device.poll(wgpu::PollType::Poll).is_err()
@@ -391,6 +456,8 @@ impl App {
             .as_ref()
             .is_some_and(|gpu| gpu.failed.load(Ordering::Acquire))
         {
+            #[cfg(target_os = "windows")]
+            self.retire_decode_device();
             let ids: Vec<_> = self.windows.keys().copied().collect();
             for id in ids {
                 self.remove(id, true);
@@ -552,6 +619,8 @@ impl App {
                 }
             }
             HostCommand::Shutdown => {
+                #[cfg(target_os = "windows")]
+                self.retire_decode_device();
                 let ids: Vec<_> = self.windows.keys().copied().collect();
                 for id in ids {
                     self.remove(id, false);
@@ -601,6 +670,91 @@ impl App {
         // After `Resized`, so the engine has the new size before the placement that carries it.
         self.report_placement(id, Trigger::Geometry);
     }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for App {
+    fn drop(&mut self) {
+        // Also covers event-loop errors and an exit that bypassed HostCommand::Shutdown.
+        self.retire_decode_device();
+    }
+}
+
+#[cfg(target_os = "windows")]
+static NEXT_DECODE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Default)]
+struct DecodeDeviceLifetime {
+    generation: Option<u64>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl DecodeDeviceLifetime {
+    fn ready(&mut self, next: &AtomicU64) -> Option<u64> {
+        if self.generation.is_some() {
+            return None;
+        }
+        let previous = next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .ok()?;
+        let generation = previous.saturating_add(1);
+        self.generation = Some(generation);
+        Some(generation)
+    }
+
+    fn retire(&mut self) -> Option<u64> {
+        self.generation.take()
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn decode_device_features(opt_in: bool, supported: wgpu::Features) -> wgpu::Features {
+    if opt_in && supported.contains(wgpu::Features::TEXTURE_FORMAT_NV12) {
+        wgpu::Features::TEXTURE_FORMAT_NV12
+    } else {
+        wgpu::Features::empty()
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn request_decode_device<T, E>(
+    features: wgpu::Features,
+    mut request: impl FnMut(wgpu::Features) -> Result<T, E>,
+) -> Result<T, E> {
+    match request(features) {
+        Err(_) if !features.is_empty() => {
+            tracing::debug!(
+                "optional Windows NV12 device unavailable; creating ordinary proxy device"
+            );
+            request(wgpu::Features::empty())
+        }
+        result => result,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn decode_poll_deadline(
+    previous: Option<Instant>,
+    now: Instant,
+    reported: Option<Instant>,
+) -> Result<Option<Instant>, ()> {
+    let Some(reported) = reported else {
+        return Ok(None);
+    };
+    // The provider retires work before its absolute deadline. Never create a busy loop for
+    // malformed/stale provider state; the caller retires decode without closing CPU proxies.
+    if reported <= now {
+        return Err(());
+    }
+    let tick = reported.min(now + Duration::from_millis(5));
+    Ok(Some(
+        previous
+            .filter(|deadline| *deadline > now)
+            .map_or(tick, |deadline| deadline.min(tick)),
+    ))
 }
 
 /// Physical frame/content readings become global logical coordinates at the current scale.
@@ -872,7 +1026,28 @@ impl ApplicationHandler<HostCommand> for App {
             install_arm(input, until, done);
         }
         let now = Instant::now();
+        #[cfg(not(target_os = "windows"))]
         let mut next = None;
+        #[cfg(target_os = "windows")]
+        {
+            // check_gpu above advances completion first. The provider only inspects bounded
+            // memory state; it never waits for MF, COM or GPU work on the host thread.
+            let reported = self.decode_lifetime.generation.and_then(|_| {
+                self.decode_progress
+                    .as_ref()
+                    .and_then(|progress| progress(now))
+            });
+            match decode_poll_deadline(self.decode_poll_at, now, reported) {
+                Ok(deadline) => self.decode_poll_at = deadline,
+                Err(()) => {
+                    tracing::warn!("Windows decode progress missed retirement deadline");
+                    // A broken provider cannot spin or poison ordinary renderer/proxy state.
+                    self.retire_decode_device();
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        let mut next = self.decode_poll_at;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let mut corrections = Vec::new();
         for (&id, window) in &mut self.windows {
@@ -1091,6 +1266,7 @@ impl Gpu {
         instance: &wgpu::Instance,
         surface: &wgpu::Surface<'_>,
         proxy: EventLoopProxy<HostCommand>,
+        #[cfg(target_os = "windows")] decode_opt_in: bool,
     ) -> Result<Self, String> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: Some(surface),
@@ -1099,6 +1275,36 @@ impl Gpu {
             apply_limit_buckets: false,
         }))
         .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "windows")]
+        let mut adapter = adapter;
+        #[cfg(target_os = "windows")]
+        let (device, queue) = {
+            let features = decode_device_features(decode_opt_in, adapter.features());
+            let mut first = true;
+            request_decode_device(features, |required_features| {
+                if !first {
+                    // wgpu documents one-use adapters. Retry the original descriptor on a
+                    // fresh surface-compatible adapter, never rely on reuse after failure.
+                    adapter = pollster::block_on(instance.request_adapter(
+                        &wgpu::RequestAdapterOptions {
+                            compatible_surface: Some(surface),
+                            force_fallback_adapter: false,
+                            power_preference: wgpu::PowerPreference::None,
+                            apply_limit_buckets: false,
+                        },
+                    ))
+                    .map_err(|error| error.to_string())?;
+                }
+                first = false;
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("shared proxy device"),
+                    required_features,
+                    ..Default::default()
+                }))
+                .map_err(|error| error.to_string())
+            })?
+        };
+        #[cfg(not(target_os = "windows"))]
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("shared proxy device"),
             ..Default::default()
@@ -1665,6 +1871,133 @@ fn window_scale(windows: &HashMap<u64, ProxyWindow>, id: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_decode_feature_opt_in_requires_capability() {
+        let nv12 = wgpu::Features::TEXTURE_FORMAT_NV12;
+        let extra = wgpu::Features::TIMESTAMP_QUERY;
+        assert_eq!(
+            decode_device_features(false, nv12 | extra),
+            wgpu::Features::empty()
+        );
+        assert_eq!(decode_device_features(true, extra), wgpu::Features::empty());
+        assert_eq!(decode_device_features(true, nv12 | extra), nv12);
+    }
+
+    #[test]
+    fn windows_decode_optional_request_failure_retries_ordinary_once() {
+        let mut calls = Vec::new();
+        let result = request_decode_device(wgpu::Features::TEXTURE_FORMAT_NV12, |features| {
+            calls.push(features);
+            if features.is_empty() {
+                Ok("ordinary")
+            } else {
+                Err("optional refused")
+            }
+        });
+        assert_eq!(result, Ok("ordinary"));
+        assert_eq!(
+            calls,
+            [wgpu::Features::TEXTURE_FORMAT_NV12, wgpu::Features::empty()]
+        );
+        let mut count = 0;
+        assert_eq!(
+            request_decode_device(wgpu::Features::TEXTURE_FORMAT_NV12, |_| {
+                count += 1;
+                Err::<(), _>(count)
+            }),
+            Err(2)
+        );
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn windows_decode_ordinary_request_failure_does_not_retry() {
+        for features in [wgpu::Features::empty(), wgpu::Features::TEXTURE_FORMAT_NV12] {
+            let mut count = 0;
+            assert_eq!(
+                request_decode_device(features, |_| {
+                    count += 1;
+                    Ok::<_, ()>(7)
+                }),
+                Ok(7)
+            );
+            assert_eq!(count, 1);
+        }
+        let mut count = 0;
+        assert_eq!(
+            request_decode_device(wgpu::Features::empty(), |_| {
+                count += 1;
+                Err::<(), _>("ordinary refused")
+            }),
+            Err("ordinary refused")
+        );
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn windows_decode_generations_are_unique_retire_once_and_never_wrap() {
+        let next = AtomicU64::new(0);
+        let mut first = DecodeDeviceLifetime::default();
+        let mut second = DecodeDeviceLifetime::default();
+        assert_eq!(first.ready(&next), Some(1));
+        assert_eq!(first.ready(&next), None);
+        assert_eq!(second.ready(&next), Some(2));
+        assert_eq!(first.retire(), Some(1));
+        assert_eq!(first.retire(), None);
+        assert_eq!(second.retire(), Some(2));
+        assert_eq!(second.retire(), None);
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert_eq!(first.ready(&exhausted), None);
+        assert_eq!(first.retire(), None);
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn windows_decode_progress_schedules_without_windows_and_preserves_early_wake() {
+        let now = Instant::now();
+        let operation = now + Duration::from_secs(2);
+        let first = decode_poll_deadline(None, now, Some(operation))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, now + Duration::from_millis(5));
+        let early = now + Duration::from_millis(1);
+        assert_eq!(
+            decode_poll_deadline(Some(first), early, Some(operation)).unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            decode_poll_deadline(Some(first), first, Some(operation)).unwrap(),
+            Some(first + Duration::from_millis(5))
+        );
+        let nearer = now + Duration::from_millis(3);
+        assert_eq!(
+            decode_poll_deadline(Some(first), early, Some(nearer)).unwrap(),
+            Some(nearer)
+        );
+    }
+
+    #[test]
+    fn windows_decode_progress_clears_on_none_and_rejects_expired_deadlines() {
+        let now = Instant::now();
+        let pending = now + Duration::from_millis(5);
+        assert_eq!(decode_poll_deadline(Some(pending), now, None), Ok(None));
+        assert_eq!(decode_poll_deadline(Some(pending), now, Some(now)), Err(()));
+        assert_eq!(
+            decode_poll_deadline(None, now, Some(now - Duration::from_millis(1))),
+            Err(())
+        );
+        let absolute = now + Duration::from_secs(2);
+        assert_eq!(
+            decode_poll_deadline(None, absolute - Duration::from_millis(1), Some(absolute))
+                .unwrap(),
+            Some(absolute)
+        );
+        assert_eq!(
+            decode_poll_deadline(Some(absolute), absolute, None),
+            Ok(None)
+        );
+    }
 
     #[test]
     fn content_placement_uses_frame_offsets_and_corrects_at_most_once() {

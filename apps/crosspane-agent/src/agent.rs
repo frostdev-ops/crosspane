@@ -5390,12 +5390,21 @@ impl Agent {
             })).collect::<Vec<_>>(),
             "notices": self.notices.iter().collect::<Vec<_>>(),
             "projections": self.projections.iter().map(|(k, text)| {
-                let frames = self.proxy_ids.stats(*k).map(|s| json!({
-                    "frames": s.frames,
-                    "bytes": s.bytes,
-                    "last_ms_ago": s.last.map(|t| t.elapsed().as_millis() as u64),
-                    "latency_ms": s.latency_ms.map(|ms| (ms * 10.0).round() / 10.0),
-                }));
+                let frames = self.proxy_ids.stats(*k).map(|s| {
+                    #[allow(unused_mut)]
+                    let mut received = json!({
+                        "frames": s.frames,
+                        "bytes": s.bytes,
+                        "last_ms_ago": s.last.map(|t| t.elapsed().as_millis() as u64),
+                        "latency_ms": s.latency_ms.map(|ms| (ms * 10.0).round() / 10.0),
+                    });
+                    #[cfg(windows)]
+                    {
+                        received["decode_path"] = json!(s.decode_path);
+                        received["decode_fallback"] = json!(s.decode_fallback);
+                    }
+                    received
+                });
                 json!({
                     "source": k.source.short(),
                     "projection": k.projection.0,
