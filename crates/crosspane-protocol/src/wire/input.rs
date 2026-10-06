@@ -1,16 +1,16 @@
 //! Hot-path encodings: input-stream messages and pointer datagrams. Implemented in WP-1.1.
 
-use crosspane_types::geom::{PointDevice, VectorLogical};
+use crosspane_types::geom::{PixelSize, PointDevice, VectorLogical};
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::{DisplayId, ProjectionId, SessionId};
+use crosspane_types::id::{DisplayId, ProjectionId, SessionId, WindowId};
 use crosspane_types::input::{LockKeys, ScrollDelta, ScrollPhase};
 
 use super::frame::decode_header;
 use super::{
     Frame, HEADER_LEN, KIND_ACK, KIND_BUTTON, KIND_KEY, KIND_LOCK_KEYS, KIND_POINTER,
     KIND_PRESS_AT, KIND_PROJ_BUTTON, KIND_PROJ_HELD, KIND_PROJ_KEY, KIND_PROJ_MOTION,
-    KIND_PROJ_SCROLL, KIND_SCROLL, KIND_STATE, KIND_STATUS, MAX_INPUT_PAYLOAD, WIRE_VERSION,
-    WireError,
+    KIND_PROJ_SCROLL, KIND_SCROLL, KIND_STATE, KIND_STATUS, KIND_STATUS_MOVE, MAX_INPUT_PAYLOAD,
+    WIRE_VERSION, WireError,
 };
 use crate::msg::{InputMessage, MAX_HELD_KEYS, PointerMessage, Refusal, TargetStatus};
 use crate::projection::ProjInput;
@@ -117,6 +117,10 @@ pub fn encode_input(msg: &InputMessage, out: &mut Vec<u8>) -> Result<(), WireErr
         }
         InputMessage::Status { session, status } => {
             let codes = match status {
+                TargetStatus::NativeMove { .. } | TargetStatus::NativeMoveEnded { .. } => {
+                    encode_move_status(*session, *status, out);
+                    return Ok(());
+                }
                 TargetStatus::LocalOverride => [1, 0],
                 TargetStatus::Resumed => [2, 0],
                 TargetStatus::Refused(reason) => [
@@ -154,6 +158,7 @@ pub fn decode_input(frame: &Frame) -> Result<InputMessage, WireError> {
         KIND_STATE => 15,
         KIND_ACK => 12,
         KIND_STATUS => 10,
+        KIND_STATUS_MOVE => 42,
         kind => return Err(WireError::BadKind(kind)),
     };
     if len != expected {
@@ -168,6 +173,12 @@ pub fn decode_input(frame: &Frame) -> Result<InputMessage, WireError> {
         return Ok(InputMessage::Status {
             session,
             status: decode_status(reader.byte()?, reader.byte()?)?,
+        });
+    }
+    if frame.kind == KIND_STATUS_MOVE {
+        return Ok(InputMessage::Status {
+            session,
+            status: decode_move_status(&mut reader)?,
         });
     }
     let seq = u32::from_le_bytes(reader.take()?);
@@ -658,6 +669,61 @@ fn decode_phase(code: u8) -> Result<ScrollPhase, WireError> {
     }
 }
 
+fn encode_move_status(session: SessionId, status: TargetStatus, out: &mut Vec<u8>) {
+    append_header(out, KIND_STATUS_MOVE, 42);
+    out.extend_from_slice(&session.0.to_le_bytes());
+    match status {
+        TargetStatus::NativeMove {
+            window,
+            proxy,
+            grab,
+            size,
+        } => {
+            out.push(1);
+            out.extend_from_slice(&window.0.to_le_bytes());
+            out.push(u8::from(proxy.is_some()));
+            out.extend_from_slice(&proxy.map_or(0, |id| id.0).to_le_bytes());
+            out.extend_from_slice(&grab.0.to_le_bytes());
+            out.extend_from_slice(&grab.1.to_le_bytes());
+            out.extend_from_slice(&size.width.to_le_bytes());
+            out.extend_from_slice(&size.height.to_le_bytes());
+        }
+        TargetStatus::NativeMoveEnded { window } => {
+            out.push(2);
+            out.extend_from_slice(&window.0.to_le_bytes());
+            out.extend_from_slice(&[0; 25]);
+        }
+        _ => unreachable!("only move statuses use their separate kind"),
+    }
+}
+
+fn decode_move_status(reader: &mut Reader<'_>) -> Result<TargetStatus, WireError> {
+    let code = reader.byte()?;
+    let window = WindowId(u64::from_le_bytes(reader.take()?));
+    let present = decode_down(reader.byte()?)?;
+    let proxy = u64::from_le_bytes(reader.take()?);
+    let grab = (
+        i32::from_le_bytes(reader.take()?),
+        i32::from_le_bytes(reader.take()?),
+    );
+    let size = PixelSize::new(
+        u32::from_le_bytes(reader.take()?),
+        u32::from_le_bytes(reader.take()?),
+    );
+    match code {
+        1 if present || proxy == 0 => Ok(TargetStatus::NativeMove {
+            window,
+            proxy: present.then_some(ProjectionId(proxy)),
+            grab,
+            size,
+        }),
+        2 if !present && proxy == 0 && grab == (0, 0) && size == PixelSize::new(0, 0) => {
+            Ok(TargetStatus::NativeMoveEnded { window })
+        }
+        _ => Err(WireError::BadValue("native move status fields")),
+    }
+}
+
 fn decode_status(code: u8, detail: u8) -> Result<TargetStatus, WireError> {
     match (code, detail) {
         (1, 0) => Ok(TargetStatus::LocalOverride),
@@ -671,5 +737,90 @@ fn decode_status(code: u8, detail: u8) -> Result<TargetStatus, WireError> {
             _ => return Err(WireError::BadValue("unknown refusal detail")),
         })),
         _ => Err(WireError::BadValue("invalid status code or detail")),
+    }
+}
+
+#[cfg(test)]
+mod drag_in_wire_tests {
+    use super::*;
+
+    fn encoded(status: TargetStatus) -> (InputMessage, Vec<u8>, Frame) {
+        let message = InputMessage::Status {
+            session: SessionId(11),
+            status,
+        };
+        let mut bytes = Vec::new();
+        encode_input(&message, &mut bytes).unwrap();
+        let mut decoder = crate::wire::FrameDecoder::new(MAX_INPUT_PAYLOAD);
+        decoder.push(&bytes);
+        let frame = decoder.next_frame().unwrap().unwrap();
+        (message, bytes, frame)
+    }
+
+    #[test]
+    fn native_move_status_round_trip_exact_42_byte_payload() {
+        for proxy in [None, Some(ProjectionId(u64::MAX))] {
+            let (message, bytes, frame) = encoded(TargetStatus::NativeMove {
+                window: WindowId(u64::MAX),
+                proxy,
+                grab: (i32::MIN, i32::MAX),
+                size: PixelSize::new(u32::MAX, 1),
+            });
+            assert_eq!(frame.kind, KIND_STATUS_MOVE);
+            assert_eq!(frame.payload.len(), 42);
+            assert_eq!(bytes.len(), HEADER_LEN + 42);
+            assert_eq!(decode_input(&frame).unwrap(), message);
+        }
+        let (message, _, frame) = encoded(TargetStatus::NativeMoveEnded {
+            window: WindowId(5),
+        });
+        assert_eq!(&frame.payload[17..], &[0; 25]);
+        assert_eq!(decode_input(&frame).unwrap(), message);
+    }
+
+    #[test]
+    fn native_move_status_rejects_wrong_length_and_noncanonical_ended() {
+        let (_, _, frame) = encoded(TargetStatus::NativeMoveEnded {
+            window: WindowId(5),
+        });
+        for length in 0..42 {
+            let short = Frame {
+                kind: frame.kind,
+                payload: frame.payload[..length].to_vec(),
+            };
+            assert!(matches!(
+                decode_input(&short),
+                Err(WireError::BadLength { .. })
+            ));
+        }
+        for offset in 17..42 {
+            let mut bad = frame.clone();
+            bad.payload[offset] = 1;
+            assert!(decode_input(&bad).is_err());
+        }
+        let mut long = frame.clone();
+        long.payload.push(0);
+        assert!(matches!(
+            decode_input(&long),
+            Err(WireError::BadLength { .. })
+        ));
+        let mut bad_code = frame;
+        bad_code.payload[8] = 3;
+        assert!(decode_input(&bad_code).is_err());
+    }
+
+    #[test]
+    fn native_move_keeps_old_status_kind_unchanged() {
+        for status in [
+            TargetStatus::LocalOverride,
+            TargetStatus::Resumed,
+            TargetStatus::Refused(Refusal::Locked),
+        ] {
+            let (message, bytes, frame) = encoded(status);
+            assert_eq!(frame.kind, KIND_STATUS);
+            assert_eq!(frame.payload.len(), 10);
+            assert_eq!(bytes.len(), HEADER_LEN + 10);
+            assert_eq!(decode_input(&frame).unwrap(), message);
+        }
     }
 }

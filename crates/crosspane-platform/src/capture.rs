@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crosspane_types::geom::PointDevice;
+use crosspane_types::geom::{PixelSize, PointDevice};
 use crosspane_types::hid::{HidUsage, MouseButton};
 use crosspane_types::id::{DisplayId, WindowId};
 use crosspane_types::input::{LockKeys, ScrollDelta};
@@ -102,6 +102,19 @@ pub enum CaptureEvent {
         grab: PointDevice,
         at: MonoTime,
     },
+    /// While not capturing: a native window move is in progress under the pointer, reported
+    /// without any edge test (DRAG v0-b; the seat decides). `window`: a `WindowSource` id, or the
+    /// proxy's own window id when a proxy is moved. `grab`: the pointer's offset inside that
+    /// window's content, in device pixels of the display it is on; `size`: the content size.
+    /// Backends report it for injected input too (the E1 target case) and at most every 20 ms.
+    NativeMove {
+        window: WindowId,
+        grab: PointDevice,
+        size: PixelSize,
+        at: MonoTime,
+    },
+    /// The move reported by `NativeMove` ended (release, window change, lost sample).
+    NativeMoveEnded { window: WindowId, at: MonoTime },
     /// The pointer stopped pressing against a portal: it moved away, left the stretch, or the portal
     /// was removed. Cancels any push-to-cross delay.
     EdgeReleased { portal: PortalId, at: MonoTime },

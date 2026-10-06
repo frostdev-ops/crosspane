@@ -15,10 +15,10 @@ use crosspane_protocol::link::LinkEvent;
 use crosspane_protocol::msg::{
     Capability, ControlMessage, EndReason, InputMessage, PointerMessage, Refusal, TargetStatus,
 };
-use crosspane_types::geom::PointDevice;
+use crosspane_types::geom::{PixelSize, PointDevice};
 use crosspane_types::hid::MouseButton;
 use crosspane_types::id::DisplayId;
-use crosspane_types::id::{NodeId, SessionId};
+use crosspane_types::id::{NodeId, ProjectionId, SessionId, WindowId};
 use crosspane_types::time::MonoTime;
 
 use crate::config::EngineConfig;
@@ -110,6 +110,11 @@ pub struct TargetE1 {
     drag_ignore_up: Option<SessionId>,
     drag_used: Option<(ProjectionKey, u32)>,
     drag_down: Option<InjectId>,
+    native_move: Option<(WindowId, Option<ProjectionId>, MonoTime)>,
+    native_move_sample: Option<((i32, i32), PixelSize)>,
+    native_proxy: Option<ProjectionId>,
+    native_move_gate: bool,
+    drag_in: BTreeSet<NodeId>,
 }
 
 impl fmt::Debug for TargetE1 {
@@ -162,6 +167,11 @@ impl TargetE1 {
             drag_ignore_up: None,
             drag_used: None,
             drag_down: None,
+            native_move: None,
+            native_move_sample: None,
+            native_proxy: None,
+            native_move_gate: true,
+            drag_in: BTreeSet::new(),
         };
         let mut out = Vec::new();
         target.physical.startup(true, &target.recovery)?;
@@ -205,6 +215,16 @@ impl TargetE1 {
             return;
         }
         match input {
+            Input::DragInPeer { peer, available } => {
+                if *available {
+                    self.drag_in.insert(*peer);
+                } else {
+                    self.drag_in.remove(peer);
+                    if self.active.is_some_and(|a| a.controller == *peer) {
+                        self.clear_native_move();
+                    }
+                }
+            }
             Input::Session(event) => {
                 match event {
                     SessionEvent::State(state) => {
@@ -306,15 +326,128 @@ impl TargetE1 {
             {
                 self.end_session(None, None, out);
             }
+            Input::Capture(CaptureEvent::NativeMove {
+                window, grab, size, ..
+            }) => {
+                // Expire a lease before admitting a fact, even when its scheduled Tick is late.
+                self.tick(out);
+                self.native_move(*window, *grab, *size, out);
+            }
+            Input::Capture(CaptureEvent::NativeMoveEnded { window, .. }) => {
+                if self.native_move.is_some_and(|(old, _, _)| old == *window) {
+                    self.end_native_move(out);
+                }
+            }
             Input::Capture(CaptureEvent::LocalActivity { .. }) => self.local_activity(out),
             Input::Tick => self.tick(out),
+            Input::Command(Command::Rearm) => self.native_move_gate = true,
             Input::Command(Command::Panic) => {
+                self.native_move_gate = false;
                 self.end_session(Some(EndReason::Panic), None, out);
             }
             Input::InjectDone { id, ok } => self.inject_done(*id, *ok, out),
             _ => {}
         }
         self.collect();
+    }
+
+    /// The engine resolves a moved proxy using E2's authoritative table before dispatch.
+    pub(crate) fn prepare_native_move(&mut self, proxy: Option<ProjectionId>) {
+        self.native_proxy = proxy;
+    }
+
+    /// PullAt can arrive before the controller's up on the separate input stream. Ending this
+    /// controller's session uses the existing journaled release path before any source park.
+    pub(crate) fn release_for_pull_at(&mut self, peer: NodeId, out: &mut Vec<Output>) {
+        if self.active.is_some_and(|active| active.controller == peer) {
+            self.end_session(Some(EndReason::Released), None, out);
+        }
+    }
+
+    fn clear_native_move(&mut self) {
+        self.native_move = None;
+        self.native_move_sample = None;
+    }
+
+    fn end_native_move(&mut self, out: &mut Vec<Output>) {
+        if let Some((window, _, _)) = self.native_move.take()
+            && let Some(active) = self.active.filter(|a| self.drag_in.contains(&a.controller))
+        {
+            out.push(Output::SendInput {
+                peer: active.controller,
+                msg: InputMessage::Status {
+                    session: active.session,
+                    status: TargetStatus::NativeMoveEnded { window },
+                },
+            });
+        }
+        self.native_move_sample = None;
+    }
+
+    fn native_move(
+        &mut self,
+        window: WindowId,
+        grab: PointDevice,
+        size: PixelSize,
+        out: &mut Vec<Output>,
+    ) {
+        let Some(active) = self.active.filter(|a| self.drag_in.contains(&a.controller)) else {
+            self.clear_native_move();
+            return;
+        };
+        if !self.native_move_gate
+            || !self.permits_io()
+            || !self
+                .ledger
+                .held()
+                .contains(&Held::Button(MouseButton::PRIMARY))
+            || !grab.x.is_finite()
+            || !grab.y.is_finite()
+            || size.width == 0
+            || size.height == 0
+            || grab.x < 0.0
+            || grab.y < 0.0
+            || grab.x >= f64::from(size.width)
+            || grab.y >= f64::from(size.height)
+            || grab.x > f64::from(i32::MAX)
+            || grab.y > f64::from(i32::MAX)
+        {
+            self.clear_native_move();
+            return;
+        }
+        let grab = (
+            grab.x.round().min(f64::from(size.width - 1)) as i32,
+            grab.y.round().min(f64::from(size.height - 1)) as i32,
+        );
+        let proxy = self.native_proxy;
+        if self.native_move.is_some_and(|(old, _, _)| old != window) {
+            self.end_native_move(out);
+        }
+        let changed = self
+            .native_move
+            .is_none_or(|(old, old_proxy, _)| old != window || old_proxy != proxy)
+            || self.native_move_sample != Some((grab, size));
+        if !changed
+            && self.native_move.is_some_and(|(_, _, at)| {
+                self.now.saturating_duration_since(at) < Duration::from_millis(20)
+            })
+        {
+            return;
+        }
+        out.push(Output::SendInput {
+            peer: active.controller,
+            msg: InputMessage::Status {
+                session: active.session,
+                status: TargetStatus::NativeMove {
+                    window,
+                    proxy,
+                    grab,
+                    size,
+                },
+            },
+        });
+        self.native_move = Some((window, proxy, self.now));
+        self.native_move_sample = Some((grab, size));
     }
 
     /// True while another node controls this one (an E1 session is active here).
@@ -530,6 +663,7 @@ impl TargetE1 {
         notice: Option<Notice>,
         out: &mut Vec<Output>,
     ) {
+        self.clear_native_move();
         self.cancel_drag(false, out);
         self.drag_ignore_up = None;
         let Some(active) = self.active else {

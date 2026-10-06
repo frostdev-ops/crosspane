@@ -18,7 +18,7 @@ use crosspane_protocol::msg::{
     ControlMessage, EndReason, InputMessage, MAX_HELD_KEYS, Placement, PointerMessage, TargetStatus,
 };
 use crosspane_types::display::DisplayInfo;
-use crosspane_types::geom::{DisplayGeometry, PixelRect, PointDevice};
+use crosspane_types::geom::{DisplayGeometry, PixelRect, PixelSize, PointDevice};
 use crosspane_types::hid::{HidUsage, MouseButton};
 use crosspane_types::id::{DisplayId, GlobalDisplayId, NodeId, ProjectionId, SessionId, WindowId};
 use crosspane_types::input::LockKeys;
@@ -255,6 +255,16 @@ enum InputMode {
     ChordOnly,
     /// The exit capture is being activated: transitions are buffered (A4).
     Buffer,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeerMove {
+    session: SessionId,
+    window: WindowId,
+    proxy: Option<ProjectionId>,
+    grab: PointDevice,
+    size: PixelSize,
+    at: MonoTime,
 }
 
 #[derive(Debug)]
@@ -519,6 +529,9 @@ pub struct ControllerE1 {
     // change here re-offers the set even when its strips are identical.
     portal_mapping: Vec<PortalMapping>,
     drag_peers: BTreeSet<NodeId>,
+    drag_in_peers: BTreeSet<NodeId>,
+    peer_move: Option<PeerMove>,
+    peer_move_home: Option<ProjectionKey>,
     drag_offer: Option<DragOffer>,
     drag_title: String,
     drag_push: Option<DragPush>,
@@ -763,6 +776,50 @@ impl ControllerE1 {
         }
     }
 
+    pub(crate) fn peer_move_proxy(&self) -> Option<(NodeId, ProjectionId)> {
+        let session = self.session()?;
+        let fact = self.peer_move.filter(|fact| fact.session == session.id)?;
+        fact.proxy.map(|projection| (session.peer, projection))
+    }
+
+    pub(crate) fn prepare_peer_move_home(&mut self, key: Option<ProjectionKey>) {
+        self.peer_move_home = key;
+    }
+
+    fn peer_move_current(&self, now: MonoTime) -> Option<PeerMove> {
+        let Phase::Controlling(control) = &self.phase else {
+            return None;
+        };
+        let fact = self.peer_move?;
+        let peer = control.session.peer;
+        let no_other_buttons = self
+            .peers
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.config.node))
+            .filter(|node| *node != peer)
+            .all(|node| {
+                self.router
+                    .held_on(node)
+                    .iter()
+                    .all(|item| !matches!(item, Held::Button(_)))
+            })
+            && self
+                .capture_buttons
+                .iter()
+                .all(|button| *button == MouseButton::PRIMARY);
+        (self.config.drag_across
+            && self.permits_io()
+            && self.drag_in_peers.contains(&peer)
+            && fact.session == control.session.id
+            && now >= fact.at
+            && now.saturating_duration_since(fact.at) <= Duration::from_millis(500)
+            && self.router.held_on(peer) == [Held::Button(MouseButton::PRIMARY)]
+            && no_other_buttons
+            && !self.drag_esc)
+            .then_some(fact)
+    }
+
     pub(crate) fn drag_committed(
         &mut self,
         commit: DragCommit,
@@ -770,6 +827,9 @@ impl ControllerE1 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        if matches!(commit.kind, DragKind::PullIn(_) | DragKind::Home(_)) {
+            return;
+        }
         if matches!(commit.kind, DragKind::Out(_)) && key.is_none() {
             self.hide_hud(now, out);
             self.return_home(EndReason::Released, None, false, true, now, out);
@@ -967,6 +1027,9 @@ impl ControllerE1 {
             confirmed_portals: None,
             portal_mapping: Vec::new(),
             drag_peers: BTreeSet::new(),
+            drag_in_peers: BTreeSet::new(),
+            peer_move: None,
+            peer_move_home: None,
             drag_offer: None,
             drag_title: String::new(),
             drag_push: None,
@@ -982,7 +1045,28 @@ impl ControllerE1 {
     /// Handle one input (every input is offered to both roles), appending outputs.
     pub fn handle(&mut self, input: &Input, now: MonoTime, out: &mut Vec<Output>) {
         self.prune(now);
+        if self.peer_move.is_some_and(|fact| {
+            now.saturating_duration_since(fact.at) > Duration::from_millis(500)
+                || self
+                    .session()
+                    .is_none_or(|session| session.id != fact.session)
+                || !self.permits_io()
+        }) {
+            self.peer_move = None;
+            self.peer_move_home = None;
+        }
         match input {
+            Input::DragInPeer { peer, available } => {
+                if *available {
+                    self.drag_in_peers.insert(*peer);
+                } else {
+                    self.drag_in_peers.remove(peer);
+                    if self.session().is_some_and(|s| s.peer == *peer) {
+                        self.peer_move = None;
+                        self.peer_move_home = None;
+                    }
+                }
+            }
             Input::DragPeer { peer, available } => {
                 if *available {
                     self.drag_peers.insert(*peer);
@@ -1874,11 +1958,14 @@ impl ControllerE1 {
             CaptureEvent::Key { usage, down, .. } if self.input_mode() != InputMode::Off => {
                 if *usage == HidUsage::keyboard(0x29)
                     && (self.drag_esc
+                        || self.peer_move_current(now).is_some()
                         || self
                             .drag
                             .is_some_and(|d| !matches!(d.stage, DragStage::Pressed { .. })))
                 {
                     self.drag_esc = *down;
+                    self.peer_move = None;
+                    self.peer_move_home = None;
                     if self.drag_activating() {
                         self.return_home(EndReason::Released, None, false, true, now, out);
                     } else {
@@ -1906,6 +1993,8 @@ impl ControllerE1 {
                     return;
                 }
                 if *button == MouseButton::PRIMARY && !down {
+                    self.peer_move = None;
+                    self.peer_move_home = None;
                     self.drag = None;
                 }
                 self.capture_button(*button, *down, now, out);
@@ -2025,6 +2114,8 @@ impl ControllerE1 {
             drag.motion += mm;
             return;
         }
+        let peer_move = self.peer_move_current(now);
+        let peer_move_home = self.peer_move_home;
         let (Some(layout), Phase::Controlling(c)) = (&self.layout, &mut self.phase) else {
             return;
         };
@@ -2064,7 +2155,71 @@ impl ControllerE1 {
                 // removal that is unconfirmed, WP-2.43 A1). The pointer stays where it was.
                 let fenced = display.node != self.config.node
                     && (self.teardown.is_some() || c.home.is_some_and(|h| h.bind));
-                if !self.router.no_buttons_held()
+                if display.node == self.config.node
+                    && let Some(fact) = peer_move
+                    && let Some(seat) = layout.get(display)
+                    && let Some(source) = layout.get(previous.0)
+                    && let Some(edge) = layout
+                        .portals()
+                        .iter()
+                        .find(|p| p.id == portal)
+                        .map(|p| p.edge)
+                {
+                    let kind = peer_move_home.map_or(DragKind::PullIn(fact.window), DragKind::Home);
+                    let mut commit = drag::placement(
+                        Drag {
+                            portal,
+                            offer: DragOffer {
+                                window: fact.window,
+                                kind,
+                                peer: c.session.peer,
+                                size: fact.size,
+                                scale: source.geometry.scale,
+                            },
+                            grab: fact.grab,
+                            edge,
+                            entry: display,
+                            stage: DragStage::Pending,
+                            motion: crosspane_types::geom::VectorMm::zero(),
+                        },
+                        position,
+                        seat.geometry,
+                        0,
+                    );
+                    commit.place.drag = false;
+                    let peer = c.session.peer;
+                    let item = Held::Button(MouseButton::PRIMARY);
+                    if self.router.route(item, false, peer) == Some(peer) {
+                        // Reliable input enqueue precedes every PullAt/Restore output. The target
+                        // also ends this E1 session before admitting PullAt across the streams.
+                        c.session.transition(item, false, now, out);
+                        self.drag_swallow = Some(c.capture.id);
+                        self.reentry = layout
+                            .portals()
+                            .iter()
+                            .find(|p| p.id == portal)
+                            .and_then(|returned| {
+                                layout
+                                    .portals()
+                                    .iter()
+                                    .find(|p| p.from == returned.to && p.to == returned.from)
+                            })
+                            .map(|p| (p.from, p.to, p.edge, now.saturating_add(REENTRY_GUARD)));
+                        self.note_entry_failure(HomeFailure::Gone);
+                        self.return_home(
+                            EndReason::Released,
+                            Some((display.display, position)),
+                            false,
+                            true,
+                            now,
+                            out,
+                        );
+                        // return_home clears v0-a pending ownership; retain only this completed drop.
+                        self.drag_commit = Some(commit);
+                        self.peer_move = None;
+                        self.peer_move_home = None;
+                    }
+                } else if !self.router.no_buttons_held()
                     || self.drag.is_some()
                     || !self.capture_buttons.is_empty()
                     || (display.node != self.config.node && !self.peers.contains(&display.node))
@@ -2145,6 +2300,7 @@ impl ControllerE1 {
         if let LinkEvent::Closed { peer, .. } = event {
             self.peers.remove(peer);
             self.drag_peers.remove(peer);
+            self.drag_in_peers.remove(peer);
             if self.drag_drop.is_some_and(|(d, _)| d.offer.peer == *peer)
                 || self
                     .drag_push
@@ -2310,7 +2466,39 @@ impl ControllerE1 {
                         }));
                         self.return_home(EndReason::Released, None, false, true, now, out);
                     }
-                    TargetStatus::Resumed => {}
+                    TargetStatus::NativeMove {
+                        window,
+                        proxy,
+                        grab,
+                        size,
+                    } if self.drag_in_peers.contains(peer) => {
+                        if size.width > 0
+                            && size.height > 0
+                            && grab.0 >= 0
+                            && grab.1 >= 0
+                            && (grab.0 as u32) < size.width
+                            && (grab.1 as u32) < size.height
+                        {
+                            self.peer_move = Some(PeerMove {
+                                session: *session,
+                                window: *window,
+                                proxy: *proxy,
+                                grab: PointDevice::new(f64::from(grab.0), f64::from(grab.1)),
+                                size: *size,
+                                at: now,
+                            });
+                        } else {
+                            self.peer_move = None;
+                        }
+                        self.peer_move_home = None;
+                    }
+                    TargetStatus::NativeMoveEnded { .. } if self.drag_in_peers.contains(peer) => {
+                        self.peer_move = None;
+                        self.peer_move_home = None;
+                    }
+                    TargetStatus::NativeMove { .. }
+                    | TargetStatus::NativeMoveEnded { .. }
+                    | TargetStatus::Resumed => {}
                 }
             }
             _ => {}
@@ -2325,6 +2513,8 @@ impl ControllerE1 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        self.peer_move = None;
+        self.peer_move_home = None;
         self.release_session_held(session, now, out);
         let connected = self.peers.contains(&session.peer);
         if connected && send_end {
@@ -2370,6 +2560,8 @@ impl ControllerE1 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        self.peer_move = None;
+        self.peer_move_home = None;
         if let Some(drag) = &mut self.drag {
             drag.motion = crosspane_types::geom::VectorMm::zero();
         }

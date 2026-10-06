@@ -129,6 +129,35 @@ impl DragSeat {
     }
 }
 
+/// Output-order oracle for peer-started drops. It observes the seat's reliable enqueue order,
+/// independently of the fake target's native button accounting in `DragSeat`.
+#[derive(Debug, Default)]
+pub struct DragInOrder {
+    pub downs: u32,
+    pub ups: u32,
+    pub drops: u32,
+    held: bool,
+}
+impl DragInOrder {
+    pub fn primary(&mut self, down: bool) {
+        if down {
+            assert!(!self.held, "duplicate routed primary down");
+            self.held = true;
+            self.downs += 1;
+        } else {
+            assert!(self.held, "duplicate routed primary up");
+            self.held = false;
+            self.ups += 1;
+        }
+    }
+    pub fn drop_under_pointer(&mut self, drag: bool) {
+        assert!(!drag, "a peer-started drag must never continue");
+        assert!(!self.held, "commit preceded reliable primary up");
+        assert_eq!(self.downs, self.ups, "commit with unmatched primary");
+        self.drops += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -422,6 +422,11 @@ impl E2 {
             } => (peer, request, Message::Pull { request, window }),
             _ => return,
         };
+        debug_assert_eq!(
+            request & 0x8000_0000,
+            0,
+            "app browse IDs reserve the high bit for automatic pulls"
+        );
         if self.peers.contains(&peer) {
             send(peer, msg, out);
         } else {
@@ -440,6 +445,39 @@ impl E2 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
+        if let Message::StartAt {
+            place,
+            token: 0,
+            anchor: (0, 0),
+            ..
+        } = msg
+            && !place.drag
+        {
+            // Frozen StartAt has no request/window ID. Clearing correlation never changes how
+            // this or any other StartAt is opened; unsolicited identical responses are harmless.
+            self.automatic_pulls.remove(&peer);
+        }
+        if let Message::WindowList { request, .. } = msg
+            && request & 0x8000_0000 != 0
+        {
+            return;
+        }
+        if let Message::BrowseRefused { request, reason } = msg
+            && request & 0x8000_0000 != 0
+        {
+            if self
+                .automatic_pulls
+                .get(&peer)
+                .is_some_and(|(current, _, _)| current == request)
+            {
+                self.automatic_pulls.remove(&peer);
+                out.push(Output::Notice(Notice::ProjectionRefused {
+                    peer,
+                    reason: *reason,
+                }));
+            }
+            return; // Engine-owned replies never satisfy an application waiter or tray browse.
+        }
         match msg {
             Message::WindowList { request, windows } => {
                 out.push(Output::BrowseResult {

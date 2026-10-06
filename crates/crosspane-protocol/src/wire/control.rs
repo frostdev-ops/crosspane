@@ -675,6 +675,23 @@ fn projection_to_pb(message: &ProjectionMessage) -> Result<pb::Projection, WireE
                 token: *token,
             })
         }
+        ProjectionMessage::PullAt {
+            request,
+            window,
+            place,
+        } => {
+            if place.drag {
+                return Err(WireError::BadValue("pull placement drag"));
+            }
+            Body::PullAt(pb::ProjectionPullAt {
+                request: *request,
+                window: window.0,
+                display: place.display.0,
+                x: place.x,
+                y: place.y,
+                drag: place.drag,
+            })
+        }
         ProjectionMessage::Start {
             projection,
             window,
@@ -903,6 +920,21 @@ fn projection_from_pb(projection: pb::Projection) -> Result<ProjectionMessage, W
             projection: ProjectionId(cancel.projection),
             token: cancel.token,
         },
+        Body::PullAt(pull) => {
+            if pull.drag {
+                return Err(WireError::BadValue("pull placement drag"));
+            }
+            ProjectionMessage::PullAt {
+                request: pull.request,
+                window: WindowId(pull.window),
+                place: ProxyPlacement {
+                    display: DisplayId(pull.display),
+                    x: pull.x,
+                    y: pull.y,
+                    drag: pull.drag,
+                },
+            }
+        }
         Body::Start(start) => {
             check_projection_string(&start.title)?;
             check_projection_string(&start.app_id)?;
@@ -1129,7 +1161,7 @@ mod pb {
     pub struct Projection {
         #[prost(
             oneof = "projection::Body",
-            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+            tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
         )]
         pub body: Option<projection::Body>,
     }
@@ -1175,6 +1207,8 @@ mod pb {
             DragReady(super::ProjectionDragReady),
             #[prost(message, tag = "19")]
             DragCancel(super::ProjectionDragCancel),
+            #[prost(message, tag = "20")]
+            PullAt(super::ProjectionPullAt),
         }
     }
 
@@ -1380,6 +1414,22 @@ mod pb {
         pub request: u32,
         #[prost(uint64, tag = "2")]
         pub window: u64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, prost::Message)]
+    pub struct ProjectionPullAt {
+        #[prost(uint32, tag = "1")]
+        pub request: u32,
+        #[prost(uint64, tag = "2")]
+        pub window: u64,
+        #[prost(uint32, tag = "3")]
+        pub display: u32,
+        #[prost(sint32, tag = "4")]
+        pub x: i32,
+        #[prost(sint32, tag = "5")]
+        pub y: i32,
+        #[prost(bool, tag = "6")]
+        pub drag: bool,
     }
 
     #[derive(Clone, Copy, PartialEq, prost::Message)]
@@ -1670,5 +1720,55 @@ mod pb {
     pub struct Goodbye {
         #[prost(string, tag = "1")]
         pub message: String,
+    }
+}
+
+#[cfg(test)]
+mod drag_in_wire_tests {
+    use super::*;
+
+    #[test]
+    fn pull_at_round_trip_and_no_continuation() {
+        let message = ControlMessage::Projection(ProjectionMessage::PullAt {
+            request: 0x8000_0001,
+            window: WindowId(u64::MAX),
+            place: ProxyPlacement {
+                display: DisplayId(3),
+                x: i32::MIN,
+                y: i32::MAX,
+                drag: false,
+            },
+        });
+        let mut encoded = Vec::new();
+        encode_control(&message, &mut encoded).unwrap();
+        let mut decoder = crate::wire::FrameDecoder::new(crate::wire::MAX_CONTROL_PAYLOAD);
+        decoder.push(&encoded);
+        assert_eq!(
+            decode_control(&decoder.next_frame().unwrap().unwrap()).unwrap(),
+            message
+        );
+        let mut bad = message;
+        let ControlMessage::Projection(ProjectionMessage::PullAt { place, .. }) = &mut bad else {
+            unreachable!()
+        };
+        place.drag = true;
+        assert!(matches!(
+            encode_control(&bad, &mut Vec::new()),
+            Err(WireError::BadValue(_))
+        ));
+        let bad_pb = pb::Projection {
+            body: Some(pb::projection::Body::PullAt(pb::ProjectionPullAt {
+                request: 1,
+                window: 2,
+                display: 3,
+                x: 4,
+                y: 5,
+                drag: true,
+            })),
+        };
+        assert!(matches!(
+            projection_from_pb(bad_pb),
+            Err(WireError::BadValue(_))
+        ));
     }
 }

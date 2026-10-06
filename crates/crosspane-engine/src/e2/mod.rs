@@ -64,6 +64,9 @@ pub struct E2 {
     scales: BTreeMap<DisplayId, f64>,
     pub(super) display_bounds: BTreeMap<DisplayId, DisplayGeometry>,
     proxy_windows: BTreeMap<WindowId, ProjectionKey>,
+    drag_in_peers: BTreeSet<NodeId>,
+    next_browse_request: u32,
+    automatic_pulls: BTreeMap<NodeId, (u32, WindowId, MonoTime)>,
     focused: Option<WindowId>,
     /// The window that had focus before a parked window was activated for its proxy: focus
     /// goes back to it when the proxy loses focus, so this node's own new windows don't open
@@ -93,6 +96,36 @@ impl fmt::Debug for E2 {
 }
 
 impl E2 {
+    /// A target reports only a proxy of its current controller's own projection.
+    pub(crate) fn proxy_projection(
+        &self,
+        window: WindowId,
+        controller: NodeId,
+    ) -> Option<ProjectionId> {
+        self.proxy_windows
+            .get(&window)
+            .filter(|key| key.source == controller)
+            .map(|key| key.projection)
+    }
+
+    pub(crate) fn drag_in_available(&self, peer: NodeId) -> bool {
+        self.peers.contains(&peer) && self.drag_in_peers.contains(&peer)
+    }
+
+    pub(crate) fn drag_in_home(
+        &self,
+        peer: NodeId,
+        projection: ProjectionId,
+    ) -> Option<ProjectionKey> {
+        self.sources
+            .get(&projection)
+            .filter(|s| s.peer == peer)
+            .map(|_| ProjectionKey {
+                source: self.node,
+                projection,
+            })
+    }
+
     /// Accepted focus only; pending wishes and ignored raw events never appear here.
     pub(crate) fn clipboard_source_focus(
         &self,
@@ -155,6 +188,9 @@ impl E2 {
                 scales: BTreeMap::new(),
                 display_bounds: BTreeMap::new(),
                 proxy_windows: BTreeMap::new(),
+                drag_in_peers: BTreeSet::new(),
+                next_browse_request: 1,
+                automatic_pulls: BTreeMap::new(),
                 focused: None,
                 focus_before: None,
                 next_projection: Some(1),
@@ -195,7 +231,16 @@ impl E2 {
     }
 
     pub fn handle(&mut self, input: &Input, now: MonoTime, out: &mut Vec<Output>) {
+        self.automatic_pulls.retain(|_, (_, _, until)| now < *until);
         match input {
+            Input::DragInPeer { peer, available } => {
+                if *available {
+                    self.drag_in_peers.insert(*peer);
+                } else {
+                    self.drag_in_peers.remove(peer);
+                    self.automatic_pulls.remove(peer);
+                }
+            }
             Input::PeerUp { peer } => {
                 self.peers.insert(*peer);
                 self.resume_sources(*peer, now, out);
@@ -294,6 +339,8 @@ impl E2 {
             Input::Command(Command::Rearm) => self.panic = false,
             Input::Link(LinkEvent::Closed { peer, .. }) => {
                 self.peers.remove(peer);
+                self.drag_in_peers.remove(peer);
+                self.automatic_pulls.remove(peer);
                 let sources: Vec<_> = self
                     .sources
                     .iter()
@@ -337,6 +384,7 @@ impl E2 {
                     | Message::Close { .. }
                     | Message::ListWindows { .. }
                     | Message::Pull { .. }
+                    | Message::PullAt { .. }
                     | Message::ProxyPlaced { .. } => self.source_control(*peer, msg, now, out),
                     Message::ReturnAt { projection, place }
                         if self
@@ -391,6 +439,10 @@ impl E2 {
             self.source_deadline(),
             self.ledgers.next_deadline(),
             self.destination_deadline(),
+            self.automatic_pulls
+                .values()
+                .map(|(_, _, until)| *until)
+                .min(),
         ]
         .into_iter()
         .flatten()

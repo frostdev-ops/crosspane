@@ -212,6 +212,43 @@ impl E2 {
         out: &mut Vec<Output>,
     ) -> Option<ProjectionKey> {
         match commit.kind {
+            crate::e1::drag::Kind::PullIn(window) => {
+                if !self.permits_io() || !self.drag_in_available(commit.peer) {
+                    return None;
+                }
+                // Bit 31 belongs only to engine-initiated pulls; zero in the counter is skipped.
+                let request = 0x8000_0000 | self.next_browse_request;
+                self.next_browse_request = (self.next_browse_request + 1) & 0x7fff_ffff;
+                if self.next_browse_request == 0 {
+                    self.next_browse_request = 1;
+                }
+                self.automatic_pulls.insert(
+                    commit.peer,
+                    (request, window, now.saturating_add(Duration::from_secs(5))),
+                );
+                send(
+                    commit.peer,
+                    Message::PullAt {
+                        request,
+                        window,
+                        place: commit.place,
+                    },
+                    out,
+                );
+                None
+            }
+            crate::e1::drag::Kind::Home(key) => {
+                if self.permits_io()
+                    && self.drag_in_available(commit.peer)
+                    && self
+                        .sources
+                        .get(&key.projection)
+                        .is_some_and(|source| source.peer == commit.peer)
+                {
+                    self.return_at(key, commit.place, now, out);
+                }
+                None
+            }
             crate::e1::drag::Kind::Out(window) => {
                 self.project(window, commit.peer, now, out).ok()?;
                 self.place_start(
@@ -473,7 +510,15 @@ impl E2 {
         now: MonoTime,
         out: &mut Vec<Output>,
     ) {
-        if let Message::ListWindows { request } | Message::Pull { request, .. } = msg {
+        if let Message::PullAt { place, .. } = msg
+            && (!self.drag_in_available(peer) || place.drag)
+        {
+            return;
+        }
+        if let Message::ListWindows { request }
+        | Message::Pull { request, .. }
+        | Message::PullAt { request, .. } = msg
+        {
             let refusal = if !self.granted(peer, Capability::WindowBrowse)
                 || !self.granted(peer, Capability::WindowShare)
             {
@@ -494,7 +539,7 @@ impl E2 {
                 );
                 return;
             }
-            if let Message::Pull { window, .. } = msg {
+            if let Message::Pull { window, .. } | Message::PullAt { window, .. } = msg {
                 if let Err(reason) = self.project(*window, peer, now, out) {
                     send(
                         peer,
@@ -504,6 +549,8 @@ impl E2 {
                         },
                         out,
                     );
+                } else if let Message::PullAt { place, .. } = msg {
+                    self.place_start(*place, 0, (0, 0), None, out);
                 }
             } else {
                 // BTreeMap iteration supplies ascending WindowId order before the cap.
@@ -1956,5 +2003,180 @@ mod fullscreen_routing_tests {
             e2.source_input(peer, &motion, later, &mut out);
             assert!(out.iter().any(|o| matches!(o, Output::Inject { cmd, .. } if *cmd == InjectCmd::MoveTo { display, position: PointDevice::new(25.0, 36.0) })), "{out:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod drag_in_tests {
+    use super::*;
+    use crate::e1::drag::{Commit, Kind};
+    use crate::{EngineConfig, Input};
+    use crosspane_input::journal::MemoryJournal;
+    use crosspane_platform::{LockState, SessionState};
+    use crosspane_protocol::projection::{ProxyPlacement, WindowSummary};
+    use crosspane_protocol::{link::LinkEvent, msg::ControlMessage};
+    const A: NodeId = NodeId([1; 32]);
+    const B: NodeId = NodeId([2; 32]);
+    fn fixture() -> E2 {
+        let (mut e2, _) = E2::new(
+            &EngineConfig::new(A),
+            Box::<MemoryJournal>::default(),
+            MonoTime::ZERO,
+        )
+        .unwrap();
+        e2.state = SessionState {
+            lock: LockState::Unlocked,
+            active: Some(true),
+        };
+        e2.awaiting_state = false;
+        e2.peers.insert(B);
+        e2.drag_in_peers.insert(B);
+        e2.grants.insert(B, [Capability::WindowPresent].into());
+        e2
+    }
+    fn pull(e2: &mut E2, now: MonoTime) -> u32 {
+        let mut out = Vec::new();
+        e2.drag_commit(
+            Commit {
+                kind: Kind::PullIn(WindowId(9)),
+                peer: B,
+                place: ProxyPlacement {
+                    display: DisplayId(1),
+                    x: 20,
+                    y: 30,
+                    drag: false,
+                },
+                token: 0,
+                anchor: (0, 0),
+                size: PixelSize::new(320, 200),
+            },
+            now,
+            &mut out,
+        );
+        let Output::SendControl {
+            msg: ControlMessage::Projection(Message::PullAt { request, .. }),
+            ..
+        } = out[0]
+        else {
+            panic!("missing automatic pull")
+        };
+        request
+    }
+    #[test]
+    fn automatic_namespace_wraps_nonzero_and_replaces_only_that_peer() {
+        let mut e2 = fixture();
+        e2.next_browse_request = 0x7fff_ffff;
+        let old = pull(&mut e2, MonoTime::ZERO);
+        let current = pull(&mut e2, MonoTime::ZERO);
+        assert_eq!((old, current), (u32::MAX, 0x8000_0001));
+        assert_eq!(e2.automatic_pulls.len(), 1);
+        let mut out = Vec::new();
+        e2.destination_control(
+            B,
+            &Message::BrowseRefused {
+                request: old,
+                reason: Refusal::Busy,
+            },
+            MonoTime::ZERO,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(e2.automatic_pulls.contains_key(&B));
+        e2.destination_control(
+            B,
+            &Message::BrowseRefused {
+                request: current,
+                reason: Refusal::Permission,
+            },
+            MonoTime::ZERO,
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![Output::Notice(Notice::ProjectionRefused {
+                peer: B,
+                reason: Refusal::Permission
+            })]
+        );
+        e2.destination_control(
+            B,
+            &Message::BrowseRefused {
+                request: current,
+                reason: Refusal::Busy,
+            },
+            MonoTime::ZERO,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(e2.automatic_pulls.is_empty());
+    }
+    #[test]
+    fn automatic_timeout_and_disconnect_clear_silently() {
+        let mut e2 = fixture();
+        pull(&mut e2, MonoTime::ZERO);
+        assert_eq!(
+            e2.next_deadline(),
+            Some(MonoTime::from_nanos(5_000_000_000))
+        );
+        let mut out = Vec::new();
+        e2.handle(&Input::Tick, MonoTime::from_nanos(5_000_000_000), &mut out);
+        assert!(out.is_empty());
+        assert!(e2.automatic_pulls.is_empty());
+        pull(&mut e2, MonoTime::ZERO);
+        e2.handle(
+            &Input::DragInPeer {
+                peer: B,
+                available: false,
+            },
+            MonoTime::ZERO,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(e2.automatic_pulls.is_empty());
+        e2.drag_in_peers.insert(B);
+        pull(&mut e2, MonoTime::ZERO);
+        e2.handle(
+            &Input::Link(LinkEvent::Closed {
+                peer: B,
+                error: crosspane_protocol::link::LinkError::Closed,
+            }),
+            MonoTime::ZERO,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(e2.automatic_pulls.is_empty());
+    }
+    #[test]
+    fn automatic_success_correlation_never_changes_start_at_placement() {
+        let mut e2 = fixture();
+        pull(&mut e2, MonoTime::ZERO);
+        let place = ProxyPlacement {
+            display: DisplayId(1),
+            x: 1,
+            y: 2,
+            drag: false,
+        };
+        let mut out = Vec::new();
+        e2.destination_control(
+            B,
+            &Message::StartAt {
+                projection: ProjectionId(77),
+                window: WindowSummary {
+                    title: "authored".into(),
+                    app_id: "fake".into(),
+                },
+                size: PixelSize::new(320, 200),
+                place,
+                token: 0,
+                anchor: (0, 0),
+            },
+            MonoTime::ZERO,
+            &mut out,
+        );
+        assert!(e2.automatic_pulls.is_empty());
+        assert!(out.iter().any(
+            |o| matches!(o, Output::OpenProxy { place: Some(actual), .. } if *actual == place)
+        ));
+        assert!(!out.iter().any(|o| matches!(o, Output::BrowseResult { .. })));
     }
 }

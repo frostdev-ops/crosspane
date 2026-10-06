@@ -4,10 +4,12 @@ use crosspane_protocol::msg::{
     Capability, ClipFailure, ClipFetch, ClipFetchFailed, ClipFetchId, ClipOffer, ClipOfferId,
     ClipWithdraw, ControlMessage,
 };
+use crosspane_protocol::projection::{ProjectionMessage, ProxyPlacement};
 use crosspane_protocol::wire::{
     FrameDecoder, KIND_CONTROL, MAX_CONTROL_PAYLOAD, decode_control, encode_control,
 };
 use crosspane_types::ClipKind;
+use crosspane_types::id::{DisplayId, WindowId};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -50,6 +52,16 @@ fuzz_target!(|data: &[u8]| {
             reason,
         }),
         ControlMessage::Grants(vec![Capability::ClipboardRead, Capability::ClipboardWrite]),
+        ControlMessage::Projection(ProjectionMessage::PullAt {
+            request: 0x8000_0001 | u32::from(value),
+            window: WindowId(id),
+            place: ProxyPlacement {
+                display: DisplayId(u32::from(value)),
+                x: i32::from(value),
+                y: -i32::from(value),
+                drag: false,
+            },
+        }),
     ] {
         let mut encoded = Vec::new();
         assert_eq!(encode_control(&message, &mut encoded), Ok(()));

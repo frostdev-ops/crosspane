@@ -92,6 +92,7 @@ message Projection {
     ProjectionReturnAt return_at = 17;
     ProjectionDragReady drag_ready = 18;
     ProjectionDragCancel drag_cancel = 19;
+    ProjectionPullAt pull_at = 20;
   }
 }
 
@@ -123,6 +124,10 @@ message ProjectionDragReady {
   uint64 projection = 1; uint32 token = 2; uint32 display = 3; double x = 4; double y = 5;
 }
 message ProjectionDragCancel { uint64 projection = 1; uint32 token = 2; }
+message ProjectionPullAt {
+  uint32 request = 1; uint64 window = 2; uint32 display = 3;
+  sint32 x = 4; sint32 y = 5; bool drag = 6;
+}
 
 message ProjectionAccepted {
   uint64 projection = 1;

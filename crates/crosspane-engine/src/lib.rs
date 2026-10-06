@@ -129,6 +129,27 @@ impl Engine {
             self.controller
                 .refresh_drag(self.e2.drag_offer(window, peer), now, &mut out);
         }
+        if let Some((peer, projection)) = self.controller.peer_move_proxy() {
+            self.controller
+                .prepare_peer_move_home(self.e2.drag_in_home(peer, projection));
+        } else {
+            self.controller.prepare_peer_move_home(None);
+        }
+        if let Input::Capture(CaptureEvent::NativeMove { window, .. }) = &input {
+            let proxy = self
+                .target
+                .controller()
+                .and_then(|controller| self.e2.proxy_projection(*window, controller));
+            self.target.prepare_native_move(proxy);
+        }
+        if let Input::Link(LinkEvent::Control {
+            peer,
+            msg: ControlMessage::Projection(ProjectionMessage::PullAt { .. }),
+        }) = &input
+            && self.e2.drag_in_available(*peer)
+        {
+            self.target.release_for_pull_at(*peer, &mut out);
+        }
         if let Input::Capture(
             CaptureEvent::DragAtEdge {
                 portal,

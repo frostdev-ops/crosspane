@@ -292,6 +292,11 @@ pub enum Input {
         peer: NodeId,
         available: bool,
     },
+    /// Whether `peer` negotiated `DRAG_IN_FEATURE` (both Hellos), like `DragPeer` for `drag/0`.
+    DragInPeer {
+        peer: NodeId,
+        available: bool,
+    },
     /// The native window id of an open proxy, so a moved proxy can be recognised.
     ProxyWindow {
         key: ProjectionKey,

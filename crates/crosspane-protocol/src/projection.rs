@@ -31,6 +31,10 @@ pub struct ProxyPlacement {
 /// unless both `Hello`s carry it.
 pub const DRAG_FEATURE: &str = "drag/0";
 
+/// The protocol feature for drags that start on the peer (DRAG v0-b). Neither side sends
+/// `PullAt` or `TargetStatus::NativeMove*` unless both `Hello`s carry it.
+pub const DRAG_IN_FEATURE: &str = "drag/1";
+
 /// What the destination needs to know about the window being projected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowSummary {
@@ -210,6 +214,15 @@ pub enum ProjectionMessage {
         display: Option<DisplayId>,
         origin: PointDevice,
         size: PixelSize,
+    },
+    /// Destination → source (DRAG v0-b case a): `Pull`, with the proxy's content placed at
+    /// `place` on the destination (`place.drag` is always `false`: no continuation). Needs
+    /// `WindowBrowse` and `WindowShare` like `Pull`. The source answers with
+    /// `StartAt { place, token: 0, anchor: (0, 0) }`, or `BrowseRefused { request }`.
+    PullAt {
+        request: u32,
+        window: WindowId,
+        place: ProxyPlacement,
     },
 }
 

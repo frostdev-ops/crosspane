@@ -44,6 +44,8 @@ pub const KIND_PROJ_SCROLL: u8 = 0x0A;
 pub const KIND_PROJ_MOTION: u8 = 0x0B;
 pub const KIND_PROJ_HELD: u8 = 0x0C;
 pub const KIND_PRESS_AT: u8 = 0x0D;
+/// DRAG-v0b move statuses: 42-byte payload, separate from the framing header.
+pub const KIND_STATUS_MOVE: u8 = 0x0E;
 pub const KIND_POINTER: u8 = 0x20;
 pub const KIND_AUDIO: u8 = 0x21;
 pub const KIND_CONTROL: u8 = 0x40;

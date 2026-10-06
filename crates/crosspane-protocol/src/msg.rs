@@ -3,9 +3,9 @@
 use crosspane_types::ClipKind;
 use crosspane_types::audio::{AudioKind, AudioStreamId};
 use crosspane_types::display::DisplayInfo;
-use crosspane_types::geom::{PointDevice, PointMm};
+use crosspane_types::geom::{PixelSize, PointDevice, PointMm};
 use crosspane_types::hid::{HidUsage, MouseButton};
-use crosspane_types::id::{DisplayId, NodeId, SessionId};
+use crosspane_types::id::{DisplayId, NodeId, ProjectionId, SessionId, WindowId};
 use crosspane_types::input::{LockKeys, ScrollDelta};
 
 // ---------------------------------------------------------------------------------------------
@@ -85,6 +85,22 @@ pub enum TargetStatus {
     Resumed,
     /// The target refuses injection for this reason; the controller takes input back.
     Refused(Refusal),
+    /// Target → controller (DRAG v0-b, `DRAG_IN_FEATURE`): a native window move is in progress
+    /// under the injected pointer. `window`: the target's `WindowSource` id, or a proxy's own
+    /// window id; `proxy`: when that window is the target's proxy of one of the controller's
+    /// projections, its `ProjectionId` (the target resolves it; `None` otherwise). `grab`: the
+    /// pointer's offset inside the window's content, whole device pixels of the display the
+    /// window is on; `size`: the content size in those pixels. Repeated at most every 20 ms while
+    /// the move continues; superseded by `NativeMoveEnded`, a session end, or 500 ms of silence.
+    NativeMove {
+        window: WindowId,
+        proxy: Option<ProjectionId>,
+        grab: (i32, i32),
+        size: PixelSize,
+    },
+    /// Target → controller: the native move of `window` ended on the target (button released
+    /// there, window changed, lookup lost it). Never sent after the session ends.
+    NativeMoveEnded { window: WindowId },
 }
 
 /// Why a node refuses a session or a message.

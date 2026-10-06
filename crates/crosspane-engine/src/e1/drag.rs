@@ -11,6 +11,8 @@ use crosspane_types::time::MonoTime;
 pub(crate) enum Kind {
     Out(WindowId),
     Back(ProjectionKey),
+    PullIn(WindowId),
+    Home(ProjectionKey),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
