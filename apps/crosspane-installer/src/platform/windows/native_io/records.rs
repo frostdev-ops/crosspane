@@ -75,6 +75,8 @@ pub enum RecordKind {
     StageCatalog,
     Operation,
     Supervisor,
+    TaskActivation,
+    SupervisorArchiveIntent,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordName {
@@ -82,6 +84,9 @@ pub enum RecordName {
     StageCatalog,
     Operation([u8; 16]),
     Supervisor,
+    TaskActivation,
+    SupervisorEpoch(u8),
+    SupervisorArchiveIntent,
 }
 impl RecordName {
     pub fn file_name(&self) -> NativeResult<super::files::PrivateName> {
@@ -89,6 +94,13 @@ impl RecordName {
             Self::Receipt => super::files::PrivateName::new("receipt.json"),
             Self::StageCatalog => super::files::PrivateName::new("stage-catalog.json"),
             Self::Supervisor => super::files::PrivateName::new("supervisor.json"),
+            Self::TaskActivation => super::files::PrivateName::new("task-activation.json"),
+            Self::SupervisorEpoch(0) => super::files::PrivateName::new("supervisor-epoch-0.json"),
+            Self::SupervisorEpoch(1) => super::files::PrivateName::new("supervisor-epoch-1.json"),
+            Self::SupervisorEpoch(2) => super::files::PrivateName::new("supervisor-epoch-2.json"),
+            Self::SupervisorArchiveIntent => {
+                super::files::PrivateName::new("supervisor-archive-intent.json")
+            }
             Self::Operation(id) if *id != [0; 16] => {
                 super::files::PrivateName::new(&format!("operation-{}.json", hex(id)))
             }
@@ -101,6 +113,9 @@ impl RecordName {
             Self::StageCatalog => RecordKind::StageCatalog,
             Self::Operation(_) => RecordKind::Operation,
             Self::Supervisor => RecordKind::Supervisor,
+            Self::TaskActivation => RecordKind::TaskActivation,
+            Self::SupervisorEpoch(_) => RecordKind::Supervisor,
+            Self::SupervisorArchiveIntent => RecordKind::SupervisorArchiveIntent,
         }
     }
     fn operation(&self) -> Option<[u8; 16]> {

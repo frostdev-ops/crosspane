@@ -191,29 +191,511 @@ impl NewInstanceEvidence {
     }
 }
 
-/// No task/child/tree capability is fabricated while native activation is split to a4b.
+#[cfg(any(windows, test))]
+// Source-included focused integration tests consume this; unit-test native entry is absent.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn record_instance(value: &str) -> NativeResult<u64> {
+    if value.len() != 32
+        || value
+            .bytes()
+            .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
+    {
+        return Err(NativeError::Invalid);
+    }
+    let instance = u64::from_str_radix(value, 16).map_err(|_| NativeError::Invalid)?;
+    if instance == 0 || format!("{instance:032x}") != value {
+        return Err(NativeError::Invalid);
+    }
+    Ok(instance)
+}
+
+/// Only the bounded initial post-start observation treats a stale predecessor as pending.
+/// Once a NEW candidate exists, FileId, Status, context and owned-child failures remain strict.
+#[cfg(any(windows, test))]
+// Source-included focused integration tests consume this; unit-test native entry is absent.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn pending_start_observation(error: NativeError) -> bool {
+    matches!(
+        error,
+        NativeError::Missing | NativeError::Busy | NativeError::Unavailable | NativeError::Foreign
+    )
+}
+#[cfg(any(windows, test))]
+// Source-included focused integration tests consume this; unit-test native entry is absent.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn new_ready_candidate(
+    phase: &crate::agent_contract::BootstrapPhase,
+    instance: u64,
+    previous: Option<u64>,
+) -> NativeResult<bool> {
+    if instance == 0 {
+        return Err(NativeError::Invalid);
+    }
+    Ok(*phase == crate::agent_contract::BootstrapPhase::Ready && Some(instance) != previous)
+}
+
+/// The constructor remains inert. Native use requires the caller's ORIGINAL nonce-bound IO and
+/// (for stop only) an alias of the actual already-held installer lock; no fresh current context.
 #[cfg(any(windows, test))]
 pub(crate) struct NativeUpgradePort {
+    #[cfg(all(windows, not(test)))]
+    native: Option<upgrade::Bound>,
     _sealed: (),
 }
 #[cfg(any(windows, test))]
 impl NativeUpgradePort {
     pub(crate) fn new() -> Self {
-        Self { _sealed: () }
+        Self {
+            #[cfg(all(windows, not(test)))]
+            native: None,
+            _sealed: (),
+        }
+    }
+    #[cfg(windows)]
+    pub(crate) fn bind_io(
+        &mut self,
+        io: std::sync::Arc<super::native_io::WindowsNativeIo>,
+        deadline: &super::native_io::Deadline,
+    ) -> NativeResult<()> {
+        #[cfg(not(test))]
+        {
+            if let Some(bound) = &self.native {
+                if !std::sync::Arc::ptr_eq(&io, &bound.io) {
+                    return Err(NativeError::Foreign);
+                }
+                return deadline.check();
+            }
+            let proof = io.admit_support(deadline)?;
+            proof.check(&io, deadline)?;
+            self.native = Some(upgrade::Bound::new(io, deadline.clone()));
+            Ok(())
+        }
+        #[cfg(test)]
+        {
+            let _ = (io, deadline);
+            Err(NativeError::Unsupported)
+        }
+    }
+    #[cfg(windows)]
+    pub(crate) fn bind_stop_lock(
+        &mut self,
+        lock: &super::native_io::InstallerLock,
+        deadline: &super::native_io::Deadline,
+    ) -> NativeResult<()> {
+        #[cfg(not(test))]
+        {
+            let bound = self.native.as_mut().ok_or(NativeError::Unsupported)?;
+            if bound.stop.attempted || bound.lease.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let proof = bound.io.admit_support(deadline)?;
+            bound.lease = Some(bound.io.lease_stop_lock(&proof, lock, deadline)?);
+            Ok(())
+        }
+        #[cfg(test)]
+        {
+            let _ = (lock, deadline);
+            Err(NativeError::Unsupported)
+        }
     }
 }
 #[cfg(any(windows, test))]
 impl super::payload::health::ServicePort for NativeUpgradePort {
-    fn stop_for_replace(&mut self, _operation: [u8; 16]) -> NativeResult<UpgradeStopProof> {
-        // Leaf exclusivity cannot stand in for the missing original supervisor/job proof.
-        Err(NativeError::Unsupported)
+    fn stop_for_replace(&mut self, operation: [u8; 16]) -> NativeResult<UpgradeStopProof> {
+        #[cfg(all(windows, not(test)))]
+        {
+            self.native
+                .as_mut()
+                .ok_or(NativeError::Unsupported)?
+                .stop(operation)
+        }
+        #[cfg(any(not(windows), test))]
+        {
+            let _ = operation;
+            Err(NativeError::Unsupported)
+        }
     }
     fn start_once(
         &mut self,
-        _operation: [u8; 16],
-        _payload: &super::payload::health::VerifiedPayload,
+        operation: [u8; 16],
+        payload: &super::payload::health::VerifiedPayload,
     ) -> NativeResult<NewInstanceEvidence> {
-        Err(NativeError::Unsupported)
+        #[cfg(all(windows, not(test)))]
+        {
+            self.native
+                .as_mut()
+                .ok_or(NativeError::Unsupported)?
+                .start(operation, payload)
+        }
+        #[cfg(any(not(windows), test))]
+        {
+            let _ = (operation, payload);
+            Err(NativeError::Unsupported)
+        }
+    }
+    fn recover_stop(
+        &mut self,
+        record: &super::payload::recovery::OperationRecord,
+    ) -> NativeResult<UpgradeStopProof> {
+        #[cfg(all(windows, not(test)))]
+        {
+            self.native
+                .as_mut()
+                .ok_or(NativeError::Unsupported)?
+                .recover_stop(record)
+        }
+        #[cfg(any(not(windows), test))]
+        {
+            let _ = record;
+            Err(NativeError::Unsupported)
+        }
+    }
+    fn recover_started(
+        &mut self,
+        record: &super::payload::recovery::OperationRecord,
+        payload: &super::payload::health::VerifiedPayload,
+    ) -> NativeResult<Option<NewInstanceEvidence>> {
+        #[cfg(all(windows, not(test)))]
+        {
+            self.native
+                .as_mut()
+                .ok_or(NativeError::Unsupported)?
+                .recover_started(record, payload)
+                .map(Some)
+        }
+        #[cfg(any(not(windows), test))]
+        {
+            let _ = (record, payload);
+            Err(NativeError::Unsupported)
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+mod upgrade {
+    use super::super::{
+        native_io::{
+            self, AgentObservation, Deadline, WindowsNativeIo,
+            supervisor_owner::{
+                AdmittedSupervisorOwner, RetainedTreeCompletion, StopSequence, TerminalStopPort,
+            },
+        },
+        payload::{health::VerifiedPayload, recovery},
+        transport::WindowsAgentPort,
+    };
+    use super::*;
+    use crate::agent_contract::{
+        AgentCall, AgentPort, DecodedReply, InstallerRequest, ObservationSource, StatusAdmission,
+    };
+    use std::sync::Arc;
+
+    pub(super) struct Bound {
+        pub(super) io: Arc<WindowsNativeIo>,
+        deadline: Deadline,
+        pub(super) lease: Option<Arc<native_io::StopLockLease>>,
+        pub(super) stop: Attempt,
+        sequence: StopSequence,
+        owner: Option<AdmittedSupervisorOwner>,
+        completion: Option<Arc<RetainedTreeCompletion>>,
+        start_attempted: bool,
+    }
+    #[derive(Default)]
+    pub(super) struct Attempt {
+        pub(super) attempted: bool,
+    }
+    impl Bound {
+        pub(super) fn new(io: Arc<WindowsNativeIo>, deadline: Deadline) -> Self {
+            Self {
+                io,
+                deadline,
+                lease: None,
+                stop: Attempt::default(),
+                sequence: StopSequence::default(),
+                owner: None,
+                completion: None,
+                start_attempted: false,
+            }
+        }
+        fn selected(
+            &self,
+            operation: [u8; 16],
+            phase: recovery::Phase,
+        ) -> NativeResult<recovery::OperationRecord> {
+            if operation == [0; 16] {
+                return Err(NativeError::Invalid);
+            }
+            let proof = self.io.admit_support(&self.deadline)?;
+            let record = recovery::selected_operation(&self.io, &proof, &self.deadline)?
+                .ok_or(NativeError::Missing)?;
+            if record.operation() != operation || record.phase() != phase {
+                return Err(NativeError::Foreign);
+            }
+            Ok(record)
+        }
+        pub(super) fn stop(&mut self, operation: [u8; 16]) -> NativeResult<UpgradeStopProof> {
+            if self.stop.attempted {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            self.selected(operation, recovery::Phase::StopIntent)?;
+            let lease = self
+                .lease
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::Unsupported)?;
+            let proof = self.io.admit_support(&self.deadline)?;
+            lease.reverify(&proof, &self.deadline)?;
+            // Reserve before any persistence or RPC. No error can make a second attempt legal.
+            self.stop.attempted = true;
+            let original = self.io.observe_agent(&proof, &self.deadline)?;
+            let selected = self
+                .io
+                .agent_generation(&original, &proof, &self.deadline)?;
+            let mut journal = journal::Journal::read(&self.io, &proof, &self.deadline)?
+                .ok_or(NativeError::Missing)?;
+            if journal.current != Some(selected) {
+                return Err(NativeError::Foreign);
+            }
+            let retained = self.io.clone_agent(&original, &proof, &self.deadline)?;
+            self.owner = Some(AdmittedSupervisorOwner::admit(
+                self.io.clone(),
+                retained,
+                Some(lease.clone()),
+                &self.deadline,
+            )?);
+            let port = WindowsAgentPort::new(
+                self.io.clone(),
+                self.io.admit_support(&self.deadline)?,
+                self.io.bound_clock(),
+                &self.deadline,
+            )?;
+            let settlement = port.stop_settlement();
+            let timeout = self
+                .deadline
+                .remaining_ms()?
+                .min(crate::agent_contract::MAX_TIMEOUT_MS);
+            let native = supervisor::NativeStop {
+                io: &self.io,
+                proof: &proof,
+                lock: lease.lock(),
+                journal: &mut journal,
+                port: Some(port),
+                deadline: &self.deadline,
+                timeout_ms: timeout,
+            };
+            let mut ordered = OrderedStop {
+                native,
+                owner: self.owner.as_ref().ok_or(NativeError::Foreign)?,
+                operation,
+                selected,
+                deadline: &self.deadline,
+            };
+            let result = self.sequence.run_once(&mut ordered);
+            drop(ordered);
+            if !self.sequence.submitted() {
+                return Err(result.err().unwrap_or(NativeError::OutcomeUnknown));
+            }
+            // An ACK is never completion. Even an uncertain RPC may be resolved ONLY by the
+            // actual original supervisor exit + empty original job + exact clean agent receipt.
+            let completed = self
+                .owner
+                .as_ref()
+                .ok_or(NativeError::Foreign)?
+                .observe_completion(operation, &self.deadline)?;
+            completed.reverify(&self.deadline)?;
+            settlement.wait(&self.deadline)?;
+            drop(original);
+            self.completion = Some(Arc::new(completed));
+            journal.phase = journal::Phase::Finished;
+            journal.stop_instance = None;
+            let proof = self.io.admit_support(&self.deadline)?;
+            journal.publish(&self.io, &proof, lease.lock(), &self.deadline)?;
+            // Broker settlement already closed every old connected pipe and old image pin.
+            // ALL local stop-lease aliases are released before the caller's owned-lock handoff.
+            drop(lease);
+            self.lease.take();
+            self.owner.take();
+            let record = self.selected(operation, recovery::Phase::StopIntent)?;
+            self.recover_stop(&record)
+        }
+        pub(super) fn recover_stop(
+            &mut self,
+            record: &recovery::OperationRecord,
+        ) -> NativeResult<UpgradeStopProof> {
+            if self.lease.is_some() || self.owner.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            let completed = self.completion.as_ref().ok_or(NativeError::Unsupported)?;
+            if record.operation() != completed.operation() {
+                return Err(NativeError::Foreign);
+            }
+            completed.reverify(&self.deadline)?;
+            let proof = self.io.admit_support(&self.deadline)?;
+            let current = recovery::selected_operation(&self.io, &proof, &self.deadline)?
+                .ok_or(NativeError::Foreign)?;
+            if serde_json::to_vec(&current).map_err(|_| NativeError::Invalid)?
+                != serde_json::to_vec(record).map_err(|_| NativeError::Invalid)?
+            {
+                return Err(NativeError::Foreign);
+            }
+            Ok(UpgradeStopProof {
+                operation: completed.operation(),
+                original_instance: Some(completed.original_instance()),
+                _sealed: (),
+            })
+        }
+        pub(super) fn start(
+            &mut self,
+            operation: [u8; 16],
+            payload: &VerifiedPayload,
+        ) -> NativeResult<NewInstanceEvidence> {
+            if self.start_attempted || self.lease.is_some() || self.owner.is_some() {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            self.selected(operation, recovery::Phase::StartIntent)?;
+            if operation != payload.operation() {
+                return Err(NativeError::Foreign);
+            }
+            let proof = self.io.admit_support(&self.deadline)?;
+            payload.reverify(&self.io, &proof, &self.deadline)?;
+            let selection = task::prepare_upgrade(self.io.clone(), payload, &self.deadline)?;
+            // The outer coordinator has dropped its actual lock. No alias is held here.
+            let trusted = TrustedImages::current()?;
+            self.start_attempted = true;
+            let evidence = task::start_upgrade(&trusted, &selection, &self.deadline)?;
+            if evidence.operation() != operation {
+                return Err(NativeError::Foreign);
+            }
+            drop(trusted);
+            drop(selection);
+            let record = self.selected(operation, recovery::Phase::StartIntent)?;
+            self.recover_started(&record, payload)
+        }
+        pub(super) fn recover_started(
+            &mut self,
+            record: &recovery::OperationRecord,
+            payload: &VerifiedPayload,
+        ) -> NativeResult<NewInstanceEvidence> {
+            if self.lease.is_some()
+                || self.owner.is_some()
+                || record.operation() != payload.operation()
+            {
+                return Err(NativeError::Unsupported);
+            }
+            let proof = self.io.admit_support(&self.deadline)?;
+            payload.reverify(&self.io, &proof, &self.deadline)?;
+            let current = recovery::selected_operation(&self.io, &proof, &self.deadline)?
+                .ok_or(NativeError::Foreign)?;
+            if serde_json::to_vec(&current).map_err(|_| NativeError::Invalid)?
+                != serde_json::to_vec(record).map_err(|_| NativeError::Invalid)?
+            {
+                return Err(NativeError::Foreign);
+            }
+            let previous = record
+                .original_instance()
+                .map(record_instance)
+                .transpose()?;
+            loop {
+                self.deadline.check()?;
+                let proof = self.io.admit_support(&self.deadline)?;
+                match self.io.observe_agent(&proof, &self.deadline) {
+                    Ok(agent) => {
+                        let instance = agent.bootstrap().instance_id;
+                        if !new_ready_candidate(&agent.bootstrap().phase, instance, previous)? {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            continue;
+                        }
+                        let image = self.io.agent_identity(&agent, &proof, &self.deadline)?;
+                        if image != payload.agent_identity()? {
+                            return Err(NativeError::Foreign);
+                        }
+                        ready_status(&self.io, &agent, &self.deadline)?;
+                        let retained = self.io.clone_agent(&agent, &proof, &self.deadline)?;
+                        // Fresh source handshake validates actual SAME own-job child lineage;
+                        // task EnginePID, claim and scheduler GUID are never readiness authority.
+                        let owner = AdmittedSupervisorOwner::admit(
+                            self.io.clone(),
+                            retained,
+                            None,
+                            &self.deadline,
+                        )?;
+                        agent.revalidate(&self.io, &proof, &self.deadline)?;
+                        payload.reverify(&self.io, &proof, &self.deadline)?;
+                        owner.close_ready(&self.deadline)?;
+                        return Ok(NewInstanceEvidence {
+                            operation: record.operation(),
+                            instance,
+                            image_identity: image,
+                            _sealed: (),
+                        });
+                    }
+                    Err(error) if pending_start_observation(error) => {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    struct OrderedStop<'a> {
+        native: supervisor::NativeStop<'a>,
+        owner: &'a AdmittedSupervisorOwner,
+        operation: [u8; 16],
+        selected: supervisor::Generation,
+        deadline: &'a Deadline,
+    }
+    impl TerminalStopPort for OrderedStop<'_> {
+        fn persist(&mut self) -> NativeResult<()> {
+            supervisor::StopPort::persist_stop(&mut self.native, self.selected.instance)
+        }
+        fn arm(&mut self) -> NativeResult<()> {
+            self.owner.arm_terminal(self.operation, self.deadline)
+        }
+        fn submit(&mut self) -> NativeResult<()> {
+            supervisor::StopPort::submit_stop(&mut self.native, self.selected.instance)
+        }
+    }
+    fn ready_status(
+        io: &Arc<WindowsNativeIo>,
+        original: &AgentObservation,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        let proof = io.admit_support(deadline)?;
+        let mut port = WindowsAgentPort::new(io.clone(), proof, io.bound_clock(), deadline)?;
+        port.submit(AgentCall {
+            id: 1,
+            request: InstallerRequest::Status,
+            timeout_ms: deadline
+                .remaining_ms()?
+                .min(crate::agent_contract::MAX_TIMEOUT_MS),
+        })
+        .map_err(|_| NativeError::Unavailable)?;
+        loop {
+            deadline.check()?;
+            let mut replies = port.poll();
+            if replies.len() > 1 {
+                return Err(NativeError::Foreign);
+            }
+            if let Some(reply) = replies.pop() {
+                if reply.id != 1 || reply.source != ObservationSource::Live {
+                    return Err(NativeError::Foreign);
+                }
+                match reply.result {
+                    Ok(DecodedReply::Status(StatusAdmission::Supported(health))) => {
+                        let instance = &health.installer().instance;
+                        if instance.id != original.bootstrap().instance_id
+                            || instance.pid != original.bootstrap().pid
+                            || instance.uid.is_some()
+                        {
+                            return Err(NativeError::Foreign);
+                        }
+                        original.revalidate(io, &io.admit_support(deadline)?, deadline)?;
+                        return Ok(());
+                    }
+                    _ => return Err(NativeError::Unavailable),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 

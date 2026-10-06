@@ -359,6 +359,39 @@ pub(crate) mod selected {
         pub(crate) fn creation_time(&self) -> u64 {
             self.facts.created
         }
+        /// Duplicates ONLY the already-admitted live original object, never a PID or record.
+        /// Lead f912268c: this readonly capability supplies same-job clean-successor retention;
+        /// it confers no execution/image/assignment/termination authority.
+        // Test builds exclude the native supervisor consumers of this new retained capability.
+        #[cfg_attr(test, allow(dead_code, unused_imports))]
+        pub(crate) fn duplicate_retained(
+            &self,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<OwnedHandle>> {
+            self.revalidate(deadline)?;
+            let mut raw = std::ptr::null_mut();
+            // SAFETY: source is the retained original process; target is this process, minimal
+            // query/synchronize rights and no inheritance. No SAME_ACCESS or new PID lookup.
+            let duplicated = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    self.handle.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &mut raw,
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    0,
+                )
+            };
+            if duplicated == 0 || raw.is_null() {
+                return Err(NativeError::Unavailable);
+            }
+            // SAFETY: successful non-null duplication transfers this one real readonly handle.
+            let handle = Arc::new(unsafe { OwnedHandle::from_raw_handle(raw) });
+            self.revalidate(deadline)?;
+            deadline.check()?;
+            Ok(handle)
+        }
         /// Called only inside the fixed AgentObservation factory's bounded native owner.
         pub(crate) fn admit(
             bootstrap: &BootstrapV1,
@@ -539,5 +572,119 @@ pub(crate) mod selected {
                 file,
             })
         }
+    }
+}
+
+/// A real retained object for THIS Limited process only; never a PID/journal-selection factory.
+#[cfg(windows)]
+// Test builds exclude the native activation/supervisor graph that owns these new capabilities.
+#[cfg_attr(test, allow(dead_code, unused_imports))]
+pub(crate) mod own {
+    use super::super::identity::{self, LimitedIdentity, TokenFacts};
+    use super::*;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{Foundation::*, System::Threading::*};
+
+    pub(crate) struct OwnProcessIdentity {
+        handle: Arc<OwnedHandle>,
+        expected: TokenFacts,
+        pid: u32,
+        creation: u64,
+    }
+    impl OwnProcessIdentity {
+        pub(crate) fn current(expected: &TokenFacts, deadline: &Deadline) -> NativeResult<Self> {
+            deadline.check()?;
+            identity::native::refuse_impersonation()?;
+            LimitedIdentity::admit(expected.clone()).map_err(|_| NativeError::Foreign)?;
+            let mut raw = std::ptr::null_mut();
+            // SAFETY: duplicate only our own process pseudo-handle into THIS process; minimal
+            // query/synchronize rights, no inheritance, and complete owned-handle output.
+            let duplicated = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    GetCurrentProcess(),
+                    GetCurrentProcess(),
+                    &mut raw,
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    0,
+                )
+            };
+            if duplicated == 0 || raw.is_null() {
+                return Err(NativeError::Unavailable);
+            }
+            // SAFETY: successful non-null duplication transfers one real owned handle.
+            let handle = Arc::new(unsafe { OwnedHandle::from_raw_handle(raw) });
+            let current = identity::native::observe_process(&handle)?;
+            LimitedIdentity::admit(current.clone()).map_err(|_| NativeError::Foreign)?;
+            if &current != expected {
+                return Err(NativeError::Foreign);
+            }
+            // SAFETY: retained query handle for our actual original process.
+            let pid = unsafe { GetProcessId(handle.as_raw_handle()) };
+            let creation = creation(&handle)?;
+            if pid == 0 || creation == 0 {
+                return Err(NativeError::Foreign);
+            }
+            let owned = Self {
+                handle,
+                expected: expected.clone(),
+                pid,
+                creation,
+            };
+            owned.reverify(deadline)?;
+            Ok(owned)
+        }
+        pub(crate) fn pid(&self) -> u32 {
+            self.pid
+        }
+        pub(crate) fn creation(&self) -> u64 {
+            self.creation
+        }
+        /// Handle view is only available on this sealed current-process object; no raw borrow.
+        pub(crate) fn handle(&self) -> Arc<OwnedHandle> {
+            self.handle.clone()
+        }
+        pub(crate) fn reverify(&self, deadline: &Deadline) -> NativeResult<()> {
+            deadline.check()?;
+            // SAFETY: actual retained original query/synchronize process, nonblocking wait.
+            if unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } != WAIT_TIMEOUT {
+                return Err(NativeError::Foreign);
+            }
+            // SAFETY: original retained query handle, never OpenProcess by a stored PID.
+            if unsafe { GetProcessId(self.handle.as_raw_handle()) } != self.pid
+                || creation(&self.handle)? != self.creation
+            {
+                return Err(NativeError::Foreign);
+            }
+            let facts = identity::native::observe_process(&self.handle)?;
+            LimitedIdentity::admit(facts.clone()).map_err(|_| NativeError::Foreign)?;
+            if facts != self.expected {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()
+        }
+    }
+    fn creation(handle: &OwnedHandle) -> NativeResult<u64> {
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: retained query process and four complete, distinct writable FILETIME outputs.
+        if unsafe {
+            GetProcessTimes(
+                handle.as_raw_handle(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        } == 0
+        {
+            return Err(NativeError::Unavailable);
+        }
+        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
     }
 }

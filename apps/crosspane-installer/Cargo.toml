@@ -54,6 +54,7 @@ wayland-client.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_System_TaskScheduler",

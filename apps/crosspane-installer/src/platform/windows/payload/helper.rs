@@ -951,10 +951,12 @@ mod native {
             record: OperationRecord,
             parent: &ParentExited,
         ) -> NativeResult<RecoveryDecision> {
-            let lock = self.lock.as_ref().ok_or(NativeError::Foreign)?;
             let proof = self.io.admit_support(&self.deadline)?;
             parent.reverify(&self.deadline)?;
-            super::super::resume_helper(
+            // Transfer our actual lock; neither the helper trait nor the parent-exit capability
+            // changes. The owned coordinator may release this lock before waiting for readiness.
+            let lock = self.lock.take().ok_or(NativeError::Foreign)?;
+            super::super::recovery::resume_helper_owned(
                 self.io.clone(),
                 &proof,
                 lock,

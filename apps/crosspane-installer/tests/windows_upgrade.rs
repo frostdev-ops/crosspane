@@ -10,7 +10,7 @@ mod native_io;
 mod payload;
 #[path = "../src/platform/windows/service.rs"]
 mod service;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 #[path = "../src/platform/windows/transport.rs"]
 mod transport;
 
@@ -841,4 +841,335 @@ fn helper_partial_native_outputs_or_poisoned_classification_never_claim_suspende
     control.quarantine();
     assert!(!control.publish_created(true, false));
     assert!(!control.retire());
+}
+
+#[test]
+fn owned_lock_handoff_drops_actual_lock_before_run_and_only_restores_fresh_permit() {
+    use std::{cell::Cell, rc::Rc};
+    struct Lock(Rc<Cell<bool>>);
+    impl Drop for Lock {
+        fn drop(&mut self) {
+            self.0.set(false);
+        }
+    }
+    let held = Rc::new(Cell::new(true));
+    let fresh = Rc::new(Cell::new(false));
+    let mut boundary = payload::LockHandoff::Owned(Some(Lock(held.clone())));
+    let mut permit = Some(7);
+    let observed = Cell::new(0);
+    let result = boundary.run_once(
+        &mut permit,
+        true,
+        || {
+            assert!(!held.get());
+            observed.set(observed.get() + 1);
+            Ok(41)
+        },
+        || {
+            assert!(!held.get());
+            fresh.set(true);
+            Ok((Lock(fresh.clone()), 8))
+        },
+    );
+    assert_eq!(result, Ok(41));
+    assert_eq!(observed.get(), 1);
+    assert_eq!(permit, Some(8));
+    assert!(fresh.get());
+    assert!(boundary.get().is_ok());
+    drop(boundary);
+    assert!(!fresh.get());
+}
+#[test]
+fn owned_lock_handoff_borrowed_nonidle_and_missing_permit_never_run() {
+    let lock = 1;
+    let mut borrowed = payload::LockHandoff::Borrowed(&lock);
+    let mut permit = Some(7);
+    assert_eq!(
+        borrowed.run_once(
+            &mut permit,
+            true,
+            || panic!("borrowed must refuse"),
+            || Ok((1, 8))
+        ),
+        Err::<(), _>(NativeError::Unsupported)
+    );
+    for (idle, expected, initial) in [
+        (false, NativeError::OutcomeUnknown, Some(7)),
+        (true, NativeError::Foreign, None),
+    ] {
+        let mut owned = payload::LockHandoff::Owned(Some(1));
+        let mut permit = initial;
+        assert_eq!(
+            owned.run_once(&mut permit, idle, || panic!("no authority"), || Ok((1, 8))),
+            Err::<(), _>(expected)
+        );
+        assert!(owned.get().is_ok());
+        assert_eq!(permit, initial);
+    }
+}
+#[test]
+fn owned_lock_handoff_run_failure_never_reenters_or_repeats_run() {
+    let mut boundary = payload::LockHandoff::Owned(Some(1));
+    let mut permit = Some(7);
+    let runs = std::cell::Cell::new(0);
+    assert_eq!(
+        boundary.run_once(
+            &mut permit,
+            true,
+            || {
+                runs.set(runs.get() + 1);
+                Err::<(), _>(NativeError::OutcomeUnknown)
+            },
+            || panic!("failed Run cannot reenter")
+        ),
+        Err(NativeError::OutcomeUnknown)
+    );
+    assert_eq!(permit, None);
+    assert!(boundary.get().is_err());
+    assert_eq!(
+        boundary.run_once(
+            &mut permit,
+            true,
+            || panic!("no repeated Run"),
+            || Ok((2, 8))
+        ),
+        Err::<(), _>(NativeError::Foreign)
+    );
+    assert_eq!(runs.get(), 1);
+}
+#[test]
+fn owned_lock_handoff_changed_selection_or_failed_reacquire_never_publishes() {
+    for error in [
+        NativeError::Foreign,
+        NativeError::Busy,
+        NativeError::OutcomeUnknown,
+    ] {
+        let mut boundary = payload::LockHandoff::Owned(Some(1));
+        let mut permit = Some(7);
+        let runs = std::cell::Cell::new(0);
+        let result = boundary.run_once(
+            &mut permit,
+            true,
+            || {
+                runs.set(runs.get() + 1);
+                Ok(())
+            },
+            || Err::<(i32, i32), _>(error),
+        );
+        assert_eq!(result, Err(error));
+        assert_eq!(permit, None);
+        assert!(boundary.get().is_err());
+        assert_eq!(
+            boundary.run_once(
+                &mut permit,
+                true,
+                || panic!("old StartIntent never reruns"),
+                || Ok((2, 8))
+            ),
+            Err::<(), _>(NativeError::Foreign)
+        );
+        assert_eq!(runs.get(), 1);
+    }
+}
+
+struct EpochFake {
+    events: Vec<&'static str>,
+    fail: Option<(&'static str, bool)>,
+    intent: Option<native_io::epoch_archive::ArchivePhase>,
+    source: bool,
+    target: bool,
+    victim: bool,
+}
+impl EpochFake {
+    fn step(&mut self, name: &'static str, effect: impl FnOnce(&mut Self)) -> NativeResult<()> {
+        self.events.push(name);
+        if self.fail == Some((name, false)) {
+            return Err(NativeError::Unavailable);
+        }
+        effect(self);
+        if self.fail == Some((name, true)) {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+}
+impl native_io::epoch_archive::ArchivePort for EpochFake {
+    fn persist(&mut self, phase: native_io::epoch_archive::ArchivePhase) -> NativeResult<()> {
+        use native_io::epoch_archive::ArchivePhase::*;
+        self.step(
+            match phase {
+                PruneIntent => "prune-intent",
+                MoveIntent => "move-intent",
+                Complete => "complete",
+            },
+            |f| {
+                f.intent = Some(phase);
+            },
+        )
+    }
+    fn prune(&mut self) -> NativeResult<()> {
+        assert_eq!(
+            self.intent,
+            Some(native_io::epoch_archive::ArchivePhase::PruneIntent)
+        );
+        self.step("prune", |f| f.victim = false)
+    }
+    fn move_current(&mut self) -> NativeResult<()> {
+        assert_eq!(
+            self.intent,
+            Some(native_io::epoch_archive::ArchivePhase::MoveIntent)
+        );
+        assert!(!self.victim);
+        self.step("move", |f| {
+            f.source = false;
+            f.target = true;
+        })
+    }
+    fn observe_complete(&mut self) -> NativeResult<()> {
+        self.step("observe", |f| assert!(!f.source && f.target))
+    }
+}
+#[test]
+fn epoch_archive_actual_order_journals_each_effect_and_observes_before_complete() {
+    let mut f = EpochFake {
+        events: vec![],
+        fail: None,
+        intent: None,
+        source: true,
+        target: false,
+        victim: true,
+    };
+    native_io::epoch_archive::ArchiveSequence::default()
+        .run_once(&mut f, true)
+        .unwrap();
+    assert_eq!(
+        f.events,
+        [
+            "prune-intent",
+            "prune",
+            "move-intent",
+            "move",
+            "observe",
+            "complete"
+        ]
+    );
+    assert!(!f.source && f.target && !f.victim);
+}
+#[test]
+fn epoch_archive_every_before_after_interruption_refuses_repeated_effects() {
+    for point in [
+        "prune-intent",
+        "prune",
+        "move-intent",
+        "move",
+        "observe",
+        "complete",
+    ] {
+        for after in [false, true] {
+            let mut f = EpochFake {
+                events: vec![],
+                fail: Some((point, after)),
+                intent: None,
+                source: true,
+                target: false,
+                victim: true,
+            };
+            let mut sequence = native_io::epoch_archive::ArchiveSequence::default();
+            assert!(sequence.run_once(&mut f, true).is_err());
+            let effects = f.events.clone();
+            assert_eq!(
+                sequence.run_once(&mut f, true),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert_eq!(f.events, effects);
+            if f.source {
+                assert!(!f.target);
+            } else {
+                assert!(f.target);
+            }
+        }
+    }
+}
+#[test]
+fn epoch_archive_vacancy_has_no_prune_effect() {
+    let mut f = EpochFake {
+        events: vec![],
+        fail: None,
+        intent: None,
+        source: true,
+        target: false,
+        victim: false,
+    };
+    native_io::epoch_archive::ArchiveSequence::default()
+        .run_once(&mut f, false)
+        .unwrap();
+    assert_eq!(f.events, ["move-intent", "move", "observe", "complete"]);
+}
+
+#[test]
+fn owner_record_instance_is_exact_u64_and_cold_recovery_never_replays_effects() {
+    use payload::health::ServicePort;
+    for instance in [1, (1u64 << 53) + 7, u64::MAX] {
+        assert_eq!(
+            service::record_instance(&format!("{instance:032x}")),
+            Ok(instance)
+        );
+    }
+    for text in [
+        "1",
+        "00000000000000000000000000000000",
+        "0000000000000000FFFFFFFFFFFFFFFF",
+        "10000000000000000000000000000000",
+    ] {
+        assert!(service::record_instance(text).is_err());
+    }
+    let mut port = service::NativeUpgradePort::new();
+    let mut record = OperationRecord::new([7; 16]).unwrap();
+    record.set_phase(Phase::StopIntent);
+    assert!(matches!(
+        port.recover_stop(&record),
+        Err(NativeError::Unsupported)
+    ));
+    record.set_phase(Phase::StartIntent);
+    let payload = payload::health::VerifiedPayload::fixture([7; 16]).unwrap();
+    assert!(matches!(
+        port.recover_started(&record, &payload),
+        Err(NativeError::Unsupported)
+    ));
+}
+
+#[test]
+fn start_readiness_stale_predecessor_waits_without_status_until_exact_new_candidate() {
+    use agent_contract::BootstrapPhase;
+    for error in [
+        NativeError::Foreign,
+        NativeError::Missing,
+        NativeError::Busy,
+        NativeError::Unavailable,
+    ] {
+        assert!(service::pending_start_observation(error));
+    }
+    for error in [
+        NativeError::Invalid,
+        NativeError::Unsupported,
+        NativeError::OutcomeUnknown,
+        NativeError::Oversize,
+    ] {
+        assert!(!service::pending_start_observation(error));
+    }
+    let previous = (1u64 << 53) + 7;
+    let new = previous + 1;
+    let mut status_attempts = 0;
+    for (phase, instance) in [
+        (BootstrapPhase::Ready, previous),
+        (BootstrapPhase::Starting, new),
+        (BootstrapPhase::Ready, new),
+    ] {
+        if service::new_ready_candidate(&phase, instance, Some(previous)).unwrap() {
+            status_attempts += 1;
+            assert_eq!(instance, new);
+        }
+    }
+    assert_eq!(status_attempts, 1);
+    assert!(service::new_ready_candidate(&BootstrapPhase::Ready, 0, None).is_err());
 }

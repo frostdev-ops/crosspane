@@ -40,14 +40,13 @@ impl Drop for Flight {
         self.0.store(false, Ordering::Release);
     }
 }
-pub(super) fn start(
-    cancel: Cancellation,
-    clock: Arc<dyn Clock>,
-) -> NativeResult<(
+pub(super) type StartedWorker = (
     mpsc::SyncSender<Work>,
     mpsc::Receiver<AgentReply>,
     Arc<AtomicBool>,
-)> {
+    super::StopSettlement,
+);
+pub(super) fn start(cancel: Cancellation, clock: Arc<dyn Clock>) -> NativeResult<StartedWorker> {
     WORKERS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < MAX_QUEUE).then_some(n + 1)
@@ -58,6 +57,8 @@ pub(super) fn start(
     let (results, receive) = mpsc::sync_channel(MAX_QUEUE);
     let active = Arc::new(AtomicBool::new(false));
     let current = active.clone();
+    let settlement = super::StopSettlement(Arc::new(AtomicBool::new(false)));
+    let terminal = settlement.clone();
     std::thread::Builder::new()
         .name("installer-windows-agent".into())
         .spawn(move || {
@@ -138,7 +139,91 @@ pub(super) fn start(
                     break;
                 }
             }
+            // Leaving the loop has dropped the actual in-flight Work endpoint. Drop the queue
+            // receiver too, including every queued endpoint alias, BEFORE publishing settlement.
+            publish_terminal(calls, &terminal);
         })
         .map_err(|_| NativeError::Unavailable)?;
-    Ok((send, receive, active))
+    Ok((send, receive, active, settlement))
+}
+
+/// Shared production settlement point: dropping a queue drops EVERY queued endpoint alias. The
+/// current Work left scope before this function is called; delivery/Flight never set this token.
+fn publish_terminal<T>(pending: mpsc::Receiver<T>, terminal: &super::StopSettlement) {
+    drop(pending);
+    terminal.0.store(true, Ordering::Release);
+}
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    #[test]
+    fn stop_reply_and_inactive_flag_do_not_settle_a_queued_endpoint_alias() {
+        let token = super::super::StopSettlement(Arc::new(AtomicBool::new(false)));
+        let active = Arc::new(AtomicBool::new(true));
+        let flight = Flight(active.clone());
+        let (reply, receive) = mpsc::sync_channel(1);
+        drop(flight);
+        reply.send(()).unwrap();
+        receive.recv().unwrap();
+        assert!(!active.load(Ordering::Acquire));
+        assert!(!token.0.load(Ordering::Acquire));
+        let (send, queue) = mpsc::sync_channel(1);
+        send.send(Arc::new(AtomicBool::new(true))).unwrap();
+        drop(send);
+        assert!(!token.0.load(Ordering::Acquire));
+        publish_terminal(queue, &token);
+        assert!(token.0.load(Ordering::Acquire));
+    }
+    #[test]
+    fn late_queue_alias_drop_precedes_terminal_token_publication() {
+        #[derive(Debug)]
+        struct Pin {
+            entered: mpsc::SyncSender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Drop for Pin {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+        }
+        let token = super::super::StopSettlement(Arc::new(AtomicBool::new(false)));
+        let (entered, observe) = mpsc::sync_channel(1);
+        let (release, hold) = mpsc::sync_channel(1);
+        let (send, queue) = mpsc::sync_channel(1);
+        send.send(Pin {
+            entered,
+            release: hold,
+        })
+        .unwrap();
+        drop(send);
+        let held = token.clone();
+        let worker = std::thread::spawn(move || publish_terminal(queue, &held));
+        observe.recv_timeout(Duration::from_secs(3)).unwrap();
+        let before = token.0.load(Ordering::Acquire);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(!before);
+        assert!(token.0.load(Ordering::Acquire));
+    }
+    #[test]
+    fn stop_token_deadline_does_not_claim_terminal_alias_settlement() {
+        use super::super::super::native_io::{Cancellation, MonotonicClock};
+        let token = super::super::StopSettlement(Arc::new(AtomicBool::new(false)));
+        let cancel = Cancellation::default();
+        let deadline =
+            Deadline::new(1000, Arc::new(MonotonicClock::default()), cancel.clone()).unwrap();
+        cancel.cancel();
+        assert_eq!(token.wait(&deadline), Err(NativeError::Cancelled));
+        assert!(!token.0.load(Ordering::Acquire));
+        let (_send, queue) = mpsc::sync_channel::<()>(1);
+        publish_terminal(queue, &token);
+        let deadline = Deadline::new(
+            1000,
+            Arc::new(MonotonicClock::default()),
+            Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(token.wait(&deadline), Ok(()));
+    }
 }

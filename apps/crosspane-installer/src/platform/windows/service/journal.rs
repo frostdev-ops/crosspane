@@ -168,3 +168,25 @@ impl Journal {
         Ok(())
     }
 }
+
+#[cfg(windows)]
+impl Journal {
+    /// Native source transitions are locked and exact-current. A cold journal is never an owner
+    /// factory: the caller retains its genuine job/process and exclusive namespace separately.
+    // Test builds exclude the native supervisor's new locked transition wiring.
+    #[cfg_attr(test, allow(dead_code, unused_imports))]
+    pub(crate) fn publish_owned_transition(
+        &self,
+        io: &super::super::native_io::WindowsNativeIo,
+        proof: &super::super::native_io::SupportProof,
+        lock: &super::super::native_io::InstallerLock,
+        expected: Option<&Self>,
+        deadline: &super::super::native_io::Deadline,
+    ) -> NativeResult<()> {
+        let current = Self::read(io, proof, deadline)?;
+        if current.as_ref() != expected {
+            return Err(NativeError::Foreign);
+        }
+        self.publish(io, proof, lock, deadline)
+    }
+}

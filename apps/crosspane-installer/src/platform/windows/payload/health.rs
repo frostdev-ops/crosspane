@@ -17,18 +17,14 @@ pub(crate) trait ServicePort {
     /// A4b must supply fresh retained-owner completion. This is NEVER a repeated stop RPC.
     fn recover_stop(
         &mut self,
-        _record: &super::recovery::OperationRecord,
-    ) -> NativeResult<super::super::service::UpgradeStopProof> {
-        Err(NativeError::Unsupported)
-    }
+        record: &super::recovery::OperationRecord,
+    ) -> NativeResult<super::super::service::UpgradeStopProof>;
     /// A4b must supply a fresh actual new-instance observation. This is NEVER a repeated start.
     fn recover_started(
         &mut self,
-        _record: &super::recovery::OperationRecord,
-        _payload: &VerifiedPayload,
-    ) -> NativeResult<Option<super::super::service::NewInstanceEvidence>> {
-        Err(NativeError::Unsupported)
-    }
+        record: &super::recovery::OperationRecord,
+        payload: &VerifiedPayload,
+    ) -> NativeResult<Option<super::super::service::NewInstanceEvidence>>;
 }
 pub(crate) struct VerifiedPayload {
     // A4b native launch/health consumes the exact verified operation and role pins.

@@ -144,7 +144,25 @@ pub(crate) fn run(
     (result, source)
 }
 
+/// Private per-worker observation only. ACK/active=false never imply old endpoint pins settled.
+#[derive(Clone)]
+pub(crate) struct StopSettlement(Arc<AtomicBool>);
+impl StopSettlement {
+    pub(crate) fn wait(&self, deadline: &Deadline) -> NativeResult<()> {
+        loop {
+            deadline.check()?;
+            if self.0.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 pub struct WindowsAgentPort {
+    // Consumed by native upgrade entry, which is deliberately cfg(not(test)).
+    #[cfg_attr(test, allow(dead_code))]
+    settlement: StopSettlement,
     queue: AgentQueue,
     sender: Option<mpsc::SyncSender<worker::Work>>,
     receiver: mpsc::Receiver<AgentReply>,
@@ -162,6 +180,12 @@ impl std::fmt::Debug for WindowsAgentPort {
     }
 }
 impl WindowsAgentPort {
+    // Shipping consuming-stop integration; absent from the lib-test native entry graph.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn stop_settlement(&self) -> StopSettlement {
+        self.settlement.clone()
+    }
+
     #[allow(dead_code)] // Lead750c0da2: selected installer operation integration awaits A4.
     pub(crate) fn installer_stop(
         self,
@@ -258,8 +282,10 @@ impl WindowsAgentPort {
     }
     fn start(endpoint: Arc<dyn Endpoint>, clock: Arc<dyn Clock>) -> NativeResult<Self> {
         let cancellation = super::native_io::Cancellation::default();
-        let (sender, receiver, active) = worker::start(cancellation.clone(), clock.clone())?;
+        let (sender, receiver, active, settlement) =
+            worker::start(cancellation.clone(), clock.clone())?;
         Ok(Self {
+            settlement,
             queue: AgentQueue::default(),
             sender: Some(sender),
             receiver,

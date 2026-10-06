@@ -1,14 +1,32 @@
 //! Windows installer native foundation. Observations and record bytes are never authority.
 //! The native adapter is Windows-only; bounded admission decisions remain portable for tests.
 
+#[path = "native_io/activation.rs"]
+// Only new native graph: production entries are intentionally absent in unit-test roots.
+#[cfg_attr(test, allow(dead_code, unused_imports))]
+pub(crate) mod activation;
+#[path = "native_io/epoch_archive.rs"]
+// Only new native graph: production entries are intentionally absent in unit-test roots.
+#[cfg_attr(test, allow(dead_code, unused_imports))]
+pub(crate) mod epoch_archive;
 #[path = "native_io/files.rs"]
 pub mod files;
 #[path = "native_io/identity.rs"]
 pub mod identity;
+#[path = "native_io/jobs.rs"]
+// Only new native graph: production entries are intentionally absent in unit-test roots.
+#[cfg_attr(test, allow(dead_code, unused_imports))]
+pub(crate) mod jobs;
 #[path = "native_io/process.rs"]
 pub mod process;
 #[path = "native_io/records.rs"]
 pub mod records;
+#[path = "native_io/supervisor_owner.rs"]
+// Only new native graph: production entries are intentionally absent in unit-test roots.
+#[cfg_attr(test, allow(dead_code, unused_imports))]
+pub(crate) mod supervisor_owner;
+#[path = "native_io/task.rs"]
+pub(crate) mod task;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NativeError {
@@ -46,6 +64,8 @@ pub(crate) use adapter::ExitObservation;
 #[allow(unused_imports)]
 // Source-included probe exports; library unit tests do not invoke them.
 pub(crate) use adapter::scratch::{FixtureLock, ScratchFixture, scratch_current};
+#[cfg(windows)]
+pub(crate) use adapter::{BrokerAdmission, JobAdmission, PeerRolePin, StopLockLease};
 #[cfg(windows)]
 #[allow(unused_imports)]
 // A4b/A5 consumers retain these sealed native return capabilities.
@@ -1320,6 +1340,668 @@ mod adapter {
         owner: Arc<CallOwner>,
         clock: Arc<dyn Clock>,
     }
+    /// A checked lease of the caller's SAME installer lock, never a newly acquired lock.
+    // Shipping consumers are cfg(not(test)); integration roots cover this exact new bridge.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) struct StopLockLease {
+        io: Arc<WindowsNativeIo>,
+        lock: InstallerLock,
+    }
+    // Shipping consumers are cfg(not(test)); integration roots cover this exact new bridge.
+    #[cfg_attr(test, allow(dead_code))]
+    impl StopLockLease {
+        pub(crate) fn lock(&self) -> &InstallerLock {
+            &self.lock
+        }
+        pub(crate) fn reverify(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.io.verify_stop_lock(proof, &self.lock, deadline)
+        }
+    }
+    /// Private, same-context launch admission. No path or journal constructs this capability.
+    // Shipping consumers are cfg(not(test)); integration roots cover this exact new bridge.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) struct JobAdmission {
+        io: Arc<WindowsNativeIo>,
+        agent: OpenedPe,
+        root: PayloadRoot,
+    }
+    // Shipping consumers are cfg(not(test)); integration roots cover this exact new bridge.
+    #[cfg_attr(test, allow(dead_code))]
+    impl JobAdmission {
+        pub(crate) fn io(&self) -> &Arc<WindowsNativeIo> {
+            &self.io
+        }
+        pub(crate) fn application(&self) -> &str {
+            self.agent.canonical_dos_path()
+        }
+        pub(crate) fn cwd(&self) -> &str {
+            self.root.canonical_dos_path()
+        }
+        pub(crate) fn reverify(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.agent.reverify(&self.io, proof, deadline)?;
+            let budget = proof.budget(&self.io, deadline)?;
+            self.io.context.validate(&budget)?;
+            if self.root.0.target != self.io.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            let install = self
+                .root
+                .0
+                .install
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?;
+            install.as_ref().ok_or(NativeError::Missing)?.revalidate(
+                &self.io.context.security,
+                false,
+                &budget,
+            )
+        }
+        pub(crate) fn agent_matches(
+            &self,
+            agent: &AgentObservation,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.reverify(proof, deadline)?;
+            let budget = proof.budget(&self.io, deadline)?;
+            if agent.0.target != self.io.context.target.nonce
+                || agent.0.image_identity != self.agent.identity()
+            {
+                return Err(NativeError::Foreign);
+            }
+            agent.0.validate_pins(&self.io.context, &budget)
+        }
+        pub(crate) fn retained_agent(
+            &self,
+            agent: &AgentObservation,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<std::os::windows::io::OwnedHandle>> {
+            self.agent_matches(agent, proof, deadline)?;
+            let budget = proof.budget(&self.io, deadline)?;
+            let handle = agent.0.process.duplicate_retained(&budget)?;
+            self.agent_matches(agent, proof, deadline)?;
+            Ok(handle)
+        }
+    }
+    /// Rooted, opaque OLD installer-role evidence for completion only; never image approval.
+    // Shipping consumers are cfg(not(test)); integration roots cover this exact new bridge.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) struct BrokerAdmission {
+        io: Arc<WindowsNativeIo>,
+        runtime: Mutex<Option<Arc<Anchor>>>,
+        parent: Arc<Anchor>,
+        expected_runtime: String,
+        install: Arc<Anchor>,
+        installer: Mutex<Option<Arc<File>>>,
+        installer_identity: FileIdentity,
+        installer_path: String,
+        endpoint: String,
+    }
+    // Shipping consumers are cfg(not(test)); integration roots cover this exact new bridge.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) struct PeerRolePin {
+        context: Arc<Context>,
+        parent: Arc<Anchor>,
+        file: File,
+        name: String,
+        path: String,
+        identity: FileIdentity,
+    }
+    // Shipping consumers are cfg(not(test)); integration roots cover this exact new bridge.
+    #[cfg_attr(test, allow(dead_code))]
+    impl PeerRolePin {
+        pub(crate) fn path(&self) -> &str {
+            &self.path
+        }
+        pub(crate) fn identity(&self) -> FileIdentity {
+            self.identity
+        }
+        pub(crate) fn reverify(&self, deadline: &Deadline) -> NativeResult<()> {
+            self.context.validate(deadline)?;
+            self.parent
+                .revalidate(&self.context.security, false, deadline)?;
+            let facts = native::observe(&self.file, &self.name, &self.context.security)?;
+            files::admit_component(&facts, Admission::PrivateFile)?;
+            let (_, current) = self.parent.open_file_metadata(
+                &PrivateName::new(&self.name)?,
+                &self.context.security,
+                deadline,
+            )?;
+            if facts.identity != self.identity || current != self.identity {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()
+        }
+    }
+    // Shipping consumers are cfg(not(test)); integration roots cover this exact new bridge.
+    #[cfg_attr(test, allow(dead_code))]
+    impl BrokerAdmission {
+        pub(crate) fn io(&self) -> &Arc<WindowsNativeIo> {
+            &self.io
+        }
+        pub(crate) fn token(&self) -> &TokenFacts {
+            &self.io.context.target.identity
+        }
+        pub(crate) fn installer_identity(&self) -> FileIdentity {
+            self.installer_identity
+        }
+        pub(crate) fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+        pub(crate) fn reverify(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let budget = proof.budget(&self.io, deadline)?;
+            self.io.context.validate(&budget)?;
+            self.parent
+                .revalidate(&self.io.context.security, true, &budget)?;
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .as_ref()
+                .cloned();
+            if let Some(runtime) = runtime {
+                runtime.revalidate(&self.io.context.security, true, &budget)?;
+            }
+            self.install
+                .revalidate(&self.io.context.security, false, &budget)?;
+            let pin = self
+                .installer
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .as_ref()
+                .cloned()
+                .ok_or(NativeError::Unsupported)?;
+            let facts =
+                native::observe(&pin, "crosspane-installer.exe", &self.io.context.security)?;
+            files::admit_component(&facts, Admission::PrivateFile)?;
+            let (_, current) = self.install.open_file_metadata(
+                &PrivateName::new("crosspane-installer.exe")?,
+                &self.io.context.security,
+                &budget,
+            )?;
+            if facts.identity != self.installer_identity || current != self.installer_identity {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+        pub(crate) fn bind_runtime(
+            &self,
+            agent: &AgentObservation,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.reverify(proof, deadline)?;
+            if agent.0.target != self.io.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            agent.revalidate(&self.io, proof, deadline)?;
+            let actual = agent
+                .0
+                .runtime_canonical
+                .to_str()
+                .ok_or(NativeError::Unsupported)?;
+            if process::literal_path(actual)? != process::literal_path(&self.expected_runtime)? {
+                return Err(NativeError::Foreign);
+            }
+            *self.runtime.lock().map_err(|_| NativeError::Unavailable)? =
+                Some(agent.0.runtime.clone());
+            Ok(())
+        }
+        pub(crate) fn peer_role(
+            &self,
+            observed_image: &str,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<PeerRolePin> {
+            let budget = proof.budget(&self.io, deadline)?;
+            let context = self.io.context.clone();
+            context.validate(&budget)?;
+            let image = process::literal_path(observed_image)?;
+            if image == process::literal_path(&self.installer_path)? {
+                let (file, identity) = self.install.open_file_metadata(
+                    &PrivateName::new("crosspane-installer.exe")?,
+                    &context.security,
+                    &budget,
+                )?;
+                if identity != self.installer_identity {
+                    return Err(NativeError::Foreign);
+                }
+                return Ok(PeerRolePin {
+                    context,
+                    parent: self.install.clone(),
+                    file,
+                    name: "crosspane-installer.exe".into(),
+                    path: self.installer_path.clone(),
+                    identity,
+                });
+            }
+            // ONLY the active fixed helper role can be selected. The observed image is compared,
+            // never opened; catalog ids select this one anchored constant internal path.
+            let observed = self
+                .io
+                .read_record(
+                    proof,
+                    records::RecordName::StageCatalog,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .ok_or(NativeError::Missing)?;
+            let catalog: super::super::payload::recovery::StageCatalog =
+                records::record_data(&records::RecordName::StageCatalog, observed.bytes())?;
+            catalog.validate()?;
+            let operation = catalog.active.ok_or(NativeError::Unsupported)?;
+            let op: String = operation.iter().map(|byte| format!("{byte:02x}")).collect();
+            let fixed = format!("{}\\payload-stage\\{op}", context.target.paths.install());
+            let parent = Arc::new(
+                Anchor::open(&fixed, &context.security, true, &budget)?
+                    .ok_or(NativeError::Missing)?,
+            );
+            let path = format!(
+                "{}\\helper-copy.exe",
+                parent
+                    .canonical_dos_path(&context.security, &budget)?
+                    .to_str()
+                    .ok_or(NativeError::Unsupported)?
+            );
+            if image != process::literal_path(&path)? {
+                return Err(NativeError::Unsupported);
+            }
+            let (file, identity) = parent.open_file_metadata(
+                &PrivateName::new("helper-copy.exe")?,
+                &context.security,
+                &budget,
+            )?;
+            Ok(PeerRolePin {
+                context,
+                parent,
+                file,
+                name: "helper-copy.exe".into(),
+                path,
+                identity,
+            })
+        }
+        pub(crate) fn release_image_pin(&self) -> NativeResult<()> {
+            self.installer
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?
+                .take();
+            Ok(())
+        }
+    }
+
+    #[cfg(not(test))]
+    pub(crate) struct ArchivedSupervisorEpoch {
+        io: Arc<WindowsNativeIo>,
+        namespace: Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
+        permit: Arc<super::super::service::task::TaskRunPermit>,
+        intent: super::epoch_archive::ArchiveIntent,
+        bytes: Vec<u8>,
+    }
+    #[cfg(not(test))]
+    pub(crate) struct FirstSupervisorEpoch {
+        io: Arc<WindowsNativeIo>,
+        namespace: Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
+        permit: Arc<super::super::service::task::TaskRunPermit>,
+    }
+    /// Neither variant has a record/fact constructor. Both start with a fresh actual own task
+    /// claim, original IO and retained FIRST_INSTANCE namespace, before any child can be created.
+    #[cfg(not(test))]
+    pub(crate) enum OwnedArchiveResult {
+        First(FirstSupervisorEpoch),
+        Archived(ArchivedSupervisorEpoch),
+    }
+    #[cfg(not(test))]
+    impl OwnedArchiveResult {
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &Arc<super::super::service::task::TaskRunPermit>,
+            owner: &Arc<super::jobs::SupervisorOwner>,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let (original, namespace, claim) = match self {
+                Self::First(value) => (&value.io, &value.namespace, &value.permit),
+                Self::Archived(value) => (&value.io, &value.namespace, &value.permit),
+            };
+            if !std::ptr::eq(io, original.as_ref())
+                || !Arc::ptr_eq(permit, claim)
+                || !Arc::ptr_eq(namespace, &owner.exclusive_lease(proof, deadline)?)
+            {
+                return Err(NativeError::Foreign);
+            }
+            io.verify_stop_lock(proof, lock, deadline)?;
+            namespace.reverify(io, proof, deadline)?;
+            claim.reverify(io, proof, deadline)?;
+            let current = io.read_record(
+                proof,
+                records::RecordName::Supervisor,
+                files::MAX_RECORD_BYTES,
+                deadline,
+            )?;
+            if current.is_some() {
+                return Err(NativeError::Foreign);
+            }
+            match self {
+                Self::First(_) => {
+                    if io
+                        .read_record(
+                            proof,
+                            records::RecordName::SupervisorArchiveIntent,
+                            files::MAX_RECORD_BYTES,
+                            deadline,
+                        )?
+                        .is_some()
+                        || super::super::payload::recovery::selected_operation(io, proof, deadline)?
+                            .is_some()
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                }
+                Self::Archived(value) => {
+                    let intent =
+                        read_archive_intent(io, proof, deadline)?.ok_or(NativeError::Foreign)?;
+                    if intent != value.intent
+                        || intent.phase != super::epoch_archive::ArchivePhase::Complete
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    let record = io
+                        .read_record(
+                            proof,
+                            records::RecordName::SupervisorEpoch(intent.slot),
+                            files::MAX_RECORD_BYTES,
+                            deadline,
+                        )?
+                        .ok_or(NativeError::Foreign)?;
+                    if record.identity != epoch_identity(intent.source)
+                        || record.bytes() != value.bytes
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    let prior = super::super::service::journal::Journal::decode(record.bytes())?;
+                    let selected =
+                        super::super::payload::recovery::selected_operation(io, proof, deadline)?;
+                    let lineage = super::activation::correlate_upgrade(
+                        claim.operation(),
+                        claim.user(),
+                        selected.as_ref(),
+                        Some(&prior),
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                    if lineage.operation() != intent.operation
+                        || intent.owner_creation != claim.owner_identity().creation()
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                }
+            }
+            deadline.check()
+        }
+    }
+    #[cfg(not(test))]
+    fn epoch_identity(stamp: super::super::payload::recovery::FileStamp) -> FileIdentity {
+        FileIdentity {
+            volume: stamp.volume,
+            file: stamp.file,
+        }
+    }
+    #[cfg(not(test))]
+    fn epoch_stamp(identity: FileIdentity) -> super::super::payload::recovery::FileStamp {
+        super::super::payload::recovery::FileStamp {
+            volume: identity.volume,
+            file: identity.file,
+        }
+    }
+    #[cfg(not(test))]
+    fn epoch_hash(bytes: &[u8]) -> [u8; 32] {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+        let mut result = [0; 32];
+        result.copy_from_slice(digest.as_ref());
+        result
+    }
+    #[cfg(not(test))]
+    fn read_archive_intent(
+        io: &WindowsNativeIo,
+        proof: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<Option<super::epoch_archive::ArchiveIntent>> {
+        io.read_record(
+            proof,
+            records::RecordName::SupervisorArchiveIntent,
+            files::MAX_RECORD_BYTES,
+            deadline,
+        )?
+        .map(|record| {
+            let value: super::epoch_archive::ArchiveIntent = records::record_data(
+                &records::RecordName::SupervisorArchiveIntent,
+                record.bytes(),
+            )?;
+            value.validate()?;
+            Ok(value)
+        })
+        .transpose()
+    }
+    #[cfg(not(test))]
+    fn publish_archive_intent(
+        io: &WindowsNativeIo,
+        proof: &SupportProof,
+        lock: &InstallerLock,
+        intent: &super::epoch_archive::ArchiveIntent,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        intent.validate()?;
+        let bytes = records::encode_record(
+            &records::RecordName::SupervisorArchiveIntent,
+            serde_json::to_value(intent).map_err(|_| NativeError::Invalid)?,
+        )?;
+        let result = io.publish_record(
+            proof,
+            lock,
+            records::RecordName::SupervisorArchiveIntent,
+            &bytes,
+            deadline,
+        )?;
+        if result.native_failure.is_some()
+            || result.state != records::PublicationRecovery::NewPublished
+        {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    struct NativeEpochArchive<'a> {
+        io: &'a Arc<WindowsNativeIo>,
+        proof: &'a SupportProof,
+        lock: &'a InstallerLock,
+        namespace: &'a Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
+        permit: &'a Arc<super::super::service::task::TaskRunPermit>,
+        prior: &'a super::super::service::journal::Journal,
+        source: &'a records::ObservedRecord,
+        intent: &'a mut super::epoch_archive::ArchiveIntent,
+        deadline: &'a Deadline,
+    }
+    #[cfg(not(test))]
+    impl NativeEpochArchive<'_> {
+        fn renew(&self) -> NativeResult<()> {
+            self.permit.reverify(self.io, self.proof, self.deadline)?;
+            self.namespace
+                .reverify(self.io, self.proof, self.deadline)?;
+            self.io
+                .verify_stop_lock(self.proof, self.lock, self.deadline)
+        }
+    }
+    #[cfg(not(test))]
+    impl super::epoch_archive::ArchivePort for NativeEpochArchive<'_> {
+        fn persist(&mut self, phase: super::epoch_archive::ArchivePhase) -> NativeResult<()> {
+            self.renew()?;
+            self.intent.phase = phase;
+            publish_archive_intent(self.io, self.proof, self.lock, self.intent, self.deadline)
+        }
+        fn prune(&mut self) -> NativeResult<()> {
+            self.renew()?;
+            let context = self.io.context.clone();
+            let held = self.lock.0.clone();
+            let budget = self.proof.budget(self.io, self.deadline)?;
+            let expected = epoch_identity(self.intent.victim.ok_or(NativeError::Foreign)?);
+            let name = records::RecordName::SupervisorEpoch(self.intent.slot).file_name()?;
+            let owner = self.io.owner.clone();
+            self.io
+                .owner
+                .run(Dispatch::Mutation, self.deadline, move || {
+                    let change = Change::new();
+                    let result = change.finish((|| {
+                        context.validate(&budget)?;
+                        validate_payload_lock(&context, &held, &budget)?;
+                        change.reached();
+                        held.parent.delete_private_record(
+                            &name,
+                            expected,
+                            &context.security,
+                            &budget,
+                        )
+                    })());
+                    if result == Err(NativeError::OutcomeUnknown) {
+                        owner.retire_mutations();
+                    }
+                    result
+                })
+        }
+        fn move_current(&mut self) -> NativeResult<()> {
+            self.renew()?;
+            let selected = super::super::payload::recovery::selected_operation(
+                self.io,
+                self.proof,
+                self.deadline,
+            )?;
+            let fresh = self
+                .io
+                .read_record(
+                    self.proof,
+                    records::RecordName::Supervisor,
+                    files::MAX_RECORD_BYTES,
+                    self.deadline,
+                )?
+                .ok_or(NativeError::Foreign)?;
+            if fresh.identity != self.source.identity || fresh.bytes() != self.source.bytes() {
+                return Err(NativeError::Foreign);
+            }
+            let renewed = super::activation::correlate_upgrade(
+                self.permit.operation(),
+                self.permit.user(),
+                selected.as_ref(),
+                Some(self.prior),
+            )?
+            .ok_or(NativeError::Foreign)?;
+            if !renewed.matches_predecessor(self.prior) {
+                return Err(NativeError::Foreign);
+            }
+            let context = self.io.context.clone();
+            let held = self.lock.0.clone();
+            let budget = self.proof.budget(self.io, self.deadline)?;
+            let expected = self.source.identity;
+            let target = records::RecordName::SupervisorEpoch(self.intent.slot).file_name()?;
+            let owner = self.io.owner.clone();
+            self.io
+                .owner
+                .run(Dispatch::Mutation, self.deadline, move || {
+                    let change = Change::new();
+                    let result = change.finish((|| {
+                        context.validate(&budget)?;
+                        validate_payload_lock(&context, &held, &budget)?;
+                        let parent = &held.parent;
+                        let source = parent
+                            .opaque("supervisor.json", false, &context.security, &budget)?
+                            .ok_or(NativeError::Foreign)?;
+                        if source.identity != expected {
+                            return Err(NativeError::Foreign);
+                        }
+                        change.reached();
+                        let identity = parent.move_opaque(
+                            source,
+                            parent,
+                            target.as_str(),
+                            &context.security,
+                            &budget,
+                        )?;
+                        if identity != expected
+                            || parent
+                                .opaque("supervisor.json", false, &context.security, &budget)?
+                                .is_some()
+                        {
+                            return Err(NativeError::OutcomeUnknown);
+                        }
+                        Ok(())
+                    })());
+                    if result == Err(NativeError::OutcomeUnknown) {
+                        owner.retire_mutations();
+                    }
+                    result
+                })
+        }
+        fn observe_complete(&mut self) -> NativeResult<()> {
+            self.renew()?;
+            let target = self
+                .io
+                .read_record(
+                    self.proof,
+                    records::RecordName::SupervisorEpoch(self.intent.slot),
+                    files::MAX_RECORD_BYTES,
+                    self.deadline,
+                )?
+                .ok_or(NativeError::OutcomeUnknown)?;
+            if target.identity != self.source.identity
+                || target.bytes() != self.source.bytes()
+                || self
+                    .io
+                    .read_record(
+                        self.proof,
+                        records::RecordName::Supervisor,
+                        files::MAX_RECORD_BYTES,
+                        self.deadline,
+                    )?
+                    .is_some()
+            {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    #[test]
+    fn epoch_archive_actual_change_guard_classifies_shortened_budget_after_effect_unknown() {
+        // Pure error classification only: no Context, native owner, path or OS call is opened.
+        let before = Change::new();
+        assert_eq!(
+            before.finish::<()>(Err(NativeError::Timeout)),
+            Err(NativeError::Timeout)
+        );
+        let after = Change::new();
+        after.reached();
+        assert_eq!(
+            after.finish::<()>(Err(NativeError::Timeout)),
+            Err(NativeError::OutcomeUnknown)
+        );
+        assert_eq!(
+            after.finish::<()>(Err(NativeError::Unavailable)),
+            Err(NativeError::OutcomeUnknown)
+        );
+    }
     /// Read-only sealed observations, bound to the genuine target context. Non-Clone/non-Copy.
     /// The pinned fixed image leaf is not a queried loaded-section FileId (W4.1a2 ruling).
     pub(crate) struct AgentObservation(Arc<AgentObservationData>);
@@ -2140,6 +2822,345 @@ mod adapter {
                     Ok(facts.identity)
                 })())
             })
+        }
+        // Additive private bridges preserve every A1/A2 constructor and original capability.
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        fn verify_stop_lock(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.lock_binding(proof, lock, deadline)?;
+            let budget = proof.budget(self, deadline)?;
+            let context = self.context.clone();
+            let lease = lock.0.clone();
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                validate_payload_lock(&context, &lease, &budget)
+            })
+        }
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn lease_stop_lock(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<StopLockLease>> {
+            self.verify_stop_lock(proof, lock, deadline)?;
+            Ok(Arc::new(StopLockLease {
+                io: self.clone(),
+                lock: InstallerLock(lock.0.clone()),
+            }))
+        }
+
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn bridge_nonce(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<[u8; 16]> {
+            proof.check(self, deadline)?;
+            Ok(self.context.target.nonce)
+        }
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn bound_clock(&self) -> Arc<dyn Clock> {
+            self.clock.clone()
+        }
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn own_process_identity(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<process::own::OwnProcessIdentity> {
+            let budget = proof.budget(self, deadline)?;
+            let context = self.context.clone();
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                process::own::OwnProcessIdentity::current(&context.target.identity, &budget)
+            })
+        }
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn prepare_supervisor(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            agent: &OpenedPe,
+            root: &PayloadRoot,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<jobs::SupervisorOwner>> {
+            let admission = JobAdmission {
+                io: self.clone(),
+                agent: OpenedPe(agent.0.clone()),
+                root: PayloadRoot(root.0.clone()),
+            };
+            admission.reverify(proof, deadline)?;
+            jobs::SupervisorOwner::prepare(admission, proof, deadline)
+        }
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn clone_agent(
+            &self,
+            agent: &AgentObservation,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<AgentObservation> {
+            proof.check(self, deadline)?;
+            if agent.0.target != self.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            Ok(AgentObservation(agent.0.clone()))
+        }
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn agent_identity(
+            &self,
+            agent: &AgentObservation,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            if agent.0.target != self.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            let budget = proof.budget(self, deadline)?;
+            let context = self.context.clone();
+            let observed = agent.0.clone();
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                observed.validate_pins(&context, &budget)?;
+                Ok(observed.image_identity)
+            })
+        }
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn agent_generation(
+            &self,
+            agent: &AgentObservation,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<super::super::service::supervisor::Generation> {
+            proof.check(self, deadline)?;
+            if agent.0.target != self.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            Ok(super::super::service::supervisor::Generation {
+                pid: agent.0.bootstrap.pid,
+                creation: agent.0.process.creation_time(),
+                instance: agent.0.bootstrap.instance_id,
+            })
+        }
+        // Exact new bridge: native production callers are excluded from lib-test roots.
+        #[cfg_attr(test, allow(dead_code))]
+        pub(crate) fn broker_admission(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<BrokerAdmission>> {
+            let budget = proof.budget(self, deadline)?;
+            let context = self.context.clone();
+            let io = self.clone();
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                let parent = Arc::new(
+                    Anchor::open(
+                        &format!("{}\\Crosspane", context.target.paths.local()),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?,
+                );
+                let expected_runtime = format!(
+                    "{}\\runtime",
+                    parent
+                        .canonical_dos_path(&context.security, &budget)?
+                        .to_str()
+                        .ok_or(NativeError::Unsupported)?
+                );
+                let runtime = Anchor::open(&expected_runtime, &context.security, true, &budget)?
+                    .map(Arc::new);
+                let install = Arc::new(
+                    Anchor::open(
+                        context.target.paths.install(),
+                        &context.security,
+                        false,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?,
+                );
+                let canonical = &expected_runtime;
+                let (installer, installer_identity) = install.open_file_metadata(
+                    &PrivateName::new("crosspane-installer.exe")?,
+                    &context.security,
+                    &budget,
+                )?;
+                let installer_path = format!(
+                    "{}\\crosspane-installer.exe",
+                    install
+                        .canonical_dos_path(&context.security, &budget)?
+                        .to_str()
+                        .ok_or(NativeError::Unsupported)?
+                );
+                let mut key = canonical.as_bytes().to_vec();
+                key.extend_from_slice(context.target.identity.user.bytes());
+                key.extend_from_slice(context.target.identity.logon.bytes());
+                key.extend_from_slice(&context.target.identity.session.to_le_bytes());
+                let endpoint = format!(
+                    r"\\.\pipe\Crosspane.Installer.Supervisor.{:016x}",
+                    xxhash_rust::xxh3::xxh3_64(&key)
+                );
+                Ok(Arc::new(BrokerAdmission {
+                    io,
+                    runtime: Mutex::new(runtime),
+                    parent,
+                    expected_runtime,
+                    install,
+                    installer: Mutex::new(Some(Arc::new(installer))),
+                    installer_identity,
+                    installer_path,
+                    endpoint,
+                }))
+            })
+        }
+
+        #[cfg(not(test))]
+        pub(crate) fn prepare_supervisor_epoch(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &Arc<super::super::service::task::TaskRunPermit>,
+            owner: &Arc<super::jobs::SupervisorOwner>,
+            deadline: &Deadline,
+        ) -> NativeResult<OwnedArchiveResult> {
+            self.verify_stop_lock(proof, lock, deadline)?;
+            permit.reverify(self, proof, deadline)?;
+            let namespace = owner.exclusive_lease(proof, deadline)?;
+            namespace.reverify(self, proof, deadline)?;
+            let source = self.read_record(
+                proof,
+                records::RecordName::Supervisor,
+                files::MAX_RECORD_BYTES,
+                deadline,
+            )?;
+            let pending = read_archive_intent(self, proof, deadline)?;
+            if let Some(previous) = &pending {
+                // An interrupted intent is never retried from history. A completed older intent
+                // may be superseded only after its immutable actual archive is freshly matched.
+                previous.require_complete()?;
+                let target = self
+                    .read_record(
+                        proof,
+                        records::RecordName::SupervisorEpoch(previous.slot),
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                if target.identity != epoch_identity(previous.source)
+                    || epoch_hash(target.bytes()) != previous.sha256
+                {
+                    return Err(NativeError::Foreign);
+                }
+                super::super::service::journal::Journal::decode(target.bytes())?;
+            }
+            let selected =
+                super::super::payload::recovery::selected_operation(self, proof, deadline)?;
+            let Some(source) = source else {
+                if pending.is_some() || selected.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+                let result = OwnedArchiveResult::First(FirstSupervisorEpoch {
+                    io: self.clone(),
+                    namespace,
+                    permit: permit.clone(),
+                });
+                result.reverify(self, proof, lock, permit, owner, deadline)?;
+                return Ok(result);
+            };
+            let prior = super::super::service::journal::Journal::decode(source.bytes())?;
+            let lineage = super::activation::correlate_upgrade(
+                permit.operation(),
+                permit.user(),
+                selected.as_ref(),
+                Some(&prior),
+            )?
+            .ok_or(NativeError::Foreign)?;
+            self.archive_supervisor_epoch(
+                proof, lock, namespace, permit, &lineage, &prior, source, deadline,
+            )
+        }
+        #[cfg(not(test))]
+        // Independent admitted IO/lock/namespace/claim/lineage/source/deadline capabilities
+        // remain explicit; grouping them would obscure the frozen authority boundaries.
+        #[allow(clippy::too_many_arguments)]
+        fn archive_supervisor_epoch(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            namespace: Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
+            permit: &Arc<super::super::service::task::TaskRunPermit>,
+            lineage: &super::activation::UpgradeLineage,
+            prior: &super::super::service::journal::Journal,
+            source: records::ObservedRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<OwnedArchiveResult> {
+            use super::epoch_archive::{ArchiveIntent, ArchivePhase};
+            if !lineage.matches_predecessor(prior) || lineage.operation() != permit.operation() {
+                return Err(NativeError::Foreign);
+            }
+            let mut slots: [Option<super::super::service::journal::Journal>; 3] =
+                [None, None, None];
+            let mut identities = [None, None, None];
+            for slot in 0..3 {
+                if let Some(record) = self.read_record(
+                    proof,
+                    records::RecordName::SupervisorEpoch(slot as u8),
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )? {
+                    slots[slot] = Some(super::super::service::journal::Journal::decode(
+                        record.bytes(),
+                    )?);
+                    identities[slot] = Some(epoch_stamp(record.identity));
+                }
+            }
+            let (slot, prune) = super::epoch_archive::select_slot(&slots)?;
+            let mut intent = ArchiveIntent {
+                schema_version: 1,
+                operation: permit.operation(),
+                owner_creation: permit.owner_identity().creation(),
+                slot,
+                source: epoch_stamp(source.identity),
+                sha256: epoch_hash(source.bytes()),
+                victim: identities[usize::from(slot)],
+                phase: if prune {
+                    ArchivePhase::PruneIntent
+                } else {
+                    ArchivePhase::MoveIntent
+                },
+            };
+            let mut driver = NativeEpochArchive {
+                io: self,
+                proof,
+                lock,
+                namespace: &namespace,
+                permit,
+                prior,
+                source: &source,
+                intent: &mut intent,
+                deadline,
+            };
+            super::epoch_archive::ArchiveSequence::default().run_once(&mut driver, prune)?;
+            Ok(OwnedArchiveResult::Archived(ArchivedSupervisorEpoch {
+                io: self.clone(),
+                namespace,
+                permit: permit.clone(),
+                intent,
+                bytes: source.bytes().to_vec(),
+            }))
         }
         pub fn native_idle(&self) -> bool {
             self.owner.idle()

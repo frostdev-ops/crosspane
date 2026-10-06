@@ -544,6 +544,7 @@ pub(crate) use native::{
 };
 
 #[cfg(windows)]
+#[allow(dead_code)] // The frozen borrowed helper API stays available but cannot release a caller's lock.
 pub(crate) fn resume_helper(
     io: std::sync::Arc<super::super::native_io::WindowsNativeIo>,
     proof: &super::super::native_io::SupportProof,
@@ -552,6 +553,40 @@ pub(crate) fn resume_helper(
     parent: &super::helper::ParentExited,
     deadline: &super::super::native_io::Deadline,
 ) -> NativeResult<RecoveryDecision> {
+    let (payload, mut operation) =
+        prepare_helper_resume(io.clone(), proof, lock, operation, parent, deadline)?;
+    let mut service = super::super::service::NativeUpgradePort::new();
+    service.bind_io(io, deadline)?;
+    // Parent exit proves only the installer copy's exit, never the old supervisor/job tree.
+    payload.recover(&mut service, lock, &mut operation, Vec::new(), deadline)
+}
+
+/// Internal entry consumes the actual lock held by HelperEntryPort, preserving its signatures.
+#[cfg(windows)]
+pub(crate) fn resume_helper_owned(
+    io: std::sync::Arc<super::super::native_io::WindowsNativeIo>,
+    proof: &super::super::native_io::SupportProof,
+    lock: super::super::native_io::InstallerLock,
+    operation: OperationRecord,
+    parent: &super::helper::ParentExited,
+    deadline: &super::super::native_io::Deadline,
+) -> NativeResult<RecoveryDecision> {
+    let (payload, mut operation) =
+        prepare_helper_resume(io, proof, &lock, operation, parent, deadline)?;
+    let mut service = super::super::service::NativeUpgradePort::new();
+    // Cold helper recovery cannot rebuild a lost original-owner capability from ParentExited.
+    payload.recover_owned(&mut service, lock, &mut operation, Vec::new(), deadline)
+}
+
+#[cfg(windows)]
+fn prepare_helper_resume(
+    io: std::sync::Arc<super::super::native_io::WindowsNativeIo>,
+    proof: &super::super::native_io::SupportProof,
+    lock: &super::super::native_io::InstallerLock,
+    operation: OperationRecord,
+    parent: &super::helper::ParentExited,
+    deadline: &super::super::native_io::Deadline,
+) -> NativeResult<(super::WindowsPayload, OperationRecord)> {
     if parent.operation() != operation.operation() {
         return Err(NativeError::Foreign);
     }
@@ -573,10 +608,7 @@ pub(crate) fn resume_helper(
     let mut operation = operation;
     operation.set_phase(Phase::ParentExited);
     save_operation(io, proof, lock, &operation, deadline)?;
-    let mut service = super::super::service::NativeUpgradePort::new();
-    // Parent exit proves only this installer copy is released. The actual recovery executor
-    // asks for fresh old-owner proof; a4's production factory returns Unsupported without effects.
-    payload.recover(&mut service, lock, &mut operation, Vec::new(), deadline)
+    Ok((payload, operation))
 }
 
 /// Read-only observations select a recovery branch. The port retains fresh native capabilities;

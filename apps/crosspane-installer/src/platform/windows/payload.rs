@@ -10,12 +10,61 @@ pub(crate) mod recovery;
 #[path = "payload/staging.rs"]
 pub(crate) mod staging;
 
+/// Actual owned-lock boundary, shared with focused fakes. It has no native authority factory.
+#[cfg(any(windows, test))]
+#[allow(dead_code)] // Older source-included test roots compile but do not execute this new boundary.
+pub(crate) enum LockHandoff<'a, L> {
+    Borrowed(&'a L),
+    Owned(Option<L>),
+}
+#[cfg(any(windows, test))]
+#[allow(dead_code)]
+impl<L> LockHandoff<'_, L> {
+    pub(crate) fn get(&self) -> super::native_io::NativeResult<&L> {
+        match self {
+            Self::Borrowed(lock) => Ok(lock),
+            Self::Owned(lock) => lock
+                .as_ref()
+                .ok_or(super::native_io::NativeError::OutcomeUnknown),
+        }
+    }
+    /// Caller validates its durable selection and native idle state before entering. A failed
+    /// effect/reentry cannot restore an old permit or run again through this consumed boundary.
+    pub(crate) fn run_once<P, S>(
+        &mut self,
+        permit: &mut Option<P>,
+        native_idle: bool,
+        effect: impl FnOnce() -> super::native_io::NativeResult<S>,
+        reenter: impl FnOnce() -> super::native_io::NativeResult<(L, P)>,
+    ) -> super::native_io::NativeResult<S> {
+        use super::native_io::NativeError;
+        if !native_idle {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        let Self::Owned(lock) = self else {
+            return Err(NativeError::Unsupported);
+        };
+        if permit.is_none() {
+            return Err(NativeError::Foreign);
+        }
+        let owned = lock.take().ok_or(NativeError::OutcomeUnknown)?;
+        *permit = None;
+        drop(owned);
+        let started = effect()?;
+        let (fresh_lock, fresh_permit) = reenter()?;
+        *self = Self::Owned(Some(fresh_lock));
+        *permit = Some(fresh_permit);
+        Ok(started)
+    }
+}
+
 #[cfg(windows)]
 mod native {
     use super::super::native_io::{
         Deadline, InstallerLock, NativeError, NativeResult, OpenedPe, PayloadRoot, PruneOutcome,
         SelfImagePin, StagedPe, SupportProof, WindowsNativeIo,
     };
+    use super::LockHandoff;
     use super::{
         health::{ServicePort, VerifiedPayload},
         inventory::{ApprovedInventory, ApprovedPe, PayloadRole},
@@ -78,7 +127,7 @@ mod native {
             let mut port = NativePayloadPort {
                 payload: self,
                 service,
-                lock,
+                lock: LockHandoff::Borrowed(lock),
                 deadline,
                 inputs,
                 permit: None,
@@ -105,7 +154,68 @@ mod native {
             let mut port = NativePayloadPort {
                 payload: self,
                 service,
-                lock,
+                lock: LockHandoff::Borrowed(lock),
+                deadline,
+                inputs,
+                permit: None,
+                staged: Vec::new(),
+                published: Vec::new(),
+                stop: None,
+            };
+            recovery::resume(&mut port, record)
+        }
+        /// The caller transfers the actual installer lock. No borrowed-lock path may Run.
+        #[allow(dead_code)] // The installer apply UI is supplied by the next integration package.
+        pub(crate) fn apply_owned(
+            &self,
+            service: &mut super::super::service::NativeUpgradePort,
+            lock: InstallerLock,
+            record: &mut OperationRecord,
+            inputs: Vec<PayloadInput>,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if inputs.len() != 3
+                || [PayloadRole::Agent, PayloadRole::Ui, PayloadRole::Ctl]
+                    .iter()
+                    .any(|role| inputs.iter().filter(|input| input.role == *role).count() != 1)
+            {
+                return Err(NativeError::Invalid);
+            }
+            service.bind_io(self.io.clone(), deadline)?;
+            service.bind_stop_lock(&lock, deadline)?;
+            let mut port = NativePayloadPort {
+                payload: self,
+                service,
+                lock: LockHandoff::Owned(Some(lock)),
+                deadline,
+                inputs,
+                permit: None,
+                staged: Vec::new(),
+                published: Vec::new(),
+                stop: None,
+            };
+            super::staging::apply(&mut port, record)
+        }
+        /// Recovery keeps Stop and Run observational and owns any lock handoff at StartIntent.
+        pub(crate) fn recover_owned(
+            &self,
+            service: &mut super::super::service::NativeUpgradePort,
+            lock: InstallerLock,
+            record: &mut OperationRecord,
+            inputs: Vec<PayloadInput>,
+            deadline: &Deadline,
+        ) -> NativeResult<recovery::RecoveryDecision> {
+            if inputs.iter().enumerate().any(|(i, input)| {
+                input.role == PayloadRole::Installer
+                    || inputs[..i].iter().any(|old| old.role == input.role)
+            }) {
+                return Err(NativeError::Invalid);
+            }
+            service.bind_io(self.io.clone(), deadline)?;
+            let mut port = NativePayloadPort {
+                payload: self,
+                service,
+                lock: LockHandoff::Owned(Some(lock)),
                 deadline,
                 inputs,
                 permit: None,
@@ -131,7 +241,7 @@ mod native {
     struct NativePayloadPort<'a, S> {
         payload: &'a WindowsPayload,
         service: &'a mut S,
-        lock: &'a InstallerLock,
+        lock: LockHandoff<'a, InstallerLock>,
         deadline: &'a Deadline,
         inputs: Vec<PayloadInput>,
         permit: Option<MutationPermit>,
@@ -156,7 +266,7 @@ mod native {
             self.permit = Some(recovery::save_operation(
                 self.payload.io.clone(),
                 &proof,
-                self.lock,
+                self.lock.get()?,
                 record,
                 self.deadline,
             )?);
@@ -182,7 +292,7 @@ mod native {
             let release = self.payload.root.prove_released(
                 &self.payload.io,
                 &proof,
-                self.lock,
+                self.lock.get()?,
                 stop.operation(),
                 self.deadline,
             )?;
@@ -217,7 +327,7 @@ mod native {
             let staged = self.payload.root.stage(
                 &self.payload.io,
                 &proof,
-                self.lock,
+                self.lock.get()?,
                 self.permit()?,
                 role,
                 content,
@@ -261,7 +371,7 @@ mod native {
             let id = self.payload.root.backup(
                 &self.payload.io,
                 &proof,
-                self.lock,
+                self.lock.get()?,
                 self.permit()?,
                 observed,
                 self.deadline,
@@ -286,7 +396,7 @@ mod native {
             let image = self.payload.root.publish(
                 &self.payload.io,
                 &proof,
-                self.lock,
+                self.lock.get()?,
                 self.permit()?,
                 staged,
                 self.deadline,
@@ -317,10 +427,58 @@ mod native {
         ) -> NativeResult<Self::Started> {
             let proof = self.proof()?;
             verified.reverify(&self.payload.io, &proof, self.deadline)?;
-            if self.permit()?.phase() != Phase::StartIntent {
+            if self.permit()?.phase() != Phase::StartIntent
+                || self.permit()?.operation() != operation
+                || verified.operation() != operation
+            {
                 return Err(NativeError::Foreign);
             }
-            self.service.start_once(operation, verified)
+            let before = recovery::selected_operation(&self.payload.io, &proof, self.deadline)?
+                .ok_or(NativeError::Missing)?;
+            if before.operation() != operation || before.phase() != Phase::StartIntent {
+                return Err(NativeError::Foreign);
+            }
+            let selected = serde_json::to_value(&before).map_err(|_| NativeError::Invalid)?;
+            let encoded = super::super::native_io::records::encode_record(
+                &super::super::native_io::records::RecordName::Operation(operation),
+                selected.clone(),
+            )?;
+            if self.permit()?.bytes() != encoded {
+                return Err(NativeError::Foreign);
+            }
+            // The fixed-image constructor and the new supervisor acquire the same lock. Release
+            // only our actual owned lock, with no outstanding IO call or mutation permit.
+            let payload = self.payload;
+            let deadline = self.deadline;
+            let service = &mut *self.service;
+            self.lock.run_once(
+                &mut self.permit,
+                payload.io.native_idle(),
+                || service.start_once(operation, verified),
+                || {
+                    // A timeout or an unknown Run leaves StartIntent durable; reentry is not run.
+                    // Fresh support/lock/record/image admission precedes later publications.
+                    let proof = payload.io.admit_support(deadline)?;
+                    let acquired = payload.io.acquire_installer_lock(&proof, deadline)?;
+                    let proof = payload.io.admit_support(deadline)?;
+                    let after = recovery::selected_operation(&payload.io, &proof, deadline)?
+                        .ok_or(NativeError::Missing)?;
+                    if serde_json::to_value(&after).map_err(|_| NativeError::Invalid)? != selected {
+                        return Err(NativeError::Foreign);
+                    }
+                    let _root = payload.io.payload_root(&proof, &acquired, deadline)?;
+                    verified.reverify(&payload.io, &proof, deadline)?;
+                    let proof = payload.io.admit_support(deadline)?;
+                    let fresh_permit = recovery::save_operation(
+                        payload.io.clone(),
+                        &proof,
+                        &acquired,
+                        &after,
+                        deadline,
+                    )?;
+                    Ok((acquired, fresh_permit))
+                },
+            )
         }
         fn health(
             &mut self,
@@ -350,7 +508,7 @@ mod native {
                 match self.payload.root.prune(
                     &self.payload.io,
                     &proof,
-                    self.lock,
+                    self.lock.get()?,
                     self.permit()?,
                     old,
                     self.deadline,
@@ -359,7 +517,7 @@ mod native {
                         let proof = self.proof()?;
                         self.payload.io.retire_pruned(
                             &proof,
-                            self.lock,
+                            self.lock.get()?,
                             self.permit()?,
                             pruned,
                             self.deadline,
@@ -529,7 +687,7 @@ mod native {
             self.payload.root.settle_stage(
                 &self.payload.io,
                 &proof,
-                self.lock,
+                self.lock.get()?,
                 self.permit()?,
                 stage,
                 self.deadline,
@@ -544,7 +702,7 @@ mod native {
             self.payload.root.rollback_stage(
                 &self.payload.io,
                 &proof,
-                self.lock,
+                self.lock.get()?,
                 self.permit()?,
                 &self.payload.inventory,
                 &self.payload.installer,
@@ -560,4 +718,6 @@ pub(crate) use native::PayloadInput;
 #[cfg(windows)]
 pub(crate) use native::WindowsPayload;
 #[cfg(windows)]
+#[allow(unused_imports)]
+// Keep the frozen borrowed helper re-export; native entry transfers its owned lock.
 pub(crate) use recovery::resume_helper;

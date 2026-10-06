@@ -1420,6 +1420,63 @@ pub(crate) mod native {
             self.revalidate(security, true, deadline)?;
             entries(self.file()?, deadline)
         }
+        /// Delete ONLY the selected fixed supervisor archive record, on its freshly admitted
+        /// exact DELETE handle. The caller already persisted ArchiveIntent under the real lock.
+        // Only the new native epoch adapter consumes this; production entry is cfg(not(test)).
+        #[cfg_attr(test, allow(dead_code, unused_imports))]
+        pub(crate) fn delete_private_record(
+            &self,
+            name: &PrivateName,
+            expected: FileIdentity,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !matches!(
+                name.as_str(),
+                "supervisor-epoch-0.json" | "supervisor-epoch-1.json" | "supervisor-epoch-2.json"
+            ) {
+                return Err(NativeError::Foreign);
+            }
+            self.revalidate(security, true, deadline)?;
+            // Strict File admission adds READ_CONTROL_ACCESS for the owner/DACL query,
+            // unlike the deliberately opaque old-leaf adapter. Generic opaque behavior stays.
+            let source = open_component(
+                self.file()?,
+                &ComponentName::new(name.as_str())?,
+                ObjectKind::File,
+                super::DELETE,
+                0,
+                deadline,
+            )?
+            .ok_or(NativeError::Foreign)?;
+            let facts = observe(&source, name.as_str(), security)?;
+            super::admit_component(&facts, super::Admission::PrivateFile)?;
+            if facts.identity != expected {
+                return Err(NativeError::Foreign);
+            }
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            deadline.check()?;
+            // SAFETY: this is the exact private non-reparse record with expected FileId, opened
+            // relative with DELETE/no-follow. No name reopening or target-following for the effect.
+            if unsafe {
+                SetFileInformationByHandle(
+                    source.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            // DeletePending is NOT completion: settle this exact handle before positive absence.
+            drop(source);
+            deadline.check()?;
+            match self.opaque(name.as_str(), false, security, deadline)? {
+                None => Ok(()),
+                Some(_) => Err(NativeError::OutcomeUnknown),
+            }
+        }
         /// Bounded no-follow deletion, only below a completed fixed backup-generation handle.
         pub(crate) fn prune_tree(
             &self,
