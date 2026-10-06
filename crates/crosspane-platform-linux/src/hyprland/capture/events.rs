@@ -1,7 +1,7 @@
 //! Private in-process datagrams: no allocator or shared queue locks on the abort delivery path.
 use crosspane_platform::{CaptureEvent, CaptureId, EndReason, MotionKind, PortalId};
 use crosspane_types::{
-    geom::{PointDevice, VectorLogical},
+    geom::{PixelSize, PointDevice, VectorLogical},
     hid::{HidUsage, MouseButton},
     id::{DisplayId, WindowId},
     input::{LockKeys, ScrollDelta, ScrollPhase},
@@ -163,6 +163,25 @@ pub(super) fn encode(epoch: u64, generation: u64, event: &CaptureEvent) -> Optio
             w[7] = grab.y.to_bits();
             w[8] = at.as_nanos();
         }
+        CaptureEvent::NativeMove {
+            window,
+            grab,
+            size,
+            at,
+        } => {
+            w[0] = 14;
+            w[3] = window.0;
+            w[4] = grab.x.to_bits();
+            w[5] = grab.y.to_bits();
+            w[6] = u64::from(size.width);
+            w[7] = u64::from(size.height);
+            w[8] = at.as_nanos();
+        }
+        CaptureEvent::NativeMoveEnded { window, at } => {
+            w[0] = 15;
+            w[3] = window.0;
+            w[4] = at.as_nanos();
+        }
         _ => return None,
     }
     Some(bytes(w))
@@ -265,6 +284,16 @@ pub(super) fn decode(b: &[u8; SIZE]) -> Option<Packet> {
             grab: PointDevice::new(f(6), f(7)),
             at: at(8),
         },
+        14 => CaptureEvent::NativeMove {
+            window: WindowId(w[3]),
+            grab: PointDevice::new(f(4), f(5)),
+            size: PixelSize::new(w[6] as u32, w[7] as u32),
+            at: at(8),
+        },
+        15 => CaptureEvent::NativeMoveEnded {
+            window: WindowId(w[3]),
+            at: at(4),
+        },
         _ => return None,
     };
     Some(Packet::Event {
@@ -277,6 +306,32 @@ pub(super) fn decode(b: &[u8; SIZE]) -> Option<Packet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_move_packets_round_trip_epoch_geometry_and_end() {
+        for event in [
+            CaptureEvent::NativeMove {
+                window: WindowId(u64::MAX),
+                grab: PointDevice::new(120.5, -45.25),
+                size: PixelSize::new(u32::MAX, 937),
+                at: MonoTime::from_nanos(12345),
+            },
+            CaptureEvent::NativeMoveEnded {
+                window: WindowId(u64::MAX),
+                at: MonoTime::from_nanos(67890),
+            },
+        ] {
+            let Packet::Event {
+                epoch,
+                generation,
+                event: decoded,
+            } = decode(&encode(5, 9, &event).unwrap()).unwrap()
+            else {
+                panic!("wrong packet")
+            };
+            assert_eq!((epoch, generation, decoded), (5, 9, event));
+        }
+    }
 
     #[test]
     fn native_drag_packet_keeps_epoch_generation_window_and_device_grab() {

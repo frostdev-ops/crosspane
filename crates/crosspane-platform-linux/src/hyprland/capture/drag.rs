@@ -1,7 +1,11 @@
 //! Native-move samples; the Wayland worker alone publishes events and owns capture activation.
 use super::{Abort, Source, backend, wayland::Monitor};
-use crosspane_platform::{CapturePortal, Edge, IoGate, PlatformError, PortalId};
-use crosspane_types::{geom::PointDevice, id::WindowId, time::MonoTime};
+use crosspane_platform::{CaptureEvent, CapturePortal, Edge, IoGate, PlatformError, PortalId};
+use crosspane_types::{
+    geom::{PixelSize, PointDevice},
+    id::{DisplayId, WindowId},
+    time::MonoTime,
+};
 use serde_json::Value;
 use std::{
     sync::{Arc, Condvar, Mutex, atomic::Ordering},
@@ -13,6 +17,7 @@ use std::{
 pub(super) struct Sample {
     pub window: WindowId,
     pub workspace: Value,
+    display: Option<DisplayId>,
     origin: [f64; 2],
     size: [f64; 2],
     pub cursor: [f64; 2],
@@ -41,12 +46,45 @@ impl Sample {
         Some(Self {
             window,
             workspace: client["workspace"].clone(),
+            display: client["monitor"]
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .map(DisplayId),
             origin,
             size,
             cursor,
             at: super::wayland::now(),
             received: Instant::now(),
         })
+    }
+    /// Device pixels from the client's own monitor, independently of any portal.
+    pub fn native_geometry(&self, monitors: &[Monitor]) -> Option<(PointDevice, PixelSize)> {
+        let display = self.display?;
+        let mut matching = monitors.iter().filter(|m| m.id == display);
+        let monitor = matching.next()?;
+        if matching.next().is_some() || !monitor.scale.is_finite() || monitor.scale <= 0.0 {
+            return None;
+        }
+        let size = self.size.map(|size| (size * monitor.scale).round());
+        let grab = PointDevice::new(
+            (self.cursor[0] - self.origin[0]) * monitor.scale,
+            (self.cursor[1] - self.origin[1]) * monitor.scale,
+        );
+        (size
+            .iter()
+            .all(|size| size.is_finite() && *size >= 1.0 && *size <= f64::from(u32::MAX))
+            && grab.x.is_finite()
+            && grab.y.is_finite())
+        .then_some((grab, PixelSize::new(size[0] as u32, size[1] as u32)))
+    }
+    fn moves_with(&self, previous: &Self, moving: bool) -> bool {
+        self.same(previous)
+            && (0..2).all(|i| {
+                ((self.cursor[i] - self.origin[i]) - (previous.cursor[i] - previous.origin[i]))
+                    .abs()
+                    <= 1.0
+            })
+            && (moving || (0..2).any(|i| (self.cursor[i] - previous.cursor[i]).abs() >= 4.0))
     }
     fn same(&self, other: &Self) -> bool {
         self.window == other.window && self.workspace == other.workspace && self.size == other.size
@@ -85,19 +123,105 @@ fn location(
     (distance <= tolerance && (-padding..=1.0 + padding).contains(&position))
         .then_some((position, m.scale))
 }
-fn period(sample: Option<&Sample>, portals: &[CapturePortal], monitors: &[Monitor]) -> Duration {
+fn period(
+    sample: Option<&Sample>,
+    portals: &[CapturePortal],
+    monitors: &[Monitor],
+    moving: bool,
+) -> Duration {
     Duration::from_millis(
-        if sample.is_some_and(|s| {
-            portals
-                .iter()
-                .any(|p| location(s, p, monitors, 48.0).is_some())
-        }) {
+        if moving
+            || sample.is_some_and(|s| {
+                portals
+                    .iter()
+                    .any(|p| location(s, p, monitors, 48.0).is_some())
+            })
+        {
             20
         } else {
             100
         },
     )
 }
+/// Geometry facts have no first-miss tolerance. A stationary release is indistinguishable
+/// from a held stationary move: only incoherence/loss ends this latch (DRAG-v0b ruling).
+#[derive(Default)]
+pub(super) struct NativeDetector {
+    previous: Option<Sample>,
+    moving: Option<WindowId>,
+    published_sample: Option<MonoTime>,
+    published_observation: Option<MonoTime>,
+    reported_window: Option<WindowId>,
+}
+impl NativeDetector {
+    pub fn observe(&mut self, sample: Option<&Sample>) -> (Option<WindowId>, bool) {
+        let next = sample
+            .zip(self.previous.as_ref())
+            .filter(|(sample, previous)| sample.moves_with(previous, self.moving.is_some()))
+            .map(|(sample, _)| sample.window);
+        let ended = self.moving.filter(|window| Some(*window) != next);
+        self.moving = next;
+        self.previous = sample.cloned();
+        (ended, next.is_some())
+    }
+    /// Memory-only selection shared by polling and the strip-enter publication fence.
+    /// Every sample changes the latch, including a throttled repeat. Completed reads may
+    /// be closer than their start times; queued samples must not burst on one observation.
+    pub fn events(
+        &mut self,
+        sample: Option<&Sample>,
+        monitors: &[Monitor],
+        observed_at: MonoTime,
+    ) -> [Option<CaptureEvent>; 2] {
+        let geometry = sample.and_then(|sample| sample.native_geometry(monitors));
+        let (ended, moving) = self.observe(sample.filter(|_| geometry.is_some()));
+        // A geometric latch can restart while publication is throttled. Only a move
+        // actually reported to the consumer owes an end; loss/re-latch/loss in one batch
+        // must not produce a second end without an intervening published fact.
+        let ended = ended
+            .filter(|window| self.reported_window == Some(*window))
+            .map(|window| {
+                self.reported_window = None;
+                CaptureEvent::NativeMoveEnded {
+                    window,
+                    at: observed_at,
+                }
+            });
+        let due = |now: MonoTime, previous: Option<MonoTime>| {
+            previous.is_none_or(|previous| {
+                now.as_nanos()
+                    .checked_sub(previous.as_nanos())
+                    .is_some_and(|elapsed| elapsed >= 20_000_000)
+            })
+        };
+        let fact = if moving
+            && let (Some(sample), Some((grab, size))) = (sample, geometry)
+            && due(sample.at, self.published_sample)
+            && due(observed_at, self.published_observation)
+        {
+            // Keep these clocks across latch breaks: a new move cannot bypass the bound.
+            self.published_sample = Some(sample.at);
+            self.published_observation = Some(observed_at);
+            self.reported_window = Some(sample.window);
+            Some(CaptureEvent::NativeMove {
+                window: sample.window,
+                grab,
+                size,
+                at: sample.at,
+            })
+        } else {
+            None
+        };
+        [ended, fact]
+    }
+}
+
+const INJECTED_IDLE_WINDOW: Duration = Duration::from_secs(2);
+fn injected_recent(at: Option<Instant>, now: Instant) -> bool {
+    at.and_then(|at| now.checked_duration_since(at))
+        .is_some_and(|age| age <= INJECTED_IDLE_WINDOW)
+}
+
 #[derive(Default)]
 pub(super) struct Detector {
     previous: Option<Sample>,
@@ -124,14 +248,7 @@ impl Detector {
         self.moving = sample
             .as_ref()
             .zip(self.previous.as_ref())
-            .is_some_and(|(s, p)| {
-                let coherent = s.same(p)
-                    && (0..2).all(|i| {
-                        ((s.cursor[i] - s.origin[i]) - (p.cursor[i] - p.origin[i])).abs() <= 1.0
-                    });
-                coherent
-                    && (self.moving || (0..2).any(|i| (s.cursor[i] - p.cursor[i]).abs() >= 4.0))
-            });
+            .is_some_and(|(s, p)| s.moves_with(p, self.moving));
         let next = sample.as_ref().filter(|_| self.moving).and_then(|s| {
             portals.iter().find_map(|p| {
                 let (position, scale) = location(s, p, monitors, 1.0)?;
@@ -321,7 +438,8 @@ impl Poller {
         abort: Arc<Abort>,
         epoch: u64,
     ) -> Result<Self, PlatformError> {
-        Self::spawn(
+        let injection_gate = gate.clone();
+        Self::spawn_with_injection(
             move || {
                 let ipc = source.ipc(Duration::from_millis(20)).ok()?;
                 let cursor = ipc.json("cursorpos").ok()?;
@@ -329,11 +447,24 @@ impl Poller {
                 Sample::parse(&cursor, &client)
             },
             move || gate.is_open() && abort.epoch.load(Ordering::Acquire) == epoch,
+            move || {
+                super::super::inject::injected_position_for(&injection_gate)
+                    .and_then(|position| position.last())
+                    .map(|injection| injection.at)
+            },
         )
     }
+    #[cfg(test)]
     fn spawn(
+        read: impl FnMut() -> Option<Sample> + Send + 'static,
+        allowed: impl Fn() -> bool + Send + 'static,
+    ) -> Result<Self, PlatformError> {
+        Self::spawn_with_injection(read, allowed, || None)
+    }
+    fn spawn_with_injection(
         mut read: impl FnMut() -> Option<Sample> + Send + 'static,
         allowed: impl Fn() -> bool + Send + 'static,
+        injected_at: impl Fn() -> Option<Instant> + Send + 'static,
     ) -> Result<Self, PlatformError> {
         let shared = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let worker = shared.clone();
@@ -342,13 +473,30 @@ impl Poller {
             .spawn(move || {
                 let (lock, wake) = &*worker;
                 let mut due = Instant::now();
+                let mut native = NativeDetector::default();
                 loop {
                     let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
                     if state.stopped {
                         return;
                     }
-                    if state.config.paused || state.config.portals.is_empty() || !allowed() {
+                    if state.config.paused || !allowed() {
+                        native = NativeDetector::default();
                         drop(wake.wait(state).unwrap_or_else(|e| e.into_inner()));
+                        continue;
+                    }
+                    if state.config.portals.is_empty()
+                        && !injected_recent(injected_at(), Instant::now())
+                    {
+                        // Only inspect process-local injection metadata while idle. No owner
+                        // compositor IPC without a portal or admitted recent injected motion.
+                        if native.moving.is_some() {
+                            state.publish(None);
+                        }
+                        native = NativeDetector::default();
+                        drop(
+                            wake.wait_timeout(state, Duration::from_millis(100))
+                                .unwrap_or_else(|e| e.into_inner()),
+                        );
                         continue;
                     }
                     if Instant::now() < due {
@@ -365,14 +513,26 @@ impl Poller {
                     let sample = read(); // Fresh bounded requests, never while holding the shared mutex.
                     let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
                     state.busy = false;
+                    let (_, moving) = native.observe(sample.as_ref());
                     due = started
                         + period(
                             sample.as_ref(),
                             &state.config.portals,
                             &state.config.monitors,
+                            moving,
                         );
-                    if state.revision == revision && !state.config.paused && allowed() {
+                    if state.revision == revision
+                        && !state.config.paused
+                        && allowed()
+                        && (!state.config.portals.is_empty()
+                            || injected_recent(injected_at(), Instant::now()))
+                    {
                         state.publish(sample);
+                    } else {
+                        if native.moving.is_some() && !state.config.paused && allowed() {
+                            state.publish(None);
+                        }
+                        native = NativeDetector::default();
                     }
                     wake.notify_all();
                 }
@@ -473,7 +633,7 @@ mod tests {
     fn recorded(x: f64, scale: f64, tiled: bool) -> Sample {
         let cursor = json!({"x": -200.0 + x / scale, "y": 100.0 + 468.0 / scale});
         let size = if tiled { [516, 898] } else { [360, 240] };
-        Sample::parse(&cursor, &json!({"stableId":"1800000a", "address":"0x123", "at":[cursor["x"].as_f64().unwrap() - 80.0, cursor["y"].as_f64().unwrap() - 80.0], "size":size, "workspace":{"id":1,"name":"1"},"floating":true})).unwrap()
+        Sample::parse(&cursor, &json!({"stableId":"1800000a", "address":"0x123", "at":[cursor["x"].as_f64().unwrap() - 80.0, cursor["y"].as_f64().unwrap() - 80.0], "size":size, "workspace":{"id":1,"name":"1"},"monitor":1,"floating":true})).unwrap()
     }
     fn hit() -> Hit {
         let (portals, monitors) = layout(1.0);
@@ -484,6 +644,250 @@ mod tests {
             .1
             .unwrap()
     }
+    #[test]
+    fn native_move_anywhere_uses_twenty_ms_and_client_monitor_pixels() {
+        for scale in [1.0, 1.5] {
+            let (_, monitors) = layout(scale);
+            let mut native = NativeDetector::default();
+            assert_eq!(
+                native.observe(Some(&recorded(400.0, scale, false))),
+                (None, false)
+            );
+            for n in 1..=10 {
+                let mut sample = recorded(400.0 + f64::from(n) * 8.0, scale, false);
+                sample.at = MonoTime::from_nanos(n as u64 * 20_000_000);
+                assert_eq!(native.observe(Some(&sample)), (None, true));
+                assert_eq!(
+                    period(Some(&sample), &[], &monitors, true),
+                    Duration::from_millis(20)
+                );
+                let (grab, size) = sample.native_geometry(&monitors).unwrap();
+                assert_eq!(grab, PointDevice::new(80.0 * scale, 80.0 * scale));
+                assert_eq!(
+                    size,
+                    PixelSize::new((360.0 * scale) as u32, (240.0 * scale) as u32)
+                );
+            }
+        }
+        let sample = recorded(400.0, 1.0, false);
+        let (_, mut monitors) = layout(1.0);
+        assert!(sample.native_geometry(&[]).is_none());
+        monitors.push(monitors[0].clone());
+        assert!(sample.native_geometry(&monitors).is_none());
+    }
+
+    #[test]
+    fn native_move_ends_once_on_incoherence_none_or_changed_client_workspace_size() {
+        for why in ["release motion", "none", "client", "workspace", "size"] {
+            let mut native = NativeDetector::default();
+            native.observe(Some(&recorded(400.0, 1.0, false)));
+            let moving = recorded(408.0, 1.0, false);
+            assert_eq!(native.observe(Some(&moving)), (None, true));
+            let mut next = moving.clone();
+            match why {
+                // After release, the cursor moves while the window stays put: native fact,
+                // not a button-release observation. Stationary release is tested separately.
+                "release motion" => next.cursor[0] += 4.0,
+                "client" => next.window = WindowId(2),
+                "workspace" => next.workspace = json!({"id":2}),
+                "size" => next.size[0] += 1.0,
+                "none" => (),
+                _ => unreachable!(),
+            }
+            let sample = (why != "none").then_some(&next);
+            assert_eq!(
+                native.observe(sample),
+                (Some(moving.window), false),
+                "{why}"
+            );
+            assert_eq!(native.observe(sample), (None, false), "{why}");
+        }
+    }
+
+    #[test]
+    fn native_stationary_release_is_unobservable_and_edge_first_miss_is_unchanged() {
+        let (portals, monitors) = layout(1.0);
+        let mut native = NativeDetector::default();
+        let mut gesture = Gesture::default();
+        for x in [1067.0, 1071.0] {
+            let sample = recorded(x, 1.0, false);
+            native.observe(Some(&sample));
+            gesture.observe(Some(sample), &portals, &monitors, Instant::now());
+        }
+        // Geometry carries no button state. Both stationary held and released are identical.
+        let stationary = recorded(1071.0, 1.0, false);
+        assert_eq!(native.observe(Some(&stationary)), (None, true));
+        let (released, hit) = gesture.observe(
+            Some(stationary.clone()),
+            &portals,
+            &monitors,
+            Instant::now(),
+        );
+        assert!(released.is_none());
+        assert_eq!(hit.unwrap().sample.window, stationary.window);
+        assert_eq!(native.observe(None), (Some(stationary.window), false));
+        let (released, hit) = gesture.observe(None, &portals, &monitors, Instant::now());
+        assert!(released.is_none() && hit.is_none());
+        assert_eq!(
+            gesture.detector.hit.as_ref().unwrap().sample.window,
+            stationary.window
+        );
+        assert_eq!(
+            gesture.observe(None, &portals, &monitors, Instant::now()).0,
+            Some(portals[0].id)
+        );
+    }
+
+    #[test]
+    fn native_publication_throttles_completed_samples_and_queued_batch_replay() {
+        let (_, monitors) = layout(1.0);
+        let at = |ms: u64| MonoTime::from_nanos(ms * 1_000_000);
+        let sample = |x, ms| {
+            let mut sample = recorded(x, 1.0, false);
+            sample.at = at(ms);
+            sample
+        };
+        let mut native = NativeDetector::default();
+        native.events(Some(&sample(400.0, 0)), &monitors, at(0));
+        // Starts can be 20 ms apart yet a slow 30 ms read and a fast 1 ms read
+        // complete at 30/31 ms. Neither sample nor emission freshness may be invented.
+        let first = native.events(Some(&sample(408.0, 30)), &monitors, at(30));
+        assert!(
+            matches!(first[1], Some(CaptureEvent::NativeMove { at: timestamp, .. }) if timestamp == at(30))
+        );
+        assert_eq!(
+            native.events(Some(&sample(416.0, 31)), &monitors, at(31)),
+            [None, None]
+        );
+        assert!(native.moving.is_some());
+        let next = native.events(Some(&sample(424.0, 51)), &monitors, at(51));
+        assert!(
+            matches!(next[1], Some(CaptureEvent::NativeMove { at: timestamp, .. }) if timestamp == at(51))
+        );
+
+        let mut native = NativeDetector::default();
+        native.events(Some(&sample(400.0, 0)), &monitors, at(100));
+        let first = native.events(Some(&sample(408.0, 20)), &monitors, at(100));
+        assert!(
+            matches!(first[1], Some(CaptureEvent::NativeMove { at: timestamp, .. }) if timestamp == at(20))
+        );
+        for (x, ms) in [(416.0, 40), (424.0, 60)] {
+            assert_eq!(
+                native.events(Some(&sample(x, ms)), &monitors, at(100)),
+                [None, None]
+            );
+        }
+        // Loss is immediate even in the same delivery batch, with exactly one end.
+        assert!(matches!(
+            native.events(None, &monitors, at(100))[0],
+            Some(CaptureEvent::NativeMoveEnded { .. })
+        ));
+        assert_eq!(native.events(None, &monitors, at(100)), [None, None]);
+        native.events(Some(&sample(432.0, 80)), &monitors, at(100));
+        assert_eq!(
+            native.events(Some(&sample(440.0, 100)), &monitors, at(100)),
+            [None, None]
+        );
+        // Same-batch [loss, coherent A1, coherent A2, loss] owes just the first end:
+        // the geometric re-latch never published a new move while still throttled.
+        assert_eq!(native.events(None, &monitors, at(100)), [None, None]);
+        assert!(native.reported_window.is_none());
+        native.events(Some(&sample(448.0, 120)), &monitors, at(120));
+        // A newer latch later publishes the untouched real sample time and owes one end.
+        let next = native.events(Some(&sample(456.0, 140)), &monitors, at(140));
+        assert!(
+            matches!(next[1], Some(CaptureEvent::NativeMove { at: timestamp, .. }) if timestamp == at(140))
+        );
+        assert!(matches!(
+            native.events(None, &monitors, at(140))[0],
+            Some(CaptureEvent::NativeMoveEnded { .. })
+        ));
+        assert_eq!(native.events(None, &monitors, at(140)), [None, None]);
+    }
+
+    #[test]
+    fn native_cancellation_between_poll_and_strip_enter_survives_the_memory_fence() {
+        let (portals, monitors) = layout(1.0);
+        let now = Instant::now();
+        for missing in [false, true] {
+            let mut native = NativeDetector::default();
+            let first = recorded(1067.0, 1.0, false);
+            let moving = recorded(1071.0, 1.0, false);
+            native.events(Some(&first), &monitors, first.at);
+            assert!(matches!(
+                native.events(Some(&moving), &monitors, moving.at)[1],
+                Some(CaptureEvent::NativeMove { .. })
+            ));
+            let hit = hit();
+            let mut gesture = Gesture {
+                watch: Some(Watch::new(hit.clone(), now)),
+                last: Some(hit.clone()),
+                ..Default::default()
+            };
+            let mut cancelled = moving.clone();
+            cancelled.cursor[0] -= 4.0; // Window stays still: incoherent post-release motion.
+            let poller = Poller::spawn(|| None, || false).unwrap();
+            {
+                let mut publication = poller.shared.0.lock().unwrap();
+                publication.publish((!missing).then_some(cancelled));
+                publication.publish(Some(moving.clone()));
+            }
+            // Same pending batch goes through both detectors under the memory-only fence;
+            // event delivery happens later. The legacy strict watch cancellation still wins.
+            let observed_at = moving.at;
+            let (events, released, drop) = poller.fence(|pending| {
+                let events: Vec<_> = pending
+                    .iter()
+                    .flat_map(|sample| native.events(sample.as_ref(), &monitors, observed_at))
+                    .flatten()
+                    .collect();
+                let (released, drop) =
+                    gesture.pressed(pending, PortalId(1), 0.5, &portals, &monitors, now);
+                (events, released, drop)
+            });
+            assert_eq!(events.iter().filter(|event| matches!(event, CaptureEvent::NativeMoveEnded { window, .. } if *window == moving.window)).count(), 1);
+            assert_eq!(released, Some(PortalId(1)));
+            assert!(drop.is_none());
+            assert!(gesture.watch.is_none());
+            assert!(poller.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn no_portal_polling_requires_injected_motion_within_two_seconds() {
+        let now = Instant::now();
+        assert!(!injected_recent(None, now));
+        assert!(injected_recent(Some(now), now));
+        assert!(injected_recent(Some(now - Duration::from_secs(2)), now));
+        assert!(!injected_recent(
+            Some(now - Duration::from_secs(2) - Duration::from_nanos(1)),
+            now
+        ));
+        assert!(!injected_recent(Some(now + Duration::from_nanos(1)), now));
+        let injected = Arc::new(Mutex::new(None));
+        let observed = injected.clone();
+        let (tx, rx) = mpsc::channel();
+        let poller = Poller::spawn_with_injection(
+            move || {
+                tx.send(()).unwrap();
+                Some(recorded(400.0, 1.0, false))
+            },
+            || true,
+            move || *observed.lock().unwrap(),
+        )
+        .unwrap();
+        let (_, monitors) = layout(1.0);
+        poller.configure(vec![], monitors, false);
+        // Process-local metadata inspection may wake, but no IPC/sample read is admitted.
+        assert!(rx.recv_timeout(Duration::from_millis(120)).is_err());
+        *injected.lock().unwrap() = Some(Instant::now());
+        poller.shared.1.notify_all();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        poller
+            .pause(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+    }
+
     #[test]
     fn detector_window_id_matches_window_source_for_the_same_client_json() {
         use super::super::super::{ipc::HyprIpc, windows::HyprlandWindows};
@@ -762,15 +1166,20 @@ mod tests {
         let sample = recorded(1071.0, 1.0, false);
         assert!(Sample::parse(&json!({"x":0,"y":0}), &json!({})).is_none());
         assert_eq!(
-            period(Some(&sample), &portals, &monitors),
+            period(Some(&sample), &portals, &monitors, false),
             Duration::from_millis(20)
         );
         assert_eq!(
-            period(Some(&recorded(900.0, 1.0, false)), &portals, &monitors),
+            period(
+                Some(&recorded(900.0, 1.0, false)),
+                &portals,
+                &monitors,
+                false
+            ),
             Duration::from_millis(100)
         );
         assert_eq!(
-            period(Some(&sample), &[], &monitors),
+            period(Some(&sample), &[], &monitors, false),
             Duration::from_millis(100)
         );
     }

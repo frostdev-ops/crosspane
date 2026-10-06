@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used)]
 use crosspane_platform::{
     CaptureEvent, CaptureId, CapturePortal, Edge, EndReason, InputCapture, IoGate, MotionKind,
-    PlatformError, PortalId,
+    PlatformError, PointerInjector, PortalId,
 };
 use crosspane_platform_linux::hyprland::{
     capture::{
@@ -2876,7 +2876,14 @@ impl Toplevel {
 /// Opt-in prerequisite for R3. The parent has no compositor endpoints; it creates one fresh
 /// script-owned nest and gives only its verified endpoints to the measurement child.
 fn owned_drag_test(test: &str) -> bool {
-    if std::env::var("CROSSPANE_WP255_DROP_PROBE").as_deref() != Ok("1") {
+    let native_move =
+        test == "native_move_facts_without_portals_repeat_and_end_on_post_release_incoherence";
+    let flag = if native_move {
+        "CROSSPANE_WP272_NATIVE_MOVE_PROBE"
+    } else {
+        "CROSSPANE_WP255_DROP_PROBE"
+    };
+    if std::env::var(flag).as_deref() != Ok("1") {
         return false;
     }
     if std::env::var("CROSSPANE_CAPTURE_CHILD").as_deref() != Ok(test) {
@@ -2885,9 +2892,22 @@ fn owned_drag_test(test: &str) -> bool {
             rustix::fs::FlockOperation::LockExclusive,
         );
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let wrapper = root.join("scripts/lead/impl-env.sh");
-        let script = root.join("scripts/hypr-nested.sh");
-        let name = format!("wp255-drop-probe-{}", std::process::id());
+        let wrapper = if native_move {
+            PathBuf::from("/home/jame/Projects/Crosspane/scripts/lead/impl-env.sh")
+        } else {
+            root.join("scripts/lead/impl-env.sh")
+        };
+        let script = if native_move {
+            PathBuf::from("/home/jame/Projects/Crosspane/scripts/hypr-nested.sh")
+        } else {
+            root.join("scripts/hypr-nested.sh")
+        };
+        let prefix = if native_move {
+            "wp272-native-move"
+        } else {
+            "wp255-drop-probe"
+        };
+        let name = format!("{prefix}-{}", std::process::id());
         let state = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
             .join(format!("crosspane-hypr-{name}"));
         assert!(!state.exists(), "refusing a pre-existing nest state");
@@ -2946,6 +2966,11 @@ fn owned_drag_test(test: &str) -> bool {
             );
             child.arg(format!("{key}={value}"));
         }
+        if native_move {
+            // Bound only this owned child process group. The nest itself is stopped by its
+            // retained PID/start-checked script guard, including assertion/timeout paths.
+            child.arg("timeout").args(["--kill-after=3s", "30s"]);
+        }
         let result = child
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
@@ -2963,6 +2988,137 @@ fn owned_drag_test(test: &str) -> bool {
     assert!(nested()); // PID/start, lock PID/display and both sockets, before any connection.
     settle_outputs(&ipc());
     true
+}
+
+/// Geometry-only NativeMove conformance. The parent creates and cleans a fresh nest, and
+/// the child verifies its recorded PID/start and sockets before connecting or injecting.
+#[test]
+fn native_move_facts_without_portals_repeat_and_end_on_post_release_incoherence() {
+    if !owned_drag_test(
+        "native_move_facts_without_portals_repeat_and_end_on_post_release_incoherence",
+    ) {
+        return;
+    }
+    let _guard = serialize();
+    let ipc = ipc();
+    ipc.eval("hl.bind(\"SUPER + mouse:272\", hl.dsp.window.drag(), { mouse = true })")
+        .unwrap();
+    let driver = Driver::bare();
+    let mut window = Toplevel::new();
+    let mut f = Fixture::with_driver(driver, Arc::new(|_| {}));
+    let client = ipc.json("activewindow").unwrap();
+    assert_eq!(client["pid"].as_u64(), Some(u64::from(std::process::id())));
+    let id = client["stableId"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("0x");
+    let own = crosspane_types::id::WindowId(u64::from_str_radix(id, 16).unwrap());
+    let address = client["address"].as_str().unwrap();
+    assert!(
+        address
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || ch == 'x')
+    );
+    ipc.eval(&format!(
+        "hl.dispatch(hl.dsp.window.float({{window=\"address:{address}\",action=\"enable\"}}))"
+    ))
+    .unwrap();
+    ipc.eval(&format!("hl.dispatch(hl.dsp.window.move({{window=\"address:{address}\",x=200,y=100,relative=false}}))")).unwrap();
+    f.capture.set_portals(&[]).unwrap();
+    // Use the real injector's process-local motion record to admit no-portal polling. Every
+    // pointer/key below belongs to this proof-verified nest; no owner endpoint is inherited.
+    let (_keys, mut pointer) =
+        crosspane_platform_linux::hyprland::inject::connect(f.gate.clone(), ipc.clone()).unwrap();
+    pointer
+        .move_to(f.portal.display, PointDevice::new(280.0, 180.0))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(150)); // Admit a baseline at the idle 100 ms cadence.
+    while f.events.try_recv().is_ok() {}
+    f.driver.keyboard.key(f.driver.time(), 125, 1);
+    f.driver.keyboard.modifiers(64, 0, 0, 0);
+    f.driver.sync();
+    pointer.button(MouseButton::PRIMARY, true).unwrap();
+    struct Release<'a> {
+        pointer: &'a mut dyn PointerInjector,
+        driver: &'a mut Driver,
+    }
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            let _ = self.pointer.button(MouseButton::PRIMARY, false);
+            self.driver.keyboard.key(self.driver.time(), 125, 0);
+            self.driver.keyboard.modifiers(0, 0, 0, 0);
+            self.driver.sync();
+        }
+    }
+    let release = Release {
+        pointer: &mut pointer,
+        driver: &mut f.driver,
+    };
+    let started = Instant::now();
+    let mut times = Vec::new();
+    // Continuous owned motion stays far from every output edge. Query latency can slow
+    // the nominal 50 Hz poll; native acceptance asserts the frozen >=20 Hz observation.
+    while started.elapsed() < Duration::from_millis(900) {
+        let x = 320.0 + 180.0 * started.elapsed().as_secs_f64();
+        release
+            .pointer
+            .move_to(f.portal.display, PointDevice::new(x, 180.0))
+            .unwrap();
+        window.pump();
+        while let Ok(event) = f.events.try_recv() {
+            match event {
+                CaptureEvent::NativeMove {
+                    window,
+                    grab,
+                    size,
+                    at,
+                } => {
+                    assert_eq!(window, own);
+                    assert_eq!(grab, PointDevice::new(80.0, 80.0));
+                    assert!(size.width > 0 && size.height > 0);
+                    times.push(at.as_nanos());
+                }
+                CaptureEvent::NativeMoveEnded { .. } => panic!("coherent held move ended"),
+                CaptureEvent::DragAtEdge { .. } | CaptureEvent::EdgePressed { .. } => {
+                    panic!("interior no-portal move reported an edge")
+                }
+                _ => (),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(times.len() >= 2, "no repeated NativeMove facts");
+    let span = (times.last().unwrap() - times[0]) as f64 / 1_000_000_000.0;
+    let hz = (times.len() - 1) as f64 / span;
+    assert!(hz >= 20.0, "NativeMove cadence {hz:.2} Hz");
+    drop(release); // Exactly the owed primary up; not a fabricated native-end observation.
+    while f.events.try_recv().is_ok() {}
+    // Stationary release is unobservable by frozen geometry-only detection. A real cursor
+    // motion after up changes grab offset while the owned window remains at its drop point.
+    pointer
+        .move_to(f.portal.display, PointDevice::new(600.0, 180.0))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut ends = 0;
+    while Instant::now() < deadline {
+        match f.events.recv_timeout(Duration::from_millis(25)) {
+            Ok(CaptureEvent::NativeMoveEnded { window, .. }) => {
+                assert_eq!(window, own);
+                ends += 1;
+            }
+            Ok(CaptureEvent::NativeMove { .. }) if ends > 0 => {
+                panic!("stationary post-release geometry rearmed")
+            }
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => (),
+            Err(error) => panic!("event channel: {error}"),
+        }
+        window.pump();
+    }
+    assert_eq!(ends, 1, "post-release incoherence must end exactly once");
+    eprintln!(
+        "WP-2.72 owned nested geometry: facts={} cadence={hz:.2}Hz post-release-incoherence ends={ends}; stationary-release observation=unsupported",
+        times.len()
+    );
 }
 
 #[test]

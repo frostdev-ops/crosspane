@@ -260,6 +260,7 @@ struct State {
     keys: BTreeSet<u32>,
     capture: Option<Capture>,
     gesture: drag::Gesture,
+    native: drag::NativeDetector,
     drag: drag::Poller,
     generation: u64,
     cursor: Option<WpCursorShapeDeviceV1>,
@@ -399,6 +400,7 @@ impl Client {
             keys: BTreeSet::new(),
             capture: None,
             gesture: drag::Gesture::default(),
+            native: drag::NativeDetector::default(),
             drag: drag::Poller::new(source.clone(), gate, abort, epoch)?,
             generation: 0,
             cursor: None,
@@ -1436,6 +1438,7 @@ fn pump(
 impl State {
     fn poll_drag(&mut self) {
         if self.capture.is_some() || !self.gate.is_open() || self.check_epoch().is_err() {
+            self.native = drag::NativeDetector::default();
             return;
         }
         let samples = self.drag.take();
@@ -1448,7 +1451,16 @@ impl State {
             .filter(|p| p.mapped)
             .map(|p| p.portal)
             .collect();
+        let observed_at = now();
         for sample in samples {
+            for event in self
+                .native
+                .events(sample.as_ref(), &self.monitors, observed_at)
+                .into_iter()
+                .flatten()
+            {
+                self.emit(event);
+            }
             let (released, hit) =
                 self.gesture
                     .observe(sample, &portals, &self.monitors, Instant::now());
@@ -1657,16 +1669,31 @@ impl State {
             .filter(|p| p.mapped)
             .map(|p| p.portal)
             .collect();
-        let (released, hit) = self.drag.fence(|sample| {
-            self.gesture.pressed(
-                sample,
+        let observed_at = now();
+        let observed = Instant::now();
+        let (native, released, hit) = self.drag.fence(|pending| {
+            let native: Vec<_> = pending
+                .iter()
+                .flat_map(|sample| {
+                    self.native
+                        .events(sample.as_ref(), &self.monitors, observed_at)
+                })
+                .flatten()
+                .collect();
+            let (released, hit) = self.gesture.pressed(
+                pending,
                 portal,
                 position,
                 &portals,
                 &self.monitors,
-                Instant::now(),
-            )
+                observed,
+            );
+            (native, released, hit)
         });
+        // The publication lock covers only memory selection, never clocks, IPC or delivery.
+        for event in native {
+            self.emit(event);
+        }
         if let Some(portal) = released {
             self.emit(CaptureEvent::EdgeReleased { portal, at });
         }
