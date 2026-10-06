@@ -47,7 +47,13 @@ pub(crate) use adapter::ExitObservation;
 // Source-included probe exports; library unit tests do not invoke them.
 pub(crate) use adapter::scratch::{FixtureLock, ScratchFixture, scratch_current};
 #[cfg(windows)]
+#[allow(unused_imports)]
+// A4b/A5 consumers retain these sealed native return capabilities.
+pub(crate) use adapter::{ImageReleased, OpaqueLeaf, PrunedGeneration};
+#[cfg(windows)]
 pub use adapter::{InstallerLock, SupportProof, WindowsNativeIo, WindowsTarget};
+#[cfg(windows)]
+pub(crate) use adapter::{OpenedPe, PayloadRoot, PruneOutcome, SelfImagePin, StagedPe};
 
 #[cfg(windows)]
 mod adapter {
@@ -329,6 +335,986 @@ mod adapter {
             f.write_str("InstallerLock")
         }
     }
+    use super::super::payload::{
+        inventory::{ApprovedPe, PayloadRole, PeFacts},
+        recovery::{MutationPermit, Phase},
+    };
+    /// The only observed bytes allowed to create an Installer approval pin: our own module.
+    pub(crate) struct SelfImagePin(Arc<OwnImage>);
+    struct OwnImage {
+        target: [u8; 16],
+        parent: Arc<Anchor>,
+        leaf: String,
+        image: native::ImageData,
+    }
+    impl SelfImagePin {
+        pub(crate) fn facts(&self) -> &PeFacts {
+            &self.0.image.facts
+        }
+        pub(crate) fn identity(&self) -> FileIdentity {
+            self.0.image.identity
+        }
+        pub(crate) fn canonical_dos_path(&self) -> &str {
+            &self.0.image.canonical
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let budget = proof.budget(io, deadline)?;
+            if self.0.target != io.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            let image = self.0.clone();
+            let context = io.context.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                let fresh = image.parent.open_image(
+                    &image.leaf,
+                    false,
+                    env!("CARGO_PKG_VERSION"),
+                    &context.security,
+                    &budget,
+                )?;
+                if fresh.identity != image.image.identity || fresh.facts != image.image.facts {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(())
+            })
+        }
+    }
+    pub(crate) struct OpenedPe(Arc<ApprovedImage>);
+    struct ApprovedImage {
+        target: [u8; 16],
+        parent: Arc<Anchor>,
+        leaf: String,
+        image: native::ImageData,
+        expected: ApprovedPe,
+    }
+    impl OpenedPe {
+        pub(crate) fn identity(&self) -> FileIdentity {
+            self.0.image.identity
+        }
+        pub(crate) fn canonical_dos_path(&self) -> &str {
+            &self.0.image.canonical
+        }
+        pub(crate) fn approved(&self) -> &ApprovedPe {
+            &self.0.expected
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let budget = proof.budget(io, deadline)?;
+            if self.0.target != io.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            let image = self.0.clone();
+            let context = io.context.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                let fresh = image.parent.open_image(
+                    &image.leaf,
+                    true,
+                    image.expected.version(),
+                    &context.security,
+                    &budget,
+                )?;
+                if fresh.identity != image.image.identity || fresh.facts != *image.expected.facts()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                Ok(())
+            })
+        }
+    }
+    pub(crate) struct PayloadRoot(Arc<PayloadRootData>);
+    struct PayloadRootData {
+        target: [u8; 16],
+        install: Mutex<Option<Arc<Anchor>>>,
+        // A4b native launch consumers use the fixed retained install working directory.
+        #[allow(dead_code)]
+        canonical: String,
+    }
+    pub(crate) struct OpaqueLeaf {
+        target: [u8; 16],
+        role: PayloadRole,
+        observed: native::OpaqueData,
+    }
+    impl OpaqueLeaf {
+        pub(crate) fn identity(&self) -> FileIdentity {
+            self.observed.identity
+        }
+    }
+    pub(crate) struct StagedPe {
+        target: [u8; 16],
+        operation: [u8; 16],
+        role: PayloadRole,
+        parent: Arc<Anchor>,
+        image: native::ImageData,
+        expected: ApprovedPe,
+    }
+    impl StagedPe {
+        pub(crate) fn role(&self) -> PayloadRole {
+            self.role
+        }
+        pub(crate) fn observation(&self) -> super::super::payload::recovery::ImageObservation {
+            super::super::payload::recovery::ImageObservation {
+                identity: self.image.identity.into(),
+                facts: self.image.facts.clone(),
+            }
+        }
+    }
+    pub(crate) struct PrunedGeneration {
+        target: [u8; 16],
+        operation: [u8; 16],
+        generation: [u8; 16],
+    }
+    pub(crate) enum PruneOutcome {
+        Removed(PrunedGeneration),
+        Retained,
+    }
+    /// Positive exclusive fixed-leaf admission ONLY. It does not prove old supervisor/tree completion.
+    pub(crate) struct ImageReleased {
+        target: [u8; 16],
+        operation: [u8; 16],
+    }
+    impl ImageReleased {
+        // A4b composes this image fence with genuine old owner/tree completion.
+        #[allow(dead_code)]
+        pub(crate) fn operation(&self) -> [u8; 16] {
+            self.operation
+        }
+        pub(crate) fn binding(
+            &self,
+            io: &WindowsNativeIo,
+            operation: [u8; 16],
+        ) -> NativeResult<()> {
+            if self.target != io.context.target.nonce || self.operation != operation {
+                return Err(NativeError::Foreign);
+            }
+            Ok(())
+        }
+    }
+    impl PayloadRoot {
+        // A4b native launch consumers use this fixed retained working directory.
+        #[allow(dead_code)]
+        pub(crate) fn canonical_dos_path(&self) -> &str {
+            &self.0.canonical
+        }
+        fn check(&self, context: &Context, budget: &Deadline) -> NativeResult<Option<Arc<Anchor>>> {
+            if self.0.target != context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            context.validate(budget)?;
+            let slot = self
+                .0
+                .install
+                .lock()
+                .map_err(|_| NativeError::Unavailable)?;
+            if let Some(root) = &*slot {
+                root.revalidate(&context.security, true, budget)?;
+            }
+            Ok(slot.clone())
+        }
+        fn ensure(
+            &self,
+            context: &Context,
+            budget: &Deadline,
+            change: &Change,
+        ) -> NativeResult<Arc<Anchor>> {
+            if let Some(root) = self.check(context, budget)? {
+                return Ok(root);
+            }
+            let programs = match Anchor::open(
+                context.target.paths.programs(),
+                &context.security,
+                false,
+                budget,
+            )? {
+                Some(root) => root,
+                None => {
+                    change.reached();
+                    context
+                        .local
+                        .create_child_directory("Programs", &context.security, budget)?
+                }
+            };
+            let root = match programs.child("Crosspane", &context.security, budget)? {
+                Some(root) => root,
+                None => {
+                    change.reached();
+                    programs.create_child_directory("Crosspane", &context.security, budget)?
+                }
+            };
+            let root = Arc::new(root);
+            *self
+                .0
+                .install
+                .lock()
+                .map_err(|_| NativeError::Unavailable)? = Some(root.clone());
+            Ok(root)
+        }
+        pub(crate) fn open_approved(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            role: PayloadRole,
+            expected: &ApprovedPe,
+            deadline: &Deadline,
+        ) -> NativeResult<OpenedPe> {
+            if expected.role() != role {
+                return Err(NativeError::Foreign);
+            }
+            let budget = proof.budget(io, deadline)?;
+            let context = io.context.clone();
+            let root = self.0.clone();
+            let expected = expected.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                let root = PayloadRoot(root)
+                    .check(&context, &budget)?
+                    .ok_or(NativeError::Missing)?;
+                let image = root.open_image(
+                    role.leaf(),
+                    true,
+                    expected.version(),
+                    &context.security,
+                    &budget,
+                )?;
+                if image.facts != *expected.facts() {
+                    return Err(NativeError::Unsupported);
+                }
+                Ok(OpenedPe(Arc::new(ApprovedImage {
+                    target: context.target.nonce,
+                    parent: root,
+                    leaf: role.leaf().into(),
+                    image,
+                    expected,
+                })))
+            })
+        }
+        pub(crate) fn open_staged(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            role: PayloadRole,
+            expected: &ApprovedPe,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<StagedPe>> {
+            if operation == [0; 16] || expected.role() != role {
+                return Err(NativeError::Invalid);
+            }
+            let budget = proof.budget(io, deadline)?;
+            let context = io.context.clone();
+            let root = self.0.clone();
+            let expected = expected.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                let Some(root) = PayloadRoot(root).check(&context, &budget)? else {
+                    return Ok(None);
+                };
+                let Some(stage) = root.child("payload-stage", &context.security, &budget)? else {
+                    return Ok(None);
+                };
+                let Some(parent) =
+                    stage.child(&records::hex(&operation), &context.security, &budget)?
+                else {
+                    return Ok(None);
+                };
+                let parent = Arc::new(parent);
+                let image = match parent.open_staged_image(
+                    role.leaf(),
+                    expected.version(),
+                    &context.security,
+                    &budget,
+                ) {
+                    Ok(image) => image,
+                    Err(NativeError::Missing) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if image.facts != *expected.facts() {
+                    return Err(NativeError::Unsupported);
+                }
+                Ok(Some(StagedPe {
+                    target: context.target.nonce,
+                    operation,
+                    role,
+                    parent,
+                    image,
+                    expected,
+                }))
+            })
+        }
+        /// A complete stage observed after an interrupted write is flushed under a fresh intent
+        /// before adoption; observation alone cannot claim durable staging.
+        pub(crate) fn settle_stage(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            staged: &StagedPe,
+            deadline: &Deadline,
+        ) -> NativeResult<super::super::payload::recovery::ImageObservation> {
+            io.lock_binding(proof, lock, deadline)?;
+            check_permit(io, permit, Phase::StageIntent, Some(staged.role))?;
+            if staged.target != io.context.target.nonce || staged.operation != permit.operation() {
+                return Err(NativeError::Foreign);
+            }
+            let context = io.context.clone();
+            let lease = lock.0.clone();
+            let budget = proof.budget(io, deadline)?;
+            let file = staged.image.file.clone();
+            let parent = staged.parent.clone();
+            let expected = staged.expected.clone();
+            let identity = staged.image.identity;
+            let operation = permit.operation();
+            let bytes = permit.bytes().to_vec();
+            io.owner.run(Dispatch::Mutation, deadline, move || {
+                let change = Change::new();
+                change.finish((|| {
+                    validate_payload_lock(&context, &lease, &budget)?;
+                    validate_intent(&context, &lease, operation, &bytes, &budget)?;
+                    parent.revalidate(&context.security, true, &budget)?;
+                    let image = native::measure_image(file.clone(), expected.version(), &budget)?;
+                    if image.identity != identity || image.facts != *expected.facts() {
+                        return Err(NativeError::Foreign);
+                    }
+                    change.reached();
+                    // SAFETY: only a freshly hash/PE-admitted own writable stage, under its durable intent.
+                    if unsafe { FlushFileBuffers(file.as_raw_handle()) } == 0 {
+                        return Err(native::last_error());
+                    }
+                    budget.check()?;
+                    Ok(super::super::payload::recovery::ImageObservation {
+                        identity: identity.into(),
+                        facts: expected.facts().clone(),
+                    })
+                })())
+            })
+        }
+        pub(crate) fn observe_backup(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            role: PayloadRole,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<FileIdentity>> {
+            if operation == [0; 16] {
+                return Err(NativeError::Invalid);
+            }
+            let budget = proof.budget(io, deadline)?;
+            let context = io.context.clone();
+            let root = self.0.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                let Some(root) = PayloadRoot(root).check(&context, &budget)? else {
+                    return Ok(None);
+                };
+                let Some(backups) = root.child("payload-backups", &context.security, &budget)?
+                else {
+                    return Ok(None);
+                };
+                let Some(generation) =
+                    backups.child(&records::hex(&operation), &context.security, &budget)?
+                else {
+                    return Ok(None);
+                };
+                Ok(generation
+                    .opaque(role.leaf(), false, &context.security, &budget)?
+                    .map(|leaf| leaf.identity))
+            })
+        }
+        /// Roll back only a pre-stop staging generation with exactly the approved fixed content.
+        /// Unknown/partial/loaded material is retained; no installed or backup image is changed.
+        // Separate sealed io/proof/lock/intent/pin/deadline arguments preserve the admitted authority boundaries.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn rollback_stage(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            inventory: &super::super::payload::inventory::ApprovedInventory,
+            installer: &ApprovedPe,
+            deadline: &Deadline,
+        ) -> NativeResult<super::super::payload::recovery::RollbackOutcome> {
+            io.lock_binding(proof, lock, deadline)?;
+            check_permit(io, permit, Phase::RollbackIntent, None)?;
+            let expected = PayloadRole::ALL
+                .into_iter()
+                .map(|role| {
+                    if role == PayloadRole::Installer {
+                        Ok(installer.clone())
+                    } else {
+                        inventory.role(role).cloned()
+                    }
+                })
+                .collect::<NativeResult<Vec<_>>>()?;
+            let budget = proof.budget(io, deadline)?;
+            let context = io.context.clone();
+            let lease = lock.0.clone();
+            let root = self.0.clone();
+            let operation = permit.operation();
+            let bytes = permit.bytes().to_vec();
+            io.owner.run(Dispatch::Mutation, deadline, move || {
+                use super::super::payload::recovery::RollbackOutcome;
+                let change = Change::new();
+                change.finish((|| {
+                    validate_payload_lock(&context, &lease, &budget)?;
+                    validate_intent(&context, &lease, operation, &bytes, &budget)?;
+                    let Some(root) = PayloadRoot(root).check(&context, &budget)? else {
+                        return Ok(RollbackOutcome::RolledBack);
+                    };
+                    let Some(stage) = root.child("payload-stage", &context.security, &budget)?
+                    else {
+                        return Ok(RollbackOutcome::RolledBack);
+                    };
+                    let Some(generation) =
+                        stage.child(&records::hex(&operation), &context.security, &budget)?
+                    else {
+                        return Ok(RollbackOutcome::RolledBack);
+                    };
+                    for leaf in generation.entry_names(&context.security, &budget)? {
+                        let pin = if leaf == "helper-copy.exe" {
+                            expected
+                                .iter()
+                                .find(|pin| pin.role() == PayloadRole::Installer)
+                        } else {
+                            expected.iter().find(|pin| pin.role().leaf() == leaf)
+                        };
+                        let Some(pin) = pin else {
+                            return Ok(RollbackOutcome::Retained);
+                        };
+                        let image = match generation.open_image(
+                            &leaf,
+                            true,
+                            pin.version(),
+                            &context.security,
+                            &budget,
+                        ) {
+                            Ok(image) => image,
+                            Err(
+                                NativeError::Unsupported
+                                | NativeError::Unavailable
+                                | NativeError::Foreign
+                                | NativeError::Busy,
+                            ) => return Ok(RollbackOutcome::Retained),
+                            Err(error) => return Err(error),
+                        };
+                        if image.facts != *pin.facts() {
+                            return Ok(RollbackOutcome::Retained);
+                        }
+                        drop(image);
+                    }
+                    drop(generation);
+                    change.reached();
+                    match stage.prune_tree(&records::hex(&operation), &context.security, &budget) {
+                        Ok(()) => Ok(RollbackOutcome::RolledBack),
+                        Err(NativeError::Busy | NativeError::Foreign) => {
+                            Ok(RollbackOutcome::Retained)
+                        }
+                        Err(error) => Err(error),
+                    }
+                })())
+            })
+        }
+        pub(crate) fn observe_opaque(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            role: PayloadRole,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<OpaqueLeaf>> {
+            let budget = proof.budget(io, deadline)?;
+            let context = io.context.clone();
+            let root = self.0.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                let Some(root) = PayloadRoot(root).check(&context, &budget)? else {
+                    return Ok(None);
+                };
+                root.opaque(role.leaf(), false, &context.security, &budget)?
+                    .map(|observed| {
+                        Ok(OpaqueLeaf {
+                            target: context.target.nonce,
+                            role,
+                            observed,
+                        })
+                    })
+                    .transpose()
+            })
+        }
+        pub(crate) fn prove_released(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<ImageReleased> {
+            io.lock_binding(proof, lock, deadline)?;
+            if operation == [0; 16] {
+                return Err(NativeError::Invalid);
+            }
+            let budget = proof.budget(io, deadline)?;
+            let context = io.context.clone();
+            let lease = lock.0.clone();
+            let root = self.0.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                validate_payload_lock(&context, &lease, &budget)?;
+                if let Some(root) = PayloadRoot(root).check(&context, &budget)? {
+                    for role in PayloadRole::ALL {
+                        drop(root.opaque(role.leaf(), true, &context.security, &budget)?);
+                    }
+                }
+                Ok(ImageReleased {
+                    target: context.target.nonce,
+                    operation,
+                })
+            })
+        }
+        // Separate sealed io/proof/lock/intent/pin/deadline arguments preserve the admitted authority boundaries.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn stage(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            role: PayloadRole,
+            input: Box<dyn std::io::Read + Send>,
+            expected: &ApprovedPe,
+            deadline: &Deadline,
+        ) -> NativeResult<StagedPe> {
+            self.stage_leaf(
+                io,
+                proof,
+                lock,
+                permit,
+                role,
+                role.leaf(),
+                input,
+                expected,
+                deadline,
+            )
+        }
+        // Separate sealed io/proof/lock/intent/pin/deadline arguments preserve the admitted authority boundaries.
+        #[allow(clippy::too_many_arguments)]
+        fn stage_leaf(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            role: PayloadRole,
+            leaf: &'static str,
+            input: Box<dyn std::io::Read + Send>,
+            expected: &ApprovedPe,
+            deadline: &Deadline,
+        ) -> NativeResult<StagedPe> {
+            io.lock_binding(proof, lock, deadline)?;
+            check_permit(io, permit, Phase::StageIntent, Some(role))?;
+            if expected.role() != role {
+                return Err(NativeError::Foreign);
+            }
+            let root = self.0.clone();
+            let context = io.context.clone();
+            let lease = lock.0.clone();
+            let budget = proof.budget(io, deadline)?;
+            let expected = expected.clone();
+            let operation = permit.operation();
+            let bytes = permit.bytes().to_vec();
+            io.owner.run(Dispatch::Mutation, deadline, move || {
+                let change = Change::new();
+                change.finish((|| {
+                    validate_payload_lock(&context, &lease, &budget)?;
+                    validate_intent(&context, &lease, operation, &bytes, &budget)?;
+                    let root = PayloadRoot(root).ensure(&context, &budget, &change)?;
+                    let parent =
+                        ensure_payload_child(&root, "payload-stage", &context, &budget, &change)?;
+                    let parent = Arc::new(ensure_payload_child(
+                        &parent,
+                        &records::hex(&operation),
+                        &context,
+                        &budget,
+                        &change,
+                    )?);
+                    change.reached();
+                    let image =
+                        parent.stage_image(leaf, input, &expected, &context.security, &budget)?;
+                    Ok(StagedPe {
+                        target: context.target.nonce,
+                        operation,
+                        role,
+                        parent,
+                        image,
+                        expected,
+                    })
+                })())
+            })
+        }
+        // A4b/A5 calls helper staging only after genuine old-owner completion.
+        #[allow(dead_code)]
+        pub(crate) fn stage_helper(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            source: &SelfImagePin,
+            deadline: &Deadline,
+        ) -> NativeResult<OpenedPe> {
+            source.reverify(io, proof, deadline)?;
+            let expected = ApprovedPe::own_image(source)?;
+            let input = io.self_image_reader(source, proof, deadline)?;
+            let staged = self.stage_leaf(
+                io,
+                proof,
+                lock,
+                permit,
+                PayloadRole::Installer,
+                "helper-copy.exe",
+                input,
+                &expected,
+                deadline,
+            )?;
+            drop(staged);
+            self.open_helper(io, proof, permit.operation(), &expected, deadline)
+        }
+        pub(crate) fn open_helper(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            operation: [u8; 16],
+            expected: &ApprovedPe,
+            deadline: &Deadline,
+        ) -> NativeResult<OpenedPe> {
+            if operation == [0; 16] || expected.role() != PayloadRole::Installer {
+                return Err(NativeError::Invalid);
+            }
+            let budget = proof.budget(io, deadline)?;
+            let context = io.context.clone();
+            let root = self.0.clone();
+            let expected = expected.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                let root = PayloadRoot(root)
+                    .check(&context, &budget)?
+                    .ok_or(NativeError::Missing)?;
+                let parent = root
+                    .child("payload-stage", &context.security, &budget)?
+                    .ok_or(NativeError::Missing)?;
+                let parent = Arc::new(
+                    parent
+                        .child(&records::hex(&operation), &context.security, &budget)?
+                        .ok_or(NativeError::Missing)?,
+                );
+                let image = parent.open_image(
+                    "helper-copy.exe",
+                    true,
+                    expected.version(),
+                    &context.security,
+                    &budget,
+                )?;
+                if image.facts != *expected.facts() {
+                    return Err(NativeError::Unsupported);
+                }
+                Ok(OpenedPe(Arc::new(ApprovedImage {
+                    target: context.target.nonce,
+                    parent,
+                    leaf: "helper-copy.exe".into(),
+                    image,
+                    expected,
+                })))
+            })
+        }
+        pub(crate) fn backup(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            observed: OpaqueLeaf,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            io.lock_binding(proof, lock, deadline)?;
+            check_permit(io, permit, Phase::BackupIntent, Some(observed.role))?;
+            if observed.target != io.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            let root = self.0.clone();
+            let context = io.context.clone();
+            let lease = lock.0.clone();
+            let budget = proof.budget(io, deadline)?;
+            let operation = permit.operation();
+            let bytes = permit.bytes().to_vec();
+            io.owner.run(Dispatch::Mutation, deadline, move || {
+                let change = Change::new();
+                change.finish((|| {
+                    validate_payload_lock(&context, &lease, &budget)?;
+                    validate_intent(&context, &lease, operation, &bytes, &budget)?;
+                    let root = PayloadRoot(root)
+                        .check(&context, &budget)?
+                        .ok_or(NativeError::Missing)?;
+                    let journal: super::super::payload::recovery::OperationRecord =
+                        records::record_data(&records::RecordName::Operation(operation), &bytes)?;
+                    if journal.role(observed.role)?.original
+                        != super::super::payload::recovery::OriginalLeaf::Present(
+                            observed.observed.identity.into(),
+                        )
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    let parent =
+                        ensure_payload_child(&root, "payload-backups", &context, &budget, &change)?;
+                    let parent = ensure_payload_child(
+                        &parent,
+                        &records::hex(&operation),
+                        &context,
+                        &budget,
+                        &change,
+                    )?;
+                    change.reached();
+                    root.move_opaque(
+                        observed.observed,
+                        &parent,
+                        observed.role.leaf(),
+                        &context.security,
+                        &budget,
+                    )
+                })())
+            })
+        }
+        pub(crate) fn publish(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            staged: StagedPe,
+            deadline: &Deadline,
+        ) -> NativeResult<OpenedPe> {
+            io.lock_binding(proof, lock, deadline)?;
+            check_permit(io, permit, Phase::PublishIntent, Some(staged.role))?;
+            if staged.target != io.context.target.nonce || staged.operation != permit.operation() {
+                return Err(NativeError::Foreign);
+            }
+            let root = self.0.clone();
+            let context = io.context.clone();
+            let lease = lock.0.clone();
+            let budget = proof.budget(io, deadline)?;
+            let operation = permit.operation();
+            let bytes = permit.bytes().to_vec();
+            io.owner.run(Dispatch::Mutation, deadline, move || {
+                let change = Change::new();
+                change.finish((|| {
+                    validate_payload_lock(&context, &lease, &budget)?;
+                    validate_intent(&context, &lease, operation, &bytes, &budget)?;
+                    let root = PayloadRoot(root)
+                        .check(&context, &budget)?
+                        .ok_or(NativeError::Missing)?;
+                    let fresh = native::measure_image(
+                        staged.image.file.clone(),
+                        staged.expected.version(),
+                        &budget,
+                    )?;
+                    if fresh.identity != staged.image.identity
+                        || fresh.facts != *staged.expected.facts()
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    drop(fresh);
+                    change.reached();
+                    staged.parent.publish_image(
+                        &staged.image,
+                        &root,
+                        staged.role.leaf(),
+                        &context.security,
+                        &budget,
+                    )?;
+                    // Drop the writable stage before returning a readonly approved fixed-image pin.
+                    let identity = staged.image.identity;
+                    let expected = staged.expected;
+                    drop(staged.image);
+                    let image = root.open_image(
+                        staged.role.leaf(),
+                        true,
+                        expected.version(),
+                        &context.security,
+                        &budget,
+                    )?;
+                    if image.identity != identity || image.facts != *expected.facts() {
+                        return Err(NativeError::OutcomeUnknown);
+                    }
+                    Ok(OpenedPe(Arc::new(ApprovedImage {
+                        target: context.target.nonce,
+                        parent: root,
+                        leaf: staged.role.leaf().into(),
+                        image,
+                        expected,
+                    })))
+                })())
+            })
+        }
+        pub(crate) fn prune(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            completed: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<PruneOutcome> {
+            io.lock_binding(proof, lock, deadline)?;
+            check_permit(io, permit, Phase::PruneIntent, None)?;
+            let root = self.0.clone();
+            let context = io.context.clone();
+            let lease = lock.0.clone();
+            let budget = proof.budget(io, deadline)?;
+            let operation = permit.operation();
+            let bytes = permit.bytes().to_vec();
+            io.owner.run(Dispatch::Mutation, deadline, move || {
+                let change = Change::new();
+                change.finish((|| {
+                    validate_payload_lock(&context, &lease, &budget)?;
+                    validate_intent(&context, &lease, operation, &bytes, &budget)?;
+                    let (_, catalog_bytes) = lease
+                        .parent
+                        .read_private(
+                            &records::RecordName::StageCatalog.file_name()?,
+                            &context.security,
+                            files::MAX_RECORD_BYTES,
+                            &budget,
+                        )?
+                        .ok_or(NativeError::Missing)?;
+                    let catalog: super::super::payload::recovery::StageCatalog =
+                        records::record_data(&records::RecordName::StageCatalog, &catalog_bytes)?;
+                    if !super::super::payload::recovery::prune_candidates(&catalog)?
+                        .contains(&completed)
+                    {
+                        return Err(NativeError::Foreign);
+                    }
+                    let removed = || {
+                        PruneOutcome::Removed(PrunedGeneration {
+                            target: context.target.nonce,
+                            operation,
+                            generation: completed,
+                        })
+                    };
+                    let Some(root) = PayloadRoot(root).check(&context, &budget)? else {
+                        return Ok(removed());
+                    };
+                    let Some(parent) = root.child("payload-backups", &context.security, &budget)?
+                    else {
+                        return Ok(removed());
+                    };
+                    // A failed prune is incomplete retention; the owner must settle before another effect.
+                    change.reached();
+                    match parent.prune_tree(&records::hex(&completed), &context.security, &budget) {
+                        Ok(()) => Ok(removed()),
+                        Err(NativeError::Busy | NativeError::Foreign) => Ok(PruneOutcome::Retained),
+                        Err(error) => Err(error),
+                    }
+                })())
+            })
+        }
+    }
+    struct OffsetReader {
+        file: File,
+        offset: u64,
+    }
+    impl std::io::Read for OffsetReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            use std::os::windows::fs::FileExt;
+            let count = self.file.seek_read(buffer, self.offset)?;
+            self.offset += count as u64;
+            Ok(count)
+        }
+    }
+    fn ensure_payload_child(
+        parent: &Anchor,
+        name: &str,
+        context: &Context,
+        budget: &Deadline,
+        change: &Change,
+    ) -> NativeResult<Anchor> {
+        if let Some(child) = parent.child(name, &context.security, budget)? {
+            return Ok(child);
+        }
+        change.reached();
+        parent.create_child_directory(name, &context.security, budget)
+    }
+    fn check_permit(
+        io: &WindowsNativeIo,
+        permit: &MutationPermit,
+        phase: Phase,
+        role: Option<PayloadRole>,
+    ) -> NativeResult<()> {
+        if !std::ptr::eq(io, permit.io().as_ref())
+            || permit.phase() != phase
+            || permit.role() != role
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+    fn validate_payload_lock(
+        context: &Context,
+        lease: &LockState,
+        budget: &Deadline,
+    ) -> NativeResult<()> {
+        context.validate(budget)?;
+        if lease.target != context.target.nonce {
+            return Err(NativeError::Foreign);
+        }
+        lease.parent.revalidate(&context.security, true, budget)?;
+        if native::observe(&lease.file, "install.lock", &context.security)?.identity
+            != lease.identity
+        {
+            return Err(NativeError::Foreign);
+        }
+        budget.check()
+    }
+    fn validate_intent(
+        context: &Context,
+        lease: &LockState,
+        operation: [u8; 16],
+        expected: &[u8],
+        budget: &Deadline,
+    ) -> NativeResult<()> {
+        let name = records::RecordName::Operation(operation);
+        let (_, bytes) = lease
+            .parent
+            .read_private(
+                &name.file_name()?,
+                &context.security,
+                files::MAX_RECORD_BYTES,
+                budget,
+            )?
+            .ok_or(NativeError::Missing)?;
+        if bytes != expected {
+            return Err(NativeError::Foreign);
+        }
+        let (_, catalog) = lease
+            .parent
+            .read_private(
+                &records::RecordName::StageCatalog.file_name()?,
+                &context.security,
+                files::MAX_RECORD_BYTES,
+                budget,
+            )?
+            .ok_or(NativeError::Missing)?;
+        let catalog: super::super::payload::recovery::StageCatalog =
+            records::record_data(&records::RecordName::StageCatalog, &catalog)?;
+        catalog.validate()?;
+        if catalog.active != Some(operation) {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
     pub struct WindowsNativeIo {
         context: Arc<Context>,
         owner: Arc<CallOwner>,
@@ -385,6 +1371,18 @@ mod adapter {
         }
     }
     impl AgentObservation {
+        /// Revalidates the same selected process before exposing its original creation fact.
+        // A4b native supervisor generation uses the original retained-process creation fact.
+        #[allow(dead_code)]
+        pub(crate) fn creation_time(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<u64> {
+            self.revalidate(io, proof, deadline)?;
+            Ok(self.0.process.creation_time())
+        }
         pub(crate) fn bootstrap(&self) -> &crate::agent_contract::BootstrapV1 {
             &self.0.bootstrap
         }
@@ -647,6 +1645,192 @@ mod adapter {
                 context: Arc::new(context),
                 owner,
                 clock,
+            })
+        }
+        pub(crate) fn payload_root(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<PayloadRoot> {
+            self.lock_binding(proof, lock, deadline)?;
+            let budget = proof.budget(self, deadline)?;
+            let context = self.context.clone();
+            let lease = lock.0.clone();
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                validate_payload_lock(&context, &lease, &budget)?;
+                let install = Anchor::open(
+                    context.target.paths.install(),
+                    &context.security,
+                    true,
+                    &budget,
+                )?
+                .map(Arc::new);
+                let canonical = match &install {
+                    Some(root) => root
+                        .canonical_dos_path(&context.security, &budget)?
+                        .to_str()
+                        .ok_or(NativeError::Unsupported)?
+                        .to_owned(),
+                    None => context.target.paths.install().to_owned(),
+                };
+                Ok(PayloadRoot(Arc::new(PayloadRootData {
+                    target: context.target.nonce,
+                    install: Mutex::new(install),
+                    canonical,
+                })))
+            })
+        }
+        /// Retires ONLY an opaque positive post-prune absence result, under the existing intent.
+        pub(crate) fn retire_pruned(
+            &self,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &MutationPermit,
+            pruned: PrunedGeneration,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.lock_binding(proof, lock, deadline)?;
+            check_permit(self, permit, Phase::PruneIntent, None)?;
+            if pruned.target != self.context.target.nonce || pruned.operation != permit.operation()
+            {
+                return Err(NativeError::Foreign);
+            }
+            let context = self.context.clone();
+            let lease = lock.0.clone();
+            let budget = proof.budget(self, deadline)?;
+            let expected = permit.bytes().to_vec();
+            let owner = self.owner.clone();
+            self.owner.run(Dispatch::Mutation, deadline, move || {
+                validate_payload_lock(&context, &lease, &budget)?;
+                validate_intent(&context, &lease, pruned.operation, &expected, &budget)?;
+                let (_, bytes) = lease
+                    .parent
+                    .read_private(
+                        &records::RecordName::StageCatalog.file_name()?,
+                        &context.security,
+                        files::MAX_RECORD_BYTES,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                let mut catalog: super::super::payload::recovery::StageCatalog =
+                    records::record_data(&records::RecordName::StageCatalog, &bytes)?;
+                if catalog.active != Some(pruned.operation)
+                    || !super::super::payload::recovery::prune_candidates(&catalog)?
+                        .contains(&pruned.generation)
+                {
+                    return Err(NativeError::Foreign);
+                }
+                // Recheck positive absence immediately before retiring correlation. A recreated
+                // entry is retained, even though an earlier prune returned a genuine sealed result.
+                if let Some(root) = Anchor::open(
+                    context.target.paths.install(),
+                    &context.security,
+                    true,
+                    &budget,
+                )? && let Some(backups) =
+                    root.child("payload-backups", &context.security, &budget)?
+                    && backups
+                        .opaque(
+                            &records::hex(&pruned.generation),
+                            false,
+                            &context.security,
+                            &budget,
+                        )?
+                        .is_some()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                super::super::payload::recovery::retire_completed(&mut catalog, pruned.generation)?;
+                let bytes = records::encode_record(
+                    &records::RecordName::StageCatalog,
+                    serde_json::to_value(&catalog).map_err(|_| NativeError::Invalid)?,
+                )?;
+                let mut store = NativeStore {
+                    context,
+                    lease,
+                    budget,
+                    name: records::RecordName::StageCatalog,
+                    change: Change::new(),
+                };
+                let budget = store.budget.clone();
+                let publication = records::publish(&mut store, &bytes, &budget);
+                let publication = store.change.finish(publication)?;
+                if publication.native_failure.is_some()
+                    || publication.state != records::PublicationRecovery::NewPublished
+                {
+                    owner.retire_mutations();
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                Ok(())
+            })
+        }
+        pub(crate) fn self_image_reader(
+            &self,
+            image: &SelfImagePin,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<Box<dyn std::io::Read + Send>> {
+            image.reverify(self, proof, deadline)?;
+            let budget = proof.budget(self, deadline)?;
+            let image = image.0.clone();
+            let context = self.context.clone();
+            let file = self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                image
+                    .image
+                    .file
+                    .try_clone()
+                    .map_err(|_| NativeError::Unavailable)
+            })?;
+            Ok(Box::new(OffsetReader { file, offset: 0 }))
+        }
+        pub(crate) fn self_image(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<SelfImagePin> {
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentProcess, QueryFullProcessImageNameW,
+            };
+            let budget = proof.budget(self, deadline)?;
+            let context = self.context.clone();
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                let mut buffer = vec![0u16; 32768];
+                let mut size = buffer.len() as u32;
+                // SAFETY: this process's pseudo-handle only; query own executing module path, no PID lookup.
+                if unsafe {
+                    QueryFullProcessImageNameW(
+                        GetCurrentProcess(),
+                        0,
+                        buffer.as_mut_ptr(),
+                        &mut size,
+                    )
+                } == 0
+                {
+                    return Err(native::last_error());
+                }
+                let path = String::from_utf16(&buffer[..size as usize])
+                    .map_err(|_| NativeError::Unavailable)?;
+                let (parent, leaf) = path.rsplit_once('\\').ok_or(NativeError::Unsupported)?;
+                let parent = Arc::new(
+                    Anchor::open(parent, &context.security, false, &budget)?
+                        .ok_or(NativeError::Missing)?,
+                );
+                let image = parent.open_image(
+                    leaf,
+                    false,
+                    env!("CARGO_PKG_VERSION"),
+                    &context.security,
+                    &budget,
+                )?;
+                Ok(SelfImagePin(Arc::new(OwnImage {
+                    target: context.target.nonce,
+                    parent,
+                    leaf: leaf.into(),
+                    image,
+                })))
             })
         }
         pub fn target(&self) -> &WindowsTarget {

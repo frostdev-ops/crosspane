@@ -353,6 +353,12 @@ pub(crate) mod selected {
         Exited { creation: u64, code: u32 },
     }
     impl SelectedProcess {
+        /// Original raw creation FILETIME of the retained, admitted kernel process.
+        // A4b native supervisor generation consumes this newly admitted read-only fact.
+        #[allow(dead_code)]
+        pub(crate) fn creation_time(&self) -> u64 {
+            self.facts.created
+        }
         /// Called only inside the fixed AgentObservation factory's bounded native owner.
         pub(crate) fn admit(
             bootstrap: &BootstrapV1,

@@ -17,6 +17,21 @@ fn main() {
     #[cfg(windows)]
     {
         let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+        // The fixed helper entry is admitted before any supervisor, diagnose or GUI work.
+        match crosspane_installer::platform::windows::replace_helper_mode(&arguments) {
+            Ok(true) => {
+                if let Err(error) = crosspane_installer::platform::windows::replace_helper_entry() {
+                    eprintln!("Crosspane Installer replace helper: {error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Err(_) => {
+                eprintln!("Crosspane Installer replace helper: invalid arguments");
+                std::process::exit(2);
+            }
+            Ok(false) => {}
+        }
         match crosspane_installer::platform::windows::service::supervisor_mode(&arguments) {
             Ok(true) => {
                 if let Err(error) =

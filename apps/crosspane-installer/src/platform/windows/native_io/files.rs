@@ -177,6 +177,7 @@ impl ComponentName {
 pub(crate) enum ObjectKind {
     Directory,
     File,
+    Opaque,
 }
 pub(crate) struct ComponentRequest {
     pub name: ComponentName,
@@ -531,7 +532,9 @@ pub(crate) mod native {
         type Object = File;
         fn submit(&self, parent: Option<&File>, request: &ComponentRequest) -> NativeResult<File> {
             let parent = parent.ok_or(NativeError::Foreign)?;
-            if !request.dont_reparse || !request.open_reparse_point {
+            if !request.open_reparse_point
+                || (!request.dont_reparse && (request.kind != ObjectKind::Opaque || request.create))
+            {
                 return Err(NativeError::Foreign);
             }
             let units: Vec<u16> = request.name.as_str().encode_utf16().collect();
@@ -546,7 +549,11 @@ pub(crate) mod native {
                 Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
                 RootDirectory: parent.as_raw_handle(),
                 ObjectName: &name,
-                Attributes: OBJ_DONT_REPARSE,
+                Attributes: if request.dont_reparse {
+                    OBJ_DONT_REPARSE
+                } else {
+                    OBJ_CASE_INSENSITIVE
+                },
                 SecurityDescriptor: self
                     .descriptor
                     .map_or(std::ptr::null(), |value| value.0.cast()),
@@ -557,14 +564,23 @@ pub(crate) mod native {
             let kind = match request.kind {
                 ObjectKind::Directory => FILE_DIRECTORY_FILE,
                 ObjectKind::File => FILE_NON_DIRECTORY_FILE,
+                ObjectKind::Opaque => 0,
             };
             // SAFETY: retained admitted parent handle; exactly one checked counted component;
-            // public SDK structures/binding, strict open/create and no reparse following. No
-            // case-insensitive, inherit, privilege-bypass, overwrite or full-path fallback.
+            // public SDK structures/binding; strict ancestors/approved leaves remain exact-case.
+            // Only an existing opaque final entry uses case-insensitive lookup plus OPEN_REPARSE_POINT;
+            // it never follows its target. No inherit, privilege-bypass, overwrite or path fallback.
             let status = unsafe {
                 NtCreateFile(
                     &mut raw,
-                    self.access | READ_CONTROL_ACCESS | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    self.access
+                        | FILE_READ_ATTRIBUTES
+                        | SYNCHRONIZE
+                        | if request.kind == ObjectKind::Opaque {
+                            0
+                        } else {
+                            READ_CONTROL_ACCESS
+                        },
                     &attributes,
                     &mut status_block,
                     std::ptr::null(),
@@ -632,6 +648,7 @@ pub(crate) mod native {
         let access = match kind {
             ObjectKind::Directory => FILE_LIST_DIRECTORY | FILE_TRAVERSE,
             ObjectKind::File => GENERIC_READ | GENERIC_WRITE | super::DELETE,
+            ObjectKind::Opaque => return Err(NativeError::Invalid),
         };
         relative_component(
             &NativeComponentIo {
@@ -1066,6 +1083,571 @@ pub(crate) mod native {
             deadline.check()?;
             Ok(())
         }
+    }
+
+    /// Raw observed PE facts are not approval. The caller supplies the embedded expected pin.
+    pub(crate) struct ImageData {
+        pub file: Arc<File>,
+        pub identity: FileIdentity,
+        pub canonical: String,
+        pub facts: super::super::super::payload::inventory::PeFacts,
+    }
+    pub(crate) struct OpaqueData {
+        file: File,
+        pub identity: FileIdentity,
+        name: String,
+    }
+    fn raw_identity(file: &File) -> NativeResult<FileIdentity> {
+        // SAFETY: retained native leaf handle; query only, no device/pipe accepted.
+        if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
+            return Err(NativeError::Foreign);
+        }
+        let id: FILE_ID_INFO = info(file, FileIdInfo)?;
+        let value = FileIdentity {
+            volume: id.VolumeSerialNumber,
+            file: id.FileId.Identifier,
+        };
+        if value.volume == 0 || value.file == [0; 16] {
+            return Err(NativeError::Foreign);
+        }
+        Ok(value)
+    }
+    fn canonical_file(file: &File, deadline: &Deadline) -> NativeResult<String> {
+        let mut units = vec![0u16; MAX_PATH_UNITS];
+        // SAFETY: query of exactly the retained file, complete bounded UTF-16 output.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                units.as_mut_ptr(),
+                units.len() as u32,
+                VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if len == 0 || len >= units.len() {
+            return Err(last_error());
+        }
+        deadline.check()?;
+        String::from_utf16(&units[..len]).map_err(|_| NativeError::Unavailable)
+    }
+    pub(crate) fn measure_image(
+        file: Arc<File>,
+        version: &str,
+        deadline: &Deadline,
+    ) -> NativeResult<ImageData> {
+        use super::super::super::payload::inventory::{MAX_IMAGE_BYTES, PeFacts, pe_header};
+        use aws_lc_rs::digest::{Context, SHA256};
+        use std::os::windows::fs::FileExt;
+        let before = raw_identity(&file)?;
+        let standard: FILE_STANDARD_INFO = info(&file, FileStandardInfo)?;
+        let size = u64::try_from(standard.EndOfFile).map_err(|_| NativeError::Oversize)?;
+        if standard.Directory || !(128..=MAX_IMAGE_BYTES).contains(&size) {
+            return Err(NativeError::Unsupported);
+        }
+        let mut digest = Context::new(&SHA256);
+        let mut prefix = Vec::new();
+        let mut block = vec![0; 64 * 1024];
+        let mut offset = 0;
+        while offset < size {
+            deadline.check()?;
+            let requested = usize::try_from((size - offset).min(block.len() as u64))
+                .map_err(|_| NativeError::Oversize)?;
+            let count = file
+                .seek_read(&mut block[..requested], offset)
+                .map_err(|_| NativeError::Unavailable)?;
+            if count == 0 {
+                return Err(NativeError::Unavailable);
+            }
+            digest.update(&block[..count]);
+            let kept = count.min((1024 * 1024usize).saturating_sub(prefix.len()));
+            prefix.extend_from_slice(&block[..kept]);
+            offset += count as u64;
+        }
+        let after: FILE_STANDARD_INFO = info(&file, FileStandardInfo)?;
+        if raw_identity(&file)? != before || after.EndOfFile != standard.EndOfFile {
+            return Err(NativeError::Foreign);
+        }
+        let (machine, subsystem) = pe_header(&prefix, size)?;
+        let mut sha256 = [0; 32];
+        sha256.copy_from_slice(digest.finish().as_ref());
+        let facts = PeFacts {
+            size,
+            sha256,
+            machine,
+            subsystem,
+            version: version.into(),
+        };
+        deadline.check()?;
+        Ok(ImageData {
+            canonical: canonical_file(&file, deadline)?,
+            file,
+            identity: before,
+            facts,
+        })
+    }
+    impl Anchor {
+        pub(crate) fn child(
+            &self,
+            child: &str,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<Self>> {
+            self.revalidate(security, false, deadline)?;
+            let name = ComponentName::new(child)?;
+            let Some(file) = open_component(
+                self.file()?,
+                &name,
+                ObjectKind::Directory,
+                FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                deadline,
+            )?
+            else {
+                return Ok(None);
+            };
+            let facts = observe(&file, child, security)?;
+            admit_component(&facts, Admission::PrivateDirectory)?;
+            if facts.identity.volume != self.identity()?.volume {
+                return Err(NativeError::Foreign);
+            }
+            let mut value = self.clone();
+            value.path = format!("{}\\{child}", self.path.trim_end_matches('\\'));
+            value.pins.push(Pin {
+                file: Arc::new(file),
+                facts,
+            });
+            Ok(Some(value))
+        }
+        pub(crate) fn open_image(
+            &self,
+            leaf: &str,
+            private: bool,
+            version: &str,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<ImageData> {
+            self.open_image_access(leaf, private, false, version, security, deadline)
+        }
+        pub(crate) fn open_staged_image(
+            &self,
+            leaf: &str,
+            version: &str,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<ImageData> {
+            self.open_image_access(leaf, true, true, version, security, deadline)
+        }
+        fn open_image_access(
+            &self,
+            leaf: &str,
+            private: bool,
+            delete: bool,
+            version: &str,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<ImageData> {
+            self.revalidate(security, false, deadline)?;
+            let file = open_component(
+                self.file()?,
+                &ComponentName::new(leaf)?,
+                ObjectKind::File,
+                GENERIC_READ
+                    | if delete {
+                        super::DELETE | GENERIC_WRITE
+                    } else {
+                        0
+                    },
+                FILE_SHARE_READ,
+                deadline,
+            )?
+            .ok_or(NativeError::Missing)?;
+            let facts = observe(&file, leaf, security)?;
+            if private {
+                admit_component(&facts, Admission::PrivateFile)?;
+            } else if facts.reparse || facts.directory || facts.actual != leaf || facts.links != 1 {
+                return Err(NativeError::Foreign);
+            }
+            if facts.identity.volume != self.identity()?.volume {
+                return Err(NativeError::Foreign);
+            }
+            measure_image(Arc::new(file), version, deadline)
+        }
+        /// Opens only the opaque entry below an admitted parent; OPEN_REPARSE_POINT bypasses
+        /// processing of THIS leaf. No directory traversal or approval of its ACL/contents occurs.
+        pub(crate) fn opaque(
+            &self,
+            leaf: &str,
+            exclusive: bool,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<Option<OpaqueData>> {
+            self.revalidate(security, false, deadline)?;
+            let request = ComponentRequest {
+                name: ComponentName::new(leaf)?,
+                kind: ObjectKind::Opaque,
+                create: false,
+                dont_reparse: false,
+                open_reparse_point: true,
+            };
+            deadline.check()?;
+            let file = match (NativeComponentIo {
+                access: if exclusive { super::DELETE } else { 0 },
+                sharing: if exclusive {
+                    0
+                } else {
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                },
+                descriptor: None,
+            })
+            .submit(Some(self.file()?), &request)
+            {
+                Ok(file) => file,
+                Err(NativeError::Missing) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            // NT's opaque-only single-component lookup chose this entry. Preserve its actual
+            // spelling; differently cased stale leaves at a case-insensitive fixed path are backups.
+            let actual = name(&file)?;
+            ComponentName::new(&actual)?;
+            let identity = raw_identity(&file)?;
+            if identity.volume != self.identity()?.volume {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()?;
+            Ok(Some(OpaqueData {
+                file,
+                identity,
+                name: actual,
+            }))
+        }
+        pub(crate) fn stage_image(
+            &self,
+            leaf: &str,
+            mut input: Box<dyn std::io::Read + Send>,
+            expected: &super::super::super::payload::inventory::ApprovedPe,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<ImageData> {
+            use std::io::Write;
+            let mut file = self.create_private(&PrivateName::new(leaf)?, security, deadline)?;
+            let mut block = vec![0; 64 * 1024];
+            let mut count = 0u64;
+            loop {
+                deadline.check()?;
+                let remaining = expected.size().saturating_sub(count);
+                // Probe one extra byte at the exact limit without allocating the entire executable.
+                let limit = usize::try_from(remaining.min(block.len() as u64).max(1))
+                    .map_err(|_| NativeError::Oversize)?;
+                let read = input
+                    .read(&mut block[..limit])
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+                if read == 0 {
+                    break;
+                }
+                count = count
+                    .checked_add(read as u64)
+                    .ok_or(NativeError::Oversize)?;
+                if count > expected.size() {
+                    return Err(NativeError::Oversize);
+                }
+                deadline.check()?;
+                file.write_all(&block[..read])
+                    .map_err(|_| NativeError::OutcomeUnknown)?;
+            }
+            if count != expected.size() {
+                return Err(NativeError::Unsupported);
+            }
+            deadline.check()?;
+            // SAFETY: retained own CREATE_NEW writable stage; no replace/POSIX bypass flags.
+            if unsafe { FlushFileBuffers(file.as_raw_handle()) } == 0 {
+                return Err(last_error());
+            }
+            let image = measure_image(Arc::new(file), expected.version(), deadline)?;
+            if image.facts != *expected.facts() {
+                return Err(NativeError::Unsupported);
+            }
+            Ok(image)
+        }
+        pub(crate) fn move_opaque(
+            &self,
+            mut source: OpaqueData,
+            destination: &Anchor,
+            leaf: &str,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<FileIdentity> {
+            self.revalidate(security, false, deadline)?;
+            destination.revalidate(security, true, deadline)?;
+            let expected = source.identity;
+            // Settle the observation pin before acquiring positive exclusive DELETE admission.
+            let old_name = source.name.clone();
+            drop(source.file);
+            source = self
+                .opaque(&old_name, true, security, deadline)?
+                .ok_or(NativeError::Foreign)?;
+            if source.identity != expected {
+                return Err(NativeError::Foreign);
+            }
+            rename_no_replace(&source.file, destination, leaf, deadline)?;
+            if raw_identity(&source.file)? != expected || name(&source.file)? != leaf {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(expected)
+        }
+        pub(crate) fn publish_image(
+            &self,
+            image: &ImageData,
+            destination: &Anchor,
+            leaf: &str,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.revalidate(security, true, deadline)?;
+            destination.revalidate(security, true, deadline)?;
+            if raw_identity(&image.file)? != image.identity {
+                return Err(NativeError::Foreign);
+            }
+            rename_no_replace(&image.file, destination, leaf, deadline)?;
+            if name(&image.file)? != leaf || raw_identity(&image.file)? != image.identity {
+                return Err(NativeError::OutcomeUnknown);
+            }
+            Ok(())
+        }
+        pub(crate) fn entry_names(
+            &self,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<Vec<String>> {
+            self.revalidate(security, true, deadline)?;
+            entries(self.file()?, deadline)
+        }
+        /// Bounded no-follow deletion, only below a completed fixed backup-generation handle.
+        pub(crate) fn prune_tree(
+            &self,
+            leaf: &str,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.revalidate(security, true, deadline)?;
+            let request = ComponentRequest {
+                name: ComponentName::new(leaf)?,
+                kind: ObjectKind::Opaque,
+                create: false,
+                dont_reparse: false,
+                open_reparse_point: true,
+            };
+            let file = match (NativeComponentIo {
+                access: super::DELETE | FILE_LIST_DIRECTORY,
+                sharing: 0,
+                descriptor: None,
+            })
+            .submit(Some(self.file()?), &request)
+            {
+                Ok(file) => file,
+                Err(NativeError::Missing) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let identity = raw_identity(&file)?;
+            if identity.volume != self.identity()?.volume {
+                return Err(NativeError::Foreign);
+            }
+            let root = OpaqueData {
+                file,
+                identity,
+                name: leaf.into(),
+            };
+            let mut budget = 1024usize;
+            prune_leaf(root, deadline, 0, &mut budget)?;
+            match self.opaque(leaf, false, security, deadline)? {
+                None => Ok(()),
+                Some(_) => Err(NativeError::OutcomeUnknown),
+            }
+        }
+    }
+    fn rename_no_replace(
+        source: &File,
+        destination: &Anchor,
+        leaf: &str,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        ComponentName::new(leaf)?;
+        let units: Vec<u16> = leaf.encode_utf16().collect();
+        let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let length = offset
+            .checked_add(units.len() * 2)
+            .ok_or(NativeError::Invalid)?;
+        let mut buffer = vec![
+            0u64;
+            length
+                .max(std::mem::size_of::<FILE_RENAME_INFO>())
+                .div_ceil(8)
+        ];
+        let pointer = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: aligned complete variable buffer; single checked component under retained root.
+        // ReplaceIfExists=false preserves backup collisions and loaded-image sharing refusal.
+        unsafe {
+            (*pointer).Anonymous.ReplaceIfExists = false;
+            (*pointer).RootDirectory = destination.file()?.as_raw_handle();
+            (*pointer).FileNameLength = (units.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(
+                units.as_ptr(),
+                buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
+                units.len(),
+            );
+        }
+        deadline.check()?;
+        // SAFETY: retained source with DELETE, same-volume root, no following/copy/overwrite fallback.
+        if unsafe {
+            SetFileInformationByHandle(
+                source.as_raw_handle(),
+                FileRenameInfo,
+                pointer.cast(),
+                length as u32,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        deadline.check()
+    }
+    fn entries(file: &File, deadline: &Deadline) -> NativeResult<Vec<String>> {
+        let mut output = Vec::new();
+        let mut restart = true;
+        loop {
+            deadline.check()?;
+            let mut buffer = vec![0u64; 8192];
+            // SAFETY: retained non-reparse directory, aligned bounded enumeration output. Names
+            // are observations only; each child is separately opened relative with no traversal.
+            if unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    if restart {
+                        FileIdBothDirectoryRestartInfo
+                    } else {
+                        FileIdBothDirectoryInfo
+                    },
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                )
+            } == 0
+            {
+                // SAFETY: reads this thread's last completed query error.
+                let code = unsafe { GetLastError() };
+                if code == ERROR_NO_MORE_FILES {
+                    break;
+                }
+                return Err(error(code));
+            }
+            restart = false;
+            let mut at = 0usize;
+            loop {
+                let header = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                if at + header > buffer.len() * 8 {
+                    return Err(NativeError::Unavailable);
+                }
+                // SAFETY: current fixed header lies inside complete successful aligned output.
+                let row = unsafe { buffer.as_ptr().cast::<u8>().add(at) };
+                // SAFETY: both fixed u32 fields lie within the checked header; no flexible-array reference.
+                let bytes = unsafe {
+                    row.add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength))
+                        .cast::<u32>()
+                        .read_unaligned()
+                } as usize;
+                if !bytes.is_multiple_of(2) || at + header + bytes > buffer.len() * 8 {
+                    return Err(NativeError::Unavailable);
+                }
+                // SAFETY: exact variable UTF-16 name range checked in the live output allocation.
+                let units = unsafe {
+                    std::slice::from_raw_parts(
+                        buffer.as_ptr().cast::<u8>().add(at + header).cast::<u16>(),
+                        bytes / 2,
+                    )
+                };
+                let name = String::from_utf16(units).map_err(|_| NativeError::Unavailable)?;
+                if name != "." && name != ".." {
+                    ComponentName::new(&name)?;
+                    output.push(name);
+                    if output.len() > 1024 {
+                        return Err(NativeError::Oversize);
+                    }
+                }
+                // SAFETY: first u32 field lies within the previously checked fixed header.
+                let next = unsafe { row.cast::<u32>().read_unaligned() } as usize;
+                if next == 0 {
+                    break;
+                }
+                if next < header
+                    || !next.is_multiple_of(8)
+                    || at.checked_add(next).is_none_or(|value| value <= at)
+                {
+                    return Err(NativeError::Unavailable);
+                }
+                at += next;
+            }
+        }
+        Ok(output)
+    }
+    fn prune_leaf(
+        leaf: OpaqueData,
+        deadline: &Deadline,
+        depth: usize,
+        budget: &mut usize,
+    ) -> NativeResult<()> {
+        deadline.check()?;
+        if depth > 32 || *budget == 0 {
+            return Err(NativeError::Oversize);
+        }
+        *budget -= 1;
+        let standard: FILE_STANDARD_INFO = info(&leaf.file, FileStandardInfo)?;
+        let tag: FILE_ATTRIBUTE_TAG_INFO = info(&leaf.file, FileAttributeTagInfo)?;
+        if standard.Directory && tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            for name in entries(&leaf.file, deadline)? {
+                let request = ComponentRequest {
+                    name: ComponentName::new(&name)?,
+                    kind: ObjectKind::Opaque,
+                    create: false,
+                    dont_reparse: false,
+                    open_reparse_point: true,
+                };
+                let file = (NativeComponentIo {
+                    access: super::DELETE | FILE_LIST_DIRECTORY,
+                    sharing: 0,
+                    descriptor: None,
+                })
+                .submit(Some(&leaf.file), &request)?;
+                let identity = raw_identity(&file)?;
+                if identity.volume != leaf.identity.volume {
+                    return Err(NativeError::Foreign);
+                }
+                if self::name(&file)? != name {
+                    return Err(NativeError::Foreign);
+                }
+                prune_leaf(
+                    OpaqueData {
+                        file,
+                        identity,
+                        name,
+                    },
+                    deadline,
+                    depth + 1,
+                    budget,
+                )?;
+            }
+        }
+        let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        deadline.check()?;
+        // SAFETY: exact exclusively opened entry itself; reparse targets never enumerated or deleted.
+        if unsafe {
+            SetFileInformationByHandle(
+                leaf.file.as_raw_handle(),
+                FileDispositionInfo,
+                (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        deadline.check()
     }
 
     /// Fixture-only creator ledger, not reconstructed from disk or deserialized bytes.

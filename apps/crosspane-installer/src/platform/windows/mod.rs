@@ -2,8 +2,27 @@
 //! install, agent, task or payload capability.
 pub mod detect;
 pub mod native_io;
+pub(crate) mod payload;
 pub mod service;
 pub mod transport;
+
+/// Fixed-argument binary entry only; it grants no root, process or operation authority.
+#[doc(hidden)]
+pub fn replace_helper_mode(arguments: &[std::ffi::OsString]) -> native_io::NativeResult<bool> {
+    payload::helper::replace_helper_mode(arguments)
+}
+
+/// Run the admitted fixed helper without initializing the installer GUI.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn replace_helper_entry() -> native_io::NativeResult<()> {
+    match payload::helper::replace_helper_entry()? {
+        payload::helper::HelperExit::HandoffCompleted => Ok(()),
+        payload::helper::HelperExit::RecoveryRetained => {
+            Err(native_io::NativeError::OutcomeUnknown)
+        }
+    }
+}
 
 /// Construct the shell without any install, agent or native-resource capability.
 pub fn unavailable(

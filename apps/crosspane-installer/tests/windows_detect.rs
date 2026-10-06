@@ -4,6 +4,13 @@
 mod detect;
 #[path = "../src/platform/windows/native_io.rs"]
 mod native_io;
+#[path = "../src/platform/windows/payload.rs"]
+mod payload;
+#[path = "../src/platform/windows/service.rs"]
+mod service;
+#[cfg(windows)]
+#[path = "../src/platform/windows/transport.rs"]
+mod transport;
 
 use crosspane_installer::agent_contract;
 use detect::*;

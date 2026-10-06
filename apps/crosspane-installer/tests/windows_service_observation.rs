@@ -5,6 +5,10 @@ use crosspane_installer::agent_contract;
 mod detect;
 #[path = "../src/platform/windows/native_io.rs"]
 mod native_io;
+#[path = "../src/platform/windows/payload.rs"]
+mod payload;
+#[path = "../src/platform/windows/service.rs"]
+mod service;
 #[path = "../src/platform/windows/transport.rs"]
 mod transport;
 use agent_contract::{BootstrapPhase, BootstrapV1, InstanceStatus};
