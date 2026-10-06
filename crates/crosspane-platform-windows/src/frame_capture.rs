@@ -96,6 +96,8 @@ struct Shared {
     monitor_reader: Option<MonitorSnapshotReader>,
     alive: AtomicBool,
     fault: AtomicBool,
+    #[cfg(feature = "gpu")]
+    gpu: Mutex<Option<Arc<crate::gpu::WindowsGpu>>>,
 }
 impl Shared {
     fn permitted(&self, epoch: u64) -> bool {
@@ -115,7 +117,15 @@ struct Call {
 }
 impl Call {
     fn check(&self, shared: &Shared) -> Result<(), PlatformError> {
-        if !shared.permitted(self.epoch) {
+        #[cfg(feature = "gpu")]
+        let setup = matches!(self.operation, Operation::Gpu(_));
+        #[cfg(not(feature = "gpu"))]
+        let setup = false;
+        // Device construction observes no captured surface and does not open the node gate.
+        if !shared.alive.load(Ordering::Acquire)
+            || shared.fault.load(Ordering::Acquire)
+            || (!setup && !shared.permitted(self.epoch))
+        {
             return Err(PlatformError::Locked);
         }
         if self.abandoned.load(Ordering::Acquire) || Instant::now() >= self.until {
@@ -125,6 +135,8 @@ impl Call {
     }
 }
 enum Operation {
+    #[cfg(feature = "gpu")]
+    Gpu(wgpu::Features),
     Start {
         id: StreamId,
         target: CaptureTarget,
@@ -151,6 +163,20 @@ impl fmt::Debug for WindowsFrameCapture {
     }
 }
 impl WindowsFrameCapture {
+    /// Enable a source-only device before streams exist; CPU WGC remains available on refusal.
+    #[cfg(feature = "gpu")]
+    pub fn enable_gpu(
+        &self,
+        wanted: wgpu::Features,
+    ) -> Result<Arc<crate::gpu::WindowsGpu>, PlatformError> {
+        self.call(Operation::Gpu(wanted))?;
+        self.shared
+            .gpu
+            .lock()
+            .map_err(|_| backend("GPU initialization poisoned"))?
+            .clone()
+            .ok_or_else(|| backend("GPU initialization missing"))
+    }
     pub fn new(gate: Arc<IoGate>, resolver: WindowResolver) -> Result<Self, PlatformError> {
         Self::with_reader(gate, resolver, None)
     }
@@ -177,6 +203,8 @@ impl WindowsFrameCapture {
             monitor_reader,
             alive: AtomicBool::new(true),
             fault: AtomicBool::new(false),
+            #[cfg(feature = "gpu")]
+            gpu: Mutex::new(None),
         });
         let (commands, receive) = mpsc::sync_channel(1);
         let (ready, initialized) = mpsc::sync_channel(1);
@@ -216,7 +244,11 @@ impl WindowsFrameCapture {
 
     fn call(&self, operation: Operation) -> Result<(), PlatformError> {
         let epoch = self.shared.gate.epoch();
-        if !self.shared.permitted(epoch) {
+        #[cfg(feature = "gpu")]
+        let setup = matches!(operation, Operation::Gpu(_));
+        #[cfg(not(feature = "gpu"))]
+        let setup = false;
+        if !setup && !self.shared.permitted(epoch) {
             return Err(PlatformError::Locked);
         }
         let until = Instant::now() + BOUND;
@@ -324,7 +356,7 @@ impl Drop for Runtime {
 }
 struct Gpu {
     device: ID3D11Device,
-    context: Mutex<ID3D11DeviceContext>,
+    context: Arc<Mutex<ID3D11DeviceContext>>,
 }
 // The non-Send WinRT wrapper remains on its MTA worker. Native D3D11 objects
 // have binding-provided Send/Sync; all immediate-context access is serialized.
@@ -336,13 +368,17 @@ impl Graphics {
     fn new() -> Result<Self, PlatformError> {
         let mut device = None;
         let mut context = None;
+        #[cfg(feature = "gpu")]
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        #[cfg(not(feature = "gpu"))]
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         // SAFETY: initialized output Options; no SINGLETHREADED flag, context access serialized.
         unsafe {
             D3D11CreateDevice(
                 None,
                 D3D_DRIVER_TYPE_HARDWARE,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                flags,
                 None,
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -350,6 +386,25 @@ impl Graphics {
                 Some(&mut context),
             )
         }
+        .or_else(|error| {
+            if flags == D3D11_CREATE_DEVICE_BGRA_SUPPORT {
+                return Err(error);
+            }
+            // SAFETY: identical initialized outputs; CPU WGC preserves the previous BGRA-only fallback.
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            }
+        })
         .map_err(|e| api("D3D11CreateDevice", e))?;
         let device = device.ok_or_else(|| backend("missing D3D device"))?;
         let context = context.ok_or_else(|| backend("missing D3D context"))?;
@@ -361,7 +416,7 @@ impl Graphics {
         Ok(Self {
             gpu: Arc::new(Gpu {
                 device,
-                context: Mutex::new(context),
+                context: Arc::new(Mutex::new(context)),
             }),
             capture,
         })
@@ -405,6 +460,8 @@ struct Image {
     gpu: Arc<Gpu>,
     gate: Arc<IoGate>,
     epoch: u64,
+    #[cfg(feature = "gpu")]
+    surface: Option<Arc<crate::gpu::Surface>>,
 }
 impl fmt::Debug for Image {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -438,6 +495,14 @@ impl NativeImage for Image {
     fn read(&self, f: &mut dyn FnMut(&[u8], u32)) -> Result<(), PlatformError> {
         if !self.permitted() {
             return Err(PlatformError::Locked);
+        }
+        #[cfg(feature = "gpu")]
+        if self
+            .surface
+            .as_ref()
+            .is_some_and(|surface| !surface.readable())
+        {
+            return Err(backend("GPU image handoff incomplete"));
         }
         let until = Instant::now() + BOUND;
         let context = loop {
@@ -528,6 +593,32 @@ impl NativeImage for Image {
         }
         f(&pixels, row);
         Ok(())
+    }
+}
+
+/// Downcasts only our own retained capture image. The lease holds queue ownership until drop.
+#[cfg(feature = "gpu")]
+pub fn capture_lease<'a>(
+    image: &'a dyn NativeImage,
+    gpu: &'a crate::gpu::WindowsGpu,
+) -> Result<Option<crate::gpu::Lease<'a>>, PlatformError> {
+    let Some(image) = image.as_any().downcast_ref::<Image>() else {
+        return Ok(None);
+    };
+    let Some(surface) = &image.surface else {
+        return Ok(None);
+    };
+    if !surface.belongs(gpu) {
+        return Err(backend("capture GPU device mismatch"));
+    }
+    match surface.begin(gpu, image.gate.clone(), image.epoch) {
+        Ok(lease) => Ok(Some(lease)),
+        Err(error) => {
+            if !matches!(error, PlatformError::Locked) {
+                gpu.retire();
+            }
+            Err(error)
+        }
     }
 }
 
@@ -752,6 +843,12 @@ impl Stream {
         graphics: &Graphics,
         _start: Instant,
     ) -> Result<Option<Frame>, PlatformError> {
+        #[cfg(feature = "gpu")]
+        if let Ok(gpu) = shared.gpu.lock()
+            && let Some(gpu) = gpu.as_ref()
+        {
+            let _ = gpu.healthy();
+        }
         // Drain a bounded number, replacing/releasing older pool frames immediately.
         for _ in 0..4 {
             match frame_result(self.pool.TryGetNextFrame()) {
@@ -796,22 +893,69 @@ impl Stream {
             return Ok(None);
         };
         let output = PixelSize::new(roi.width() as u32, roi.height() as u32);
+        #[cfg(feature = "gpu")]
+        if self.slots.iter().any(|image| {
+            image
+                .surface
+                .as_ref()
+                .is_some_and(|surface| !surface.healthy())
+        }) {
+            // Old resources retire, never become CPU readback. A fresh healthy D3D11 slot may replace them.
+            // SAFETY: read-only status query on the retained WGC device.
+            unsafe { graphics.gpu.device.GetDeviceRemovedReason() }
+                .map_err(|e| api("capture device removed", e))?;
+            self.slots.clear();
+        }
         if self.slots.first().is_none_or(|image| image.size != output) {
             self.slots.clear();
             for _ in 0..2 {
+                #[cfg(feature = "gpu")]
+                let surface = shared
+                    .gpu
+                    .lock()
+                    .map_err(|_| backend("GPU context poisoned"))?
+                    .as_ref()
+                    .filter(|gpu| gpu.healthy().is_ok())
+                    .and_then(|gpu| crate::gpu::Surface::new(gpu.clone(), output).ok());
                 self.slots.push(Arc::new(Image {
                     size: output,
-                    texture: graphics.gpu.texture(output, false)?,
+                    texture: {
+                        #[cfg(feature = "gpu")]
+                        if let Some(surface) = &surface {
+                            surface.shared.texture.clone()
+                        } else {
+                            graphics.gpu.texture(output, false)?
+                        }
+                        #[cfg(not(feature = "gpu"))]
+                        {
+                            graphics.gpu.texture(output, false)?
+                        }
+                    },
                     gpu: Arc::clone(&graphics.gpu),
                     gate: Arc::clone(&shared.gate),
                     epoch: self.epoch,
+                    #[cfg(feature = "gpu")]
+                    surface,
                 }));
             }
         }
         let Some(image) = self
             .slots
             .iter()
-            .find(|image| Arc::strong_count(image) == 1)
+            .find(|image| {
+                let free = Arc::strong_count(image) == 1;
+                #[cfg(feature = "gpu")]
+                {
+                    free && image
+                        .surface
+                        .as_ref()
+                        .is_none_or(|surface| surface.free(true))
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    free
+                }
+            })
             .cloned()
         else {
             return Ok(None);
@@ -885,6 +1029,10 @@ impl Stream {
         unsafe {
             context.CopySubresourceRegion(&image.texture, 0, 0, 0, 0, &texture, 0, Some(&area))
         };
+        #[cfg(feature = "gpu")]
+        if let Some(surface) = &image.surface {
+            surface.copied(&context)?;
+        }
         drop(context);
         drop(held);
         if !shared.permitted(self.epoch) {
@@ -958,6 +1106,23 @@ fn worker(
     while shared.alive.load(Ordering::Acquire) && !shared.fault.load(Ordering::Acquire) {
         if let Ok(call) = receive.recv_timeout(POLL) {
             let result = call.check(shared).and_then(|()| match &call.operation {
+                #[cfg(feature = "gpu")]
+                Operation::Gpu(wanted) => {
+                    if !streams.is_empty() {
+                        return Err(backend("GPU initialization after stream start"));
+                    }
+                    let gpu = crate::gpu::WindowsGpu::new(
+                        graphics.gpu.device.clone(),
+                        graphics.gpu.context.clone(),
+                        *wanted,
+                    )?;
+                    call.check(shared)?;
+                    *shared
+                        .gpu
+                        .lock()
+                        .map_err(|_| backend("GPU context poisoned"))? = Some(gpu);
+                    Ok(())
+                }
                 Operation::Start {
                     id,
                     target,

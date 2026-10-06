@@ -22,6 +22,8 @@ pub mod displays;
 pub mod drag;
 #[cfg(windows)]
 pub mod frame_capture;
+#[cfg(all(windows, feature = "gpu"))]
+pub mod gpu;
 #[cfg(windows)]
 pub mod hotkey;
 #[cfg(windows)]

@@ -351,6 +351,8 @@ pub struct Platform {
 pub struct GpuDevice {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    #[cfg(windows)]
+    pub windows: std::sync::Arc<crosspane_platform_windows::gpu::WindowsGpu>,
 }
 
 /// GPU frame paths are on unless `CROSSPANE_GPU=0` (for comparisons and as an escape hatch).
@@ -485,9 +487,10 @@ pub fn video_codecs(
     }
     #[cfg(all(windows, feature = "video"))]
     {
-        return Some(std::sync::Arc::new(
-            crosspane_platform_windows::video::MfCodecs::new(),
-        ));
+        return Some(std::sync::Arc::new(gpu.map_or_else(
+            crosspane_platform_windows::video::MfCodecs::new,
+            |gpu| crosspane_platform_windows::video::MfCodecs::new().with_gpu(gpu.windows.clone()),
+        )));
     }
     #[allow(unreachable_code)]
     None
@@ -498,6 +501,7 @@ pub fn video_codecs(
 #[cfg(all(windows, feature = "video"))]
 pub(crate) fn windows_receive_codecs(
     host: Option<crosspane_render::proxy::HostHandle>,
+    source: Option<&GpuDevice>,
 ) -> (
     Arc<dyn crosspane_media::codec::VideoCodecs>,
     Option<Arc<crosspane_platform_windows::video::MfDecodeGpu>>,
@@ -510,9 +514,12 @@ pub(crate) fn windows_receive_codecs(
             let _ = host.send(crosspane_render::proxy::HostCommand::Run(Box::new(|| {})));
         })))
     });
+    let codecs = source.map_or_else(MfCodecs::new, |source| {
+        MfCodecs::new().with_gpu(source.windows.clone())
+    });
     let codecs = match &gpu {
-        Some(gpu) => MfCodecs::new().with_decode_gpu(gpu.clone()),
-        None => MfCodecs::new(),
+        Some(gpu) => codecs.with_decode_gpu(gpu.clone()),
+        None => codecs,
     };
     (Arc::new(codecs), gpu)
 }
@@ -1091,6 +1098,16 @@ pub fn create(
             },
         )
     });
+    let gpu = if std::env::var("CROSSPANE_GPU").as_deref() != Ok("0") {
+        frames.as_ref().and_then(|frames| {
+            frames.enable_gpu(wgpu::Features::empty())
+                .map(|windows| GpuDevice { device: windows.device.clone(), queue: windows.queue.clone(), windows })
+                .map_err(|error| tracing::info!(%error, "Windows source GPU unavailable: CPU frame path"))
+                .ok()
+        })
+    } else {
+        None
+    };
     Ok(Platform {
         gate,
         session: Box::new(session),
@@ -1114,7 +1131,7 @@ pub fn create(
             .map(|backend| Box::new(backend) as Box<dyn TrayHost>),
         links: optional("links", WindowsLinkInfo::new())
             .map(|backend| Box::new(backend) as Box<dyn crosspane_platform::LinkInfo>),
-        gpu: None,
+        gpu,
         home: None,
         proxy_placement: None,
         startup_recovery: recovered.startup,

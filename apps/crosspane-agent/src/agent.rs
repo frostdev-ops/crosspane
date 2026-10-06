@@ -5419,8 +5419,29 @@ impl Agent {
         #[cfg(windows)]
         {
             status["network"] = self.network_status();
+            add_source_media(&mut status, &self.source_media);
         }
         status
+    }
+}
+
+#[cfg(any(windows, test))]
+fn add_source_media(status: &mut serde_json::Value, source: &SourceSender) {
+    status["source_media"] = serde_json::json!(source.status());
+}
+
+#[cfg(test)]
+mod gpu_status_tests {
+    #[test]
+    fn existing_destination_received_and_backend_gpu_meanings_are_preserved() {
+        let (source, _receive) = crate::media::source_channel();
+        let mut status = serde_json::json!({ "installer": { "backends": { "gpu": "present" } },
+            "projections": [{ "received": { "frames": 7, "bytes": 41 } }] });
+        let old = status.clone();
+        super::add_source_media(&mut status, &source);
+        assert_eq!(status["installer"], old["installer"]);
+        assert_eq!(status["projections"], old["projections"]);
+        assert_eq!(status["source_media"], serde_json::json!([]));
     }
 }
 

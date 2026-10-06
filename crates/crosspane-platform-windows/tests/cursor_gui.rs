@@ -33,8 +33,13 @@ use windows_sys::Win32::{
 
 #[path = "../src/cursor.rs"]
 mod cursor;
+#[cfg_attr(feature = "gpu", allow(dead_code))]
 #[path = "../src/frame_capture.rs"]
 mod frame_capture;
+#[cfg(feature = "gpu")]
+#[allow(dead_code)]
+#[path = "../src/gpu.rs"]
+mod gpu;
 #[path = "../src/window.rs"]
 mod window;
 

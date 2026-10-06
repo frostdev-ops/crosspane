@@ -480,12 +480,77 @@ pub enum Shape {
 pub struct Capture {
     id: CaptureId,
     open: Arc<Mutex<bool>>,
+    #[cfg(any(windows, test))]
+    path: Arc<Mutex<SourcePath>>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourcePath {
+    hash: &'static str,
+    encode: &'static str,
+    mft: String,
+    reason: &'static str,
+}
+#[cfg(any(windows, test))]
+impl Default for SourcePath {
+    fn default() -> Self {
+        Self {
+            hash: "cpu",
+            encode: "not_started",
+            mft: String::new(),
+            reason: "pending",
+        }
+    }
+}
+#[cfg(any(windows, test))]
+impl SourcePath {
+    fn hashed(&mut self, gpu: bool, available: bool) {
+        self.hash = if gpu { "dx12" } else { "cpu" };
+        self.reason = if gpu {
+            "gpu"
+        } else if available {
+            "sharing_unavailable"
+        } else {
+            "adapter_unavailable"
+        };
+    }
+    fn encoded(&mut self, name: &str) {
+        self.encode = if name.ends_with(" / GPU input") {
+            "gpu_mf"
+        } else {
+            "cpu_mf"
+        };
+        self.mft = name.into();
+        if self.encode == "cpu_mf" && self.hash == "dx12" {
+            self.reason = "gpu_encode_refused";
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CaptureId(u64);
 
 impl Capture {
+    #[cfg(any(windows, test))]
+    fn report(&self, change: impl FnOnce(&mut SourcePath)) {
+        self.while_open(|| {
+            if let Ok(mut path) = self.path.lock() {
+                let before = path.clone();
+                change(&mut path);
+                if *path != before {
+                    tracing::info!(
+                        capture = self.id.0,
+                        hash = path.hash,
+                        encode = path.encode,
+                        mft = path.mft,
+                        reason = path.reason,
+                        "source media path"
+                    );
+                }
+            }
+        });
+    }
     /// Run `f` unless the capture has been retired, holding its gate: retiring waits for `f`.
     fn while_open<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
         let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
@@ -611,9 +676,33 @@ pub struct SourceSender {
     frames: Option<SourceFrames>,
     /// The next capture identity, shared by every clone.
     captures: Arc<AtomicU64>,
+    #[cfg(any(windows, test))]
+    paths: Arc<Mutex<BTreeMap<ProjectionId, Capture>>>,
 }
 
 impl SourceSender {
+    /// Separate from destination received statistics and backend construction availability.
+    #[cfg(any(windows, test))]
+    pub(crate) fn status(&self) -> Vec<serde_json::Value> {
+        let rows = self
+            .paths
+            .lock()
+            .map(|rows| rows.clone())
+            .unwrap_or_default();
+        rows.into_iter()
+            .filter_map(|(projection, capture)| {
+                capture
+                    .while_open(|| {
+                        let path = capture.path.lock().ok()?.clone();
+                        Some(
+                            serde_json::json!({ "projection": projection.0, "capture": capture.id.0,
+                "hash": path.hash, "encode": path.encode, "mft": path.mft, "reason": path.reason }),
+                        )
+                    })
+                    .flatten()
+            })
+            .collect()
+    }
     /// A new, open capture with an identity no capture has had before; `None` once all of them
     /// have been used.
     pub fn open_capture(&self) -> Option<Capture> {
@@ -628,6 +717,8 @@ impl SourceSender {
         Some(Capture {
             id: CaptureId(id),
             open: Arc::new(Mutex::new(true)),
+            #[cfg(any(windows, test))]
+            path: Arc::new(Mutex::new(SourcePath::default())),
         })
     }
 
@@ -635,6 +726,10 @@ impl SourceSender {
     /// more, and the images it had queued are released.
     pub fn stop(&self, capture: &Capture) {
         capture.close();
+        #[cfg(any(windows, test))]
+        if let Ok(mut paths) = self.paths.lock() {
+            paths.retain(|_, row| row.id != capture.id);
+        }
         if let Some(frames) = &self.frames {
             let retired = frames
                 .lock()
@@ -649,6 +744,25 @@ impl SourceSender {
 
     /// Queue `cmd`. A frame or cursor of a retired capture is refused (and handed back).
     pub fn send(&self, cmd: SourceCmd) -> Result<(), mpsc::SendError<SourceCmd>> {
+        #[cfg(any(windows, test))]
+        if let Ok(mut paths) = self.paths.lock() {
+            match &cmd {
+                SourceCmd::Start {
+                    projection,
+                    capture,
+                    ..
+                } => {
+                    paths.retain(|_, row| row.is_open());
+                    if paths.len() < 128 || paths.contains_key(projection) {
+                        paths.insert(*projection, capture.clone());
+                    }
+                }
+                SourceCmd::Retire { projection } => {
+                    paths.remove(projection);
+                }
+                _ => (),
+            }
+        }
         match cmd {
             SourceCmd::Frame { capture, frame } => self.send_frame(capture, frame),
             SourceCmd::Cursor { capture, cursor } => {
@@ -731,6 +845,8 @@ impl From<Sender<SourceCmd>> for SourceSender {
             commands,
             frames: None,
             captures: Arc::default(),
+            #[cfg(any(windows, test))]
+            paths: Arc::default(),
         }
     }
 }
@@ -742,6 +858,8 @@ pub(crate) fn source_channel() -> (SourceSender, Receiver<SourceCmd>) {
             commands,
             frames: Some(Arc::new(Mutex::new(FrameMailbox::default()))),
             captures: Arc::default(),
+            #[cfg(any(windows, test))]
+            paths: Arc::default(),
         },
         receiver,
     )
@@ -804,6 +922,10 @@ struct Encoding {
     regions: RegionScheduler,
     /// GPU change detection and NV12 for frames on the GPU (GPU-v0); `None` once it failed.
     gpu: Option<SourceGpu>,
+    #[cfg(windows)]
+    gpu_failed_size: Option<PixelSize>,
+    #[cfg(windows)]
+    native_encode_failed: bool,
     video: Option<Box<dyn VideoEncoder>>,
     /// The next video frame must be an IDR (a frame was dropped, or the receiver asked).
     video_key: bool,
@@ -1038,6 +1160,10 @@ fn encode_loop(
                             peer_region,
                             regions: RegionScheduler::new(RegionConfig::default()),
                             gpu: None,
+                            #[cfg(windows)]
+                            gpu_failed_size: None,
+                            #[cfg(windows)]
+                            native_encode_failed: false,
                             video: None,
                             video_key: true,
                             last: None,
@@ -1315,12 +1441,8 @@ enum Plan {
 
 /// A frame's texture on the source GPU and the frame's top-left corner in it, when the frame is
 /// in GPU memory there (DMA-BUF capture on Linux, an SCK IOSurface on the Mac).
+#[cfg(not(windows))]
 fn frame_texture(frame: &Frame, video: &VideoSetup) -> Option<(wgpu::Texture, (u32, u32))> {
-    #[cfg(windows)]
-    {
-        let _ = (frame, video);
-        None
-    }
     #[cfg(unix)]
     let native = frame.native()?;
     #[cfg(unix)]
@@ -1339,7 +1461,7 @@ fn frame_texture(frame: &Frame, video: &VideoSetup) -> Option<(wgpu::Texture, (u
 
 /// Device memory isn't readable by the CPU: tiles for the lossless codec are gathered on the GPU.
 /// The Mac's memory is unified, so it reads the changed tiles in place instead.
-const GATHER_ON_GPU: bool = cfg!(target_os = "linux");
+const GATHER_ON_GPU: bool = cfg!(any(target_os = "linux", windows));
 
 /// One captured frame: change detection always runs (on the GPU when the frame is there, else
 /// over its pixels), then the scheduler decides what goes out, and only tiles that go out are
@@ -1354,14 +1476,62 @@ fn encode_frame(
     out: &mut Vec<u8>,
 ) {
     out.clear();
+    #[cfg(windows)]
+    let mut lease = match frame.native().zip(video.gpu.as_ref()) {
+        Some((image, gpu)) => match crosspane_platform_windows::frame_capture::capture_lease(
+            image.as_ref(),
+            &gpu.windows,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                enc.capture
+                    .report(|path| path.reason = "handoff_incomplete");
+                tracing::debug!(%error, "GPU capture handoff refused");
+                return; // Never map an uncertain native handoff.
+            }
+        },
+        None => None,
+    };
+    #[cfg(windows)]
+    let mut texture = lease.as_ref().map(|lease| (lease.texture.clone(), (0, 0)));
+    #[cfg(not(windows))]
     let texture = frame_texture(frame, video);
     if texture.is_some()
         && enc.gpu.is_none()
+        && {
+            #[cfg(windows)]
+            {
+                enc.gpu_failed_size != Some(frame.size)
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        }
         && let Some(gpu) = &video.gpu
     {
         enc.gpu = SourceGpu::new(gpu.device.clone(), gpu.queue.clone())
-            .map_err(|e| tracing::info!(error = %e, "GPU tile hashing unavailable"))
+            .map_err(|e| {
+                #[cfg(windows)]
+                {
+                    enc.gpu_failed_size = Some(frame.size);
+                }
+                tracing::info!(error = %e, "GPU tile hashing unavailable")
+            })
             .ok();
+    }
+    #[cfg(windows)]
+    if enc.gpu.is_none() {
+        if let Some(lease) = lease.as_mut()
+            && lease.finish().is_err()
+        {
+            return;
+        }
+        texture = None;
+    }
+    #[cfg(windows)]
+    if let Some(lease) = lease.as_mut() {
+        lease.submitted();
     }
     let (scan, on_gpu) = match scan_frame(enc, frame, texture.as_ref()) {
         Ok(scanned) => scanned,
@@ -1370,6 +1540,15 @@ fn encode_frame(
             return;
         }
     };
+    #[cfg(windows)]
+    if let Some(lease) = lease.as_ref()
+        && lease.check().is_err()
+    {
+        return;
+    }
+    #[cfg(windows)]
+    enc.capture
+        .report(|path| path.hashed(on_gpu, video.gpu.is_some()));
     let available = enc.peer_video && video.codecs.is_some();
     let plan = plan(enc, &scan, frame.size, now, available);
     tracing::trace!(
@@ -1390,6 +1569,8 @@ fn encode_frame(
                 key,
                 transport,
                 out,
+                #[cfg(windows)]
+                lease.as_ref(),
             );
         }
         Plan::Video { region, key } => {
@@ -1411,6 +1592,8 @@ fn encode_frame(
                     false,
                     transport,
                     out,
+                    #[cfg(windows)]
+                    lease.as_ref(),
                 ),
             }
             if idle {
@@ -1425,12 +1608,20 @@ fn encode_frame(
                 video,
                 transport,
                 out,
+                #[cfg(windows)]
+                lease.as_mut(),
             ) {
                 tracing::info!(error = %e, "video failed: lossless tiles for a while");
                 enc.video = None;
                 enc.scheduler.video_failed(now);
                 enc.regions.video_failed(now);
                 enc.encoder.request_key();
+                #[cfg(windows)]
+                if let Some(lease) = lease.as_mut()
+                    && lease.finish().is_err()
+                {
+                    return;
+                }
                 send_tiles(enc, frame, true, transport, out);
             }
         }
@@ -1461,6 +1652,11 @@ fn scan_frame(
             Err(e) => {
                 tracing::warn!(error = %e, "GPU tile hashing failed: CPU from now on");
                 enc.gpu = None;
+                #[cfg(windows)]
+                {
+                    enc.gpu_failed_size = Some(frame.size);
+                    return Err(e.to_string());
+                } // The lease must finish before any CPU readback.
             }
         }
     }
@@ -1525,12 +1721,19 @@ fn emit_and_send(
     key: bool,
     transport: &dyn SourceOutput,
     out: &mut Vec<u8>,
+    #[cfg(windows)] lease: Option<&crosspane_platform_windows::gpu::Lease<'_>>,
 ) {
     match emit_tiles(enc, frame, texture, scan, video, key, out) {
         Ok(stats) => {
             gpu_committed(enc, on_gpu);
             if stats.is_some() {
-                send(enc, out, transport);
+                send(
+                    enc,
+                    out,
+                    transport,
+                    #[cfg(windows)]
+                    lease,
+                );
             }
         }
         Err(e) => tracing::warn!(error = %e, "encode failed"),
@@ -1573,6 +1776,10 @@ fn emit_tiles(
         };
         // This frame is lost; the next one is scanned on the CPU, every tile changed.
         enc.gpu = None;
+        #[cfg(windows)]
+        {
+            enc.gpu_failed_size = Some(frame.size);
+        }
         return Err(format!(
             "GPU tile gather failed, CPU from now on: {failure}"
         ));
@@ -1608,7 +1815,13 @@ fn send_tiles(
             // A CPU scan was committed: the GPU's hashes no longer describe the reference.
             gpu_committed(enc, false);
             if stats.is_some() {
-                send(enc, out, transport);
+                send(
+                    enc,
+                    out,
+                    transport,
+                    #[cfg(windows)]
+                    None,
+                );
             }
         }
         Err(e) => tracing::warn!(error = %e, "encode failed"),
@@ -1625,6 +1838,7 @@ fn send_video(
     video: &VideoSetup,
     transport: &dyn SourceOutput,
     out: &mut Vec<u8>,
+    #[cfg(windows)] mut lease: Option<&mut crosspane_platform_windows::gpu::Lease<'_>>,
 ) -> Result<(), String> {
     let Some(mut header) = header(enc, frame) else {
         return Ok(());
@@ -1635,6 +1849,19 @@ fn send_video(
     });
     if enc.video.is_none() {
         let codecs = video.codecs.as_ref().ok_or("no video codecs")?;
+        #[cfg(all(windows, feature = "video"))]
+        let encoder: Box<dyn VideoEncoder> = if enc.native_encode_failed {
+            Box::new(
+                crosspane_platform_windows::video::MfCodecs::new()
+                    .encoder_cpu(size, enc.bits_per_second, 60)
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            codecs
+                .encoder(size, enc.bits_per_second, 60)
+                .map_err(|e| e.to_string())?
+        };
+        #[cfg(not(all(windows, feature = "video")))]
         let encoder = codecs
             .encoder(size, enc.bits_per_second, 60)
             .map_err(|e| e.to_string())?;
@@ -1654,7 +1881,22 @@ fn send_video(
         size,
         force_key,
         &mut access_unit,
+        #[cfg(windows)]
+        lease.as_deref_mut(),
+        #[cfg(windows)]
+        &mut enc.native_encode_failed,
     )?;
+    #[cfg(windows)]
+    if let Some(lease) = lease.as_ref() {
+        lease.check().map_err(|error| error.to_string())?;
+    }
+    #[cfg(windows)]
+    {
+        // A replacement encoder in this capture keeps the selected fallback, rather than
+        // reattempting hardware admission on each new video burst.
+        enc.native_encode_failed |= !encoder.name().ends_with(" / GPU input");
+        enc.capture.report(|path| path.encoded(encoder.name()));
+    }
     enc.video_key = false;
     header.key = encoded.key;
     match area {
@@ -1662,7 +1904,13 @@ fn send_video(
         None => write_video(header, &access_unit, out),
     }
     .map_err(|e| e.to_string())?;
-    send(enc, out, transport);
+    send(
+        enc,
+        out,
+        transport,
+        #[cfg(windows)]
+        lease.as_deref(),
+    );
     Ok(())
 }
 
@@ -1679,7 +1927,63 @@ fn encode_picture(
     size: PixelSize,
     force_key: bool,
     out: &mut Vec<u8>,
+    #[cfg(windows)] mut lease: Option<&mut crosspane_platform_windows::gpu::Lease<'_>>,
+    #[cfg(windows)] native_failed: &mut bool,
 ) -> Result<EncodedVideo, String> {
+    #[cfg(all(windows, feature = "video"))]
+    if let (Some((texture, at)), Some(gpu)) = (texture, gpu)
+        && !*native_failed
+    {
+        let native = (|| -> Result<Option<EncodedVideo>, String> {
+            let admission = lease.as_deref().ok_or("missing source GPU admission")?;
+            admission.check().map_err(|error| error.to_string())?;
+            let Some(pool) = encoder.input_pool(size).map_err(|e| e.to_string())? else {
+                return Ok(None);
+            };
+            let input = pool.acquire().map_err(|e| e.to_string())?;
+            let Some((buffer, layout)) =
+                crosspane_platform_windows::video::gpu::nv12_buffer(input.as_ref())
+            else {
+                return Ok(None);
+            };
+            gpu.write_nv12(
+                FrameRegion {
+                    texture,
+                    origin: (at.0 + origin.0, at.1 + origin.1),
+                    size,
+                },
+                crosspane_render::source::Nv12Output {
+                    target: crosspane_render::source::Nv12Target::Buffer {
+                        buffer,
+                        y_offset: layout.y.offset,
+                        y_pitch: layout.y.pitch,
+                        uv_offset: layout.uv.offset,
+                        uv_pitch: layout.uv.pitch,
+                    },
+                    colour: input.colour(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            crosspane_platform_windows::video::gpu::finish_input(input.as_ref(), admission)
+                .map_err(|e| e.to_string())?;
+            encoder
+                .encode_native(input.as_ref(), size, force_key, out)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        })();
+        match native {
+            Ok(Some(encoded)) => return Ok(encoded),
+            Ok(None) => *native_failed = true,
+            Err(error) => {
+                *native_failed = true;
+                tracing::debug!(%error, "GPU MF input refused: CPU session");
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Some(lease) = lease.as_mut() {
+        lease.finish().map_err(|e| e.to_string())?;
+    }
     #[cfg(all(target_os = "linux", feature = "video"))]
     if let (Some((texture, at)), Some(gpu)) = (texture, gpu) {
         let native = (|| -> Result<Option<EncodedVideo>, String> {
@@ -1743,6 +2047,70 @@ fn encode_picture(
 }
 
 /// Send the newest cursor shape; a refused one stays due and goes again on the next pass.
+#[cfg(test)]
+mod gpu_source_tests {
+    use super::*;
+
+    fn start(source: &SourceSender, capture: &Capture) {
+        source
+            .send(SourceCmd::Start {
+                capture: capture.clone(),
+                projection: ProjectionId(75),
+                peer: NodeId([3; 32]),
+                video: true,
+                region: false,
+                cursor: false,
+                bits_per_second: 1_000_000,
+            })
+            .unwrap();
+    }
+    #[test]
+    fn source_status_reports_observed_cpu_gpu_and_fallback_paths() {
+        let (source, _receive) = source_channel();
+        let capture = source.open_capture().unwrap();
+        start(&source, &capture);
+        assert_eq!(source.status()[0]["encode"], "not_started");
+        capture.report(|path| {
+            path.hashed(false, false);
+            path.encoded("Microsoft H.264 encoder (software)");
+        });
+        assert_eq!(source.status()[0]["hash"], "cpu");
+        assert_eq!(source.status()[0]["encode"], "cpu_mf");
+        capture.report(|path| {
+            path.hashed(true, true);
+            path.encoded("Fixture H.264 hardware / GPU input");
+        });
+        assert_eq!(source.status()[0]["hash"], "dx12");
+        assert_eq!(source.status()[0]["encode"], "gpu_mf");
+        capture.report(|path| path.encoded("Microsoft H.264 encoder (software)"));
+        assert_eq!(source.status()[0]["encode"], "cpu_mf");
+        assert_eq!(source.status()[0]["reason"], "gpu_encode_refused");
+        source.stop(&capture);
+        assert!(source.status().is_empty());
+    }
+    #[test]
+    fn replacement_capture_discards_old_source_status_and_no_native_success_before_frame() {
+        let (source, _receive) = source_channel();
+        let old = source.open_capture().unwrap();
+        start(&source, &old);
+        old.report(|path| {
+            path.hashed(true, true);
+            path.encoded("old / GPU input");
+        });
+        let new = source.open_capture().unwrap();
+        start(&source, &new);
+        old.report(|path| path.encoded("late old / GPU input"));
+        assert_eq!(source.status()[0]["capture"], new.id.0);
+        assert_eq!(source.status()[0]["encode"], "not_started");
+        assert_eq!(source.status()[0]["mft"], "");
+        source.stop(&old);
+        assert_eq!(source.status().len(), 1);
+        source.stop(&new);
+        new.report(|path| path.encoded("after close / GPU input"));
+        assert!(source.status().is_empty());
+    }
+}
+
 fn send_cursor(enc: &mut Encoding, transport: &dyn SourceOutput, out: &mut Vec<u8>) {
     enc.cursor_dirty = false;
     let Some(cursor) = &enc.cursor else { return };
@@ -1792,20 +2160,37 @@ fn send_cursor(enc: &mut Encoding, transport: &dyn SourceOutput, out: &mut Vec<u
 }
 
 /// Send one encoded frame; a refused one is dropped and the next of either kind becomes a key.
-fn send(enc: &mut Encoding, frame: &[u8], transport: &dyn SourceOutput) {
+fn send(
+    enc: &mut Encoding,
+    frame: &[u8],
+    transport: &dyn SourceOutput,
+    #[cfg(windows)] lease: Option<&crosspane_platform_windows::gpu::Lease<'_>>,
+) {
     let Ok(header) = read_header(frame) else {
         return;
     };
     // Numbered and handed over under the gate: once the capture is retired, nothing more of it
     // goes out and it uses no more numbers.
-    let sent = enc.capture.while_open(|| {
-        let numbers = enc.numbers.get();
-        enc.numbers.set(Sequences {
-            picture: numbers.picture.max(header.seq),
-            ..numbers
-        });
-        transport.send_media(enc.peer, Arc::from(frame))
-    });
+    let sent = enc
+        .capture
+        .while_open(|| {
+            let packet = Arc::from(frame);
+            // Scan/gather/encode may have waited after admission. Check the original image
+            // epoch again at publication, within the existing media capture retirement fence.
+            #[cfg(windows)]
+            if let Some(lease) = lease
+                && lease.check().is_err()
+            {
+                return None;
+            }
+            let numbers = enc.numbers.get();
+            enc.numbers.set(Sequences {
+                picture: numbers.picture.max(header.seq),
+                ..numbers
+            });
+            Some(transport.send_media(enc.peer, packet))
+        })
+        .flatten();
     match sent {
         None | Some(Ok(())) => {}
         Some(Err(LinkError::Congested)) => {

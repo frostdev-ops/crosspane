@@ -5,7 +5,8 @@
 //! jobs and event waits have a two-second deadline. A native call already running
 //! cannot be preempted; a timed-out facade is retired and never accepts another frame.
 //! Windows receive GPU output uses one copy-only NV12 import and fresh immutable Y/UV
-//! textures. The original CPU output remains the fallback; encoder behavior is unchanged.
+//! textures. Optional GPU encode uses the source's protected D3D11 device; both paths
+//! retain the original CPU fallback.
 #![allow(unsafe_code)]
 
 use crate::model::video::{self as model, Clock, Events, Headers, Params, References};
@@ -38,6 +39,8 @@ use windows::{
 const BOUND: Duration = Duration::from_secs(2);
 const MAX_PACKET: usize = 64 * 1024 * 1024;
 const MAX_IMAGE: usize = model::MAX_DIMENSION as usize * model::MAX_DIMENSION as usize * 3 / 2;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 fn api<T>(result: windows::core::Result<T>, operation: &str) -> Result<T, CodecError> {
     result.map_err(|error| {
@@ -55,6 +58,8 @@ fn failure(reason: &str) -> CodecError {
 #[derive(Debug, Default)]
 pub struct MfCodecs {
     decode_gpu: Option<Arc<MfDecodeGpu>>,
+    #[cfg(feature = "gpu")]
+    gpu: Option<Arc<crate::gpu::WindowsGpu>>,
 }
 impl MfCodecs {
     pub fn new() -> Self {
@@ -63,6 +68,11 @@ impl MfCodecs {
     /// Receive-only GPU handshake; encoding and explicit CPU decoding are unchanged.
     pub fn with_decode_gpu(mut self, gpu: Arc<MfDecodeGpu>) -> Self {
         self.decode_gpu = Some(gpu);
+        self
+    }
+    #[cfg(feature = "gpu")]
+    pub fn with_gpu(mut self, gpu: Arc<crate::gpu::WindowsGpu>) -> Self {
+        self.gpu = Some(gpu);
         self
     }
     pub fn encoder_cpu(
@@ -79,6 +89,10 @@ impl MfCodecs {
             bitrate,
             fps,
             clock: Clock::default(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            #[cfg(feature = "gpu")]
+            pool: None,
         })
     }
     pub fn decoder_cpu(&self) -> Result<MfDecoder, CodecError> {
@@ -97,6 +111,21 @@ impl VideoCodecs for MfCodecs {
         bits_per_second: u32,
         fps: u32,
     ) -> Result<Box<dyn VideoEncoder>, CodecError> {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            let params = Params::new(size, bits_per_second, fps)?;
+            let (worker, name) =
+                Worker::new_with_source_gpu(Mode::Encoder(params), Some(gpu.clone()))?;
+            return Ok(Box::new(MfEncoder {
+                worker,
+                name,
+                bitrate: bits_per_second,
+                fps,
+                clock: Clock::default(),
+                gpu: Some(gpu.clone()),
+                pool: None,
+            }));
+        }
         Ok(Box::new(self.encoder_cpu(size, bits_per_second, fps)?))
     }
     fn decoder(&self) -> Result<Box<dyn VideoDecoder>, CodecError> {
@@ -116,6 +145,10 @@ pub struct MfEncoder {
     bitrate: u32,
     fps: u32,
     clock: Clock,
+    #[cfg(feature = "gpu")]
+    gpu: Option<Arc<crate::gpu::WindowsGpu>>,
+    #[cfg(feature = "gpu")]
+    pool: Option<Arc<gpu::Pool>>,
 }
 impl std::fmt::Debug for MfEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -131,6 +164,76 @@ impl MfEncoder {
     }
 }
 impl VideoEncoder for MfEncoder {
+    #[cfg(feature = "gpu")]
+    fn input_pool(
+        &mut self,
+        size: PixelSize,
+    ) -> Result<Option<Arc<dyn crosspane_media::codec::NativeInputPool>>, CodecError> {
+        use crosspane_media::codec::NativeInputPool;
+        if !self.worker.selection.native() {
+            return Ok(None);
+        }
+        let Some(gpu) = &self.gpu else {
+            return Ok(None);
+        };
+        let params = Params::new(size, self.bitrate, self.fps)?;
+        if self
+            .pool
+            .as_ref()
+            .is_none_or(|pool| pool.display != params.size)
+        {
+            self.pool = Some(gpu::Pool::new(gpu.clone(), size)?);
+        }
+        Ok(self
+            .pool
+            .clone()
+            .map(|pool| pool as Arc<dyn NativeInputPool>))
+    }
+    #[cfg(feature = "gpu")]
+    fn encode_native(
+        &mut self,
+        input: &dyn crosspane_media::codec::NativeInput,
+        size: PixelSize,
+        force_key: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<EncodedVideo, CodecError> {
+        out.clear();
+        let params = Params::new(size, self.bitrate, self.fps)?;
+        if input.size() != params.coded()? || input.colour() != YuvColour::default() {
+            return Err(CodecError::BadInput("MF native geometry or colour"));
+        }
+        let (at, duration) = self.clock.next(self.fps)?;
+        let reply = self.worker.request(Job::EncodeNative {
+            input: gpu::lease(
+                input,
+                self.pool
+                    .as_ref()
+                    .ok_or(CodecError::BadInput("missing MF input pool"))?,
+            )?,
+            params,
+            key: force_key,
+            at,
+            duration,
+        });
+        // A rejected native session is retired; CPU encoding starts with fresh header/IDR state.
+        if reply.is_err() {
+            self.worker
+                .selection
+                .refused(crate::model::gpu::Reason::Mft);
+        }
+        match reply? {
+            Reply::Encoded { bytes, key, name } => {
+                self.name = name;
+                #[cfg(feature = "gpu")]
+                {
+                    self.worker.selection = crate::model::gpu::Path::selected(self.name.clone());
+                }
+                out.extend_from_slice(&bytes);
+                Ok(EncodedVideo { key })
+            }
+            _ => Err(failure("unexpected native encoder reply")),
+        }
+    }
     fn encode(
         &mut self,
         pixels: &[u8],
@@ -141,6 +244,15 @@ impl VideoEncoder for MfEncoder {
     ) -> Result<EncodedVideo, CodecError> {
         out.clear();
         let params = Params::new(size, self.bitrate, self.fps)?;
+        #[cfg(feature = "gpu")]
+        if self.worker.send.is_none() {
+            // Old native work retains its own resources. A fresh CPU worker never reuses them.
+            let (worker, name) = Worker::new(Mode::Encoder(params))?;
+            self.worker = worker;
+            self.name = name;
+            self.gpu = None;
+            self.pool = None;
+        }
         let mut picture = model::bgra_to_nv12(pixels, stride, size)?;
         picture.y.append(&mut picture.uv);
         let (at, duration) = self.clock.next(self.fps)?;
@@ -153,6 +265,10 @@ impl VideoEncoder for MfEncoder {
         })? {
             Reply::Encoded { bytes, key, name } => {
                 self.name = name;
+                #[cfg(feature = "gpu")]
+                {
+                    self.worker.selection = crate::model::gpu::Path::selected(self.name.clone());
+                }
                 out.extend_from_slice(&bytes);
                 Ok(EncodedVideo { key })
             }
@@ -275,6 +391,14 @@ enum Job {
         at: i64,
         duration: i64,
     },
+    #[cfg(feature = "gpu")]
+    EncodeNative {
+        input: Arc<gpu::InputSlot>,
+        params: Params,
+        key: bool,
+        at: i64,
+        duration: i64,
+    },
     Encode {
         params: Params,
         bytes: Vec<u8>,
@@ -314,6 +438,8 @@ struct Worker {
     done: mpsc::Receiver<()>,
     join: Option<thread::JoinHandle<()>>,
     control: Option<mpsc::SyncSender<()>>,
+    #[cfg(feature = "gpu")]
+    selection: crate::model::gpu::Path,
 }
 impl Worker {
     fn new(mode: Mode) -> Result<(Self, String), CodecError> {
@@ -322,6 +448,25 @@ impl Worker {
     fn new_with_gpu(
         mode: Mode,
         gpu: Option<Arc<MfDecodeGpu>>,
+    ) -> Result<(Self, String), CodecError> {
+        Self::spawn(
+            mode,
+            gpu,
+            #[cfg(feature = "gpu")]
+            None,
+        )
+    }
+    #[cfg(feature = "gpu")]
+    fn new_with_source_gpu(
+        mode: Mode,
+        source_gpu: Option<Arc<crate::gpu::WindowsGpu>>,
+    ) -> Result<(Self, String), CodecError> {
+        Self::spawn(mode, None, source_gpu)
+    }
+    fn spawn(
+        mode: Mode,
+        gpu: Option<Arc<MfDecodeGpu>>,
+        #[cfg(feature = "gpu")] source_gpu: Option<Arc<crate::gpu::WindowsGpu>>,
     ) -> Result<(Self, String), CodecError> {
         let (send, receive) = mpsc::sync_channel::<Envelope>(1);
         let (started, start) = mpsc::sync_channel(1);
@@ -342,7 +487,15 @@ impl Worker {
                             return;
                         }
                     };
-                    let mut codec = match Native::new(mode, gpu, control_send, deadline, &flag) {
+                    let mut codec = match Native::new(
+                        mode,
+                        gpu,
+                        control_send,
+                        deadline,
+                        &flag,
+                        #[cfg(feature = "gpu")]
+                        source_gpu,
+                    ) {
                         Ok(codec) => codec,
                         Err(error) => {
                             let _ = started.try_send(Err(error));
@@ -433,9 +586,17 @@ impl Worker {
             done,
             join: Some(join),
             control,
+            #[cfg(feature = "gpu")]
+            selection: crate::model::gpu::Path::default(),
         };
         match start.recv_timeout(BOUND) {
-            Ok(Ok(name)) => Ok((worker, name)),
+            Ok(Ok(name)) => {
+                #[cfg(feature = "gpu")]
+                {
+                    worker.selection = crate::model::gpu::Path::selected(name.clone());
+                }
+                Ok((worker, name))
+            }
             Ok(Err(error)) => {
                 let _ = worker.close();
                 Err(CodecError::Unavailable(error.to_string()))
@@ -559,6 +720,8 @@ struct Native {
     gpu_mta: Option<decode_gpu::GpuMta>,
     control: mpsc::SyncSender<()>,
     leases: Vec<decode_gpu::SourceLease>,
+    #[cfg(feature = "gpu")]
+    source_gpu: Option<Arc<crate::gpu::WindowsGpu>>,
 }
 impl Native {
     fn new(
@@ -567,9 +730,26 @@ impl Native {
         control: mpsc::SyncSender<()>,
         deadline: Instant,
         stop: &AtomicBool,
+        #[cfg(feature = "gpu")] source_gpu: Option<Arc<crate::gpu::WindowsGpu>>,
     ) -> Result<Self, CodecError> {
+        #[cfg(feature = "gpu")]
+        let native = match (&source_gpu, mode) {
+            (Some(gpu), Mode::Encoder(params)) => gpu::select(gpu, params, deadline, stop).ok(),
+            _ => None,
+        };
         Ok(Self {
-            session: Session::select(mode, false, deadline, stop)?,
+            session: {
+                #[cfg(feature = "gpu")]
+                if let Some(native) = native {
+                    native
+                } else {
+                    Session::select(mode, false, deadline, stop)?
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    Session::select(mode, false, deadline, stop)?
+                }
+            },
             mode,
             first: true,
             headers: Headers::default(),
@@ -579,6 +759,8 @@ impl Native {
             gpu_mta: None,
             control,
             leases: Vec::new(),
+            #[cfg(feature = "gpu")]
+            source_gpu,
         })
     }
     fn poll_leases(&mut self) -> bool {
@@ -681,6 +863,14 @@ impl Native {
                 at,
                 duration,
             } => self.decode_native(&bytes, at, duration, deadline, stop),
+            #[cfg(feature = "gpu")]
+            Job::EncodeNative {
+                input,
+                params,
+                key,
+                at,
+                duration,
+            } => self.encode_native(input, params, key, at, duration, deadline, stop),
             Job::Encode {
                 params,
                 bytes,
@@ -703,6 +893,79 @@ impl Native {
         }
         result
     }
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn encode_native(
+        &mut self,
+        input: Arc<gpu::InputSlot>,
+        params: Params,
+        key: bool,
+        at: i64,
+        duration: i64,
+        deadline: Instant,
+        stop: &AtomicBool,
+    ) -> Result<Reply, CodecError> {
+        let previous = match self.mode {
+            Mode::Encoder(params) => params,
+            _ => return Err(failure("wrong GPU codec mode")),
+        };
+        if self.session.invalid || params.size != previous.size {
+            let gpu = self
+                .source_gpu
+                .as_ref()
+                .ok_or_else(|| failure("missing native GPU"))?;
+            self.session = gpu::select(gpu, params, deadline, stop)?;
+            self.headers = Headers::default();
+            self.references = References::default();
+            self.first = true;
+        } else if params.bitrate != previous.bitrate {
+            self.session
+                .property(&CODECAPI_AVEncCommonMeanBitRate, params.bitrate.into())?;
+        }
+        if self.session.manager.is_none() {
+            return Err(failure("GPU session unavailable"));
+        }
+        self.mode = Mode::Encoder(params);
+        let force = key || self.first;
+        if force {
+            self.session
+                .property(&CODECAPI_AVEncVideoForceKeyFrame, 1_u32.into())?;
+        }
+        // SAFETY: public input stream requirements; absent attribute means no extra bind requirement.
+        let bind = match unsafe {
+            self.session
+                .transform
+                .GetInputStreamAttributes(self.session.input)
+                .and_then(|attrs| attrs.GetUINT32(&MF_SA_D3D11_BINDFLAGS))
+        } {
+            Ok(bind) => bind,
+            Err(error) if error.code() == MF_E_ATTRIBUTENOTFOUND => 0,
+            Err(error) => return Err(failure(&error.to_string())),
+        };
+        let sample = input.sample(at, duration, bind)?;
+        let output = self
+            .session
+            .exchange_guarded(&sample, at, deadline, stop, &|| input.permitted())?;
+        let data = sample_bytes(&output, MAX_PACKET)?;
+        let (bytes, key) = self.headers.packet(&data, force)?;
+        self.references.check(&bytes)?;
+        if key
+            && model::h264_aperture(&bytes)?
+                != (model::Aperture {
+                    x: 0,
+                    y: 0,
+                    size: params.coded()?,
+                })
+        {
+            return Err(failure("GPU encoder changed coded geometry"));
+        }
+        self.first = false;
+        Ok(Reply::Encoded {
+            bytes,
+            key,
+            name: self.session.name.clone(),
+        })
+    }
     #[allow(clippy::too_many_arguments)]
     fn encode(
         &mut self,
@@ -718,6 +981,10 @@ impl Native {
             Mode::Encoder(params) => params,
             _ => return Err(failure("wrong codec mode")),
         };
+        #[cfg(feature = "gpu")]
+        if self.session.manager.is_some() {
+            self.session.invalid = true;
+        }
         if self.session.invalid || params.size != previous.size {
             self.session = Session::select(Mode::Encoder(params), false, deadline, stop)?;
             self.first = true;
@@ -820,6 +1087,8 @@ struct Session {
     name: String,
     mode: Mode,
     invalid: bool,
+    #[cfg(feature = "gpu")]
+    manager: Option<IMFDXGIDeviceManager>,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -832,6 +1101,12 @@ impl Drop for Session {
             let _ = self
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            #[cfg(feature = "gpu")]
+            if self.manager.is_some() {
+                let _ = self
+                    .transform
+                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+            }
             if let Ok(shutdown) = self.transform.cast::<IMFShutdown>() {
                 let _ = shutdown.Shutdown();
             }
@@ -960,6 +1235,12 @@ impl Session {
             name,
             mode,
             invalid: false,
+            #[cfg(feature = "gpu")]
+            manager: if matches!(mode, Mode::Encoder(_)) {
+                manager.cloned()
+            } else {
+                None
+            },
         };
         // SAFETY: live transform, documented stream and attribute getters and writable one-element IDs.
         unsafe {
@@ -1106,13 +1387,21 @@ impl Session {
         }
         Err(failure("decoder has no CPU NV12 output type"))
     }
-    fn event(&mut self, deadline: Instant, stop: &AtomicBool) -> Result<(), CodecError> {
+    fn event(
+        &mut self,
+        deadline: Instant,
+        stop: &AtomicBool,
+        permitted: &dyn Fn() -> bool,
+    ) -> Result<(), CodecError> {
         let generator = self
             .events
             .as_ref()
             .ok_or_else(|| failure("missing async event generator"))?;
         loop {
             check(deadline, stop)?;
+            if !permitted() {
+                return Err(failure("native capture retired"));
+            }
             // SAFETY: exclusively owned generator, explicitly NONBLOCKING; no callback allocation.
             let event = unsafe { generator.GetEvent(MF_EVENT_FLAG_NO_WAIT) };
             match event {
@@ -1148,14 +1437,27 @@ impl Session {
         deadline: Instant,
         stop: &AtomicBool,
     ) -> Result<IMFSample, CodecError> {
+        self.exchange_guarded(input, at, deadline, stop, &|| true)
+    }
+    fn exchange_guarded(
+        &mut self,
+        input: &IMFSample,
+        at: i64,
+        deadline: Instant,
+        stop: &AtomicBool,
+        permitted: &dyn Fn() -> bool,
+    ) -> Result<IMFSample, CodecError> {
         let asynchronous = self.events.is_some();
         if asynchronous {
             while !self.credits.can_submit() {
-                self.event(deadline, stop)?;
+                self.event(deadline, stop, permitted)?;
             }
             self.credits.submit(at)?;
         }
         check(deadline, stop)?;
+        if !permitted() {
+            return Err(failure("native capture retired"));
+        }
         api(
             // SAFETY: prepared stream, owned sample; async input credit was consumed exactly once.
             unsafe { self.transform.ProcessInput(self.input, input, 0) },
@@ -1164,10 +1466,13 @@ impl Session {
         for _ in 0..4 {
             if asynchronous {
                 while !self.credits.can_output() {
-                    self.event(deadline, stop)?;
+                    self.event(deadline, stop, permitted)?;
                 }
             }
             check(deadline, stop)?;
+            if !permitted() {
+                return Err(failure("native capture retired"));
+            }
             match self.output_sample() {
                 Err(error)
                     if error.code() == MF_E_TRANSFORM_STREAM_CHANGE

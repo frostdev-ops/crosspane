@@ -472,8 +472,10 @@ fn start_agent(
 
     #[cfg(all(windows, feature = "video"))]
     let (windows_codecs, decode_gpu) = if config.video_mbps != Some(0) {
-        let (codecs, bridge) =
-            platform::windows_receive_codecs(host.as_ref().map(|(_, handle)| handle.clone()));
+        let (codecs, bridge) = platform::windows_receive_codecs(
+            host.as_ref().map(|(_, handle)| handle.clone()),
+            platform.gpu.as_ref(),
+        );
         (Some(codecs), bridge)
     } else {
         (None, None)

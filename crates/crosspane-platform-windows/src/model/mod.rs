@@ -10,6 +10,7 @@ pub mod displays;
 pub mod drag;
 pub mod frame_capture;
 pub mod geometry;
+pub mod gpu;
 pub mod hook;
 pub mod hotkey;
 pub mod inject;
