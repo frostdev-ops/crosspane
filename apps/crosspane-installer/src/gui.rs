@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +86,9 @@ pub struct ReviewOptions {
     /// Review: render the capture without opening a window.
     #[arg(long)]
     pub offscreen: bool,
+    /// Demo only: close our window after 1–8000 ms; a stalled close exits nonzero within 9 s.
+    #[arg(long, value_name = "MS")]
+    pub exit_after_ms: Option<u64>,
     /// Linux production: directory holding `payload.tar` and `payload.sha256`.
     #[arg(long, value_name = "DIR")]
     pub payload: Option<PathBuf>,
@@ -92,6 +96,16 @@ pub struct ReviewOptions {
 
 impl ReviewOptions {
     pub fn validate(&self) -> Result<Option<ScreenId>> {
+        if let Some(ms) = self.exit_after_ms {
+            ensure!(
+                self.demo && !self.offscreen,
+                "--exit-after-ms requires a windowed --demo"
+            );
+            ensure!(
+                (1..=8_000).contains(&ms),
+                "--exit-after-ms must be between 1 and 8000"
+            );
+        }
         ensure!(
             self.demo || self.screen.is_none(),
             "--screen requires --demo"
@@ -275,6 +289,7 @@ impl ReviewOptions {
             || self.from.is_some()
             || self.pointer.is_some()
             || self.offscreen
+            || self.exit_after_ms.is_some()
     }
 
     /// The scripted review this launch captures, if it captures one.
@@ -306,6 +321,13 @@ impl ReviewOptions {
 }
 
 pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
+    // Arm before even the bounded font read: only this explicit windowed demo process is owned.
+    let _watchdog = if options.demo && options.exit_after_ms.is_some() {
+        options.validate()?;
+        Some(DemoWatchdog::arm()?)
+    } else {
+        None
+    };
     match options.mode() {
         LaunchMode::Demo => {
             let screen = options
@@ -330,6 +352,7 @@ pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
             let window = Window {
                 size: options.size.unwrap_or(DEFAULT_SIZE),
                 pixels_per_point: options.pixels_per_point.unwrap_or(1.0),
+                exit_after_ms: options.exit_after_ms,
             };
             run_gui(
                 options.screenshot.clone(),
@@ -344,9 +367,9 @@ pub fn run(options: ReviewOptions, brand: BrandBytes<'static>) -> Result<()> {
             options.validate()?;
             // A font without --demo: production reads the system font itself and takes no
             // override. Other operating systems keep today's disconnected normal entry.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             bail!("--font is only valid with --demo; production uses the system font");
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             {
                 let font = options.font.as_deref().context("Missing explicit font")?;
                 run_gui(
@@ -385,7 +408,12 @@ fn production_controller(
         ensure!(payload.is_none(), "--payload is only used on Linux");
         crate::platform::macos::integration::open()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        ensure!(payload.is_none(), "--payload is only supported on Linux");
+        crate::platform::windows::open()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = payload;
         bail!("Installation is not available on this operating system yet.");
@@ -397,6 +425,7 @@ fn production_controller(
 struct Window {
     size: egui::Vec2,
     pixels_per_point: f32,
+    exit_after_ms: Option<u64>,
 }
 
 impl Default for Window {
@@ -404,6 +433,7 @@ impl Default for Window {
         Self {
             size: DEFAULT_SIZE,
             pixels_per_point: 1.0,
+            exit_after_ms: None,
         }
     }
 }
@@ -416,6 +446,11 @@ fn run_gui(
     fonts: egui::FontDefinitions,
     controller: Box<dyn InstallerController>,
 ) -> Result<()> {
+    let demo_deadline = window
+        .exit_after_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    let demo_closed = Arc::new(AtomicBool::new(false));
+    let app_demo_closed = demo_closed.clone();
     let capture_requested = screenshot.is_some();
     // The deadline starts before native viewport setup, not when capture is requested.
     let capture_timing = screenshot
@@ -462,10 +497,19 @@ fn run_gui(
                 script,
                 script_frame: 0,
                 from,
+                demo_deadline,
+                demo_closed: app_demo_closed,
             }))
         }),
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if window.exit_after_ms.is_some() {
+        ensure!(
+            demo_closed.load(Ordering::Acquire),
+            "Demo window exited before its own timer Close"
+        );
+        eprintln!("Demo window exited normally after its own frame and timer Close");
+    }
     if capture_requested {
         let completion = completion
             .lock()
@@ -473,6 +517,41 @@ fn run_gui(
         completion.result()?;
     }
     Ok(())
+}
+
+struct DemoWatchdog {
+    cancel: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DemoWatchdog {
+    fn arm() -> Result<Self> {
+        let (cancel, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("crosspane-demo-deadline".into())
+            .spawn(move || {
+                if matches!(
+                    receive.recv_timeout(Duration::from_secs(9)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    eprintln!("Demo window: own-process deadline expired; normal close unverified");
+                    std::process::exit(1);
+                }
+            })?;
+        Ok(Self {
+            cancel,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for DemoWatchdog {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -542,6 +621,8 @@ struct InstallerGui {
     script_frame: u64,
     /// The screen shown before the reviewed one, while it still shows.
     from: Option<Box<dyn InstallerController>>,
+    demo_deadline: Option<Instant>,
+    demo_closed: Arc<AtomicBool>,
 }
 
 impl Drop for InstallerGui {
@@ -569,6 +650,19 @@ impl InstallerGui {
 
 impl eframe::App for InstallerGui {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self
+            .demo_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            && self.frames > 0
+        {
+            self.demo_deadline = None;
+            self.demo_closed.store(true, Ordering::Release);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if let Some(deadline) = self.demo_deadline {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+        }
         // A window-manager close during a running change is refused, so the change is never cut
         // short by the process exiting; the view explains why.
         if ctx.input(|input| input.viewport().close_requested()) && !self.controller.request_close()

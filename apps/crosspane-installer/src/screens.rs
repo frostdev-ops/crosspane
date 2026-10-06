@@ -30,6 +30,7 @@ use eframe::egui::{
 
 use crate::demo::{
     DEMO_LABEL, HIDE_LABEL, MICROPHONE_COPY, MICROPHONE_DETAIL, MIRROR_LABEL, REMOVE_AUDIO_LABEL,
+    progress_groups,
 };
 use crate::motion::{
     IllustrationMotion, MotionLevel, TRANSITION_MS, illustration_allowed, illustration_duration,
@@ -632,8 +633,8 @@ impl WizardShell {
         let current = view
             .progress
             .current
-            .and_then(|group| PROGRESS_GROUPS.iter().position(|g| *g == group));
-        let done_count = PROGRESS_GROUPS
+            .and_then(|group| progress_groups().iter().position(|g| *g == group));
+        let done_count = progress_groups()
             .iter()
             .take_while(|group| view.progress.completed.contains(group))
             .count();
@@ -653,19 +654,19 @@ impl WizardShell {
             painter.rect_filled(pill, 10.0, theme::alpha(theme::FROST, 16));
         }
         // The track between marks, and how far setup has come along it.
-        let last = first + (PROGRESS_GROUPS.len() - 1) as f32 * step;
+        let last = first + (progress_groups().len() - 1) as f32 * step;
         painter.line_segment(
             [Pos2::new(mark_x, first), Pos2::new(mark_x, last)],
             (1.5, theme::alpha(theme::QUIET, 40)),
         );
-        let reached = (first + fill.min((PROGRESS_GROUPS.len() - 1) as f32) * step).min(last);
+        let reached = (first + fill.min((progress_groups().len() - 1) as f32) * step).min(last);
         if fill > 0.0 {
             painter.line_segment(
                 [Pos2::new(mark_x, first), Pos2::new(mark_x, reached)],
                 (1.5, theme::alpha(theme::FROST, 170)),
             );
         }
-        for (index, group) in PROGRESS_GROUPS.into_iter().enumerate() {
+        for (index, group) in progress_groups().iter().copied().enumerate() {
             let is_current = view.progress.current == Some(group);
             let done = view.progress.completed.contains(&group);
             let label = progress_label(group);
@@ -775,14 +776,14 @@ impl WizardShell {
             Pos2::new(rect.left(), rect.bottom() - 4.0),
             Vec2::new(rect.width(), 4.0),
         );
-        let done: Vec<bool> = PROGRESS_GROUPS
+        let done: Vec<bool> = progress_groups()
             .iter()
             .map(|group| view.progress.completed.contains(group))
             .collect();
         let current = view
             .progress
             .current
-            .and_then(|group| PROGRESS_GROUPS.iter().position(|g| *g == group));
+            .and_then(|group| progress_groups().iter().position(|g| *g == group));
         let response = ui.interact(strip, ui.id().with("progress-strip"), Sense::hover());
         response.widget_info(|| {
             egui::WidgetInfo::labeled(
@@ -791,7 +792,7 @@ impl WizardShell {
                 format!(
                     "Setup progress: {} of {} done",
                     done.iter().filter(|d| **d).count(),
-                    PROGRESS_GROUPS.len()
+                    progress_groups().len()
                 ),
             )
         });
@@ -1797,11 +1798,11 @@ fn eyebrow(view: &WizardView, narrow: bool) -> Option<String> {
     match view.screen {
         ScreenId::Welcome | ScreenId::RepairRemove => None,
         _ => view.progress.current.map(|group| {
-            let step = PROGRESS_GROUPS
+            let step = progress_groups()
                 .iter()
                 .position(|g| *g == group)
                 .map_or(1, |index| index + 1);
-            format!("STEP {step} OF {}", PROGRESS_GROUPS.len())
+            format!("STEP {step} OF {}", progress_groups().len())
         }),
     }
 }
@@ -2402,14 +2403,6 @@ pub(crate) fn check_wording(check: &RowView) -> String {
         RowState::Unchecked => "Not checked yet".to_owned(),
     }
 }
-
-const PROGRESS_GROUPS: [ProgressGroup; 5] = [
-    ProgressGroup::Install,
-    ProgressGroup::PermissionsNetwork,
-    ProgressGroup::Connect,
-    ProgressGroup::Arrange,
-    ProgressGroup::Ready,
-];
 
 fn progress_label(group: ProgressGroup) -> &'static str {
     match group {

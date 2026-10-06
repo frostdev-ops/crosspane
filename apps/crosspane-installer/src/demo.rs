@@ -5,6 +5,136 @@
 
 use crate::view::*;
 
+fn platform_copy(view: &mut WizardView, platform: crate::agent_contract::AgentPlatform) {
+    if platform != crate::agent_contract::AgentPlatform::Windows {
+        return;
+    }
+    view.machine = Some("windows-pc".into());
+    view.progress
+        .completed
+        .retain(|group| *group != ProgressGroup::PermissionsNetwork);
+    for row in &mut view.rows {
+        if row.label == "Start Crosspane when you sign in" {
+            row.label = "Start Crosspane while you're signed in".into();
+        }
+        if row.state == RowState::Skipped {
+            row.detail =
+                "Do this later from Crosspane > Settings; open Crosspane from the Start menu"
+                    .into();
+        }
+        if row.id == 20 && view.screen == ScreenId::InstallPlan {
+            row.detail = if row.state == RowState::Failed {
+                "Crosspane's files could not be installed. Free up about 200 MB, then try again."
+            } else {
+                r"Installing Crosspane for your account: programs in %LOCALAPPDATA%\Programs\Crosspane, state in %LOCALAPPDATA%\Crosspane, and Start menu entries. Nothing outside your account changes."
+            }.into();
+        }
+        if row.id == 23 && view.screen == ScreenId::Installing {
+            row.detail =
+                "Waiting for Crosspane to start with its key in Windows Credential Manager.".into();
+        }
+    }
+    if matches!(
+        view.screen,
+        ScreenId::Compatibility | ScreenId::InstallPlan | ScreenId::Installing
+    ) {
+        let checks = [
+            ("Operating system", "Windows 11"),
+            ("Signed-in session", "Ordinary user"),
+            ("Graphics and video", "Direct3D 11 and H.264"),
+            ("Required libraries", ""),
+        ];
+        view.rows
+            .retain(|row| !row.is_check() || row.id < check_row_id(checks.len()));
+        for (index, (label, detail)) in checks.iter().enumerate() {
+            if let Some(row) = view
+                .rows
+                .iter_mut()
+                .find(|row| row.id == check_row_id(index))
+            {
+                row.label = (*label).into();
+                row.detail = (*detail).into();
+            }
+        }
+    }
+    match view.screen {
+        ScreenId::Grants => view.message =
+            "Choose what to allow here. You can change this later in the Crosspane Settings app."
+                .into(),
+        ScreenId::RepairRemove => {
+            view.fields.retain(|field| {
+                !matches!(
+                    field,
+                    FieldView::Toggle {
+                        role: ToggleRole::RemoveAudioDriver,
+                        ..
+                    }
+                )
+            });
+            view.message = r"Removal stops Crosspane first. State is in %LOCALAPPDATA%\Crosspane. Deleting this computer's identity and trust is a separate choice.".into();
+        }
+        _ => {}
+    }
+}
+
+/// The screens that apply to one shell platform, without constructing native services.
+pub fn screens_for(
+    platform: crate::agent_contract::AgentPlatform,
+) -> &'static [(ScreenId, &'static str)] {
+    if platform == crate::agent_contract::AgentPlatform::Windows {
+        &[
+            (ScreenId::Welcome, "welcome"),
+            (ScreenId::Compatibility, "compatibility"),
+            (ScreenId::InstallPlan, "install-plan"),
+            (ScreenId::Installing, "installing"),
+            (ScreenId::Connect, "connect"),
+            (ScreenId::MatchNumbers, "match-numbers"),
+            (ScreenId::Grants, "grants"),
+            (ScreenId::Layout, "layout"),
+            (ScreenId::Summary, "summary"),
+            (ScreenId::RepairRemove, "repair-remove"),
+        ]
+    } else {
+        &SCREENS
+    }
+}
+
+/// Platform applicability is data shared by the flow and its progress rail.
+pub fn progress_groups_for(
+    platform: crate::agent_contract::AgentPlatform,
+) -> &'static [ProgressGroup] {
+    if platform == crate::agent_contract::AgentPlatform::Windows {
+        &[
+            ProgressGroup::Install,
+            ProgressGroup::Connect,
+            ProgressGroup::Arrange,
+            ProgressGroup::Ready,
+        ]
+    } else {
+        &[
+            ProgressGroup::Install,
+            ProgressGroup::PermissionsNetwork,
+            ProgressGroup::Connect,
+            ProgressGroup::Arrange,
+            ProgressGroup::Ready,
+        ]
+    }
+}
+
+pub(crate) fn progress_groups() -> &'static [ProgressGroup] {
+    progress_groups_for(copy_platform())
+}
+
+/// Native shell copy selection is centralized here; renderers do not test the target OS.
+pub fn copy_platform() -> crate::agent_contract::AgentPlatform {
+    #[cfg(windows)]
+    return crate::agent_contract::AgentPlatform::Windows;
+    #[cfg(target_os = "macos")]
+    return crate::agent_contract::AgentPlatform::Macos;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    crate::agent_contract::AgentPlatform::Linux
+}
+
 pub const DEMO_LABEL: &str = "Demo — no changes made";
 pub const HIDE_LABEL: &str = "Hide projected windows on a virtual display (recommended)";
 pub const MIRROR_LABEL: &str = "Mirror instead (windows stay visible on this Mac)";
@@ -48,7 +178,7 @@ pub const VARIANTS: [(&str, ScreenId); 9] = [
 /// The screen a review name shows: one of [`SCREENS`] or a [`VARIANTS`] state of one.
 pub fn screen_named(name: &str) -> Option<ScreenId> {
     let name = motion_variant(name).0;
-    SCREENS
+    screens_for(copy_platform())
         .iter()
         .find(|(_, key)| *key == name)
         .map(|(id, _)| *id)
@@ -81,6 +211,7 @@ fn skipped_fixture(screen: ScreenId) -> WizardView {
     view.fields.clear();
     view.layout = None;
     view.link_caption = None;
+    platform_copy(&mut view, copy_platform());
     view
 }
 
@@ -284,6 +415,7 @@ pub fn fixture_named(name: &str) -> Option<WizardView> {
     if let Some(motion) = motion {
         view.motion = motion;
     }
+    platform_copy(&mut view, copy_platform());
     Some(view)
 }
 
@@ -355,13 +487,7 @@ fn install_rows(states: &[RowState; 5]) -> Vec<RowView> {
 }
 
 fn progress(screen: ScreenId) -> ProgressView {
-    let order = [
-        ProgressGroup::Install,
-        ProgressGroup::PermissionsNetwork,
-        ProgressGroup::Connect,
-        ProgressGroup::Arrange,
-        ProgressGroup::Ready,
-    ];
+    let order = progress_groups();
     let current = match screen {
         ScreenId::Welcome
         | ScreenId::Compatibility
@@ -785,6 +911,7 @@ pub fn fixture(screen: ScreenId) -> WizardView {
             ButtonKind::Link,
         ));
     }
+    platform_copy(&mut view, copy_platform());
     view
 }
 
@@ -978,19 +1105,111 @@ impl DisconnectedController {
     }
 
     fn navigate(&mut self, back: bool) {
-        let index = SCREENS
+        let screens = screens_for(copy_platform());
+        let index = screens
             .iter()
             .position(|(id, _)| *id == self.view.screen)
             .unwrap_or(0);
         let next = if back {
             index.saturating_sub(1)
         } else {
-            (index + 1).min(SCREENS.len() - 1)
+            (index + 1).min(screens.len() - 1)
         };
         let revision = self.view.revision + 1;
         let motion = self.view.motion;
-        self.view = fixture(SCREENS[next].0);
+        self.view = fixture(screens[next].0);
         self.view.revision = revision;
         self.view.motion = motion;
+    }
+}
+
+#[cfg(test)]
+mod windows_copy_tests {
+    use super::*;
+    use crate::agent_contract::AgentPlatform;
+
+    fn windows(screen: ScreenId) -> WizardView {
+        let mut view = fixture(screen);
+        platform_copy(&mut view, AgentPlatform::Windows);
+        view
+    }
+
+    #[test]
+    fn windows_install_copy_names_start_menu_and_local_app_data() {
+        let view = windows(ScreenId::InstallPlan);
+        let payload = view.rows.iter().find(|row| row.id == 20).unwrap();
+        assert!(payload.detail.contains("Start menu"));
+        assert!(payload.detail.contains(r"%LOCALAPPDATA%\Crosspane"));
+        assert!(!payload.detail.contains("~/.local"));
+    }
+
+    #[test]
+    fn windows_running_copy_uses_signed_in_and_credential_manager() {
+        let view = windows(ScreenId::Installing);
+        assert!(view.rows.iter().any(|row| row.label.contains("signed in")));
+        let agent = view.rows.iter().find(|row| row.id == 23).unwrap();
+        assert!(agent.detail.contains("Credential Manager"));
+        assert!(!agent.detail.contains("keyring"));
+    }
+
+    #[test]
+    fn windows_removal_has_no_mac_audio_driver_choice() {
+        let view = windows(ScreenId::RepairRemove);
+        assert!(!view.fields.iter().any(|field| matches!(
+            field,
+            FieldView::Toggle {
+                role: ToggleRole::RemoveAudioDriver,
+                ..
+            }
+        )));
+        assert!(view.message.contains(r"%LOCALAPPDATA%\Crosspane"));
+        assert!(!view.message.contains("Mac"));
+    }
+
+    #[test]
+    fn windows_settings_copy_is_conditional_platform_data() {
+        let mut view = fixture_named("summary-skipped").unwrap();
+        platform_copy(&mut view, AgentPlatform::Windows);
+        assert!(view.rows.iter().filter(|row| row.state == RowState::Skipped).all(|row|
+            row.detail == "Do this later from Crosspane > Settings; open Crosspane from the Start menu"
+        ));
+        assert!(
+            !view
+                .rows
+                .iter()
+                .any(|row| row.detail.contains("System Settings"))
+        );
+    }
+
+    #[test]
+    fn windows_sequence_omits_permissions_firewall_and_mac_only_choices() {
+        let screens = screens_for(AgentPlatform::Windows);
+        assert_eq!(screens.len(), 10);
+        assert!(!screens.iter().any(|(screen, _)| matches!(
+            screen,
+            ScreenId::Permissions
+                | ScreenId::Network
+                | ScreenId::AudioComponent
+                | ScreenId::HidingChoice
+        )));
+        assert!(
+            screens
+                .iter()
+                .any(|(screen, _)| *screen == ScreenId::Layout)
+        );
+        assert!(!format!("{screens:?}").contains("Practice"));
+    }
+
+    #[test]
+    fn windows_rail_contains_only_the_four_applicable_groups() {
+        assert_eq!(
+            progress_groups_for(AgentPlatform::Windows),
+            [
+                ProgressGroup::Install,
+                ProgressGroup::Connect,
+                ProgressGroup::Arrange,
+                ProgressGroup::Ready,
+            ]
+        );
     }
 }
