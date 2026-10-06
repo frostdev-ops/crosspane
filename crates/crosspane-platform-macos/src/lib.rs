@@ -12,6 +12,7 @@ pub mod displays;
 pub mod frame_capture;
 #[cfg(feature = "gpu")]
 pub mod gpu_import;
+pub mod hotkeys;
 pub mod inject;
 pub mod keychain;
 pub mod link;

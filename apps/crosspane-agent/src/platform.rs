@@ -1567,17 +1567,25 @@ pub fn create(
         ),
         None => (None, None),
     };
+    let capture = optional("capture", MacCapture::new(gate.clone()));
+    let hotkeys = capture.as_ref().and_then(|capture| {
+        let chord =
+            crosspane_engine::EngineConfig::new(crosspane_types::id::NodeId([0; 32])).release_chord;
+        optional(
+            "hotkeys",
+            crosspane_platform_macos::hotkeys::MacHotkeys::new(capture, &chord),
+        )
+    });
     Ok(Platform {
         startup_recovery,
         session: Box::new(session),
         displays: Box::new(displays),
-        capture: optional("capture", MacCapture::new(gate.clone()))
-            .map(|c| Box::new(c) as Box<dyn InputCapture>),
+        capture: capture.map(|c| Box::new(c) as Box<dyn InputCapture>),
         keys,
         pointer,
         overlay: optional("overlay", MacOverlay::new())
             .map(|o| Box::new(o) as Box<dyn OverlayHost>),
-        hotkeys: None,
+        hotkeys: hotkeys.map(|h| Box::new(h) as Box<dyn GlobalHotkeys>),
         keystore: keystore(),
         // Microphone is required while audio is on: the speaker loopback input is gated by it.
         permissions: Box::new(MacPermissions::new(audio_enabled())),

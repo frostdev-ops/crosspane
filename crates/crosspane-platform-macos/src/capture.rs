@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{
-    CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, Edge, EndReason, EventSink,
-    InputCapture, IoGate, MotionKind, Permission, PermissionState, PlatformError, PortalId,
+    CaptureAbort, CaptureEvent, CaptureId, CapturePortal, CaptureStart, Chord, Edge, EndReason,
+    EventSink, HotkeyEvent, InputCapture, IoGate, MotionKind, Permission, PermissionState,
+    PlatformError, PortalId,
 };
 use crosspane_types::geom::{PointDevice, VectorLogical};
-use crosspane_types::hid::{MouseButton, macos_to_hid};
+use crosspane_types::hid::{HidUsage, MouseButton, hid_to_macos, macos_to_hid};
 use crosspane_types::id::DisplayId;
 use crosspane_types::input::{LockKeys, ScrollDelta, ScrollPhase};
 use crosspane_types::time::MonoTime;
@@ -32,7 +33,7 @@ use objc2_core_graphics::{
     CGWarpMouseCursorPosition, kCGNullDirectDisplay,
 };
 
-use crate::{clock, permissions};
+use crate::{clock, hotkeys::ChordState, permissions};
 
 mod drag;
 
@@ -538,6 +539,8 @@ impl Request {
 
 enum Delivery {
     Subscribe(Arc<dyn EventSink<CaptureEvent>>, LockKeys, bool),
+    HotkeySubscribe(Arc<dyn EventSink<HotkeyEvent>>, HotkeyEvent),
+    Hotkey(HotkeyEvent),
     Activate {
         token: u64,
         id: CaptureId,
@@ -668,6 +671,10 @@ impl Shared {
         } else {
             Ok(())
         }
+    }
+
+    fn hotkey_available(&self) -> Result<(), PlatformError> {
+        self.available().map_err(|_| hotkeys_unavailable())
     }
 
     fn queue(&self, message: Delivery) -> Result<(), PlatformError> {
@@ -845,9 +852,18 @@ fn send_event(sink: &dyn EventSink<CaptureEvent>, event: CaptureEvent) -> bool {
     catch_unwind(AssertUnwindSafe(|| sink.send(event))).is_ok()
 }
 
+fn send_hotkey(sink: &dyn EventSink<HotkeyEvent>, event: HotkeyEvent) -> bool {
+    match event {
+        HotkeyEvent::Pressed { .. } => tracing::debug!("chord pressed"),
+        HotkeyEvent::Released { .. } => tracing::debug!("chord released"),
+    }
+    catch_unwind(AssertUnwindSafe(|| sink.send(event))).is_ok()
+}
+
 fn deliver(shared: Arc<Shared>, receiver: Receiver<Delivery>) {
     let _guard = DeliveryGuard(shared.clone());
     let mut sink: Option<Arc<dyn EventSink<CaptureEvent>>> = None;
+    let mut hotkey_sink: Option<Arc<dyn EventSink<HotkeyEvent>>> = None;
     let mut active: Option<(u64, CaptureId)> = None;
     while let Ok(message) = receiver.recv() {
         if shared.dead.load(Ordering::Acquire) {
@@ -867,6 +883,23 @@ fn deliver(shared: Arc<Shared>, receiver: Receiver<Delivery>) {
             return;
         }
         match message {
+            Delivery::HotkeySubscribe(new_sink, current) => {
+                if shared.hotkey_available().is_err() {
+                    continue;
+                }
+                if !send_hotkey(&*new_sink, current) {
+                    return;
+                }
+                hotkey_sink = Some(new_sink);
+            }
+            Delivery::Hotkey(event) => {
+                if shared.hotkey_available().is_ok()
+                    && let Some(sink) = &hotkey_sink
+                    && !send_hotkey(&**sink, event)
+                {
+                    return;
+                }
+            }
             Delivery::Subscribe(new_sink, locks, blinded) => {
                 if !send_event(&*new_sink, CaptureEvent::LockKeys(locks))
                     || !send_event(&*new_sink, CaptureEvent::KeyboardBlinded(blinded))
@@ -970,6 +1003,12 @@ impl Wake {
 }
 
 enum Command {
+    HotkeySet(Chord, Arc<HotkeyRequest>, Sender<Result<(), PlatformError>>),
+    HotkeySubscribe(
+        Arc<dyn EventSink<HotkeyEvent>>,
+        Arc<HotkeyRequest>,
+        Sender<Result<(), PlatformError>>,
+    ),
     Subscribe(
         Arc<dyn EventSink<CaptureEvent>>,
         Arc<Request>,
@@ -996,6 +1035,9 @@ impl Command {
     fn fail(self) {
         let error = PlatformError::Backend("capture worker stopped".into());
         match self {
+            Self::HotkeySet(_, _, reply) | Self::HotkeySubscribe(_, _, reply) => {
+                let _ = reply.send(Err(hotkeys_unavailable()));
+            }
             Self::Subscribe(_, _, reply) | Self::Monitor(_, _, reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -1003,6 +1045,71 @@ impl Command {
                 let _ = reply.send(Err(error));
             }
         }
+    }
+}
+
+fn hotkeys_unavailable() -> PlatformError {
+    PlatformError::Unsupported("macOS release chord tap unavailable")
+}
+
+struct HotkeyRequest {
+    deadline: Instant,
+    cancelled: AtomicBool,
+}
+impl HotkeyRequest {
+    fn valid(&self, shared: &Shared) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+            && Instant::now() < self.deadline
+            && shared.available().is_ok()
+    }
+}
+
+/// Owns only existing tap resources. Capture Drop/death still stops the tap: retaining this
+/// handle never reopens it. Hotkey requests deliberately carry no capture epoch or IoGate check.
+#[derive(Clone)]
+pub(crate) struct HotkeyTap {
+    shared: Arc<Shared>,
+    commands: Sender<Command>,
+    wake: Arc<Wake>,
+}
+impl HotkeyTap {
+    fn call(
+        &self,
+        command: impl FnOnce(Arc<HotkeyRequest>, Sender<Result<(), PlatformError>>) -> Command,
+    ) -> Result<(), PlatformError> {
+        self.shared.hotkey_available()?;
+        let request = Arc::new(HotkeyRequest {
+            deadline: Instant::now() + CALL_BUDGET,
+            cancelled: AtomicBool::new(false),
+        });
+        let (reply, receiver) = mpsc::channel();
+        self.commands
+            .send(command(request.clone(), reply))
+            .map_err(|_| hotkeys_unavailable())?;
+        self.wake.wake();
+        let result =
+            receiver.recv_timeout(request.deadline.saturating_duration_since(Instant::now()));
+        self.shared.hotkey_available()?;
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                request.cancelled.store(true, Ordering::Release);
+                Err(match error {
+                    mpsc::RecvTimeoutError::Timeout => PlatformError::Timeout,
+                    mpsc::RecvTimeoutError::Disconnected => hotkeys_unavailable(),
+                })
+            }
+        }
+    }
+    pub(crate) fn set(&self, chord: &Chord) -> Result<(), PlatformError> {
+        ChordState::validate(chord)?;
+        self.call(|request, reply| Command::HotkeySet(chord.clone(), request, reply))
+    }
+    pub(crate) fn subscribe(
+        &self,
+        sink: Arc<dyn EventSink<HotkeyEvent>>,
+    ) -> Result<(), PlatformError> {
+        self.call(|request, reply| Command::HotkeySubscribe(sink, request, reply))
     }
 }
 
@@ -1022,6 +1129,14 @@ impl std::fmt::Debug for MacCapture {
 }
 
 impl MacCapture {
+    pub(crate) fn hotkey_tap(&self) -> Result<HotkeyTap, PlatformError> {
+        self.shared.hotkey_available()?;
+        Ok(HotkeyTap {
+            shared: self.shared.clone(),
+            commands: self.commands.clone(),
+            wake: self.wake.clone(),
+        })
+    }
     /// Fails with PermissionDenied(InputMonitoring | Accessibility) if either is missing.
     pub fn new(gate: Arc<IoGate>) -> Result<MacCapture, PlatformError> {
         check_permissions()?;
@@ -1270,6 +1385,8 @@ impl Drop for MacCapture {
 
 struct TapState {
     shared: Arc<Shared>,
+    hotkeys: ChordState,
+    hotkey_subscribed: bool,
     commands: Receiver<Command>,
     tap: Option<CFRetained<CFMachPort>>,
     portal_config: Arc<Vec<Portal>>,
@@ -1301,6 +1418,96 @@ struct TapState {
 }
 
 impl TapState {
+    fn hotkey_modifiers(flags: CGEventFlags) -> u8 {
+        (0..8).fold(0, |bits, bit| {
+            if hid_to_macos(HidUsage::keyboard(0xe0 + bit))
+                .and_then(|code| modifier_down(code, flags))
+                == Some(true)
+            {
+                bits | 1 << bit
+            } else {
+                bits
+            }
+        })
+    }
+
+    fn hotkey_snapshot() -> ([bool; 128], u8) {
+        let source = CGEventSourceStateID::HIDSystemState;
+        let mut held = [false; 128];
+        for (code, down) in held.iter_mut().enumerate() {
+            *down = CGEventSource::key_state(source, code as u16);
+        }
+        (
+            held,
+            Self::hotkey_modifiers(CGEventSource::flags_state(source)),
+        )
+    }
+
+    fn hotkey_input(&mut self, code: u16, down: bool, flags: u8, physical: bool, at: MonoTime) {
+        if self.shared.available().is_ok()
+            && let Some(event) = self.hotkeys.key(code, down, flags, physical, at)
+            && self.hotkey_subscribed
+        {
+            let _ = self.shared.queue(Delivery::Hotkey(event));
+        }
+    }
+
+    fn hotkey_subscribe(
+        &mut self,
+        sink: Arc<dyn EventSink<HotkeyEvent>>,
+        at: MonoTime,
+    ) -> Result<(), PlatformError> {
+        if self.hotkey_subscribed {
+            return Err(PlatformError::Backend(
+                "GlobalHotkeys::subscribe called twice".into(),
+            ));
+        }
+        self.shared
+            .queue(Delivery::HotkeySubscribe(sink, self.hotkeys.current(at)))
+            .map_err(|_| hotkeys_unavailable())?;
+        self.hotkey_subscribed = true;
+        Ok(())
+    }
+
+    fn hotkey_observe(&mut self, kind: CGEventType, event: &CGEvent) {
+        if !matches!(
+            kind,
+            CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+        ) {
+            return;
+        }
+        let physical = crate::hotkeys::physical_source(
+            CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUserData),
+            CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUnixProcessID),
+            CGEvent::integer_value_field(Some(event), CGEventField::EventSourceStateID),
+            INJECTED,
+        );
+        if !physical {
+            return;
+        }
+        let Ok(code) = u16::try_from(CGEvent::integer_value_field(
+            Some(event),
+            CGEventField::KeyboardEventKeycode,
+        )) else {
+            return;
+        };
+        let flags = CGEvent::flags(Some(event));
+        let down = if kind == CGEventType::FlagsChanged {
+            let Some(down) = modifier_down(code, flags) else {
+                return;
+            };
+            down
+        } else {
+            kind == CGEventType::KeyDown
+        };
+        self.hotkey_input(
+            code,
+            down,
+            Self::hotkey_modifiers(flags),
+            true,
+            clock::now(),
+        );
+    }
     fn start_pin(
         &mut self,
         token: u64,
@@ -1726,6 +1933,46 @@ impl TapState {
                 continue;
             }
             match command {
+                Command::HotkeySet(chord, request, reply) => {
+                    let result = (|| {
+                        if !request.valid(&self.shared) {
+                            return Err(PlatformError::Timeout);
+                        }
+                        check_permissions().map_err(|_| hotkeys_unavailable())?;
+                        let (held, flags) = Self::hotkey_snapshot();
+                        let at = clock::now();
+                        if !request.valid(&self.shared) {
+                            return Err(PlatformError::Timeout);
+                        }
+                        let release = self.hotkeys.release_for_replacement(&chord, at)?;
+                        let next = self.hotkeys.set(&chord, held, flags, at)?;
+                        if self.hotkey_subscribed {
+                            for event in [release, next].into_iter().flatten() {
+                                self.shared
+                                    .queue(Delivery::Hotkey(event))
+                                    .map_err(|_| hotkeys_unavailable())?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    let _ = reply.send(result);
+                }
+                Command::HotkeySubscribe(sink, request, reply) => {
+                    let result = (|| {
+                        if !request.valid(&self.shared) {
+                            return Err(PlatformError::Timeout);
+                        }
+                        check_permissions().map_err(|_| hotkeys_unavailable())?;
+                        let (held, flags) = Self::hotkey_snapshot();
+                        let at = clock::now();
+                        if !request.valid(&self.shared) {
+                            return Err(PlatformError::Timeout);
+                        }
+                        self.hotkeys.refresh(held, flags, at);
+                        self.hotkey_subscribe(sink, at)
+                    })();
+                    let _ = reply.send(result);
+                }
                 Command::Subscribe(sink, request, reply) => {
                     let result = if !request.valid(&self.shared) {
                         Err(PlatformError::Timeout)
@@ -2423,6 +2670,8 @@ unsafe extern "C-unwind" fn tap_callback(
         let Some(input) = (unsafe { event.as_ref() }) else {
             return event;
         };
+        // Observation precedes capture suppression and has its own held state/epoch semantics.
+        state.hotkey_observe(kind, input);
         if state.event(kind, input) {
             event
         } else {
@@ -2520,6 +2769,8 @@ fn run_tap(
 ) {
     let state = Box::into_raw(Box::new(TapState {
         shared: shared.clone(),
+        hotkeys: ChordState::default(),
+        hotkey_subscribed: false,
         commands,
         tap: None,
         portal_config: Arc::new(Vec::new()),
@@ -3311,6 +3562,123 @@ mod tests {
     fn tap_fixture() -> (TapState, Receiver<Delivery>) {
         let (tap, receiver, _) = tap_cursor_fixture(true);
         (tap, receiver)
+    }
+
+    fn wp276_chord() -> Chord {
+        Chord {
+            modifiers: vec![
+                HidUsage::keyboard(0xe0),
+                HidUsage::keyboard(0xe1),
+                HidUsage::keyboard(0xe2),
+            ],
+            key: HidUsage::keyboard(0x29),
+        }
+    }
+
+    #[test]
+    fn wp276_owner_preserves_hold_across_capture_epochs_and_queues_current_first() {
+        let (mut tap, receiver) = tap_fixture();
+        let mut held = [false; 128];
+        for code in [0x3b, 0x38, 0x3a, 0x35] {
+            held[code] = true;
+        }
+        tap.hotkeys
+            .set(&wp276_chord(), held, 7, MonoTime::from_nanos(10))
+            .unwrap();
+        tap.hotkey_subscribe(Arc::new(|_: HotkeyEvent| {}), MonoTime::from_nanos(11))
+            .unwrap();
+        match receiver.try_recv().unwrap() {
+            Delivery::HotkeySubscribe(_, current) => {
+                assert_eq!(
+                    current,
+                    HotkeyEvent::Pressed {
+                        at: MonoTime::from_nanos(10)
+                    }
+                );
+            }
+            _ => panic!("missing first hotkey state"),
+        }
+        for capturing in [true, false, true, false] {
+            tap.shared.epoch.fetch_add(1, Ordering::AcqRel);
+            tap.shared.capturing.store(capturing, Ordering::Release);
+            tap.hotkey_input(0x35, true, 7, true, MonoTime::from_nanos(12));
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(
+                tap.hotkeys.current(MonoTime::from_nanos(13)),
+                HotkeyEvent::Pressed {
+                    at: MonoTime::from_nanos(10)
+                }
+            );
+        }
+        tap.hotkey_input(0x35, false, 7, false, MonoTime::from_nanos(14));
+        assert!(receiver.try_recv().is_err());
+        tap.hotkey_input(0x35, false, 7, true, MonoTime::from_nanos(15));
+        assert!(
+            matches!(receiver.try_recv().unwrap(), Delivery::Hotkey(HotkeyEvent::Released { at }) if at == MonoTime::from_nanos(15))
+        );
+        tap.hotkey_input(0x35, false, 7, true, MonoTime::from_nanos(16));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn wp276_owner_stop_or_death_refuses_and_emits_no_hotkey_loss_event() {
+        for dead in [false, true] {
+            let (mut tap, receiver) = tap_fixture();
+            tap.hotkeys
+                .set(&wp276_chord(), [false; 128], 0, MonoTime::ZERO)
+                .unwrap();
+            tap.hotkey_subscribed = true;
+            if dead {
+                tap.shared.dead.store(true, Ordering::Release);
+            } else {
+                tap.shared.stop.store(true, Ordering::Release);
+            }
+            for code in [0x3b, 0x38, 0x3a, 0x35] {
+                tap.hotkey_input(code, true, 7, true, MonoTime::from_nanos(1));
+            }
+            assert!(receiver.try_recv().is_err());
+            assert!(matches!(
+                tap.shared.hotkey_available(),
+                Err(PlatformError::Unsupported(_))
+            ));
+            let (reply, answer) = mpsc::channel();
+            Command::HotkeySet(
+                wp276_chord(),
+                Arc::new(HotkeyRequest {
+                    deadline: Instant::now() + Duration::from_secs(3600),
+                    cancelled: AtomicBool::new(false),
+                }),
+                reply,
+            )
+            .fail();
+            assert!(matches!(
+                answer.try_recv().unwrap(),
+                Err(PlatformError::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn wp276_hotkey_request_is_epoch_independent_but_cancellable_expiring_and_terminal() {
+        let (tap, _) = tap_fixture();
+        let request = HotkeyRequest {
+            deadline: Instant::now() + Duration::from_secs(3600),
+            cancelled: AtomicBool::new(false),
+        };
+        assert!(request.valid(&tap.shared));
+        tap.shared.epoch.fetch_add(1, Ordering::AcqRel);
+        tap.shared.capturing.store(true, Ordering::Release);
+        assert!(request.valid(&tap.shared));
+        request.cancelled.store(true, Ordering::Release);
+        assert!(!request.valid(&tap.shared));
+        let expired = HotkeyRequest {
+            deadline: Instant::now(),
+            cancelled: AtomicBool::new(false),
+        };
+        assert!(!expired.valid(&tap.shared));
+        request.cancelled.store(false, Ordering::Release);
+        tap.shared.stop.store(true, Ordering::Release);
+        assert!(!request.valid(&tap.shared));
     }
 
     #[test]
@@ -4212,6 +4580,8 @@ mod tests {
         (
             TapState {
                 shared,
+                hotkeys: ChordState::default(),
+                hotkey_subscribed: false,
                 commands,
                 tap: None,
                 portal_config: portals.clone(),
