@@ -354,6 +354,14 @@ fn windows_mirror_startup_notice(pending: &mut Option<usize>, say: impl FnOnce(S
     }
 }
 
+/// Advertise both drop protocols under the existing user switch; negotiation is bilateral.
+fn append_drag_features(features: &mut Vec<String>, across: bool) {
+    if across {
+        features.push(crosspane_protocol::projection::DRAG_FEATURE.to_owned());
+        features.push(crosspane_protocol::projection::DRAG_IN_FEATURE.to_owned());
+    }
+}
+
 fn start_agent(
     paths: &Paths,
     lifecycle: &mut lifecycle::Lifecycle,
@@ -473,9 +481,7 @@ fn start_agent(
     };
     // `cursor`: this node shows the source's cursor shapes on its proxies (WP-2.16).
     let mut features = vec!["e1".to_owned(), "cursor".to_owned()];
-    if config.drag.across {
-        features.push(crosspane_protocol::projection::DRAG_FEATURE.to_owned());
-    }
+    append_drag_features(&mut features, config.drag.across);
     if video.codecs.is_some() {
         features.push("h264".to_owned());
         // Region video (WP-2.32): this node shows a video rectangle over its lossless canvas.
@@ -2708,5 +2714,22 @@ mod windows_mirror_startup_notice_tests {
         let mut empty = Some(0);
         super::windows_mirror_startup_notice(&mut empty, |text| said.push(text));
         assert_eq!(said.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod drag_in_wiring_tests {
+    #[test]
+    fn drag_in_advertisement_uses_the_existing_across_switch() {
+        for across in [false, true] {
+            let mut features = vec!["e1".to_owned(), "cursor".to_owned()];
+            super::append_drag_features(&mut features, across);
+            let mut expected = vec!["e1".to_owned(), "cursor".to_owned()];
+            if across {
+                expected.push(crosspane_protocol::projection::DRAG_FEATURE.to_owned());
+                expected.push(crosspane_protocol::projection::DRAG_IN_FEATURE.to_owned());
+            }
+            assert_eq!(features, expected);
+        }
     }
 }

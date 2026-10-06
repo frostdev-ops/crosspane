@@ -952,10 +952,11 @@ fn print_status(s: &Value) {
 }
 
 fn format_peer_drag(peer: &Value) -> &'static str {
-    if peer["drag"] == "on" {
-        "drag:on"
-    } else {
-        "drag:off"
+    match (peer["drag"] == "on", peer["drag_in"] == true) {
+        (true, true) => "drag:on+in",
+        (true, false) => "drag:on",
+        (false, true) => "drag:in",
+        (false, false) => "drag:off",
     }
 }
 
@@ -1002,7 +1003,31 @@ mod drag_status_tests {
     }
 
     #[test]
-    fn formatted_status_names_each_peers_drag_and_the_active_engine_label() {
+    fn drag_in_status_preserves_legacy_and_reports_bilateral_availability() {
+        assert_eq!(
+            format_peer_drag(&json!({"drag":"on", "drag_in":true})),
+            "drag:on+in"
+        );
+        assert_eq!(
+            format_peer_drag(&json!({"drag":"off", "drag_in":true})),
+            "drag:in"
+        );
+        assert_eq!(
+            format_peer_drag(&json!({"drag":"on", "drag_in":false})),
+            "drag:on"
+        );
+        assert_eq!(
+            format_peer_drag(&json!({"drag":"off", "drag_in":false})),
+            "drag:off"
+        );
+        assert_eq!(
+            format_peer_drag(&json!({"drag":"off", "features":["drag/1"]})),
+            "drag:off"
+        );
+        assert_eq!(
+            format_peer_drag(&json!({"drag":"off", "drag_in":"true"})),
+            "drag:off"
+        );
         assert_eq!(format_peer_drag(&json!({"drag":"on"})), "drag:on");
         assert_eq!(format_peer_drag(&json!({"drag":"off"})), "drag:off");
         assert_eq!(format_peer_drag(&json!({})), "drag:off");

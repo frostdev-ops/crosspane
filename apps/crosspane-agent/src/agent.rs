@@ -26,7 +26,9 @@ use crosspane_protocol::msg::{
     Capability, ClipFailure, ClipFetchFailed, ControlMessage, Hello, Placement, Refusal,
     RevocationNotice,
 };
-use crosspane_protocol::projection::{DRAG_FEATURE, ProjectionMessage, ProxyPlacement};
+use crosspane_protocol::projection::{
+    DRAG_FEATURE, DRAG_IN_FEATURE, ProjectionMessage, ProxyPlacement,
+};
 use crosspane_render::proxy::{HostCommand, HostEvent, HostHandle};
 use crosspane_types::audio::AudioKind;
 use crosspane_types::display::DisplayInfo;
@@ -158,6 +160,8 @@ struct PeerInfo {
     /// What the engine was last told about audio with this peer (`Input::AudioPeer`).
     audio: bool,
     drag: bool,
+    /// Last bilateral drag/1 availability fed to the engine.
+    drag_in: bool,
     clip: bool,
 }
 
@@ -1881,6 +1885,7 @@ impl Agent {
                 let peer = *peer;
                 self.feed(Input::Link(event));
                 self.sync_drag_peer(peer);
+                self.sync_drag_in_peer(peer);
                 return;
             }
             _ => {}
@@ -1921,6 +1926,7 @@ impl Agent {
         // After `PeerUp`: the engine ignores audio availability for a peer that isn't up.
         self.sync_audio_peer(peer);
         self.sync_drag_peer(peer);
+        self.sync_drag_in_peer(peer);
         self.sync_clip_peer(peer);
         self.feed(Input::PeerDisplays {
             peer,
@@ -1990,6 +1996,7 @@ impl Agent {
         self.feed(Input::AudioConnectionReplaced { peer });
         self.sync_audio_peer(peer);
         self.sync_drag_peer(peer);
+        self.sync_drag_in_peer(peer);
         self.sync_clip_peer(peer);
         self.peer_features_changed(peer);
         if displays_changed {
@@ -2031,6 +2038,18 @@ impl Agent {
         if info.drag != available {
             info.drag = available;
             self.feed(Input::DragPeer { peer, available });
+        }
+    }
+
+    fn sync_drag_in_peer(&mut self, peer: NodeId) {
+        let Some(info) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        let has = |features: &[String]| features.iter().any(|f| f == DRAG_IN_FEATURE);
+        let available = info.connected && has(&self.features) && has(&info.features);
+        if info.drag_in != available {
+            info.drag_in = available;
+            self.feed(Input::DragInPeer { peer, available });
         }
     }
 
@@ -3095,6 +3114,12 @@ impl Agent {
             if let Some(link) = self.links.get_mut(&node) {
                 link.close("forgotten");
             }
+            // Retire both negotiated drag capabilities before forgetting their cached state.
+            if let Some(info) = self.peers.get_mut(&node) {
+                info.connected = false;
+            }
+            self.sync_drag_peer(node);
+            self.sync_drag_in_peer(node);
             self.peers.remove(&node);
         }
     }
@@ -3110,7 +3135,7 @@ impl Agent {
             return;
         };
         let request = self.next_request;
-        self.next_request = self.next_request.wrapping_add(1).max(1);
+        self.next_request = advance_browse_request(self.next_request);
         self.waiters.insert(
             request,
             Waiter {
@@ -5306,6 +5331,7 @@ impl Agent {
                 "displays": info.displays.iter().map(display_json).collect::<Vec<_>>(),
                 "features": info.features,
                 "drag": if info.drag { "on" } else { "off" },
+                "drag_in": info.drag_in,
                 "grants": self.trust.with(|t| t.peers().iter().find(|e| e.node == *node).map(|e| {
                     e.granted.iter().filter_map(|c| crate::ctl::capability_name(*c)).collect::<Vec<_>>()
                 }).unwrap_or_default()),
@@ -6184,6 +6210,11 @@ pub fn subscribe_platform(platform: &mut Platform, tx: &Sender<Event>) {
     }
 }
 
+/// App Browse/Pull IDs use only the low 31 bits; the engine owns the high-bit namespace.
+fn advance_browse_request(current: u32) -> u32 {
+    (current.wrapping_add(1) & 0x7fff_ffff).max(1)
+}
+
 /// Debug trace of engine inputs, without motion noise or key contents (04 §7: logs never
 /// record keys).
 fn log_input(input: &Input) {
@@ -6196,7 +6227,50 @@ fn log_input(input: &Input) {
         Input::Link(LinkEvent::Motion { msg, .. }) => {
             tracing::trace!(pos = ?msg.position, "in: link motion")
         }
+        Input::Capture(CaptureEvent::NativeMove {
+            window,
+            grab,
+            size,
+            at,
+        }) => {
+            tracing::debug!(
+                window = window.0,
+                ?grab,
+                ?size,
+                at = at.as_nanos(),
+                "in: capture native move"
+            )
+        }
+        Input::Capture(CaptureEvent::NativeMoveEnded { window, at }) => {
+            tracing::debug!(
+                window = window.0,
+                at = at.as_nanos(),
+                "in: capture native move ended"
+            )
+        }
+        Input::DragInPeer { peer, available } => {
+            tracing::debug!(peer = %peer.short(), available, "in: drag in peer")
+        }
         Input::Link(LinkEvent::Input { peer, msg }) => match msg {
+            crosspane_protocol::msg::InputMessage::Status {
+                session,
+                status:
+                    crosspane_protocol::msg::TargetStatus::NativeMove {
+                        window,
+                        proxy,
+                        grab,
+                        size,
+                    },
+            } => tracing::debug!(
+                peer = %peer.short(), session = session.0, window = window.0,
+                projection = ?proxy.map(|id| id.0), ?grab, ?size, "in: native move report"
+            ),
+            crosspane_protocol::msg::InputMessage::Status {
+                session,
+                status: crosspane_protocol::msg::TargetStatus::NativeMoveEnded { window },
+            } => tracing::debug!(
+                peer = %peer.short(), session = session.0, window = window.0, "in: native move ended report"
+            ),
             crosspane_protocol::msg::InputMessage::Key { .. } => {
                 tracing::debug!(peer = %peer.short(), "in: link key")
             }
@@ -8738,6 +8812,315 @@ mod audio_tests {
                         .count(),
                     usize::from(local)
                 );
+            }
+        }
+    }
+
+    /// Authored Hello/status inputs; the parent rig binds only exact IPv4 loopback and has no
+    /// native capture, injection, display, parking, clipboard or key-store backend.
+    mod drag_in_wiring_tests {
+        use super::*;
+
+        fn availability(inputs: &[Input], wanted: bool) -> usize {
+            inputs
+                .iter()
+                .filter(|input| {
+                    matches!(input,
+                Input::DragInPeer { available, .. } if *available == wanted)
+                })
+                .count()
+        }
+
+        #[test]
+        fn drag_in_requires_both_hellos_and_tracks_cold_refresh_and_disconnect() {
+            for local in [false, true] {
+                for remote in [false, true] {
+                    let mut r = rig(false);
+                    assert!(r.agent.status()["peers"].as_array().unwrap().is_empty());
+                    assert!(!PeerInfo::default().drag_in);
+                    r.agent.features.push(DRAG_FEATURE.into());
+                    if local {
+                        r.agent.features.push(DRAG_IN_FEATURE.into());
+                    }
+                    let mut names = vec!["e1", DRAG_FEATURE];
+                    if remote {
+                        names.push(DRAG_IN_FEATURE);
+                    }
+                    r.agent.fed.clear();
+                    r.refresh(&names); // A cold/unannounced refresh uses the real first-Hello path.
+                    let wanted = local && remote;
+                    assert_eq!(r.agent.status()["peers"][0]["drag"], "on");
+                    assert_eq!(r.agent.status()["peers"][0]["drag_in"], wanted);
+                    assert_eq!(availability(&r.agent.fed, true), usize::from(wanted));
+                    if wanted {
+                        let up = r
+                            .agent
+                            .fed
+                            .iter()
+                            .position(|i| matches!(i, Input::PeerUp { .. }))
+                            .unwrap();
+                        let ready = r
+                            .agent
+                            .fed
+                            .iter()
+                            .position(|i| {
+                                matches!(
+                                    i,
+                                    Input::DragInPeer {
+                                        available: true,
+                                        ..
+                                    }
+                                )
+                            })
+                            .unwrap();
+                        assert!(up < ready);
+                    }
+                    let peer = r.peer;
+                    r.agent.sync_drag_in_peer(peer);
+                    assert_eq!(availability(&r.agent.fed, true), usize::from(wanted));
+                    r.agent.fed.clear();
+                    r.refresh(&["e1", DRAG_FEATURE]);
+                    assert_eq!(r.agent.status()["peers"][0]["drag_in"], false);
+                    assert_eq!(availability(&r.agent.fed, false), usize::from(wanted));
+                    r.refresh(&["e1", DRAG_FEATURE, DRAG_IN_FEATURE]);
+                    r.agent.fed.clear();
+                    r.close();
+                    assert_eq!(r.agent.status()["peers"][0]["drag"], "off");
+                    assert_eq!(r.agent.status()["peers"][0]["drag_in"], false);
+                    assert_eq!(availability(&r.agent.fed, false), usize::from(local));
+                    if local {
+                        let closed = r
+                            .agent
+                            .fed
+                            .iter()
+                            .position(|i| matches!(i, Input::Link(LinkEvent::Closed { .. })))
+                            .unwrap();
+                        let unavailable = r
+                            .agent
+                            .fed
+                            .iter()
+                            .position(|i| {
+                                matches!(
+                                    i,
+                                    Input::DragInPeer {
+                                        available: false,
+                                        ..
+                                    }
+                                )
+                            })
+                            .unwrap();
+                        assert!(
+                            closed < unavailable,
+                            "link cleanup precedes feature removal"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn drag_in_is_independent_of_drag_out_and_reconnects_from_real_availability() {
+            let mut r = rig(false);
+            r.agent.features.push(DRAG_IN_FEATURE.into());
+            r.hello(&["e1", DRAG_IN_FEATURE]);
+            assert_eq!(r.agent.status()["peers"][0]["drag"], "off");
+            assert_eq!(r.agent.status()["peers"][0]["drag_in"], true);
+            r.close();
+            r.agent.fed.clear();
+            r.hello(&["e1", DRAG_IN_FEATURE]);
+            assert_eq!(availability(&r.agent.fed, true), 1);
+            assert_eq!(r.agent.status()["peers"][0]["drag_in"], true);
+            r.agent
+                .features
+                .retain(|feature| feature != DRAG_IN_FEATURE);
+            let peer = r.peer;
+            r.agent.sync_drag_in_peer(peer);
+            assert_eq!(r.agent.status()["peers"][0]["drag_in"], false);
+            assert_eq!(availability(&r.agent.fed, false), 1);
+        }
+
+        #[test]
+        fn drag_in_forget_and_revoke_retire_availability_before_cache_removal() {
+            for revoke in [false, true] {
+                let mut r = rig(false);
+                r.agent
+                    .features
+                    .extend([DRAG_FEATURE.to_owned(), DRAG_IN_FEATURE.to_owned()]);
+                r.hello(&["e1", DRAG_FEATURE, DRAG_IN_FEATURE]);
+                r.agent.fed.clear();
+                let request = if revoke {
+                    Request::Revoke {
+                        peer: "peer-name".into(),
+                    }
+                } else {
+                    Request::Forget {
+                        peer: "peer-name".into(),
+                    }
+                };
+                let response = r.agent.on_ctl(request);
+                assert!(response.ok, "{response:?}");
+                assert!(!r.agent.peers.contains_key(&r.peer));
+                assert_eq!(availability(&r.agent.fed, false), 1);
+                assert_eq!(
+                    r.agent
+                        .fed
+                        .iter()
+                        .filter(|i| matches!(
+                            i,
+                            Input::DragPeer {
+                                available: false,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1
+                );
+                r.close(); // An eventual native-link callback does not re-publish the transition.
+                assert_eq!(availability(&r.agent.fed, false), 1);
+                r.hello(&["e1", DRAG_FEATURE, DRAG_IN_FEATURE]); // A queued untrusted Hello is refused.
+                assert!(!r.agent.peers.contains_key(&r.peer));
+                assert_eq!(availability(&r.agent.fed, true), 0);
+            }
+        }
+
+        #[test]
+        fn drag_in_app_browse_allocator_keeps_the_engine_namespace_reserved() {
+            let mut r = rig(false);
+            r.hello(&["e1"]);
+            r.agent.next_request = 0x7fff_ffff;
+            for (request, expected) in [
+                (
+                    Request::WindowsFrom {
+                        peer: "peer-name".into(),
+                    },
+                    0x7fff_ffff,
+                ),
+                (
+                    Request::Pull {
+                        peer: "peer-name".into(),
+                        window: 99,
+                    },
+                    1,
+                ),
+            ] {
+                let (reply, _received) = mpsc::channel();
+                r.agent.start_waiting(request, reply);
+                let actual = r
+                    .agent
+                    .fed
+                    .iter()
+                    .rev()
+                    .find_map(|i| match i {
+                        Input::Command(
+                            Command::Browse { request, .. } | Command::Pull { request, .. },
+                        ) => Some(*request),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(actual & 0x8000_0000, 0);
+            }
+            assert_eq!(r.agent.next_request, 2);
+            for current in [0, 0x7fff_ffff, u32::MAX] {
+                assert_eq!(advance_browse_request(current), 1);
+            }
+        }
+
+        #[test]
+        fn drag_in_logs_only_native_move_ids_geometry_and_availability() {
+            use crosspane_protocol::msg::{InputMessage, TargetStatus};
+            use crosspane_types::id::SessionId;
+            #[derive(Clone)]
+            struct Writer(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for Writer {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(bytes.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || writer.clone())
+                .finish();
+            let peer = NodeId([0x44; 32]);
+            let at = crosspane_types::time::MonoTime::from_nanos(7000);
+            tracing::subscriber::with_default(subscriber, || {
+                for input in [
+                    Input::Capture(CaptureEvent::NativeMove {
+                        window: WindowId(424242),
+                        grab: PointDevice::new(10.25, 20.5),
+                        size: PixelSize::new(320, 200),
+                        at,
+                    }),
+                    Input::Capture(CaptureEvent::NativeMoveEnded {
+                        window: WindowId(424242),
+                        at,
+                    }),
+                    Input::Link(LinkEvent::Input {
+                        peer,
+                        msg: InputMessage::Status {
+                            session: SessionId(515151),
+                            status: TargetStatus::NativeMove {
+                                window: WindowId(424242),
+                                proxy: Some(ProjectionId(808080)),
+                                grab: (10, 20),
+                                size: PixelSize::new(320, 200),
+                            },
+                        },
+                    }),
+                    Input::Link(LinkEvent::Input {
+                        peer,
+                        msg: InputMessage::Status {
+                            session: SessionId(515151),
+                            status: TargetStatus::NativeMoveEnded {
+                                window: WindowId(424242),
+                            },
+                        },
+                    }),
+                    Input::DragInPeer {
+                        peer,
+                        available: true,
+                    },
+                    Input::Capture(CaptureEvent::Key {
+                        usage: crosspane_types::hid::HidUsage::keyboard(4),
+                        down: true,
+                        at,
+                    }),
+                ] {
+                    log_input(&input);
+                }
+            });
+            let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            for expected in [
+                "in: capture native move",
+                "in: capture native move ended",
+                "in: native move report",
+                "in: native move ended report",
+                "in: drag in peer",
+                "window=424242",
+                "session=515151",
+                "projection=Some(808080)",
+                "available=true",
+                "in: capture key",
+            ] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+            for forbidden in [
+                "usage",
+                "HidUsage",
+                "title",
+                "Key {",
+                "keyboard",
+                "features=",
+            ] {
+                assert!(!text.contains(forbidden), "logged {forbidden}: {text}");
             }
         }
     }

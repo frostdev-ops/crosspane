@@ -328,6 +328,21 @@ is projected there and ordinary pointer crossing resumes. Both peers must advert
 negotiated drag setting per peer and the active gesture's HUD label.
 `[drag] push_to_cross_ms = 150` sets the edge dwell in milliseconds, clamped to 0–2000.
 
+While controlling a peer, dragging a window back across the edge toward this machine uses
+`drag/1`, negotiated by both peers under the same `[drag] across` switch. With a current native
+move report from the peer, the window is dropped under the pointer here; dragging a proxy of
+this machine's window back restores the original here. The drag never continues on this
+machine: the routed primary-button release precedes the drop, and the later physical release
+is swallowed. Esc cancels the current offer; a later native move report can re-arm it. Without
+a current report or the required grants, the button-held crossing remains blocked or the
+projection is refused. This requires a native-move detector on the peer; negotiated features
+alone do not prove that its backend can report the gesture.
+
+`crosspanectl status` shows `drag:on+in` when both `drag/0` and `drag/1` are currently negotiated
+on the connected link, `drag:on` for `drag/0` only, `drag:in` for `drag/1` only, and `drag:off`
+when neither is available. Old agent responses without `drag_in` retain their previous display.
+The JSON peer fields keep the existing `drag` value and add the bilateral `drag_in` boolean.
+
 - **Notifications** that your notification daemon shows on the output where a projected window is
   parked appear in that projected window (they're captured with it). Pinning the daemon to a real
   output (e.g. mako's `output=`) avoids it.
