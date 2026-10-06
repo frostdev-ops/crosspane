@@ -3,7 +3,11 @@
 #![allow(unsafe_code)]
 use super::{Desktop, DpiScope, Pinned, Port, backend, default_desktop, hwnd, integrity};
 use crate::{
-    model::parking::{MarkerModel, MarkerObservation, MarkerState, NativeIdentity, NativePort},
+    model::parking::{
+        MarkerDesktopGuid, MarkerDesktopMembership, MarkerDesktopPlacement, MarkerModel,
+        MarkerObservation, MarkerState, NativeIdentity, NativePort, marker_desktop_placement,
+        marker_desktop_ready,
+    },
     session::WindowsSession,
 };
 use crosspane_platform::{IoGate, LockState, PlatformError, SessionEvent, SessionEvents};
@@ -161,6 +165,7 @@ impl Drop for Class {
 struct Window {
     handle: HWND,
     life: Option<Box<WindowLife>>,
+    desktop_keep_logged: Cell<bool>,
 }
 impl Window {
     fn new(class: &Class) -> Result<Self, PlatformError> {
@@ -189,6 +194,7 @@ impl Window {
         let value = Self {
             handle,
             life: Some(life),
+            desktop_keep_logged: Cell::new(false),
         };
         // SAFETY: only our layered marker; constant authored region opacity, no captured pixels.
         if unsafe { SetLayeredWindowAttributes(handle, 0, 255, LWA_ALPHA) } == 0 {
@@ -240,10 +246,12 @@ impl Window {
     }
     fn show(
         &self,
-        source: NativeIdentity,
+        observed: MarkerObservation,
         state: crate::model::parking::MarkerFrame,
+        initial: bool,
         mut admit: impl FnMut() -> Result<bool, PlatformError>,
     ) -> Result<bool, PlatformError> {
+        let source = observed.identity;
         if !self.alive() {
             return Err(backend("marker owned window disappeared"));
         }
@@ -319,11 +327,40 @@ impl Window {
             self.hide()?;
             return Ok(false);
         }
-        let manager = desktop
-            .0
-            .as_ref()
-            .ok_or_else(|| backend("marker desktop manager"))?;
-        if !current_desktop(&desktop, hwnd(source))? {
+        let membership = desktop_membership(&desktop, hwnd(source));
+        let (guid_state, guid) = if membership == MarkerDesktopMembership::Current {
+            if !admit()? {
+                self.hide()?;
+                return Ok(false);
+            }
+            match desktop.0.as_ref() {
+                Some(manager) => {
+                    // SAFETY: source tuple/context is freshly admitted; metadata-only GUID query.
+                    match unsafe {
+                        manager.GetWindowDesktopId(windows::Win32::Foundation::HWND(hwnd(source)))
+                    } {
+                        Ok(guid) if guid != windows::core::GUID::zeroed() => {
+                            (MarkerDesktopGuid::Known, Some(guid))
+                        }
+                        Ok(_) => (MarkerDesktopGuid::Zero, None),
+                        Err(_) => (MarkerDesktopGuid::Error, None),
+                    }
+                }
+                None => (MarkerDesktopGuid::Error, None),
+            }
+        } else {
+            (MarkerDesktopGuid::Error, None) // No GUID query is needed on the initial unknown path.
+        };
+        let decide = |membership| {
+            marker_desktop_placement(
+                initial,
+                membership,
+                guid_state,
+                observed.visible,
+                observed.cloaked,
+            )
+        };
+        if decide(membership) == MarkerDesktopPlacement::Hide {
             self.hide()?;
             return Ok(false);
         }
@@ -331,18 +368,8 @@ impl Window {
             self.hide()?;
             return Ok(false);
         }
-        // SAFETY: source identity/context was freshly admitted; documented metadata-only GUID query.
-        let guid =
-            unsafe { manager.GetWindowDesktopId(windows::Win32::Foundation::HWND(hwnd(source))) }
-                .map_err(|_| backend("marker source desktop unknown"))?;
-        if guid == windows::core::GUID::zeroed() {
-            return Err(backend("marker source desktop unknown"));
-        }
-        if !admit()? {
-            self.hide()?;
-            return Ok(false);
-        }
-        if !current_desktop(&desktop, hwnd(source))? {
+        let placement = decide(desktop_membership(&desktop, hwnd(source)));
+        if placement == MarkerDesktopPlacement::Hide {
             self.hide()?;
             return Ok(false);
         }
@@ -350,16 +377,38 @@ impl Window {
             self.hide()?;
             return Ok(false);
         }
-        // SAFETY: this marker alone is owned here; public API moves it to the admitted source GUID.
-        unsafe {
-            manager.MoveWindowToDesktop(windows::Win32::Foundation::HWND(self.handle), &guid)
+        if placement == MarkerDesktopPlacement::Follow {
+            let manager = desktop
+                .0
+                .as_ref()
+                .ok_or_else(|| backend("marker desktop manager"))?;
+            let guid = guid.ok_or_else(|| backend("marker desktop GUID plan unavailable"))?;
+            // SAFETY: only this owned marker moves to the admitted source's known nonzero GUID.
+            unsafe {
+                manager.MoveWindowToDesktop(windows::Win32::Foundation::HWND(self.handle), &guid)
+            }
+            .map_err(|_| backend("marker owned desktop follow refused"))?;
+        } else if !self.desktop_keep_logged.replace(true) {
+            let message = wide(&format!(
+                "Crosspane marker desktop id unavailable; retaining marker desktop HWND={}",
+                source.hwnd
+            ));
+            // SAFETY: authored HWND-only debug text is NUL-terminated and valid for this call.
+            unsafe {
+                windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW(message.as_ptr())
+            };
         }
-        .map_err(|_| backend("marker owned desktop follow refused"))?;
         if !admit()? {
             self.hide()?;
             return Ok(false);
         }
-        if !current_desktop(&desktop, hwnd(source))? || !current_desktop(&desktop, self.handle)? {
+        if decide(desktop_membership(&desktop, hwnd(source))) == MarkerDesktopPlacement::Hide
+            || !marker_desktop_ready(
+                initial,
+                placement,
+                desktop_membership(&desktop, self.handle),
+            )
+        {
             self.hide()?;
             return Ok(false);
         }
@@ -564,7 +613,7 @@ impl Owner {
             && existing.identity == identity
         {
             existing.changed.set(true);
-            sync_entry(existing, port, id, &self.session, &self.retire)?;
+            sync_entry(existing, port, id, &self.session, &self.retire, false)?;
             return port.check();
         }
         self.entries.remove(&id);
@@ -593,7 +642,7 @@ impl Owner {
         };
         // Initial native region/presentation errors retain their exact cause for strict rollback.
         // Honest hide/cloak/membership/adjacency changes keep this created window and its hooks.
-        sync_entry(&mut entry, port, id, &self.session, &self.retire)?;
+        sync_entry(&mut entry, port, id, &self.session, &self.retire, true)?;
         port.check()?;
         self.entries.insert(id, entry);
         Ok(())
@@ -630,7 +679,7 @@ impl Owner {
         }
         let mut removed = Vec::new();
         for (&id, entry) in &mut self.entries {
-            if let Err(error) = sync_entry(entry, port, id, &self.session, &self.retire) {
+            if let Err(error) = sync_entry(entry, port, id, &self.session, &self.retire, false) {
                 // Strict identity/context loss retires. A later owned presentation/query refusal
                 // hides safely and preserves hooks for a future admitted change, never re-parks.
                 let retire = matches!(
@@ -786,12 +835,20 @@ fn current_desktop(desktop: &Desktop, window: HWND) -> Result<bool, PlatformErro
         .map(|value| value.as_bool())
         .map_err(|_| backend("marker desktop membership unknown"))
 }
+fn desktop_membership(desktop: &Desktop, window: HWND) -> MarkerDesktopMembership {
+    match current_desktop(desktop, window) {
+        Ok(true) => MarkerDesktopMembership::Current,
+        Ok(false) => MarkerDesktopMembership::Other,
+        Err(_) => MarkerDesktopMembership::Unknown,
+    }
+}
 fn sync_entry(
     entry: &mut Entry,
     port: &mut Port,
     id: WindowId,
     session: &Option<WindowsSession>,
     retire: &AtomicBool,
+    initial: bool,
 ) -> Result<(), PlatformError> {
     if entry.destroyed.get() {
         return Err(PlatformError::NotFound);
@@ -804,7 +861,7 @@ fn sync_entry(
         MarkerState::Shown(frame) => {
             admit(&entry.pinned, port, id, session, retire)?;
             if changed {
-                let shown = entry.window.show(entry.identity, frame, || {
+                let shown = entry.window.show(observed, frame, initial, || {
                     admit(&entry.pinned, port, id, session, retire)?;
                     Ok(facts(&entry.pinned, port, id, true)? == observed)
                 })?;

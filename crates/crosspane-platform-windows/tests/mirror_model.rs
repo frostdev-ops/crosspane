@@ -802,3 +802,150 @@ fn marker_journal_fault_query_poison_prevents_later_decoration_or_source_mutatio
     assert!(c.port.native_log.is_empty());
     assert_eq!(c.journal().entries().len(), 1);
 }
+
+#[test]
+fn marker_desktop_current_guid_error_zero_keeps_real_park() {
+    for guid in [MarkerDesktopGuid::Error, MarkerDesktopGuid::Zero] {
+        for initial in [false, true] {
+            assert_eq!(
+                marker_desktop_placement(
+                    initial,
+                    MarkerDesktopMembership::Current,
+                    guid,
+                    true,
+                    false
+                ),
+                MarkerDesktopPlacement::Keep
+            );
+        }
+        let (mut c, store) = controller();
+        c.bind();
+        let before = c.port.current.as_ref().unwrap().outer;
+        let parked = c
+            .park_decorated(WindowId(12345), PixelSize::new(400, 300), 1.0, |port| {
+                assert_eq!(
+                    marker_desktop_placement(
+                        true,
+                        MarkerDesktopMembership::Current,
+                        guid,
+                        true,
+                        false
+                    ),
+                    MarkerDesktopPlacement::Keep
+                );
+                assert_eq!(port.current.as_ref().unwrap().outer, before);
+                assert!(port.native_log.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(parked.kind, crosspane_platform::ParkingKind::Mirror);
+        assert_eq!(c.journal().entries().len(), 1);
+        assert!(c.port.native_log.is_empty());
+        c.restore(WindowId(12345)).unwrap();
+        assert!(c.journal().entries().is_empty());
+        assert!(
+            Journal::load(&store.0.lock().unwrap().images)
+                .unwrap()
+                .0
+                .entries()
+                .is_empty()
+        );
+    }
+}
+#[test]
+fn marker_desktop_initial_unknown_requires_visible_uncloaked_and_later_hides() {
+    use MarkerDesktopGuid::{Error, Known, Zero};
+    use MarkerDesktopMembership::{Current, Other, Unknown};
+    use MarkerDesktopPlacement::{Follow, Hide, Keep};
+    assert_eq!(
+        marker_desktop_placement(true, Current, Known, true, false),
+        Follow
+    );
+    for guid in [Error, Zero, Known] {
+        assert_eq!(
+            marker_desktop_placement(true, Unknown, guid, true, false),
+            Keep
+        );
+        assert_eq!(
+            marker_desktop_placement(true, Unknown, guid, false, false),
+            Hide
+        );
+        assert_eq!(
+            marker_desktop_placement(true, Unknown, guid, true, true),
+            Hide
+        );
+        assert_eq!(
+            marker_desktop_placement(false, Unknown, guid, true, false),
+            Hide
+        );
+        assert_eq!(
+            marker_desktop_placement(true, Other, guid, true, false),
+            Hide
+        );
+        assert_eq!(
+            marker_desktop_placement(false, Other, guid, true, false),
+            Hide
+        );
+    }
+}
+#[test]
+fn marker_desktop_own_unknown_only_allows_initial_keep_and_other_never_shows() {
+    use MarkerDesktopMembership::{Current, Other, Unknown};
+    use MarkerDesktopPlacement::{Follow, Hide, Keep};
+    for (initial, placement, own, expected) in [
+        (true, Keep, Unknown, true),
+        (false, Keep, Unknown, false),
+        (true, Follow, Unknown, false),
+        (false, Follow, Unknown, false),
+        (true, Keep, Current, true),
+        (false, Keep, Current, true),
+        (true, Follow, Current, true),
+        (false, Follow, Current, true),
+        (true, Keep, Other, false),
+        (false, Keep, Other, false),
+        (true, Follow, Other, false),
+        (false, Follow, Other, false),
+        (true, Hide, Current, false),
+        (true, Hide, Unknown, false),
+    ] {
+        assert_eq!(marker_desktop_ready(initial, placement, own), expected);
+    }
+}
+#[test]
+fn marker_desktop_fallback_never_masks_genuine_creation_failure_or_rollback() {
+    for stage in [
+        "marker class unavailable",
+        "marker window unavailable",
+        "marker observer unavailable",
+    ] {
+        let (mut c, store) = controller();
+        c.bind();
+        let before = c.port.current.as_ref().unwrap().outer;
+        let error = c
+            .park_decorated(WindowId(12345), PixelSize::new(400, 300), 1.0, |_| {
+                assert_eq!(
+                    marker_desktop_placement(
+                        true,
+                        MarkerDesktopMembership::Current,
+                        MarkerDesktopGuid::Error,
+                        true,
+                        false
+                    ),
+                    MarkerDesktopPlacement::Keep
+                );
+                Err(PlatformError::Backend(stage.into()))
+            })
+            .unwrap_err();
+        assert!(matches!(error, PlatformError::Backend(detail) if detail == stage));
+        assert_eq!(c.port.current.as_ref().unwrap().outer, before);
+        assert!(c.port.native_log.is_empty());
+        assert!(c.journal().entries().is_empty());
+        assert!(
+            Journal::load(&store.0.lock().unwrap().images)
+                .unwrap()
+                .0
+                .entries()
+                .is_empty()
+        );
+    }
+}

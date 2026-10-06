@@ -678,6 +678,61 @@ pub enum MarkerState {
     Hidden,
     Shown(MarkerFrame),
 }
+/// Virtual-desktop queries are advisory only for this owned marker's placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerDesktopMembership {
+    Current,
+    Other,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerDesktopGuid {
+    Known,
+    Error,
+    Zero,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerDesktopPlacement {
+    Follow,
+    Keep,
+    Hide,
+}
+/// W2.7b: an unguessable GUID never requires moving an owned marker already created here.
+pub fn marker_desktop_placement(
+    initial: bool,
+    membership: MarkerDesktopMembership,
+    guid: MarkerDesktopGuid,
+    visible: bool,
+    cloaked: bool,
+) -> MarkerDesktopPlacement {
+    use MarkerDesktopGuid::Known;
+    use MarkerDesktopMembership::{Current, Other, Unknown};
+    use MarkerDesktopPlacement::{Follow, Hide, Keep};
+    if !visible || cloaked {
+        return Hide;
+    }
+    match membership {
+        Current if guid == Known => Follow,
+        Current => Keep,
+        Unknown if initial => Keep,
+        Unknown | Other => Hide,
+    }
+}
+/// Unknown own membership is acceptable only for an initially untouched marker kept here.
+pub fn marker_desktop_ready(
+    initial: bool,
+    placement: MarkerDesktopPlacement,
+    own: MarkerDesktopMembership,
+) -> bool {
+    placement != MarkerDesktopPlacement::Hide
+        && match own {
+            MarkerDesktopMembership::Current => true,
+            MarkerDesktopMembership::Other => false,
+            MarkerDesktopMembership::Unknown => {
+                initial && placement == MarkerDesktopPlacement::Keep
+            }
+        }
+}
 /// One actual runtime park owns one decoration. Loss never changes the parking journal.
 #[derive(Clone, Debug, Default)]
 pub struct MarkerModel {
