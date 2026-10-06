@@ -200,6 +200,8 @@ pub(crate) trait AudioPlane: Send {
     fn packet(&self, peer: NodeId, packet: AudioPacket);
     /// Stop every stream with `peer` at once.
     fn cancel_peer(&self, peer: NodeId);
+    /// Latest projected-process set; runs on the worker's host thread, never on this loop.
+    fn set_peer_sources(&self, peer: NodeId, pids: &[u32]);
     fn stats(&self) -> WorkerStats;
     /// Stop everything and wait (bounded) for the worker's threads.
     fn shutdown(self: Box<Self>);
@@ -216,6 +218,9 @@ impl AudioPlane for AudioWorker {
 
     fn cancel_peer(&self, peer: NodeId) {
         AudioWorker::cancel_peer(self, peer);
+    }
+    fn set_peer_sources(&self, peer: NodeId, pids: &[u32]) {
+        AudioWorker::set_peer_sources(self, peer, pids);
     }
 
     fn stats(&self) -> WorkerStats {
@@ -682,6 +687,7 @@ pub struct Agent {
     revocations: crate::revocations::Issued,
     /// The audio worker (WP-3.6d); `None` when audio sharing is off or has no backend.
     audio: Option<Box<dyn AudioPlane>>,
+    audio_sources: crate::audio::SourceCatalogue,
     clipboard: Option<crate::clipboard::Worker>,
     /// Accepted local promises only, to retire this connection's transport work on withdrawal.
     clip_promises: BTreeMap<u64, NodeId>,
@@ -972,6 +978,7 @@ impl Agent {
             port: e2.port,
             revocations: e2.revocations,
             audio,
+            audio_sources: crate::audio::SourceCatalogue::default(),
             clipboard: None,
             clip_promises: BTreeMap::new(),
             clip_readers: BTreeSet::new(),
@@ -1180,6 +1187,15 @@ impl Agent {
             _ => {}
         }
         self.revalidate_proxy_observation(&mut input);
+        // Already decoded and delivered through the transport's current-connection check.
+        self.audio_sources.observe(&input);
+        let source_window = match &input {
+            Input::Parked {
+                window,
+                result: Ok(_),
+            } => Some(*window),
+            _ => None,
+        };
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_input(&input);
         }
@@ -1213,6 +1229,8 @@ impl Agent {
             self.engine.controlled_by(),
         );
         let outputs = self.engine.handle(input, now);
+        self.audio_sources
+            .outputs(self.node, source_window, &outputs);
         if let Some(peer) = offering {
             for output in &outputs {
                 if let Output::ClipPromise { offer, .. } = output {
@@ -1229,8 +1247,26 @@ impl Agent {
         #[cfg(test)]
         self.emitted.extend(outputs.iter().cloned());
         self.execute(outputs);
+        self.sync_projection_audio();
         self.tracker.executed();
         self.flush_placements();
+    }
+
+    fn sync_projection_audio(&mut self) {
+        let changes = self.audio_sources.changes(self.node, |window| {
+            if !self.projectable_windows.contains(&window) {
+                return None;
+            }
+            self.placement
+                .windows
+                .get(&window)
+                .and_then(|info| info.pid)
+        });
+        if let Some(audio) = &self.audio {
+            for (peer, pids) in changes {
+                audio.set_peer_sources(peer, &pids);
+            }
+        }
     }
 
     /// A worker may have queued geometry before our synchronous move. Read back conflicting
@@ -9189,6 +9225,7 @@ mod audio_tests {
     }
 
     impl AudioPlane for Recorder {
+        fn set_peer_sources(&self, _peer: NodeId, _pids: &[u32]) {}
         fn submit(&self, output: Output) {
             self.push(Call::Submit(output));
         }
@@ -9275,7 +9312,13 @@ mod audio_tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             #[cfg(unix)]
-            std::fs::create_dir_all(&path).unwrap();
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .unwrap();
+            }
             #[cfg(windows)]
             crate::paths::create_private_dir(&path).unwrap();
             TempDir(path)
@@ -12467,6 +12510,131 @@ mod home_tests {
             ),
         );
         h
+    }
+
+    type SourceCalls = Arc<Mutex<Vec<(NodeId, Vec<u32>)>>>;
+    struct SourceRecorder(SourceCalls);
+    impl AudioPlane for SourceRecorder {
+        fn set_peer_sources(&self, peer: NodeId, pids: &[u32]) {
+            self.0.lock().unwrap().push((peer, pids.to_vec()));
+        }
+        fn submit(&self, _: Output) {}
+        fn packet(&self, _: NodeId, _: AudioPacket) {}
+        fn cancel_peer(&self, _: NodeId) {}
+        fn stats(&self) -> WorkerStats {
+            WorkerStats::default()
+        }
+        fn shutdown(self: Box<Self>) {}
+    }
+    fn source_audio_fixture() -> (Home, SourceRecorder) {
+        let mut h = bare_scenario();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        h.rig.agent.audio = Some(Box::new(SourceRecorder(calls.clone())));
+        let peer = h.rig.peer;
+        step(
+            &mut h,
+            control_input(peer, ControlMessage::Grants(vec![Capability::AudioSpeaker])),
+        );
+        project(&mut h, 1);
+        (h, SourceRecorder(calls))
+    }
+    fn source_calls(h: &Home, recorder: &SourceRecorder) -> Vec<Vec<u32>> {
+        recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(peer, _)| *peer == h.rig.peer)
+            .map(|(_, pids)| pids.clone())
+            .collect()
+    }
+    #[test]
+    fn source_projection_hook_start_and_final_end_use_original_window_pid() {
+        let (mut h, calls) = source_audio_fixture();
+        assert_eq!(source_calls(&h, &calls), [vec![42]]);
+        give_back(&mut h, 1);
+        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
+    }
+    #[test]
+    fn source_projection_hook_second_window_same_pid_does_not_resubmit() {
+        let (mut h, calls) = source_audio_fixture();
+        step(
+            &mut h,
+            Input::Windows(WindowEvent::Added(window(
+                20,
+                "fixture",
+                42,
+                Some(1),
+                (0.0, 0.0, 320.0, 240.0),
+                WindowState::Normal,
+            ))),
+        );
+        let peer = h.rig.peer;
+        step(
+            &mut h,
+            Input::Command(Command::Project {
+                window: WindowId(20),
+                to: peer,
+                place: None,
+            }),
+        );
+        step(
+            &mut h,
+            projection_input(
+                peer,
+                ProjectionMessage::Accepted {
+                    projection: ProjectionId(2),
+                    size: PixelSize::new(400, 300),
+                    scale: 1.0,
+                },
+            ),
+        );
+        assert_eq!(source_calls(&h, &calls), [vec![42]]);
+        give_back(&mut h, 1);
+        assert_eq!(source_calls(&h, &calls), [vec![42]]);
+        give_back(&mut h, 2);
+        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
+    }
+    #[test]
+    fn source_projection_hook_received_revoke_and_connection_loss_clear() {
+        for replacement in [false, true] {
+            let (mut h, calls) = source_audio_fixture();
+            let peer = h.rig.peer;
+            if replacement {
+                step(&mut h, Input::AudioConnectionReplaced { peer });
+            } else {
+                step(
+                    &mut h,
+                    control_input(peer, ControlMessage::Grants(Vec::new())),
+                );
+            }
+            assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
+            step(&mut h, Input::Tick);
+            assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
+        }
+        let (mut h, calls) = source_audio_fixture();
+        h.rig.agent.on_link(LinkEvent::Closed {
+            peer: h.rig.peer,
+            error: crosspane_protocol::link::LinkError::Closed,
+        });
+        assert_eq!(source_calls(&h, &calls), [vec![42], vec![]]);
+    }
+    #[test]
+    fn source_projection_hook_current_window_pid_refresh_and_missing_pid_clear() {
+        let (mut h, calls) = source_audio_fixture();
+        let mut info = window(
+            10,
+            "fixture",
+            52,
+            Some(1),
+            (0.0, 0.0, 320.0, 240.0),
+            WindowState::Normal,
+        );
+        step(&mut h, Input::Windows(WindowEvent::Changed(info.clone())));
+        assert_eq!(source_calls(&h, &calls), [vec![42], vec![52]]);
+        info.pid = None;
+        step(&mut h, Input::Windows(WindowEvent::Changed(info)));
+        assert_eq!(source_calls(&h, &calls), [vec![42], vec![52], vec![]]);
     }
     fn cross_scenario(h: &mut Home) {
         let portal = h
@@ -18248,6 +18416,7 @@ mod home_tests {
     struct StatsPlane(WorkerStats);
 
     impl AudioPlane for StatsPlane {
+        fn set_peer_sources(&self, _peer: NodeId, _pids: &[u32]) {}
         fn submit(&self, _output: Output) {}
         fn packet(&self, _peer: NodeId, _packet: AudioPacket) {}
         fn cancel_peer(&self, _peer: NodeId) {}

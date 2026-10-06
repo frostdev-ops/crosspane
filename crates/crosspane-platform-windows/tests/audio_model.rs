@@ -1,6 +1,254 @@
 #![allow(clippy::unwrap_used)]
 use crosspane_platform::{AudioDeviceError, AudioFormat, IoGate};
 
+mod projected_sources {
+    use super::*;
+    use crosspane_platform_windows::model::audio::{
+        MAX_PEER_SOURCES, SPEAKER_FRAME_SAMPLES, SourceLifecycle, SourceSet, SpeakerMixer,
+    };
+
+    #[test]
+    fn source_set_sorts_deduplicates_and_reconciles_only_changed_roots() {
+        let mut set = SourceSet::new(true);
+        let first = set.replace(&[20, 10, 20], true).unwrap();
+        assert_eq!(first.start, [10, 20]);
+        assert!(first.stop.is_empty());
+        assert!(first.changed);
+        assert_eq!(set.started(first.revision, 10), Some(true));
+        assert_eq!(set.started(first.revision, 20), None);
+        let same = set.replace(&[10, 20], true).unwrap();
+        assert!(!same.changed);
+        assert!(same.start.is_empty() && same.stop.is_empty());
+        let next = set.replace(&[20, 30], true).unwrap();
+        assert_eq!(next.start, [30]);
+        assert_eq!(next.stop, [10]);
+        assert_eq!(set.running(), &[20]);
+        assert_eq!(set.started(next.revision, 30), None);
+    }
+
+    #[test]
+    fn source_empty_emits_last_inactive_once_and_rejects_late_activation() {
+        let mut set = SourceSet::new(true);
+        let first = set.replace(&[10], true).unwrap();
+        assert_eq!(set.started(first.revision, 10), Some(true));
+        let empty = set.replace(&[], true).unwrap();
+        assert_eq!(empty.stop, [10]);
+        assert_eq!(empty.active, Some(false));
+        assert_eq!(set.started(first.revision, 10), None);
+        assert_eq!(set.replace(&[], true).unwrap().active, None);
+    }
+
+    #[test]
+    fn source_failure_is_peer_terminal_false_before_one_error_and_no_same_set_retry() {
+        let mut set = SourceSet::new(true);
+        let first = set.replace(&[10, 20], true).unwrap();
+        assert_eq!(set.started(first.revision, 10), Some(true));
+        set.started(first.revision, 20);
+        let failure = set.failed(first.revision, 10).unwrap();
+        assert_eq!(failure.active, Some(false));
+        assert_eq!(failure.error, AudioDeviceError::Failed);
+        assert!(set.running().is_empty());
+        assert!(set.failed(first.revision, 20).is_none());
+        let same = set.replace(&[20, 10], true).unwrap();
+        assert!(!same.changed && same.start.is_empty());
+        assert_eq!(set.started(first.revision, 20), None);
+        let changed = set.replace(&[20], true).unwrap();
+        assert_eq!(changed.start, [20]);
+        assert_eq!(set.started(changed.revision, 20), Some(true));
+    }
+
+    #[test]
+    fn source_failed_activation_before_first_active_is_one_error_without_fake_edge() {
+        let mut set = SourceSet::new(true);
+        let first = set.replace(&[10, 20], true).unwrap();
+        let failed = set.failed(first.revision, 10).unwrap();
+        assert_eq!(failed.active, None);
+        assert_eq!(failed.error, AudioDeviceError::Failed);
+        assert_eq!(set.started(first.revision, 20), None);
+        assert!(set.failed(first.revision, 20).is_none());
+    }
+
+    #[test]
+    fn source_stale_failure_cannot_retire_a_new_revision() {
+        let mut set = SourceSet::new(true);
+        let old = set.replace(&[10], true).unwrap();
+        let current = set.replace(&[20], true).unwrap();
+        assert_eq!(set.started(current.revision, 20), Some(true));
+        assert!(set.failed(old.revision, 10).is_none());
+        assert_eq!(set.running(), &[20]);
+    }
+
+    #[test]
+    fn source_below_20348_reports_unavailable_once_without_any_start() {
+        let mut set = SourceSet::new(false);
+        let first = set.replace(&[10], true).unwrap();
+        assert!(first.start.is_empty());
+        assert_eq!(first.error, Some(AudioDeviceError::Unavailable));
+        assert_eq!(set.started(first.revision, 10), None);
+        assert_eq!(set.replace(&[20], true).unwrap().error, None);
+        assert_eq!(set.replace(&[], true).unwrap().active, None);
+    }
+
+    #[test]
+    fn source_closed_gate_never_starts_and_transient_closure_does_not_rearm() {
+        let mut set = SourceSet::new(true);
+        assert!(matches!(
+            set.replace(&[10], false),
+            Err(crosspane_platform::PlatformError::Locked)
+        ));
+        assert!(set.running().is_empty());
+        let first = set.replace(&[10], true).unwrap();
+        assert_eq!(set.started(first.revision, 10), Some(true));
+        assert_eq!(set.gate_closed(), Some(false));
+        assert_eq!(set.gate_closed(), None);
+        assert_eq!(set.started(first.revision, 10), None);
+        assert!(set.replace(&[10], true).unwrap().start.is_empty());
+        assert_eq!(set.replace(&[20], true).unwrap().start, [20]);
+    }
+
+    #[test]
+    fn source_bounds_and_zero_pid_refuse_before_changing_current_set() {
+        let mut set = SourceSet::new(true);
+        let first = set.replace(&[10], true).unwrap();
+        set.started(first.revision, 10);
+        assert!(set.replace(&[0, 20], true).is_err());
+        let too_many: Vec<_> = (1..=MAX_PEER_SOURCES as u32 + 1).collect();
+        assert!(set.replace(&too_many, true).is_err());
+        assert_eq!(set.running(), &[10]);
+        assert!(!set.replace(&[10], true).unwrap().changed);
+    }
+
+    #[test]
+    fn source_lifecycle_disabled_before_blocked_stop_rejects_late_pcm_and_activation() {
+        use std::{
+            sync::{Arc, mpsc},
+            time::Duration,
+        };
+        let gate = super::open_gate();
+        let life = Arc::new(SourceLifecycle::new(gate.clone()));
+        let mut set = SourceSet::new(true);
+        let first = set.replace(&[10], true).unwrap();
+        set.started(first.revision, 10);
+        life.replace_revision(gate.epoch(), true);
+        let owner = life.clone();
+        let (entered, stopped) = mpsc::sync_channel(1);
+        let (release, blocked_stop) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            // Same ordering and eligibility object as native source_worker, before COM Stop.
+            owner.disable();
+            let failure = set.failed(first.revision, 10).unwrap();
+            entered
+                .send((failure, set.started(first.revision, 10)))
+                .unwrap();
+            blocked_stop.recv_timeout(Duration::from_secs(1)).unwrap();
+            set
+        });
+        let (failure, late_started) = stopped.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(failure.active, Some(false));
+        assert_eq!(failure.error, AudioDeviceError::Failed);
+        assert_eq!(late_started, None);
+        let mut pcm_writes = 0;
+        if life.permits() {
+            pcm_writes += 1;
+        }
+        assert_eq!(
+            pcm_writes, 0,
+            "late callback wrote while native stop was blocked"
+        );
+        assert!(!life.permits());
+        release.send(()).unwrap();
+        let mut set = worker.join().unwrap();
+        assert!(!set.replace(&[10], true).unwrap().changed);
+        assert!(!life.permits());
+        let changed = set.replace(&[20], true).unwrap();
+        assert!(changed.changed);
+        life.replace_revision(gate.epoch(), true);
+        assert_eq!(set.started(changed.revision, 20), Some(true));
+        assert!(life.permits());
+    }
+
+    #[test]
+    fn source_lifecycle_deliberate_revision_differs_from_permanent_cancel_and_gate_aba() {
+        let gate = super::open_gate();
+        let life = SourceLifecycle::new(gate.clone());
+        life.replace_revision(gate.epoch(), true);
+        assert!(life.permits());
+        life.disable();
+        assert!(!life.permits());
+        life.replace_revision(gate.epoch(), true);
+        assert!(life.permits());
+        gate.set_session_permits(false);
+        gate.set_session_permits(true);
+        assert!(
+            !life.permits(),
+            "an unobserved gate ABA rearmed the old revision"
+        );
+        life.replace_revision(gate.epoch(), true);
+        assert!(life.permits());
+        life.cancel();
+        life.replace_revision(gate.epoch(), true);
+        assert!(life.is_cancelled());
+        assert!(!life.permits(), "late completion rearmed a retired owner");
+    }
+
+    fn input(samples: &[f32]) -> rtrb::Consumer<f32> {
+        let (mut producer, consumer) = rtrb::RingBuffer::new(samples.len() + 2);
+        for &sample in samples {
+            producer.push(sample).unwrap();
+        }
+        consumer
+    }
+
+    #[test]
+    fn speaker_mixer_sums_roots_then_clamps_preserving_stereo() {
+        let mut a = input(&[0.75, -0.75, 0.2, 0.1]);
+        let mut b = input(&[0.75, -0.75, 0.3, 0.4]);
+        let mut mixer = SpeakerMixer::new();
+        let mut output = [0.0; SPEAKER_FRAME_SAMPLES];
+        mixer.begin();
+        mixer.add(&mut a);
+        mixer.add(&mut b);
+        mixer.finish(&mut output);
+        assert_eq!(&output[..4], &[1.0, -1.0, 0.5, 0.5]);
+        assert!(output[4..].iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn speaker_mixer_clears_each_frame_and_keeps_half_frames_for_next_pass() {
+        let mut a = input(&[0.25, -0.25, 0.5]);
+        let mut mixer = SpeakerMixer::new();
+        let mut output = [0.0; SPEAKER_FRAME_SAMPLES];
+        mixer.begin();
+        mixer.add(&mut a);
+        mixer.finish(&mut output);
+        assert_eq!(&output[..2], &[0.25, -0.25]);
+        assert_eq!(a.slots(), 1);
+        mixer.begin();
+        mixer.add(&mut a);
+        mixer.finish(&mut output);
+        assert!(output.iter().all(|value| *value == 0.0));
+        assert_eq!(a.slots(), 1);
+    }
+
+    #[test]
+    fn speaker_mixer_treats_nonfinite_as_silence_without_overflow_or_allocation() {
+        let samples = [f32::MAX, -f32::MAX, f32::NAN, f32::INFINITY];
+        let mut a = input(&samples);
+        let mut b = input(&samples);
+        let mut mixer = SpeakerMixer::new();
+        let mut output = [0.0; SPEAKER_FRAME_SAMPLES];
+        super::allocations::start();
+        mixer.begin();
+        mixer.add(&mut a);
+        mixer.add(&mut b);
+        mixer.finish(&mut output);
+        let allocations = super::allocations::finish();
+        assert_eq!(allocations, 0);
+        assert_eq!(&output[..4], &[1.0, -1.0, 0.0, 0.0]);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+}
+
 #[test]
 fn open_reply_device_loss_is_failed_not_locked() {
     use crosspane_platform::PlatformError;

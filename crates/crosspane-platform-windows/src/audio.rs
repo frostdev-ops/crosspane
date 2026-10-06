@@ -1,28 +1,37 @@
-//! Windows destination-only WASAPI shared playback; no virtual endpoints or microphone opens.
+//! Windows shared playback and projected-process-tree source capture; no microphone opens.
 //! \[E\] IAudioClient::Initialize documents EVENTCALLBACK|NOPERSIST in shared mode.
 //! <https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize>
 //! Render owns all COM objects on one MTA thread. The control thread alone delivers events.
 //! \[U\] A stalled OS call can outlive a bounded return: disabled workers retain their resources.
 //! Gate/stop latch consumption silent immediately; already submitted endpoint audio is not revoked.
 //! Device/default changes terminate a stream; only an explicit new open can restart playback.
+//! \[E\] Process-tree loopback needs build20348; it does not mute the original application.
+//! <https://learn.microsoft.com/en-us/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_process_loopback_params>
+//! \[U\] The frozen source API carries PIDs, not original process claims. Refreshing projected
+//! PIDs and retaining a liveness handle mitigates, but cannot authenticate against PID reuse.
 
 #![allow(unsafe_code)]
 
-use crate::model::audio::{Converter, MAX_RENDER_FRAMES, MixFormat, StreamControl, wait_open};
+use crate::model::audio::{
+    Converter, MAX_RENDER_FRAMES, MixFormat, SPEAKER_FRAME_SAMPLES, SourceLifecycle, SourceSet,
+    SpeakerMixer, StreamControl, wait_open,
+};
 use crosspane_platform::{
-    AudioCapture, AudioEvent, AudioFormat, AudioHost, AudioKind, AudioPlayback, AudioStop,
-    EventSink, IoGate, PlatformError, VirtualPorts,
+    AudioCapture, AudioDeviceError, AudioEvent, AudioFormat, AudioHost, AudioKind, AudioPlayback,
+    AudioStop, EventSink, IoGate, PlatformError, VirtualPorts,
 };
 use crosspane_types::id::NodeId;
-use rtrb::{Consumer, RingBuffer};
+use rtrb::{Consumer, Producer, RingBuffer};
 use std::{
+    collections::BTreeMap,
     ffi::c_void,
-    fmt, mem,
+    fmt,
+    mem::{self, ManuallyDrop},
     ptr::{self, null_mut},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc::{self, SyncSender},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::{Duration, Instant},
@@ -32,15 +41,25 @@ use windows::{
         Foundation::{HANDLE, PROPERTYKEY},
         Media::Audio::*,
         System::Com::{
-            CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+            BLOB, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
             CoTaskMemFree, CoUninitialize,
+            StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0},
         },
+        System::Variant::VT_BLOB,
     },
     core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR},
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, WAIT_FAILED, WAIT_OBJECT_0},
-    System::Threading::{CreateEventW, SetEvent, WaitForSingleObject},
+    System::{
+        Diagnostics::Debug::OutputDebugStringW,
+        LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        SystemInformation::OSVERSIONINFOW,
+        Threading::{
+            CreateEventW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+        },
+    },
 };
 
 const OPEN_TIME: Duration = Duration::from_secs(2);
@@ -125,6 +144,7 @@ struct Record {
 }
 struct Registry {
     records: Vec<Record>,
+    sources: Vec<SourceRecord>,
     sink: Option<Arc<dyn EventSink<AudioEvent>>>,
 }
 struct HostState {
@@ -133,11 +153,13 @@ struct HostState {
     observer_done: AtomicBool,
 }
 
-/// Destination playback remains available when add_peer is Unsupported (WP-W5.2a item0).
+/// Destination playback stays independent of source-peer admission (WP-W5.2a item0).
 /// Construction touches no endpoint. Native opens require an open gate and explicit invocation.
 pub struct WindowsAudioHost {
     gate: Arc<IoGate>,
     state: Arc<HostState>,
+    peers: BTreeMap<NodeId, SourceHandle>,
+    process_loopback: bool,
 }
 impl fmt::Debug for WindowsAudioHost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -153,6 +175,10 @@ impl WindowsAudioHost {
                     .records
                     .iter()
                     .all(|record| record.control.is_retired())
+                    && registry
+                        .sources
+                        .iter()
+                        .all(|record| record.control.retired.load(Ordering::Acquire))
             })
             .unwrap_or(false)
     }
@@ -160,6 +186,7 @@ impl WindowsAudioHost {
         let state = Arc::new(HostState {
             registry: Mutex::new(Registry {
                 records: Vec::with_capacity(MAX_STREAMS),
+                sources: Vec::with_capacity(MAX_STREAMS),
                 sink: None,
             }),
             shutdown: AtomicBool::new(false),
@@ -170,7 +197,12 @@ impl WindowsAudioHost {
             .name("crosspane-audio-events".into())
             .spawn(move || observe(owner))
             .map_err(|_| unavailable())?;
-        Ok(Self { gate, state })
+        Ok(Self {
+            gate,
+            state,
+            peers: BTreeMap::new(),
+            process_loopback: loopback_supported(),
+        })
     }
 }
 fn observe(state: Arc<HostState>) {
@@ -187,6 +219,10 @@ fn observe(state: Arc<HostState>) {
                 record.control.cancel();
                 record.wake.signal();
             }
+            for record in &registry.sources {
+                record.control.cancel();
+                record.wake.signal();
+            }
             self.0.observer_done.store(true, Ordering::Release);
         }
     }
@@ -199,6 +235,7 @@ fn observe(state: Arc<HostState>) {
             };
             let sink = registry.sink.clone();
             let mut errors = Vec::with_capacity(MAX_STREAMS);
+            let mut source_events = Vec::with_capacity(MAX_STREAMS * 3);
             for record in &mut registry.records {
                 if state.shutdown.load(Ordering::Acquire) {
                     record.control.cancel();
@@ -218,9 +255,64 @@ fn observe(state: Arc<HostState>) {
                 !r.control.is_retired()
                     || !r.reported && r.control.reason().is_some() && sink.is_none()
             });
-            (sink, errors)
+            for record in &mut registry.sources {
+                if state.shutdown.load(Ordering::Acquire) {
+                    record.control.cancel();
+                    record.wake.signal();
+                }
+                while let Ok(event) = record.events.pop() {
+                    match event {
+                        SourceEvent::Active(active) => {
+                            // Preserve genuine zero/positive edges in owner order, even when a
+                            // later failure already fenced PCM before this control tick ran.
+                            if active != record.sent_active {
+                                record.sent_active = active;
+                                source_events.push(AudioEvent::VirtualActive {
+                                    peer: record.peer,
+                                    kind: AudioKind::Speaker,
+                                    active,
+                                });
+                            }
+                        }
+                        SourceEvent::Error(error) => source_events.push(AudioEvent::DeviceError {
+                            peer: Some(record.peer),
+                            kind: AudioKind::Speaker,
+                            error,
+                        }),
+                    }
+                }
+                if !record.control.permits() && record.sent_active {
+                    record.sent_active = false;
+                    source_events.push(AudioEvent::VirtualActive {
+                        peer: record.peer,
+                        kind: AudioKind::Speaker,
+                        active: false,
+                    });
+                }
+                let fallback = match record.control.fallback_error.swap(0, Ordering::AcqRel) {
+                    1 => Some(AudioDeviceError::Unavailable),
+                    2 => Some(AudioDeviceError::Locked),
+                    3 => Some(AudioDeviceError::PermissionDenied),
+                    4 => Some(AudioDeviceError::Failed),
+                    _ => None,
+                };
+                if let Some(error) = fallback {
+                    source_events.push(AudioEvent::DeviceError {
+                        peer: Some(record.peer),
+                        kind: AudioKind::Speaker,
+                        error,
+                    });
+                }
+            }
+            registry
+                .sources
+                .retain(|r| !r.control.retired.load(Ordering::Acquire) || r.events.slots() != 0);
+            (sink, errors, source_events)
         };
         if let Some(sink) = dispatch.0 {
+            for event in dispatch.2 {
+                sink.send(event);
+            }
             for error in dispatch.1 {
                 sink.send(AudioEvent::DeviceError {
                     peer: None,
@@ -237,11 +329,99 @@ fn observe(state: Arc<HostState>) {
     state.observer_done.store(true, Ordering::Release);
 }
 impl AudioHost for WindowsAudioHost {
-    fn add_peer(&mut self, _: NodeId, _: &str) -> Result<VirtualPorts, PlatformError> {
-        Err(PlatformError::Unsupported("Windows virtual audio devices"))
+    fn add_peer(&mut self, peer: NodeId, _: &str) -> Result<VirtualPorts, PlatformError> {
+        if self.state.shutdown.load(Ordering::Acquire) || self.peers.contains_key(&peer) {
+            return Err(unavailable());
+        }
+        if self.peers.len() >= 4 || lock(&self.state.registry)?.sources.len() >= MAX_STREAMS {
+            return Err(PlatformError::Unsupported("Windows source worker limit"));
+        }
+        let (speaker, speaker_out) = RingBuffer::new(96_000);
+        let (mic_in, microphone) = RingBuffer::<f32>::new(960);
+        let (events, event_reader) = RingBuffer::new(64);
+        let (send, receive) = mpsc::sync_channel(1);
+        let control = Arc::new(SourceControl::new(self.gate.clone()));
+        let wake = Arc::new(Wake::new()?);
+        let worker_control = control.clone();
+        let worker_wake = wake.clone();
+        let gate = self.gate.clone();
+        let supported = self.process_loopback;
+        thread::Builder::new()
+            .name("crosspane-process-audio".into())
+            .spawn(move || {
+                source_worker(
+                    gate,
+                    supported,
+                    receive,
+                    speaker,
+                    microphone,
+                    events,
+                    worker_control,
+                    worker_wake,
+                )
+            })
+            .map_err(|_| unavailable())?;
+        lock(&self.state.registry)?.sources.push(SourceRecord {
+            peer,
+            control: control.clone(),
+            wake: wake.clone(),
+            events: event_reader,
+            sent_active: false,
+        });
+        self.peers.insert(
+            peer,
+            SourceHandle {
+                send,
+                control,
+                wake,
+            },
+        );
+        Ok(VirtualPorts {
+            speaker_out,
+            mic_in,
+        })
     }
-    fn remove_peer(&mut self, _: NodeId) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("Windows virtual audio devices"))
+    fn remove_peer(&mut self, peer: NodeId) -> Result<(), PlatformError> {
+        if let Some(handle) = self.peers.remove(&peer) {
+            handle.stop();
+        }
+        Ok(())
+    }
+    fn set_peer_sources(&mut self, peer: NodeId, pids: &[u32]) -> Result<(), PlatformError> {
+        let handle = self.peers.get(&peer).ok_or(PlatformError::NotFound)?;
+        let deadline = Instant::now() + OPEN_TIME;
+        if handle.control.eligibility.is_cancelled() {
+            return Err(unavailable());
+        }
+        let (send, receive) = mpsc::sync_channel(1);
+        // Invalid/unbounded configuration still reaches the owner to retire obsolete captures,
+        // but never copies an unbounded caller slice or silently truncates an authorized set.
+        let pids = if pids.len() > crate::model::audio::MAX_PEER_SOURCES {
+            vec![0]
+        } else {
+            pids.to_vec()
+        };
+        handle
+            .send
+            .try_send(SourceRequest {
+                pids,
+                deadline,
+                reply: send,
+            })
+            .map_err(|_| unavailable())?;
+        handle.wake.signal();
+        loop {
+            match receive.recv_timeout(Duration::from_millis(2)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(unavailable()),
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(_) => {
+                    handle.control.cancel();
+                    handle.wake.signal();
+                    return Err(PlatformError::Timeout);
+                }
+            }
+        }
     }
     fn subscribe(&mut self, sink: Arc<dyn EventSink<AudioEvent>>) -> Result<(), PlatformError> {
         if self.state.shutdown.load(Ordering::Acquire) {
@@ -323,6 +503,10 @@ impl AudioHost for WindowsAudioHost {
 }
 impl Drop for WindowsAudioHost {
     fn drop(&mut self) {
+        for handle in self.peers.values() {
+            handle.control.cancel();
+            handle.wake.signal();
+        }
         self.state.shutdown.store(true, Ordering::Release);
         if let Ok(registry) = lock(&self.state.registry) {
             for record in &registry.records {
@@ -335,6 +519,641 @@ impl Drop for WindowsAudioHost {
             thread::sleep(Duration::from_millis(1));
         }
     }
+}
+
+// Source workers own their clients, process liveness handles, PCM scratches and producer. An OS
+// stall can retain that owner after the caller's 2s bound; cancellation prevents any later PCM.
+// The registry counts retained owners against MAX_STREAMS, so retries cannot grow them unbounded.
+struct SourceControl {
+    eligibility: SourceLifecycle,
+    retired: AtomicBool,
+    fallback_error: AtomicU8,
+}
+impl SourceControl {
+    fn new(gate: Arc<IoGate>) -> Self {
+        Self {
+            eligibility: SourceLifecycle::new(gate),
+            retired: AtomicBool::new(false),
+            fallback_error: AtomicU8::new(0),
+        }
+    }
+    fn cancel(&self) {
+        self.eligibility.cancel();
+    }
+    fn permits(&self) -> bool {
+        self.eligibility.permits()
+    }
+}
+struct SourceHandle {
+    send: SyncSender<SourceRequest>,
+    control: Arc<SourceControl>,
+    wake: Arc<Wake>,
+}
+impl SourceHandle {
+    fn stop(&self) {
+        self.control.cancel();
+        self.wake.signal();
+        let deadline = Instant::now() + STOP_TIME;
+        while !self.control.retired.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+struct SourceRequest {
+    pids: Vec<u32>,
+    deadline: Instant,
+    reply: SyncSender<Result<(), PlatformError>>,
+}
+#[derive(Clone, Copy)]
+enum SourceEvent {
+    Active(bool),
+    Error(AudioDeviceError),
+}
+struct SourceRecord {
+    peer: NodeId,
+    control: Arc<SourceControl>,
+    wake: Arc<Wake>,
+    events: Consumer<SourceEvent>,
+    sent_active: bool,
+}
+fn emit(events: &mut Producer<SourceEvent>, event: SourceEvent, control: &SourceControl) {
+    // A saturated control-event channel fails closed instead of blocking the audio owner.
+    if events.push(event).is_err() {
+        let error = match event {
+            SourceEvent::Error(AudioDeviceError::Unavailable) => 1,
+            SourceEvent::Error(AudioDeviceError::Locked) => 2,
+            SourceEvent::Error(AudioDeviceError::PermissionDenied) => 3,
+            _ => 4,
+        };
+        control.fallback_error.store(error, Ordering::Release);
+        control.cancel();
+    }
+}
+fn active(events: &mut Producer<SourceEvent>, value: Option<bool>, control: &SourceControl) {
+    if let Some(value) = value {
+        emit(events, SourceEvent::Active(value), control);
+    }
+}
+fn log_source_failure(pid: u32) {
+    let message: Vec<u16> = format!("Crosspane process audio failed pid={pid}\0")
+        .encode_utf16()
+        .collect();
+    // SAFETY: bounded scalar PID-only debug message, no sample, title, path or process content.
+    unsafe {
+        OutputDebugStringW(message.as_ptr());
+    }
+}
+fn loopback_supported() -> bool {
+    // SAFETY: ntdll is already loaded. RtlGetVersion is a documented public version query,
+    // resolved with its exact SDK ABI, and writes only this initialized local descriptor.
+    unsafe {
+        let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            return false;
+        }
+        let Some(function) = GetProcAddress(module, c"RtlGetVersion".as_ptr().cast()) else {
+            return false;
+        };
+        let query: unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32 = mem::transmute(function);
+        let mut version = OSVERSIONINFOW {
+            dwOSVersionInfoSize: mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        query(&mut version) >= 0 && version.dwMajorVersion >= 10 && version.dwBuildNumber >= 20348
+    }
+}
+
+#[repr(C)]
+struct SourceActivation {
+    table: *const IActivateAudioInterfaceCompletionHandler_Vtbl,
+    refs: AtomicU32,
+    done: Arc<Wake>,
+    parameters: AUDIOCLIENT_ACTIVATION_PARAMS,
+    variant: PROPVARIANT,
+}
+unsafe extern "system" fn source_query(
+    this: *mut c_void,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if iid.is_null() || out.is_null() {
+        return HRESULT(0x80004003u32 as i32);
+    }
+    // SAFETY: COM supplies iid/output. Only IUnknown, our exact handler and IAgileObject exist.
+    unsafe {
+        *out = null_mut();
+        if *iid == IUnknown::IID
+            || *iid == IActivateAudioInterfaceCompletionHandler::IID
+            || *iid == GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90)
+        {
+            *out = this;
+            source_add_ref(this);
+            HRESULT(0)
+        } else {
+            HRESULT(0x80004002u32 as i32)
+        }
+    }
+}
+unsafe extern "system" fn source_add_ref(this: *mut c_void) -> u32 {
+    // SAFETY: live COM reference to our reprC allocation; reference count is atomic.
+    unsafe {
+        (&*this.cast::<SourceActivation>())
+            .refs
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+}
+unsafe extern "system" fn source_release(this: *mut c_void) -> u32 {
+    // SAFETY: only the final COM reference reclaims this exact owned Box.
+    let n = unsafe {
+        (&*this.cast::<SourceActivation>())
+            .refs
+            .fetch_sub(1, Ordering::AcqRel)
+            - 1
+    };
+    if n == 0 {
+        // SAFETY: no COM caller or callback retains the allocation after its final release.
+        unsafe {
+            drop(Box::from_raw(this.cast::<SourceActivation>()));
+        }
+    }
+    n
+}
+unsafe extern "system" fn source_complete(this: *mut c_void, _: *mut c_void) -> HRESULT {
+    // SAFETY: OS retains the agile handler. Callback only signals its retained event, no locks,
+    // allocations, logging, COM result query or sample work.
+    unsafe {
+        (&*this.cast::<SourceActivation>()).done.signal();
+    }
+    HRESULT(0)
+}
+static SOURCE_ACTIVATION: IActivateAudioInterfaceCompletionHandler_Vtbl =
+    IActivateAudioInterfaceCompletionHandler_Vtbl {
+        base__: IUnknown_Vtbl {
+            QueryInterface: source_query,
+            AddRef: source_add_ref,
+            Release: source_release,
+        },
+        ActivateCompleted: source_complete,
+    };
+fn activate_source(
+    pid: u32,
+    deadline: Instant,
+    control: &SourceControl,
+) -> Result<IAudioClient, PlatformError> {
+    let done = Arc::new(Wake::new()?);
+    let mut object = Box::new(SourceActivation {
+        table: &SOURCE_ACTIVATION,
+        refs: AtomicU32::new(1),
+        done: done.clone(),
+        parameters: AUDIOCLIENT_ACTIVATION_PARAMS {
+            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                    TargetProcessId: pid,
+                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                },
+            },
+        },
+        variant: PROPVARIANT::default(),
+    });
+    object.variant = PROPVARIANT {
+        Anonymous: PROPVARIANT_0 {
+            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                vt: VT_BLOB,
+                Anonymous: PROPVARIANT_0_0_0 {
+                    blob: BLOB {
+                        cbSize: mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                        pBlobData: (&mut object.parameters as *mut AUDIOCLIENT_ACTIVATION_PARAMS)
+                            .cast(),
+                    },
+                },
+                ..Default::default()
+            }),
+        },
+    };
+    let pointer = Box::into_raw(object);
+    // SAFETY: exact reprC COM layout; handler owns the initial reference and inline blob.
+    let handler = unsafe { IActivateAudioInterfaceCompletionHandler::from_raw(pointer.cast()) };
+    // SAFETY: public process-tree loopback only; parameter storage lives through the operation.
+    let operation = unsafe {
+        ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&(*pointer).variant),
+            &handler,
+        )
+    }
+    .map_err(|_| unavailable())?;
+    let mut expired = false;
+    loop {
+        // SAFETY: owner retains handler, operation, parameters and event through late completion.
+        let result = unsafe { WaitForSingleObject(done.0, 2) };
+        expired |= Instant::now() >= deadline || control.eligibility.is_cancelled();
+        if result == WAIT_OBJECT_0 {
+            break;
+        }
+        if result == WAIT_FAILED {
+            // Retain this bounded owner, not detached uncounted COM references. Caller retirement
+            // disables PCM immediately and counts this owner until completion can be observed.
+            control.cancel();
+            expired = true;
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    if expired {
+        return Err(PlatformError::Timeout);
+    }
+    let mut result = HRESULT(0x8000000au32 as i32);
+    let mut unknown = None;
+    // SAFETY: completed owned operation on its MTA; exact initialized outputs.
+    unsafe { operation.GetActivateResult(&mut result, &mut unknown) }.map_err(|_| unavailable())?;
+    result.ok().map_err(|_| unavailable())?;
+    unknown
+        .ok_or_else(unavailable)?
+        .cast()
+        .map_err(|_| unavailable())
+}
+
+struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: this owner closes only its own successfully opened read-only process handle.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+impl ProcessHandle {
+    fn open(pid: u32) -> Result<Self, PlatformError> {
+        // SAFETY: read-only liveness, no signals, executable/path query or identity claim.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            Err(unavailable())
+        } else {
+            Ok(Self(handle))
+        }
+    }
+    fn alive(&self) -> bool {
+        // SAFETY: retained process handle; zero wait observes termination without changing it.
+        unsafe { WaitForSingleObject(self.0, 0) == windows_sys::Win32::Foundation::WAIT_TIMEOUT }
+    }
+}
+struct SourceCapture {
+    pid: u32,
+    process: ProcessHandle,
+    packets: IAudioCaptureClient,
+    audio: IAudioClient,
+    event: Arc<Wake>,
+    pcm: Producer<f32>,
+    mix: Consumer<f32>,
+    started: bool,
+    ready: bool,
+}
+impl SourceCapture {
+    fn open(
+        pid: u32,
+        deadline: Instant,
+        control: &SourceControl,
+        epoch: &StreamControl,
+    ) -> Result<Self, PlatformError> {
+        let check = || {
+            if Instant::now() >= deadline {
+                return Err(PlatformError::Timeout);
+            }
+            if !control.permits() || !epoch.permits() {
+                return Err(locked());
+            }
+            Ok(())
+        };
+        check()?;
+        let process = ProcessHandle::open(pid)?;
+        if !process.alive() {
+            return Err(unavailable());
+        }
+        let event = Arc::new(Wake::new()?);
+        let audio = activate_source(pid, deadline, control)?;
+        check()?;
+        let format = WAVEFORMATEX {
+            wFormatTag: 3,
+            nChannels: 2,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 384_000,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        // SAFETY: initialized public shared process-loopback client, checked fixed Speaker format.
+        // NOPERSIST is documented for rendering, not asserted for this capture initializer.
+        unsafe {
+            audio.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK
+                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                0,
+                0,
+                &format,
+                None,
+            )
+        }
+        .map_err(|_| unavailable())?;
+        check()?;
+        // SAFETY: exact live event is retained until client Stop and COM release.
+        unsafe { audio.SetEventHandle(HANDLE(event.0)) }.map_err(|_| unavailable())?;
+        // SAFETY: initialized capture's precise service, owned on the same MTA.
+        let packets =
+            unsafe { audio.GetService::<IAudioCaptureClient>() }.map_err(|_| unavailable())?;
+        let (pcm, mix) = RingBuffer::new(9_600);
+        let mut client = Self {
+            pid,
+            process,
+            packets,
+            audio,
+            event,
+            pcm,
+            mix,
+            started: false,
+            ready: false,
+        };
+        check()?;
+        if !client.process.alive() {
+            return Err(unavailable());
+        }
+        // SAFETY: same-thread successfully initialized shared capture, exactly one start.
+        unsafe { client.audio.Start() }.map_err(|_| unavailable())?;
+        client.started = true;
+        check()?;
+        Ok(client)
+    }
+    fn drain(&mut self, control: &SourceControl, epoch: &StreamControl) -> bool {
+        if !self.process.alive() {
+            return false;
+        }
+        if !mem::replace(&mut self.ready, false) {
+            // SAFETY: own registered event. PCM is drained only on actual WASAPI notification;
+            // zero wait collects other signaled clients after the wait-any woke one of them.
+            match unsafe { WaitForSingleObject(self.event.0, 0) } {
+                WAIT_OBJECT_0 => {}
+                windows_sys::Win32::Foundation::WAIT_TIMEOUT => return true,
+                _ => return false,
+            }
+        }
+        for _ in 0..32 {
+            if !control.permits() || !epoch.permits() {
+                return true;
+            }
+            let mut pending = 0;
+            // SAFETY: same-thread initialized capture; raw HRESULT avoids allocations in PCM loop.
+            if unsafe {
+                (self.packets.vtable().GetNextPacketSize)(self.packets.as_raw(), &mut pending)
+            }
+            .is_err()
+            {
+                return false;
+            }
+            if pending == 0 {
+                return true;
+            }
+            let mut data = null_mut();
+            let mut frames = 0;
+            let mut flags = 0;
+            // SAFETY: exact initialized outputs; one matching release below for each acquisition.
+            if unsafe {
+                (self.packets.vtable().GetBuffer)(
+                    self.packets.as_raw(),
+                    &mut data,
+                    &mut frames,
+                    &mut flags,
+                    null_mut(),
+                    null_mut(),
+                )
+            }
+            .is_err()
+            {
+                return false;
+            }
+            let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+            let valid = frames as usize <= MAX_RENDER_FRAMES && (silent || !data.is_null());
+            if valid && epoch.permits() && control.permits() {
+                for frame in 0..frames as usize {
+                    if self.pcm.slots() < 2 {
+                        break;
+                    }
+                    for channel in 0..2 {
+                        let value = if silent {
+                            0.0
+                        } else {
+                            // SAFETY: fixed stereo f32 negotiated; valid packet has frames*8 bytes.
+                            unsafe {
+                                ptr::read_unaligned(
+                                    data.add((frame * 2 + channel) * 4).cast::<f32>(),
+                                )
+                            }
+                        };
+                        let _ = self.pcm.push(if value.is_finite() { value } else { 0.0 });
+                    }
+                }
+            }
+            // SAFETY: exactly one release, including invalid packets and gate transitions.
+            let released =
+                unsafe { (self.packets.vtable().ReleaseBuffer)(self.packets.as_raw(), frames) };
+            if !valid || released.is_err() {
+                return false;
+            }
+        }
+        false
+    }
+}
+impl Drop for SourceCapture {
+    fn drop(&mut self) {
+        if self.started {
+            // SAFETY: own exact initialized client; one Stop, no retry on unknown result.
+            let _ = unsafe { (self.audio.vtable().Stop)(self.audio.as_raw()) };
+        }
+        let _ = &self.event;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_worker(
+    gate: Arc<IoGate>,
+    supported: bool,
+    requests: Receiver<SourceRequest>,
+    mut speaker: Producer<f32>,
+    _microphone: Consumer<f32>,
+    mut events: Producer<SourceEvent>,
+    control: Arc<SourceControl>,
+    wake: Arc<Wake>,
+) {
+    struct Retire(Arc<SourceControl>);
+    impl Drop for Retire {
+        fn drop(&mut self) {
+            if thread::panicking() {
+                self.0.fallback_error.store(4, Ordering::Release);
+            }
+            self.0.cancel();
+            self.0.retired.store(true, Ordering::Release);
+        }
+    }
+    let _retire = Retire(control.clone());
+    let Ok(_apartment) = Apartment::new() else {
+        emit(
+            &mut events,
+            SourceEvent::Error(AudioDeviceError::Failed),
+            &control,
+        );
+        return;
+    };
+    let mut set = SourceSet::new(supported);
+    let mut captures: Vec<SourceCapture> =
+        Vec::with_capacity(crate::model::audio::MAX_PEER_SOURCES);
+    let mut epoch = StreamControl::new(gate.clone());
+    let mut revision = 0;
+    let mut mixer = SpeakerMixer::new();
+    let mut frame = [0.0; SPEAKER_FRAME_SAMPLES];
+    let mut next_mix = Instant::now();
+    while !control.eligibility.is_cancelled() {
+        if !epoch.permits() {
+            control.eligibility.disable();
+            active(&mut events, set.gate_closed(), &control);
+            captures.clear();
+        }
+        let request = match requests.try_recv() {
+            Ok(request) => Some(request),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        };
+        if let Some(request) = request {
+            let result = (|| {
+                if Instant::now() >= request.deadline {
+                    return Err(PlatformError::Timeout);
+                }
+                let delta = match set.replace(&request.pids, gate.is_open()) {
+                    Ok(delta) => delta,
+                    Err(error) => {
+                        control.eligibility.disable();
+                        active(&mut events, set.gate_closed(), &control);
+                        captures.clear();
+                        return Err(error);
+                    }
+                };
+                if !delta.changed {
+                    return Ok(());
+                }
+                revision = delta.revision;
+                let observed_epoch = gate.epoch();
+                epoch = StreamControl::new(gate.clone());
+                if delta.active == Some(false) {
+                    control.eligibility.disable();
+                }
+                active(&mut events, delta.active, &control);
+                captures.retain(|client| !delta.stop.contains(&client.pid));
+                control
+                    .eligibility
+                    .replace_revision(observed_epoch, !request.pids.is_empty());
+                if let Some(error) = delta.error {
+                    emit(&mut events, SourceEvent::Error(error), &control);
+                }
+                for pid in delta.start {
+                    match SourceCapture::open(pid, request.deadline, &control, &epoch) {
+                        Ok(client) => {
+                            captures.push(client);
+                            active(&mut events, set.started(revision, pid), &control);
+                        }
+                        Err(error) => {
+                            if !control.permits() || !epoch.permits() {
+                                control.eligibility.disable();
+                                active(&mut events, set.gate_closed(), &control);
+                                captures.clear();
+                                return Err(locked());
+                            }
+                            control.eligibility.disable();
+                            if let Some(failure) = set.failed(revision, pid) {
+                                active(&mut events, failure.active, &control);
+                                emit(&mut events, SourceEvent::Error(failure.error), &control);
+                            }
+                            captures.clear();
+                            log_source_failure(pid);
+                            return Err(error);
+                        }
+                    }
+                }
+                if !request.pids.is_empty() && (!control.permits() || !epoch.permits()) {
+                    control.eligibility.disable();
+                    active(&mut events, set.gate_closed(), &control);
+                    captures.clear();
+                    return Err(locked());
+                }
+                Ok(())
+            })();
+            let _ = request.reply.try_send(result);
+        }
+        if control.eligibility.is_cancelled() {
+            break;
+        }
+        let failed = captures
+            .iter_mut()
+            .find_map(|client| (!client.drain(&control, &epoch)).then_some(client.pid));
+        if let Some(pid) = failed {
+            control.eligibility.disable();
+            if let Some(failure) = set.failed(revision, pid) {
+                active(&mut events, failure.active, &control);
+                emit(&mut events, SourceEvent::Error(failure.error), &control);
+            }
+            captures.clear();
+            log_source_failure(pid);
+        }
+        let now = Instant::now();
+        if !captures.is_empty() && now >= next_mix {
+            mixer.begin();
+            for client in &mut captures {
+                mixer.add(&mut client.mix);
+            }
+            mixer.finish(&mut frame);
+            if epoch.permits() && control.permits() {
+                for pair in frame.as_chunks::<2>().0 {
+                    if speaker.slots() < 2 {
+                        break;
+                    }
+                    if !epoch.permits() || !control.permits() {
+                        break;
+                    }
+                    let _ = speaker.push(pair[0]);
+                    let _ = speaker.push(pair[1]);
+                }
+            }
+            next_mix = now + Duration::from_millis(10);
+        }
+        let mut handles = [null_mut(); crate::model::audio::MAX_PEER_SOURCES + 1];
+        handles[0] = wake.0;
+        for (index, capture) in captures.iter().enumerate() {
+            handles[index + 1] = capture.event.0;
+        }
+        // SAFETY: every event is retained by this same owner, bounded below MAXIMUM_WAIT_OBJECTS;
+        // short timeout observes gate epochs and liveness even when WASAPI produces no packets.
+        let waited =
+            unsafe { WaitForMultipleObjects((captures.len() + 1) as u32, handles.as_ptr(), 0, 2) };
+        if waited == WAIT_FAILED {
+            control.fallback_error.store(4, Ordering::Release);
+            break;
+        }
+        if let Some(index) = waited.checked_sub(WAIT_OBJECT_0 + 1)
+            && let Some(capture) = captures.get_mut(index as usize)
+        {
+            capture.ready = true;
+        }
+    }
+    control.eligibility.disable();
+    active(&mut events, set.gate_closed(), &control);
+    captures.clear();
 }
 
 struct Apartment;

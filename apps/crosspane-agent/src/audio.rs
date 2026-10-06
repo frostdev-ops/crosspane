@@ -118,7 +118,7 @@ mod host;
 #[cfg(test)]
 mod tests;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -199,6 +199,14 @@ impl fmt::Debug for AudioWorker {
 }
 
 impl AudioWorker {
+    /// Nonblocking latest-set delivery, ordered against death like other caller submissions.
+    pub(crate) fn set_peer_sources(&self, peer: NodeId, pids: &[u32]) {
+        let shadow = lock(&self.shared.shadow);
+        if self.shared.closing.load(Ordering::SeqCst) || shadow.dead {
+            return;
+        }
+        self.shared.host.push_sources(peer, pids);
+    }
     /// Start the worker's threads and subscribe to `host`'s events.
     pub fn start(
         host: Box<dyn AudioHost>,
@@ -333,6 +341,101 @@ impl AudioWorker {
     /// Counters, for tests and diagnostics.
     pub(crate) fn stats(&self) -> WorkerStats {
         self.shared.counters.snapshot()
+    }
+}
+
+/// Data-only catalogue of genuine source-local projection/window bindings. PIDs are refreshed
+/// from current WindowInfo; this mitigates but never authenticates process reuse \[U\].
+#[derive(Debug, Default)]
+pub(crate) struct SourceCatalogue {
+    projections:
+        BTreeMap<crosspane_engine::io::ProjectionKey, (NodeId, crosspane_types::id::WindowId)>,
+    granted: BTreeSet<NodeId>,
+    sent: BTreeMap<NodeId, Vec<u32>>,
+}
+impl SourceCatalogue {
+    /// The SAME validated Input::Link path as the outgoing engine: wire bounded decode, Hello
+    /// first, then transport hub current-connection filtering before on_link/feed. Not local grants.
+    pub(crate) fn observe(&mut self, input: &crosspane_engine::Input) {
+        use crosspane_engine::Input;
+        use crosspane_protocol::{
+            link::LinkEvent,
+            msg::{Capability, ControlMessage},
+        };
+        match input {
+            Input::Link(LinkEvent::Control {
+                peer,
+                msg: ControlMessage::Grants(grants),
+            }) => {
+                if grants.contains(&Capability::AudioSpeaker) {
+                    self.granted.insert(*peer);
+                } else {
+                    self.granted.remove(peer);
+                }
+            }
+            Input::Link(LinkEvent::Closed { peer, .. })
+            | Input::AudioConnectionReplaced { peer } => {
+                self.granted.remove(peer);
+            }
+            _ => {}
+        }
+    }
+    /// Initial Parked input and ProjectionStarted share one handle batch, even for Twin capture.
+    pub(crate) fn outputs(
+        &mut self,
+        node: NodeId,
+        window: Option<crosspane_types::id::WindowId>,
+        outputs: &[Output],
+    ) {
+        for output in outputs {
+            match output {
+                Output::Notice(crosspane_engine::Notice::ProjectionStarted {
+                    key, peer, ..
+                }) if key.source == node => {
+                    if let Some(window) = window {
+                        self.projections.insert(*key, (*peer, window));
+                    }
+                }
+                Output::Notice(crosspane_engine::Notice::ProjectionEnded { key, .. }) => {
+                    self.projections.remove(key);
+                }
+                _ => {}
+            }
+        }
+    }
+    pub(crate) fn changes(
+        &mut self,
+        node: NodeId,
+        pid: impl Fn(crosspane_types::id::WindowId) -> Option<u32>,
+    ) -> Vec<(NodeId, Vec<u32>)> {
+        let mut desired: BTreeMap<NodeId, BTreeSet<u32>> = BTreeMap::new();
+        for (key, (peer, window)) in &self.projections {
+            if key.source == node
+                && self.granted.contains(peer)
+                && let Some(pid) = pid(*window).filter(|pid| *pid != 0)
+            {
+                desired.entry(*peer).or_default().insert(pid);
+            }
+        }
+        let peers: BTreeSet<_> = desired.keys().chain(self.sent.keys()).copied().collect();
+        let mut changed = Vec::new();
+        for peer in peers {
+            let pids: Vec<_> = desired
+                .remove(&peer)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if self.sent.get(&peer).map_or(&[][..], Vec::as_slice) == pids {
+                continue;
+            }
+            if pids.is_empty() {
+                self.sent.remove(&peer);
+            } else {
+                self.sent.insert(peer, pids.clone());
+            }
+            changed.push((peer, pids));
+        }
+        changed
     }
 }
 

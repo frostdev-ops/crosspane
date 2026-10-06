@@ -584,6 +584,10 @@ impl Drop for OwnedChild {
 #[test]
 #[ignore = "Limited own shared tone only; global win-gui lock and probe manifest required"]
 fn owned_shared_playback_probe() {
+    supervise_owned("owned_audio_child", "CROSSPANE_AUDIO_CHILD", 1);
+}
+
+fn supervise_owned(entry: &str, marker: &str, process_limit: u32) {
     std::panic::set_hook(Box::new(|_| eprintln!("AUDIO_PROBE_FIXED_FAILURE")));
     assert!(limited(), "ELEVATED_REFUSED");
     // SAFETY: unnamed own job; flags constrain only the genuine newly created child.
@@ -593,7 +597,7 @@ fn owned_shared_playback_probe() {
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-    limits.BasicLimitInformation.ActiveProcessLimit = 1;
+    limits.BasicLimitInformation.ActiveProcessLimit = process_limit;
     // SAFETY: exact owned job and initialized size; no existing owner process is assigned.
     assert_ne!(
         // SAFETY: exact owned job and initialized limits, no owner process is assigned.
@@ -611,12 +615,12 @@ fn owned_shared_playback_probe() {
     let spawned = Command::new(std::env::current_exe().expect("OWN_EXE"))
         .args([
             "--exact",
-            "owned_audio_child",
+            entry,
             "--ignored",
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("CROSSPANE_AUDIO_CHILD", "owned")
+        .env(marker, "owned")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -672,17 +676,30 @@ fn owned_shared_playback_probe() {
     if !errors.is_empty() {
         println!("AUDIO_CHILD_ERROR_BYTES count={}", errors.len());
     }
+    // SAFETY: retire only descendants in this private kill-on-close job after its genuine probe
+    // child exits. This also contains a grandchild waiting on a pipe after an abrupt probe exit.
+    unsafe {
+        TerminateJobObject(job.0, 124);
+    }
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
     let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
     // SAFETY: own job accounting only, exact initialized output.
-    let okay = unsafe {
-        QueryInformationJobObject(
-            job.0,
-            JobObjectBasicAccountingInformation,
-            (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-            mem::size_of_val(&accounting) as u32,
-            null_mut(),
-        )
-    } != 0;
+    let okay = loop {
+        // SAFETY: only our private job, exact initialized accounting output.
+        let okay = unsafe {
+            QueryInformationJobObject(
+                job.0,
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                mem::size_of_val(&accounting) as u32,
+                null_mut(),
+            )
+        } != 0;
+        if !okay || accounting.ActiveProcesses == 0 || Instant::now() >= cleanup_deadline {
+            break okay;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
     println!(
         "AUDIO_CLEANUP child_exited=1 job_empty={} child_success={} child_exit_code={:?}",
         okay && accounting.ActiveProcesses == 0,
@@ -706,4 +723,291 @@ fn owned_audio_child() {
         println!("AUDIO_TRIAL_FAILED code={code}");
         panic!("OWN_TRIAL_FAILED");
     }
+}
+
+#[test]
+#[ignore = "Limited owned child-tree capture only; global win-gui lock and probe manifest required"]
+fn owned_projected_source_probe() {
+    // Supervisor touches no endpoint. The owned probe child and its genuine tone child alone
+    // enter the private job; an independent supervisor watchdog kills that job at15s.
+    supervise_owned("owned_projected_source_child", "CROSSPANE_SOURCE_CHILD", 2);
+}
+
+fn own_handshake(marker: &str, expected: &str) -> ProbeResult<Watchdog> {
+    if std::env::var(marker).ok().as_deref() != Some("owned") || !limited() {
+        return Err("CHILD_GUARD_REFUSED");
+    }
+    let mut in_job = 0;
+    // SAFETY: read-only own process membership. The supervisor created/assigned the private job
+    // before sending the inherited-pipe handshake; no arbitrary PID is accepted by this entry.
+    if unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } == 0 || in_job == 0 {
+        return Err("CHILD_JOB_REFUSED");
+    }
+    let mut begin = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut begin)
+        .map_err(|_| "HANDSHAKE_FAILED")?;
+    if begin != expected {
+        return Err("HANDSHAKE_REFUSED");
+    }
+    let watchdog = Watchdog::new(None, 14_000);
+    println!("SOURCE_CHILD_EARLY limited=1 owned_job_handshake=1 trials_planned=1");
+    std::io::stdout().flush().map_err(|_| "OUTPUT_FAILED")?;
+    Ok(watchdog)
+}
+fn source_stage(stage: &'static str) -> ProbeResult<()> {
+    println!("SOURCE_STAGE stage={stage}");
+    std::io::stdout().flush().map_err(|_| "OUTPUT_FAILED")
+}
+struct ToneChild(Child);
+impl Drop for ToneChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            // SAFETY: exactly the genuine tone child this probe created, never supplied PID.
+            unsafe {
+                TerminateProcess(self.0.as_raw_handle(), 124);
+                WaitForSingleObject(self.0.as_raw_handle(), 1000);
+            }
+        }
+    }
+}
+fn projected_child() -> ProbeResult<()> {
+    let _watchdog = own_handshake("CROSSPANE_SOURCE_CHILD", "OWNED_JOB_READY\n")?;
+    if !supported_version() {
+        println!("SOURCE_VERSION_REFUSED trials_started=0");
+        return Ok(());
+    }
+    let _apartment = Apartment::new()?;
+    // SAFETY: read-only render presence, no changes, settings or foreign capture.
+    let enumerator: IMMDeviceEnumerator =
+        sdk(unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER) })?;
+    // SAFETY: read-only default render presence; missing endpoint ends this measurement.
+    if unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.is_err() {
+        println!("SOURCE_NO_ENDPOINT trials_started=0");
+        return Ok(());
+    }
+    let mut tone = ToneChild(
+        Command::new(std::env::current_exe().map_err(|_| "OWN_EXE")?)
+            .args([
+                "--exact",
+                "owned_projected_tone_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CROSSPANE_SOURCE_TONE", "owned")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "TONE_CHILD_FAILED")?,
+    );
+    let mut input = tone.0.stdin.take().ok_or("TONE_STDIN")?;
+    input
+        .write_all(b"OWNED_TONE_JOB_READY\n")
+        .map_err(|_| "TONE_HANDSHAKE")?;
+    let mut output = BufReader::new(tone.0.stdout.take().ok_or("TONE_STDOUT")?);
+    // Read only this own fixture's bounded fixed guard receipt, skipping Rust test labels.
+    let guard_deadline = Instant::now() + Duration::from_secs(2);
+    let mut guard = false;
+    for _ in 0..8 {
+        let mut line = String::new();
+        output.read_line(&mut line).map_err(|_| "TONE_READY")?;
+        if line.len() > 512 || Instant::now() >= guard_deadline {
+            return Err("TONE_READY_BOUND");
+        }
+        if line.contains("SOURCE_CHILD_EARLY limited=1 owned_job_handshake=1") {
+            guard = true;
+            break;
+        }
+    }
+    if !guard {
+        return Err("TONE_GUARD_MISSING");
+    }
+    let trial = match std::env::var("CROSSPANE_SOURCE_TRIAL").ok().as_deref() {
+        None | Some("1") => 1,
+        Some("2") => 2,
+        _ => return Err("TRIAL_NUMBER_REFUSED"),
+    };
+    println!("SOURCE_TRIAL_STARTED trial={trial} source_peak_dbfs=-60");
+    std::io::stdout().flush().map_err(|_| "OUTPUT_FAILED")?;
+    let gate = IoGate::new();
+    gate.set_session_permits(true);
+    gate.set_engine_permits(true);
+    let mut host = WindowsAudioHost::new(gate).map_err(|_| "SOURCE_HOST_FAILED")?;
+    let (send, events) = std::sync::mpsc::channel();
+    host.subscribe(Arc::new(move |event| {
+        let _ = send.send(event);
+    }))
+    .map_err(|_| "SOURCE_SUBSCRIBE_FAILED")?;
+    let peer = crosspane_types::id::NodeId([7; 32]);
+    let mut ports = host
+        .add_peer(peer, "owned")
+        .map_err(|_| "SOURCE_PEER_FAILED")?;
+    source_stage("own_tree_capture_opening")?;
+    // The only PID is obtained from the genuine just-created private tone child. No external
+    // environment, arbitrary PID, existing process, endpoint loopback or owner audio is captured.
+    host.set_peer_sources(peer, &[tone.0.id()])
+        .map_err(|_| "SOURCE_ACTIVATION_FAILED")?;
+    source_stage("own_tree_capture_opened")?;
+    let active = events
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|_| "SOURCE_ACTIVE_MISSING")?;
+    if active
+        != (crosspane_platform::AudioEvent::VirtualActive {
+            peer,
+            kind: AudioKind::Speaker,
+            active: true,
+        })
+    {
+        return Err("SOURCE_ACTIVE_WRONG");
+    }
+    input
+        .write_all(b"START_OWN_TONE\n")
+        .map_err(|_| "TONE_START_FAILED")?;
+    source_stage("owned_tone_running")?;
+    let mut samples = 0u64;
+    let mut nonzero = 0u64;
+    let mut peak = 0.0f32;
+    let mut energy = 0.0f64;
+    let mut sine = 0.0f64;
+    let mut cosine = 0.0f64;
+    let mut frames = 0u64;
+    let deadline = Instant::now() + Duration::from_millis(1600);
+    while Instant::now() < deadline {
+        while ports.speaker_out.slots() >= 2 {
+            let left = ports.speaker_out.pop().map_err(|_| "SOURCE_RING_FAILED")?;
+            let right = ports.speaker_out.pop().map_err(|_| "SOURCE_RING_FAILED")?;
+            if !left.is_finite() || !right.is_finite() {
+                return Err("SOURCE_NONFINITE");
+            }
+            samples += 2;
+            peak = peak.max(left.abs()).max(right.abs());
+            nonzero += u64::from(left.abs() > 0.000_01) + u64::from(right.abs() > 0.000_01);
+            let phase = std::f64::consts::TAU * (frames % 48) as f64 / 48.0;
+            sine += f64::from(left) * phase.sin();
+            cosine += f64::from(left) * phase.cos();
+            energy += f64::from(left).powi(2);
+            frames += 1;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    source_stage("source_stopping")?;
+    let stopped = Instant::now();
+    host.set_peer_sources(peer, &[])
+        .map_err(|_| "SOURCE_STOP_FAILED")?;
+    let stop_ms = stopped.elapsed().as_secs_f64() * 1000.0;
+    let inactive = events
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|_| "SOURCE_INACTIVE_MISSING")?;
+    if inactive
+        != (crosspane_platform::AudioEvent::VirtualActive {
+            peer,
+            kind: AudioKind::Speaker,
+            active: false,
+        })
+    {
+        return Err("SOURCE_INACTIVE_WRONG");
+    }
+    let removing = Instant::now();
+    host.remove_peer(peer).map_err(|_| "SOURCE_REMOVE_FAILED")?;
+    let remove_ms = removing.elapsed().as_secs_f64() * 1000.0;
+    let retired = host.fixture_retired();
+    let before_tail = ports.speaker_out.slots();
+    while ports.speaker_out.pop().is_ok() {}
+    thread::sleep(Duration::from_millis(100));
+    let after_stop_samples = ports.speaker_out.slots();
+    drop(host);
+    input
+        .write_all(b"FINISH_OWN_TONE\n")
+        .map_err(|_| "TONE_FINISH_FAILED")?;
+    drop(input);
+    let status = tone.0.wait().map_err(|_| "TONE_WAIT_FAILED")?;
+    let correlation = if frames != 0 && energy > 0.0 {
+        2.0 * (sine * sine + cosine * cosine) / (frames as f64 * energy)
+    } else {
+        0.0
+    };
+    println!(
+        "SOURCE_METRICS samples={samples} nonzero={nonzero} peak={peak:.7} tone_correlation={correlation:.5} empty_set_ms={stop_ms:.3} remove_ms={remove_ms:.3} queued_before_tail={before_tail} samples_after_stop={after_stop_samples}"
+    );
+    println!(
+        "SOURCE_RETIREMENT active_then_inactive=1 clients_retired={retired} own_tone_child_exited={} own_tone_exit_code={:?}",
+        status.success(),
+        status.code()
+    );
+    if !retired || !status.success() {
+        return Err("SOURCE_RETIREMENT_UNPROVEN");
+    }
+    if stop_ms > 2000.0 || remove_ms > 50.0 || after_stop_samples != 0 {
+        return Err("SOURCE_STOP_BOUND_FAILED");
+    }
+    if nonzero == 0 || peak > 0.001_1 || correlation < 0.5 {
+        return Err("SOURCE_TONE_NOT_ESTABLISHED");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "internal private-job source entry; no arbitrary PID or endpoint changes"]
+fn owned_projected_source_child() {
+    std::panic::set_hook(Box::new(|_| eprintln!("SOURCE_CHILD_FIXED_FAILURE")));
+    if let Err(code) = projected_child() {
+        println!("SOURCE_TRIAL_FAILED code={code}");
+        std::io::stdout().flush().expect("OWN_OUTPUT");
+        panic!("OWN_SOURCE_TRIAL_FAILED");
+    }
+}
+
+#[test]
+#[ignore = "internal genuine tone child; private handshake, Limited, no settings"]
+fn owned_projected_tone_child() {
+    std::panic::set_hook(Box::new(|_| eprintln!("SOURCE_TONE_FIXED_FAILURE")));
+    let watchdog =
+        own_handshake("CROSSPANE_SOURCE_TONE", "OWNED_TONE_JOB_READY\n").expect("TONE_GUARD");
+    let mut command = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut command)
+        .expect("OWN_TONE_COMMAND");
+    assert_eq!(command, "START_OWN_TONE\n", "OWN_TONE_REFUSED");
+    // SAFETY: monotonic own watchdog starts BEFORE endpoint activation and the first PCM sample.
+    watchdog.tone_until.store(
+        unsafe { GetTickCount64() }.saturating_add(1900),
+        Ordering::Release,
+    );
+    source_stage("owned_render_opening").expect("OWN_OUTPUT");
+    let gate = IoGate::new();
+    gate.set_session_permits(true);
+    gate.set_engine_permits(true);
+    let mut host = WindowsAudioHost::new(gate).expect("OWN_RENDER_HOST");
+    let mut playback = host
+        .open_playback(AudioKind::Speaker.format())
+        .expect("OWN_RENDER_OPEN");
+    source_stage("owned_render_opened").expect("OWN_OUTPUT");
+    let start = Instant::now();
+    let mut phase = 0u64;
+    while start.elapsed() < Duration::from_millis(1200) {
+        while playback.pcm.slots() >= 960 {
+            for _ in 0..480 {
+                let sample = (std::f32::consts::TAU * (phase % 48) as f32 / 48.0).sin() * 0.001;
+                phase += 1;
+                playback.pcm.push(sample).expect("OWN_PCM");
+                playback.pcm.push(sample).expect("OWN_PCM");
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    drop(playback);
+    watchdog.tone_until.store(0, Ordering::Release);
+    assert!(host.fixture_retired(), "OWN_RENDER_RETIREMENT");
+    drop(host);
+    source_stage("owned_render_retired").expect("OWN_OUTPUT");
+    command.clear();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut command)
+        .expect("OWN_TONE_FINISH");
+    assert_eq!(command, "FINISH_OWN_TONE\n", "OWN_TONE_FINISH_REFUSED");
 }

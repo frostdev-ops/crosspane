@@ -30,6 +30,243 @@ use super::*;
 
 // ---- Fakes ----
 
+struct ReleaseSourceGate(Arc<Gate>);
+impl Drop for ReleaseSourceGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn receive_speaker_grant(sources: &mut SourceCatalogue, peer: NodeId, enabled: bool) {
+    sources.observe(&crosspane_engine::Input::Link(
+        crosspane_protocol::link::LinkEvent::Control {
+            peer,
+            msg: crosspane_protocol::msg::ControlMessage::Grants(if enabled {
+                vec![crosspane_protocol::msg::Capability::AudioSpeaker]
+            } else {
+                vec![]
+            }),
+        },
+    ));
+}
+
+fn source_notice(node: NodeId, projection: u64, peer: NodeId) -> Output {
+    Output::Notice(crosspane_engine::Notice::ProjectionStarted {
+        key: crosspane_engine::io::ProjectionKey {
+            source: node,
+            projection: crosspane_types::id::ProjectionId(projection),
+        },
+        peer,
+        parking: crosspane_protocol::projection::ParkingKind::Twin,
+    })
+}
+
+#[test]
+fn source_projection_start_sends_current_pids_and_second_window_same_pid_is_unchanged() {
+    let peer = node(46);
+    let node = node(45);
+    let mut sources = SourceCatalogue::default();
+    receive_speaker_grant(&mut sources, peer, true);
+    let first = crosspane_types::id::WindowId(1);
+    sources.outputs(node, Some(first), &[source_notice(node, 1, peer)]);
+    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![10])]);
+    sources.outputs(
+        node,
+        Some(crosspane_types::id::WindowId(2)),
+        &[source_notice(node, 2, peer)],
+    );
+    assert!(sources.changes(node, |_| Some(10)).is_empty());
+    assert_eq!(
+        sources.changes(node, |window| Some(if window == first { 20 } else { 10 })),
+        vec![(peer, vec![10, 20])]
+    );
+}
+
+#[test]
+fn source_projection_end_sends_empty_and_destination_or_pidless_window_never_adds_a_source() {
+    let peer = node(48);
+    let node = node(47);
+    let mut sources = SourceCatalogue::default();
+    receive_speaker_grant(&mut sources, peer, true);
+    sources.outputs(
+        node,
+        Some(crosspane_types::id::WindowId(1)),
+        &[source_notice(peer, 1, node)],
+    );
+    assert!(sources.changes(node, |_| Some(99)).is_empty());
+    sources.outputs(
+        node,
+        Some(crosspane_types::id::WindowId(2)),
+        &[source_notice(node, 1, peer)],
+    );
+    assert!(sources.changes(node, |_| None).is_empty());
+    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![10])]);
+    sources.outputs(
+        node,
+        None,
+        &[Output::Notice(crosspane_engine::Notice::ProjectionEnded {
+            key: crosspane_engine::io::ProjectionKey {
+                source: node,
+                projection: crosspane_types::id::ProjectionId(1),
+            },
+            reason: crosspane_protocol::projection::ProjectionEndReason::Returned,
+        })],
+    );
+    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![])]);
+    assert!(sources.changes(node, |_| Some(10)).is_empty());
+}
+
+#[test]
+fn source_projection_uses_received_grant_only_and_revoke_sends_empty() {
+    let peer = node(50);
+    let node = node(49);
+    let mut sources = SourceCatalogue::default();
+    sources.outputs(
+        node,
+        Some(crosspane_types::id::WindowId(1)),
+        &[source_notice(node, 1, peer)],
+    );
+    sources.observe(&crosspane_engine::Input::Grants(
+        [(
+            peer,
+            [crosspane_protocol::msg::Capability::AudioSpeaker].into(),
+        )]
+        .into(),
+    ));
+    assert!(sources.changes(node, |_| Some(10)).is_empty());
+    receive_speaker_grant(&mut sources, peer, true);
+    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![10])]);
+    sources.observe(&crosspane_engine::Input::Grants(Default::default()));
+    assert!(sources.changes(node, |_| Some(10)).is_empty());
+    receive_speaker_grant(&mut sources, peer, false);
+    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![])]);
+}
+
+#[test]
+fn source_projection_connection_replacement_and_closed_window_clear_without_cached_pid_rebind() {
+    let peer = node(52);
+    let node = node(51);
+    let mut sources = SourceCatalogue::default();
+    receive_speaker_grant(&mut sources, peer, true);
+    sources.outputs(
+        node,
+        Some(crosspane_types::id::WindowId(1)),
+        &[source_notice(node, 1, peer)],
+    );
+    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![10])]);
+    sources.observe(&crosspane_engine::Input::AudioConnectionReplaced { peer });
+    assert_eq!(sources.changes(node, |_| Some(10)), vec![(peer, vec![])]);
+    assert!(sources.changes(node, |_| Some(10)).is_empty());
+    receive_speaker_grant(&mut sources, peer, true);
+    assert_eq!(sources.changes(node, |_| Some(20)), vec![(peer, vec![20])]);
+    sources.observe(&crosspane_engine::Input::Link(
+        crosspane_protocol::link::LinkEvent::Closed {
+            peer,
+            error: LinkError::Closed,
+        },
+    ));
+    assert_eq!(sources.changes(node, |_| Some(20)), vec![(peer, vec![])]);
+    receive_speaker_grant(&mut sources, peer, true);
+    assert_eq!(sources.changes(node, |_| Some(20)), vec![(peer, vec![20])]);
+    assert_eq!(sources.changes(node, |_| None), vec![(peer, vec![])]);
+}
+
+#[test]
+fn source_sets_wait_for_successful_add_and_coalesce_to_latest_before_dispatch() {
+    let h = Harness::new();
+    let peer = NodeId([41; 32]);
+    let gate = h.probe.hold_adds();
+    let _release = ReleaseSourceGate(gate.clone());
+    h.submit(Output::AddAudioPeer {
+        peer,
+        name: "owned fake".into(),
+    });
+    gate.wait_entered(1);
+    h.w().set_peer_sources(peer, &[10]);
+    h.w().set_peer_sources(peer, &[20]);
+    h.w().set_peer_sources(peer, &[]);
+    assert!(lock(&h.probe.source_sets).is_empty());
+    gate.release();
+    h.barrier();
+    assert_eq!(*lock(&h.probe.source_sets), vec![(peer, vec![])]);
+}
+
+#[test]
+fn source_sets_pending_behind_a_call_keep_only_latest_empty_and_run_off_caller() {
+    let h = Harness::new();
+    let peer = NodeId([42; 32]);
+    h.add_peer(peer);
+    let gate = Gate::closed();
+    let _release = ReleaseSourceGate(gate.clone());
+    *lock(&h.probe.sources_gate) = Some(gate.clone());
+    h.w().set_peer_sources(peer, &[10]);
+    gate.wait_entered(1);
+    for pid in 20..2000 {
+        h.w().set_peer_sources(peer, &[pid]);
+    }
+    h.w().set_peer_sources(peer, &[]);
+    assert_eq!(h.shared().host.queued_sources(), 1);
+    gate.release();
+    h.barrier();
+    assert_eq!(
+        *lock(&h.probe.source_sets),
+        vec![(peer, vec![10]), (peer, vec![])]
+    );
+}
+
+#[test]
+fn source_sets_failed_add_or_pending_remove_never_dispatch_stale_capture() {
+    let h = Harness::new();
+    let peer = NodeId([43; 32]);
+    let gate = h.probe.hold_adds();
+    let _release = ReleaseSourceGate(gate.clone());
+    h.probe.fail_add.store(true, Ordering::SeqCst);
+    h.submit(Output::AddAudioPeer {
+        peer,
+        name: "owned fake".into(),
+    });
+    gate.wait_entered(1);
+    h.w().set_peer_sources(peer, &[10]);
+    gate.release();
+    h.barrier();
+    assert!(lock(&h.probe.source_sets).is_empty());
+    assert_eq!(h.shared().host.queued_sources(), 0);
+    h.probe.fail_add.store(false, Ordering::SeqCst);
+    h.add_peer(peer);
+    h.w().set_peer_sources(peer, &[1]);
+    h.barrier();
+    assert_eq!(*lock(&h.probe.source_sets), vec![(peer, vec![1])]);
+    lock(&h.probe.source_sets).clear();
+    let held = h.probe.hold_opens();
+    let _release_open = ReleaseSourceGate(held.clone());
+    h.submit(Output::OpenAudioPlayback {
+        key: key(peer, 2, 1),
+    });
+    held.wait_entered(1);
+    h.w().set_peer_sources(peer, &[20]);
+    h.submit(Output::RemoveAudioPeer { peer });
+    h.wait_applied();
+    held.release();
+    h.barrier();
+    assert!(lock(&h.probe.source_sets).is_empty());
+}
+
+#[test]
+fn source_sets_error_is_dropped_without_killing_worker_or_changing_data_replies() {
+    let h = Harness::new();
+    let peer = NodeId([44; 32]);
+    h.add_peer(peer);
+    h.probe.fail_sources.store(true, Ordering::SeqCst);
+    h.w().set_peer_sources(peer, &[10]);
+    h.barrier();
+    assert!(!h.shared().is_shutdown());
+    assert_eq!(*lock(&h.probe.source_sets), vec![(peer, vec![10])]);
+    h.probe.fail_sources.store(false, Ordering::SeqCst);
+    h.w().set_peer_sources(peer, &[]);
+    h.barrier();
+    assert_eq!(lock(&h.probe.source_sets).last(), Some(&(peer, vec![])));
+}
+
 const STEREO: AudioFormat = AudioFormat {
     rate: 48_000,
     channels: 2,
@@ -217,6 +454,9 @@ struct HostProbe {
     playbacks: Mutex<Vec<PlaybackEnds>>,
     names: Mutex<Vec<String>>,
     formats: Mutex<Vec<AudioFormat>>,
+    source_sets: Mutex<Vec<(NodeId, Vec<u32>)>>,
+    sources_gate: Mutex<Option<Arc<Gate>>>,
+    fail_sources: AtomicBool,
     sink: Mutex<Option<Arc<dyn EventSink<AudioEvent>>>>,
 }
 
@@ -247,6 +487,9 @@ impl HostProbe {
             playbacks: Mutex::new(Vec::new()),
             names: Mutex::new(Vec::new()),
             formats: Mutex::new(Vec::new()),
+            source_sets: Mutex::new(Vec::new()),
+            sources_gate: Mutex::new(None),
+            fail_sources: AtomicBool::new(false),
             sink: Mutex::new(None),
         })
     }
@@ -347,6 +590,20 @@ fn sleep_ms(ms: u64) {
 }
 
 impl AudioHost for FakeHost {
+    fn set_peer_sources(&mut self, peer: NodeId, pids: &[u32]) -> Result<(), PlatformError> {
+        assert!(
+            lock(&self.0.peers).contains_key(&peer),
+            "sources preceded real add_peer"
+        );
+        lock(&self.0.source_sets).push((peer, pids.to_vec()));
+        if let Some(gate) = lock(&self.0.sources_gate).clone() {
+            gate.pass();
+        }
+        if self.0.fail_sources.load(Ordering::SeqCst) {
+            return Err(PlatformError::Backend("fake source failure".into()));
+        }
+        Ok(())
+    }
     fn add_peer(&mut self, peer: NodeId, name: &str) -> Result<VirtualPorts, PlatformError> {
         let probe = &self.0;
         // Everything the test configures is read before the call is announced, so a test that

@@ -12,7 +12,7 @@ use std::{
     sync::mpsc::Receiver,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -291,4 +291,228 @@ pub fn wait_open(
         control.cancel();
     }
     result
+}
+
+/// Bounded root count and one 10 ms frame of the frozen 48 kHz stereo Speaker format.
+pub const MAX_PEER_SOURCES: usize = 32;
+pub const SPEAKER_FRAME_SAMPLES: usize = 960;
+
+/// Per-revision PCM eligibility, distinct from permanent owner retirement. Native control uses
+/// disable BEFORE a possibly stalled Stop/release. Only a deliberate changed set replaces the
+/// revision; callbacks cannot re-arm it. This grants no PID, projection or received-grant authority.
+pub struct SourceLifecycle {
+    gate: Arc<IoGate>,
+    epoch: AtomicU64,
+    enabled: AtomicBool,
+    cancelled: AtomicBool,
+}
+impl fmt::Debug for SourceLifecycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SourceLifecycle(..)")
+    }
+}
+impl SourceLifecycle {
+    pub fn new(gate: Arc<IoGate>) -> Self {
+        Self {
+            epoch: AtomicU64::new(gate.epoch()),
+            gate,
+            enabled: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+    pub fn replace_revision(&self, observed_epoch: u64, enabled: bool) {
+        self.epoch.store(observed_epoch, Ordering::Release);
+        self.enabled
+            .store(enabled && !self.is_cancelled(), Ordering::Release);
+    }
+    pub fn disable(&self) {
+        self.enabled.store(false, Ordering::Release);
+    }
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.disable();
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+    pub fn permits(&self) -> bool {
+        !self.is_cancelled()
+            && self.enabled.load(Ordering::Acquire)
+            && self.gate.is_open()
+            && self.gate.epoch() == self.epoch.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+pub struct SourceDelta {
+    pub revision: u64,
+    pub start: Vec<u32>,
+    pub stop: Vec<u32>,
+    pub changed: bool,
+    pub active: Option<bool>,
+    pub error: Option<AudioDeviceError>,
+}
+#[derive(Debug)]
+pub struct SourceFailure {
+    pub active: Option<bool>,
+    pub error: AudioDeviceError,
+}
+#[derive(Debug)]
+pub struct SourceSet {
+    supported: bool,
+    unavailable_reported: bool,
+    desired: Vec<u32>,
+    running: Vec<u32>,
+    revision: u64,
+    terminal: bool,
+}
+impl SourceSet {
+    /// The revision correlates results only; PID reuse is explicitly unverified \[U\].
+    /// A Failed revision is peer-terminal because the frozen engine's error ends the peer stream.
+    pub fn new(supported: bool) -> Self {
+        Self {
+            supported,
+            unavailable_reported: false,
+            desired: Vec::new(),
+            running: Vec::with_capacity(MAX_PEER_SOURCES),
+            revision: 0,
+            terminal: false,
+        }
+    }
+    pub fn replace(&mut self, pids: &[u32], permitted: bool) -> Result<SourceDelta, PlatformError> {
+        if pids.len() > MAX_PEER_SOURCES || pids.contains(&0) {
+            return Err(PlatformError::Unsupported(
+                "Windows source audio root bound",
+            ));
+        }
+        if !pids.is_empty() && !permitted {
+            return Err(PlatformError::Locked);
+        }
+        let mut desired = pids.to_vec();
+        desired.sort_unstable();
+        desired.dedup();
+        let mut delta = SourceDelta {
+            revision: self.revision,
+            start: Vec::new(),
+            stop: Vec::new(),
+            changed: false,
+            active: None,
+            error: None,
+        };
+        if desired == self.desired {
+            return Ok(delta);
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(PlatformError::Unsupported(
+                "Windows source audio revisions exhausted",
+            ))?;
+        let was_active = !self.running.is_empty();
+        delta.stop = self
+            .running
+            .iter()
+            .copied()
+            .filter(|pid| !desired.contains(pid))
+            .collect();
+        self.running.retain(|pid| desired.contains(pid));
+        if was_active && self.running.is_empty() {
+            delta.active = Some(false);
+        }
+        if self.supported {
+            // Pending roots from the old revision must get a new admission, not a stale result.
+            delta.start = desired
+                .iter()
+                .copied()
+                .filter(|pid| !self.running.contains(pid))
+                .collect();
+        } else if !desired.is_empty() && !self.unavailable_reported {
+            self.unavailable_reported = true;
+            delta.error = Some(AudioDeviceError::Unavailable);
+        }
+        self.desired = desired;
+        self.revision = revision;
+        self.terminal = !self.supported;
+        delta.revision = revision;
+        delta.changed = true;
+        Ok(delta)
+    }
+    pub fn started(&mut self, revision: u64, pid: u32) -> Option<bool> {
+        if self.terminal
+            || revision != self.revision
+            || !self.desired.contains(&pid)
+            || self.running.contains(&pid)
+        {
+            return None;
+        }
+        let was_empty = self.running.is_empty();
+        self.running.push(pid);
+        self.running.sort_unstable();
+        was_empty.then_some(true)
+    }
+    /// The caller fences ALL peer PCM before teardown, publishing inactive before the one error.
+    pub fn failed(&mut self, revision: u64, pid: u32) -> Option<SourceFailure> {
+        if self.terminal || revision != self.revision || !self.desired.contains(&pid) {
+            return None;
+        }
+        self.terminal = true;
+        let was_active = !self.running.is_empty();
+        self.running.clear();
+        Some(SourceFailure {
+            active: was_active.then_some(false),
+            error: AudioDeviceError::Failed,
+        })
+    }
+    pub fn gate_closed(&mut self) -> Option<bool> {
+        self.terminal = true;
+        let was_active = !self.running.is_empty();
+        self.running.clear();
+        was_active.then_some(false)
+    }
+    pub fn running(&self) -> &[u32] {
+        &self.running
+    }
+}
+/// No allocation in begin/add/finish; preserve complete stereo frames through underrun.
+/// Wider accumulation prevents finite full-scale source values overflowing before final clamp.
+pub struct SpeakerMixer {
+    sum: [f64; SPEAKER_FRAME_SAMPLES],
+}
+impl fmt::Debug for SpeakerMixer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SpeakerMixer(..)")
+    }
+}
+impl Default for SpeakerMixer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl SpeakerMixer {
+    pub fn new() -> Self {
+        Self {
+            sum: [0.0; SPEAKER_FRAME_SAMPLES],
+        }
+    }
+    pub fn begin(&mut self) {
+        self.sum.fill(0.0);
+    }
+    pub fn add(&mut self, pcm: &mut Consumer<f32>) {
+        let samples = (pcm.slots() / 2 * 2).min(SPEAKER_FRAME_SAMPLES);
+        for sum in &mut self.sum[..samples] {
+            let Ok(value) = pcm.pop() else { break };
+            if value.is_finite() {
+                *sum += f64::from(value);
+            }
+        }
+    }
+    pub fn finish(&self, output: &mut [f32; SPEAKER_FRAME_SAMPLES]) {
+        for (sample, sum) in output.iter_mut().zip(self.sum) {
+            *sample = if sum.is_finite() {
+                sum.clamp(-1.0, 1.0) as f32
+            } else {
+                0.0
+            };
+        }
+    }
 }

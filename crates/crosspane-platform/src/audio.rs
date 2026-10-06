@@ -92,6 +92,14 @@ impl Drop for AudioPlayback {
 pub trait AudioHost: Send {
     fn add_peer(&mut self, peer: NodeId, name: &str) -> Result<VirtualPorts, PlatformError>;
     fn remove_peer(&mut self, peer: NodeId) -> Result<(), PlatformError>;
+    /// The processes whose audio this peer's virtual speaker carries, for a backend with no
+    /// virtual device (Windows per-app capture). Replaces the previous set; empty stops them all.
+    /// Each pid's process tree is captured; the app still plays locally. Backends with a real
+    /// virtual device ignore it.
+    fn set_peer_sources(&mut self, peer: NodeId, pids: &[u32]) -> Result<(), PlatformError> {
+        let _ = (peer, pids);
+        Ok(())
+    }
     fn subscribe(&mut self, sink: Arc<dyn EventSink<AudioEvent>>) -> Result<(), PlatformError>;
     fn open_capture(&mut self, format: AudioFormat) -> Result<AudioCapture, PlatformError>;
     fn open_playback(&mut self, format: AudioFormat) -> Result<AudioPlayback, PlatformError>;
