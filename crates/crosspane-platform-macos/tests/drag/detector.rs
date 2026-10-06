@@ -387,3 +387,92 @@ fn tiling_decision_accepts_only_changed_native_tiles_within_500ms() {
         start
     ));
 }
+
+#[test]
+fn native_move_model_reports_current_coherent_device_geometry_without_portals() {
+    let mut monitor = Move::default();
+    for x in [300.0, 305.0] {
+        let (window, pointer) = sample(123, 7, x, 100.0);
+        monitor.sample(Some(window), CGPoint::new(pointer.x, pointer.y), &[]);
+    }
+    assert!(
+        matches!(monitor.native(MonoTime::ZERO).as_slice(), [CaptureEvent::NativeMove { window: WindowId(123), grab, size, .. }]
+        if *grab == PointDevice::new(160.0, 24.0) && *size == PixelSize::new(800, 600))
+    );
+    let (window, mut pointer) = sample(123, 7, 310.0, 100.0);
+    pointer.y += 0.5;
+    monitor.sample(Some(window), CGPoint::new(pointer.x, pointer.y), &[]);
+    assert!(
+        matches!(monitor.native(MonoTime::ZERO).as_slice(), [CaptureEvent::NativeMove { grab, .. }]
+        if *grab == PointDevice::new(160.0, 25.0))
+    );
+    assert!(matches!(
+        monitor.clear(MonoTime::ZERO).as_slice(),
+        [CaptureEvent::NativeMoveEnded {
+            window: WindowId(123),
+            ..
+        }]
+    ));
+    assert!(monitor.clear(MonoTime::ZERO).is_empty());
+}
+
+#[test]
+fn native_move_model_latch_break_or_lost_window_ends_once() {
+    for reason in ["window", "pid", "resize", "offset", "lost"] {
+        let mut monitor = Move::default();
+        for x in [300.0, 305.0] {
+            let (window, pointer) = sample(123, 7, x, 100.0);
+            monitor.sample(Some(window), CGPoint::new(pointer.x, pointer.y), &[]);
+        }
+        monitor.native(MonoTime::ZERO);
+        let (mut window, mut pointer) = sample(123, 7, 310.0, 100.0);
+        match reason {
+            "window" => window.window = WindowId(124),
+            "pid" => window.pid = 8,
+            "resize" => window.frame.size.width += 1.0,
+            "offset" => pointer.y += 2.0,
+            _ => {}
+        }
+        monitor.sample(
+            (reason != "lost").then_some(window),
+            CGPoint::new(pointer.x, pointer.y),
+            &[],
+        );
+        assert!(matches!(
+            monitor.native(MonoTime::ZERO).as_slice(),
+            [CaptureEvent::NativeMoveEnded {
+                window: WindowId(123),
+                ..
+            }]
+        ));
+        assert!(monitor.native(MonoTime::ZERO).is_empty());
+        assert!(monitor.clear(MonoTime::ZERO).is_empty());
+    }
+}
+
+#[test]
+fn native_move_model_invalid_device_geometry_ends_instead_of_casting() {
+    for scale in [
+        f64::NAN,
+        f64::INFINITY,
+        0.0,
+        -1.0,
+        0.0001,
+        f64::from(u32::MAX),
+    ] {
+        let mut monitor = Move::default();
+        for x in [300.0, 305.0] {
+            let (window, pointer) = sample(123, 7, x, 100.0);
+            monitor.sample(Some(window), CGPoint::new(pointer.x, pointer.y), &[]);
+        }
+        monitor.native(MonoTime::ZERO);
+        let (mut window, pointer) = sample(123, 7, 310.0, 100.0);
+        window.scale = scale;
+        monitor.sample(Some(window), CGPoint::new(pointer.x, pointer.y), &[]);
+        assert!(matches!(
+            monitor.native(MonoTime::ZERO).as_slice(),
+            [CaptureEvent::NativeMoveEnded { .. }]
+        ));
+        assert!(monitor.native(MonoTime::ZERO).is_empty());
+    }
+}

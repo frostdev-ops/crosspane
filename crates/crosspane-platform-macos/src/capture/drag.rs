@@ -8,7 +8,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crosspane_platform::{CaptureEvent, PlatformError, PortalId};
-use crosspane_types::geom::{PointDevice, PointLogical, RectLogical, SizeLogical};
+use crosspane_types::geom::{PixelSize, PointDevice, PointLogical, RectLogical, SizeLogical};
 use crosspane_types::id::WindowId;
 use crosspane_types::time::MonoTime;
 use objc2_core_foundation::{CFDictionary, CFNumber, CFString, CFType, CGPoint, CGRect};
@@ -93,6 +93,7 @@ pub(super) struct Move {
     pressed: HashSet<PortalId>,
     emitted: HashMap<PortalId, MonoTime>,
     last_lookup: Option<MonoTime>,
+    native_reported: Option<WindowId>,
 }
 
 impl Move {
@@ -213,6 +214,57 @@ impl Move {
         events
     }
 
+    /// Publish only after sample(): pointer, frame and scale then describe one observation.
+    /// The native path has no portals and shares the physical move's coherence detector.
+    pub fn native(&mut self, at: MonoTime) -> Vec<CaptureEvent> {
+        let fact = self.window.filter(|_| self.moving).and_then(|window| {
+            let width = (window.frame.size.width * window.scale).round();
+            let height = (window.frame.size.height * window.scale).round();
+            let grab = PointDevice::new(
+                (self.pointer.x - window.frame.origin.x) * window.scale,
+                (self.pointer.y - window.frame.origin.y) * window.scale,
+            );
+            if !crate::windows::valid_frame(window.frame)
+                || !window.scale.is_finite()
+                || window.scale <= 0.0
+                || ![width, height, grab.x, grab.y]
+                    .into_iter()
+                    .all(f64::is_finite)
+                || width < 1.0
+                || height < 1.0
+                || width > f64::from(u32::MAX)
+                || height > f64::from(u32::MAX)
+                || grab.x < 0.0
+                || grab.y < 0.0
+                || grab.x >= width
+                || grab.y >= height
+            {
+                return None;
+            }
+            Some((
+                window.window,
+                grab,
+                PixelSize::new(width as u32, height as u32),
+            ))
+        });
+        let mut events = Vec::new();
+        if self.native_reported != fact.map(|(window, _, _)| window)
+            && let Some(window) = self.native_reported.take()
+        {
+            events.push(CaptureEvent::NativeMoveEnded { window, at });
+        }
+        if let Some((window, grab, size)) = fact {
+            self.native_reported = Some(window);
+            events.push(CaptureEvent::NativeMove {
+                window,
+                grab,
+                size,
+                at,
+            });
+        }
+        events
+    }
+
     pub fn at_edge(&self, portal: PortalId) -> Option<(WindowFact, Option<RectLogical>)> {
         self.window
             .filter(|_| self.moving && self.pressed.contains(&portal))
@@ -227,10 +279,11 @@ impl Move {
             && self.pre_edge.is_empty()
             && self.emitted.is_empty()
             && self.last_lookup.is_none()
+            && self.native_reported.is_none()
         {
             return Vec::new();
         }
-        let events = self
+        let mut events: Vec<_> = self
             .pressed
             .iter()
             .map(|&portal| {
@@ -238,6 +291,9 @@ impl Move {
                 CaptureEvent::EdgeReleased { portal, at }
             })
             .collect();
+        if let Some(window) = self.native_reported {
+            events.push(CaptureEvent::NativeMoveEnded { window, at });
+        }
         if self.moving {
             tracing::debug!(window = ?self.window.map(|w| w.window), latched = false, reason = "gesture ended", "drag detector state changed");
         }

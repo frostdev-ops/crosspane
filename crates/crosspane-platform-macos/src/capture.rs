@@ -1290,6 +1290,9 @@ struct TapState {
     /// Every button the tap saw go down and not yet up, whether or not capture suppressed it.
     held_buttons: HeldButtons,
     drag: drag::Move,
+    // Injected reports must never clear or reclassify a concurrent physical edge gesture.
+    native_drag: drag::Move,
+    native_drag_epoch: Option<u64>,
     window_at: Box<dyn Fn(CGPoint) -> Result<Option<drag::WindowFact>, PlatformError>>,
     tiling_busy: Arc<AtomicBool>,
     settled_primary: bool,
@@ -1785,6 +1788,7 @@ impl TapState {
         {
             self.tap_disabled();
         }
+        self.reconcile_native_drag(clock::now());
         self.sync_portals();
         if self.last_geometry_poll.elapsed() >= Duration::from_secs(1) {
             self.last_geometry_poll = Instant::now();
@@ -1824,6 +1828,7 @@ impl TapState {
         let blinded = secure_input();
         if blinded != self.blinded {
             self.blinded = blinded;
+            self.reconcile_native_drag(clock::now());
             if blinded {
                 let _ = self.shared.finish(EndReason::Lost, None);
             }
@@ -1953,7 +1958,8 @@ impl TapState {
         }
     }
 
-    fn tap_disabled(&self) {
+    fn tap_disabled(&mut self) {
+        self.clear_native_drag(clock::now());
         if let Some(tap) = &self.tap {
             CGEvent::tap_enable(tap, true);
         }
@@ -1989,6 +1995,78 @@ impl TapState {
                 .event(0, CaptureEvent::EdgeReleased { portal, at });
         }
         self.pressed = update.pressed;
+    }
+
+    fn clear_native_drag(&mut self, at: MonoTime) {
+        for event in self.native_drag.clear(at) {
+            self.shared.event(0, event);
+        }
+        self.native_drag_epoch = None;
+    }
+
+    fn native_drag_admitted(&self, epoch: u64) -> bool {
+        self.subscribed
+            && !self.blinded
+            && self.shared.available().is_ok()
+            && self.shared.gate.is_open()
+            && !self.shared.capturing.load(Ordering::Acquire)
+            && self.shared.epoch.load(Ordering::Acquire) == epoch
+    }
+
+    fn reconcile_native_drag(&mut self, at: MonoTime) {
+        if self
+            .native_drag_epoch
+            .is_some_and(|epoch| !self.native_drag_admitted(epoch))
+        {
+            self.clear_native_drag(at);
+        }
+    }
+
+    fn injected_native_drag(&mut self, kind: CGEventType, event: &CGEvent, at: MonoTime) {
+        self.reconcile_native_drag(at);
+        if kind != CGEventType::LeftMouseDragged {
+            if matches!(
+                kind,
+                CGEventType::LeftMouseUp
+                    | CGEventType::MouseMoved
+                    | CGEventType::LeftMouseDown
+                    | CGEventType::RightMouseDragged
+                    | CGEventType::OtherMouseDragged
+                    | CGEventType::RightMouseDown
+                    | CGEventType::RightMouseUp
+                    | CGEventType::OtherMouseDown
+                    | CGEventType::OtherMouseUp
+            ) {
+                self.clear_native_drag(at);
+            }
+            return;
+        }
+        let epoch = self.shared.epoch.load(Ordering::Acquire);
+        if !self.native_drag_admitted(epoch) {
+            self.clear_native_drag(at);
+            return;
+        }
+        self.native_drag_epoch = Some(epoch);
+        if !self.native_drag.lookup_due(at) {
+            return;
+        }
+        let location = CGEvent::location(Some(event));
+        let window = match (self.window_at)(location) {
+            Ok(window) => window,
+            Err(error) => {
+                tracing::debug!(%error, "native move window lookup failed");
+                None
+            }
+        };
+        // The callback can race an abort or gate revocation. Never publish its stale facts.
+        if !self.native_drag_admitted(epoch) {
+            self.clear_native_drag(at);
+            return;
+        }
+        self.native_drag.sample(window, location, &[]);
+        for event in self.native_drag.native(at) {
+            self.shared.event(0, event);
+        }
     }
 
     /// Returns true only when the OS should receive this event.
@@ -2030,7 +2108,20 @@ impl TapState {
         // the OS: never local motion, an edge press or a captured key. Otherwise injected motion
         // reaching an edge could cross back to the controller.
         if integer(CGEventField::EventSourceUserData) == INJECTED {
+            self.injected_native_drag(kind, event, at);
             return true;
+        }
+        self.reconcile_native_drag(at);
+        if matches!(
+            kind,
+            CGEventType::MouseMoved
+                | CGEventType::LeftMouseDragged
+                | CGEventType::RightMouseDragged
+                | CGEventType::OtherMouseDragged
+                | CGEventType::LeftMouseDown
+                | CGEventType::LeftMouseUp
+        ) {
+            self.clear_native_drag(at);
         }
         let motion = matches!(
             kind,
@@ -2448,6 +2539,8 @@ fn run_tap(
         suppressed_buttons: [0; 256],
         held_buttons: HeldButtons::default(),
         drag: drag::Move::default(),
+        native_drag: drag::Move::default(),
+        native_drag_epoch: None,
         window_at: Box::new(drag::under_pointer),
         tiling_busy: Arc::new(AtomicBool::new(false)),
         settled_primary: false,
@@ -3776,8 +3869,11 @@ mod tests {
                 ),
             }))
         });
-        for x in [40.0, 45.0, 99.0] {
+        tap.shared.time.store(NANOSECONDS, Ordering::Release);
+        let base = clock::now();
+        for (ms, x) in [(0, 40.0), (20, 45.0), (40, 99.0)] {
             let event = pointer(CGEventType::LeftMouseDragged, 0, false);
+            CGEvent::set_timestamp(Some(&event), base.as_nanos() + ms * 1_000_000);
             CGEvent::set_location(Some(&event), CGPoint::new(x, 50.0));
             assert!(tap.event(CGEventType::LeftMouseDragged, &event));
         }
@@ -3806,6 +3902,279 @@ mod tests {
                 }
             )
         )));
+    }
+
+    fn native_move_fixture() -> (
+        TapState,
+        Receiver<Delivery>,
+        Arc<FakeCursor>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (mut tap, receiver, cursor) = tap_cursor_fixture(true);
+        tap.monitor = true;
+        tap.portal_config = Arc::new(Vec::new());
+        tap.portals = tap.portal_config.clone();
+        *tap.shared.portals.lock().unwrap() = tap.portals.clone();
+        tap.shared.time.store(NANOSECONDS, Ordering::Release);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        tap.window_at = Box::new(move |point| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(native_move_window(point, 42, 7)))
+        });
+        (tap, receiver, cursor, calls)
+    }
+
+    fn native_move_window(point: CGPoint, id: u64, pid: i32) -> drag::WindowFact {
+        drag::WindowFact {
+            window: crosspane_types::id::WindowId(id),
+            pid,
+            scale: 2.0,
+            frame: crosspane_types::geom::RectLogical::new(
+                crosspane_types::geom::PointLogical::new(point.x - 80.0, point.y - 12.0),
+                crosspane_types::geom::SizeLogical::new(400.0, 300.0),
+            ),
+        }
+    }
+
+    fn native_move_pointer(
+        kind: CGEventType,
+        base: MonoTime,
+        ms: u64,
+        x: f64,
+    ) -> CFRetained<CGEvent> {
+        let event = pointer(kind, 0, true);
+        CGEvent::set_location(Some(&event), CGPoint::new(x, 50.0));
+        CGEvent::set_timestamp(Some(&event), base.as_nanos() + ms * 1_000_000);
+        event
+    }
+
+    fn native_move_events(receiver: &Receiver<Delivery>) -> Vec<CaptureEvent> {
+        receiver
+            .try_iter()
+            .map(|event| match event {
+                Delivery::Event(
+                    0,
+                    event
+                    @ (CaptureEvent::NativeMove { .. } | CaptureEvent::NativeMoveEnded { .. }),
+                ) => event,
+                _ => panic!("injected events emitted local, edge or captured input"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn native_move_tagged_drag_is_coherent_rate_limited_and_never_local_or_edge_input() {
+        let (mut tap, receiver, cursor, calls) = native_move_fixture();
+        let base = clock::now();
+        for (ms, x) in [
+            (0, 300.0),
+            (1, 500.0),
+            (19, 600.0),
+            (20, 305.0),
+            (21, 700.0),
+            (40, 310.0),
+        ] {
+            assert!(tap.event(
+                CGEventType::LeftMouseDragged,
+                &native_move_pointer(CGEventType::LeftMouseDragged, base, ms, x)
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let events = native_move_events(&receiver);
+        assert_eq!(events.len(), 2);
+        for (event, ms) in events.iter().zip([20, 40]) {
+            assert!(
+                matches!(event, CaptureEvent::NativeMove { window: crosspane_types::id::WindowId(42), grab, size, at }
+                if *grab == PointDevice::new(160.0, 24.0)
+                    && *size == crosspane_types::geom::PixelSize::new(800, 600)
+                    && at.as_nanos() == base.as_nanos() + ms * 1_000_000)
+            );
+        }
+        assert!(tap.last_activity.is_none());
+        assert!(tap.pressed.is_empty());
+        assert!(cursor.warps().is_empty());
+        assert_eq!(tap.held_buttons, HeldButtons::default());
+    }
+
+    #[test]
+    fn native_move_injected_up_or_motion_ends_once_without_another_lookup() {
+        for kind in [CGEventType::LeftMouseUp, CGEventType::MouseMoved] {
+            let (mut tap, receiver, _, calls) = native_move_fixture();
+            let base = clock::now();
+            for (ms, x) in [(0, 300.0), (20, 305.0)] {
+                assert!(tap.event(
+                    CGEventType::LeftMouseDragged,
+                    &native_move_pointer(CGEventType::LeftMouseDragged, base, ms, x)
+                ));
+            }
+            native_move_events(&receiver);
+            for ms in [40, 60] {
+                assert!(tap.event(kind, &native_move_pointer(kind, base, ms, 310.0)));
+            }
+            assert!(matches!(
+                native_move_events(&receiver).as_slice(),
+                [CaptureEvent::NativeMoveEnded {
+                    window: crosspane_types::id::WindowId(42),
+                    ..
+                }]
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn native_move_missing_failed_or_changed_window_ends_before_a_new_latch() {
+        let (mut tap, receiver, _, _) = native_move_fixture();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        tap.window_at = Box::new(move |point| match seen.fetch_add(1, Ordering::Relaxed) {
+            0 | 1 => Ok(Some(native_move_window(point, 42, 7))),
+            2 => Ok(None),
+            3 => Err(PlatformError::NotFound),
+            4 | 5 => Ok(Some(native_move_window(point, 43, 7))),
+            _ => Ok(Some(native_move_window(point, 43, 8))),
+        });
+        let base = clock::now();
+        for n in 0..8 {
+            assert!(tap.event(
+                CGEventType::LeftMouseDragged,
+                &native_move_pointer(
+                    CGEventType::LeftMouseDragged,
+                    base,
+                    n * 20,
+                    300.0 + n as f64 * 5.0
+                )
+            ));
+        }
+        let events = native_move_events(&receiver);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                CaptureEvent::NativeMove {
+                    window: crosspane_types::id::WindowId(42),
+                    ..
+                },
+                CaptureEvent::NativeMoveEnded {
+                    window: crosspane_types::id::WindowId(42),
+                    ..
+                },
+                CaptureEvent::NativeMove {
+                    window: crosspane_types::id::WindowId(43),
+                    ..
+                },
+                CaptureEvent::NativeMoveEnded {
+                    window: crosspane_types::id::WindowId(43),
+                    ..
+                },
+                CaptureEvent::NativeMove {
+                    window: crosspane_types::id::WindowId(43),
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn native_move_phase_loss_ends_once_and_epoch_change_requires_a_new_anchor() {
+        for phase in ["subscription", "capture", "gate", "blinded", "epoch"] {
+            let (mut tap, receiver, _, calls) = native_move_fixture();
+            let base = clock::now();
+            for (ms, x) in [(0, 300.0), (20, 305.0)] {
+                assert!(tap.event(
+                    CGEventType::LeftMouseDragged,
+                    &native_move_pointer(CGEventType::LeftMouseDragged, base, ms, x)
+                ));
+            }
+            native_move_events(&receiver);
+            match phase {
+                "subscription" => tap.subscribed = false,
+                "capture" => tap.shared.capturing.store(true, Ordering::Release),
+                "gate" => tap.shared.gate.set_engine_permits(false),
+                "blinded" => tap.blinded = true,
+                _ => {
+                    tap.shared.epoch.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            tap.reconcile_native_drag(base);
+            tap.reconcile_native_drag(base);
+            assert!(matches!(
+                native_move_events(&receiver).as_slice(),
+                [CaptureEvent::NativeMoveEnded { .. }]
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            assert!(tap.event(
+                CGEventType::LeftMouseDragged,
+                &native_move_pointer(CGEventType::LeftMouseDragged, base, 40, 310.0)
+            ));
+            assert!(native_move_events(&receiver).is_empty());
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                if phase == "epoch" { 3 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn native_move_callback_gate_or_epoch_race_discards_sample_and_ends_once() {
+        for gate in [false, true] {
+            let (mut tap, receiver, _, _) = native_move_fixture();
+            let base = clock::now();
+            for (ms, x) in [(0, 300.0), (20, 305.0)] {
+                assert!(tap.event(
+                    CGEventType::LeftMouseDragged,
+                    &native_move_pointer(CGEventType::LeftMouseDragged, base, ms, x)
+                ));
+            }
+            native_move_events(&receiver);
+            let shared = tap.shared.clone();
+            tap.window_at = Box::new(move |point| {
+                if gate {
+                    shared.gate.set_engine_permits(false);
+                } else {
+                    shared.epoch.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(Some(native_move_window(point, 42, 7)))
+            });
+            assert!(tap.event(
+                CGEventType::LeftMouseDragged,
+                &native_move_pointer(CGEventType::LeftMouseDragged, base, 40, 310.0)
+            ));
+            assert!(matches!(
+                native_move_events(&receiver).as_slice(),
+                [CaptureEvent::NativeMoveEnded {
+                    window: crosspane_types::id::WindowId(42),
+                    ..
+                }]
+            ));
+            assert!(tap.native_drag_epoch.is_none());
+        }
+    }
+
+    #[test]
+    fn native_move_injected_end_preserves_a_physical_edge_gesture() {
+        for kind in [CGEventType::LeftMouseUp, CGEventType::MouseMoved] {
+            let (mut tap, receiver, _) = tap_cursor_fixture(true);
+            let portal = tap.portals[0];
+            for x in [90.0, 99.0] {
+                tap.drag.sample(
+                    Some(native_move_window(CGPoint::new(x, 50.0), 7, 9)),
+                    CGPoint::new(x, 50.0),
+                    &[portal],
+                );
+            }
+            assert_eq!(
+                tap.drag
+                    .update(&[portal], &[(portal.portal.id, 0.5)], MonoTime::ZERO)
+                    .len(),
+                1
+            );
+            assert!(tap.drag.at_edge(portal.portal.id).is_some());
+            assert!(tap.event(kind, &pointer(kind, 0, true)));
+            assert!(native_move_events(&receiver).is_empty());
+            assert!(tap.drag.at_edge(portal.portal.id).is_some());
+        }
     }
 
     #[test]
@@ -3862,6 +4231,8 @@ mod tests {
                 suppressed_buttons: [0; 256],
                 held_buttons: HeldButtons::default(),
                 drag: drag::Move::default(),
+                native_drag: drag::Move::default(),
+                native_drag_epoch: None,
                 window_at: Box::new(|_| Ok(None)),
                 tiling_busy: Arc::new(AtomicBool::new(false)),
                 settled_primary: false,
