@@ -466,7 +466,17 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
                 _ => unreachable!(),
             }
             .map_err(|error| {
-                tracing::warn!(%error, operation = job.id, "parking operation failed");
+                tracing::warn!(
+                    %error,
+                    operation = job.id,
+                    window = window.0,
+                    operation_kind = match job.command {
+                        Command::Park { .. } => "park",
+                        Command::Resize { .. } => "move",
+                        Command::Restore { .. } => "restore",
+                    },
+                    "parking operation failed"
+                );
                 #[cfg(windows)]
                 if matches!(job.command, Command::Park { .. }) && matches!(&error,
                     PlatformError::Unsupported(reason) if *reason == crosspane_platform_windows::model::parking::PENDING_REPARK_REASON)
@@ -488,7 +498,15 @@ fn operation(backend: &mut dyn WindowParking, job: Job) -> Completion {
                 Some((display, at)) => backend.restore_at(window, display, at),
                 None => backend.restore(window),
             }
-            .inspect_err(|error| tracing::error!(%error, "could not restore a parked window"));
+            .inspect_err(|error| {
+                tracing::error!(
+                    %error,
+                    operation = job.id,
+                    window = window.0,
+                    operation_kind = "restore",
+                    "could not restore a parked window"
+                );
+            });
             Outcome::Restored {
                 window,
                 ok: result.is_ok(),

@@ -99,16 +99,20 @@ impl HyprlandOverlay {
                 }
                 let outcome =
                     catch_unwind(AssertUnwindSafe(|| worker.run(&receiver, &worker_stop)));
+                let host_dropped =
+                    worker_stop.load(Ordering::Acquire) && matches!(&outcome, Ok(Ok(())));
                 let cause = match outcome {
-                    Ok(Ok(())) if worker_stop.load(Ordering::Acquire) => {
-                        backend("overlay host dropped")
-                    }
+                    Ok(Ok(())) if host_dropped => backend("overlay host dropped"),
                     Ok(Ok(())) => backend("overlay worker exited unexpectedly"),
                     Ok(Err(error)) => error,
                     Err(_) => backend("overlay worker panicked"),
                 };
                 // Keep state outside the unwind boundary, so every live ID survives a panic.
-                tracing::warn!(%cause, "overlay worker exited");
+                if host_dropped {
+                    tracing::debug!(%cause, "overlay worker exited");
+                } else {
+                    tracing::warn!(%cause, "overlay worker exited");
+                }
                 worker.state.unavailable_all(&cause);
                 let _ = worker.connection.flush();
             })

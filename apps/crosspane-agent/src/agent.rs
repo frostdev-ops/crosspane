@@ -1681,6 +1681,18 @@ impl Agent {
             }
             crate::parking_worker::Outcome::Started { .. } => {}
             crate::parking_worker::Outcome::Parked { window, result } => {
+                if let Err(failure) = result
+                    && let Some(cached) = self.placement.windows.get(window)
+                {
+                    tracing::warn!(
+                        operation = completion.id,
+                        window = window.0,
+                        app_id = %cached.app_id,
+                        pid = ?cached.pid,
+                        ?failure,
+                        "parking failed for cached window"
+                    );
+                }
                 #[cfg(windows)]
                 if completion.notice
                     == Some(crosspane_platform_windows::model::parking::PENDING_REPARK_REASON)
@@ -1704,6 +1716,15 @@ impl Agent {
                 }
             }
             crate::parking_worker::Outcome::Restored { window, ok } => {
+                if !ok && let Some(cached) = self.placement.windows.get(window) {
+                    tracing::warn!(
+                        operation = completion.id,
+                        window = window.0,
+                        app_id = %cached.app_id,
+                        pid = ?cached.pid,
+                        "restore failed for cached window"
+                    );
+                }
                 self.tracker.restored(*window, completion.id, *ok);
                 if *ok {
                     self.home.twins.remove(window);
@@ -2197,12 +2218,21 @@ impl Agent {
             } => {
                 self.capture_motion_seen = false;
                 let result = match &mut self.platform.capture {
-                    Some(capture) => capture.begin(id, portal).map_err(failure),
-                    None => Err(Failure::Other),
+                    Some(capture) => capture.begin(id, portal).map_err(|cause| {
+                        let text = cause.to_string();
+                        let f = failure(cause);
+                        tracing::info!(failure = ?f, cause = %text, "capture refused");
+                        f
+                    }),
+                    None => {
+                        tracing::info!(
+                            failure = ?Failure::Other,
+                            cause = "no capture backend",
+                            "capture refused"
+                        );
+                        Err(Failure::Other)
+                    }
                 };
-                if let Err(f) = &result {
-                    tracing::info!(failure = ?f, "capture refused");
-                }
                 let begun = Input::CaptureBegun { id, result };
                 if drain_first {
                     // Linux delivers activation callbacks before begin returns. Put the answer
