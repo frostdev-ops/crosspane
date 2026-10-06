@@ -814,7 +814,14 @@ fn hyprland_injection_contract() {
         .unwrap();
     assert_eq!(
         virtual_locks(&ipc).caps_lock,
-        Some(!held_lock.caps_lock.unwrap())
+        held_lock.caps_lock,
+        "a held Caps key must defer the requested mask until its real up"
+    );
+    keyboard.key(HidUsage::keyboard(0x39), false).unwrap();
+    assert_eq!(
+        virtual_locks(&ipc).caps_lock,
+        Some(!held_lock.caps_lock.unwrap()),
+        "the real up must finish before the requested mask is applied"
     );
     keyboard.release_all().unwrap();
     keyboard.set_lock_keys(initial).unwrap();
@@ -1117,6 +1124,9 @@ fn runtime_layout_and_outputs(ipc: &HyprIpc) {
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        // Refresh alone publishes no modifier state. This fixture-only, unheld up triggers
+        // the existing group's legitimate publication without creating a held key.
+        keyboard.key(HidUsage::keyboard(0x73), false).unwrap();
         let devices = ipc.json("devices").unwrap();
         if devices["keyboards"].as_array().unwrap().iter().any(|k| {
             k["name"]

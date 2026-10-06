@@ -153,6 +153,244 @@ struct Pointer {
     remainder_y: i64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LockEpoch {
+    gate: u64,
+    config: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingLock {
+    wanted: bool,
+    epoch: LockEpoch,
+}
+
+/// The injected keyboard's own XKB state. Physical/IME snapshots never seed it or decide taps.
+/// A lock request made while its key is down waits until XKB finishes that key's real up:
+/// overwriting a LockMods filter in flight would let that up undo the requested state.
+struct KeyboardState {
+    xkb: xkb::State,
+    down: BTreeSet<u16>,
+    pending: [Option<PendingLock>; 2],
+}
+
+impl KeyboardState {
+    fn new(keymap: &xkb::Keymap, group: u32) -> Self {
+        let mut xkb = xkb::State::new(keymap);
+        xkb.update_mask(0, 0, 0, 0, 0, group);
+        Self {
+            xkb,
+            down: BTreeSet::new(),
+            pending: [None; 2],
+        }
+    }
+
+    fn discard_stale(&mut self, epoch: LockEpoch, allowed: bool) {
+        for pending in &mut self.pending {
+            if pending.is_some_and(|p| !allowed || p.epoch != epoch) {
+                *pending = None;
+            }
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        self.pending = [None; 2];
+    }
+
+    fn held_lock(&self, symbol: u32) -> bool {
+        let map = self.xkb.get_keymap();
+        let group = self.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
+        self.down.iter().any(|code| {
+            map.key_get_syms_by_level((u32::from(*code) + 8).into(), group, 0)
+                .iter()
+                .any(|s| s.raw() == symbol)
+        })
+    }
+
+    fn set_locks_if(
+        &mut self,
+        wanted: LockKeys,
+        epoch: LockEpoch,
+        admitted: impl FnOnce() -> Result<(), PlatformError>,
+    ) -> Result<bool, PlatformError> {
+        self.discard_stale(epoch, true);
+        let mut pending = self.pending;
+        let mut immediate = LockKeys::default();
+        for (index, symbol, value, destination) in [
+            (
+                0,
+                xkb::keysyms::KEY_Caps_Lock,
+                wanted.caps_lock,
+                &mut immediate.caps_lock,
+            ),
+            (
+                1,
+                xkb::keysyms::KEY_Num_Lock,
+                wanted.num_lock,
+                &mut immediate.num_lock,
+            ),
+        ] {
+            if let Some(wanted) = value {
+                if self.held_lock(symbol) {
+                    pending[index] = Some(PendingLock { wanted, epoch });
+                } else {
+                    pending[index] = None;
+                    *destination = Some(wanted);
+                }
+            }
+        }
+        // No requested state changes before this final gate/epoch/deadline fence.
+        if let Err(error) = admitted() {
+            self.cancel_pending();
+            return Err(error);
+        }
+        self.pending = pending;
+        Ok(self.apply_mask(immediate))
+    }
+
+    #[cfg(test)]
+    fn set_locks(&mut self, wanted: LockKeys, epoch: LockEpoch) -> bool {
+        self.set_locks_if(wanted, epoch, || Ok(())).unwrap()
+    }
+
+    fn apply_mask(&mut self, wanted: LockKeys) -> bool {
+        let current = self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED);
+        let target = lock_mask(&self.xkb.get_keymap(), current, wanted);
+        if target == current {
+            return false;
+        }
+        self.xkb.update_mask(
+            self.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            self.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
+            target,
+            self.xkb.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED),
+            self.xkb.serialize_layout(xkb::STATE_LAYOUT_LATCHED),
+            self.xkb.serialize_layout(xkb::STATE_LAYOUT_LOCKED),
+        );
+        true
+    }
+
+    fn key_if(&mut self, code: u16, down: bool, epoch: LockEpoch, admitted: impl Fn() -> bool) {
+        self.discard_stale(epoch, admitted());
+        let changed = if down {
+            self.down.insert(code)
+        } else {
+            self.down.remove(&code)
+        };
+        if changed {
+            self.xkb.update_key(
+                (u32::from(code) + 8).into(),
+                if down {
+                    xkb::KeyDirection::Down
+                } else {
+                    xkb::KeyDirection::Up
+                },
+            );
+        }
+        // An up is always processed, including cleanup. Only a still-admitted request may
+        // override the result of its LockMods filter after that real up.
+        if !down {
+            self.discard_stale(epoch, admitted());
+            let mut wanted = LockKeys::default();
+            for (index, symbol, destination) in [
+                (0, xkb::keysyms::KEY_Caps_Lock, &mut wanted.caps_lock),
+                (1, xkb::keysyms::KEY_Num_Lock, &mut wanted.num_lock),
+            ] {
+                if !self.held_lock(symbol)
+                    && let Some(pending) = self.pending[index].take()
+                {
+                    *destination = Some(pending.wanted);
+                }
+            }
+            self.apply_mask(wanted);
+        }
+    }
+
+    #[cfg(test)]
+    fn key(&mut self, code: u16, down: bool, epoch: LockEpoch, allowed: bool) {
+        self.key_if(code, down, epoch, || allowed);
+    }
+
+    fn require_idle_for_keymap(&self, changed: bool) -> Result<(), PlatformError> {
+        if changed && !self.down.is_empty() {
+            return Err(PlatformError::Timeout);
+        }
+        Ok(())
+    }
+
+    fn reconfigure(&mut self, keymap: &xkb::Keymap, group: u32) -> Result<(), PlatformError> {
+        self.require_idle_for_keymap(true)?;
+        let old_map = self.xkb.get_keymap();
+        let locked = translate_mods(
+            &old_map,
+            keymap,
+            self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
+        );
+        let latched = translate_mods(
+            &old_map,
+            keymap,
+            self.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
+        );
+        let mut state = xkb::State::new(keymap);
+        state.update_mask(
+            state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            latched,
+            locked,
+            0,
+            0,
+            group,
+        );
+        self.xkb = state;
+        self.cancel_pending();
+        Ok(())
+    }
+}
+
+fn translate_mods(old: &xkb::Keymap, new: &xkb::Keymap, mask: u32) -> u32 {
+    (0..old.num_mods().min(32)).fold(0, |translated, index| {
+        let destination = new.mod_get_index(old.mod_get_name(index));
+        if mask & (1 << index) != 0 && destination < 32 {
+            translated | (1 << destination)
+        } else {
+            translated
+        }
+    })
+}
+
+fn lock_admission(
+    gate: &IoGate,
+    config: &AtomicU64,
+    epoch: LockEpoch,
+    paused: bool,
+    deadline: Instant,
+) -> Result<(), PlatformError> {
+    if !gate.is_open()
+        || gate.epoch() != epoch.gate
+        || config.load(Ordering::Acquire) != epoch.config
+    {
+        return Err(PlatformError::Locked);
+    }
+    if paused || Instant::now() >= deadline {
+        return Err(PlatformError::Timeout);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn virtual_locks(state: &xkb::State) -> LockKeys {
+    let mask = state.serialize_mods(xkb::STATE_MODS_LOCKED);
+    let map = state.get_keymap();
+    let value = |name| {
+        let index = map.mod_get_index(name);
+        (index < 32).then(|| mask & (1 << index) != 0)
+    };
+    LockKeys {
+        caps_lock: value(xkb::MOD_NAME_CAPS),
+        num_lock: value(xkb::MOD_NAME_NUM),
+        scroll_lock: None,
+    }
+}
+
 pub(super) struct Source {
     connection: Connection,
     queue: EventQueue<Events>,
@@ -169,11 +407,10 @@ pub(super) struct Source {
     gate: Arc<IoGate>,
     injected: Arc<InjectedPosition>,
     keyboard: Option<ZwpVirtualKeyboardV1>,
-    xkb: xkb::State,
+    keys: KeyboardState,
     pointers: BTreeMap<DisplayId, Pointer>,
     active: Option<DisplayId>,
     held_keys: BTreeSet<u16>,
-    xkb_down: BTreeSet<u16>,
     released_keys: BTreeSet<u16>,
     held_buttons: BTreeSet<(DisplayId, u32)>,
     buttons_down: BTreeSet<(DisplayId, u32)>,
@@ -198,15 +435,7 @@ impl Source {
         let queue = connection.new_event_queue();
         let registry = connection.display().get_registry(&queue.handle(), ());
         let keymap = compile_keymap(&config.names)?;
-        let mut xkb = xkb::State::new(&keymap);
-        xkb.update_mask(
-            0,
-            0,
-            lock_mask(&keymap, 0, config.locks),
-            0,
-            0,
-            layout_group(&keymap, &config),
-        );
+        let keys = KeyboardState::new(&keymap, layout_group(&keymap, &config));
         let mut source = Self {
             connection,
             queue,
@@ -223,11 +452,10 @@ impl Source {
             gate,
             injected,
             keyboard: None,
-            xkb,
+            keys,
             pointers: BTreeMap::new(),
             active: None,
             held_keys: BTreeSet::new(),
-            xkb_down: BTreeSet::new(),
             released_keys: BTreeSet::new(),
             held_buttons: BTreeSet::new(),
             buttons_down: BTreeSet::new(),
@@ -252,7 +480,6 @@ impl Source {
         let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
         upload_keymap(&keyboard, &keymap)?;
         source.keyboard = Some(keyboard);
-        source.modifiers();
         source.sync(deadline)?;
         Ok(source)
     }
@@ -389,50 +616,40 @@ impl Source {
         } else {
             None
         };
+        // A new state cannot preserve held XKB action filters. Reject before ANY effects:
+        // existing failed-refresh cleanup finishes those real ups on the OLD state, then retries.
+        self.keys.require_idle_for_keymap(keymap.is_some())?;
         self.monitors = config.monitors.iter().cloned().collect();
         self.reconcile_pointers();
         self.maintain_outputs();
         if self.keyboard.is_none() {
             return self.sync(deadline);
         }
+        let epoch = self.lock_epoch();
+        let allowed = !self.blocked();
+        self.keys.discard_stale(epoch, allowed);
         if let Some(keymap) = keymap {
-            let mut state = xkb::State::new(&keymap);
-            for &code in &self.xkb_down {
-                state.update_key((u32::from(code) + 8).into(), xkb::KeyDirection::Down);
-            }
-            state.update_mask(
-                state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-                0,
-                lock_mask(&keymap, 0, config.locks),
-                0,
-                0,
-                layout_group(&keymap, &config),
-            );
             if let Some(keyboard) = &self.keyboard {
                 upload_keymap(keyboard, &keymap)?;
             }
-            self.xkb = state;
+            self.keys
+                .reconfigure(&keymap, layout_group(&keymap, &config))?;
             self.names = config.names;
-            // Not `allowed`: that refuses while paused, and the sync below enforces the deadline.
-            if self.gate.is_open() {
-                self.modifiers();
-            }
         } else {
-            let group = layout_group(&self.xkb.get_keymap(), &config);
-            if group != self.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE) {
-                self.xkb.update_mask(
-                    self.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-                    self.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
-                    self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
+            let group = layout_group(&self.keys.xkb.get_keymap(), &config);
+            if group != self.keys.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE) {
+                self.keys.xkb.update_mask(
+                    self.keys.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+                    self.keys.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
+                    self.keys.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
                     0,
                     0,
                     group,
                 );
-                if self.gate.is_open() {
-                    self.modifiers();
-                }
             }
         }
+        // A refresh preserves our lock state; it never publishes a physical/IME snapshot.
+        // The next admitted injected event or explicit lock request supplies modifiers.
         self.sync(deadline)
     }
 
@@ -467,13 +684,20 @@ impl Source {
         !self.gate.is_open() || self.refresh.is_paused()
     }
 
+    fn lock_epoch(&self) -> LockEpoch {
+        LockEpoch {
+            gate: self.gate.epoch(),
+            config: self.config_epoch.load(Ordering::Acquire),
+        }
+    }
+
     fn modifiers(&self) {
         if let Some(keyboard) = &self.keyboard {
             keyboard.modifiers(
-                self.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-                self.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
-                self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
-                self.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+                self.keys.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+                self.keys.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
+                self.keys.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
+                self.keys.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
             );
         }
     }
@@ -492,21 +716,13 @@ impl Source {
             }
             keyboard.key(time_ms(), u32::from(evdev), u32::from(down));
         }
-        let changed = if down {
-            self.xkb_down.insert(evdev)
-        } else {
-            self.xkb_down.remove(&evdev)
-        };
-        if changed {
-            self.xkb.update_key(
-                (u32::from(evdev) + 8).into(),
-                if down {
-                    xkb::KeyDirection::Down
-                } else {
-                    xkb::KeyDirection::Up
-                },
-            );
-        }
+        let epoch = self.lock_epoch();
+        let gate = &self.gate;
+        let config = &self.config_epoch;
+        let paused = self.refresh.is_paused();
+        self.keys.key_if(evdev, down, epoch, || {
+            lock_admission(gate, config, epoch, paused, deadline).is_ok()
+        });
         if !down && self.held_keys.contains(&evdev) {
             self.released_keys.insert(evdev);
         }
@@ -515,6 +731,8 @@ impl Source {
     }
 
     fn release_keys(&mut self) {
+        // Cleanup owes only ups; it must not complete an earlier deferred lock request.
+        self.keys.cancel_pending();
         for code in self.held_keys.clone() {
             let _ = self.key(code, false, Instant::now());
         }
@@ -590,7 +808,9 @@ impl Source {
         if !self.blocked() {
             return false;
         }
-        let needed = !self.xkb_down.is_empty()
+        let epoch = self.lock_epoch();
+        self.keys.discard_stale(epoch, false);
+        let needed = !self.keys.down.is_empty()
             || !self.buttons_down.is_empty()
             || self
                 .pointers
@@ -773,90 +993,23 @@ impl Source {
 
     fn set_locks(
         &mut self,
-        current: LockKeys,
         wanted: LockKeys,
+        gate_epoch: u64,
         deadline: Instant,
     ) -> Result<(), PlatformError> {
-        // ScrollLock is unavailable on this platform. Its wanted value is ignored, while
-        // CapsLock and NumLock still apply. Unknown physical lock states remain unsupported.
-        let keymap = self.xkb.get_keymap();
-        let group = self.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
-        let mut changes = Vec::new();
-        for (symbol, now, want) in [
-            (
-                xkb::keysyms::KEY_Caps_Lock,
-                current.caps_lock,
-                wanted.caps_lock,
-            ),
-            (
-                xkb::keysyms::KEY_Num_Lock,
-                current.num_lock,
-                wanted.num_lock,
-            ),
-        ] {
-            if let Some(want) = want {
-                let now = now.ok_or(PlatformError::Unsupported("lock key state unavailable"))?;
-                if now != want {
-                    changes.push(lock_keycode(&keymap, group, symbol));
-                }
-            }
+        let epoch = LockEpoch {
+            gate: gate_epoch,
+            config: self.config_epoch.load(Ordering::Acquire),
+        };
+        let gate = &self.gate;
+        let config = &self.config_epoch;
+        let paused = self.refresh.is_paused();
+        // Set only our virtual mask, never tap a lock key or copy a physical/IME mask.
+        if self.keys.set_locks_if(wanted, epoch, || {
+            lock_admission(gate, config, epoch, paused, deadline)
+        })? {
+            self.modifiers();
         }
-        let target = lock_mask(
-            &keymap,
-            self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
-            wanted,
-        );
-        if changes.is_empty() && target == self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED) {
-            return Ok(());
-        }
-        // Physical LEDs and this virtual source's locked state are independent on Hyprland.
-        // Even when the physical value already matches, apply the requested mask to our source.
-        self.allowed(deadline)?;
-        self.xkb.update_mask(
-            self.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-            self.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
-            lock_mask(
-                &keymap,
-                self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
-                current,
-            ),
-            0,
-            0,
-            group,
-        );
-        for code in changes.into_iter().flatten() {
-            // The guard sends an up on any error after the tap starts. A caller-held key is
-            // restored only if the gate still permits it; closed gates must leave it released.
-            let held = self.held_keys.contains(&code);
-            let mut tap = LockTap {
-                source: self,
-                code,
-                complete: false,
-            };
-            if held {
-                tap.source.key(code, false, deadline)?;
-            }
-            tap.source.key(code, true, deadline)?;
-            tap.source.key(code, false, deadline)?;
-            if held {
-                tap.source.key(code, true, deadline)?;
-            }
-            tap.complete = true;
-        }
-        self.allowed(deadline)?;
-        self.xkb.update_mask(
-            self.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-            self.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
-            lock_mask(
-                &keymap,
-                self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
-                wanted,
-            ),
-            0,
-            0,
-            group,
-        );
-        self.modifiers();
         Ok(())
     }
 
@@ -993,7 +1146,7 @@ impl Source {
                 }
                 Ok(())
             }
-            Action::SetLocks(current, wanted) => self.set_locks(current, wanted, deadline),
+            Action::SetLocks(wanted, epoch) => self.set_locks(wanted, epoch, deadline),
             Action::Move(display, position) => self.move_to(display, position, deadline),
             Action::Button(button, down) => {
                 let code = button_code(button)?;
@@ -1327,20 +1480,6 @@ fn needs_known_config(action: &Action) -> bool {
     }
 }
 
-struct LockTap<'a> {
-    source: &'a mut Source,
-    code: u16,
-    complete: bool,
-}
-
-impl Drop for LockTap<'_> {
-    fn drop(&mut self) {
-        if !self.complete {
-            let _ = self.source.key(self.code, false, Instant::now());
-        }
-    }
-}
-
 fn compile_keymap(names: &Rmlvo) -> Result<xkb::Keymap, PlatformError> {
     xkb::Keymap::new_from_names(
         &xkb::Context::new(xkb::CONTEXT_NO_ENVIRONMENT_NAMES),
@@ -1408,22 +1547,6 @@ fn layout_group(keymap: &xkb::Keymap, config: &Config) -> u32 {
                 .find(|&i| config.active_keymap.as_deref() == Some(keymap.layout_get_name(i)))
         })
         .unwrap_or(0)
-}
-
-fn lock_keycode(keymap: &xkb::Keymap, group: u32, symbol: u32) -> Option<u16> {
-    // Use the unshifted symbol in the active group; tapping a shifted-only binding would toggle
-    // whatever unrelated symbol occupies its base level. In that case use modifiers alone.
-    (keymap.min_keycode().raw()..=keymap.max_keycode().raw()).find_map(|code| {
-        keymap
-            .key_get_syms_by_level(code.into(), group, 0)
-            .iter()
-            .any(|s| s.raw() == symbol)
-            .then(|| {
-                code.checked_sub(8)
-                    .and_then(|evdev| u16::try_from(evdev).ok())
-            })
-            .flatten()
-    })
 }
 
 fn scroll_steps(remainder: &mut i64, value: i32) -> i64 {
@@ -1537,6 +1660,378 @@ mod tests {
         .unwrap()
     }
 
+    mod lock_sync {
+        use super::*;
+
+        const EPOCH: LockEpoch = LockEpoch { gate: 1, config: 2 };
+
+        fn locks(caps: bool, num: bool) -> LockKeys {
+            LockKeys {
+                caps_lock: Some(caps),
+                num_lock: Some(num),
+                scroll_lock: None,
+            }
+        }
+
+        fn keyboard() -> KeyboardState {
+            KeyboardState::new(&keymap(""), 0)
+        }
+
+        fn actual(keys: &KeyboardState) -> LockKeys {
+            virtual_locks(&keys.xkb)
+        }
+
+        #[test]
+        fn initial_source_is_clear_without_a_physical_seed() {
+            assert_eq!(actual(&keyboard()), locks(false, false));
+        }
+
+        #[test]
+        fn identical_and_none_requests_submit_no_modifier_change() {
+            let mut keys = keyboard();
+            assert!(keys.set_locks(locks(true, true), EPOCH));
+            for wanted in [locks(true, true), LockKeys::default()] {
+                assert!(!keys.set_locks(wanted, EPOCH));
+                assert_eq!(actual(&keys), locks(true, true));
+                assert!(keys.down.is_empty());
+            }
+        }
+
+        #[test]
+        fn real_xkb_down_state_up_preserves_both_lock_directions() {
+            for caps in [false, true] {
+                for before_up in [false, true] {
+                    for code in [58, 69] {
+                        let mut keys = keyboard();
+                        keys.set_locks(locks(caps, caps), EPOCH);
+                        keys.key(code, true, EPOCH, true);
+                        let wanted = locks(!caps, !caps);
+                        if before_up {
+                            keys.set_locks(wanted, EPOCH);
+                            assert!(keys.down.contains(&code));
+                        }
+                        keys.key(code, false, EPOCH, true);
+                        if !before_up {
+                            keys.set_locks(wanted, EPOCH);
+                        }
+                        assert_eq!(actual(&keys), wanted);
+                        assert!(keys.down.is_empty());
+                        assert!(keys.pending.iter().all(Option::is_none));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn held_requests_wait_for_the_up_without_retapping() {
+            let mut keys = keyboard();
+            keys.key(58, true, EPOCH, true);
+            assert_eq!(actual(&keys).caps_lock, Some(true));
+            assert!(!keys.set_locks(locks(false, false), EPOCH));
+            assert_eq!(actual(&keys).caps_lock, Some(true));
+            assert_eq!(keys.down, BTreeSet::from([58]));
+            keys.key(58, false, EPOCH, true);
+            assert_eq!(actual(&keys).caps_lock, Some(false));
+            assert!(keys.down.is_empty());
+        }
+
+        #[test]
+        fn latest_held_request_wins_and_none_leaves_it_unchanged() {
+            let mut keys = keyboard();
+            keys.set_locks(locks(true, false), EPOCH);
+            keys.key(58, true, EPOCH, true);
+            keys.set_locks(locks(false, false), EPOCH);
+            keys.set_locks(locks(true, false), EPOCH);
+            assert!(!keys.set_locks(LockKeys::default(), EPOCH));
+            keys.key(58, false, EPOCH, true);
+            assert_eq!(actual(&keys).caps_lock, Some(true));
+        }
+
+        #[test]
+        fn one_held_lock_does_not_delay_the_other_lock() {
+            let mut keys = keyboard();
+            keys.key(58, true, EPOCH, true);
+            assert!(keys.set_locks(locks(false, true), EPOCH));
+            assert_eq!(actual(&keys), locks(true, true));
+            keys.key(69, true, EPOCH, true);
+            keys.key(69, false, EPOCH, true);
+            assert_eq!(actual(&keys).caps_lock, Some(true));
+            keys.key(58, false, EPOCH, true);
+            assert_eq!(actual(&keys).caps_lock, Some(false));
+        }
+
+        #[test]
+        fn pending_request_is_cancelled_by_closed_or_changed_epochs() {
+            for (epoch, allowed) in [
+                (EPOCH, false),
+                (LockEpoch { gate: 3, ..EPOCH }, true),
+                (LockEpoch { config: 4, ..EPOCH }, true),
+            ] {
+                let mut keys = keyboard();
+                keys.key(58, true, EPOCH, true);
+                keys.set_locks(locks(false, false), EPOCH);
+                keys.key(58, false, epoch, allowed);
+                assert_eq!(actual(&keys).caps_lock, Some(true));
+                assert!(keys.pending.iter().all(Option::is_none));
+                assert!(keys.down.is_empty());
+            }
+        }
+
+        #[test]
+        fn close_then_reopen_refuses_a_queued_request_before_changing_state() {
+            let gate = IoGate::new();
+            gate.set_session_permits(true);
+            gate.set_engine_permits(true);
+            let config = AtomicU64::new(4);
+            let epoch = LockEpoch {
+                gate: gate.epoch(),
+                config: 4,
+            };
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut keys = keyboard();
+            gate.set_session_permits(false);
+            gate.set_session_permits(true);
+            assert!(matches!(
+                keys.set_locks_if(locks(true, true), epoch, || {
+                    lock_admission(&gate, &config, epoch, false, deadline)
+                }),
+                Err(PlatformError::Locked)
+            ));
+            assert_eq!(actual(&keys), locks(false, false));
+            assert!(keys.pending.iter().all(Option::is_none));
+        }
+
+        #[test]
+        fn final_request_fence_cancels_pending_and_preserves_the_virtual_mask() {
+            for error in [PlatformError::Locked, PlatformError::Timeout] {
+                let mut keys = keyboard();
+                keys.key(58, true, EPOCH, true);
+                keys.set_locks(locks(false, false), EPOCH);
+                assert!(
+                    keys.set_locks_if(locks(false, true), EPOCH, || Err(error))
+                        .is_err()
+                );
+                assert_eq!(actual(&keys), locks(true, false));
+                assert!(keys.pending.iter().all(Option::is_none));
+                keys.key(58, false, EPOCH, true);
+                assert_eq!(actual(&keys), locks(true, false));
+                assert!(keys.down.is_empty());
+            }
+        }
+
+        #[test]
+        fn epoch_change_during_real_up_cancels_the_pending_mask_but_not_the_up() {
+            for close in [true, false] {
+                let gate = IoGate::new();
+                gate.set_session_permits(true);
+                gate.set_engine_permits(true);
+                let config = AtomicU64::new(4);
+                let epoch = LockEpoch {
+                    gate: gate.epoch(),
+                    config: 4,
+                };
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let mut keys = keyboard();
+                keys.key(58, true, epoch, true);
+                keys.set_locks(locks(false, false), epoch);
+                let checks = std::cell::Cell::new(0);
+                keys.key_if(58, false, epoch, || {
+                    let check = checks.get();
+                    checks.set(check + 1);
+                    if check == 1 {
+                        if close {
+                            gate.set_session_permits(false);
+                            gate.set_session_permits(true);
+                        } else {
+                            config.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    lock_admission(&gate, &config, epoch, false, deadline).is_ok()
+                });
+                assert_eq!(actual(&keys).caps_lock, Some(true));
+                assert!(keys.down.is_empty());
+                assert!(keys.pending.iter().all(Option::is_none));
+            }
+        }
+
+        #[test]
+        fn cleanup_cancels_pending_and_releases_real_xkb_keys() {
+            let mut keys = keyboard();
+            keys.key(58, true, EPOCH, true);
+            keys.key(42, true, EPOCH, true);
+            keys.set_locks(locks(false, false), EPOCH);
+            keys.cancel_pending();
+            for code in keys.down.clone() {
+                keys.key(code, false, EPOCH, false);
+            }
+            assert!(keys.down.is_empty());
+            assert_eq!(keys.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED), 0);
+            assert_eq!(actual(&keys).caps_lock, Some(true));
+            assert!(keys.pending.iter().all(Option::is_none));
+        }
+
+        #[test]
+        fn paused_or_expired_requests_cannot_change_masks_or_wait_for_an_up() {
+            let gate = IoGate::new();
+            gate.set_session_permits(true);
+            gate.set_engine_permits(true);
+            let config = AtomicU64::new(4);
+            let epoch = LockEpoch {
+                gate: gate.epoch(),
+                config: 4,
+            };
+            for (paused, deadline) in [
+                (true, Instant::now() + Duration::from_secs(1)),
+                (false, Instant::now()),
+            ] {
+                let mut keys = keyboard();
+                keys.key(58, true, epoch, true);
+                assert!(matches!(
+                    keys.set_locks_if(locks(false, true), epoch, || {
+                        lock_admission(&gate, &config, epoch, paused, deadline)
+                    }),
+                    Err(PlatformError::Timeout)
+                ));
+                assert_eq!(actual(&keys), locks(true, false));
+                assert!(keys.pending.iter().all(Option::is_none));
+            }
+        }
+
+        #[test]
+        fn no_caps_keysym_still_allows_a_mask_only_request() {
+            let mut keys = KeyboardState::new(&keymap("compose:caps"), 0);
+            keys.key(58, true, EPOCH, true);
+            assert!(keys.set_locks(locks(true, false), EPOCH));
+            assert_eq!(actual(&keys).caps_lock, Some(true));
+            assert_eq!(keys.down, BTreeSet::from([58]));
+        }
+
+        #[test]
+        fn mask_requests_preserve_depressed_latched_group_and_held_keys() {
+            let map = compile_keymap(&Rmlvo {
+                layout: "us,de".into(),
+                variant: String::new(),
+                options: String::new(),
+            })
+            .unwrap();
+            let mut keys = KeyboardState::new(&map, 1);
+            keys.key(42, true, EPOCH, true);
+            let shift = keys.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+            let alt = 1 << map.mod_get_index("Mod1");
+            keys.xkb.update_mask(shift, alt, 0, 0, 0, 1);
+            assert!(keys.set_locks(locks(true, true), EPOCH));
+            assert_eq!(keys.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED), shift);
+            assert_eq!(keys.xkb.serialize_mods(xkb::STATE_MODS_LATCHED), alt);
+            assert_eq!(keys.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE), 1);
+            assert_eq!(keys.down, BTreeSet::from([42]));
+        }
+
+        #[test]
+        fn lock_request_preserves_each_layout_component() {
+            let map = compile_keymap(&Rmlvo {
+                layout: "us,de,fr".into(),
+                variant: String::new(),
+                options: String::new(),
+            })
+            .unwrap();
+            let mut keys = KeyboardState::new(&map, 0);
+            keys.xkb.update_mask(0, 0, 0, 1, 1, 1);
+            let components = [
+                xkb::STATE_LAYOUT_DEPRESSED,
+                xkb::STATE_LAYOUT_LATCHED,
+                xkb::STATE_LAYOUT_LOCKED,
+            ];
+            let before = components.map(|component| keys.xkb.serialize_layout(component));
+            assert!(keys.set_locks(locks(true, true), EPOCH));
+            assert_eq!(
+                components.map(|component| keys.xkb.serialize_layout(component)),
+                before
+            );
+        }
+
+        #[test]
+        fn real_group_key_up_is_not_stuck_by_a_lock_request() {
+            let map = compile_keymap(&Rmlvo {
+                layout: "us,de".into(),
+                variant: String::new(),
+                options: "grp:switch".into(),
+            })
+            .unwrap();
+            let mut keys = KeyboardState::new(&map, 0);
+            keys.key(100, true, EPOCH, true);
+            assert_eq!(keys.xkb.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED), 1);
+            assert!(keys.set_locks(locks(true, true), EPOCH));
+            assert_eq!(keys.xkb.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED), 1);
+            assert_eq!(keys.xkb.serialize_layout(xkb::STATE_LAYOUT_LOCKED), 0);
+            keys.key(100, false, EPOCH, true);
+            assert_eq!(keys.xkb.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED), 0);
+            assert_eq!(keys.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE), 0);
+            assert!(keys.down.is_empty());
+        }
+
+        #[test]
+        fn changed_keymap_rejects_then_finishes_the_old_lock_filter_before_retry() {
+            let mut keys = keyboard();
+            keys.set_locks(locks(true, false), EPOCH);
+            keys.key(58, true, EPOCH, true);
+            assert_eq!(actual(&keys).caps_lock, Some(true));
+            let map = compile_keymap(&Rmlvo {
+                layout: "us,de".into(),
+                variant: String::new(),
+                options: String::new(),
+            })
+            .unwrap();
+            assert!(
+                map.key_get_syms_by_level(66_u32.into(), 0, 0)
+                    .iter()
+                    .any(|s| s.raw() == xkb::keysyms::KEY_Caps_Lock)
+            );
+            assert!(keys.require_idle_for_keymap(false).is_ok());
+            assert!(matches!(
+                keys.require_idle_for_keymap(true),
+                Err(PlatformError::Timeout)
+            ));
+            assert!(matches!(
+                keys.reconfigure(&map, 0),
+                Err(PlatformError::Timeout)
+            ));
+            assert_eq!(keys.xkb.get_keymap().num_layouts(), 1);
+            assert!(keys.down.contains(&58));
+            assert_eq!(actual(&keys).caps_lock, Some(true));
+            // Existing failed-refresh cleanup cancels pending requests and releases the old
+            // state's real key. Its prelocked LockMods filter must clear Caps on this up.
+            keys.cancel_pending();
+            keys.key(58, false, LockEpoch { config: 3, ..EPOCH }, false);
+            assert_eq!(actual(&keys).caps_lock, Some(false));
+            assert!(keys.down.is_empty());
+            keys.reconfigure(&map, 0).unwrap();
+            assert_eq!(keys.xkb.get_keymap().num_layouts(), 2);
+            assert_eq!(actual(&keys).caps_lock, Some(false));
+        }
+
+        #[test]
+        fn refresh_preserves_virtual_locks_and_discards_pending_requests() {
+            let mut keys = keyboard();
+            keys.set_locks(locks(true, true), EPOCH);
+            keys.key(58, true, EPOCH, true);
+            keys.set_locks(locks(false, true), EPOCH);
+            assert!(matches!(
+                keys.reconfigure(&keymap("compose:caps"), 0),
+                Err(PlatformError::Timeout)
+            ));
+            assert_eq!(actual(&keys), locks(true, true));
+            assert_eq!(keys.down, BTreeSet::from([58]));
+            keys.cancel_pending();
+            keys.key(58, false, EPOCH, false);
+            let released = actual(&keys);
+            keys.reconfigure(&keymap("compose:caps"), 0).unwrap();
+            assert_eq!(actual(&keys), released);
+            assert_eq!(released, locks(false, true));
+            assert!(keys.pending.iter().all(Option::is_none));
+            assert!(keys.down.is_empty());
+        }
+    }
+
     #[test]
     fn lock_masks_preserve_unrequested_modifiers() {
         let keymap = keymap("");
@@ -1566,20 +2061,16 @@ mod tests {
     }
 
     #[test]
-    fn lock_keycodes_follow_the_keymap() {
-        assert_eq!(
-            lock_keycode(&keymap(""), 0, xkb::keysyms::KEY_Caps_Lock),
-            Some(58)
-        );
-        let remapped = keymap("compose:caps");
-        assert_eq!(
-            lock_keycode(&remapped, 0, xkb::keysyms::KEY_Caps_Lock),
-            None
-        );
-        assert_eq!(
-            lock_keycode(&remapped, 0, xkb::keysyms::KEY_Num_Lock),
-            Some(69)
-        );
+    fn held_lock_detection_follows_the_keymap() {
+        let mut keys = KeyboardState::new(&keymap(""), 0);
+        keys.key(58, true, LockEpoch { gate: 0, config: 0 }, true);
+        assert!(keys.held_lock(xkb::keysyms::KEY_Caps_Lock));
+        keys.key(58, false, LockEpoch { gate: 0, config: 0 }, true);
+        keys.reconfigure(&keymap("compose:caps"), 0).unwrap();
+        keys.key(58, true, LockEpoch { gate: 0, config: 0 }, true);
+        assert!(!keys.held_lock(xkb::keysyms::KEY_Caps_Lock));
+        keys.key(69, true, LockEpoch { gate: 0, config: 0 }, true);
+        assert!(keys.held_lock(xkb::keysyms::KEY_Num_Lock));
     }
 
     fn injecting_actions() -> Vec<Action> {
@@ -1596,7 +2087,7 @@ mod tests {
             Action::Button(MouseButton::PRIMARY, true),
             Action::Move(DisplayId(0), PointDevice::new(1.0, 1.0)),
             Action::Scroll(wheel),
-            Action::SetLocks(LockKeys::default(), LockKeys::default()),
+            Action::SetLocks(LockKeys::default(), 0),
         ]
     }
 
@@ -1658,7 +2149,6 @@ mod tests {
             names: rmlvo(layout),
             active_keymap: None,
             layout_index: None,
-            locks: LockKeys::default(),
             monitors: Vec::new(),
             keyboard_addresses: BTreeSet::new(),
         }

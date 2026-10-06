@@ -24,7 +24,6 @@ pub(super) struct Config {
     pub names: Rmlvo,
     pub active_keymap: Option<String>,
     pub layout_index: Option<u32>,
-    pub locks: LockKeys,
     pub monitors: Vec<(String, u32)>,
     pub keyboard_addresses: BTreeSet<String>,
 }
@@ -104,7 +103,6 @@ pub(super) fn read(
         layout_index: keyboard
             .and_then(|k| k["active_layout_index"].as_u64())
             .and_then(|i| u32::try_from(i).ok()),
-        locks: parse_locks(&devices, own_name)?,
         monitors,
         keyboard_addresses: keyboards(&devices)?
             .iter()

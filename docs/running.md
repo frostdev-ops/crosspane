@@ -321,6 +321,11 @@ per-item sizes are shown. On macOS, if remote paste is blocked, check whether Cr
 
 ## Known limitations (v0)
 
+On Linux, lock-state sync writes only Crosspane's injected keyboard source. It does not directly
+reset or set the physical keyboard or IME keyboard. An active IME may forward the source's
+modifiers, so equality of lock states across the whole node is not verified. The physical keyboard
+keeps its own lock state after control ends.
+
 Drag a window across: on paired machines with drag enabled, drag its title bar against the
 screen edge toward the peer. On Hyprland, release when the HUD says “Release to move”; the window
 is projected there and ordinary pointer crossing resumes. Both peers must advertise `drag/0`;

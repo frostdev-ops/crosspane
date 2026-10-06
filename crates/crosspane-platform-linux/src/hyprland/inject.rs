@@ -12,6 +12,12 @@
 //! both must be clear to inject. A lost Wayland connection, a lost configuration watcher, or
 //! both handles being dropped, still ends the worker, whose drop releases whatever is held.
 //!
+//! Lock requests update only this source's virtual XKB mask, without manufactured key taps or
+//! physical/IME reseeding. Caps/Num requests made while their injected keys are held wait for
+//! those keys' real ups. Gate/configuration epoch loss or cleanup cancels those pending requests.
+//! The public lock reader remains a separate physical-keyboard snapshot, not verification of
+//! the requested mask or of the node's main/IME keyboard.
+//!
 //! **Where the pointer was put (WP-1.43).** The injection worker records the absolute position of
 //! every submitted `move_to` and when it was made, in an `InjectedPosition` that lives as long as
 //! either the worker or a local-activity monitor holds it. Hyprland offers no per-device input stream
@@ -60,6 +66,7 @@ pub struct HyprlandPointerInjector {
 struct Handle {
     commands: SyncSender<Command>,
     locks: config::LockReader,
+    gate: Arc<IoGate>,
     key_alive: Arc<AtomicBool>,
     pointer_alive: Arc<AtomicBool>,
 }
@@ -140,7 +147,7 @@ pub(super) fn injected_position_for(gate: &Arc<IoGate>) -> Option<Arc<InjectedPo
 
 enum Action {
     Key(HidUsage, bool),
-    SetLocks(LockKeys, LockKeys),
+    SetLocks(LockKeys, u64),
     ReleaseKeys,
     RecoverKeys(Vec<HidUsage>),
     Move(DisplayId, PointDevice),
@@ -201,13 +208,14 @@ pub fn connect(
     let keys = key_alive.clone();
     let pointers = pointer_alive.clone();
     let worker_ipc = ipc.clone();
+    let worker_gate = gate.clone();
     std::thread::Builder::new()
         .name("hypr-inject".into())
         .spawn(move || {
             let result = (|| {
                 let config = config::read(&worker_ipc, None, deadline)?;
                 let previous = config.keyboard_addresses.clone();
-                let source = wayland::Source::new(gate, config, injected, deadline)?;
+                let source = wayland::Source::new(worker_gate, config, injected, deadline)?;
                 let name = config::own_keyboard_name(&worker_ipc, &previous)?;
                 let watcher =
                     config::Watcher::new(worker_ipc, name.clone(), source.config_epoch())?;
@@ -229,6 +237,7 @@ pub fn connect(
     let shared = Arc::new(Handle {
         commands,
         locks: config::LockReader::new(ipc, name)?,
+        gate,
         key_alive,
         pointer_alive,
     });
@@ -252,9 +261,8 @@ impl KeyInjector for HyprlandKeyInjector {
 
     fn set_lock_keys(&mut self, wanted: LockKeys) -> Result<(), PlatformError> {
         let deadline = Instant::now() + CALL_BUDGET;
-        let current = self.shared.locks.read(deadline)?;
         self.shared
-            .call(Action::SetLocks(current, wanted), deadline)
+            .call(Action::SetLocks(wanted, self.shared.gate.epoch()), deadline)
     }
 
     fn release_all(&mut self) -> Result<(), PlatformError> {
