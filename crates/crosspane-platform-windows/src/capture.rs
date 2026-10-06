@@ -4,7 +4,7 @@
 //! either hook exists. While captured, one nonce-tagged F24 SCANCODE pair is outstanding; missing
 //! acknowledgment ends capture within approximately 500 ms plus scheduling/native-call delay.
 //! After hook loss at most one pair can reach the foreground. F24 is not universally unused.
-//! Partial insertion owes only its matching up, retried three times; a failed up remains [U],
+//! Partial insertion owes only its matching up, retried three times; a failed up remains \[U\],
 //! possibly held locally. It is never reported as verified cleanup. Native calls have no public
 //! hard real-time guarantee. Mouse Raw Input mismatch conservatively ends both hooks without
 //! claiming that Windows removes them together. This backend exclusively owns mouse Raw Input.

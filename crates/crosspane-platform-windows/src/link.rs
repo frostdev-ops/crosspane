@@ -1,7 +1,7 @@
 //! Read-only Windows interface snapshots and owned IP-change registrations.
 //! Notifications perform one atomic signal only. Enumeration, delivery and cancellation
 //! run outside their callbacks; callbacks never wait on a resource used by cancellation.
-//! https://learn.microsoft.com/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2
+//! <https://learn.microsoft.com/windows/win32/api/netioapi/nf-netioapi-cancelmibchangenotify2>
 #![allow(unsafe_code)]
 
 use crate::model::link::{Adapter, Coalescer, normalize};

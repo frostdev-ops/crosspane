@@ -2,8 +2,8 @@
 //! Each request reacquires facts; the allocator is held only after native calls finish.
 //! DPI comes from never-shown PMv2 helper windows, NOT GetDpiForMonitor: Microsoft's
 //! documentation forbids that API on a per-monitor-aware caller.
-//! https://learn.microsoft.com/windows/win32/api/shellscalingapi/nf-shellscalingapi-getdpiformonitor
-//! https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getdpiforwindow
+//! <https://learn.microsoft.com/windows/win32/api/shellscalingapi/nf-shellscalingapi-getdpiformonitor>
+//! <https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getdpiforwindow>
 //! Active desktop targets, including virtual targets, are retained by actual CCD path.
 //! Mirrored/ambiguous identities are refused rather than fabricated. No output is created.
 #![allow(unsafe_code)]
