@@ -348,6 +348,10 @@ pub(crate) mod selected {
         handle: OwnedHandle,
         facts: ProcessFacts,
     }
+    pub(crate) enum ProcessExit {
+        Running,
+        Exited { creation: u64, code: u32 },
+    }
     impl SelectedProcess {
         /// Called only inside the fixed AgentObservation factory's bounded native owner.
         pub(crate) fn admit(
@@ -390,6 +394,74 @@ pub(crate) mod selected {
         pub(crate) fn revalidate(&self, deadline: &Deadline) -> NativeResult<()> {
             let current = Self::observe(&self.handle, self.facts.pid, self.facts.file, deadline)?;
             process_matches(&self.facts, &current)
+        }
+        /// Query the retained original kernel object. An exited PID is never reopened.
+        pub(crate) fn observe_exit(&self, deadline: &Deadline) -> NativeResult<ProcessExit> {
+            deadline.check()?;
+            // SAFETY: original retained query/synchronize handle; zero wait, no mutation.
+            let state = unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) };
+            if state == WAIT_TIMEOUT {
+                self.revalidate(deadline)?;
+                return Ok(ProcessExit::Running);
+            }
+            if state != WAIT_OBJECT_0 {
+                return Err(NativeError::Unavailable);
+            }
+            let (mut creation, mut exit, mut kernel, mut user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            // SAFETY: retained original query handle and complete distinct writable outputs.
+            if unsafe {
+                GetProcessTimes(
+                    self.handle.as_raw_handle(),
+                    &mut creation,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            } == 0
+            {
+                return Err(NativeError::Unavailable);
+            }
+            let creation =
+                (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+            if creation == 0 || creation != self.facts.created {
+                return Err(NativeError::Foreign);
+            }
+            let mut code = 0;
+            // SAFETY: signalled retained original process and complete exit-code output.
+            if unsafe { GetExitCodeProcess(self.handle.as_raw_handle(), &mut code) } == 0 {
+                return Err(NativeError::Unavailable);
+            }
+            deadline.check()?;
+            Ok(ProcessExit::Exited { creation, code })
+        }
+        /// Query only the explicitly retained service-owned job; never a null/current job.
+        #[allow(dead_code)] // Lead750c0da2 holds the actual owned-job caller until A4.
+        pub(crate) fn in_job(&self, job: &OwnedHandle, deadline: &Deadline) -> NativeResult<bool> {
+            if job.as_raw_handle().is_null() {
+                return Err(NativeError::Foreign);
+            }
+            self.observe_exit(deadline)?;
+            let mut result = 0;
+            // SAFETY: both original process and actual non-null own job stay retained by the
+            // enclosing observation owner until this query completes, including caller timeout.
+            if unsafe {
+                windows_sys::Win32::System::JobObjects::IsProcessInJob(
+                    self.handle.as_raw_handle(),
+                    job.as_raw_handle(),
+                    &mut result,
+                )
+            } == 0
+            {
+                return Err(NativeError::Unavailable);
+            }
+            self.observe_exit(deadline)?;
+            deadline.check()?;
+            Ok(result != 0)
         }
         fn observe(
             handle: &OwnedHandle,

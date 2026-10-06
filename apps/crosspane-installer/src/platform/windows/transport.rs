@@ -31,6 +31,41 @@ pub(crate) trait Endpoint: Send + Sync {
     ) -> Result<DecodedReply, CallFailure>;
     fn admit_status(&self, reply: &DecodedReply) -> Result<(), CallFailure>;
     fn source(&self) -> ObservationSource;
+    fn selected_instance(&self) -> NativeResult<u64> {
+        Err(NativeError::Unsupported)
+    }
+    fn stop_frame(&self, _expected_instance: u64, _deadline: &Deadline) -> Result<(), CallFailure> {
+        Err(CallFailure::Unavailable)
+    }
+    fn check_after_stop(&self, deadline: &Deadline) -> NativeResult<()> {
+        self.check(deadline)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopAcknowledgement {
+    Stopping,
+}
+
+pub(crate) fn run_stop(
+    endpoint: &dyn Endpoint,
+    expected_instance: u64,
+    deadline: &Deadline,
+) -> Result<StopAcknowledgement, CallFailure> {
+    endpoint.check(deadline).map_err(failure)?;
+    let status = endpoint.frame(&InstallerRequest::Status, deadline)?;
+    endpoint.admit_status(&status)?;
+    if endpoint.selected_instance().map_err(failure)? != expected_instance {
+        return Err(CallFailure::Unavailable);
+    }
+    endpoint.check(deadline).map_err(failure)?;
+    endpoint.stop_frame(expected_instance, deadline)?;
+    // No post-stop Status. The exact connected origin/context can be rechecked after it exits.
+    endpoint
+        .check_after_stop(deadline)
+        .map_err(|_| CallFailure::TimeoutOutcomeUnknown)?;
+    deadline.check().map_err(failure)?;
+    Ok(StopAcknowledgement::Stopping)
 }
 
 pub(crate) fn failure(error: NativeError) -> CallFailure {
@@ -127,6 +162,68 @@ impl std::fmt::Debug for WindowsAgentPort {
     }
 }
 impl WindowsAgentPort {
+    #[allow(dead_code)] // Lead750c0da2: selected installer operation integration awaits A4.
+    pub(crate) fn installer_stop(
+        self,
+        expected_instance: u64,
+        timeout_ms: u64,
+    ) -> Result<StopAcknowledgement, CallFailure> {
+        self.endpoint.admit_caller().map_err(failure)?;
+        if self.outstanding != 0
+            || self.active.load(Ordering::Acquire)
+            || self.retired.load(Ordering::Acquire)
+        {
+            return Err(CallFailure::Unavailable);
+        }
+        if expected_instance == 0 {
+            return Err(CallFailure::InvalidCall(
+                crate::agent_contract::ContractError::InvalidValue,
+            ));
+        }
+        if !(1..=crate::agent_contract::MAX_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(CallFailure::InvalidCall(
+                crate::agent_contract::ContractError::InvalidDeadline,
+            ));
+        }
+        let sender = self.sender.as_ref().ok_or(CallFailure::Unavailable)?;
+        let deadline = Deadline::new(timeout_ms, self.clock.clone(), self.cancellation.clone())
+            .map_err(failure)?;
+        let (reply, receive) = mpsc::sync_channel(1);
+        sender
+            .try_send(worker::Work {
+                request: worker::WorkRequest::Stop {
+                    expected_instance,
+                    reply,
+                },
+                deadline: deadline.clone(),
+                endpoint: self.endpoint.clone(),
+                retired: self.retired.clone(),
+            })
+            .map_err(|_| CallFailure::Unavailable)?;
+        loop {
+            let remaining = match deadline.remaining_ms() {
+                Ok(remaining) => remaining,
+                Err(_) => {
+                    self.retired.store(true, Ordering::Release);
+                    return Err(CallFailure::TimeoutOutcomeUnknown);
+                }
+            };
+            match receive.recv_timeout(std::time::Duration::from_millis(remaining.clamp(1, 10))) {
+                Ok(result) => {
+                    if deadline.check().is_err() {
+                        self.retired.store(true, Ordering::Release);
+                        return Err(CallFailure::TimeoutOutcomeUnknown);
+                    }
+                    return result;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.retired.store(true, Ordering::Release);
+                    return Err(CallFailure::TimeoutOutcomeUnknown);
+                }
+            }
+        }
+    }
     #[cfg(test)]
     #[allow(dead_code)] // Source-included integration seam; primary library unit tests do not call it.
     pub(crate) fn workers() -> usize {
@@ -235,7 +332,7 @@ impl AgentPort for WindowsAgentPort {
         for call in self.queue.take_calls() {
             self.pending.insert(call.id, deadline.clone());
             let work = worker::Work {
-                call: call.clone(),
+                request: worker::WorkRequest::Ordinary(call.clone()),
                 deadline: deadline.clone(),
                 endpoint: self.endpoint.clone(),
                 retired: self.retired.clone(),

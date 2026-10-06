@@ -38,6 +38,10 @@ pub use process::{Cancellation, Clock, Deadline, MonotonicClock};
 
 #[cfg(windows)]
 pub(crate) use adapter::AgentObservation;
+#[cfg(windows)]
+#[allow(unused_imports)]
+// A4 consumes completion fields; terminal ACK presently only rechecks origin.
+pub(crate) use adapter::ExitObservation;
 #[cfg(all(windows, test))]
 #[allow(unused_imports)]
 // Source-included probe exports; library unit tests do not invoke them.
@@ -345,6 +349,36 @@ mod adapter {
         bootstrap: crate::agent_contract::BootstrapV1,
         phase_seq: std::sync::atomic::AtomicU64,
     }
+    #[allow(dead_code)] // A4's held job adapter consumes these facts; ACK is submission only.
+    pub(crate) enum ExitObservation {
+        Running,
+        Exited {
+            creation: u64,
+            code: u32,
+            receipt: Option<crate::agent_contract::LastExitV1>,
+        },
+    }
+    impl AgentObservationData {
+        fn validate_pins(&self, context: &Context, budget: &Deadline) -> NativeResult<()> {
+            self.runtime.revalidate(&context.security, true, budget)?;
+            self.install.revalidate(&context.security, false, budget)?;
+            if self.runtime.canonical_dos_path(&context.security, budget)? != self.runtime_canonical
+            {
+                return Err(NativeError::Foreign);
+            }
+            let facts = native::observe(&self.image, "crosspane-agent.exe", &context.security)?;
+            files::admit_component(&facts, Admission::PrivateFile)?;
+            let (_, current_image) = self.install.open_file_metadata(
+                &PrivateName::new("crosspane-agent.exe")?,
+                &context.security,
+                budget,
+            )?;
+            if facts.identity != self.image_identity || current_image != self.image_identity {
+                return Err(NativeError::Foreign);
+            }
+            budget.check()
+        }
+    }
     impl std::fmt::Debug for AgentObservation {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("AgentObservation")
@@ -431,6 +465,77 @@ mod adapter {
                     .map_err(|_| NativeError::Foreign)?;
                 observed.process.revalidate(&budget)?;
                 budget.check()
+            })
+        }
+        /// Fresh context and pins plus the original handle, including after original exit.
+        /// A replacement bootstrap never becomes an original-process completion proof.
+        pub(crate) fn observe_exit(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<ExitObservation> {
+            let budget = proof.budget(io, deadline)?;
+            if self.0.target != io.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            let observed = self.0.clone();
+            let context = io.context.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                observed.validate_pins(&context, &budget)?;
+                match observed.process.observe_exit(&budget)? {
+                    process::selected::ProcessExit::Running => Ok(ExitObservation::Running),
+                    process::selected::ProcessExit::Exited { creation, code } => {
+                        let receipt = observed
+                            .runtime
+                            .read_private(
+                                &PrivateName::new("last_exit.json")?,
+                                &context.security,
+                                crate::agent_contract::MAX_RESPONSE_BYTES,
+                                &budget,
+                            )?
+                            .map(|(_, bytes)| {
+                                let receipt = crate::agent_contract::parse_last_exit(&bytes)
+                                    .map_err(|_| NativeError::Invalid)?;
+                                if receipt.instance_id != observed.bootstrap.instance_id
+                                    || receipt.stopped_unix_ms < observed.bootstrap.started_unix_ms
+                                {
+                                    return Err(NativeError::Foreign);
+                                }
+                                Ok(receipt)
+                            })
+                            .transpose()?;
+                        budget.check()?;
+                        Ok(ExitObservation::Exited {
+                            creation,
+                            code,
+                            receipt,
+                        })
+                    }
+                }
+            })
+        }
+        #[allow(dead_code)] // Lead750c0da2 holds the production owned-job adapter until A4.
+        pub(crate) fn in_job(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            job: Arc<std::os::windows::io::OwnedHandle>,
+            deadline: &Deadline,
+        ) -> NativeResult<bool> {
+            let budget = proof.budget(io, deadline)?;
+            if self.0.target != io.context.target.nonce || job.as_raw_handle().is_null() {
+                return Err(NativeError::Foreign);
+            }
+            let observed = self.0.clone();
+            let context = io.context.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                // Owns this exact Arc through actual completion: no duplicate, raw borrow, new
+                // rights, name lookup or job authority introduced on the caller thread.
+                context.validate(&budget)?;
+                observed.validate_pins(&context, &budget)?;
+                observed.process.in_job(&job, &budget)
             })
         }
     }

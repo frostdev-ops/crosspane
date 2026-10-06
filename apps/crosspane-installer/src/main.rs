@@ -14,6 +14,26 @@ struct DiagnoseOptions {
     payload: Option<std::path::PathBuf>,
 }
 fn main() {
+    #[cfg(windows)]
+    {
+        let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+        match crosspane_installer::platform::windows::service::supervisor_mode(&arguments) {
+            Ok(true) => {
+                if let Err(error) =
+                    crosspane_installer::platform::windows::service::supervisor_entry()
+                {
+                    eprintln!("Crosspane Installer supervisor: {error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Err(_) => {
+                eprintln!("Crosspane Installer supervisor: invalid arguments");
+                std::process::exit(2);
+            }
+            Ok(false) => {}
+        }
+    }
     if std::env::args_os().any(|arg| arg == "--diagnose") {
         let options = DiagnoseOptions::parse();
         if let Err(error) = crosspane_installer::diagnose::run(options.payload) {

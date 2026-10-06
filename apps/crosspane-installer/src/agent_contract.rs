@@ -685,6 +685,52 @@ pub fn encode_request(request: &InstallerRequest) -> Result<Vec<u8>, ContractErr
     }
     Ok(bytes)
 }
+
+// Leada0d6de07: production visibility stays private. Source-included Windows fixture adapters
+// use these byte-only views through the existing test-hooks seam, never a native capability.
+#[cfg(all(windows, not(feature = "test-hooks")))]
+pub(crate) use installer_stop_codec::{decode_installer_stop, encode_installer_stop};
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use installer_stop_codec::{decode_installer_stop, encode_installer_stop};
+
+#[cfg(any(windows, feature = "test-hooks"))]
+mod installer_stop_codec {
+    use super::*;
+
+    pub fn encode_installer_stop(expected_instance: u64) -> Result<Vec<u8>, ContractError> {
+        if expected_instance == 0 {
+            return Err(ContractError::InvalidValue);
+        }
+        #[derive(Serialize)]
+        struct Stop {
+            cmd: &'static str,
+            expected_instance: u64,
+        }
+        let mut bytes = serde_json::to_vec(&Stop {
+            cmd: "installer_stop",
+            expected_instance,
+        })
+        .map_err(|_| ContractError::InvalidValue)?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_REQUEST_BYTES {
+            return Err(ContractError::Oversize);
+        }
+        Ok(bytes)
+    }
+    pub fn decode_installer_stop(bytes: &[u8]) -> Result<(), CallFailure> {
+        let value = json(bytes).map_err(|_| CallFailure::InvalidResponse)?;
+        if !envelope(&value).map_err(|_| CallFailure::InvalidResponse)? {
+            return Err(refusal(&value));
+        }
+        if value.as_object().is_none_or(|object| object.len() != 2)
+            || value.get("result").and_then(Value::as_str) != Some("stopping")
+        {
+            return Err(CallFailure::InvalidResponse);
+        }
+        Ok(()) // Submission acknowledgement only; never health, exit or cleanup.
+    }
+}
 pub fn decode_reply(
     request: &InstallerRequest,
     bytes: &[u8],

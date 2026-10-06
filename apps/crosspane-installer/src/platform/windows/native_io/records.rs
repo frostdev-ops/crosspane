@@ -74,18 +74,21 @@ pub enum RecordKind {
     Receipt,
     StageCatalog,
     Operation,
+    Supervisor,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordName {
     Receipt,
     StageCatalog,
     Operation([u8; 16]),
+    Supervisor,
 }
 impl RecordName {
     pub fn file_name(&self) -> NativeResult<super::files::PrivateName> {
         match self {
             Self::Receipt => super::files::PrivateName::new("receipt.json"),
             Self::StageCatalog => super::files::PrivateName::new("stage-catalog.json"),
+            Self::Supervisor => super::files::PrivateName::new("supervisor.json"),
             Self::Operation(id) if *id != [0; 16] => {
                 super::files::PrivateName::new(&format!("operation-{}.json", hex(id)))
             }
@@ -97,6 +100,7 @@ impl RecordName {
             Self::Receipt => RecordKind::Receipt,
             Self::StageCatalog => RecordKind::StageCatalog,
             Self::Operation(_) => RecordKind::Operation,
+            Self::Supervisor => RecordKind::Supervisor,
         }
     }
     fn operation(&self) -> Option<[u8; 16]> {
@@ -120,12 +124,12 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Envelope {
+struct Envelope<T = serde_json::Value> {
     schema_version: u32,
     kind: RecordKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation: Option<[u8; 16]>,
-    data: serde_json::Value,
+    data: T,
 }
 fn parse_record(bytes: &[u8]) -> NativeResult<Envelope> {
     check_read_size(bytes.len(), MAX_RECORD_BYTES)?;
@@ -174,6 +178,18 @@ pub fn validate_for(name: &RecordName, bytes: &[u8]) -> NativeResult<()> {
         return Err(NativeError::Invalid);
     }
     Ok(())
+}
+
+/// Validated body observation only; preserves the private envelope's existing parser/correlation.
+pub(crate) fn record_data<T: serde::de::DeserializeOwned>(
+    name: &RecordName,
+    bytes: &[u8],
+) -> NativeResult<T> {
+    validate_for(name, bytes)?;
+    // Deserialize through the SAME envelope with the typed body intact. Parsing first into
+    // Value alone would erase duplicate body keys before the body's deny_unknown_fields check.
+    let envelope: Envelope<T> = serde_json::from_slice(bytes).map_err(|_| NativeError::Invalid)?;
+    Ok(envelope.data)
 }
 
 pub(crate) struct BoundedRecordWriter {

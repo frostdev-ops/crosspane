@@ -2,6 +2,7 @@
 //! install, agent, task or payload capability.
 pub mod detect;
 pub mod native_io;
+pub mod service;
 pub mod transport;
 
 /// Construct the shell without any install, agent or native-resource capability.

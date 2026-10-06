@@ -47,7 +47,8 @@ pub(super) mod native {
     use super::*;
     use crate::agent_contract::{
         AgentPlatform, CallFailure, DecodedReply, InstallerRequest, ObservationSource,
-        StatusAdmission, decode_reply, encode_request,
+        StatusAdmission, decode_installer_stop, decode_reply, encode_installer_stop,
+        encode_request,
     };
     use std::{
         os::windows::{
@@ -137,35 +138,29 @@ pub(super) mod native {
             self.verify_pipe(&pipe, deadline)?;
             Ok(pipe)
         }
-    }
-    impl Endpoint for NativeEndpoint {
-        fn admit_caller(&self) -> NativeResult<()> {
-            super::super::super::native_io::identity::native::refuse_impersonation()
-        }
-        fn check(&self, deadline: &Deadline) -> NativeResult<()> {
-            self.observation
-                .revalidate(&self.io, &self.support, deadline)
-        }
-        fn source(&self) -> ObservationSource {
-            ObservationSource::Live
-        }
-        fn admit_status(&self, reply: &DecodedReply) -> Result<(), CallFailure> {
-            let DecodedReply::Status(StatusAdmission::Supported(health)) = reply else {
-                return Err(CallFailure::Unavailable);
-            };
-            status_matches(
-                self.observation.bootstrap(),
-                self.observation.image_canonical(),
-                &health.installer().instance,
-            )
-            .map_err(failure)
-        }
-        fn frame(
+        fn verify_terminal_pipe(
             &self,
-            request: &InstallerRequest,
+            pipe: &OwnedHandle,
             deadline: &Deadline,
-        ) -> Result<DecodedReply, CallFailure> {
-            let bytes = encode_request(request).map_err(CallFailure::InvalidCall)?;
+        ) -> NativeResult<()> {
+            deadline.check()?;
+            let mut pid = 0;
+            // SAFETY: same connected retained pipe; complete server PID query output only.
+            if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0
+                || pid != self.observation.bootstrap().pid
+                || pid == 0
+            {
+                return Err(NativeError::Foreign);
+            }
+            self.check_after_stop(deadline)
+        }
+        fn exchange(
+            &self,
+            bytes: Vec<u8>,
+            deadline: &Deadline,
+            terminal: bool,
+            read_only: bool,
+        ) -> Result<Vec<u8>, CallFailure> {
             let pipe = self.connect(deadline).map_err(failure)?;
             let mut sent = 0;
             while sent < bytes.len() {
@@ -199,17 +194,74 @@ pub(super) mod native {
                     .append(&operation.bytes[..count])
                     .map_err(|_| CallFailure::InvalidResponse)?
                 {
-                    self.verify_pipe(&pipe, deadline).map_err(|e| {
-                        if readonly(request) {
+                    let origin = if terminal {
+                        self.verify_terminal_pipe(&pipe, deadline)
+                    } else {
+                        self.verify_pipe(&pipe, deadline)
+                    };
+                    origin.map_err(|e| {
+                        if read_only {
                             failure(e)
                         } else {
                             CallFailure::TimeoutOutcomeUnknown
                         }
                     })?;
                     deadline.check().map_err(failure)?;
-                    return decode_reply(request, &bytes, AgentPlatform::Windows);
+                    return Ok(bytes);
                 }
             }
+        }
+    }
+    impl Endpoint for NativeEndpoint {
+        fn admit_caller(&self) -> NativeResult<()> {
+            super::super::super::native_io::identity::native::refuse_impersonation()
+        }
+        fn check(&self, deadline: &Deadline) -> NativeResult<()> {
+            self.observation
+                .revalidate(&self.io, &self.support, deadline)
+        }
+        fn source(&self) -> ObservationSource {
+            ObservationSource::Live
+        }
+        fn selected_instance(&self) -> NativeResult<u64> {
+            Ok(self.observation.bootstrap().instance_id)
+        }
+        fn stop_frame(
+            &self,
+            expected_instance: u64,
+            deadline: &Deadline,
+        ) -> Result<(), CallFailure> {
+            let bytes =
+                encode_installer_stop(expected_instance).map_err(CallFailure::InvalidCall)?;
+            let reply = self.exchange(bytes, deadline, true, false)?;
+            decode_installer_stop(&reply)
+        }
+        fn check_after_stop(&self, deadline: &Deadline) -> NativeResult<()> {
+            let proof = self.io.admit_support(deadline)?;
+            // Original exit is allowed, but context and original fixed image pins remain fresh.
+            self.observation
+                .observe_exit(&self.io, &proof, deadline)
+                .map(|_| ())
+        }
+        fn admit_status(&self, reply: &DecodedReply) -> Result<(), CallFailure> {
+            let DecodedReply::Status(StatusAdmission::Supported(health)) = reply else {
+                return Err(CallFailure::Unavailable);
+            };
+            status_matches(
+                self.observation.bootstrap(),
+                self.observation.image_canonical(),
+                &health.installer().instance,
+            )
+            .map_err(failure)
+        }
+        fn frame(
+            &self,
+            request: &InstallerRequest,
+            deadline: &Deadline,
+        ) -> Result<DecodedReply, CallFailure> {
+            let bytes = encode_request(request).map_err(CallFailure::InvalidCall)?;
+            let reply = self.exchange(bytes, deadline, false, readonly(request))?;
+            decode_reply(request, &reply, AgentPlatform::Windows)
         }
     }
     /// Every in-flight buffer/OVERLAPPED/event remains owned until actual kernel completion.

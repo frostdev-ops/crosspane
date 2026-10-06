@@ -1,5 +1,5 @@
 use super::super::native_io::{Cancellation, Clock, NativeError, NativeResult, process::Deadline};
-use super::{Endpoint, run};
+use super::{Endpoint, StopAcknowledgement, run, run_stop};
 use crate::agent_contract::{AgentCall, AgentReply, MAX_QUEUE};
 use std::{
     sync::{
@@ -20,8 +20,16 @@ impl Drop for Slot {
         WORKERS.fetch_sub(1, Ordering::Release);
     }
 }
+pub(super) enum WorkRequest {
+    Ordinary(AgentCall),
+    #[allow(dead_code)] // Same private worker branch; production Stop constructor awaits A4.
+    Stop {
+        expected_instance: u64,
+        reply: mpsc::SyncSender<Result<StopAcknowledgement, crate::agent_contract::CallFailure>>,
+    },
+}
 pub(super) struct Work {
-    pub call: AgentCall,
+    pub request: WorkRequest,
     pub deadline: Deadline,
     pub endpoint: Arc<dyn Endpoint>,
     pub retired: Arc<AtomicBool>,
@@ -62,6 +70,34 @@ pub(super) fn start(
                 };
                 current.store(true, Ordering::Release);
                 let flight = Flight(current.clone());
+                if let WorkRequest::Stop {
+                    expected_instance,
+                    reply,
+                } = &work.request
+                {
+                    let result =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if work.retired.load(Ordering::Acquire) {
+                                Err(crate::agent_contract::CallFailure::Unavailable)
+                            } else {
+                                run_stop(work.endpoint.as_ref(), *expected_instance, &work.deadline)
+                            }
+                        })) {
+                            Ok(result) => result,
+                            Err(_) => {
+                                Err(crate::agent_contract::CallFailure::TimeoutOutcomeUnknown)
+                            }
+                        };
+                    // A consumed Stop selection always terminates. Retirement precedes active
+                    // release/reply, and native completion still precedes dropping this Work/slot.
+                    work.retired.store(true, Ordering::Release);
+                    drop(flight);
+                    let _ = reply.try_send(result);
+                    break;
+                }
+                let WorkRequest::Ordinary(call) = &work.request else {
+                    break;
+                };
                 let (result, source) =
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if work.retired.load(Ordering::Acquire) {
@@ -70,7 +106,7 @@ pub(super) fn start(
                                 crate::agent_contract::ObservationSource::Demo,
                             )
                         } else {
-                            run(work.endpoint.as_ref(), &work.call.request, &work.deadline)
+                            run(work.endpoint.as_ref(), &call.request, &work.deadline)
                         }
                     })) {
                         Ok(result) => result,
@@ -92,7 +128,7 @@ pub(super) fn start(
                 drop(flight);
                 if results
                     .try_send(AgentReply {
-                        id: work.call.id,
+                        id: call.id,
                         observed_at_ms: clock.now_ms(),
                         source,
                         result,
