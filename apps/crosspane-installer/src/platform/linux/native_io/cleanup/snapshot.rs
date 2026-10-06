@@ -1,11 +1,13 @@
 use super::*;
+// `st_nlink` is u64 on x86_64 and u32 on aarch64.
+#[allow(clippy::unnecessary_cast)]
 pub(super) fn identity(s: &rfs::Stat) -> [u64; 10] {
     [
         s.st_dev,
         s.st_ino,
         s.st_uid as u64,
         s.st_mode as u64,
-        s.st_nlink,
+        s.st_nlink as u64,
         s.st_size as u64,
         s.st_mtime as u64,
         s.st_mtime_nsec,

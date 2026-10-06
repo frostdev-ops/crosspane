@@ -13,13 +13,15 @@ struct Leaf {
     changed: (i64, u64),
 }
 impl From<&rfs::Stat> for Leaf {
+    // `st_nlink` is u64 on x86_64 and u32 on aarch64.
+    #[allow(clippy::unnecessary_cast)]
     fn from(s: &rfs::Stat) -> Self {
         Self {
             device: s.st_dev,
             inode: s.st_ino,
             uid: s.st_uid,
             mode: s.st_mode,
-            links: s.st_nlink,
+            links: s.st_nlink as u64,
             size: s.st_size,
             modified: (s.st_mtime, s.st_mtime_nsec),
             changed: (s.st_ctime, s.st_ctime_nsec),
