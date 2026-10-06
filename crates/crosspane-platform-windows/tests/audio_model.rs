@@ -527,7 +527,8 @@ fn format_boundaries_and_invalid_source_fail_before_render() {
 }
 
 #[cfg(windows)]
-use crosspane_platform_windows::model;
+#[path = "../src/model/mod.rs"]
+pub mod model;
 #[cfg(windows)]
 #[path = "../src/audio.rs"]
 mod native;

@@ -13,8 +13,8 @@
 #![allow(unsafe_code)]
 
 use crate::model::audio::{
-    Converter, MAX_RENDER_FRAMES, MixFormat, SPEAKER_FRAME_SAMPLES, SourceLifecycle, SourceSet,
-    SpeakerMixer, StreamControl, wait_open,
+    BorrowedDescriptor, Converter, MAX_RENDER_FRAMES, MixFormat, SPEAKER_FRAME_SAMPLES,
+    SourceLifecycle, SourceSet, SpeakerMixer, StreamControl, wait_open,
 };
 use crosspane_platform::{
     AudioCapture, AudioDeviceError, AudioEvent, AudioFormat, AudioHost, AudioKind, AudioPlayback,
@@ -630,7 +630,7 @@ struct SourceActivation {
     refs: AtomicU32,
     done: Arc<Wake>,
     parameters: AUDIOCLIENT_ACTIVATION_PARAMS,
-    variant: PROPVARIANT,
+    variant: BorrowedDescriptor<PROPVARIANT>,
 }
 unsafe extern "system" fn source_query(
     this: *mut c_void,
@@ -674,6 +674,7 @@ unsafe extern "system" fn source_release(this: *mut c_void) -> u32 {
     };
     if n == 0 {
         // SAFETY: no COM caller or callback retains the allocation after its final release.
+        // The borrowed descriptor does not clear inline parameters; this Box alone owns them.
         unsafe {
             drop(Box::from_raw(this.cast::<SourceActivation>()));
         }
@@ -716,9 +717,9 @@ fn activate_source(
                 },
             },
         },
-        variant: PROPVARIANT::default(),
+        variant: BorrowedDescriptor::new(PROPVARIANT::default()),
     });
-    object.variant = PROPVARIANT {
+    object.variant = BorrowedDescriptor::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_BLOB,
@@ -732,16 +733,18 @@ fn activate_source(
                 ..Default::default()
             }),
         },
-    };
+    });
     let pointer = Box::into_raw(object);
-    // SAFETY: exact reprC COM layout; handler owns the initial reference and inline blob.
+    // SAFETY: exact reprC COM layout; handler owns the initial reference. Inline parameters
+    // stay in this stable allocation until its FINAL COM release.
     let handler = unsafe { IActivateAudioInterfaceCompletionHandler::from_raw(pointer.cast()) };
-    // SAFETY: public process-tree loopback only; parameter storage lives through the operation.
+    // SAFETY: public process-tree loopback only; descriptor borrows inline backing retained
+    // through the final handler release, including late completion after caller retirement.
     let operation = unsafe {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(&(*pointer).variant),
+            Some((*pointer).variant.get()),
             &handler,
         )
     }

@@ -9,6 +9,7 @@ use crosspane_platform::{AudioDeviceError, AudioFormat, IoGate, PlatformError};
 use rtrb::Consumer;
 use std::{
     fmt,
+    mem::ManuallyDrop,
     sync::mpsc::Receiver,
     sync::{
         Arc,
@@ -17,6 +18,24 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+/// A borrowed descriptor whose owning destructor must not clear its backing storage.
+/// Only an immutable view is exposed; the native owner retains stable backing until final release.
+/// This storage is not for descriptors owning separately allocated payloads.
+#[allow(dead_code)] // Used by the Windows adapter; its ownership tests also run on other hosts.
+#[repr(transparent)]
+pub(crate) struct BorrowedDescriptor<T>(ManuallyDrop<T>);
+
+#[allow(dead_code)]
+impl<T> BorrowedDescriptor<T> {
+    pub(crate) fn new(descriptor: T) -> Self {
+        Self(ManuallyDrop::new(descriptor))
+    }
+
+    pub(crate) fn get(&self) -> &T {
+        &self.0
+    }
+}
 
 pub const MAX_RENDER_FRAMES: usize = 16_384;
 const CHUNK: usize = 256;
@@ -513,6 +532,93 @@ impl SpeakerMixer {
             } else {
                 0.0
             };
+        }
+    }
+}
+
+#[cfg(test)]
+mod borrowed_activation_tests {
+    use super::BorrowedDescriptor;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct DescriptorSpy<'a> {
+        clears: &'a AtomicUsize,
+        value: usize,
+    }
+
+    impl Drop for DescriptorSpy<'_> {
+        fn drop(&mut self) {
+            // A safe scalar spy stands in for a descriptor clearing borrowed storage.
+            self.clears.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct BackingSpy<'a>(&'a AtomicUsize);
+
+    impl Drop for BackingSpy<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct Owner<'a> {
+        descriptor: BorrowedDescriptor<DescriptorSpy<'a>>,
+        _backing: BackingSpy<'a>,
+    }
+
+    fn owner<'a>(clears: &'a AtomicUsize, drops: &'a AtomicUsize) -> Arc<Owner<'a>> {
+        Arc::new(Owner {
+            descriptor: BorrowedDescriptor::new(DescriptorSpy { clears, value: 17 }),
+            _backing: BackingSpy(drops),
+        })
+    }
+
+    #[test]
+    fn borrowed_activation_descriptor_never_clears_inline_backing() {
+        let clears = AtomicUsize::new(0);
+        let drops = AtomicUsize::new(0);
+        let allocation = owner(&clears, &drops);
+        assert_eq!(allocation.descriptor.get().value, 17);
+        drop(allocation);
+        assert_eq!(clears.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn borrowed_activation_storage_survives_retained_reference() {
+        let clears = AtomicUsize::new(0);
+        let drops = AtomicUsize::new(0);
+        let local = owner(&clears, &drops);
+        let retained = local.clone();
+        drop(local);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(clears.load(Ordering::SeqCst), 0);
+        assert_eq!(retained.descriptor.get().value, 17);
+        drop(retained);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(clears.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn borrowed_activation_error_exits_do_not_clear_borrowed_parameters() {
+        // Different retained-reference counts model early error, cancelled wait and late completion.
+        // These are storage-lifetime scopes, not an assertion about the operating system's COM calls.
+        for retained_count in 0..=2 {
+            let clears = AtomicUsize::new(0);
+            let drops = AtomicUsize::new(0);
+            let local = owner(&clears, &drops);
+            let retained: Vec<_> = (0..retained_count).map(|_| local.clone()).collect();
+            drop(local);
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                usize::from(retained_count == 0)
+            );
+            drop(retained);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(clears.load(Ordering::SeqCst), 0);
         }
     }
 }

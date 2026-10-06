@@ -5,7 +5,8 @@
 #![allow(unsafe_code, clippy::unwrap_used, clippy::expect_used)]
 
 use crosspane_platform::{AudioHost, AudioKind, IoGate};
-use crosspane_platform_windows::model;
+#[path = "../src/model/mod.rs"]
+pub mod model;
 #[path = "../src/audio.rs"]
 mod native;
 use native::WindowsAudioHost;
