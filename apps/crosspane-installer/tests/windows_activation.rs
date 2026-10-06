@@ -535,3 +535,433 @@ fn malformed_predecessor_tuple_is_refused_by_the_actual_journal_validator() {
         );
     }
 }
+
+/// Only observations and production portable seams run here, never native permit factories.
+mod a4c_logon {
+    use super::*;
+    use native_io::{
+        activation::{
+            EntrySelection, EpochProvenance, HistoryCorrelation, LogonRecordPhase,
+            SupervisorLogonRecord, select_entry,
+        },
+        epoch_archive::{
+            HistoryRequirement, classify_prior_logon_status, first_logon_absence,
+            history_requirement, select_correlated_slots,
+        },
+        identity::{Sid, TokenFacts},
+    };
+    use service::{
+        journal::{Journal, Phase as JournalPhase},
+        supervisor::{Generation, InitialEpochPort, initialize_epoch},
+    };
+
+    const ABSENT: i32 = 0xC000005Fu32 as i32;
+
+    fn sid(parts: &[u32]) -> Sid {
+        let mut bytes = vec![1, parts.len() as u8, 0, 0, 0, 0, 0, 5];
+        for part in parts {
+            bytes.extend_from_slice(&part.to_le_bytes());
+        }
+        Sid::from_bytes(bytes).unwrap()
+    }
+    fn context(authentication_id: u64, session: u32) -> TokenFacts {
+        TokenFacts {
+            user: sid(&[21, 101]),
+            logon: sid(&[
+                5,
+                (authentication_id >> 32) as u32,
+                authentication_id as u32,
+            ]),
+            session,
+            elevated: false,
+            integrity: 0x2000,
+            authentication_id,
+            impersonating: false,
+        }
+    }
+    fn provenance(epoch: u8) -> EpochProvenance {
+        EpochProvenance::new(
+            [epoch; 16],
+            [epoch + 16; 16],
+            &context(100 + u64::from(epoch), u32::from(epoch)),
+            700 + u32::from(epoch),
+            1000 + u64::from(epoch),
+        )
+        .unwrap()
+    }
+    fn journal(provenance: &EpochProvenance, phase: JournalPhase) -> Journal {
+        let generation = Generation {
+            pid: 900,
+            creation: 2000,
+            instance: u64::MAX,
+        };
+        Journal {
+            schema_version: 1,
+            registration: provenance.registration(),
+            operation: provenance.operation(),
+            user: provenance.user().into(),
+            phase,
+            current: Some(generation),
+            stop_instance: (phase == JournalPhase::StopIntent).then_some(generation.instance),
+            original_xml: None,
+            restart_times: vec![],
+            last_tick_ms: 10,
+            clock_epoch: provenance.clock_epoch(),
+        }
+    }
+    fn bound(epoch: u8) -> SupervisorLogonRecord {
+        let provenance = provenance(epoch);
+        let mut record = SupervisorLogonRecord::new(provenance.clone()).unwrap();
+        record
+            .bind(&journal(&provenance, JournalPhase::Running))
+            .unwrap();
+        record
+    }
+    fn stamp(slot: u8) -> payload::recovery::FileStamp {
+        payload::recovery::FileStamp {
+            volume: 1,
+            file: [slot + 3; 16],
+        }
+    }
+    fn hash(journal: &Journal) -> [u8; 32] {
+        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &journal.encode().unwrap())
+            .as_ref()
+            .try_into()
+            .unwrap()
+    }
+    fn archived(record: &SupervisorLogonRecord, slot: u8, prior: &Journal) -> HistoryCorrelation {
+        HistoryCorrelation::new(slot, record.current().clone(), stamp(slot), hash(prior)).unwrap()
+    }
+
+    struct InitialFake {
+        events: Vec<&'static str>,
+        fail: Option<&'static str>,
+        admission: NativeResult<()>,
+        preparing: bool,
+        ready: bool,
+        bound: bool,
+    }
+    impl InitialFake {
+        fn admitted(admission: NativeResult<()>) -> Self {
+            Self {
+                events: vec![],
+                fail: None,
+                admission,
+                preparing: false,
+                ready: false,
+                bound: false,
+            }
+        }
+        fn step(&mut self, name: &'static str) -> NativeResult<()> {
+            self.events.push(name);
+            if self.fail == Some(name) {
+                Err(NativeError::OutcomeUnknown)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl InitialEpochPort for InitialFake {
+        type Child = u8;
+        type Ready = u8;
+        fn prepare_epoch(&mut self) -> NativeResult<()> {
+            self.step("epoch")?;
+            self.admission?;
+            self.preparing = true;
+            Ok(())
+        }
+        fn create(&mut self) -> NativeResult<Self::Child> {
+            assert!(self.preparing && !self.ready && !self.bound);
+            self.step("create")?;
+            Ok(1)
+        }
+        fn await_ready(&mut self, child: &Self::Child) -> NativeResult<Self::Ready> {
+            assert_eq!(*child, 1);
+            self.step("ready")?;
+            self.ready = true;
+            Ok(2)
+        }
+        fn publish_running(&mut self, ready: &Self::Ready) -> NativeResult<()> {
+            assert_eq!(*ready, 2);
+            assert!(self.preparing && self.ready && !self.bound);
+            self.step("running")?;
+            self.bound = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn first_logon_absence_before_create_and_ready_before_running() {
+        assert_eq!(select_entry(None), Ok(EntrySelection::Logon));
+        assert_eq!(
+            first_logon_absence(None, false, false, false, false),
+            Ok(())
+        );
+        let mut fake = InitialFake::admitted(first_logon_absence(None, false, false, false, false));
+        assert_eq!(initialize_epoch(&mut fake), Ok(2));
+        assert_eq!(fake.events, ["epoch", "create", "ready", "running"]);
+        assert!(fake.bound);
+        // A residual fixed archive slot is not positive first-logon absence.
+        assert_eq!(
+            first_logon_absence(None, false, false, false, true),
+            Err(NativeError::Unsupported)
+        );
+        let preparing = SupervisorLogonRecord::new(provenance(1)).unwrap();
+        let running = journal(preparing.current(), JournalPhase::Running);
+        assert_eq!(
+            preparing.matches_current(&running),
+            Err(NativeError::OutcomeUnknown)
+        );
+        for facts in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let mut fake = InitialFake::admitted(first_logon_absence(
+                None, facts.0, facts.1, facts.2, facts.3,
+            ));
+            assert!(initialize_epoch(&mut fake).is_err());
+            assert_eq!(fake.events, ["epoch"]);
+            assert!(!fake.preparing && !fake.ready && !fake.bound);
+        }
+        for (index, stage) in ["epoch", "create", "ready", "running"].iter().enumerate() {
+            let mut fake = InitialFake::admitted(Ok(()));
+            fake.fail = Some(stage);
+            assert_eq!(
+                initialize_epoch(&mut fake),
+                Err(NativeError::OutcomeUnknown)
+            );
+            assert_eq!(fake.events.len(), index + 1);
+            assert!(!fake.bound);
+        }
+    }
+
+    #[test]
+    fn second_clean_logon_requires_exact_disposition() {
+        let prior_record = bound(1);
+        let prior = journal(prior_record.current(), JournalPhase::Finished);
+        let bytes = prior.encode().unwrap();
+        assert_eq!(
+            prior_record.matches_current(&prior),
+            Ok(prior_record.current())
+        );
+        let new_context = context(102, 2);
+        assert!(!prior_record.current().matches_context(&new_context));
+        let mut fake = InitialFake::admitted(classify_prior_logon_status(ABSENT, false));
+        assert_eq!(initialize_epoch(&mut fake), Ok(2));
+        let mut next = prior_record
+            .rotate(provenance(2), archived(&prior_record, 0, &prior))
+            .unwrap();
+        assert_eq!(next.phase(), LogonRecordPhase::Preparing);
+        next.bind(&journal(next.current(), JournalPhase::Running))
+            .unwrap();
+        assert!(
+            next.matches_history(0, &prior, stamp(0), hash(&prior))
+                .is_ok()
+        );
+        assert_eq!(prior.encode().unwrap(), bytes);
+        for (status, data) in [
+            (0, true),
+            (0, false),
+            (0xC0000022u32 as i32, false),
+            (0xC0000001u32 as i32, false),
+            (ABSENT, true),
+        ] {
+            let mut fake = InitialFake::admitted(classify_prior_logon_status(status, data));
+            assert!(initialize_epoch(&mut fake).is_err());
+            assert_eq!(fake.events, ["epoch"]);
+        }
+        let mut foreign = prior.clone();
+        foreign.operation = [99; 16];
+        assert_eq!(
+            prior_record.matches_current(&foreign),
+            Err(NativeError::Foreign)
+        );
+    }
+
+    #[test]
+    fn earlier_crash_residue_preserves_known_history() {
+        for phase in [
+            JournalPhase::Running,
+            JournalPhase::Backoff,
+            JournalPhase::StartRequested,
+        ] {
+            let prior_record = bound(1);
+            let prior = journal(prior_record.current(), phase);
+            let bytes = prior.encode().unwrap();
+            assert_eq!(
+                history_requirement(&prior),
+                Ok(HistoryRequirement::PriorLogonDisposition)
+            );
+            prior_record.matches_current(&prior).unwrap();
+            let admission = classify_prior_logon_status(ABSENT, false);
+            let mut fake = InitialFake::admitted(admission);
+            assert_eq!(initialize_epoch(&mut fake), Ok(2));
+            let next = prior_record
+                .rotate(provenance(2), archived(&prior_record, 1, &prior))
+                .unwrap();
+            assert!(
+                next.matches_history(1, &prior, stamp(1), hash(&prior))
+                    .is_ok()
+            );
+            assert_eq!(prior.encode().unwrap(), bytes);
+            assert!(
+                next.matches_current(&journal(next.current(), JournalPhase::Running))
+                    .is_err()
+            );
+            assert_eq!(
+                next.matches_history(1, &prior, stamp(0), hash(&prior)),
+                Err(NativeError::Foreign)
+            );
+            assert_eq!(
+                next.matches_history(1, &prior, stamp(1), [9; 32]),
+                Err(NativeError::Foreign)
+            );
+        }
+        let record = bound(1);
+        let unknown = journal(record.current(), JournalPhase::Unknown);
+        assert_eq!(history_requirement(&unknown), Err(NativeError::Foreign));
+        assert_eq!(record.matches_current(&unknown), Err(NativeError::Foreign));
+        let mut malformed = journal(record.current(), JournalPhase::Running);
+        malformed.current = None;
+        assert!(history_requirement(&malformed).is_err());
+        assert!(record.matches_current(&malformed).is_err());
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&record.encode().unwrap()).unwrap();
+        encoded["data"]["extra_authority"] = serde_json::json!(true);
+        assert!(SupervisorLogonRecord::decode(&serde_json::to_vec(&encoded).unwrap()).is_err());
+    }
+
+    #[test]
+    fn concurrent_same_logon_refuses_before_create() {
+        let original = bound(1);
+        let before = original.encode().unwrap();
+        let mut first = InitialFake::admitted(Ok(()));
+        assert_eq!(initialize_epoch(&mut first), Ok(2));
+        // The production port short-circuits the failed first-instance admission. This proves
+        // ordering only; actual kernel pipe uniqueness remains an unrun native row.
+        let mut second = InitialFake::admitted(Err(NativeError::Busy));
+        assert_eq!(initialize_epoch(&mut second), Err(NativeError::Busy));
+        assert_eq!(second.events, ["epoch"]);
+        assert!(!second.preparing && !second.ready && !second.bound);
+        assert_eq!(original.encode().unwrap(), before);
+        assert!(original.current().matches_context(&context(101, 1)));
+        // Present/reused LUID cannot acquire a fresh budget through mere identity inequality.
+        assert!(classify_prior_logon_status(0, false).is_err());
+    }
+
+    #[test]
+    fn consumed_activation_stays_unchanged() {
+        let mut task = record();
+        task.registered().unwrap();
+        assert_eq!(select_entry(Some(&task)), Ok(EntrySelection::Logon));
+        task.run_intent().unwrap();
+        assert_eq!(select_entry(Some(&task)), Ok(EntrySelection::Installer));
+        task.claim_supervisor(SupervisorClaim {
+            pid: 700,
+            creation: 1000,
+        })
+        .unwrap();
+        let bytes = task.encode().unwrap();
+        assert_eq!(select_entry(Some(&task)), Ok(EntrySelection::Logon));
+        assert_eq!(
+            first_logon_absence(Some(&task), false, false, false, false),
+            Err(NativeError::Unsupported)
+        );
+        let prior_record = bound(1);
+        let prior = journal(prior_record.current(), JournalPhase::Finished);
+        prior_record.matches_current(&prior).unwrap();
+        let mut fake = InitialFake::admitted(classify_prior_logon_status(ABSENT, false));
+        assert_eq!(initialize_epoch(&mut fake), Ok(2));
+        assert_eq!(task.encode().unwrap(), bytes);
+        assert_eq!(
+            task.claim_supervisor(SupervisorClaim {
+                pid: 701,
+                creation: 1001
+            }),
+            Err(NativeError::Foreign)
+        );
+        assert_eq!(task.encode().unwrap(), bytes);
+        assert_eq!(
+            select_entry(Some(&record())),
+            Err(NativeError::OutcomeUnknown)
+        );
+        let mut encoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        encoded["data"]["phase"] = serde_json::json!("unknown");
+        assert!(TaskActivationRecord::decode(&serde_json::to_vec(&encoded).unwrap()).is_err());
+        let mut registered = record();
+        registered.registered().unwrap();
+        let mut unknown: serde_json::Value =
+            serde_json::from_slice(&registered.encode().unwrap()).unwrap();
+        unknown["data"]["phase"] = serde_json::json!("unknown");
+        let unknown = TaskActivationRecord::decode(&serde_json::to_vec(&unknown).unwrap()).unwrap();
+        assert_eq!(
+            select_entry(Some(&unknown)),
+            Err(NativeError::OutcomeUnknown)
+        );
+    }
+
+    #[test]
+    fn upgrade_then_logon_preserves_later_upgrade_history() {
+        let mut record = bound(1);
+        let mut slots: [Option<Journal>; 3] = [None, None, None];
+        for epoch in 1..=5 {
+            let phase = if epoch == 1 {
+                JournalPhase::Finished
+            } else {
+                JournalPhase::Running
+            };
+            let prior = journal(record.current(), phase);
+            let (slot, prune) = select_correlated_slots(&slots).unwrap();
+            assert_eq!(prune, epoch > 3);
+            let expected = history_requirement(&prior).unwrap();
+            assert_eq!(
+                expected,
+                if epoch == 1 {
+                    HistoryRequirement::Terminal
+                } else {
+                    HistoryRequirement::PriorLogonDisposition
+                }
+            );
+            classify_prior_logon_status(ABSENT, false).unwrap();
+            let next = record
+                .rotate(provenance(epoch + 1), archived(&record, slot, &prior))
+                .unwrap();
+            slots[usize::from(slot)] = Some(prior.clone());
+            record = next;
+            record
+                .bind(&journal(record.current(), JournalPhase::Running))
+                .unwrap();
+            assert_eq!(record.history().len(), usize::from(epoch.min(3)));
+            for (index, historical) in slots.iter().enumerate() {
+                if let Some(historical) = historical {
+                    let slot = index as u8;
+                    record
+                        .matches_history(slot, historical, stamp(slot), hash(historical))
+                        .unwrap();
+                    assert_eq!(
+                        record.matches_history(slot, historical, stamp(slot), [7; 32]),
+                        Err(NativeError::Foreign)
+                    );
+                }
+            }
+            assert_eq!(
+                SupervisorLogonRecord::decode(&record.encode().unwrap()).unwrap(),
+                record
+            );
+        }
+        let mut unknown = slots[0].clone().unwrap();
+        unknown.phase = JournalPhase::Unknown;
+        assert_eq!(
+            select_correlated_slots(&[Some(unknown), None, None]),
+            Err(NativeError::Foreign)
+        );
+        let missing = bound(6);
+        let historical = slots[0].as_ref().unwrap();
+        assert_eq!(
+            missing.matches_history(0, historical, stamp(0), hash(historical)),
+            Err(NativeError::Foreign)
+        );
+    }
+}

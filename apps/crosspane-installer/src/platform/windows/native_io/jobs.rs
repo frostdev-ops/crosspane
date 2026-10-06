@@ -609,6 +609,8 @@ mod native {
     enum PermitSource {
         #[cfg(not(test))]
         Initial(Arc<super::super::super::service::task::TaskRunPermit>),
+        #[cfg(not(test))]
+        Logon(Arc<super::super::super::service::SupervisorLogonPermit>),
         Restart(Journal),
     }
     impl ChildStartPermit {
@@ -631,12 +633,43 @@ mod native {
             result.reverify(proof, deadline)?;
             Ok(result)
         }
+        /// Separate genuine logon admission; never converts or resets an installer task claim.
+        #[cfg(not(test))]
+        pub(crate) fn initial_logon(
+            owner: Arc<SupervisorOwner>,
+            permit: Arc<super::super::super::service::SupervisorLogonPermit>,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<Self>> {
+            if permit.owner_identity().pid() != owner.original.pid()
+                || permit.owner_identity().creation() != owner.original.creation()
+            {
+                return Err(NativeError::Foreign);
+            }
+            let result = Arc::new(Self {
+                owner,
+                source: PermitSource::Logon(permit),
+            });
+            result.reverify(proof, deadline)?;
+            Ok(result)
+        }
         fn reverify(&self, proof: &SupportProof, deadline: &Deadline) -> NativeResult<()> {
             self.owner.reverify(proof, deadline)?;
             match &self.source {
                 #[cfg(not(test))]
                 PermitSource::Initial(permit) => {
                     permit.reverify(self.owner.admission.io(), proof, deadline)
+                }
+                #[cfg(not(test))]
+                PermitSource::Logon(permit) => {
+                    permit.reverify(self.owner.admission.io(), proof, deadline)?;
+                    // Only the actual completed archive/Preparing admission can mint this gate.
+                    // Retain it through the permit and renew before each native dispatch.
+                    permit.reservation().ensure_epoch_prepared(
+                        self.owner.admission.io(),
+                        proof,
+                        deadline,
+                    )
                 }
                 PermitSource::Restart(record) => {
                     let current = Journal::read(self.owner.admission.io(), proof, deadline)?

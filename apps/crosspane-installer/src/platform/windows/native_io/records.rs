@@ -76,6 +76,7 @@ pub enum RecordKind {
     Operation,
     Supervisor,
     TaskActivation,
+    SupervisorLogon,
     SupervisorArchiveIntent,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +86,7 @@ pub enum RecordName {
     Operation([u8; 16]),
     Supervisor,
     TaskActivation,
+    SupervisorLogon,
     SupervisorEpoch(u8),
     SupervisorArchiveIntent,
 }
@@ -95,6 +97,7 @@ impl RecordName {
             Self::StageCatalog => super::files::PrivateName::new("stage-catalog.json"),
             Self::Supervisor => super::files::PrivateName::new("supervisor.json"),
             Self::TaskActivation => super::files::PrivateName::new("task-activation.json"),
+            Self::SupervisorLogon => super::files::PrivateName::new("supervisor-logon.json"),
             Self::SupervisorEpoch(0) => super::files::PrivateName::new("supervisor-epoch-0.json"),
             Self::SupervisorEpoch(1) => super::files::PrivateName::new("supervisor-epoch-1.json"),
             Self::SupervisorEpoch(2) => super::files::PrivateName::new("supervisor-epoch-2.json"),
@@ -114,6 +117,7 @@ impl RecordName {
             Self::Operation(_) => RecordKind::Operation,
             Self::Supervisor => RecordKind::Supervisor,
             Self::TaskActivation => RecordKind::TaskActivation,
+            Self::SupervisorLogon => RecordKind::SupervisorLogon,
             Self::SupervisorEpoch(_) => RecordKind::Supervisor,
             Self::SupervisorArchiveIntent => RecordKind::SupervisorArchiveIntent,
         }

@@ -48,8 +48,84 @@ impl ArchiveIntent {
         Ok(())
     }
 }
-/// Read-only selection used by the production adapter. Every populated slot was decoded and
-/// validated from its fixed leaf first; its timestamp orders history only, never kernel authority.
+/// Status policy only. The native caller supplies the actual bounded LSA observation and
+/// separately renews its original context/deadline before constructing any private seal.
+pub(crate) fn classify_prior_logon_status(status: i32, has_data: bool) -> NativeResult<()> {
+    // Exact SDK STATUS_NO_SUCH_LOGON_SESSION; named native binding is checked at the call site.
+    const NO_SUCH_LOGON_SESSION: i32 = 0xC000005Fu32 as i32;
+    if status == NO_SUCH_LOGON_SESSION && !has_data {
+        Ok(())
+    } else {
+        Err(NativeError::Foreign)
+    }
+}
+
+/// Positive first-epoch absence policy, used only after fresh locked fixed-leaf observations.
+/// An old consumed task claim without provenance is not a first logon, even without a Journal.
+pub(crate) fn first_logon_absence(
+    task: Option<&super::activation::TaskActivationRecord>,
+    journal_present: bool,
+    provenance_present: bool,
+    archive_intent_present: bool,
+    archive_history_present: bool,
+) -> NativeResult<()> {
+    if journal_present || provenance_present {
+        return Err(NativeError::Foreign);
+    }
+    if archive_intent_present {
+        return Err(NativeError::OutcomeUnknown);
+    }
+    if archive_history_present {
+        return Err(NativeError::Unsupported);
+    }
+    if task.is_some_and(|record| record.claim().is_some()) {
+        return Err(NativeError::Unsupported);
+    }
+    if super::activation::select_entry(task)? != super::activation::EntrySelection::Logon {
+        return Err(NativeError::Foreign);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryRequirement {
+    Terminal,
+    PriorLogonDisposition,
+}
+/// A decoded phase determines which additional evidence is required, never whether an owner
+/// died. Nonterminal history needs exact correlated provenance and a fresh native disposition.
+pub(crate) fn history_requirement(journal: &Journal) -> NativeResult<HistoryRequirement> {
+    use super::super::service::journal::Phase;
+    let admitted = Journal::decode(&journal.encode()?)?;
+    match admitted.phase {
+        Phase::Finished | Phase::StopIntent => Ok(HistoryRequirement::Terminal),
+        Phase::Running | Phase::Backoff | Phase::StartRequested => {
+            Ok(HistoryRequirement::PriorLogonDisposition)
+        }
+        Phase::Planned | Phase::Unknown => Err(NativeError::Foreign),
+    }
+}
+/// Quota selection only. Production first validates every populated slot with its required
+/// actual admission. This function cannot construct a disposition or archive capability.
+pub(crate) fn select_correlated_slots(slots: &[Option<Journal>; 3]) -> NativeResult<(u8, bool)> {
+    for journal in slots.iter().flatten() {
+        history_requirement(journal)?;
+    }
+    if let Some(slot) = slots.iter().position(Option::is_none) {
+        return Ok((slot as u8, false));
+    }
+    let slot = slots
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, journal)| journal.as_ref().map(|journal| journal.clock_epoch))
+        .map(|(slot, _)| slot as u8)
+        .ok_or(NativeError::Invalid)?;
+    Ok((slot, true))
+}
+
+/// Preserved legacy terminal-only selection for the existing fakes. Production uses
+/// `select_correlated_slots` after native evidence validation; timestamps order history only.
+#[cfg(test)]
 pub(crate) fn select_slot(slots: &[Option<Journal>; 3]) -> NativeResult<(u8, bool)> {
     for journal in slots.iter().flatten() {
         let encoded = journal.encode()?;

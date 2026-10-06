@@ -742,3 +742,228 @@ mod tests {
         assert_eq!(start_supported(), Err(NativeError::Unsupported));
     }
 }
+
+/// Private genuine logon admission; records and route observations never construct these seals.
+#[cfg(all(windows, not(test)))]
+mod logon {
+    use super::super::native_io::{
+        Deadline, LogonReservation, NativeError, NativeResult, PriorLogonDisposition, SupportProof,
+        WindowsNativeIo,
+        activation::{self, EntrySelection, TaskActivationRecord},
+        identity::TokenFacts,
+        process::own::OwnProcessIdentity,
+    };
+    use super::{NativeImages, TrustedImages};
+    use std::sync::Arc;
+
+    pub(crate) struct SupervisorLogonCandidate {
+        images: Arc<NativeImages>,
+        owner: OwnProcessIdentity,
+        context: TokenFacts,
+        user: String,
+        epoch: [u8; 16],
+    }
+    impl std::fmt::Debug for SupervisorLogonCandidate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("SupervisorLogonCandidate")
+        }
+    }
+    fn checked_images(
+        trusted: &TrustedImages,
+        deadline: &Deadline,
+    ) -> NativeResult<Arc<NativeImages>> {
+        let images = trusted._native.clone();
+        images.reverify(deadline)?;
+        if images.module.identity() != images.installer.identity()
+            || images.module.canonical_dos_path() != images.installer.canonical_dos_path()
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(images)
+    }
+    fn selected(images: &Arc<NativeImages>, deadline: &Deadline) -> NativeResult<EntrySelection> {
+        images.reverify(deadline)?;
+        let proof = images.io.admit_support(deadline)?;
+        let record = TaskActivationRecord::read(&images.io, &proof, deadline)?;
+        if let Some(record) = &record {
+            record.bind(
+                record.operation(),
+                &images.io.target().identity().user.sddl(),
+                images.installer.identity(),
+            )?;
+        }
+        activation::select_entry(record.as_ref())
+    }
+    pub(super) fn entry_selection(
+        trusted: &TrustedImages,
+        deadline: &Deadline,
+    ) -> NativeResult<EntrySelection> {
+        selected(&checked_images(trusted, deadline)?, deadline)
+    }
+    pub(super) fn prepare_logon(
+        trusted: &TrustedImages,
+        deadline: &Deadline,
+    ) -> NativeResult<SupervisorLogonCandidate> {
+        let images = checked_images(trusted, deadline)?;
+        if selected(&images, deadline)? != EntrySelection::Logon {
+            return Err(NativeError::Foreign);
+        }
+        let proof = images.io.admit_support(deadline)?;
+        let owner = images.io.own_process_identity(&proof, deadline)?;
+        let context = images.io.target().identity().clone();
+        let user = context.user.sddl();
+        let mut epoch = [0; 16];
+        aws_lc_rs::rand::fill(&mut epoch).map_err(|_| NativeError::Unavailable)?;
+        if epoch == [0; 16] {
+            return Err(NativeError::Unavailable);
+        }
+        // One native ID source for candidate, reservation, permit, Preparing record and Journal.
+        let candidate = SupervisorLogonCandidate {
+            images,
+            owner,
+            context,
+            user,
+            epoch,
+        };
+        let proof = candidate.images.io.admit_support(deadline)?;
+        candidate.reverify(&candidate.images.io, &proof, deadline)?;
+        Ok(candidate)
+    }
+    impl SupervisorLogonCandidate {
+        pub(crate) fn io(&self) -> &Arc<WindowsNativeIo> {
+            &self.images.io
+        }
+        pub(crate) fn operation(&self) -> [u8; 16] {
+            self.epoch
+        }
+        pub(crate) fn registration(&self) -> [u8; 16] {
+            self.epoch
+        }
+        pub(crate) fn user(&self) -> &str {
+            &self.user
+        }
+        pub(crate) fn context(&self) -> &TokenFacts {
+            &self.context
+        }
+        pub(crate) fn owner_identity(&self) -> &OwnProcessIdentity {
+            &self.owner
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !std::ptr::eq(io, self.images.io.as_ref()) {
+                return Err(NativeError::Foreign);
+            }
+            proof.check(io, deadline)?;
+            self.images.reverify(deadline)?;
+            self.owner.reverify(deadline)?;
+            if io.target().identity() != &self.context
+                || self.user != self.context.user.sddl()
+                || self.images.module.identity() != self.images.installer.identity()
+                || self.images.module.canonical_dos_path()
+                    != self.images.installer.canonical_dos_path()
+                || selected(&self.images, deadline)? != EntrySelection::Logon
+            {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()
+        }
+    }
+    pub(crate) struct SupervisorLogonPermit {
+        candidate: SupervisorLogonCandidate,
+        reservation: LogonReservation,
+        disposition: PriorLogonDisposition,
+    }
+    impl std::fmt::Debug for SupervisorLogonPermit {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("SupervisorLogonPermit")
+        }
+    }
+    pub(in super::super) fn admit_logon(
+        candidate: SupervisorLogonCandidate,
+        reservation: LogonReservation,
+        disposition: PriorLogonDisposition,
+        deadline: &Deadline,
+    ) -> NativeResult<SupervisorLogonPermit> {
+        let proof = candidate.io().admit_support(deadline)?;
+        candidate.reverify(candidate.io(), &proof, deadline)?;
+        reservation.reverify(candidate.io(), &proof, deadline)?;
+        if reservation.context() != candidate.context()
+            || reservation.owner_pid() != candidate.owner_identity().pid()
+            || reservation.owner_creation() != candidate.owner_identity().creation()
+        {
+            return Err(NativeError::Foreign);
+        }
+        // Correlation binds exactly once after genuine owner/context matching; reservation makes no IDs.
+        reservation.bind_epoch(
+            candidate.io(),
+            &proof,
+            candidate.registration(),
+            candidate.operation(),
+            deadline,
+        )?;
+        disposition.reverify(candidate.io(), &proof, deadline)?;
+        let permit = SupervisorLogonPermit {
+            candidate,
+            reservation,
+            disposition,
+        };
+        let proof = permit.io().admit_support(deadline)?;
+        permit.reverify(permit.io(), &proof, deadline)?;
+        Ok(permit)
+    }
+    impl SupervisorLogonPermit {
+        pub(crate) fn io(&self) -> &Arc<WindowsNativeIo> {
+            self.candidate.io()
+        }
+        pub(crate) fn operation(&self) -> [u8; 16] {
+            self.candidate.operation()
+        }
+        pub(crate) fn registration(&self) -> [u8; 16] {
+            self.candidate.registration()
+        }
+        pub(crate) fn user(&self) -> &str {
+            self.candidate.user()
+        }
+        pub(crate) fn context(&self) -> &TokenFacts {
+            self.candidate.context()
+        }
+        pub(crate) fn owner_identity(&self) -> &OwnProcessIdentity {
+            self.candidate.owner_identity()
+        }
+        pub(crate) fn reservation(&self) -> &LogonReservation {
+            &self.reservation
+        }
+        pub(crate) fn disposition(&self) -> &PriorLogonDisposition {
+            &self.disposition
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.candidate.reverify(io, proof, deadline)?;
+            self.reservation.reverify(io, proof, deadline)?;
+            if self.reservation.context() != self.context()
+                || self.reservation.owner_pid() != self.owner_identity().pid()
+                || self.reservation.owner_creation() != self.owner_identity().creation()
+                || self.reservation.registration()? != self.registration()
+                || self.reservation.operation()? != self.operation()
+            {
+                return Err(NativeError::Foreign);
+            }
+            self.disposition.reverify(io, proof, deadline)?;
+            deadline.check()
+        }
+    }
+}
+#[cfg(all(windows, not(test)))]
+pub(super) use logon::admit_logon;
+#[cfg(all(windows, not(test)))]
+pub(crate) use logon::{SupervisorLogonCandidate, SupervisorLogonPermit};
+#[cfg(all(windows, not(test)))]
+use logon::{entry_selection, prepare_logon};

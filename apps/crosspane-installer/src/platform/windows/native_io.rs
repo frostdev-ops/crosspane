@@ -75,6 +75,11 @@ pub use adapter::{InstallerLock, SupportProof, WindowsNativeIo, WindowsTarget};
 #[cfg(windows)]
 pub(crate) use adapter::{OpenedPe, PayloadRoot, PruneOutcome, SelfImagePin, StagedPe};
 
+#[cfg(all(windows, not(test)))]
+pub(crate) use adapter::{
+    LogonArchiveResult, LogonReservation, OwnedArchiveResult, PriorLogonDisposition,
+};
+
 #[cfg(windows)]
 mod adapter {
     use super::super::detect::{FixedPaths, FolderFacts};
@@ -1642,6 +1647,195 @@ mod adapter {
         }
     }
 
+    /// Genuine current-key reservation; never reconstructed from a logon record.
+    #[cfg(not(test))]
+    pub(crate) struct LogonReservation {
+        io: Arc<WindowsNativeIo>,
+        namespace: Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
+        own: process::own::OwnProcessIdentity,
+        context: TokenFacts,
+        epoch_prepared: std::sync::OnceLock<PreparedLogonGate>,
+        epoch: std::sync::OnceLock<([u8; 16], [u8; 16])>,
+    }
+    #[cfg(not(test))]
+    impl LogonReservation {
+        pub(crate) fn bind_epoch(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            registration: [u8; 16],
+            operation: [u8; 16],
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.reverify(io, proof, deadline)?;
+            if registration == [0; 16] || operation == [0; 16] {
+                return Err(NativeError::Invalid);
+            }
+            if let Some(bound) = self.epoch.get() {
+                return if *bound == (registration, operation) {
+                    Ok(())
+                } else {
+                    Err(NativeError::Foreign)
+                };
+            }
+            self.epoch
+                .set((registration, operation))
+                .map_err(|_| NativeError::Foreign)
+        }
+        pub(crate) fn registration(&self) -> NativeResult<[u8; 16]> {
+            self.epoch
+                .get()
+                .map(|value| value.0)
+                .ok_or(NativeError::Foreign)
+        }
+        pub(crate) fn operation(&self) -> NativeResult<[u8; 16]> {
+            self.epoch
+                .get()
+                .map(|value| value.1)
+                .ok_or(NativeError::Foreign)
+        }
+        pub(crate) fn context(&self) -> &TokenFacts {
+            &self.context
+        }
+        pub(crate) fn owner_pid(&self) -> u32 {
+            self.own.pid()
+        }
+        pub(crate) fn owner_creation(&self) -> u64 {
+            self.own.creation()
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !std::ptr::eq(io, self.io.as_ref()) || self.context != io.context.target.identity {
+                return Err(NativeError::Foreign);
+            }
+            let budget = proof.budget(io, deadline)?;
+            io.context.validate(&budget)?;
+            self.own.reverify(&budget)?;
+            self.namespace.reverify(io, proof, deadline)
+        }
+        /// This is a live-memory gate set only after the actual archive/preparation factory.
+        /// The record's phase cannot set it, and a cold reservation cannot inherit it.
+        pub(crate) fn ensure_epoch_prepared(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.reverify(io, proof, deadline)?;
+            let prepared = self.epoch_prepared.get().ok_or(NativeError::Foreign)?;
+            if prepared.provenance.current().registration() != self.registration()?
+                || prepared.provenance.current().operation() != self.operation()?
+            {
+                return Err(NativeError::Foreign);
+            }
+            let observed = verify_logon_preparing_files(
+                &self.io,
+                proof,
+                prepared.provenance.current(),
+                prepared.archived.as_ref(),
+                deadline,
+            )?;
+            if observed != prepared.provenance {
+                return Err(NativeError::Foreign);
+            }
+            let current = io
+                .read_record(
+                    proof,
+                    records::RecordName::SupervisorLogon,
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .ok_or(NativeError::Foreign)?;
+            if current.identity != prepared.preparing_identity
+                || current.bytes() != prepared.preparing_bytes
+            {
+                return Err(NativeError::Foreign);
+            }
+            self.reverify(io, proof, deadline)
+        }
+    }
+    /// Exact immutable token/epoch correlation obtained only from a fresh fixed record pair.
+    /// This does not select a PID, represent a job, or prove that an owner exited.
+    #[cfg(not(test))]
+    pub(crate) struct MatchedLogonProvenance {
+        io: Arc<WindowsNativeIo>,
+        epoch: super::activation::EpochProvenance,
+    }
+    #[cfg(not(test))]
+    enum PriorLogonKind {
+        FirstAbsent,
+        SessionGone(MatchedLogonProvenance),
+    }
+    /// Narrow logon/archive admission only. NEVER an UpgradeStopProof or job-zero observation.
+    #[cfg(not(test))]
+    pub(crate) struct PriorLogonDisposition {
+        io: Arc<WindowsNativeIo>,
+        kind: PriorLogonKind,
+    }
+    #[cfg(not(test))]
+    impl PriorLogonDisposition {
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !std::ptr::eq(io, self.io.as_ref()) {
+                return Err(NativeError::Foreign);
+            }
+            let budget = proof.budget(io, deadline)?;
+            io.context.validate(&budget)?;
+            match &self.kind {
+                PriorLogonKind::FirstAbsent => deadline.check(),
+                PriorLogonKind::SessionGone(prior) => io.query_prior_logon(proof, prior, deadline),
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    fn legacy_provenance_required() -> NativeError {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "Windows supervisor logon provenance unavailable; reinstall or upgrade required"
+        );
+        NativeError::Unsupported
+    }
+    #[cfg(not(test))]
+    struct LsaBuffer(
+        *mut windows_sys::Win32::Security::Authentication::Identity::SECURITY_LOGON_SESSION_DATA,
+    );
+    #[cfg(not(test))]
+    impl Drop for LsaBuffer {
+        fn drop(&mut self) {
+            // SAFETY: only STATUS_SUCCESS assigns documented ownership to this RAII buffer.
+            // No session names or returned contents are read; the same native worker frees it.
+            let _ = unsafe {
+                windows_sys::Win32::Security::Authentication::Identity::LsaFreeReturnBuffer(
+                    self.0.cast(),
+                )
+            };
+        }
+    }
+    // A failed call's nonnull output has undocumented ownership. Keep at most one opaque value;
+    // never dereference/free it, and refuse all subsequent queries instead of accumulating it.
+    #[cfg(not(test))]
+    static LOGON_QUERY_BUSY: AtomicBool = AtomicBool::new(false);
+    #[cfg(not(test))]
+    struct LogonQueryGuard;
+    #[cfg(not(test))]
+    impl Drop for LogonQueryGuard {
+        fn drop(&mut self) {
+            LOGON_QUERY_BUSY.store(false, Ordering::Release);
+        }
+    }
+    #[cfg(not(test))]
+    static LOGON_QUERY_QUARANTINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
     #[cfg(not(test))]
     pub(crate) struct ArchivedSupervisorEpoch {
         io: Arc<WindowsNativeIo>,
@@ -1687,6 +1881,7 @@ mod adapter {
             io.verify_stop_lock(proof, lock, deadline)?;
             namespace.reverify(io, proof, deadline)?;
             claim.reverify(io, proof, deadline)?;
+            preparing_matches(io, proof, &EpochClaim::Task(permit).epoch(io)?, deadline)?;
             let current = io.read_record(
                 proof,
                 records::RecordName::Supervisor,
@@ -1734,6 +1929,18 @@ mod adapter {
                         return Err(NativeError::Foreign);
                     }
                     let prior = super::super::service::journal::Journal::decode(record.bytes())?;
+                    let provenance = preparing_matches(
+                        io,
+                        proof,
+                        &EpochClaim::Task(permit).epoch(io)?,
+                        deadline,
+                    )?;
+                    provenance.matches_history(
+                        intent.slot,
+                        &prior,
+                        intent.source,
+                        intent.sha256,
+                    )?;
                     let selected =
                         super::super::payload::recovery::selected_operation(io, proof, deadline)?;
                     let lineage = super::activation::correlate_upgrade(
@@ -1753,6 +1960,211 @@ mod adapter {
             deadline.check()
         }
     }
+    #[cfg(not(test))]
+    impl OwnedArchiveResult {
+        pub(crate) fn publish_bound(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &Arc<super::super::service::task::TaskRunPermit>,
+            owner: &Arc<super::jobs::SupervisorOwner>,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let (original, namespace, claim) = match self {
+                Self::First(value) => (&value.io, &value.namespace, &value.permit),
+                Self::Archived(value) => (&value.io, &value.namespace, &value.permit),
+            };
+            if !std::ptr::eq(io, original.as_ref())
+                || !Arc::ptr_eq(permit, claim)
+                || !Arc::ptr_eq(namespace, &owner.exclusive_lease(proof, deadline)?)
+            {
+                return Err(NativeError::Foreign);
+            }
+            publish_epoch_bound(
+                io,
+                proof,
+                lock,
+                namespace,
+                EpochClaim::Task(permit),
+                owner,
+                deadline,
+            )
+        }
+    }
+    #[cfg(not(test))]
+    #[derive(Clone)]
+    struct ArchivedEpochFiles {
+        intent: super::epoch_archive::ArchiveIntent,
+        bytes: Vec<u8>,
+    }
+    /// Minted only by completed native preparation. Retains exact immutable observed files and
+    /// correlation, not an Arc to result/permit: no reservation/permit ownership cycle exists.
+    #[cfg(not(test))]
+    struct PreparedLogonGate {
+        provenance: super::activation::SupervisorLogonRecord,
+        preparing_identity: FileIdentity,
+        preparing_bytes: Vec<u8>,
+        archived: Option<ArchivedEpochFiles>,
+    }
+    #[cfg(not(test))]
+    fn verify_logon_preparing_files(
+        io: &Arc<WindowsNativeIo>,
+        proof: &SupportProof,
+        expected: &super::activation::EpochProvenance,
+        archived: Option<&ArchivedEpochFiles>,
+        deadline: &Deadline,
+    ) -> NativeResult<super::activation::SupervisorLogonRecord> {
+        let record = preparing_matches(io, proof, expected, deadline)?;
+        if io
+            .read_record(
+                proof,
+                records::RecordName::Supervisor,
+                files::MAX_RECORD_BYTES,
+                deadline,
+            )?
+            .is_some()
+        {
+            return Err(NativeError::Foreign);
+        }
+        match archived {
+            None => {
+                if read_archive_intent(io, proof, deadline)?.is_some() {
+                    return Err(NativeError::Foreign);
+                }
+            }
+            Some(archived) => {
+                let intent =
+                    read_archive_intent(io, proof, deadline)?.ok_or(NativeError::Foreign)?;
+                intent.require_complete()?;
+                if intent != archived.intent
+                    || intent.operation != expected.operation()
+                    || intent.owner_creation != expected.owner_creation()
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let source = io
+                    .read_record(
+                        proof,
+                        records::RecordName::SupervisorEpoch(intent.slot),
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                if source.identity != epoch_identity(intent.source)
+                    || source.bytes() != archived.bytes
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let prior = super::super::service::journal::Journal::decode(source.bytes())?;
+                let epoch = record
+                    .matches_history(intent.slot, &prior, intent.source, intent.sha256)?
+                    .clone();
+                io.query_prior_logon(
+                    proof,
+                    &MatchedLogonProvenance {
+                        io: io.clone(),
+                        epoch,
+                    },
+                    deadline,
+                )?;
+            }
+        }
+        Ok(record)
+    }
+    /// Separate opaque result: existing task/upgrade result constructors remain unchanged.
+    #[cfg(not(test))]
+    pub(crate) struct LogonArchiveResult {
+        io: Arc<WindowsNativeIo>,
+        namespace: Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
+        permit: Arc<super::super::service::SupervisorLogonPermit>,
+        archived: Option<ArchivedEpochFiles>,
+    }
+    #[cfg(not(test))]
+    impl LogonArchiveResult {
+        fn renew(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            permit: &Arc<super::super::service::SupervisorLogonPermit>,
+            owner: &Arc<super::jobs::SupervisorOwner>,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if !std::ptr::eq(io, self.io.as_ref())
+                || !Arc::ptr_eq(permit, &self.permit)
+                || !Arc::ptr_eq(&self.namespace, &owner.exclusive_lease(proof, deadline)?)
+            {
+                return Err(NativeError::Foreign);
+            }
+            permit.reverify(io, proof, deadline)?;
+            self.namespace.reverify(io, proof, deadline)
+        }
+        pub(crate) fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &Arc<super::super::service::SupervisorLogonPermit>,
+            owner: &Arc<super::jobs::SupervisorOwner>,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.renew(io, proof, permit, owner, deadline)?;
+            io.verify_stop_lock(proof, lock, deadline)?;
+            let expected = EpochClaim::Logon(permit).epoch(io)?;
+            let provenance = verify_logon_preparing_files(
+                &self.io,
+                proof,
+                &expected,
+                self.archived.as_ref(),
+                deadline,
+            )?;
+            match &self.archived {
+                None => {
+                    if !matches!(permit.disposition().kind, PriorLogonKind::FirstAbsent) {
+                        return Err(NativeError::Foreign);
+                    }
+                }
+                Some(archived) => {
+                    let prior = super::super::service::journal::Journal::decode(&archived.bytes)?;
+                    let epoch = provenance.matches_history(
+                        archived.intent.slot,
+                        &prior,
+                        archived.intent.source,
+                        archived.intent.sha256,
+                    )?;
+                    let PriorLogonKind::SessionGone(matched) = &permit.disposition().kind else {
+                        return Err(NativeError::Foreign);
+                    };
+                    if epoch != &matched.epoch {
+                        return Err(NativeError::Foreign);
+                    }
+                    permit.disposition().reverify(io, proof, deadline)?;
+                }
+            }
+            deadline.check()
+        }
+        pub(crate) fn publish_bound(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &Arc<super::super::service::SupervisorLogonPermit>,
+            owner: &Arc<super::jobs::SupervisorOwner>,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            self.renew(io, proof, permit, owner, deadline)?;
+            publish_epoch_bound(
+                io,
+                proof,
+                lock,
+                &self.namespace,
+                EpochClaim::Logon(permit),
+                owner,
+                deadline,
+            )
+        }
+    }
+
     #[cfg(not(test))]
     fn epoch_identity(stamp: super::super::payload::recovery::FileStamp) -> FileIdentity {
         FileIdentity {
@@ -1825,12 +2237,256 @@ mod adapter {
     }
 
     #[cfg(not(test))]
+    #[derive(Clone, Copy)]
+    enum EpochClaim<'a> {
+        Task(&'a Arc<super::super::service::task::TaskRunPermit>),
+        Logon(&'a Arc<super::super::service::SupervisorLogonPermit>),
+    }
+    #[cfg(not(test))]
+    impl EpochClaim<'_> {
+        fn reverify(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            match self {
+                Self::Task(permit) => permit.reverify(io, proof, deadline),
+                Self::Logon(permit) => permit.reverify(io, proof, deadline),
+            }
+        }
+        fn epoch(&self, io: &WindowsNativeIo) -> NativeResult<super::activation::EpochProvenance> {
+            match self {
+                Self::Task(permit) => super::activation::EpochProvenance::new(
+                    permit.registration(),
+                    permit.operation(),
+                    &io.context.target.identity,
+                    permit.owner_identity().pid(),
+                    permit.owner_identity().creation(),
+                ),
+                Self::Logon(permit) => super::activation::EpochProvenance::new(
+                    permit.registration(),
+                    permit.operation(),
+                    permit.context(),
+                    permit.owner_identity().pid(),
+                    permit.owner_identity().creation(),
+                ),
+            }
+        }
+        fn operation(&self) -> [u8; 16] {
+            match self {
+                Self::Task(permit) => permit.operation(),
+                Self::Logon(permit) => permit.operation(),
+            }
+        }
+        fn owner_creation(&self) -> u64 {
+            match self {
+                Self::Task(permit) => permit.owner_identity().creation(),
+                Self::Logon(permit) => permit.owner_identity().creation(),
+            }
+        }
+        fn renew_predecessor(
+            &self,
+            io: &Arc<WindowsNativeIo>,
+            proof: &SupportProof,
+            prior: &super::super::service::journal::Journal,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let record = super::activation::SupervisorLogonRecord::read(io, proof, deadline)?
+                .ok_or_else(legacy_provenance_required)?;
+            let epoch = record.matches_current(prior)?;
+            match self {
+                Self::Task(permit) => {
+                    let selected =
+                        super::super::payload::recovery::selected_operation(io, proof, deadline)?;
+                    super::activation::correlate_upgrade(
+                        permit.operation(),
+                        permit.user(),
+                        selected.as_ref(),
+                        Some(prior),
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                }
+                Self::Logon(permit) => {
+                    let PriorLogonKind::SessionGone(matched) = &permit.disposition().kind else {
+                        return Err(NativeError::Foreign);
+                    };
+                    if epoch != &matched.epoch {
+                        return Err(NativeError::Foreign);
+                    }
+                    permit.disposition().reverify(io, proof, deadline)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(not(test))]
+    fn preparing_matches(
+        io: &WindowsNativeIo,
+        proof: &SupportProof,
+        expected: &super::activation::EpochProvenance,
+        deadline: &Deadline,
+    ) -> NativeResult<super::activation::SupervisorLogonRecord> {
+        let record = super::activation::SupervisorLogonRecord::read(io, proof, deadline)?
+            .ok_or_else(legacy_provenance_required)?;
+        if record.phase() != super::activation::LogonRecordPhase::Preparing
+            || record.current() != expected
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(record)
+    }
+    #[cfg(not(test))]
+    fn publish_epoch_preparing(
+        io: &Arc<WindowsNativeIo>,
+        proof: &SupportProof,
+        lock: &InstallerLock,
+        next: super::activation::EpochProvenance,
+        archived: Option<&super::epoch_archive::ArchiveIntent>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        io.verify_stop_lock(proof, lock, deadline)?;
+        let current = super::activation::SupervisorLogonRecord::read(io, proof, deadline)?;
+        let record = match (current, archived) {
+            (None, None) => super::activation::SupervisorLogonRecord::new(next)?,
+            (Some(current), Some(intent)) => {
+                intent.require_complete()?;
+                current.rotate(
+                    next,
+                    super::activation::HistoryCorrelation::new(
+                        intent.slot,
+                        current.current().clone(),
+                        intent.source,
+                        intent.sha256,
+                    )?,
+                )?
+            }
+            _ => return Err(legacy_provenance_required()),
+        };
+        record.publish(io, proof, lock, deadline)?;
+        preparing_matches(io, proof, record.current(), deadline)?;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    fn publish_epoch_bound(
+        io: &WindowsNativeIo,
+        proof: &SupportProof,
+        lock: &InstallerLock,
+        namespace: &Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
+        claim: EpochClaim<'_>,
+        owner: &Arc<super::jobs::SupervisorOwner>,
+        deadline: &Deadline,
+    ) -> NativeResult<()> {
+        io.verify_stop_lock(proof, lock, deadline)?;
+        namespace.reverify(io, proof, deadline)?;
+        claim.reverify(io, proof, deadline)?;
+        let expected = claim.epoch(io)?;
+        let mut record = preparing_matches(io, proof, &expected, deadline)?;
+        let journal = super::super::service::journal::Journal::read(io, proof, deadline)?
+            .ok_or(NativeError::Foreign)?;
+        let agent = io.observe_agent(proof, deadline)?;
+        let generation = io.agent_generation(&agent, proof, deadline)?;
+        owner.child_for_peer(&agent, proof, deadline)?;
+        if journal.current != Some(generation) {
+            return Err(NativeError::Foreign);
+        }
+        record.bind(&journal)?;
+        record.publish(io, proof, lock, deadline)?;
+        let bound = super::activation::SupervisorLogonRecord::read(io, proof, deadline)?
+            .ok_or(NativeError::Foreign)?;
+        if bound != record {
+            return Err(NativeError::Foreign);
+        }
+        bound.matches_current(&journal)?;
+        claim.reverify(io, proof, deadline)?;
+        namespace.reverify(io, proof, deadline)
+    }
+    /// Fixed-name observations only, under the caller's actual installer lock. Every slot is
+    /// read positively; any remaining history prevents a missing-provenance "first" admission.
+    #[cfg(not(test))]
+    fn archive_history_present(
+        io: &WindowsNativeIo,
+        proof: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<bool> {
+        let mut present = false;
+        for slot in 0..3 {
+            present |= io
+                .read_record(
+                    proof,
+                    records::RecordName::SupervisorEpoch(slot),
+                    files::MAX_RECORD_BYTES,
+                    deadline,
+                )?
+                .is_some();
+        }
+        Ok(present)
+    }
+    /// Shared exact slot observations; a nonterminal phase only requests more evidence.
+    /// Actual fixed FileId/full bytes and native LSA disposition remain mandatory.
+    #[cfg(not(test))]
+    fn archive_slots(
+        io: &Arc<WindowsNativeIo>,
+        proof: &SupportProof,
+        deadline: &Deadline,
+    ) -> NativeResult<(u8, Option<super::super::payload::recovery::FileStamp>)> {
+        let record = super::activation::SupervisorLogonRecord::read(io, proof, deadline)?;
+        let mut slots: [Option<super::super::service::journal::Journal>; 3] = [None, None, None];
+        let mut identities = [None, None, None];
+        for slot in 0..3 {
+            if let Some(observed) = io.read_record(
+                proof,
+                records::RecordName::SupervisorEpoch(slot as u8),
+                files::MAX_RECORD_BYTES,
+                deadline,
+            )? {
+                let journal = super::super::service::journal::Journal::decode(observed.bytes())?;
+                let requirement = super::epoch_archive::history_requirement(&journal)?;
+                let correlated = record.as_ref().and_then(|record| {
+                    record
+                        .history()
+                        .iter()
+                        .find(|entry| usize::from(entry.slot()) == slot)
+                });
+                if correlated.is_some()
+                    || requirement
+                        == super::epoch_archive::HistoryRequirement::PriorLogonDisposition
+                {
+                    let record = record.as_ref().ok_or_else(legacy_provenance_required)?;
+                    let epoch = record
+                        .matches_history(
+                            slot as u8,
+                            &journal,
+                            epoch_stamp(observed.identity),
+                            epoch_hash(observed.bytes()),
+                        )?
+                        .clone();
+                    if requirement
+                        == super::epoch_archive::HistoryRequirement::PriorLogonDisposition
+                    {
+                        let matched = MatchedLogonProvenance {
+                            io: io.clone(),
+                            epoch,
+                        };
+                        io.query_prior_logon(proof, &matched, deadline)?;
+                    }
+                }
+                identities[slot] = Some(epoch_stamp(observed.identity));
+                slots[slot] = Some(journal);
+            }
+        }
+        let (slot, _) = super::epoch_archive::select_correlated_slots(&slots)?;
+        Ok((slot, identities[usize::from(slot)]))
+    }
+
+    #[cfg(not(test))]
     struct NativeEpochArchive<'a> {
         io: &'a Arc<WindowsNativeIo>,
         proof: &'a SupportProof,
         lock: &'a InstallerLock,
         namespace: &'a Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
-        permit: &'a Arc<super::super::service::task::TaskRunPermit>,
+        claim: EpochClaim<'a>,
         prior: &'a super::super::service::journal::Journal,
         source: &'a records::ObservedRecord,
         intent: &'a mut super::epoch_archive::ArchiveIntent,
@@ -1839,7 +2495,7 @@ mod adapter {
     #[cfg(not(test))]
     impl NativeEpochArchive<'_> {
         fn renew(&self) -> NativeResult<()> {
-            self.permit.reverify(self.io, self.proof, self.deadline)?;
+            self.claim.reverify(self.io, self.proof, self.deadline)?;
             self.namespace
                 .reverify(self.io, self.proof, self.deadline)?;
             self.io
@@ -1884,11 +2540,6 @@ mod adapter {
         }
         fn move_current(&mut self) -> NativeResult<()> {
             self.renew()?;
-            let selected = super::super::payload::recovery::selected_operation(
-                self.io,
-                self.proof,
-                self.deadline,
-            )?;
             let fresh = self
                 .io
                 .read_record(
@@ -1901,16 +2552,8 @@ mod adapter {
             if fresh.identity != self.source.identity || fresh.bytes() != self.source.bytes() {
                 return Err(NativeError::Foreign);
             }
-            let renewed = super::activation::correlate_upgrade(
-                self.permit.operation(),
-                self.permit.user(),
-                selected.as_ref(),
-                Some(self.prior),
-            )?
-            .ok_or(NativeError::Foreign)?;
-            if !renewed.matches_predecessor(self.prior) {
-                return Err(NativeError::Foreign);
-            }
+            self.claim
+                .renew_predecessor(self.io, self.proof, self.prior, self.deadline)?;
             let context = self.io.context.clone();
             let held = self.lock.0.clone();
             let budget = self.proof.budget(self.io, self.deadline)?;
@@ -3028,6 +3671,171 @@ mod adapter {
         }
 
         #[cfg(not(test))]
+        fn query_prior_logon(
+            &self,
+            proof: &SupportProof,
+            prior: &MatchedLogonProvenance,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            use windows_sys::Win32::{
+                Foundation::LUID,
+                Security::{
+                    Authentication::Identity::LsaGetLogonSessionData,
+                    Credentials::STATUS_NO_SUCH_LOGON_SESSION,
+                },
+            };
+            if !std::ptr::eq(self, prior.io.as_ref())
+                || prior.epoch.user() != self.context.target.identity.user.sddl()
+                || prior.epoch.authentication_id() == self.context.target.identity.authentication_id
+                || prior.epoch.logon_sid() == self.context.target.identity.logon.bytes()
+                || LOGON_QUERY_QUARANTINE.get().is_some()
+            {
+                return Err(NativeError::Foreign);
+            }
+            prior.epoch.validate()?;
+            let budget = proof.budget(self, deadline)?;
+            let context = self.context.clone();
+            let owner = self.owner.clone();
+            let authentication_id = prior.epoch.authentication_id();
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                if LOGON_QUERY_QUARANTINE.get().is_some() {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                if LOGON_QUERY_BUSY
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return Err(NativeError::Busy);
+                }
+                let _in_flight = LogonQueryGuard;
+                if LOGON_QUERY_QUARANTINE.get().is_some() {
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                let luid = LUID {
+                    LowPart: authentication_id as u32,
+                    HighPart: (authentication_id >> 32) as u32 as i32,
+                };
+                let mut data = std::ptr::null_mut();
+                // SAFETY: one exact captured same-user prior AuthenticationId, initialized output.
+                // This never enumerates sessions or uses a record/PID to open a process.
+                let status = unsafe { LsaGetLogonSessionData(&luid, &mut data) };
+                if status == 0 {
+                    if !data.is_null() {
+                        let buffer = LsaBuffer(data);
+                        // Only documented successful ownership is freed. Names/content stay unread.
+                        drop(buffer);
+                    }
+                    budget.check()?;
+                    context.validate(&budget)?;
+                    return Err(NativeError::Foreign);
+                }
+                if !data.is_null() {
+                    // Failed-output ownership is undocumented. Quarantine one opaque value and
+                    // retire all mutations; neither dereference nor free this ambiguous output.
+                    let _ = LOGON_QUERY_QUARANTINE.set(data as usize);
+                    owner.retire_mutations();
+                    return Err(NativeError::OutcomeUnknown);
+                }
+                super::epoch_archive::classify_prior_logon_status(status, false)?;
+                if status != STATUS_NO_SUCH_LOGON_SESSION {
+                    return Err(NativeError::Foreign);
+                }
+                budget.check()?;
+                context.validate(&budget)
+            })?;
+            proof.budget(self, deadline)?.check()
+        }
+        #[cfg(not(test))]
+        pub(crate) fn observe_prior_logon(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            prior: &MatchedLogonProvenance,
+            deadline: &Deadline,
+        ) -> NativeResult<PriorLogonDisposition> {
+            self.query_prior_logon(proof, prior, deadline)?;
+            // Construction still checks the ORIGINAL observation proof; fresh publication
+            // budgets may renew only a seal that was actually delivered before this boundary.
+            proof.budget(self, deadline)?.check()?;
+            Ok(PriorLogonDisposition {
+                io: self.clone(),
+                kind: PriorLogonKind::SessionGone(MatchedLogonProvenance {
+                    io: self.clone(),
+                    epoch: prior.epoch.clone(),
+                }),
+            })
+        }
+        #[cfg(not(test))]
+        pub(crate) fn prepare_logon_reservation(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            owner: &Arc<super::jobs::SupervisorOwner>,
+            deadline: &Deadline,
+        ) -> NativeResult<(LogonReservation, PriorLogonDisposition)> {
+            self.verify_stop_lock(proof, lock, deadline)?;
+            let namespace = owner.exclusive_lease(proof, deadline)?;
+            namespace.reverify(self, proof, deadline)?;
+            let own = self.own_process_identity(proof, deadline)?;
+            let context = self.context.target.identity.clone();
+            let current = self.read_record(
+                proof,
+                records::RecordName::Supervisor,
+                files::MAX_RECORD_BYTES,
+                deadline,
+            )?;
+            let provenance = super::activation::SupervisorLogonRecord::read(self, proof, deadline)?;
+            let disposition = match (current, provenance) {
+                (None, None) => {
+                    let task =
+                        super::activation::TaskActivationRecord::read(self, proof, deadline)?;
+                    let first = super::epoch_archive::first_logon_absence(
+                        task.as_ref(),
+                        false,
+                        false,
+                        read_archive_intent(self, proof, deadline)?.is_some(),
+                        archive_history_present(self, proof, deadline)?,
+                    );
+                    if let Err(error) = first {
+                        return Err(if error == NativeError::Unsupported {
+                            legacy_provenance_required()
+                        } else {
+                            error
+                        });
+                    }
+                    PriorLogonDisposition {
+                        io: self.clone(),
+                        kind: PriorLogonKind::FirstAbsent,
+                    }
+                }
+                (Some(source), Some(record)) => {
+                    let prior = super::super::service::journal::Journal::decode(source.bytes())?;
+                    let epoch = record.matches_current(&prior)?.clone();
+                    let matched = MatchedLogonProvenance {
+                        io: self.clone(),
+                        epoch,
+                    };
+                    self.observe_prior_logon(proof, &matched, deadline)?
+                }
+                _ => return Err(legacy_provenance_required()),
+            };
+            self.verify_stop_lock(proof, lock, deadline)?;
+            namespace.reverify(self, proof, deadline)?;
+            own.reverify(deadline)?;
+            Ok((
+                LogonReservation {
+                    io: self.clone(),
+                    namespace,
+                    own,
+                    context,
+                    epoch_prepared: std::sync::OnceLock::new(),
+                    epoch: std::sync::OnceLock::new(),
+                },
+                disposition,
+            ))
+        }
+
+        #[cfg(not(test))]
         pub(crate) fn prepare_supervisor_epoch(
             self: &Arc<Self>,
             proof: &SupportProof,
@@ -3046,32 +3854,25 @@ mod adapter {
                 files::MAX_RECORD_BYTES,
                 deadline,
             )?;
-            let pending = read_archive_intent(self, proof, deadline)?;
-            if let Some(previous) = &pending {
-                // An interrupted intent is never retried from history. A completed older intent
-                // may be superseded only after its immutable actual archive is freshly matched.
-                previous.require_complete()?;
-                let target = self
-                    .read_record(
-                        proof,
-                        records::RecordName::SupervisorEpoch(previous.slot),
-                        files::MAX_RECORD_BYTES,
-                        deadline,
-                    )?
-                    .ok_or(NativeError::Foreign)?;
-                if target.identity != epoch_identity(previous.source)
-                    || epoch_hash(target.bytes()) != previous.sha256
-                {
-                    return Err(NativeError::Foreign);
-                }
-                super::super::service::journal::Journal::decode(target.bytes())?;
-            }
+            self.check_completed_archive_intent(proof, deadline)?;
             let selected =
                 super::super::payload::recovery::selected_operation(self, proof, deadline)?;
             let Some(source) = source else {
-                if pending.is_some() || selected.is_some() {
+                if read_archive_intent(self, proof, deadline)?.is_some()
+                    || selected.is_some()
+                    || super::activation::SupervisorLogonRecord::read(self, proof, deadline)?
+                        .is_some()
+                {
                     return Err(NativeError::Foreign);
                 }
+                publish_epoch_preparing(
+                    self,
+                    proof,
+                    lock,
+                    EpochClaim::Task(permit).epoch(self)?,
+                    None,
+                    deadline,
+                )?;
                 let result = OwnedArchiveResult::First(FirstSupervisorEpoch {
                     io: self.clone(),
                     namespace,
@@ -3093,8 +3894,33 @@ mod adapter {
             )
         }
         #[cfg(not(test))]
+        fn check_completed_archive_intent(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            if let Some(intent) = read_archive_intent(self, proof, deadline)? {
+                intent.require_complete()?;
+                let target = self
+                    .read_record(
+                        proof,
+                        records::RecordName::SupervisorEpoch(intent.slot),
+                        files::MAX_RECORD_BYTES,
+                        deadline,
+                    )?
+                    .ok_or(NativeError::Foreign)?;
+                if target.identity != epoch_identity(intent.source)
+                    || epoch_hash(target.bytes()) != intent.sha256
+                {
+                    return Err(NativeError::Foreign);
+                }
+                super::super::service::journal::Journal::decode(target.bytes())?;
+            }
+            Ok(())
+        }
+        #[cfg(not(test))]
         // Independent admitted IO/lock/namespace/claim/lineage/source/deadline capabilities
-        // remain explicit; grouping them would obscure the frozen authority boundaries.
+        // remain explicit; the old task/upgrade entry retains its exact signature and authority.
         #[allow(clippy::too_many_arguments)]
         fn archive_supervisor_epoch(
             self: &Arc<Self>,
@@ -3107,36 +3933,158 @@ mod adapter {
             source: records::ObservedRecord,
             deadline: &Deadline,
         ) -> NativeResult<OwnedArchiveResult> {
-            use super::epoch_archive::{ArchiveIntent, ArchivePhase};
             if !lineage.matches_predecessor(prior) || lineage.operation() != permit.operation() {
                 return Err(NativeError::Foreign);
             }
-            let mut slots: [Option<super::super::service::journal::Journal>; 3] =
-                [None, None, None];
-            let mut identities = [None, None, None];
-            for slot in 0..3 {
-                if let Some(record) = self.read_record(
+            let claim = EpochClaim::Task(permit);
+            claim.renew_predecessor(self, proof, prior, deadline)?;
+            let files =
+                self.archive_epoch_files(proof, lock, &namespace, claim, prior, &source, deadline)?;
+            publish_epoch_preparing(
+                self,
+                proof,
+                lock,
+                claim.epoch(self)?,
+                Some(&files.intent),
+                deadline,
+            )?;
+            Ok(OwnedArchiveResult::Archived(ArchivedSupervisorEpoch {
+                io: self.clone(),
+                namespace,
+                permit: permit.clone(),
+                intent: files.intent,
+                bytes: files.bytes,
+            }))
+        }
+        #[cfg(not(test))]
+        pub(crate) fn prepare_logon_epoch(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            permit: &Arc<super::super::service::SupervisorLogonPermit>,
+            owner: &Arc<super::jobs::SupervisorOwner>,
+            deadline: &Deadline,
+        ) -> NativeResult<LogonArchiveResult> {
+            self.verify_stop_lock(proof, lock, deadline)?;
+            permit.reverify(self, proof, deadline)?;
+            let namespace = owner.exclusive_lease(proof, deadline)?;
+            if !Arc::ptr_eq(&namespace, &permit.reservation().namespace) {
+                return Err(NativeError::Foreign);
+            }
+            namespace.reverify(self, proof, deadline)?;
+            self.check_completed_archive_intent(proof, deadline)?;
+            let claim = EpochClaim::Logon(permit);
+            let source = self.read_record(
+                proof,
+                records::RecordName::Supervisor,
+                files::MAX_RECORD_BYTES,
+                deadline,
+            )?;
+            let archived = match (source, &permit.disposition().kind) {
+                (None, PriorLogonKind::FirstAbsent) => {
+                    let task =
+                        super::activation::TaskActivationRecord::read(self, proof, deadline)?;
+                    let first = super::epoch_archive::first_logon_absence(
+                        task.as_ref(),
+                        false,
+                        super::activation::SupervisorLogonRecord::read(self, proof, deadline)?
+                            .is_some(),
+                        read_archive_intent(self, proof, deadline)?.is_some(),
+                        archive_history_present(self, proof, deadline)?,
+                    );
+                    if let Err(error) = first {
+                        return Err(if error == NativeError::Unsupported {
+                            legacy_provenance_required()
+                        } else {
+                            error
+                        });
+                    }
+                    None
+                }
+                (Some(source), PriorLogonKind::SessionGone(_)) => {
+                    let prior = super::super::service::journal::Journal::decode(source.bytes())?;
+                    claim.renew_predecessor(self, proof, &prior, deadline)?;
+                    Some(self.archive_epoch_files(
+                        proof, lock, &namespace, claim, &prior, &source, deadline,
+                    )?)
+                }
+                _ => return Err(NativeError::Foreign),
+            };
+            publish_epoch_preparing(
+                self,
+                proof,
+                lock,
+                claim.epoch(self)?,
+                archived.as_ref().map(|files| &files.intent),
+                deadline,
+            )?;
+            let result = LogonArchiveResult {
+                io: self.clone(),
+                namespace,
+                permit: permit.clone(),
+                archived,
+            };
+            result.reverify(self, proof, lock, permit, owner, deadline)?;
+            // Only this actual completed factory can mint the dispatcher seal. It retains exact
+            // Preparing/archive observations; a caller flag or a cold record cannot mint it.
+            let provenance = verify_logon_preparing_files(
+                self,
+                proof,
+                &claim.epoch(self)?,
+                result.archived.as_ref(),
+                deadline,
+            )?;
+            let preparing = self
+                .read_record(
                     proof,
-                    records::RecordName::SupervisorEpoch(slot as u8),
+                    records::RecordName::SupervisorLogon,
                     files::MAX_RECORD_BYTES,
                     deadline,
-                )? {
-                    slots[slot] = Some(super::super::service::journal::Journal::decode(
-                        record.bytes(),
-                    )?);
-                    identities[slot] = Some(epoch_stamp(record.identity));
-                }
+                )?
+                .ok_or(NativeError::Foreign)?;
+            if super::activation::SupervisorLogonRecord::decode(preparing.bytes())? != provenance {
+                return Err(NativeError::Foreign);
             }
-            let (slot, prune) = super::epoch_archive::select_slot(&slots)?;
+            permit
+                .reservation()
+                .epoch_prepared
+                .set(PreparedLogonGate {
+                    provenance,
+                    preparing_identity: preparing.identity,
+                    preparing_bytes: preparing.bytes().to_vec(),
+                    archived: result.archived.clone(),
+                })
+                .map_err(|_| NativeError::Foreign)?;
+            Ok(result)
+        }
+        #[cfg(not(test))]
+        // Shared exact effects keep each independently revalidated admission explicit.
+        #[allow(clippy::too_many_arguments)]
+        fn archive_epoch_files(
+            self: &Arc<Self>,
+            proof: &SupportProof,
+            lock: &InstallerLock,
+            namespace: &Arc<super::supervisor_owner::ExclusiveSupervisorLease>,
+            claim: EpochClaim<'_>,
+            prior: &super::super::service::journal::Journal,
+            source: &records::ObservedRecord,
+            deadline: &Deadline,
+        ) -> NativeResult<ArchivedEpochFiles> {
+            use super::epoch_archive::{ArchiveIntent, ArchivePhase};
+            self.verify_stop_lock(proof, lock, deadline)?;
+            namespace.reverify(self, proof, deadline)?;
+            claim.reverify(self, proof, deadline)?;
+            claim.renew_predecessor(self, proof, prior, deadline)?;
+            let (slot, victim) = archive_slots(self, proof, deadline)?;
             let mut intent = ArchiveIntent {
                 schema_version: 1,
-                operation: permit.operation(),
-                owner_creation: permit.owner_identity().creation(),
+                operation: claim.operation(),
+                owner_creation: claim.owner_creation(),
                 slot,
                 source: epoch_stamp(source.identity),
                 sha256: epoch_hash(source.bytes()),
-                victim: identities[usize::from(slot)],
-                phase: if prune {
+                victim,
+                phase: if victim.is_some() {
                     ArchivePhase::PruneIntent
                 } else {
                     ArchivePhase::MoveIntent
@@ -3146,21 +4094,19 @@ mod adapter {
                 io: self,
                 proof,
                 lock,
-                namespace: &namespace,
-                permit,
+                namespace,
+                claim,
                 prior,
-                source: &source,
+                source,
                 intent: &mut intent,
                 deadline,
             };
-            super::epoch_archive::ArchiveSequence::default().run_once(&mut driver, prune)?;
-            Ok(OwnedArchiveResult::Archived(ArchivedSupervisorEpoch {
-                io: self.clone(),
-                namespace,
-                permit: permit.clone(),
+            super::epoch_archive::ArchiveSequence::default()
+                .run_once(&mut driver, victim.is_some())?;
+            Ok(ArchivedEpochFiles {
                 intent,
                 bytes: source.bytes().to_vec(),
-            }))
+            })
         }
         pub fn native_idle(&self) -> bool {
             self.owner.idle()

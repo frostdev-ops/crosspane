@@ -395,21 +395,47 @@ fn retain_error_with(
     }
 }
 
+/// Initial task and logon epochs use this same production order. A port holds genuine native
+/// capabilities; portable observations in tests cannot construct those capabilities.
+#[cfg(any(windows, test))]
+// Library unit builds exclude the native consumer; separate integration fakes use this same seam.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) trait InitialEpochPort {
+    type Child;
+    type Ready;
+    fn prepare_epoch(&mut self) -> NativeResult<()>;
+    fn create(&mut self) -> NativeResult<Self::Child>;
+    fn await_ready(&mut self, child: &Self::Child) -> NativeResult<Self::Ready>;
+    fn publish_running(&mut self, ready: &Self::Ready) -> NativeResult<()>;
+}
+#[cfg(any(windows, test))]
+// Library unit builds exclude the native consumer; separate integration fakes use this same seam.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn initialize_epoch<P: InitialEpochPort>(port: &mut P) -> NativeResult<P::Ready> {
+    port.prepare_epoch()?;
+    let child = port.create()?;
+    let ready = port.await_ready(&child)?;
+    port.publish_running(&ready)?;
+    Ok(ready)
+}
+
 #[cfg(all(windows, not(test)))]
 mod native {
     use super::super::super::{
         native_io::{
-            AgentObservation, Cancellation, Clock, Deadline, ExitObservation, MonotonicClock,
-            SupportProof, WindowsNativeIo,
+            AgentObservation, Cancellation, Clock, Deadline, ExitObservation, InstallerLock,
+            LogonArchiveResult, MonotonicClock, OwnedArchiveResult, SupportProof, WindowsNativeIo,
+            activation::EntrySelection,
             jobs::{ChildStartPermit, CreatedChild, SupervisorOwner},
             supervisor_owner::OwnerServer,
         },
         transport::WindowsAgentPort,
     };
     use super::super::{
-        SupervisorExit, TrustedImages,
+        SupervisorExit, SupervisorLogonCandidate, SupervisorLogonPermit, TrustedImages,
+        admit_logon, entry_selection,
         journal::{Journal, Phase},
-        task,
+        prepare_logon, task,
     };
     use super::*;
     use crate::agent_contract::{
@@ -530,6 +556,228 @@ mod native {
             pause();
         }
     }
+    enum EntryCandidate {
+        Installer(Arc<task::TaskRunPermit>),
+        Logon(Box<SupervisorLogonCandidate>),
+    }
+    enum EntryPermit {
+        Installer(Arc<task::TaskRunPermit>),
+        Logon(Arc<SupervisorLogonPermit>),
+    }
+    impl EntryPermit {
+        fn operation(&self) -> [u8; 16] {
+            match self {
+                Self::Installer(permit) => permit.operation(),
+                Self::Logon(permit) => permit.operation(),
+            }
+        }
+        fn registration(&self) -> [u8; 16] {
+            match self {
+                Self::Installer(permit) => permit.registration(),
+                Self::Logon(permit) => permit.registration(),
+            }
+        }
+        fn user(&self) -> &str {
+            match self {
+                Self::Installer(permit) => permit.user(),
+                Self::Logon(permit) => permit.user(),
+            }
+        }
+        fn initial_start(
+            &self,
+            owner: Arc<SupervisorOwner>,
+            support: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<Arc<ChildStartPermit>> {
+            match self {
+                Self::Installer(permit) => {
+                    ChildStartPermit::initial(owner, permit.clone(), support, deadline)
+                }
+                Self::Logon(permit) => {
+                    ChildStartPermit::initial_logon(owner, permit.clone(), support, deadline)
+                }
+            }
+        }
+    }
+    enum InitialArchive {
+        Installer(OwnedArchiveResult),
+        Logon(LogonArchiveResult),
+    }
+    struct InitialReady {
+        original: AgentObservation,
+        generation: Generation,
+        model: Supervisor,
+        record: Journal,
+    }
+    struct NativeInitialEpoch<'a> {
+        owner: Arc<SupervisorOwner>,
+        permit: EntryPermit,
+        deadline: &'a Deadline,
+        archive: Option<InitialArchive>,
+    }
+    impl NativeInitialEpoch<'_> {
+        fn reverify_archive(
+            &self,
+            support: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            match (&self.archive, &self.permit) {
+                (Some(InitialArchive::Installer(archive)), EntryPermit::Installer(permit)) => {
+                    archive.reverify(
+                        self.owner.io(),
+                        support,
+                        lock,
+                        permit,
+                        &self.owner,
+                        deadline,
+                    )
+                }
+                (Some(InitialArchive::Logon(archive)), EntryPermit::Logon(permit)) => archive
+                    .reverify(
+                        self.owner.io(),
+                        support,
+                        lock,
+                        permit,
+                        &self.owner,
+                        deadline,
+                    ),
+                _ => Err(NativeError::Foreign),
+            }
+        }
+        fn publish_bound(
+            &self,
+            support: &SupportProof,
+            lock: &InstallerLock,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            match (&self.archive, &self.permit) {
+                (Some(InitialArchive::Installer(archive)), EntryPermit::Installer(permit)) => {
+                    archive.publish_bound(
+                        self.owner.io(),
+                        support,
+                        lock,
+                        permit,
+                        &self.owner,
+                        deadline,
+                    )
+                }
+                (Some(InitialArchive::Logon(archive)), EntryPermit::Logon(permit)) => archive
+                    .publish_bound(
+                        self.owner.io(),
+                        support,
+                        lock,
+                        permit,
+                        &self.owner,
+                        deadline,
+                    ),
+                _ => Err(NativeError::Foreign),
+            }
+        }
+    }
+    impl InitialEpochPort for NativeInitialEpoch<'_> {
+        type Child = CreatedChild;
+        type Ready = InitialReady;
+        fn prepare_epoch(&mut self) -> NativeResult<()> {
+            let support = proof(self.owner.io(), self.deadline)?;
+            let lock = self
+                .owner
+                .io()
+                .acquire_installer_lock(&support, self.deadline)?;
+            let support = proof(self.owner.io(), self.deadline)?;
+            // Both variants retain the real archive admission and Preparing provenance until
+            // Ready/publication. The logon path cannot turn its proof into an installer task claim.
+            self.archive = Some(match &self.permit {
+                EntryPermit::Installer(permit) => {
+                    InitialArchive::Installer(self.owner.io().prepare_supervisor_epoch(
+                        &support,
+                        &lock,
+                        permit,
+                        &self.owner,
+                        self.deadline,
+                    )?)
+                }
+                EntryPermit::Logon(permit) => {
+                    InitialArchive::Logon(self.owner.io().prepare_logon_epoch(
+                        &support,
+                        &lock,
+                        permit,
+                        &self.owner,
+                        self.deadline,
+                    )?)
+                }
+            });
+            Ok(())
+        }
+        fn create(&mut self) -> NativeResult<Self::Child> {
+            // A retained genuine epoch gate precedes every Create/Assign/Resume in jobs::launch.
+            {
+                let support = proof(self.owner.io(), self.deadline)?;
+                let lock = self
+                    .owner
+                    .io()
+                    .acquire_installer_lock(&support, self.deadline)?;
+                self.reverify_archive(
+                    &proof(self.owner.io(), self.deadline)?,
+                    &lock,
+                    self.deadline,
+                )?;
+            }
+            let support = proof(self.owner.io(), self.deadline)?;
+            let start = self
+                .permit
+                .initial_start(self.owner.clone(), &support, self.deadline)?;
+            self.owner.launch(
+                start,
+                &proof(self.owner.io(), self.deadline)?,
+                self.deadline,
+            )
+        }
+        fn await_ready(&mut self, child: &Self::Child) -> NativeResult<Self::Ready> {
+            let (original, generation) = await_ready(&self.owner, child, self.deadline)?;
+            let mut model = Supervisor::new(generation, self.owner.clock().now_ms(), Vec::new())?;
+            model.running();
+            let record = Journal {
+                schema_version: 1,
+                registration: self.permit.registration(),
+                operation: self.permit.operation(),
+                user: self.permit.user().to_owned(),
+                phase: Phase::Running,
+                current: Some(generation),
+                stop_instance: None,
+                original_xml: None,
+                restart_times: Vec::new(),
+                last_tick_ms: self.owner.clock().now_ms(),
+                clock_epoch: self.owner.clock().epoch(),
+            };
+            Ok(InitialReady {
+                original,
+                generation,
+                model,
+                record,
+            })
+        }
+        fn publish_running(&mut self, ready: &Self::Ready) -> NativeResult<()> {
+            let deadline = budget(self.owner.clock(), 30_000)?;
+            let support = proof(self.owner.io(), &deadline)?;
+            let lock = self
+                .owner
+                .io()
+                .acquire_installer_lock(&support, &deadline)?;
+            let support = proof(self.owner.io(), &deadline)?;
+            self.reverify_archive(&support, &lock, &deadline)?;
+            ready.record.publish_owned_transition(
+                self.owner.io(),
+                &support,
+                &lock,
+                None,
+                &deadline,
+            )?;
+            // Bound is published only after the real Running journal exists. If either write is
+            // uncertain, Preparing/current mismatches refuse later admission; no fake completion.
+            self.publish_bound(&proof(self.owner.io(), &deadline)?, &lock, &deadline)
+        }
+    }
     fn fresh_server_agent(
         owner: &Arc<SupervisorOwner>,
         expected: Generation,
@@ -631,7 +879,16 @@ mod native {
     }
     pub(super) fn run(trusted: &TrustedImages) -> NativeResult<SupervisorExit> {
         let initial = budget(Arc::new(MonotonicClock::default()), 30_000)?;
-        let permit = Arc::new(task::claim_supervisor(trusted, &initial)?);
+        // Selection is read-only and precedes either admission's effects. Once selected, an
+        // installer claim failure returns; it can NEVER fall through into a fresh logon permit.
+        let candidate = match entry_selection(trusted, &initial)? {
+            EntrySelection::Installer => {
+                EntryCandidate::Installer(Arc::new(task::claim_supervisor(trusted, &initial)?))
+            }
+            EntrySelection::Logon => {
+                EntryCandidate::Logon(Box::new(prepare_logon(trusted, &initial)?))
+            }
+        };
         let images = &trusted._native;
         let support = proof(&images.io, &initial)?;
         let owner =
@@ -644,49 +901,39 @@ mod native {
             &proof(&images.io, &initial)?,
             &initial,
         )?;
-        // Archive is real atomic admission, not a body boolean or a cold owner reconstruction.
-        let archive = {
-            let support = proof(owner.io(), &initial)?;
-            let lock = owner.io().acquire_installer_lock(&support, &initial)?;
-            owner.io().prepare_supervisor_epoch(
-                &proof(owner.io(), &initial)?,
-                &lock,
-                &permit,
-                &owner,
-                &initial,
-            )?
+        let permit = match candidate {
+            EntryCandidate::Installer(permit) => EntryPermit::Installer(permit),
+            EntryCandidate::Logon(candidate) => {
+                let (reservation, disposition) = {
+                    let support = proof(owner.io(), &initial)?;
+                    let lock = owner.io().acquire_installer_lock(&support, &initial)?;
+                    owner.io().prepare_logon_reservation(
+                        &proof(owner.io(), &initial)?,
+                        &lock,
+                        &owner,
+                        &initial,
+                    )?
+                };
+                EntryPermit::Logon(Arc::new(admit_logon(
+                    *candidate,
+                    reservation,
+                    disposition,
+                    &initial,
+                )?))
+            }
         };
-        let start = ChildStartPermit::initial(
-            owner.clone(),
-            permit.clone(),
-            &proof(owner.io(), &initial)?,
-            &initial,
-        )?;
-        let child = owner.launch(start, &proof(owner.io(), &initial)?, &initial)?;
-        let (mut original, mut generation) = await_ready(&owner, &child, &initial)?;
-        let mut model = Supervisor::new(generation, owner.clock().now_ms(), Vec::new())?;
-        model.running();
-        let mut record = Journal {
-            schema_version: 1,
-            registration: permit.registration(),
-            operation: permit.operation(),
-            user: permit.user().to_owned(),
-            phase: Phase::Running,
-            current: Some(generation),
-            stop_instance: None,
-            original_xml: None,
-            restart_times: Vec::new(),
-            last_tick_ms: owner.clock().now_ms(),
-            clock_epoch: owner.clock().epoch(),
+        let mut initial_epoch = NativeInitialEpoch {
+            owner: owner.clone(),
+            permit,
+            deadline: &initial,
+            archive: None,
         };
-        {
-            let deadline = budget(owner.clock(), 30_000)?;
-            let support = proof(owner.io(), &deadline)?;
-            let lock = owner.io().acquire_installer_lock(&support, &deadline)?;
-            let support = proof(owner.io(), &deadline)?;
-            archive.reverify(owner.io(), &support, &lock, &permit, &owner, &deadline)?;
-            record.publish_owned_transition(owner.io(), &support, &lock, None, &deadline)?;
-        }
+        let InitialReady {
+            mut original,
+            mut generation,
+            mut model,
+            mut record,
+        } = initialize_epoch(&mut initial_epoch)?;
         let bound = budget(owner.clock(), 30_000)?;
         let server_agent = fresh_server_agent(&owner, generation, &bound)?;
         server.update_generation(server_agent, &proof(owner.io(), &bound)?, &bound)?;

@@ -413,3 +413,386 @@ pub(crate) fn correlate_upgrade(
         predecessor: predecessor.clone(),
     }))
 }
+
+/// A route decision only. It never claims an activation or constructs native launch authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntrySelection {
+    Installer,
+    Logon,
+}
+pub(crate) fn select_entry(task: Option<&TaskActivationRecord>) -> NativeResult<EntrySelection> {
+    let Some(task) = task else {
+        return Ok(EntrySelection::Logon);
+    };
+    task.validate()?;
+    match task.phase {
+        Phase::RunIntent | Phase::RunObserved if task.claim.is_none() => {
+            Ok(EntrySelection::Installer)
+        }
+        Phase::Registered | Phase::RunIntent | Phase::RunObserved => Ok(EntrySelection::Logon),
+        Phase::RegistrationIntent | Phase::Unknown => Err(NativeError::OutcomeUnknown),
+    }
+}
+
+/// Immutable epoch/context observations. Neither decoding nor matching supplies owner authority.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EpochProvenance {
+    registration: [u8; 16],
+    operation: [u8; 16],
+    user: String,
+    user_sid: Vec<u8>,
+    logon_sid: Vec<u8>,
+    authentication_id: u64,
+    session: u32,
+    owner_pid: u32,
+    owner_creation: u64,
+    clock_epoch: u64,
+}
+impl std::fmt::Debug for EpochProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EpochProvenance")
+    }
+}
+impl EpochProvenance {
+    pub(crate) fn new(
+        registration: [u8; 16],
+        operation: [u8; 16],
+        facts: &super::identity::TokenFacts,
+        owner_pid: u32,
+        owner_creation: u64,
+    ) -> NativeResult<Self> {
+        super::identity::LimitedIdentity::admit(facts.clone())?;
+        let value = Self {
+            registration,
+            operation,
+            user: facts.user.sddl(),
+            user_sid: facts.user.bytes().to_vec(),
+            logon_sid: facts.logon.bytes().to_vec(),
+            authentication_id: facts.authentication_id,
+            session: facts.session,
+            owner_pid,
+            owner_creation,
+            clock_epoch: owner_creation,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub(crate) fn registration(&self) -> [u8; 16] {
+        self.registration
+    }
+    pub(crate) fn operation(&self) -> [u8; 16] {
+        self.operation
+    }
+    pub(crate) fn user(&self) -> &str {
+        &self.user
+    }
+    pub(crate) fn logon_sid(&self) -> &[u8] {
+        &self.logon_sid
+    }
+    pub(crate) fn authentication_id(&self) -> u64 {
+        self.authentication_id
+    }
+    pub(crate) fn owner_creation(&self) -> u64 {
+        self.owner_creation
+    }
+    // The focused logon fakes construct the frozen Journal using this exact epoch.
+    #[cfg(test)]
+    pub(crate) fn clock_epoch(&self) -> u64 {
+        self.clock_epoch
+    }
+    // The focused logon fakes assert exact same-context and different-logon observations.
+    #[cfg(test)]
+    pub(crate) fn matches_context(&self, facts: &super::identity::TokenFacts) -> bool {
+        self.user_sid == facts.user.bytes()
+            && self.logon_sid == facts.logon.bytes()
+            && self.authentication_id == facts.authentication_id
+            && self.session == facts.session
+    }
+    pub(crate) fn validate(&self) -> NativeResult<()> {
+        let user = super::identity::Sid::from_bytes(self.user_sid.clone())?;
+        let logon = super::identity::Sid::from_bytes(self.logon_sid.clone())?;
+        // Structural checked observations only: this does not call a native token factory.
+        super::identity::LimitedIdentity::admit(super::identity::TokenFacts {
+            user: user.clone(),
+            logon,
+            session: self.session,
+            elevated: false,
+            integrity: 0x2000,
+            authentication_id: self.authentication_id,
+            impersonating: false,
+        })?;
+        if self.registration == [0; 16]
+            || self.operation == [0; 16]
+            || self.user != user.sddl()
+            || self.authentication_id == 0
+            || self.owner_pid == 0
+            || self.owner_creation == 0
+            || self.clock_epoch != self.owner_creation
+        {
+            return Err(NativeError::Invalid);
+        }
+        Ok(())
+    }
+    pub(crate) fn matches_journal(
+        &self,
+        journal: &super::super::service::journal::Journal,
+    ) -> NativeResult<()> {
+        use super::super::service::journal::{Journal, Phase};
+        self.validate()?;
+        let journal = Journal::decode(&journal.encode()?)?;
+        if journal.user != self.user
+            || journal.registration != self.registration
+            || journal.operation != self.operation
+            || journal.clock_epoch != self.clock_epoch
+            || journal.current.is_none()
+            || !matches!(
+                journal.phase,
+                Phase::Running
+                    | Phase::Backoff
+                    | Phase::StartRequested
+                    | Phase::StopIntent
+                    | Phase::Finished
+            )
+        {
+            return Err(NativeError::Foreign);
+        }
+        Ok(())
+    }
+}
+
+/// Immutable archive correlation. The native adapter independently verifies the actual file.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryCorrelation {
+    slot: u8,
+    epoch: EpochProvenance,
+    source: super::super::payload::recovery::FileStamp,
+    sha256: [u8; 32],
+}
+impl std::fmt::Debug for HistoryCorrelation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HistoryCorrelation")
+    }
+}
+impl HistoryCorrelation {
+    pub(crate) fn new(
+        slot: u8,
+        epoch: EpochProvenance,
+        source: super::super::payload::recovery::FileStamp,
+        sha256: [u8; 32],
+    ) -> NativeResult<Self> {
+        let value = Self {
+            slot,
+            epoch,
+            source,
+            sha256,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub(crate) fn slot(&self) -> u8 {
+        self.slot
+    }
+    fn validate(&self) -> NativeResult<()> {
+        self.epoch.validate()?;
+        if self.slot > 2
+            || self.source.volume == 0
+            || self.source.file == [0; 16]
+            || self.sha256 == [0; 32]
+        {
+            return Err(NativeError::Invalid);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum LogonRecordPhase {
+    Preparing,
+    Bound,
+    Unknown,
+}
+
+/// One fixed private record, with at most the three admitted immutable archive correlations.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SupervisorLogonRecord {
+    schema_version: u8,
+    phase: LogonRecordPhase,
+    current: EpochProvenance,
+    history: Vec<HistoryCorrelation>,
+}
+impl std::fmt::Debug for SupervisorLogonRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SupervisorLogonRecord")
+    }
+}
+impl SupervisorLogonRecord {
+    pub(crate) fn new(current: EpochProvenance) -> NativeResult<Self> {
+        let value = Self {
+            schema_version: 1,
+            phase: LogonRecordPhase::Preparing,
+            current,
+            history: Vec::new(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub(crate) fn current(&self) -> &EpochProvenance {
+        &self.current
+    }
+    pub(crate) fn phase(&self) -> LogonRecordPhase {
+        self.phase
+    }
+    pub(crate) fn history(&self) -> &[HistoryCorrelation] {
+        &self.history
+    }
+    pub(crate) fn rotate(
+        &self,
+        next: EpochProvenance,
+        archived: HistoryCorrelation,
+    ) -> NativeResult<Self> {
+        self.validate()?;
+        next.validate()?;
+        archived.validate()?;
+        if self.phase != LogonRecordPhase::Bound
+            || archived.epoch != self.current
+            || next.operation == self.current.operation
+            || next.user != self.current.user
+        {
+            return Err(NativeError::Foreign);
+        }
+        let mut history = self
+            .history
+            .iter()
+            .filter(|entry| entry.slot != archived.slot)
+            .cloned()
+            .collect::<Vec<_>>();
+        history.push(archived);
+        history.sort_by_key(|entry| entry.slot);
+        let value = Self {
+            schema_version: 1,
+            phase: LogonRecordPhase::Preparing,
+            current: next,
+            history,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub(crate) fn bind(
+        &mut self,
+        journal: &super::super::service::journal::Journal,
+    ) -> NativeResult<()> {
+        self.validate()?;
+        if self.phase != LogonRecordPhase::Preparing
+            || journal.phase != super::super::service::journal::Phase::Running
+        {
+            return Err(NativeError::Foreign);
+        }
+        self.current.matches_journal(journal)?;
+        self.phase = LogonRecordPhase::Bound;
+        Ok(())
+    }
+    pub(crate) fn matches_current(
+        &self,
+        journal: &super::super::service::journal::Journal,
+    ) -> NativeResult<&EpochProvenance> {
+        self.validate()?;
+        if self.phase != LogonRecordPhase::Bound {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        self.current.matches_journal(journal)?;
+        Ok(&self.current)
+    }
+    pub(crate) fn matches_history(
+        &self,
+        slot: u8,
+        journal: &super::super::service::journal::Journal,
+        source: super::super::payload::recovery::FileStamp,
+        sha256: [u8; 32],
+    ) -> NativeResult<&EpochProvenance> {
+        self.validate()?;
+        let found = self
+            .history
+            .iter()
+            .find(|entry| entry.slot == slot)
+            .ok_or(NativeError::Foreign)?;
+        if found.source != source || found.sha256 != sha256 {
+            return Err(NativeError::Foreign);
+        }
+        found.epoch.matches_journal(journal)?;
+        Ok(&found.epoch)
+    }
+    pub(crate) fn encode(&self) -> NativeResult<Vec<u8>> {
+        self.validate()?;
+        records::encode_record(
+            &RecordName::SupervisorLogon,
+            serde_json::to_value(self).map_err(|_| NativeError::Invalid)?,
+        )
+    }
+    pub(crate) fn decode(bytes: &[u8]) -> NativeResult<Self> {
+        let value: Self = records::record_data(&RecordName::SupervisorLogon, bytes)?;
+        value.validate()?;
+        Ok(value)
+    }
+    fn validate(&self) -> NativeResult<()> {
+        self.current.validate()?;
+        if self.schema_version != 1
+            || self.history.len() > 3
+            || self.phase == LogonRecordPhase::Unknown
+        {
+            return Err(NativeError::Invalid);
+        }
+        for (index, entry) in self.history.iter().enumerate() {
+            entry.validate()?;
+            if entry.epoch.user != self.current.user
+                || entry.epoch.operation == self.current.operation
+                || self.history[..index].iter().any(|older| {
+                    older.slot == entry.slot || older.epoch.operation == entry.epoch.operation
+                })
+            {
+                return Err(NativeError::Invalid);
+            }
+        }
+        Ok(())
+    }
+}
+#[cfg(windows)]
+impl SupervisorLogonRecord {
+    pub(crate) fn read(
+        io: &super::WindowsNativeIo,
+        proof: &super::SupportProof,
+        deadline: &super::Deadline,
+    ) -> NativeResult<Option<Self>> {
+        io.read_record(
+            proof,
+            RecordName::SupervisorLogon,
+            super::files::MAX_RECORD_BYTES,
+            deadline,
+        )?
+        .map(|record| Self::decode(record.bytes()))
+        .transpose()
+    }
+    pub(crate) fn publish(
+        &self,
+        io: &super::WindowsNativeIo,
+        proof: &super::SupportProof,
+        lock: &super::InstallerLock,
+        deadline: &super::Deadline,
+    ) -> NativeResult<()> {
+        let value = io.publish_record(
+            proof,
+            lock,
+            RecordName::SupervisorLogon,
+            &self.encode()?,
+            deadline,
+        )?;
+        if value.native_failure.is_some()
+            || value.state != records::PublicationRecovery::NewPublished
+        {
+            return Err(NativeError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+}
