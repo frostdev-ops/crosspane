@@ -19,7 +19,7 @@
 //! its absence, or a revoked Accessibility permission, does.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -41,8 +41,9 @@ use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CGSize
 use objc2_core_graphics::{
     CGBeginDisplayConfiguration, CGCancelDisplayConfiguration, CGCompleteDisplayConfiguration,
     CGConfigureDisplayOrigin, CGConfigureOption, CGDisplayBounds, CGDisplayCopyAllDisplayModes,
-    CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplaySetDisplayMode, CGError,
-    CGGetActiveDisplayList, kCGDisplayShowDuplicateLowResolutionModes,
+    CGDisplayCopyDisplayMode, CGDisplayMirrorsDisplay, CGDisplayMode, CGDisplayModelNumber,
+    CGDisplaySetDisplayMode, CGDisplayVendorNumber, CGError, CGGetActiveDisplayList,
+    kCGDisplayShowDuplicateLowResolutionModes, kCGNullDirectDisplay,
 };
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
@@ -59,6 +60,7 @@ const DISPLAY_WAIT: Duration = Duration::from_secs(1);
 const INSET_WAIT: Duration = Duration::from_millis(500);
 const INSET_POLL: Duration = Duration::from_millis(50);
 const MAX_PIXELS: u32 = 8192;
+const MAX_FAILED_STARTS: u8 = 3;
 
 thread_local! {
     // Accessed exclusively inside on_main/spawn_on_main. Native objects never cross threads.
@@ -674,6 +676,7 @@ fn place_twin(id: DisplayId) -> Result<Placement, PlatformError> {
 struct Entry {
     pid: i32,
     frame: RectLogical,
+    failed_starts: u8,
 }
 
 struct ParkAttempt {
@@ -723,6 +726,34 @@ fn active_display_bounds() -> Result<Vec<RectLogical>, PlatformError> {
         .into_iter()
         .filter_map(|id| display_frame(id).ok())
         .collect())
+}
+
+/// Fresh numeric bounds, using the same Crosspane twin identity as the display source.
+fn real_display_bounds() -> Result<Vec<RectLogical>, PlatformError> {
+    active_displays()?
+        .into_iter()
+        .filter(|&id| CGDisplayMirrorsDisplay(id) == kCGNullDirectDisplay)
+        .filter(|&id| {
+            CGDisplayVendorNumber(id) != crate::displays::TWIN_VENDOR
+                || CGDisplayModelNumber(id) != crate::displays::TWIN_PRODUCT
+        })
+        .map(display_frame)
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryLocation {
+    Real,
+    Elsewhere,
+    Gone,
+}
+
+fn on_real_display(raw: &RawWindow, displays: &[RectLogical]) -> bool {
+    raw.on_screen
+        && valid_frame(raw.frame)
+        && displays
+            .iter()
+            .any(|display| valid_frame(*display) && display.contains_rect(&raw.frame))
 }
 
 /// Where a window stands with respect to native fullscreen, on any display.
@@ -964,6 +995,8 @@ pub struct MacTwinParking {
 struct TwinState {
     journal: PathBuf,
     entries: BTreeMap<WindowId, Entry>,
+    /// Imported entries are counted only on the first recovery pass, never at shutdown.
+    startup_entries: BTreeSet<WindowId>,
     displays: BTreeMap<WindowId, VirtualDisplay>,
     /// Each parked window's last frame AX reported, for when AX has no window for it.
     last: BTreeMap<WindowId, RectLogical>,
@@ -973,6 +1006,7 @@ struct TwinState {
     query: WindowQuery,
     /// The bounds of the active displays ([`active_display_bounds`]; a test stubs it).
     probe: fn() -> Result<Vec<RectLogical>, PlatformError>,
+    recovery_probe: fn() -> Result<Vec<RectLogical>, PlatformError>,
 }
 
 impl MacTwinParking {
@@ -984,6 +1018,7 @@ impl MacTwinParking {
         Ok(Self {
             state: Mutex::new(TwinState {
                 journal,
+                startup_entries: entries.keys().copied().collect(),
                 entries,
                 displays: BTreeMap::new(),
                 last: BTreeMap::new(),
@@ -991,6 +1026,7 @@ impl MacTwinParking {
                 last_inset: 0.0,
                 query: WindowQuery::new()?,
                 probe: active_display_bounds,
+                recovery_probe: real_display_bounds,
             }),
         })
     }
@@ -1411,6 +1447,121 @@ impl TwinState {
         Ok(restored)
     }
 
+    fn window_on_real_display(&self, window: WindowId) -> Result<RecoveryLocation, PlatformError> {
+        let (raw, _) = match self.quartz(window) {
+            Ok(found) => found,
+            Err(PlatformError::NotFound) => return Ok(RecoveryLocation::Gone),
+            Err(error) => return Err(error),
+        };
+        if !raw.on_screen || !valid_frame(raw.frame) {
+            return Ok(RecoveryLocation::Elsewhere);
+        }
+        // A failed display query (even NotFound) never means the window is gone.
+        Ok(if on_real_display(&raw, &(self.recovery_probe)()?) {
+            RecoveryLocation::Real
+        } else {
+            RecoveryLocation::Elsewhere
+        })
+    }
+
+    /// Startup-only acceptance, before AX and again after a failed restore that may have moved
+    /// the window home with a clamped size. An inconclusive read is never proof of restoration.
+    fn accept_recovered_with(
+        &mut self,
+        window: WindowId,
+        observed: Result<RecoveryLocation, PlatformError>,
+    ) -> Result<Option<bool>, PlatformError> {
+        match observed {
+            Ok(RecoveryLocation::Real) => {
+                self.remove_entry(window)?;
+                tracing::info!(
+                    window = window.0,
+                    "parked window is on a real display; journal entry removed"
+                );
+                Ok(Some(true))
+            }
+            Ok(RecoveryLocation::Gone) => {
+                self.remove_entry(window)?;
+                Ok(Some(false))
+            }
+            Ok(RecoveryLocation::Elsewhere) | Err(_) => Ok(None),
+        }
+    }
+
+    fn recover_startup_with(
+        &mut self,
+        window: WindowId,
+        restore: &mut impl FnMut(&mut Self, WindowId) -> Result<bool, PlatformError>,
+        observe: &mut impl FnMut(&Self, WindowId) -> Result<RecoveryLocation, PlatformError>,
+    ) -> Result<bool, PlatformError> {
+        let observed = observe(self, window);
+        if let Some(restored) = self.accept_recovered_with(window, observed)? {
+            return Ok(restored);
+        }
+        let error = match restore(self, window) {
+            Ok(restored) => return Ok(restored),
+            Err(error) => error,
+        };
+        let observed = observe(self, window);
+        if let Some(restored) = self.accept_recovered_with(window, observed)? {
+            return Ok(restored);
+        }
+        let Some(entry) = self.entries.get(&window) else {
+            return Err(error);
+        };
+        let failures = entry.failed_starts.saturating_add(1);
+        let mut entries = self.entries.clone();
+        if failures >= MAX_FAILED_STARTS {
+            entries.remove(&window);
+        } else if let Some(entry) = entries.get_mut(&window) {
+            entry.failed_starts = failures;
+        }
+        // Publish count or retirement durably before memory advances or the drop warning.
+        write_journal(&self.journal, &entries)?;
+        self.entries = entries;
+        if failures >= MAX_FAILED_STARTS {
+            tracing::warn!(
+                window = window.0,
+                "parked window recovery failed on three starts; journal entry dropped"
+            );
+            Ok(false) // Retirement is not a claim that the window was restored.
+        } else {
+            Err(error)
+        }
+    }
+
+    fn recover_with(
+        &mut self,
+        mut restore: impl FnMut(&mut Self, WindowId) -> Result<bool, PlatformError>,
+        mut observe: impl FnMut(&Self, WindowId) -> Result<RecoveryLocation, PlatformError>,
+    ) -> Result<Vec<WindowId>, PlatformError> {
+        let startup = std::mem::take(&mut self.startup_entries);
+        let mut restored = Vec::new();
+        let mut first_error = None;
+        let windows: BTreeSet<_> = self
+            .entries
+            .keys()
+            .chain(self.displays.keys())
+            .copied()
+            .collect();
+        for window in windows {
+            let result = if startup.contains(&window) && !self.displays.contains_key(&window) {
+                self.recover_startup_with(window, &mut restore, &mut observe)
+            } else {
+                restore(self, window)
+            };
+            match result {
+                Ok(true) => restored.push(window),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "twin recovery failed; continuing with remaining windows");
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(restored), Err)
+    }
+
     fn abort(&mut self, window: WindowId, error: PlatformError) -> PlatformError {
         self.abort_with(window, error, |state, window| {
             state.restore(window).map(|_| ())
@@ -1555,6 +1706,7 @@ impl TwinState {
             .or_insert(Entry {
                 pid: raw.pid,
                 frame: original,
+                failed_starts: 0,
             })
             .frame;
         self.park_sequence_with(
@@ -1709,31 +1861,8 @@ impl WindowParking for MacTwinParking {
     }
 
     fn recover(&mut self) -> Result<Vec<WindowId>, PlatformError> {
-        let mut state = self.state()?;
-        let mut restored = Vec::new();
-        let mut first_error = None;
-        let windows: std::collections::BTreeSet<_> = state
-            .entries
-            .keys()
-            .chain(state.displays.keys())
-            .copied()
-            .collect();
-        for window in windows {
-            match state.restore(window) {
-                Ok(true) => restored.push(window),
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "twin recovery failed; continuing with remaining windows");
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(restored),
-        }
+        self.state()?
+            .recover_with(TwinState::restore, TwinState::window_on_real_display)
     }
 }
 
@@ -1815,6 +1944,10 @@ fn read_journal(path: &Path) -> Result<BTreeMap<WindowId, Entry>, PlatformError>
     };
     let mut text = String::new();
     file.read_to_string(&mut text).map_err(io_error)?;
+    parse_journal(&text)
+}
+
+fn parse_journal(text: &str) -> Result<BTreeMap<WindowId, Entry>, PlatformError> {
     let invalid = || PlatformError::Backend("invalid twin journal; retained for inspection".into());
     let mut lines = text.lines();
     if lines.next() != Some("crosspane-twin-v1") {
@@ -1823,12 +1956,17 @@ fn read_journal(path: &Path) -> Result<BTreeMap<WindowId, Entry>, PlatformError>
     let mut entries = BTreeMap::new();
     for line in lines {
         let parts: Vec<_> = line.split_whitespace().collect();
-        if parts.len() != 6 {
+        if parts.len() != 6 && parts.len() != 7 {
             return Err(invalid());
         }
         let window = WindowId(parts[0].parse::<u64>().map_err(|_| invalid())?);
         let pid = parts[1].parse::<i32>().map_err(|_| invalid())?;
-        let values = parts[2..]
+        let failed_starts = parts
+            .get(6)
+            .map(|count| count.parse::<u8>().map_err(|_| invalid()))
+            .transpose()?
+            .unwrap_or(0);
+        let values = parts[2..6]
             .iter()
             .map(|v| v.parse::<f64>().map_err(|_| invalid()))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1840,12 +1978,34 @@ fn read_journal(path: &Path) -> Result<BTreeMap<WindowId, Entry>, PlatformError>
             || window.0 > u64::from(u32::MAX)
             || pid <= 0
             || !valid_frame(frame)
-            || entries.insert(window, Entry { pid, frame }).is_some()
+            || entries
+                .insert(
+                    window,
+                    Entry {
+                        pid,
+                        frame,
+                        failed_starts,
+                    },
+                )
+                .is_some()
         {
             return Err(invalid());
         }
     }
     Ok(entries)
+}
+
+fn journal_line(window: WindowId, entry: &Entry) -> String {
+    format!(
+        "{} {} {} {} {} {} {}",
+        window.0,
+        entry.pid,
+        entry.frame.origin.x,
+        entry.frame.origin.y,
+        entry.frame.size.width,
+        entry.frame.size.height,
+        entry.failed_starts
+    )
 }
 
 fn write_journal(path: &Path, entries: &BTreeMap<WindowId, Entry>) -> Result<(), PlatformError> {
@@ -1868,17 +2028,7 @@ fn write_journal(path: &Path, entries: &BTreeMap<WindowId, Entry>) -> Result<(),
     let result = (|| {
         writeln!(file, "crosspane-twin-v1").map_err(io_error)?;
         for (window, entry) in entries {
-            writeln!(
-                file,
-                "{} {} {} {} {} {}",
-                window.0,
-                entry.pid,
-                entry.frame.origin.x,
-                entry.frame.origin.y,
-                entry.frame.size.width,
-                entry.frame.size.height
-            )
-            .map_err(io_error)?;
+            writeln!(file, "{}", journal_line(*window, entry)).map_err(io_error)?;
         }
         file.sync_all().map_err(io_error)?;
         fs::rename(&temporary, path).map_err(io_error)?;
@@ -2565,14 +2715,17 @@ pub(crate) mod tests {
                 Entry {
                     pid: 500,
                     frame: rect(0.0, 0.0, 800.0, 600.0),
+                    failed_starts: 0,
                 },
             )]),
+            startup_entries: BTreeSet::from([WindowId(10)]),
             displays: BTreeMap::new(),
             last: BTreeMap::new(),
             last_fullscreen: BTreeMap::new(),
             last_inset: 0.0,
             query: WindowQuery::scripted(replies),
             probe: || Ok(vec![built_in(), twin_rect()]),
+            recovery_probe: || Ok(vec![built_in()]),
         }
     }
 
@@ -3092,6 +3245,235 @@ pub(crate) mod tests {
         fs::remove_file(&state.journal).unwrap();
     }
 
+    struct RecoveryFixture(TwinState);
+
+    impl RecoveryFixture {
+        fn new(replies: Vec<Result<Vec<RawWindow>, PlatformError>>, original: RectLogical) -> Self {
+            Self(journal_state(replies, original))
+        }
+    }
+
+    impl Drop for RecoveryFixture {
+        fn drop(&mut self) {
+            // Only the scratch journal this fixture created; no native displays are constructed.
+            let _ = fs::remove_file(&self.0.journal);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn recovery_refused_frame_on_real_display_removes_entry() {
+        let window = WindowId(10);
+        let original = rect(20.0, 30.0, 800.0, 600.0);
+        let clamped = RawWindow::fixture(10, 500, rect(20.0, 30.0, 800.0, 500.0), true);
+        for after_attempt in [false, true] {
+            let mut replies = Vec::new();
+            if after_attempt {
+                replies.push(Ok(vec![page(true)]));
+            }
+            replies.push(Ok(vec![clamped.clone()]));
+            let mut fixture = RecoveryFixture::new(replies, original);
+            let mut attempts = 0;
+            let restored = fixture
+                .0
+                .recover_with(
+                    |_, _| {
+                        attempts += 1;
+                        Err(PlatformError::Backend(
+                            "window refused original frame; journal retained".into(),
+                        ))
+                    },
+                    TwinState::window_on_real_display,
+                )
+                .unwrap();
+            assert_eq!(restored, vec![window]);
+            assert_eq!(attempts, u32::from(after_attempt));
+            assert!(fixture.0.entries.is_empty());
+            assert!(read_journal(&fixture.0.journal).unwrap().is_empty());
+        }
+        // A confirmed absence needs no display or AX read, and is not counted as restoration.
+        let mut fixture = RecoveryFixture::new(vec![Ok(vec![])], original);
+        fixture.0.recovery_probe = || panic!("absent window requires no display query");
+        let restored = fixture
+            .0
+            .recover_with(
+                |_, _| panic!("absent window requires no AX restore"),
+                TwinState::window_on_real_display,
+            )
+            .unwrap();
+        assert!(restored.is_empty());
+        assert!(read_journal(&fixture.0.journal).unwrap().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn recovery_ax_cannot_complete_on_real_display_removes_entry() {
+        let window = WindowId(10);
+        // The unrestricted Quartz query retains even a helper excluded from Browse listings.
+        let helper = RawWindow::fixture(10, 500, rect(40.0, 50.0, 1.0, 1.0), true);
+        for after_attempt in [false, true] {
+            let mut replies = Vec::new();
+            if after_attempt {
+                replies.push(Ok(vec![page(true)]));
+            }
+            replies.push(Ok(vec![helper.clone()]));
+            let mut fixture = RecoveryFixture::new(replies, rect(20.0, 30.0, 800.0, 600.0));
+            let mut attempts = 0;
+            let restored = fixture
+                .0
+                .recover_with(
+                    |_, _| {
+                        attempts += 1;
+                        Err(PlatformError::Backend(
+                            "AX error -25200 (kAXErrorCannotComplete)".into(),
+                        ))
+                    },
+                    TwinState::window_on_real_display,
+                )
+                .unwrap();
+            assert_eq!(restored, vec![window]);
+            assert_eq!(attempts, u32::from(after_attempt));
+            assert!(fixture.0.entries.is_empty());
+            assert!(read_journal(&fixture.0.journal).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn recovery_failing_twin_keeps_incremented_count_once_per_start() {
+        let window = WindowId(10);
+        let original = rect(20.0, 30.0, 800.0, 600.0);
+        let mut fixture =
+            RecoveryFixture::new(vec![Ok(vec![page(true)]), Ok(vec![page(true)])], original);
+        let fail =
+            |_: &mut TwinState, _: WindowId| Err(PlatformError::Backend("AX error -25200".into()));
+        assert!(
+            fixture
+                .0
+                .recover_with(fail, TwinState::window_on_real_display)
+                .is_err()
+        );
+        assert_eq!(fixture.0.entries[&window].failed_starts, 1);
+        assert_eq!(
+            read_journal(&fixture.0.journal).unwrap()[&window].failed_starts,
+            1
+        );
+        let journal = fs::read(&fixture.0.journal).unwrap();
+        // Same-process recovery (including shutdown) must use the old restore path, not count
+        // another failed start or relax its real-display/AX requirements.
+        assert!(
+            fixture
+                .0
+                .recover_with(fail, |_, _| panic!("startup observer reused at shutdown"))
+                .is_err()
+        );
+        assert_eq!(fixture.0.entries[&window].failed_starts, 1);
+        assert_eq!(fs::read(&fixture.0.journal).unwrap(), journal);
+        // Real-display proof refuses hidden, invalid, outside and only partly contained frames.
+        let displays = [built_in()];
+        let mut hidden = RawWindow::fixture(10, 500, original, false);
+        assert!(!on_real_display(&hidden, &displays));
+        hidden.on_screen = true;
+        for frame in [
+            rect(0.0, 0.0, 0.0, 1.0),
+            twin_rect(),
+            rect(-1.0, 0.0, 10.0, 10.0),
+        ] {
+            hidden.frame = frame;
+            assert!(!on_real_display(&hidden, &displays));
+        }
+        // NotFound from the display query is not proof that a present window vanished.
+        let mut unknown = RecoveryFixture::new(
+            (0..2)
+                .map(|_| Ok(vec![RawWindow::fixture(10, 500, original, true)]))
+                .collect(),
+            original,
+        );
+        unknown.0.recovery_probe = || Err(PlatformError::NotFound);
+        assert!(
+            unknown
+                .0
+                .recover_with(fail, TwinState::window_on_real_display)
+                .is_err()
+        );
+        assert_eq!(unknown.0.entries[&window].failed_starts, 1);
+        assert_eq!(
+            read_journal(&unknown.0.journal).unwrap()[&window].failed_starts,
+            1
+        );
+        // A reused numeric window id with a foreign PID is absence of the journaled window.
+        let foreign = RawWindow::fixture(10, 501, original, true);
+        assert!(matches!(
+            fixture.0.pick(window, vec![foreign]),
+            Err(PlatformError::NotFound)
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn recovery_third_failed_start_drops_entry_without_claiming_restored() {
+        let window = WindowId(10);
+        let mut fixture =
+            RecoveryFixture::new(vec![Ok(vec![page(true)]), Ok(vec![page(true)])], built_in());
+        fixture.0.entries.get_mut(&window).unwrap().failed_starts = 2;
+        write_journal(&fixture.0.journal, &fixture.0.entries).unwrap();
+        assert_eq!(
+            read_journal(&fixture.0.journal).unwrap()[&window].failed_starts,
+            2
+        );
+        let restored = fixture
+            .0
+            .recover_with(
+                |_, _| Err(PlatformError::Backend("AX error -25200".into())),
+                TwinState::window_on_real_display,
+            )
+            .unwrap();
+        assert!(restored.is_empty());
+        assert!(fixture.0.entries.is_empty());
+        assert!(read_journal(&fixture.0.journal).unwrap().is_empty());
+        assert!(
+            fixture
+                .0
+                .recover_with(
+                    |_, _| panic!("retired entry retried"),
+                    |_, _| panic!("retired entry observed")
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn recovery_old_journal_line_defaults_failed_start_count_to_zero() {
+        let window = WindowId(42);
+        let old = "crosspane-twin-v1\n42 123 -100.5 40.25 400 300\n";
+        let mut entries = parse_journal(old).unwrap();
+        assert_eq!(entries[&window].failed_starts, 0);
+        entries.get_mut(&window).unwrap().failed_starts = 2;
+        let new = format!(
+            "crosspane-twin-v1\n{}\n",
+            journal_line(window, &entries[&window])
+        );
+        assert_eq!(parse_journal(&new).unwrap(), entries);
+        for count in ["-1", "256", "bad", "1 extra"] {
+            assert!(
+                parse_journal(&format!(
+                    "crosspane-twin-v1\n42 123 -100.5 40.25 400 300 {count}\n"
+                ))
+                .is_err()
+            );
+        }
+        // Mixed old/new lines remain readable, while all existing strict frame checks remain.
+        assert_eq!(
+            parse_journal(&format!("{old}43 124 0 0 400 300 1\n"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parse_journal("crosspane-twin-v1\n42 123 NaN 0 400 300 1\n").is_err());
+    }
+
     #[test]
     #[allow(clippy::unwrap_used)]
     fn recover_at_original_frame_removes_fullscreen_and_ordinary_entries_without_ax() {
@@ -3126,12 +3508,14 @@ pub(crate) mod tests {
         let window = WindowId(10);
         let original = rect(20.0, 30.0, 800.0, 600.0);
         let mut state = journal_state(
-            vec![Ok(vec![RawWindow::fixture(10, 500, built_in(), true)])],
+            (0..3)
+                .map(|_| Ok(vec![RawWindow::fixture(10, 500, built_in(), true)]))
+                .collect(),
             original,
         );
         state.probe = || Err(PlatformError::Backend("fake display lookup failed".into()));
+        state.recovery_probe = state.probe;
         let path = state.journal.clone();
-        let journal = fs::read(&path).unwrap();
         let mut parking = MacTwinParking {
             state: Mutex::new(state),
         };
@@ -3142,7 +3526,7 @@ pub(crate) mod tests {
             parking.state().unwrap().entries.get(&window).unwrap().frame,
             original
         );
-        assert_eq!(fs::read(&path).unwrap(), journal);
+        assert_eq!(read_journal(&path).unwrap()[&window].failed_starts, 1);
         fs::remove_file(path).unwrap();
     }
 
@@ -3419,6 +3803,7 @@ pub(crate) mod tests {
                     PointLogical::new(-100.5, 40.25),
                     SizeLogical::new(400.0, 300.0),
                 ),
+                failed_starts: 0,
             },
         )]);
         write_journal(&path, &entries).unwrap();
