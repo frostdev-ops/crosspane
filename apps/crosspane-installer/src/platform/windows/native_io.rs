@@ -36,6 +36,8 @@ pub enum NativeError {
 pub type NativeResult<T> = Result<T, NativeError>;
 pub use process::{Cancellation, Clock, Deadline, MonotonicClock};
 
+#[cfg(windows)]
+pub(crate) use adapter::AgentObservation;
 #[cfg(all(windows, test))]
 #[allow(unused_imports)]
 // Source-included probe exports; library unit tests do not invoke them.
@@ -328,6 +330,110 @@ mod adapter {
         owner: Arc<CallOwner>,
         clock: Arc<dyn Clock>,
     }
+    /// Read-only sealed observations, bound to the genuine target context. Non-Clone/non-Copy.
+    /// The pinned fixed image leaf is not a queried loaded-section FileId (W4.1a2 ruling).
+    pub(crate) struct AgentObservation(Arc<AgentObservationData>);
+    struct AgentObservationData {
+        target: [u8; 16],
+        runtime: Arc<Anchor>,
+        install: Arc<Anchor>,
+        runtime_canonical: std::ffi::OsString,
+        image_canonical: String,
+        image: File,
+        image_identity: FileIdentity,
+        process: process::selected::SelectedProcess,
+        bootstrap: crate::agent_contract::BootstrapV1,
+        phase_seq: std::sync::atomic::AtomicU64,
+    }
+    impl std::fmt::Debug for AgentObservation {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("AgentObservation")
+        }
+    }
+    impl AgentObservation {
+        pub(crate) fn bootstrap(&self) -> &crate::agent_contract::BootstrapV1 {
+            &self.0.bootstrap
+        }
+        pub(crate) fn runtime_canonical(&self) -> &std::ffi::OsStr {
+            &self.0.runtime_canonical
+        }
+        pub(crate) fn image_canonical(&self) -> &str {
+            &self.0.image_canonical
+        }
+        #[cfg(test)]
+        #[allow(dead_code)] // Fixture-only observation view; no production caller.
+        pub(crate) fn image_identity(&self) -> FileIdentity {
+            self.0.image_identity
+        }
+        #[cfg(test)]
+        #[allow(dead_code)] // Fixture-only observation view; no production caller.
+        pub(crate) fn image_handle(&self) -> &File {
+            &self.0.image
+        }
+        pub(crate) fn revalidate(
+            &self,
+            io: &WindowsNativeIo,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<()> {
+            let budget = proof.budget(io, deadline)?;
+            if self.0.target != io.context.target.nonce {
+                return Err(NativeError::Foreign);
+            }
+            let observed = self.0.clone();
+            let context = io.context.clone();
+            io.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                observed.process.revalidate(&budget)?;
+                observed
+                    .runtime
+                    .revalidate(&context.security, true, &budget)?;
+                observed
+                    .install
+                    .revalidate(&context.security, false, &budget)?;
+                if observed
+                    .runtime
+                    .canonical_dos_path(&context.security, &budget)?
+                    != observed.runtime_canonical
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let facts =
+                    native::observe(&observed.image, "crosspane-agent.exe", &context.security)?;
+                files::admit_component(&facts, Admission::PrivateFile)?;
+                let (_, current_image) = observed.install.open_file_metadata(
+                    &PrivateName::new("crosspane-agent.exe")?,
+                    &context.security,
+                    &budget,
+                )?;
+                if facts.identity != observed.image_identity
+                    || current_image != observed.image_identity
+                {
+                    return Err(NativeError::Foreign);
+                }
+                let (_, bytes) = observed
+                    .runtime
+                    .read_private(
+                        &PrivateName::new("bootstrap.json")?,
+                        &context.security,
+                        crate::agent_contract::MAX_RESPONSE_BYTES,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                let current = crate::agent_contract::parse_bootstrap(&bytes)
+                    .map_err(|_| NativeError::Invalid)?;
+                process::bootstrap_matches(&observed.bootstrap, &current)?;
+                observed
+                    .phase_seq
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                        (current.phase_seq >= old).then_some(current.phase_seq)
+                    })
+                    .map_err(|_| NativeError::Foreign)?;
+                observed.process.revalidate(&budget)?;
+                budget.check()
+            })
+        }
+    }
     impl std::fmt::Debug for WindowsNativeIo {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("WindowsNativeIo")
@@ -440,6 +546,87 @@ mod adapter {
         }
         pub fn target(&self) -> &WindowsTarget {
             &self.context.target
+        }
+        /// Only the fixed agent/runtime leaves beneath Shell-admitted roots; no path arguments.
+        pub(crate) fn observe_agent(
+            &self,
+            proof: &SupportProof,
+            deadline: &Deadline,
+        ) -> NativeResult<AgentObservation> {
+            let budget = proof.budget(self, deadline)?;
+            let context = self.context.clone();
+            self.owner.run(Dispatch::Observation, deadline, move || {
+                context.validate(&budget)?;
+                let runtime = Arc::new(
+                    Anchor::open(
+                        &format!("{}\\Crosspane\\runtime", context.target.paths.local()),
+                        &context.security,
+                        true,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?,
+                );
+                let install = Arc::new(
+                    Anchor::open(
+                        context.target.paths.install(),
+                        &context.security,
+                        false,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?,
+                );
+                let runtime_canonical = runtime.canonical_dos_path(&context.security, &budget)?;
+                let image_canonical = std::path::PathBuf::from(
+                    install.canonical_dos_path(&context.security, &budget)?,
+                )
+                .join("crosspane-agent.exe")
+                .to_str()
+                .ok_or(NativeError::Unsupported)?
+                .to_owned();
+                let (image, image_identity) = install.open_file_metadata(
+                    &PrivateName::new("crosspane-agent.exe")?,
+                    &context.security,
+                    &budget,
+                )?;
+                let (_, bytes) = runtime
+                    .read_private(
+                        &PrivateName::new("bootstrap.json")?,
+                        &context.security,
+                        crate::agent_contract::MAX_RESPONSE_BYTES,
+                        &budget,
+                    )?
+                    .ok_or(NativeError::Missing)?;
+                let bootstrap = crate::agent_contract::parse_bootstrap(&bytes)
+                    .map_err(|_| NativeError::Invalid)?;
+                if process::literal_path(&bootstrap.runtime_dir)?
+                    != process::literal_path(
+                        runtime_canonical.to_str().ok_or(NativeError::Unsupported)?,
+                    )?
+                {
+                    return Err(NativeError::Foreign);
+                }
+                process::bootstrap_matches(&bootstrap, &bootstrap)?;
+                let process = process::selected::SelectedProcess::admit(
+                    &bootstrap,
+                    &context.target.identity,
+                    &image_canonical,
+                    image_identity,
+                    &budget,
+                )?;
+                budget.check()?;
+                Ok(AgentObservation(Arc::new(AgentObservationData {
+                    target: context.target.nonce,
+                    runtime,
+                    install,
+                    runtime_canonical,
+                    image_canonical,
+                    image,
+                    image_identity,
+                    process,
+                    phase_seq: std::sync::atomic::AtomicU64::new(bootstrap.phase_seq),
+                    bootstrap,
+                })))
+            })
         }
         pub fn admit_support(&self, deadline: &Deadline) -> NativeResult<SupportProof> {
             identity::native::refuse_impersonation()?;

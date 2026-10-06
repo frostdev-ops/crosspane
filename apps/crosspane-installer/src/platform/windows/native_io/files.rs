@@ -800,6 +800,55 @@ pub(crate) mod native {
                 .map(|p| p.facts.identity)
                 .ok_or(NativeError::Foreign)
         }
+        /// DOS canonical spelling from the retained admitted directory, never a JSON path.
+        pub(crate) fn canonical_dos_path(
+            &self,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<std::ffi::OsString> {
+            use std::os::windows::ffi::OsStringExt;
+            self.revalidate(security, false, deadline)?;
+            let mut value = vec![0u16; MAX_PATH_UNITS];
+            // SAFETY: retained directory handle and complete bounded writable UTF-16 output.
+            let length = unsafe {
+                GetFinalPathNameByHandleW(
+                    self.file()?.as_raw_handle(),
+                    value.as_mut_ptr(),
+                    value.len() as u32,
+                    VOLUME_NAME_DOS,
+                )
+            } as usize;
+            if length == 0 || length >= value.len() {
+                return Err(NativeError::Unavailable);
+            }
+            deadline.check()?;
+            Ok(std::ffi::OsString::from_wide(&value[..length]))
+        }
+        /// Metadata-only pinned fixed leaf. No executable bytes, write sharing or delete sharing.
+        pub(crate) fn open_file_metadata(
+            &self,
+            name: &PrivateName,
+            security: &Security,
+            deadline: &Deadline,
+        ) -> NativeResult<(File, FileIdentity)> {
+            self.revalidate(security, false, deadline)?;
+            let file = open_component(
+                self.file()?,
+                &ComponentName::new(name.as_str())?,
+                ObjectKind::File,
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ,
+                deadline,
+            )?
+            .ok_or(NativeError::Missing)?;
+            let facts = observe(&file, name.as_str(), security)?;
+            admit_component(&facts, Admission::PrivateFile)?;
+            if facts.identity.volume != self.identity()?.volume {
+                return Err(NativeError::Foreign);
+            }
+            deadline.check()?;
+            Ok((file, facts.identity))
+        }
         #[cfg(test)]
         pub(crate) fn fixture_path(&self) -> &str {
             &self.path

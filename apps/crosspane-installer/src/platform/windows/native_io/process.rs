@@ -9,6 +9,108 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub const MAX_NATIVE_TIMEOUT_MS: u64 = 120_000;
+
+/// Portable comparisons of observations, never constructors for native target authority.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProcessFacts {
+    pub token: super::identity::TokenFacts,
+    pub pid: u32,
+    pub created: u64,
+    pub alive: bool,
+    pub image: String,
+    /// The separately pinned fixed leaf, not the mapped image section's queried identity.
+    pub file: super::files::FileIdentity,
+}
+impl std::fmt::Debug for ProcessFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProcessFacts")
+    }
+}
+/// Literal equivalent DOS spellings only; never opens an observed pathname or follows aliases.
+pub(crate) fn literal_path(value: &str) -> NativeResult<String> {
+    if value.len() > crate::agent_contract::MAX_STRING_BYTES || value.contains('\0') {
+        return Err(NativeError::Foreign);
+    }
+    let path = value.replace('/', "\\");
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    if path.len() < 3
+        || !path.as_bytes()[0].is_ascii_uppercase()
+        || &path.as_bytes()[1..3] != b":\\"
+    {
+        return Err(NativeError::Foreign);
+    }
+    if path[3..].split('\\').any(|part| {
+        part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.contains(':')
+            || part.ends_with(['.', ' '])
+    }) {
+        return Err(NativeError::Foreign);
+    }
+    Ok(path.to_owned())
+}
+pub(crate) fn process_matches(expected: &ProcessFacts, current: &ProcessFacts) -> NativeResult<()> {
+    super::identity::LimitedIdentity::admit(current.token.clone())
+        .map_err(|_| NativeError::Foreign)?;
+    if expected.token != current.token
+        || current.pid == 0
+        || current.pid != expected.pid
+        || !current.alive
+        || !expected.alive
+        || current.created == 0
+        || current.created != expected.created
+        || current.file != expected.file
+        || current.file.volume == 0
+        || current.file.file == [0; 16]
+        || literal_path(&current.image)? != literal_path(&expected.image)?
+    {
+        return Err(NativeError::Foreign);
+    }
+    Ok(())
+}
+pub(crate) fn bootstrap_matches(
+    expected: &crate::agent_contract::BootstrapV1,
+    current: &crate::agent_contract::BootstrapV1,
+) -> NativeResult<()> {
+    use crate::agent_contract::BootstrapPhase;
+    if expected.schema_version != 1
+        || current.schema_version != 1
+        || expected.instance_id == 0
+        || expected.pid == 0
+        || current.instance_id != expected.instance_id
+        || current.pid != expected.pid
+        || current.started_unix_ms != expected.started_unix_ms
+        || current.phase_seq < expected.phase_seq
+        || current.phase == BootstrapPhase::Failed
+        || expected.phase == BootstrapPhase::Failed
+        || (expected.phase == BootstrapPhase::Ready && current.phase != BootstrapPhase::Ready)
+        || (current.phase_seq == expected.phase_seq && current.phase != expected.phase)
+        || literal_path(&current.runtime_dir)? != literal_path(&expected.runtime_dir)?
+    {
+        return Err(NativeError::Foreign);
+    }
+    Ok(())
+}
+pub(crate) fn status_matches(
+    bootstrap: &crate::agent_contract::BootstrapV1,
+    image: &str,
+    status: &crate::agent_contract::InstanceStatus,
+) -> NativeResult<()> {
+    use crate::agent_contract::BootstrapPhase;
+    bootstrap_matches(bootstrap, bootstrap)?;
+    if bootstrap.phase != BootstrapPhase::Ready
+        || status.uid.is_some()
+        || status.id != bootstrap.instance_id
+        || status.pid != bootstrap.pid
+        || status.started_unix_ms != bootstrap.started_unix_ms
+        || literal_path(&status.exe)? != literal_path(image)?
+        || literal_path(&status.runtime_dir)? != literal_path(&bootstrap.runtime_dir)?
+    {
+        return Err(NativeError::Foreign);
+    }
+    Ok(())
+}
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
@@ -226,6 +328,138 @@ impl CallOwner {
             Err(NativeError::OutcomeUnknown)
         } else {
             Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) mod selected {
+    use super::super::{
+        files::FileIdentity,
+        identity::{self, LimitedIdentity, TokenFacts},
+    };
+    use super::*;
+    use crate::agent_contract::BootstrapV1;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{Foundation::*, System::Threading::*};
+
+    /// Retains the original kernel process object and raw creation FILETIME, not just its PID.
+    pub(crate) struct SelectedProcess {
+        handle: OwnedHandle,
+        facts: ProcessFacts,
+    }
+    impl SelectedProcess {
+        /// Called only inside the fixed AgentObservation factory's bounded native owner.
+        pub(crate) fn admit(
+            bootstrap: &BootstrapV1,
+            token: &TokenFacts,
+            image: &str,
+            file: FileIdentity,
+            deadline: &Deadline,
+        ) -> NativeResult<Self> {
+            deadline.check()?;
+            if bootstrap.pid == 0 {
+                return Err(NativeError::Foreign);
+            }
+            // SAFETY: query/synchronize-only non-inheritable handle for the fixed bootstrap PID.
+            let raw = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    bootstrap.pid,
+                )
+            };
+            if raw.is_null() {
+                return Err(NativeError::Unavailable);
+            }
+            // SAFETY: successful OpenProcess transferred one owned non-pseudo process handle.
+            let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+            let current = Self::observe(&handle, bootstrap.pid, file, deadline)?;
+            let expected = ProcessFacts {
+                token: token.clone(),
+                image: super::literal_path(image)?,
+                ..current.clone()
+            };
+            process_matches(&expected, &current)?;
+            deadline.check()?;
+            Ok(Self {
+                handle,
+                facts: current,
+            })
+        }
+        pub(crate) fn revalidate(&self, deadline: &Deadline) -> NativeResult<()> {
+            let current = Self::observe(&self.handle, self.facts.pid, self.facts.file, deadline)?;
+            process_matches(&self.facts, &current)
+        }
+        fn observe(
+            handle: &OwnedHandle,
+            pid: u32,
+            file: FileIdentity,
+            deadline: &Deadline,
+        ) -> NativeResult<ProcessFacts> {
+            deadline.check()?;
+            // SAFETY: retained original process handle, zero wait, no signal or termination.
+            if unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } != WAIT_TIMEOUT {
+                return Err(NativeError::Foreign);
+            }
+            let (mut creation, mut exit, mut kernel, mut user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            // SAFETY: retained query handle and four distinct complete writable FILETIME values.
+            if unsafe {
+                GetProcessTimes(
+                    handle.as_raw_handle(),
+                    &mut creation,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            } == 0
+            {
+                return Err(NativeError::Unavailable);
+            }
+            let created =
+                (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+            if created == 0 {
+                return Err(NativeError::Foreign);
+            }
+            let token = identity::native::observe_process(handle)?;
+            LimitedIdentity::admit(token.clone()).map_err(|_| NativeError::Foreign)?;
+            let mut path = vec![0u16; 32768];
+            let mut length = path.len() as u32;
+            // SAFETY: query-only original process and complete bounded writable path buffer.
+            if unsafe {
+                QueryFullProcessImageNameW(
+                    handle.as_raw_handle(),
+                    0,
+                    path.as_mut_ptr(),
+                    &mut length,
+                )
+            } == 0
+                || length == 0
+                || length as usize >= path.len()
+            {
+                return Err(NativeError::Unavailable);
+            }
+            let image = super::literal_path(
+                &String::from_utf16(&path[..length as usize]).map_err(|_| NativeError::Foreign)?,
+            )?;
+            deadline.check()?;
+            // SAFETY: same retained process, rechecked after all observations to reject an exit.
+            if unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } != WAIT_TIMEOUT {
+                return Err(NativeError::Foreign);
+            }
+            Ok(ProcessFacts {
+                token,
+                pid,
+                created,
+                alive: true,
+                image,
+                file,
+            })
         }
     }
 }

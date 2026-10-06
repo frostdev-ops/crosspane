@@ -5,6 +5,7 @@ mod detect;
 #[path = "../src/platform/windows/native_io.rs"]
 mod native_io;
 
+use crosspane_installer::agent_contract;
 use native_io::{NativeError, records::*};
 
 #[test]

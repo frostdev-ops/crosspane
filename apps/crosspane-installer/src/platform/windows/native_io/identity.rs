@@ -175,9 +175,18 @@ pub(crate) mod native {
     }
     pub(crate) fn observe() -> NativeResult<TokenFacts> {
         refuse_impersonation()?;
+        // SAFETY: query-only current-process pseudo handle, never transferred or closed.
+        token_facts(unsafe { GetCurrentProcess() })
+    }
+    /// Query only the already-retained selected process; no caller-selected PID or token.
+    pub(crate) fn observe_process(process: &OwnedHandle) -> NativeResult<TokenFacts> {
+        refuse_impersonation()?;
+        token_facts(process.as_raw_handle())
+    }
+    fn token_facts(process: HANDLE) -> NativeResult<TokenFacts> {
         let mut raw = std::ptr::null_mut();
-        // SAFETY: query-only current process token, with a valid output pointer.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+        // SAFETY: query-only retained/pseudo process handle; valid writable token output.
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) } == 0 {
             return Err(NativeError::Unavailable);
         }
         // SAFETY: successful OpenProcessToken transferred exactly one owned handle.
