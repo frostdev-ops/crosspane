@@ -4,6 +4,8 @@
 #![allow(unsafe_code)]
 
 pub use crate::model::parking::{MirrorJournalImages, MirrorJournalStore, MirrorRecovery};
+#[path = "marker.rs"]
+mod marker;
 use crate::{
     model::{
         geometry::DisplayIds,
@@ -642,12 +644,16 @@ enum Operation {
     Fullscreen(WindowId, bool),
     Restore(WindowId),
     Recover,
+    #[cfg(test)]
+    FixtureMarker(WindowId),
 }
 enum Reply {
     Unit,
     Geometry(Parked),
     Recovery(MirrorRecovery),
     Windows(Vec<WindowId>),
+    #[cfg(test)]
+    Marker(u64),
 }
 struct Call {
     deadline: Deadline,
@@ -687,9 +693,17 @@ impl WindowsMirrorParking {
             .name("crosspane-mirror".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // No native class, hook or private session observer exists before runtime park.
+                    let mut markers = marker::Owner::default();
                     while worker_shared.alive.load(Ordering::Acquire)
                         && !worker_shared.fault.load(Ordering::Acquire)
                     {
+                        marker::pump();
+                        if controller.faulted() {
+                            markers.retire_all();
+                        } else {
+                            markers.poll(&mut controller.port);
+                        }
                         let call = match receive.recv_timeout(Duration::from_millis(25)) {
                             Ok(c) => c,
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -710,10 +724,18 @@ impl WindowsMirrorParking {
                                 Operation::Startup => {
                                     controller.recover_startup().map(Reply::Recovery)
                                 }
-                                Operation::Park(id, size, scale) => {
-                                    controller.park(id, size, scale).map(Reply::Geometry)
-                                }
+                                Operation::Park(id, size, scale) => controller
+                                    .park_decorated(id, size, scale, |port| {
+                                        let result = markers.park(id, port);
+                                        if result.is_err() {
+                                            markers.remove(id);
+                                        }
+                                        result
+                                    })
+                                    .map(Reply::Geometry),
                                 Operation::Resize(id, size, scale) => {
+                                    // Retire presentation before a synchronous source mutation can stall.
+                                    markers.suspend();
                                     controller.resize(id, size, scale).map(Reply::Geometry)
                                 }
                                 Operation::Geometry(id) => {
@@ -723,14 +745,33 @@ impl WindowsMirrorParking {
                                     controller.set_fullscreen(id, on).map(|()| Reply::Unit)
                                 }
                                 Operation::Restore(id) => {
-                                    controller.restore(id).map(|()| Reply::Unit)
+                                    // Remove before native restoration; uncertain recovery retains journal only.
+                                    markers.remove(id);
+                                    let result = controller.restore(id);
+                                    result.map(|()| Reply::Unit)
                                 }
-                                Operation::Recover => controller.recover().map(Reply::Windows),
+                                Operation::Recover => {
+                                    markers.retire_all();
+                                    controller.recover().map(Reply::Windows)
+                                }
+                                #[cfg(test)]
+                                Operation::FixtureMarker(id) => {
+                                    Ok(Reply::Marker(markers.fixture_window(id)))
+                                }
                                 Operation::Bind(_) => unreachable!(),
                             }
                         });
+                        if controller.faulted() {
+                            markers.retire_all();
+                        }
                         let _ = call.reply.send(result);
                         controller.port.deadline = None;
+                        marker::pump();
+                        if controller.faulted() {
+                            markers.retire_all();
+                        } else {
+                            markers.poll(&mut controller.port);
+                        }
                     }
                 }));
                 if result.is_err() {
@@ -771,6 +812,14 @@ impl WindowsMirrorParking {
                 self.shared.fault.store(true, Ordering::Release);
                 Err(PlatformError::Timeout)
             }
+        }
+    }
+    #[cfg(test)]
+    #[allow(dead_code)] // Exact owned metadata fixture only; absent from the shipping facade.
+    pub(crate) fn fixture_marker(&self, id: WindowId) -> Result<u64, PlatformError> {
+        match self.call(Operation::FixtureMarker(id))? {
+            Reply::Marker(window) => Ok(window),
+            _ => Err(backend("marker fixture reply")),
         }
     }
     pub fn recover_startup(&mut self) -> Result<MirrorRecovery, PlatformError> {

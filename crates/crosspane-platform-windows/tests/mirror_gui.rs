@@ -7,7 +7,7 @@ use crosspane_platform::{
 use crosspane_platform_windows::{
     displays::WindowsDisplays,
     frame_capture::WindowsFrameCapture,
-    model,
+    model, session,
     window::{self, OwnedProcessAllowlist, OwnedProcessClaim},
 };
 use crosspane_types::{geom::PixelSize, id::WindowId};
@@ -78,6 +78,35 @@ impl Drop for PhysicalScope {
         assert!(!unsafe { SetThreadDpiAwarenessContext(self.0) }.is_null());
     }
 }
+// Resources stay on the GUI thread. Every cleanup stage is attempted even if one API refuses.
+struct FixtureWindow {
+    class: Vec<u16>,
+    module: HINSTANCE,
+    window: HWND,
+}
+impl FixtureWindow {
+    fn finish(&mut self) -> bool {
+        // SAFETY: only handles created by this same fixture thread; never enumerate or kill others.
+        let destroyed = self.window.is_null() || unsafe { DestroyWindow(self.window) } != 0;
+        if destroyed {
+            self.window = null_mut();
+        }
+        // SAFETY: private registered fixture class, retained name/module until native removal.
+        let removed = self.class.is_empty()
+            || unsafe { UnregisterClassW(self.class.as_ptr(), self.module) } != 0;
+        if removed {
+            self.class.clear();
+        }
+        destroyed && removed
+    }
+}
+impl Drop for FixtureWindow {
+    fn drop(&mut self) {
+        if !self.finish() {
+            eprintln!("OWNED_M1 native fixture cleanup incomplete");
+        }
+    }
+}
 struct Fixture {
     identity: NativeIdentity,
     stop: mpsc::Sender<()>,
@@ -86,6 +115,12 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::create(false)
+    }
+    fn passive_marker() -> Self {
+        Self::create(true)
+    }
+    fn create(passive: bool) -> Self {
         let (ready, initialized) = mpsc::sync_channel(1);
         let (stop, receive) = mpsc::channel();
         let (finished, done) = mpsc::sync_channel(1);
@@ -110,11 +145,16 @@ impl Fixture {
                     ..Default::default()
                 };
                 assert_ne!(RegisterClassW(&definition), 0);
+                let mut resources = FixtureWindow {
+                    class,
+                    module,
+                    window: null_mut(),
+                };
                 let window = CreateWindowExW(
-                    0,
-                    class.as_ptr(),
+                    if passive { WS_EX_NOACTIVATE } else { 0 },
+                    resources.class.as_ptr(),
                     title.as_ptr(),
-                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    WS_OVERLAPPEDWINDOW | if passive { 0 } else { WS_VISIBLE },
                     100,
                     100,
                     416,
@@ -124,7 +164,11 @@ impl Fixture {
                     module,
                     null(),
                 );
+                resources.window = window;
                 assert!(!window.is_null());
+                if passive {
+                    ShowWindow(window, SW_SHOWNOACTIVATE);
+                }
                 let mut created = FILETIME::default();
                 let mut exit = FILETIME::default();
                 let mut kernel = FILETIME::default();
@@ -156,14 +200,24 @@ impl Fixture {
                     }
                     thread::sleep(Duration::from_millis(5));
                 }
-                let okay = DestroyWindow(window) != 0
-                    && UnregisterClassW(class.as_ptr(), module) != 0
-                    && !SetThreadDpiAwarenessContext(previous).is_null();
+                let removed = resources.finish();
+                let context_restored = !SetThreadDpiAwarenessContext(previous).is_null();
+                let okay = removed && context_restored;
                 let _ = finished.send(okay);
             }
         });
+        let identity = match initialized.recv_timeout(Duration::from_secs(3)) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = stop.send(());
+                if done.recv_timeout(Duration::from_secs(3)).is_ok() {
+                    let _ = worker.join();
+                }
+                panic!("owned fixture initialization refused: {error}");
+            }
+        };
         Self {
-            identity: initialized.recv_timeout(Duration::from_secs(3)).unwrap(),
+            identity,
             stop,
             done,
             worker: Some(worker),
@@ -424,5 +478,239 @@ fn limited_owned_mirror_recovery_and_wgc_geometry() {
     cancel.send(()).unwrap();
     println!(
         "OWNED_M1 park_visible_in_place=true resize_actual=true destination_dpi_not_rescaled=true decorated_wgc_size_matches=true restore_original=true journal_empty=true prehost_queries_and_mutation_pmv2=true prior_thread_context_restored=true context_failure_retained=true source_drop_refused=true creation_mismatch_refused=true owned_cleanup=true"
+    );
+}
+
+/// The parking facade supplies this exact owned marker handle. Retain its thread/process tuple
+/// before querying any of its metadata; no source title/class/content or foreign fields are read.
+struct MarkerClaim {
+    window: u64,
+    tid: u32,
+    created: u64,
+}
+impl MarkerClaim {
+    fn new(window: u64, source: NativeIdentity) -> Self {
+        assert_ne!(window, 0);
+        let mut pid = 0;
+        // SAFETY: facade returned an own marker; admission reads only its PID/TID first.
+        let tid = unsafe { GetWindowThreadProcessId(window as usize as HWND, &mut pid) };
+        assert_eq!(pid, source.pid);
+        assert_ne!(tid, 0);
+        assert_ne!(tid, source.tid);
+        let claim = Self {
+            window,
+            tid,
+            created: source.process_created,
+        };
+        assert!(claim.alive());
+        claim
+    }
+    fn hwnd(&self) -> HWND {
+        self.window as usize as HWND
+    }
+    fn alive(&self) -> bool {
+        let mut pid = 0;
+        let mut created = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: exact own marker admission precedes fields; query only this process's creation.
+        unsafe {
+            GetWindowThreadProcessId(self.hwnd(), &mut pid) == self.tid
+                && pid == GetCurrentProcessId()
+                && GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut created,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                ) != 0
+                && ((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+                    == self.created
+        }
+    }
+    fn visible(&self) -> bool {
+        if !self.alive() {
+            return false;
+        }
+        // SAFETY: metadata only of this freshly admitted own marker.
+        unsafe { IsWindowVisible(self.hwnd()) != 0 }
+    }
+    fn matches(&self, fixture: &Fixture) -> bool {
+        let _physical = PhysicalScope::new();
+        if !self.alive() {
+            return false;
+        }
+        let expected = fixture.facts().1;
+        let mut actual = RECT::default();
+        // SAFETY: own marker and freshly admitted fixture only; adjacency returns a handle only.
+        unsafe {
+            let style = GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) as u32;
+            let required = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            AreDpiAwarenessContextsEqual(
+                GetWindowDpiAwarenessContext(self.hwnd()),
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            ) != 0
+                && GetWindowRect(self.hwnd(), &mut actual) != 0
+                && [actual.left, actual.top, actual.right, actual.bottom] == expected
+                && style & required == required
+                && (style & WS_EX_TOPMOST != 0)
+                    == (GetWindowLongPtrW(fixture.hwnd(), GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0)
+                && GetWindowLongPtrW(self.hwnd(), GWL_STYLE) as u32 & WS_POPUP != 0
+                && IsWindowVisible(self.hwnd()) != 0
+                && GetWindow(fixture.hwnd(), GW_HWNDPREV) == self.hwnd()
+                && GetForegroundWindow() != self.hwnd()
+        }
+    }
+}
+fn marker_wait(mut predicate: impl FnMut() -> bool) {
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        if predicate() {
+            return;
+        }
+        assert!(Instant::now() < until, "owned marker metadata deadline");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+fn marker_target(source: &window::WindowsWindowSource, identity: NativeIdentity) -> WindowId {
+    let resolver = source.resolver();
+    let mut target = None;
+    marker_wait(|| {
+        let found: Vec<_> = source
+            .windows()
+            .unwrap()
+            .into_iter()
+            .filter(|w| {
+                resolver.resolve(w.id).is_some_and(|n| {
+                    (n.hwnd, n.pid, n.tid, n.process_created)
+                        == (
+                            identity.hwnd,
+                            identity.pid,
+                            identity.tid,
+                            identity.process_created,
+                        )
+                })
+            })
+            .map(|w| w.id)
+            .collect();
+        if found.len() == 1 {
+            target = Some(found[0]);
+            true
+        } else {
+            false
+        }
+    });
+    target.unwrap()
+}
+fn marker_journal_empty(store: &Store) {
+    let images = store.0.lock().unwrap().clone();
+    assert!(images.pending.is_some() && images.committed.is_some());
+    assert_eq!(images.pending, images.committed);
+    let (journal, interrupted) = Journal::load(&images).unwrap();
+    assert!(!interrupted && journal.entries().is_empty());
+}
+#[test]
+#[ignore = "Limited owned marker metadata only; no capture/socket/input; explicit win-gui opt-in"]
+fn limited_owned_mirror_marker_metadata() {
+    assert_eq!(
+        std::env::var("CROSSPANE_WINDOWS_MARKER_PROBE").as_deref(),
+        Ok("1")
+    );
+    limited();
+    let (cancel, deadline) = mpsc::channel();
+    thread::spawn(move || {
+        if matches!(
+            deadline.recv_timeout(Duration::from_secs(35)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            eprintln!("OWNED_MARKER watchdog expired");
+            std::process::exit(124);
+        }
+    });
+    // Process-private canonical journal images; W3.2a already verified filesystem durability.
+    // Recovery remains before any native source or the lazy runtime marker/session hooks.
+    let store = Store::default();
+    let mut parking = parking::WindowsMirrorParking::new(Box::new(store.clone())).unwrap();
+    assert_eq!(parking.recover_startup().unwrap().pending, 0);
+    let mut fixture = Fixture::passive_marker();
+    let original = fixture.facts();
+    assert!(original.2);
+    let displays = WindowsDisplays::new().unwrap();
+    let source = source(&displays, fixture.identity);
+    let id = marker_target(&source, fixture.identity);
+    parking
+        .bind_source(source.resolver(), displays.ids(), displays.monitor_reader())
+        .unwrap();
+    let size = PixelSize::new(
+        (original.1[2] - original.1[0]) as u32,
+        (original.1[3] - original.1[1]) as u32,
+    );
+    parking.park(id, size, 1.0).unwrap();
+    let marker = MarkerClaim::new(parking.fixture_marker(id).unwrap(), fixture.identity);
+    marker_wait(|| marker.matches(&fixture));
+    // Each operation targets this exact already admitted fixture HWND; passive flags preserve
+    // owner focus/order. No pointer/keyboard injection, screenshots, WGC or sockets are used.
+    fixture.facts();
+    assert_ne!(
+        // SAFETY: only owned fixture geometry, no source z-order or focus change.
+        unsafe {
+            SetWindowPos(
+                fixture.hwnd(),
+                null_mut(),
+                140,
+                120,
+                500,
+                380,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            )
+        },
+        0
+    );
+    marker_wait(|| marker.matches(&fixture));
+    fixture.facts();
+    // SAFETY: minimise only this owned passive fixture without activation.
+    unsafe {
+        ShowWindow(fixture.hwnd(), SW_SHOWMINNOACTIVE);
+    }
+    marker_wait(|| !marker.visible());
+    fixture.facts();
+    // SAFETY: restore only this owned passive fixture, explicitly without activation.
+    unsafe {
+        ShowWindow(fixture.hwnd(), SW_SHOWNOACTIVATE);
+    }
+    marker_wait(|| marker.matches(&fixture));
+    fixture.facts();
+    // SAFETY: hide only this owned fixture.
+    unsafe {
+        ShowWindow(fixture.hwnd(), SW_HIDE);
+    }
+    marker_wait(|| !marker.visible());
+    fixture.facts();
+    // SAFETY: show only this owned passive fixture without activation.
+    unsafe {
+        ShowWindow(fixture.hwnd(), SW_SHOWNOACTIVATE);
+    }
+    marker_wait(|| marker.matches(&fixture));
+    parking.restore(id).unwrap();
+    marker_wait(|| !marker.alive());
+    assert_eq!(parking.fixture_marker(id).unwrap(), 0);
+    assert_eq!(fixture.facts(), original);
+    marker_journal_empty(&store);
+    // Re-park is real M1 with a fresh marker; repeated restore remains idempotent.
+    parking.park(id, size, 1.0).unwrap();
+    let second = MarkerClaim::new(parking.fixture_marker(id).unwrap(), fixture.identity);
+    marker_wait(|| second.matches(&fixture));
+    parking.restore(id).unwrap();
+    marker_wait(|| !second.alive());
+    parking.restore(id).unwrap();
+    marker_journal_empty(&store);
+    drop(parking);
+    drop(source);
+    drop(displays);
+    fixture.finish();
+    cancel.send(()).unwrap();
+    println!(
+        "OWNED_MARKER park=true move_resize=true minimized_hidden=true restored_shown=true hidden_hidden=true shown_shown=true rect_exact=true adjacency_exact=true marker_pmv2=true passive_styles=true source_non_topmost_band=true marker_removed=true repark=true journal_both_empty=true owned_cleanup=true capture=false sockets=false input=false"
     );
 }

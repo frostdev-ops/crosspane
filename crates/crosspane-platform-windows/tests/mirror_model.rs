@@ -578,3 +578,227 @@ fn strict_post_publication_preflight_failure_retains_entry_instead_of_pending_su
     c.port.restore_preflight_error = false;
     assert_eq!(c.recover_startup().unwrap().pending, 1);
 }
+
+fn marker_observed() -> MarkerObservation {
+    MarkerObservation {
+        identity: identity(),
+        frame: [-1880, -80, -1480, 220],
+        dpi: 144,
+        visible: true,
+        minimized: false,
+        cloaked: false,
+        topmost: false,
+        session_allowed: true,
+    }
+}
+#[test]
+fn marker_park_move_resize_follow_exact_physical_frame_at_source_dpi() {
+    let mut marker = MarkerModel::default();
+    let mut facts = marker_observed();
+    assert_eq!(
+        marker.park(facts).unwrap(),
+        MarkerState::Shown(MarkerFrame {
+            rect: facts.frame,
+            border: 3,
+            topmost: false,
+        })
+    );
+    let generation = marker.generation();
+    facts.frame = [-1900, -100, -1360, 300];
+    facts.dpi = 192;
+    assert_eq!(
+        marker.observe(facts, true).unwrap(),
+        MarkerState::Shown(MarkerFrame {
+            rect: facts.frame,
+            border: 4,
+            topmost: false,
+        })
+    );
+    assert_eq!(marker.generation(), generation);
+}
+#[test]
+fn marker_minimize_hide_cloak_hide_and_fresh_restore_shows() {
+    for kind in 0..3 {
+        let mut marker = MarkerModel::default();
+        let original = marker_observed();
+        marker.park(original).unwrap();
+        let mut hidden = original;
+        match kind {
+            0 => hidden.minimized = true,
+            1 => hidden.visible = false,
+            _ => hidden.cloaked = true,
+        }
+        assert_eq!(marker.observe(hidden, true).unwrap(), MarkerState::Hidden);
+        assert!(matches!(
+            marker.observe(original, true).unwrap(),
+            MarkerState::Shown(_)
+        ));
+    }
+}
+#[test]
+fn marker_destroy_restore_drop_secure_inactive_remove_and_repark_recreates() {
+    for reason in 0..5 {
+        let mut marker = MarkerModel::default();
+        let original = marker_observed();
+        marker.park(original).unwrap();
+        let generation = marker.generation();
+        match reason {
+            0..=2 => marker.remove(), // Native destroy, successful restore and owner Drop.
+            _ => {
+                let mut blocked = original;
+                blocked.session_allowed = false;
+                assert_eq!(marker.observe(blocked, true).unwrap(), MarkerState::Absent);
+            }
+        }
+        assert_eq!(marker.state(), MarkerState::Absent);
+        assert_eq!(marker.observe(original, true).unwrap(), MarkerState::Absent);
+        assert!(matches!(
+            marker.park(original).unwrap(),
+            MarkerState::Shown(_)
+        ));
+        assert_eq!(marker.generation(), generation + 1);
+    }
+    let mut marker = MarkerModel::default();
+    let mut replaced = marker_observed();
+    marker.park(replaced).unwrap();
+    replaced.identity.process_created += 1;
+    assert_eq!(marker.observe(replaced, true).unwrap(), MarkerState::Absent);
+}
+#[test]
+fn marker_band_matches_only_source_and_failed_adjacency_waits_for_change() {
+    let mut marker = MarkerModel::default();
+    let mut facts = marker_observed();
+    marker.park(facts).unwrap();
+    facts.topmost = true;
+    assert!(matches!(
+        marker.observe(facts, true).unwrap(),
+        MarkerState::Shown(MarkerFrame { topmost: true, .. })
+    ));
+    marker.adjacency_failed();
+    assert_eq!(marker.observe(facts, false).unwrap(), MarkerState::Hidden);
+    assert!(matches!(
+        marker.observe(facts, true).unwrap(),
+        MarkerState::Shown(_)
+    ));
+    facts.topmost = false;
+    assert!(matches!(
+        marker.observe(facts, true).unwrap(),
+        MarkerState::Shown(MarkerFrame { topmost: false, .. })
+    ));
+}
+
+#[test]
+fn marker_fresh_revalidation_refuses_changed_identity_and_lost_session() {
+    for identity_changed in [false, true] {
+        let mut marker = MarkerModel::default();
+        let original = marker_observed();
+        marker.park(original).unwrap();
+        let mut fresh = original;
+        if identity_changed {
+            fresh.identity.process_created += 1;
+        } else {
+            fresh.session_allowed = false;
+        }
+        assert_eq!(marker.observe(fresh, false).unwrap(), MarkerState::Absent);
+        assert_eq!(marker.observe(original, true).unwrap(), MarkerState::Absent);
+        assert!(matches!(
+            marker.park(original).unwrap(),
+            MarkerState::Shown(_)
+        ));
+    }
+}
+
+#[test]
+fn marker_decoration_failure_rolls_back_real_park_in_place() {
+    let (mut c, store) = controller();
+    c.bind();
+    let before = c.port.current.as_ref().unwrap().outer;
+    let mut decorated = false;
+    let error = c
+        .park_decorated(WindowId(12345), PixelSize::new(900, 700), 2.0, |port| {
+            // Actual M1 park never changes source geometry to requested dimensions.
+            assert_eq!(port.current.as_ref().unwrap().outer, before);
+            assert!(port.native_log.is_empty());
+            decorated = true;
+            Err(PlatformError::Unsupported("owned marker creation refused"))
+        })
+        .unwrap_err();
+    assert!(decorated);
+    assert!(matches!(
+        error,
+        PlatformError::Unsupported("owned marker creation refused")
+    ));
+    assert_eq!(c.port.current.as_ref().unwrap().outer, before);
+    assert!(c.port.native_log.is_empty());
+    assert!(c.journal().entries().is_empty());
+    assert!(
+        Journal::load(&store.0.lock().unwrap().images)
+            .unwrap()
+            .0
+            .entries()
+            .is_empty()
+    );
+}
+#[test]
+fn marker_decoration_failure_retains_journal_when_concurrent_move_restore_refuses() {
+    let (mut c, store) = controller();
+    c.bind();
+    let before = c.port.current.as_ref().unwrap().outer;
+    let error = c
+        .park_decorated(WindowId(12345), PixelSize::new(400, 300), 1.0, |port| {
+            // Model an external app/fixture move while decoration is attempted, never a marker move.
+            let observed = port.current.as_mut().unwrap();
+            observed.outer[2] += 20;
+            observed.visible[2] += 20;
+            port.restore_preflight_error = true;
+            Err(PlatformError::Unsupported("owned marker creation refused"))
+        })
+        .unwrap_err();
+    let PlatformError::Backend(detail) = error else {
+        panic!("combined rollback failure required");
+    };
+    assert!(detail.contains("owned marker creation refused"));
+    assert!(detail.contains(&PlatformError::SecureInput.to_string()));
+    assert!(detail.contains("journal retained"));
+    assert_ne!(c.port.current.as_ref().unwrap().outer, before);
+    assert!(c.port.native_log.is_empty());
+    assert_eq!(c.journal().entries().len(), 1);
+    assert!(c.journal().entries()[0].may_have_mutated);
+    assert_eq!(
+        Journal::load(&store.0.lock().unwrap().images)
+            .unwrap()
+            .0
+            .entries()
+            .len(),
+        1
+    );
+}
+#[test]
+fn marker_journal_fault_query_poison_prevents_later_decoration_or_source_mutation() {
+    let (mut c, store) = controller();
+    c.bind();
+    c.park_decorated(WindowId(12345), PixelSize::new(400, 300), 1.0, |_| Ok(()))
+        .unwrap();
+    assert!(!c.faulted());
+    store.0.lock().unwrap().fail = true;
+    assert!(
+        c.resize(WindowId(12345), PixelSize::new(200, 100), 1.0)
+            .is_err()
+    );
+    assert!(c.faulted());
+    let commits = store.0.lock().unwrap().commits;
+    assert!(
+        c.park_decorated(WindowId(12345), PixelSize::new(400, 300), 1.0, |_| panic!(
+            "faulted journal must not reach decoration"
+        ))
+        .is_err()
+    );
+    assert!(c.restore(WindowId(12345)).is_err());
+    assert!(
+        c.resize(WindowId(12345), PixelSize::new(300, 200), 1.0)
+            .is_err()
+    );
+    assert_eq!(store.0.lock().unwrap().commits, commits);
+    assert!(c.port.native_log.is_empty());
+    assert_eq!(c.journal().entries().len(), 1);
+}

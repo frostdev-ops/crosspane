@@ -378,6 +378,10 @@ impl<P: NativePort> Controller<P> {
     pub fn journal(&self) -> &Journal {
         &self.journal
     }
+    /// Decorations must retire immediately when durable publication poisons this stream.
+    pub fn faulted(&self) -> bool {
+        self.fault
+    }
     pub fn bind(&mut self) {
         self.bound = true;
     }
@@ -441,6 +445,26 @@ impl<P: NativePort> Controller<P> {
         self.publish(self.journal.insert(entry)?)?;
         self.runtime.insert(id, identity);
         actual.geometry.ok_or(PlatformError::NotFound)
+    }
+    /// Native decoration follows a real park-in-place. Failed decoration must roll that park
+    /// back through the same identity/journal/context checks as an ordinary restore.
+    pub fn park_decorated(
+        &mut self,
+        id: WindowId,
+        size: PixelSize,
+        scale: f64,
+        decorate: impl FnOnce(&mut P) -> Result<(), PlatformError>,
+    ) -> Result<Parked, PlatformError> {
+        let actual = self.park(id, size, scale)?;
+        if let Err(marker_error) = decorate(&mut self.port) {
+            return match self.restore(id) {
+                Ok(()) => Err(marker_error),
+                Err(restore_error) => Err(PlatformError::Backend(format!(
+                    "mirror decoration failed: {marker_error}; rollback failed: {restore_error}; journal retained"
+                ))),
+            };
+        }
+        Ok(actual)
     }
     fn entry(&mut self, id: WindowId) -> Result<MirrorEntry, PlatformError> {
         let identity = self
@@ -625,5 +649,105 @@ impl<P: NativePort> Controller<P> {
             self.runtime.remove(&id);
         }
         Ok(restored)
+    }
+}
+
+/// Pure M1 decoration facts. Native code supplies them only after exact source admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkerObservation {
+    pub identity: NativeIdentity,
+    pub frame: [i32; 4],
+    pub dpi: u32,
+    pub visible: bool,
+    pub minimized: bool,
+    pub cloaked: bool,
+    pub topmost: bool,
+    pub session_allowed: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkerFrame {
+    pub rect: [i32; 4],
+    pub border: u32,
+    /// Lead c6471971: match the admitted source band; never promote a non-topmost source.
+    pub topmost: bool,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarkerState {
+    #[default]
+    Absent,
+    Hidden,
+    Shown(MarkerFrame),
+}
+/// One actual runtime park owns one decoration. Loss never changes the parking journal.
+#[derive(Clone, Debug, Default)]
+pub struct MarkerModel {
+    identity: Option<NativeIdentity>,
+    state: MarkerState,
+    generation: u64,
+    retry: bool,
+}
+impl MarkerModel {
+    pub fn state(&self) -> MarkerState {
+        self.state
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn park(&mut self, observed: MarkerObservation) -> Result<MarkerState, PlatformError> {
+        if self.identity != Some(observed.identity) {
+            self.generation = self.generation.checked_add(1).ok_or_else(invalid)?;
+        }
+        self.identity = Some(observed.identity);
+        self.retry = true;
+        self.observe(observed, true)
+    }
+    pub fn observe(
+        &mut self,
+        observed: MarkerObservation,
+        changed: bool,
+    ) -> Result<MarkerState, PlatformError> {
+        let Some(identity) = self.identity else {
+            return Ok(MarkerState::Absent);
+        };
+        if identity != observed.identity || !observed.session_allowed {
+            self.remove();
+            return Ok(self.state);
+        }
+        if changed {
+            self.retry = true;
+        }
+        if !observed.visible || observed.minimized || observed.cloaked || !self.retry {
+            self.state = MarkerState::Hidden;
+            return Ok(self.state);
+        }
+        let size = rect_size(observed.frame)?;
+        if observed.dpi == 0 {
+            return Err(invalid());
+        }
+        // Two device-independent pixels, rounded upward at the source's DPI, inside its frame.
+        let border = (u64::from(observed.dpi) * 2).div_ceil(96);
+        let border = u32::try_from(border)
+            .map_err(|_| invalid())?
+            .max(1)
+            .min(size.width.div_ceil(2))
+            .min(size.height.div_ceil(2));
+        self.state = MarkerState::Shown(MarkerFrame {
+            rect: observed.frame,
+            border,
+            topmost: observed.topmost,
+        });
+        Ok(self.state)
+    }
+    /// A failed native adjacency proof stays hidden until a new admitted change event/fact.
+    pub fn adjacency_failed(&mut self) {
+        if self.identity.is_some() {
+            self.state = MarkerState::Hidden;
+            self.retry = false;
+        }
+    }
+    pub fn remove(&mut self) {
+        self.identity = None;
+        self.state = MarkerState::Absent;
+        self.retry = false;
     }
 }
